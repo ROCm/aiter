@@ -291,8 +291,12 @@ __device__ __forceinline__ auto opus_gmem(T* ptr)
 }
 #endif // __HIP_DEVICE_COMPILE__
 
-template <int32_t VecPairs = 1, typename scalar_t>
-__device__ __forceinline__ void elementwise_copy(scalar_t* __restrict__ p_output,
+template <int32_t VecPairs = 1, typename scalar_t, typename gmem_i_t, typename gmem_o_t>
+__device__ __forceinline__ void elementwise_copy(gmem_i_t& g_input,
+                                                 gmem_o_t& g_output,
+                                                 const int32_t offset_i, // per-thread (s,b) offset in elements
+                                                 const int32_t offset_o,
+                                                 scalar_t* __restrict__ p_output, // fallback for VP==1
                                                  const scalar_t* __restrict__ p_input,
                                                  const int32_t hid_end,
                                                  const int32_t did_start,
@@ -306,37 +310,47 @@ __device__ __forceinline__ void elementwise_copy(scalar_t* __restrict__ p_output
 {
     if(did_end > did_start)
     {
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
         for(int32_t hid = 0; hid < hid_end; hid++)
         {
 #ifdef __HIP_DEVICE_COMPILE__
             if constexpr(VecPairs > 1)
             {
-                auto g_i = opus_gmem(p_input + hid * stride_i_h);
-                auto g_o = opus_gmem(p_output + hid * stride_o_h);
+                const int32_t byte_off_i = (offset_i + hid * stride_i_h) * elem_bytes;
+                const int32_t byte_off_o = (offset_o + hid * stride_o_h) * elem_bytes;
                 for(int32_t did = did_start + my_did_offset * VecPairs;
                     did + VecPairs <= did_end;
                     did += did_stride * VecPairs)
                 {
-                    auto v = g_i.template load<VecPairs>(did);
-                    g_o.template store<VecPairs>(v, did);
+                    auto v = g_input.template _load<VecPairs>(byte_off_i + did * elem_bytes);
+                    g_output.template _store<VecPairs>(v, byte_off_o + did * elem_bytes);
                 }
             }
             else
 #endif
             {
-                const int32_t offset_i = hid * stride_i_h;
-                const int32_t offset_o = hid * stride_o_h;
+                const int32_t off_i = offset_i + hid * stride_i_h;
+                const int32_t off_o = offset_o + hid * stride_o_h;
                 for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
                 {
-                    p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
+                    p_output[off_o + did * stride_o_d] = p_input[off_i + did * stride_i_d];
                 }
             }
         }
     }
 }
 
-template <int32_t VecPairs = 1, typename scalar_t>
-__device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_output_x,
+template <int32_t VecPairs = 1, typename scalar_t,
+          typename gmem_ix_t, typename gmem_iy_t, typename gmem_ox_t, typename gmem_oy_t>
+__device__ __forceinline__ void elementwise_copy_2c(gmem_ix_t& g_ix,
+                                                    gmem_iy_t& g_iy,
+                                                    gmem_ox_t& g_ox,
+                                                    gmem_oy_t& g_oy,
+                                                    const int32_t off_ix, // per-thread (s,b) offset in elements
+                                                    const int32_t off_iy,
+                                                    const int32_t off_ox,
+                                                    const int32_t off_oy,
+                                                    scalar_t* __restrict__ p_output_x, // fallback for VP==1
                                                     scalar_t* __restrict__ p_output_y,
                                                     const scalar_t* __restrict__ p_input_x,
                                                     const scalar_t* __restrict__ p_input_y,
@@ -357,6 +371,7 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
 {
     if(did_end > did_start)
     {
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
         const int32_t hid_min_end = hid_end_x < hid_end_y ? hid_end_x : hid_end_y;
 
         for(int32_t hid = 0; hid < hid_min_end; hid++)
@@ -364,27 +379,28 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
 #ifdef __HIP_DEVICE_COMPILE__
             if constexpr(VecPairs > 1)
             {
-                auto g_ix = opus_gmem(p_input_x + hid * stride_ix_h);
-                auto g_iy = opus_gmem(p_input_y + hid * stride_iy_h);
-                auto g_ox = opus_gmem(p_output_x + hid * stride_ox_h);
-                auto g_oy = opus_gmem(p_output_y + hid * stride_oy_h);
+                const int32_t bo_ix = (off_ix + hid * stride_ix_h) * elem_bytes;
+                const int32_t bo_iy = (off_iy + hid * stride_iy_h) * elem_bytes;
+                const int32_t bo_ox = (off_ox + hid * stride_ox_h) * elem_bytes;
+                const int32_t bo_oy = (off_oy + hid * stride_oy_h) * elem_bytes;
                 for(int32_t did = did_start + my_did_offset * VecPairs;
                     did + VecPairs <= did_end;
                     did += did_stride * VecPairs)
                 {
-                    auto vx = g_ix.template load<VecPairs>(did);
-                    auto vy = g_iy.template load<VecPairs>(did);
-                    g_ox.template store<VecPairs>(vx, did);
-                    g_oy.template store<VecPairs>(vy, did);
+                    const int32_t db = did * elem_bytes;
+                    auto vx = g_ix.template _load<VecPairs>(bo_ix + db);
+                    auto vy = g_iy.template _load<VecPairs>(bo_iy + db);
+                    g_ox.template _store<VecPairs>(vx, bo_ox + db);
+                    g_oy.template _store<VecPairs>(vy, bo_oy + db);
                 }
             }
             else
 #endif
             {
-                const int32_t offset_ix = hid * stride_ix_h;
-                const int32_t offset_iy = hid * stride_iy_h;
-                const int32_t offset_ox = hid * stride_ox_h;
-                const int32_t offset_oy = hid * stride_oy_h;
+                const int32_t offset_ix = off_ix + hid * stride_ix_h;
+                const int32_t offset_iy = off_iy + hid * stride_iy_h;
+                const int32_t offset_ox = off_ox + hid * stride_ox_h;
+                const int32_t offset_oy = off_oy + hid * stride_oy_h;
                 for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
                 {
                     p_output_x[offset_ox + did * stride_ox_d] =
@@ -400,21 +416,22 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
 #ifdef __HIP_DEVICE_COMPILE__
             if constexpr(VecPairs > 1)
             {
-                auto g_ix = opus_gmem(p_input_x + hid * stride_ix_h);
-                auto g_ox = opus_gmem(p_output_x + hid * stride_ox_h);
+                const int32_t bo_ix = (off_ix + hid * stride_ix_h) * elem_bytes;
+                const int32_t bo_ox = (off_ox + hid * stride_ox_h) * elem_bytes;
                 for(int32_t did = did_start + my_did_offset * VecPairs;
                     did + VecPairs <= did_end;
                     did += did_stride * VecPairs)
                 {
-                    auto v = g_ix.template load<VecPairs>(did);
-                    g_ox.template store<VecPairs>(v, did);
+                    const int32_t db = did * elem_bytes;
+                    auto v = g_ix.template _load<VecPairs>(bo_ix + db);
+                    g_ox.template _store<VecPairs>(v, bo_ox + db);
                 }
             }
             else
 #endif
             {
-                const int32_t offset_ix = hid * stride_ix_h;
-                const int32_t offset_ox = hid * stride_ox_h;
+                const int32_t offset_ix = off_ix + hid * stride_ix_h;
+                const int32_t offset_ox = off_ox + hid * stride_ox_h;
                 for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
                 {
                     p_output_x[offset_ox + did * stride_ox_d] =
@@ -428,21 +445,22 @@ __device__ __forceinline__ void elementwise_copy_2c(scalar_t* __restrict__ p_out
 #ifdef __HIP_DEVICE_COMPILE__
             if constexpr(VecPairs > 1)
             {
-                auto g_iy = opus_gmem(p_input_y + hid * stride_iy_h);
-                auto g_oy = opus_gmem(p_output_y + hid * stride_oy_h);
+                const int32_t bo_iy = (off_iy + hid * stride_iy_h) * elem_bytes;
+                const int32_t bo_oy = (off_oy + hid * stride_oy_h) * elem_bytes;
                 for(int32_t did = did_start + my_did_offset * VecPairs;
                     did + VecPairs <= did_end;
                     did += did_stride * VecPairs)
                 {
-                    auto v = g_iy.template load<VecPairs>(did);
-                    g_oy.template store<VecPairs>(v, did);
+                    const int32_t db = did * elem_bytes;
+                    auto v = g_iy.template _load<VecPairs>(bo_iy + db);
+                    g_oy.template _store<VecPairs>(v, bo_oy + db);
                 }
             }
             else
 #endif
             {
-                const int32_t offset_iy = hid * stride_iy_h;
-                const int32_t offset_oy = hid * stride_oy_h;
+                const int32_t offset_iy = off_iy + hid * stride_iy_h;
+                const int32_t offset_oy = off_oy + hid * stride_oy_h;
                 for(int32_t did = did_start + my_did_offset; did < did_end; did += did_stride)
                 {
                     p_output_y[offset_oy + did * stride_oy_d] =
@@ -684,24 +702,25 @@ __device__ __forceinline__ void load_cos_sin_cached_vec(float (&cos_0)[VecPairs]
 #endif
 }
 
-template <int32_t RotateStyle, int32_t VecPairs, typename o_scalar_t, typename i_scalar_t>
+// load_payload_vec: loads VecPairs element-pairs from a pre-built gmem descriptor.
+// g_buffer must be created from a UNIFORM (kernel-arg) base pointer to avoid waterfall loops.
+// byte_offset_base = (offset_sb + hid * stride_h) * sizeof(element) -- the per-thread byte offset.
+template <int32_t RotateStyle, int32_t VecPairs, typename o_scalar_t, typename gmem_t>
 __device__ __forceinline__ void load_payload_vec(o_scalar_t (&data_0)[VecPairs],
                                                  o_scalar_t (&data_1)[VecPairs],
-                                                 const i_scalar_t* p_buffer,
+                                                 gmem_t& g_buffer,
+                                                 const int32_t byte_offset_base,
                                                  const int32_t did_pair, // 0-based pair index into rotary portion
                                                  const int32_t did_start, // physical start of rotary portion
-                                                 const int32_t hid,
-                                                 const int32_t stride_h,
                                                  const int32_t size_half_r)
 {
 #ifdef __HIP_DEVICE_COMPILE__
-    const i_scalar_t* row = p_buffer + hid * stride_h;
+    constexpr int32_t elem_bytes = sizeof(typename gmem_t::scalar_type);
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
         const int32_t did = did_pair + did_start;
-        auto g = opus_gmem(row);
-        auto v0 = g.template load<VecPairs>(did);
-        auto v1 = g.template load<VecPairs>(did + size_half_r);
+        auto v0 = g_buffer.template _load<VecPairs>(byte_offset_base + did * elem_bytes);
+        auto v1 = g_buffer.template _load<VecPairs>(byte_offset_base + (did + size_half_r) * elem_bytes);
         opus::static_for<VecPairs>([&](auto i) {
             data_0[i.value] = o_scalar_t(v0[i.value]);
             data_1[i.value] = o_scalar_t(v1[i.value]);
@@ -712,18 +731,17 @@ __device__ __forceinline__ void load_payload_vec(o_scalar_t (&data_0)[VecPairs],
         // GPTJ layout: (even0, odd0, even1, odd1, ...) interleaved within rotary portion
         // Physical position = did_start + 2 * did_pair
         const int32_t phys = did_start + 2 * did_pair;
-        auto g = opus_gmem(row);
         if constexpr(VecPairs == 1)
         {
-            auto v0 = g.template load<1>(phys);
-            auto v1 = g.template load<1>(phys + 1);
+            auto v0 = g_buffer.template _load<1>(byte_offset_base + phys * elem_bytes);
+            auto v1 = g_buffer.template _load<1>(byte_offset_base + (phys + 1) * elem_bytes);
             data_0[0] = o_scalar_t(v0[0]);
             data_1[0] = o_scalar_t(v1[0]);
         }
         else
         {
-            auto v_lo = g.template load<VecPairs>(phys);
-            auto v_hi = g.template load<VecPairs>(phys + VecPairs);
+            auto v_lo = g_buffer.template _load<VecPairs>(byte_offset_base + phys * elem_bytes);
+            auto v_hi = g_buffer.template _load<VecPairs>(byte_offset_base + (phys + VecPairs) * elem_bytes);
             opus::static_for<VecPairs>([&](auto i) {
                 constexpr int idx0 = i.value * 2;
                 constexpr int idx1 = i.value * 2 + 1;
@@ -740,58 +758,59 @@ __device__ __forceinline__ void load_payload_vec(o_scalar_t (&data_0)[VecPairs],
 #endif
 }
 
-template <int32_t RotateStyle, int32_t VecPairs, typename o_scalar_t, typename i_scalar_t>
-__device__ __forceinline__ void store_payload_vec(o_scalar_t* p_buffer,
+// store_payload_vec: stores VecPairs element-pairs via a pre-built gmem descriptor.
+// g_buffer must be created from a UNIFORM (kernel-arg) base pointer to avoid waterfall loops.
+// byte_offset_base = (offset_sb + hid * stride_h) * sizeof(element) -- the per-thread byte offset.
+template <int32_t RotateStyle, int32_t VecPairs, typename gmem_t, typename i_scalar_t>
+__device__ __forceinline__ void store_payload_vec(gmem_t& g_buffer,
                                                   const i_scalar_t (&data_0)[VecPairs],
                                                   const i_scalar_t (&data_1)[VecPairs],
+                                                  const int32_t byte_offset_base,
                                                   const int32_t did_pair, // 0-based pair index into rotary portion
                                                   const int32_t did_start, // physical start of rotary portion
-                                                  const int32_t hid,
-                                                  const int32_t stride_h,
                                                   const int32_t size_half_r)
 {
 #ifdef __HIP_DEVICE_COMPILE__
-    o_scalar_t* row = p_buffer + hid * stride_h;
+    using store_scalar_t = typename gmem_t::scalar_type;
+    constexpr int32_t elem_bytes = sizeof(store_scalar_t);
     if constexpr(RotateStyle == ROTATE_STYLE_NEOX)
     {
         const int32_t did = did_pair + did_start;
-        opus::vector_t<opus_type_t<o_scalar_t>, VecPairs> v0, v1;
+        opus::vector_t<store_scalar_t, VecPairs> v0, v1;
         opus::static_for<VecPairs>([&](auto i) {
-            v0[i.value] = opus_type_t<o_scalar_t>(data_0[i.value]);
-            v1[i.value] = opus_type_t<o_scalar_t>(data_1[i.value]);
+            v0[i.value] = store_scalar_t(data_0[i.value]);
+            v1[i.value] = store_scalar_t(data_1[i.value]);
         });
-        auto g = opus_gmem(row);
-        g.template store<VecPairs>(v0, did);
-        g.template store<VecPairs>(v1, did + size_half_r);
+        g_buffer.template _store<VecPairs>(v0, byte_offset_base + did * elem_bytes);
+        g_buffer.template _store<VecPairs>(v1, byte_offset_base + (did + size_half_r) * elem_bytes);
     }
     else if constexpr(RotateStyle == ROTATE_STYLE_GPTJ)
     {
         const int32_t phys = did_start + 2 * did_pair;
-        auto g = opus_gmem(row);
         if constexpr(VecPairs == 1)
         {
-            opus::vector_t<opus_type_t<o_scalar_t>, 1> v_lo, v_hi;
-            v_lo[0] = opus_type_t<o_scalar_t>(data_0[0]);
-            v_hi[0] = opus_type_t<o_scalar_t>(data_1[0]);
-            g.template store<1>(v_lo, phys);
-            g.template store<1>(v_hi, phys + 1);
+            opus::vector_t<store_scalar_t, 1> v_lo, v_hi;
+            v_lo[0] = store_scalar_t(data_0[0]);
+            v_hi[0] = store_scalar_t(data_1[0]);
+            g_buffer.template _store<1>(v_lo, byte_offset_base + phys * elem_bytes);
+            g_buffer.template _store<1>(v_hi, byte_offset_base + (phys + 1) * elem_bytes);
         }
         else
         {
-            opus::vector_t<opus_type_t<o_scalar_t>, VecPairs> v_lo, v_hi;
+            opus::vector_t<store_scalar_t, VecPairs> v_lo, v_hi;
             opus::static_for<VecPairs>([&](auto i) {
                 constexpr int idx0 = i.value * 2;
                 constexpr int idx1 = i.value * 2 + 1;
                 if constexpr(idx0 < VecPairs) {
-                    v_lo[idx0] = opus_type_t<o_scalar_t>(data_0[i.value]);
-                    v_lo[idx1] = opus_type_t<o_scalar_t>(data_1[i.value]);
+                    v_lo[idx0] = store_scalar_t(data_0[i.value]);
+                    v_lo[idx1] = store_scalar_t(data_1[i.value]);
                 } else {
-                    v_hi[idx0 - VecPairs] = opus_type_t<o_scalar_t>(data_0[i.value]);
-                    v_hi[idx1 - VecPairs] = opus_type_t<o_scalar_t>(data_1[i.value]);
+                    v_hi[idx0 - VecPairs] = store_scalar_t(data_0[i.value]);
+                    v_hi[idx1 - VecPairs] = store_scalar_t(data_1[i.value]);
                 }
             });
-            g.template store<VecPairs>(v_lo, phys);
-            g.template store<VecPairs>(v_hi, phys + VecPairs);
+            g_buffer.template _store<VecPairs>(v_lo, byte_offset_base + phys * elem_bytes);
+            g_buffer.template _store<VecPairs>(v_hi, byte_offset_base + (phys + VecPairs) * elem_bytes);
         }
     }
 #endif
@@ -812,8 +831,10 @@ struct OpUncachedFwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_1c(scalar_t* __restrict__ p_output,
-                                                    const scalar_t* __restrict__ p_input,
+    __device__ __forceinline__ static void apply_1c(const scalar_t* __restrict__ p_base_output,
+                                                    const scalar_t* __restrict__ p_base_input,
+                                                    const int32_t offset_o, // per-thread (s,b) offset in elements
+                                                    const int32_t offset_i,
                                                     const scalar_f_t* __restrict__ p_freqs,
                                                     const int32_t size_h,
                                                     const int32_t size_d,
@@ -837,12 +858,18 @@ struct OpUncachedFwd
         load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        // Create gmem descriptors ONCE from uniform base pointers (no waterfall)
+        auto g_i = opus_gmem(p_base_input);
+        auto g_o = opus_gmem(p_base_output);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
         {
             float input_0[VecPairs], input_1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                input_0, input_1, p_input, did_pair, did_start, hid, stride_i_h, size_half_r);
+                input_0, input_1, g_i, (offset_i + hid * stride_i_h) * elem_bytes, did_pair, did_start, size_half_r);
 
             float output_0[VecPairs], output_1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -852,7 +879,7 @@ struct OpUncachedFwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_output, output_0, output_1, did_pair, did_start, hid, stride_o_h, size_half_r);
+                g_o, output_0, output_1, (offset_o + hid * stride_o_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -860,8 +887,9 @@ struct OpUncachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy<VecPairs>(p_output,
-                             p_input,
+            elementwise_copy<VecPairs>(g_i, g_o, offset_i, offset_o,
+                             const_cast<scalar_t*>(p_base_output),
+                             p_base_input,
                              size_h,
                              nope_start,
                              nope_end,
@@ -872,6 +900,7 @@ struct OpUncachedFwd
                              d_chunk_idx,
                              threads_per_sb);
         }
+#endif
     }
 
     template <int32_t RotateStyle,
@@ -885,10 +914,14 @@ struct OpUncachedFwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_2c(scalar_t* __restrict__ p_output_x,
-                                                    scalar_t* __restrict__ p_output_y,
-                                                    const scalar_t* __restrict__ p_input_x,
-                                                    const scalar_t* __restrict__ p_input_y,
+    __device__ __forceinline__ static void apply_2c(const scalar_t* __restrict__ p_base_output_x,
+                                                    const scalar_t* __restrict__ p_base_output_y,
+                                                    const scalar_t* __restrict__ p_base_input_x,
+                                                    const scalar_t* __restrict__ p_base_input_y,
+                                                    const int32_t offset_ox,
+                                                    const int32_t offset_oy,
+                                                    const int32_t offset_ix,
+                                                    const int32_t offset_iy,
                                                     const scalar_f_t* __restrict__ p_freqs,
                                                     const int32_t size_h_x,
                                                     const int32_t size_h_y,
@@ -918,12 +951,22 @@ struct OpUncachedFwd
         load_cos_sin_uncached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        auto g_ix = opus_gmem(p_base_input_x);
+        auto g_iy = opus_gmem(p_base_input_y);
+        auto g_ox = opus_gmem(p_base_output_x);
+        auto g_oy = opus_gmem(p_base_output_y);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over shared heads (both x and y)
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
+            const int32_t bo_ix = (offset_ix + hid * stride_ix_h) * elem_bytes;
+            const int32_t bo_iy = (offset_iy + hid * stride_iy_h) * elem_bytes;
+
             float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix, bo_ix, did_pair, did_start, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy, bo_iy, did_pair, did_start, size_half_r);
 
             float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -934,36 +977,36 @@ struct OpUncachedFwd
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1, (offset_ox + hid * stride_ox_h) * elem_bytes, did_pair, did_start, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1, (offset_oy + hid * stride_oy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ix0[VecPairs], ix1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes, did_pair, did_start, size_half_r);
             float ox0[VecPairs], ox1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
                 ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1, (offset_ox + hid * stride_ox_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes, did_pair, did_start, size_half_r);
             float oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1, (offset_oy + hid * stride_oy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -971,10 +1014,12 @@ struct OpUncachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c<VecPairs>(p_output_x,
-                                p_output_y,
-                                p_input_x,
-                                p_input_y,
+            elementwise_copy_2c<VecPairs>(g_ix, g_iy, g_ox, g_oy,
+                                offset_ix, offset_iy, offset_ox, offset_oy,
+                                const_cast<scalar_t*>(p_base_output_x),
+                                const_cast<scalar_t*>(p_base_output_y),
+                                p_base_input_x,
+                                p_base_input_y,
                                 size_h_x,
                                 size_h_y,
                                 nope_start,
@@ -990,6 +1035,7 @@ struct OpUncachedFwd
                                 d_chunk_idx,
                                 threads_per_sb);
         }
+#endif
     }
 };
 
@@ -1004,8 +1050,10 @@ struct OpUncachedBwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_1c(scalar_t* __restrict__ p_input_grads,
-                                                    const scalar_t* __restrict__ p_output_grads,
+    __device__ __forceinline__ static void apply_1c(const scalar_t* __restrict__ p_base_input_grads,
+                                                    const scalar_t* __restrict__ p_base_output_grads,
+                                                    const int32_t offset_ig,
+                                                    const int32_t offset_og,
                                                     const scalar_f_t* __restrict__ p_freqs,
                                                     const int32_t size_h,
                                                     const int32_t size_d,
@@ -1029,12 +1077,17 @@ struct OpUncachedBwd
         load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        auto g_og = opus_gmem(p_base_output_grads);
+        auto g_ig = opus_gmem(p_base_input_grads);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
         {
             float og0[VecPairs], og1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                og0, og1, p_output_grads, did_pair, did_start, hid, stride_o_h, size_half_r);
+                og0, og1, g_og, (offset_og + hid * stride_o_h) * elem_bytes, did_pair, did_start, size_half_r);
 
             float ig0[VecPairs], ig1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1044,7 +1097,7 @@ struct OpUncachedBwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_input_grads, ig0, ig1, did_pair, did_start, hid, stride_i_h, size_half_r);
+                g_ig, ig0, ig1, (offset_ig + hid * stride_i_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1052,8 +1105,9 @@ struct OpUncachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy<VecPairs>(p_input_grads,
-                             p_output_grads,
+            elementwise_copy<VecPairs>(g_og, g_ig, offset_og, offset_ig,
+                             const_cast<scalar_t*>(p_base_input_grads),
+                             p_base_output_grads,
                              size_h,
                              nope_start,
                              nope_end,
@@ -1064,6 +1118,7 @@ struct OpUncachedBwd
                              d_chunk_idx,
                              threads_per_sb);
         }
+#endif
     }
 
     template <int32_t RotateStyle,
@@ -1077,10 +1132,14 @@ struct OpUncachedBwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_2c(scalar_t* __restrict__ p_input_grads_x,
-                                                    scalar_t* __restrict__ p_input_grads_y,
-                                                    const scalar_t* __restrict__ p_output_grads_x,
-                                                    const scalar_t* __restrict__ p_output_grads_y,
+    __device__ __forceinline__ static void apply_2c(const scalar_t* __restrict__ p_base_input_grads_x,
+                                                    const scalar_t* __restrict__ p_base_input_grads_y,
+                                                    const scalar_t* __restrict__ p_base_output_grads_x,
+                                                    const scalar_t* __restrict__ p_base_output_grads_y,
+                                                    const int32_t offset_igx,
+                                                    const int32_t offset_igy,
+                                                    const int32_t offset_ogx,
+                                                    const int32_t offset_ogy,
                                                     const scalar_f_t* __restrict__ p_freqs,
                                                     const int32_t size_h_x,
                                                     const int32_t size_h_y,
@@ -1110,12 +1169,22 @@ struct OpUncachedBwd
         load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_freqs, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        auto g_ogx = opus_gmem(p_base_output_grads_x);
+        auto g_ogy = opus_gmem(p_base_output_grads_y);
+        auto g_igx = opus_gmem(p_base_input_grads_x);
+        auto g_igy = opus_gmem(p_base_input_grads_y);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over shared heads (both x and y)
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
+            const int32_t bo_ogx = (offset_ogx + hid * stride_ox_h) * elem_bytes;
+            const int32_t bo_ogy = (offset_ogy + hid * stride_oy_h) * elem_bytes;
+
             float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx, bo_ogx, did_pair, did_start, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy, bo_ogy, did_pair, did_start, size_half_r);
 
             float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1126,36 +1195,36 @@ struct OpUncachedBwd
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1, (offset_igx + hid * stride_ix_h) * elem_bytes, did_pair, did_start, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1, (offset_igy + hid * stride_iy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ogx0[VecPairs], ogx1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes, did_pair, did_start, size_half_r);
             float igx0[VecPairs], igx1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
                 igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1, (offset_igx + hid * stride_ix_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes, did_pair, did_start, size_half_r);
             float igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1, (offset_igy + hid * stride_iy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1163,10 +1232,12 @@ struct OpUncachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c<VecPairs>(p_input_grads_x,
-                                p_input_grads_y,
-                                p_output_grads_x,
-                                p_output_grads_y,
+            elementwise_copy_2c<VecPairs>(g_ogx, g_ogy, g_igx, g_igy,
+                                offset_ogx, offset_ogy, offset_igx, offset_igy,
+                                const_cast<scalar_t*>(p_base_input_grads_x),
+                                const_cast<scalar_t*>(p_base_input_grads_y),
+                                p_base_output_grads_x,
+                                p_base_output_grads_y,
                                 size_h_x,
                                 size_h_y,
                                 nope_start,
@@ -1182,6 +1253,7 @@ struct OpUncachedBwd
                                 d_chunk_idx,
                                 threads_per_sb);
         }
+#endif
     }
 };
 
@@ -1196,8 +1268,10 @@ struct OpCachedFwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_1c(scalar_t* __restrict__ p_output,
-                                                    const scalar_t* __restrict__ p_input,
+    __device__ __forceinline__ static void apply_1c(const scalar_t* __restrict__ p_base_output,
+                                                    const scalar_t* __restrict__ p_base_input,
+                                                    const int32_t offset_o,
+                                                    const int32_t offset_i,
                                                     const scalar_f_t* __restrict__ p_cos,
                                                     const scalar_f_t* __restrict__ p_sin,
                                                     const int32_t size_h,
@@ -1222,12 +1296,17 @@ struct OpCachedFwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        auto g_i = opus_gmem(p_base_input);
+        auto g_o = opus_gmem(p_base_output);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
         {
             float input_0[VecPairs], input_1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                input_0, input_1, p_input, did_pair, did_start, hid, stride_i_h, size_half_r);
+                input_0, input_1, g_i, (offset_i + hid * stride_i_h) * elem_bytes, did_pair, did_start, size_half_r);
 
             float output_0[VecPairs], output_1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1237,7 +1316,7 @@ struct OpCachedFwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_output, output_0, output_1, did_pair, did_start, hid, stride_o_h, size_half_r);
+                g_o, output_0, output_1, (offset_o + hid * stride_o_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1245,8 +1324,9 @@ struct OpCachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy<VecPairs>(p_output,
-                             p_input,
+            elementwise_copy<VecPairs>(g_i, g_o, offset_i, offset_o,
+                             const_cast<scalar_t*>(p_base_output),
+                             p_base_input,
                              size_h,
                              nope_start,
                              nope_end,
@@ -1257,6 +1337,7 @@ struct OpCachedFwd
                              d_chunk_idx,
                              threads_per_sb);
         }
+#endif
     }
 
     template <int32_t RotateStyle,
@@ -1270,10 +1351,14 @@ struct OpCachedFwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_2c(scalar_t* __restrict__ p_output_x,
-                                                    scalar_t* __restrict__ p_output_y,
-                                                    const scalar_t* __restrict__ p_input_x,
-                                                    const scalar_t* __restrict__ p_input_y,
+    __device__ __forceinline__ static void apply_2c(const scalar_t* __restrict__ p_base_output_x,
+                                                    const scalar_t* __restrict__ p_base_output_y,
+                                                    const scalar_t* __restrict__ p_base_input_x,
+                                                    const scalar_t* __restrict__ p_base_input_y,
+                                                    const int32_t offset_ox,
+                                                    const int32_t offset_oy,
+                                                    const int32_t offset_ix,
+                                                    const int32_t offset_iy,
                                                     const scalar_f_t* __restrict__ p_cos,
                                                     const scalar_f_t* __restrict__ p_sin,
                                                     const int32_t size_h_x,
@@ -1304,12 +1389,22 @@ struct OpCachedFwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        auto g_ix = opus_gmem(p_base_input_x);
+        auto g_iy = opus_gmem(p_base_input_y);
+        auto g_ox = opus_gmem(p_base_output_x);
+        auto g_oy = opus_gmem(p_base_output_y);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over shared heads (both x and y)
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
+            const int32_t bo_ix = (offset_ix + hid * stride_ix_h) * elem_bytes;
+            const int32_t bo_iy = (offset_iy + hid * stride_iy_h) * elem_bytes;
+
             float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix, bo_ix, did_pair, did_start, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy, bo_iy, did_pair, did_start, size_half_r);
 
             float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1320,36 +1415,36 @@ struct OpCachedFwd
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1, (offset_ox + hid * stride_ox_h) * elem_bytes, did_pair, did_start, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1, (offset_oy + hid * stride_oy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ix0[VecPairs], ix1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, p_input_x, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes, did_pair, did_start, size_half_r);
             float ox0[VecPairs], ox1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
                 ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_x, ox0, ox1, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1, (offset_ox + hid * stride_ox_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, p_input_y, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes, did_pair, did_start, size_half_r);
             float oy0[VecPairs], oy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
                 oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_output_y, oy0, oy1, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1, (offset_oy + hid * stride_oy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1357,10 +1452,12 @@ struct OpCachedFwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c<VecPairs>(p_output_x,
-                                p_output_y,
-                                p_input_x,
-                                p_input_y,
+            elementwise_copy_2c<VecPairs>(g_ix, g_iy, g_ox, g_oy,
+                                offset_ix, offset_iy, offset_ox, offset_oy,
+                                const_cast<scalar_t*>(p_base_output_x),
+                                const_cast<scalar_t*>(p_base_output_y),
+                                p_base_input_x,
+                                p_base_input_y,
                                 size_h_x,
                                 size_h_y,
                                 nope_start,
@@ -1376,6 +1473,7 @@ struct OpCachedFwd
                                 d_chunk_idx,
                                 threads_per_sb);
         }
+#endif
     }
 };
 
@@ -1390,8 +1488,10 @@ struct OpCachedBwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_1c(scalar_t* __restrict__ p_input_grads,
-                                                    const scalar_t* __restrict__ p_output_grads,
+    __device__ __forceinline__ static void apply_1c(const scalar_t* __restrict__ p_base_input_grads,
+                                                    const scalar_t* __restrict__ p_base_output_grads,
+                                                    const int32_t offset_ig,
+                                                    const int32_t offset_og,
                                                     const scalar_f_t* __restrict__ p_cos,
                                                     const scalar_f_t* __restrict__ p_sin,
                                                     const int32_t size_h,
@@ -1416,12 +1516,17 @@ struct OpCachedBwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        auto g_og = opus_gmem(p_base_output_grads);
+        auto g_ig = opus_gmem(p_base_input_grads);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over ALL heads
         for(int32_t hid = 0; hid < size_h; hid++)
         {
             float og0[VecPairs], og1[VecPairs];
             load_payload_vec<RotateStyle, VecPairs>(
-                og0, og1, p_output_grads, did_pair, did_start, hid, stride_o_h, size_half_r);
+                og0, og1, g_og, (offset_og + hid * stride_o_h) * elem_bytes, did_pair, did_start, size_half_r);
 
             float ig0[VecPairs], ig1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1431,7 +1536,7 @@ struct OpCachedBwd
             }
 
             store_payload_vec<RotateStyle, VecPairs>(
-                p_input_grads, ig0, ig1, did_pair, did_start, hid, stride_i_h, size_half_r);
+                g_ig, ig0, ig1, (offset_ig + hid * stride_i_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1439,8 +1544,9 @@ struct OpCachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy<VecPairs>(p_input_grads,
-                             p_output_grads,
+            elementwise_copy<VecPairs>(g_og, g_ig, offset_og, offset_ig,
+                             const_cast<scalar_t*>(p_base_input_grads),
+                             p_base_output_grads,
                              size_h,
                              nope_start,
                              nope_end,
@@ -1451,6 +1557,7 @@ struct OpCachedBwd
                              d_chunk_idx,
                              threads_per_sb);
         }
+#endif
     }
 
     template <int32_t RotateStyle,
@@ -1464,10 +1571,14 @@ struct OpCachedBwd
               int32_t VecPairs = 1,
               typename scalar_t,
               typename scalar_f_t>
-    __device__ __forceinline__ static void apply_2c(scalar_t* __restrict__ p_input_grads_x,
-                                                    scalar_t* __restrict__ p_input_grads_y,
-                                                    const scalar_t* __restrict__ p_output_grads_x,
-                                                    const scalar_t* __restrict__ p_output_grads_y,
+    __device__ __forceinline__ static void apply_2c(const scalar_t* __restrict__ p_base_input_grads_x,
+                                                    const scalar_t* __restrict__ p_base_input_grads_y,
+                                                    const scalar_t* __restrict__ p_base_output_grads_x,
+                                                    const scalar_t* __restrict__ p_base_output_grads_y,
+                                                    const int32_t offset_igx,
+                                                    const int32_t offset_igy,
+                                                    const int32_t offset_ogx,
+                                                    const int32_t offset_ogy,
                                                     const scalar_f_t* __restrict__ p_cos,
                                                     const scalar_f_t* __restrict__ p_sin,
                                                     const int32_t size_h_x,
@@ -1498,12 +1609,22 @@ struct OpCachedBwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
+#ifdef __HIP_DEVICE_COMPILE__
+        auto g_ogx = opus_gmem(p_base_output_grads_x);
+        auto g_ogy = opus_gmem(p_base_output_grads_y);
+        auto g_igx = opus_gmem(p_base_input_grads_x);
+        auto g_igy = opus_gmem(p_base_input_grads_y);
+        constexpr int32_t elem_bytes = sizeof(scalar_t);
+
         // Loop over shared heads (both x and y)
         for(int32_t hid = 0; hid < size_min_h; hid++)
         {
+            const int32_t bo_ogx = (offset_ogx + hid * stride_ox_h) * elem_bytes;
+            const int32_t bo_ogy = (offset_ogy + hid * stride_oy_h) * elem_bytes;
+
             float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx, bo_ogx, did_pair, did_start, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy, bo_ogy, did_pair, did_start, size_half_r);
 
             float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
@@ -1514,36 +1635,36 @@ struct OpCachedBwd
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
 
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1, (offset_igx + hid * stride_ix_h) * elem_bytes, did_pair, did_start, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1, (offset_igy + hid * stride_iy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining x-only heads
         for(int32_t hid = size_min_h; hid < size_h_x; hid++)
         {
             float ogx0[VecPairs], ogx1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, p_output_grads_x, did_pair, did_start, hid, stride_ox_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes, did_pair, did_start, size_half_r);
             float igx0[VecPairs], igx1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
                 igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_x, igx0, igx1, did_pair, did_start, hid, stride_ix_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1, (offset_igx + hid * stride_ix_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // Remaining y-only heads
         for(int32_t hid = size_min_h; hid < size_h_y; hid++)
         {
             float ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, p_output_grads_y, did_pair, did_start, hid, stride_oy_h, size_half_r);
+            load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes, did_pair, did_start, size_half_r);
             float igy0[VecPairs], igy1[VecPairs];
             for(int32_t v = 0; v < VecPairs; v++)
             {
                 igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
                 igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
             }
-            store_payload_vec<RotateStyle, VecPairs>(p_input_grads_y, igy0, igy1, did_pair, did_start, hid, stride_iy_h, size_half_r);
+            store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1, (offset_igy + hid * stride_iy_h) * elem_bytes, did_pair, did_start, size_half_r);
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1551,10 +1672,12 @@ struct OpCachedBwd
         {
             const int32_t nope_start = NopeFirst ? 0 : size_r;
             const int32_t nope_end   = NopeFirst ? (size_d - size_r) : size_d;
-            elementwise_copy_2c<VecPairs>(p_input_grads_x,
-                                p_input_grads_y,
-                                p_output_grads_x,
-                                p_output_grads_y,
+            elementwise_copy_2c<VecPairs>(g_ogx, g_ogy, g_igx, g_igy,
+                                offset_ogx, offset_ogy, offset_igx, offset_igy,
+                                const_cast<scalar_t*>(p_base_input_grads_x),
+                                const_cast<scalar_t*>(p_base_input_grads_y),
+                                p_base_output_grads_x,
+                                p_base_output_grads_y,
                                 size_h_x,
                                 size_h_y,
                                 nope_start,
@@ -1570,6 +1693,7 @@ struct OpCachedBwd
                                 d_chunk_idx,
                                 threads_per_sb);
         }
+#endif
     }
 };
 
@@ -1612,8 +1736,8 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
-    const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle,
@@ -1622,8 +1746,10 @@ __launch_bounds__(256, 8) __global__
                           false,
                           StrideDOutEq1,
                           StrideDInEq1,
-                          VecPairs>(p_output + offset_o,
-                                        p_input + offset_i,
+                          VecPairs>(p_output,
+                                        p_input,
+                                        offset_o,
+                                        offset_i,
                                         p_freqs + offset_f,
                                         size_h,
                                         size_d,
@@ -1665,7 +1791,7 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset   = sid * stride_s + bid * stride_b;
+    const int32_t offset   = sid * stride_s + bid * stride_b;
     const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle,
@@ -1674,8 +1800,10 @@ __launch_bounds__(256, 8) __global__
                           true,
                           StrideDEq1,
                           StrideDEq1,
-                          VecPairs>(p_inout + offset,
-                                      p_inout + offset,
+                          VecPairs>(p_inout,
+                                      p_inout,
+                                      offset,
+                                      offset,
                                       p_freqs + offset_f,
                                       size_h,
                                       size_d,
@@ -1736,10 +1864,10 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const uint64_t offset_f  = sid * size_f;
 
     Op::template apply_2c<RotateStyle,
@@ -1750,10 +1878,14 @@ __launch_bounds__(256, 8) __global__
                           StrideDOutYEq1,
                           StrideDInXEq1,
                           StrideDInYEq1,
-                          VecPairs>(p_output_x + offset_ox,
-                                         p_output_y + offset_oy,
-                                         p_input_x + offset_ix,
-                                         p_input_y + offset_iy,
+                          VecPairs>(p_output_x,
+                                         p_output_y,
+                                         p_input_x,
+                                         p_input_y,
+                                         offset_ox,
+                                         offset_oy,
+                                         offset_ix,
+                                         offset_iy,
                                          p_freqs + offset_f,
                                          size_h_x,
                                          size_h_y,
@@ -1807,8 +1939,8 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
-    const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const uint64_t offset_f = sid * size_f;
 
     Op::template apply_2c<RotateStyle,
@@ -1819,10 +1951,14 @@ __launch_bounds__(256, 8) __global__
                           StrideDYEq1,
                           StrideDXEq1,
                           StrideDYEq1,
-                          VecPairs>(p_inout_x + offset_x,
-                                       p_inout_y + offset_y,
-                                       p_inout_x + offset_x,
-                                       p_inout_y + offset_y,
+                          VecPairs>(p_inout_x,
+                                       p_inout_y,
+                                       p_inout_x,
+                                       p_inout_y,
+                                       offset_x,
+                                       offset_y,
+                                       offset_x,
+                                       offset_y,
                                        p_freqs + offset_f,
                                        size_h_x,
                                        size_h_y,
@@ -1876,8 +2012,8 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
-    const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle,
@@ -1886,8 +2022,10 @@ __launch_bounds__(256, 8) __global__
                           false,
                           StrideDOutEq1,
                           StrideDInEq1,
-                          VecPairs>(p_output + offset_o,
-                                        p_input + offset_i,
+                          VecPairs>(p_output,
+                                        p_input,
+                                        (int32_t)offset_o,
+                                        (int32_t)offset_i,
                                         p_cos + offset_f,
                                         p_sin + offset_f,
                                         size_h,
@@ -1931,7 +2069,7 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset   = sid * stride_s + bid * stride_b;
+    const int32_t offset   = sid * stride_s + bid * stride_b;
     const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle,
@@ -1940,8 +2078,10 @@ __launch_bounds__(256, 8) __global__
                           true,
                           StrideDEq1,
                           StrideDEq1,
-                          VecPairs>(p_inout + offset,
-                                      p_inout + offset,
+                          VecPairs>(p_inout,
+                                      p_inout,
+                                      (int32_t)offset,
+                                      (int32_t)offset,
                                       p_cos + offset_f,
                                       p_sin + offset_f,
                                       size_h,
@@ -2004,10 +2144,10 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const uint64_t offset_f  = sid * size_f;
 
     Op::template apply_2c<RotateStyle,
@@ -2018,10 +2158,14 @@ __launch_bounds__(256, 8) __global__
                           StrideDOutYEq1,
                           StrideDInXEq1,
                           StrideDInYEq1,
-                          VecPairs>(p_output_x + offset_ox,
-                                         p_output_y + offset_oy,
-                                         p_input_x + offset_ix,
-                                         p_input_y + offset_iy,
+                          VecPairs>(p_output_x,
+                                         p_output_y,
+                                         p_input_x,
+                                         p_input_y,
+                                         (int32_t)offset_ox,
+                                         (int32_t)offset_oy,
+                                         (int32_t)offset_ix,
+                                         (int32_t)offset_iy,
                                          p_cos + offset_f,
                                          p_sin + offset_f,
                                          size_h_x,
@@ -2077,8 +2221,8 @@ __launch_bounds__(256, 8) __global__
     const int32_t sid = sb_idx % size_s;
     const int32_t bid = sb_idx / size_s;
 
-    const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
-    const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const uint64_t offset_f = sid * size_f;
 
     Op::template apply_2c<RotateStyle,
@@ -2089,10 +2233,14 @@ __launch_bounds__(256, 8) __global__
                           StrideDYEq1,
                           StrideDXEq1,
                           StrideDYEq1,
-                          VecPairs>(p_inout_x + offset_x,
-                                       p_inout_y + offset_y,
-                                       p_inout_x + offset_x,
-                                       p_inout_y + offset_y,
+                          VecPairs>(p_inout_x,
+                                       p_inout_y,
+                                       p_inout_x,
+                                       p_inout_y,
+                                       (int32_t)offset_x,
+                                       (int32_t)offset_y,
+                                       (int32_t)offset_x,
+                                       (int32_t)offset_y,
                                        p_cos + offset_f,
                                        p_sin + offset_f,
                                        size_h_x,
@@ -2154,8 +2302,8 @@ __launch_bounds__(256, 8) __global__
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
-        const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+        const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+        const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
         const int64_t offset_f  = pos * size_f;
 
         Op::template apply_1c<RotateStyle,
@@ -2164,8 +2312,10 @@ __launch_bounds__(256, 8) __global__
                               false,
                               StrideDOutEq1,
                               StrideDInEq1,
-                              VecPairs>(p_output + offset_o,
-                                            p_input + offset_i,
+                              VecPairs>(p_output,
+                                            p_input,
+                                            (int32_t)offset_o,
+                                            (int32_t)offset_i,
                                             p_cos + offset_f,
                                             p_sin + offset_f,
                                             size_h,
@@ -2236,10 +2386,10 @@ __launch_bounds__(256, 8) __global__
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-        const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-        const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-        const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+        const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+        const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+        const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+        const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
         const int64_t offset_f   = pos * size_f;
 
         Op::template apply_2c<RotateStyle,
@@ -2250,10 +2400,14 @@ __launch_bounds__(256, 8) __global__
                               StrideDOutYEq1,
                               StrideDInXEq1,
                               StrideDInYEq1,
-                              VecPairs>(p_output_x + offset_ox,
-                                             p_output_y + offset_oy,
-                                             p_input_x + offset_ix,
-                                             p_input_y + offset_iy,
+                              VecPairs>(p_output_x,
+                                             p_output_y,
+                                             p_input_x,
+                                             p_input_y,
+                                             (int32_t)offset_ox,
+                                             (int32_t)offset_oy,
+                                             (int32_t)offset_ix,
+                                             (int32_t)offset_iy,
                                              p_cos + offset_f,
                                              p_sin + offset_f,
                                              size_h_x,
@@ -2310,7 +2464,7 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect_inpla
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset  = sid * stride_s + bid * stride_b;
+        const int32_t offset  = sid * stride_s + bid * stride_b;
         const int64_t offset_f = pos * size_f;
 
         Op::template apply_1c<RotateStyle,
@@ -2319,8 +2473,10 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect_inpla
                               true,
                               StrideDEq1,
                               StrideDEq1,
-                              VecPairs>(p_inout + offset,
-                                          p_inout + offset,
+                              VecPairs>(p_inout,
+                                          p_inout,
+                                          (int32_t)offset,
+                                          (int32_t)offset,
                                           p_cos + offset_f,
                                           p_sin + offset_f,
                                           size_h,
@@ -2379,8 +2535,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
-        const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+        const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
+        const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
         const int64_t offset_f  = pos * size_f;
 
         Op::template apply_2c<RotateStyle,
@@ -2391,10 +2547,14 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
                               StrideDYEq1,
                               StrideDXEq1,
                               StrideDYEq1,
-                              VecPairs>(p_inout_x + offset_x,
-                                           p_inout_y + offset_y,
-                                           p_inout_x + offset_x,
-                                           p_inout_y + offset_y,
+                              VecPairs>(p_inout_x,
+                                           p_inout_y,
+                                           p_inout_x,
+                                           p_inout_y,
+                                           (int32_t)offset_x,
+                                           (int32_t)offset_y,
+                                           (int32_t)offset_x,
+                                           (int32_t)offset_y,
                                            p_cos + offset_f,
                                            p_sin + offset_f,
                                            size_h_x,
@@ -2458,8 +2618,8 @@ __launch_bounds__(256, 8) __global__
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
-        const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+        const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+        const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
         const int64_t offset_f  = pos * size_f;
 
         Op::template apply_1c<RotateStyle,
@@ -2468,8 +2628,10 @@ __launch_bounds__(256, 8) __global__
                               false,
                               StrideDOutEq1,
                               StrideDInEq1,
-                              VecPairs>(p_output + offset_o,
-                                            p_input + offset_i,
+                              VecPairs>(p_output,
+                                            p_input,
+                                            (int32_t)offset_o,
+                                            (int32_t)offset_i,
                                             p_cos + offset_f,
                                             p_sin + offset_f,
                                             size_h,
@@ -2541,10 +2703,10 @@ __launch_bounds__(256, 8) __global__
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-        const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-        const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-        const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+        const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+        const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+        const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+        const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
         const int64_t offset_f   = pos * size_f;
 
         Op::template apply_2c<RotateStyle,
@@ -2555,10 +2717,14 @@ __launch_bounds__(256, 8) __global__
                               StrideDOutYEq1,
                               StrideDInXEq1,
                               StrideDInYEq1,
-                              VecPairs>(p_output_x + offset_ox,
-                                             p_output_y + offset_oy,
-                                             p_input_x + offset_ix,
-                                             p_input_y + offset_iy,
+                              VecPairs>(p_output_x,
+                                             p_output_y,
+                                             p_input_x,
+                                             p_input_y,
+                                             (int32_t)offset_ox,
+                                             (int32_t)offset_oy,
+                                             (int32_t)offset_ix,
+                                             (int32_t)offset_iy,
                                              p_cos + offset_f,
                                              p_sin + offset_f,
                                              size_h_x,
@@ -2616,7 +2782,7 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect2_inpl
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset  = sid * stride_s + bid * stride_b;
+        const int32_t offset  = sid * stride_s + bid * stride_b;
         const int64_t offset_f = pos * size_f;
 
         Op::template apply_1c<RotateStyle,
@@ -2625,8 +2791,10 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect2_inpl
                               true,
                               StrideDEq1,
                               StrideDEq1,
-                              VecPairs>(p_inout + offset,
-                                          p_inout + offset,
+                              VecPairs>(p_inout,
+                                          p_inout,
+                                          (int32_t)offset,
+                                          (int32_t)offset,
                                           p_cos + offset_f,
                                           p_sin + offset_f,
                                           size_h,
@@ -2686,8 +2854,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inpl
 
     if((pos >= 0) && (pos < max_position))
     {
-        const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
-        const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+        const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
+        const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
         const int64_t offset_f  = pos * size_f;
 
         Op::template apply_2c<RotateStyle,
@@ -2698,10 +2866,14 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inpl
                               StrideDYEq1,
                               StrideDXEq1,
                               StrideDYEq1,
-                              VecPairs>(p_inout_x + offset_x,
-                                           p_inout_y + offset_y,
-                                           p_inout_x + offset_x,
-                                           p_inout_y + offset_y,
+                              VecPairs>(p_inout_x,
+                                           p_inout_y,
+                                           p_inout_x,
+                                           p_inout_y,
+                                           (int32_t)offset_x,
+                                           (int32_t)offset_y,
+                                           (int32_t)offset_x,
+                                           (int32_t)offset_y,
                                            p_cos + offset_f,
                                            p_sin + offset_f,
                                            size_h_x,
@@ -2767,8 +2939,10 @@ __launch_bounds__(256, 8) __global__
                           false,
                           StrideDOutEq1,
                           StrideDInEq1,
-                          VecPairs>(p_output + offset_o,
-                                        p_input + offset_i,
+                          VecPairs>(p_output,
+                                        p_input,
+                                        (int32_t)offset_o,
+                                        (int32_t)offset_i,
                                         p_freqs + offset_f,
                                         size_h,
                                         size_d,
@@ -2821,8 +2995,10 @@ __launch_bounds__(256, 8) __global__
                           true,
                           StrideDEq1,
                           StrideDEq1,
-                          VecPairs>(p_inout + offset,
-                                      p_inout + offset,
+                          VecPairs>(p_inout,
+                                      p_inout,
+                                      (int32_t)offset,
+                                      (int32_t)offset,
                                       p_freqs + offset_f,
                                       size_h,
                                       size_d,
@@ -2887,8 +3063,10 @@ __launch_bounds__(256, 8) __global__
                           false,
                           StrideDOutEq1,
                           StrideDInEq1,
-                          VecPairs>(p_output + offset_h_o,
-                                        p_input + offset_h_i,
+                          VecPairs>(p_output,
+                                        p_input,
+                                        (int32_t)offset_h_o,
+                                        (int32_t)offset_h_i,
                                         p_cos_h + offset_h_f,
                                         p_sin_h + offset_h_f,
                                         size_h,
@@ -2910,8 +3088,10 @@ __launch_bounds__(256, 8) __global__
                           false,
                           StrideDOutEq1,
                           StrideDInEq1,
-                          VecPairs>(p_output + offset_w_o,
-                                        p_input + offset_w_i,
+                          VecPairs>(p_output,
+                                        p_input,
+                                        (int32_t)offset_w_o,
+                                        (int32_t)offset_w_i,
                                         p_cos_w + offset_w_f,
                                         p_sin_w + offset_w_f,
                                         size_h,
@@ -2970,8 +3150,10 @@ __launch_bounds__(256, 8) __global__
                           true,
                           StrideDEq1,
                           StrideDEq1,
-                          VecPairs>(p_inout + offset_h,
-                                      p_inout + offset_h,
+                          VecPairs>(p_inout,
+                                      p_inout,
+                                      (int32_t)offset_h,
+                                      (int32_t)offset_h,
                                       p_cos_h + offset_h_f,
                                       p_sin_h + offset_h_f,
                                       size_h,
@@ -2992,8 +3174,10 @@ __launch_bounds__(256, 8) __global__
                           true,
                           StrideDEq1,
                           StrideDEq1,
-                          VecPairs>(p_inout + offset_w,
-                                      p_inout + offset_w,
+                          VecPairs>(p_inout,
+                                      p_inout,
+                                      (int32_t)offset_w,
+                                      (int32_t)offset_w,
                                       p_cos_w + offset_w_f,
                                       p_sin_w + offset_w_f,
                                       size_h,
@@ -3012,12 +3196,7 @@ __launch_bounds__(256, 8) __global__
 //
 
 #define LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(ROTATE_STYLE, STRIDE_0, ...) \
-    if constexpr((ROTATE_STYLE) != ROTATE_STYLE_GPTJ)                       \
-    {                                                                       \
-        constexpr bool Stride0Eq1 = false;                                  \
-        __VA_ARGS__;                                                        \
-    }                                                                       \
-    else if((STRIDE_0) == 1)                                                \
+    if((STRIDE_0) == 1)                                                     \
     {                                                                       \
         constexpr bool Stride0Eq1 = true;                                   \
         __VA_ARGS__;                                                        \
@@ -3029,13 +3208,7 @@ __launch_bounds__(256, 8) __global__
     }
 
 #define LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(ROTATE_STYLE, STRIDE_0, STRIDE_1, ...) \
-    if constexpr((ROTATE_STYLE) != ROTATE_STYLE_GPTJ)                                 \
-    {                                                                                 \
-        constexpr bool Stride0Eq1 = false;                                            \
-        constexpr bool Stride1Eq1 = false;                                            \
-        __VA_ARGS__;                                                                  \
-    }                                                                                 \
-    else if((STRIDE_0) == 1)                                                          \
+    if((STRIDE_0) == 1)                                                               \
     {                                                                                 \
         constexpr bool Stride0Eq1 = true;                                             \
         if((STRIDE_1) == 1)                                                           \
@@ -3066,15 +3239,7 @@ __launch_bounds__(256, 8) __global__
 
 #define LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(                \
     ROTATE_STYLE, STRIDE_0, STRIDE_1, STRIDE_2, STRIDE_3, ...) \
-    if constexpr((ROTATE_STYLE) != ROTATE_STYLE_GPTJ)          \
-    {                                                          \
-        constexpr bool Stride0Eq1 = false;                     \
-        constexpr bool Stride1Eq1 = false;                     \
-        constexpr bool Stride2Eq1 = false;                     \
-        constexpr bool Stride3Eq1 = false;                     \
-        __VA_ARGS__;                                           \
-    }                                                          \
-    else if((STRIDE_0) == 1)                                   \
+    if((STRIDE_0) == 1)                                        \
     {                                                          \
         constexpr bool Stride0Eq1 = true;                      \
         if((STRIDE_1) == 1)                                    \
@@ -3211,15 +3376,35 @@ __launch_bounds__(256, 8) __global__
         }                                                      \
     }
 
+inline float get_rope_threshold()
+{
+    static float val = []() {
+        const char* env = std::getenv("AITER_ROPE_THRESHOLD");
+        return env ? std::atof(env) : 4.0f;
+    }();
+    return val;
+}
+
+inline int32_t get_rope_force_vp()
+{
+    static int32_t val = []() {
+        const char* env = std::getenv("AITER_ROPE_FORCE_VP");
+        return env ? std::atoi(env) : 0;
+    }();
+    return val;
+}
+
 template <bool ReuseFreqsFrontPart, bool Is2D, typename scalar_t = ck_tile::fp16_t>
 std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                           const int32_t size_s_w,
                                                           const int32_t size_b,
                                                           const int32_t size_f,
-                                                          const float   threshold = 4.0f)
+                                                          const float   threshold = -1.0f)
 {
     constexpr int32_t num_threads      = 256; // 4 warps x 64 threads/warp
     constexpr int32_t kernel_occupancy = 8;   // __launch_bounds__(256, 8)
+
+    const float effective_threshold = (threshold < 0.0f) ? get_rope_threshold() : threshold;
 
     const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
     const int32_t size_half_r = size_r >> 1;
@@ -3230,16 +3415,24 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
     // total_waves = total_sb * (size_half_r / vec_pairs) / warp_size
     // Must exceed gpu_capacity (num_cu * occupancy) by threshold factor.
     int32_t vec_pairs = 4;
-    while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
-        vec_pairs >>= 1;
-    const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
-    constexpr int32_t warp_size = 64;
-    while(vec_pairs > 1)
+    const int32_t force_vp = get_rope_force_vp();
+    if(force_vp > 0 && (size_half_r % force_vp == 0))
     {
-        const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
-        if(total_waves >= static_cast<int32_t>(gpu_capacity * threshold))
-            break;
-        vec_pairs >>= 1;
+        vec_pairs = force_vp;
+    }
+    else
+    {
+        while(vec_pairs > 1 && (size_half_r % vec_pairs != 0))
+            vec_pairs >>= 1;
+        const int32_t gpu_capacity = static_cast<int32_t>(get_num_cu_func() * kernel_occupancy);
+        constexpr int32_t warp_size = 64;
+        while(vec_pairs > 1)
+        {
+            const int32_t total_waves = total_sb * (size_half_r / vec_pairs) / warp_size;
+            if(total_waves >= static_cast<int32_t>(gpu_capacity * effective_threshold))
+                break;
+            vec_pairs >>= 1;
+        }
     }
 
     const int32_t threads_per_sb = size_half_r / vec_pairs;
