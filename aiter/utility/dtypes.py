@@ -42,15 +42,7 @@ _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.item
 
 
 @compile_ops("module_aiter_tensor", "make_aiter_tensor")
-def _make_aiter_tensor(
-    data_ptr: int,
-    numel: int,
-    ndim: int,
-    shape: list,
-    strides: list,
-    dtype: int,
-    device_id: int,
-): ...
+def _make_aiter_tensor(data_ptr, numel, ndim, shape, strides, dtype, device_id): ...
 
 
 def torch_to_aiter_pybind(tensor: torch.Tensor):

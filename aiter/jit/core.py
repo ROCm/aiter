@@ -1373,11 +1373,23 @@ def compile_ops(
                             doc_str = re.sub(
                                 f" (module_)?aiter.*{el} ", f" {el} ", doc_str
                             )
+                        doc_str = re.sub(
+                            r"(module_\w+\.)?aiter_tensor_t",
+                            "aiter_tensor_t",
+                            doc_str,
+                        )
+                        try:
+                            aiter_tensor_t = get_module(
+                                "module_aiter_tensor"
+                            ).aiter_tensor_t
+                        except Exception:
+                            aiter_tensor_t = object
                         namespace = {
                             "List": List,
                             "Optional": Optional,
                             "torch": torch,
                             "typing": typing,
+                            "aiter_tensor_t": aiter_tensor_t,
                         }
 
                         exec(
