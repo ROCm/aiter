@@ -55,8 +55,8 @@ static CFG* get_cfg(AiterDtype inp_dtype, AiterDtype out_dtype) {
 
 // Validation functions for fp8gemm_bf16_blockscale
 // rule1: Ndim % TileN == 0 and Kdim % TileK == 0
-static void validate_inputs(AiterTensor* A, AiterTensor* B, AiterTensor* out,
-                           AiterTensor* A_scale, AiterTensor* B_scale) {
+static void validate_inputs(aiter_tensor_t* A, aiter_tensor_t* B, aiter_tensor_t* out,
+                           aiter_tensor_t* A_scale, aiter_tensor_t* B_scale) {
     constexpr int TileN = 128, TileK = 128;
 
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16,
@@ -171,8 +171,8 @@ std::unordered_map<KernelSelector::DictKey, std::tuple<std::string, int>, Kernel
     KernelSelector::heuristic_cache;
 std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> KernelSelector::kernel_cache;
 
-static KernelArgs setup_kernel_args(AiterTensor* A, AiterTensor* B, AiterTensor* out,
-                                   AiterTensor* A_scale, AiterTensor* B_scale,
+static KernelArgs setup_kernel_args(aiter_tensor_t* A, aiter_tensor_t* B, aiter_tensor_t* out,
+                                   aiter_tensor_t* A_scale, aiter_tensor_t* B_scale,
                                    void* bias_ptr, int selectedsplitK) {
     constexpr int block_shape_m = 1, block_shape_k = 128, block_shape_n = 128;
     KernelArgs args;
@@ -198,7 +198,7 @@ static KernelArgs setup_kernel_args(AiterTensor* A, AiterTensor* B, AiterTensor*
 
 static void print_debug_info(const KernelArgs& args, const std::string& selectedKernelName,
                            int selectedsplitK, int gdx, int gdy, int gdz, hipStream_t stream,
-                           AiterTensor* bias) {
+                           aiter_tensor_t* bias) {
     if (!DebugPrint) return;
     
     printf("\n=== A8W8 GEMM Kernel Parameters ===\n");
@@ -221,17 +221,17 @@ static void print_debug_info(const KernelArgs& args, const std::string& selected
     printf("==========================================\n");
 }
 
-extern "C" __attribute__((visibility("default"))) void gemm_a8w8_blockscale_bpreshuffle_asm(
-    AiterTensor* A,
-    AiterTensor* B,
-    AiterTensor* out,
-    AiterTensor* A_scale,
-    AiterTensor* B_scale,
-    AiterTensor* bias,
+AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
+    aiter_tensor_t* A,
+    aiter_tensor_t* B,
+    aiter_tensor_t* out,
+    aiter_tensor_t* A_scale,
+    aiter_tensor_t* B_scale,
+    aiter_tensor_t* bias,
     int          splitK,
     const char*  kernelName,
     int          bpreshuffle,
-    AiterTensor* zero_bias_buf,
+    aiter_tensor_t* zero_bias_buf,
     hipStream_t  stream)
 {
     validate_inputs(A, B, out, A_scale, B_scale);

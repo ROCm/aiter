@@ -266,7 +266,7 @@ def gemm_a16w16(
         )
     if batched:
         out = out.view(*A.shape[:-1], B.shape[0])
-    if otype is not None:
+    if otype is not None and out.dtype != otype:
         out = out.to(otype)
     save_shapes(
         m,
@@ -372,8 +372,6 @@ def torch_gemm(
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
     out = F.linear(inp, weights, bias)
-    if otype is not None:
-        out = out.to(otype)
     return out
 
 
