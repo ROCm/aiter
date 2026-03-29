@@ -13,6 +13,10 @@ from aiter.ops.shuffle import shuffle_weight
 
 DEVICE_ARCH = arch_info.get_arch()
 
+pytestmark = pytest.mark.skipif(
+    not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
+)
+
 
 def shuffle_scales(scales: torch.Tensor):
     scales_shuffled = scales.clone()
@@ -224,12 +228,6 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     w_scales_f32 = e8m0_to_f32(w_scales)
     w_f32 = w_f32 * w_scales_f32
     return torch.mm(x_f32, w_f32.T).to(dtype)
-
-
-@pytest.fixture(autouse=True)
-def require_fp4():
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())

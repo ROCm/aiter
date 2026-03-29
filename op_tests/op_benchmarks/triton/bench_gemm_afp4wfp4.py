@@ -1,4 +1,3 @@
-import sys
 import torch
 import triton
 import math
@@ -170,9 +169,7 @@ def parse_args(args: list[str] | None = None):
 
 
 def main(args: list[str] | None = None) -> None:
-    if not (arch_info.is_fp4_avail()):
-        print("MXFP4 is not available on this architecture")
-        sys.exit()
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on this architecture"
 
     parsed_args, defaults = parse_args(args=args)
     if parsed_args.print_vgpr:
