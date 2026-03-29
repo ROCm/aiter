@@ -992,11 +992,11 @@ struct OpUncachedFwd
                                                     size_half_r);
 
             float output_0[VecPairs], output_1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
-            {
+            opus::static_for<VecPairs>([&](auto _v) {
+                constexpr int32_t v = _v.value;
                 output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
                 output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
-            }
+            });
 
             store_payload_vec<RotateStyle, VecPairs>(g_o,
                                                      output_0,
@@ -1090,93 +1090,181 @@ struct OpUncachedFwd
             cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
 
-        // Loop over shared heads (both x and y)
-        for(int32_t hid = 0; hid < size_min_h; hid++)
+        // Loop over shared heads (both x and y), double-buffered
         {
-            const int32_t bo_ix = (offset_ix + hid * stride_ix_h) * elem_bytes;
-            const int32_t bo_iy = (offset_iy + hid * stride_iy_h) * elem_bytes;
-
-            float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(
-                ix0, ix1, g_ix, bo_ix, did_pair, did_start, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(
-                iy0, iy1, g_iy, bo_iy, did_pair, did_start, size_half_r);
-
-            float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = 0;
+            for(; hid + 1 < size_min_h; hid += 2)
             {
-                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
-            }
+                float ix0_a[VecPairs], ix1_a[VecPairs], iy0_a[VecPairs], iy1_a[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_a, ix1_a, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_a, iy1_a, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ix0_b[VecPairs], ix1_b[VecPairs], iy0_b[VecPairs], iy1_b[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_b, ix1_b, g_ix, (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_b, iy1_b, g_iy, (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
-            store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                     ox0,
-                                                     ox1,
-                                                     (offset_ox + hid * stride_ox_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                     oy0,
-                                                     oy1,
-                                                     (offset_oy + hid * stride_oy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+                float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
+                    ox1[v] = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
+                    oy0[v] = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
+                    oy1[v] = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
+                    ox1[v] = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
+                    oy0[v] = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
+                    oy1[v] = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+            if(hid < size_min_h)
+            {
+                float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining x-only heads
-        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        // Remaining x-only heads, double-buffered
         {
-            float ix0[VecPairs], ix1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                    ix1,
-                                                    g_ix,
-                                                    (offset_ix + hid * stride_ix_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float ox0[VecPairs], ox1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_x; hid += 2)
             {
-                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ix,
+                    (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float ox0[VecPairs], ox1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    ox1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    ox1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                     ox0,
-                                                     ox1,
-                                                     (offset_ox + hid * stride_ox_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_x)
+            {
+                float ix0[VecPairs], ix1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining y-only heads
-        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        // Remaining y-only heads, double-buffered
         {
-            float iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                    iy1,
-                                                    g_iy,
-                                                    (offset_iy + hid * stride_iy_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float oy0[VecPairs], oy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_y; hid += 2)
             {
-                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_iy,
+                    (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    oy1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    oy1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                     oy0,
-                                                     oy1,
-                                                     (offset_oy + hid * stride_oy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_y)
+            {
+                float iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1275,11 +1363,11 @@ struct OpUncachedBwd
                                                     size_half_r);
 
             float ig0[VecPairs], ig1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
-            {
+            opus::static_for<VecPairs>([&](auto _v) {
+                constexpr int32_t v = _v.value;
                 ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
                 ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
-            }
+            });
 
             store_payload_vec<RotateStyle, VecPairs>(g_ig,
                                                      ig0,
@@ -1373,93 +1461,181 @@ struct OpUncachedBwd
         load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
 
-        // Loop over shared heads (both x and y)
-        for(int32_t hid = 0; hid < size_min_h; hid++)
+        // Loop over shared heads (both x and y), double-buffered
         {
-            const int32_t bo_ogx = (offset_ogx + hid * stride_ox_h) * elem_bytes;
-            const int32_t bo_ogy = (offset_ogy + hid * stride_oy_h) * elem_bytes;
-
-            float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(
-                ogx0, ogx1, g_ogx, bo_ogx, did_pair, did_start, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(
-                ogy0, ogy1, g_ogy, bo_ogy, did_pair, did_start, size_half_r);
-
-            float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = 0;
+            for(; hid + 1 < size_min_h; hid += 2)
             {
-                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
-            }
+                float ogx0_a[VecPairs], ogx1_a[VecPairs], ogy0_a[VecPairs], ogy1_a[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_a, ogx1_a, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_a, ogy1_a, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ogx0_b[VecPairs], ogx1_b[VecPairs], ogy0_b[VecPairs], ogy1_b[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_b, ogx1_b, g_ogx, (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_b, ogy1_b, g_ogy, (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
-            store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                     igx0,
-                                                     igx1,
-                                                     (offset_igx + hid * stride_ix_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                     igy0,
-                                                     igy1,
-                                                     (offset_igy + hid * stride_iy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+                float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0_a[v] * cos_0[v] + ogx1_a[v] * sin_0[v];
+                    igx1[v] = ogx1_a[v] * cos_1[v] - ogx0_a[v] * sin_1[v];
+                    igy0[v] = ogy0_a[v] * cos_0[v] + ogy1_a[v] * sin_0[v];
+                    igy1[v] = ogy1_a[v] * cos_1[v] - ogy0_a[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0_b[v] * cos_0[v] + ogx1_b[v] * sin_0[v];
+                    igx1[v] = ogx1_b[v] * cos_1[v] - ogx0_b[v] * sin_1[v];
+                    igy0[v] = ogy0_b[v] * cos_0[v] + ogy1_b[v] * sin_0[v];
+                    igy1[v] = ogy1_b[v] * cos_1[v] - ogy0_b[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+            if(hid < size_min_h)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining x-only heads
-        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        // Remaining x-only heads, double-buffered
         {
-            float ogx0[VecPairs], ogx1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                    ogx1,
-                                                    g_ogx,
-                                                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float igx0[VecPairs], igx1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_x; hid += 2)
             {
-                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogx,
+                    (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float igx0[VecPairs], igx1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igx1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igx1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                     igx0,
-                                                     igx1,
-                                                     (offset_igx + hid * stride_ix_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_x)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining y-only heads
-        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        // Remaining y-only heads, double-buffered
         {
-            float ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                    ogy1,
-                                                    g_ogy,
-                                                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float igy0[VecPairs], igy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_y; hid += 2)
             {
-                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogy,
+                    (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igy1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igy1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                     igy0,
-                                                     igy1,
-                                                     (offset_igy + hid * stride_iy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_y)
+            {
+                float ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1560,11 +1736,11 @@ struct OpCachedFwd
                                                     size_half_r);
 
             float output_0[VecPairs], output_1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
-            {
+            opus::static_for<VecPairs>([&](auto _v) {
+                constexpr int32_t v = _v.value;
                 output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
                 output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
-            }
+            });
 
             store_payload_vec<RotateStyle, VecPairs>(g_o,
                                                      output_0,
@@ -1660,93 +1836,181 @@ struct OpCachedFwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
-        // Loop over shared heads (both x and y)
-        for(int32_t hid = 0; hid < size_min_h; hid++)
+        // Loop over shared heads (both x and y), double-buffered
         {
-            const int32_t bo_ix = (offset_ix + hid * stride_ix_h) * elem_bytes;
-            const int32_t bo_iy = (offset_iy + hid * stride_iy_h) * elem_bytes;
-
-            float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(
-                ix0, ix1, g_ix, bo_ix, did_pair, did_start, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(
-                iy0, iy1, g_iy, bo_iy, did_pair, did_start, size_half_r);
-
-            float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = 0;
+            for(; hid + 1 < size_min_h; hid += 2)
             {
-                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
-            }
+                float ix0_a[VecPairs], ix1_a[VecPairs], iy0_a[VecPairs], iy1_a[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_a, ix1_a, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_a, iy1_a, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ix0_b[VecPairs], ix1_b[VecPairs], iy0_b[VecPairs], iy1_b[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_b, ix1_b, g_ix, (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_b, iy1_b, g_iy, (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
-            store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                     ox0,
-                                                     ox1,
-                                                     (offset_ox + hid * stride_ox_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                     oy0,
-                                                     oy1,
-                                                     (offset_oy + hid * stride_oy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+                float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
+                    ox1[v] = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
+                    oy0[v] = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
+                    oy1[v] = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
+                    ox1[v] = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
+                    oy0[v] = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
+                    oy1[v] = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+            if(hid < size_min_h)
+            {
+                float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining x-only heads
-        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        // Remaining x-only heads, double-buffered
         {
-            float ix0[VecPairs], ix1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                    ix1,
-                                                    g_ix,
-                                                    (offset_ix + hid * stride_ix_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float ox0[VecPairs], ox1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_x; hid += 2)
             {
-                ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ix,
+                    (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float ox0[VecPairs], ox1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    ox1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    ox1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                     ox0,
-                                                     ox1,
-                                                     (offset_ox + hid * stride_ox_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_x)
+            {
+                float ix0[VecPairs], ix1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining y-only heads
-        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        // Remaining y-only heads, double-buffered
         {
-            float iy0[VecPairs], iy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                    iy1,
-                                                    g_iy,
-                                                    (offset_iy + hid * stride_iy_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float oy0[VecPairs], oy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_y; hid += 2)
             {
-                oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_iy,
+                    (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    oy1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    oy1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                     oy0,
-                                                     oy1,
-                                                     (offset_oy + hid * stride_oy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_y)
+            {
+                float iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -1847,11 +2111,11 @@ struct OpCachedBwd
                                                     size_half_r);
 
             float ig0[VecPairs], ig1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
-            {
+            opus::static_for<VecPairs>([&](auto _v) {
+                constexpr int32_t v = _v.value;
                 ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
                 ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
-            }
+            });
 
             store_payload_vec<RotateStyle, VecPairs>(g_ig,
                                                      ig0,
@@ -1947,93 +2211,181 @@ struct OpCachedBwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
-        // Loop over shared heads (both x and y)
-        for(int32_t hid = 0; hid < size_min_h; hid++)
+        // Loop over shared heads (both x and y), double-buffered
         {
-            const int32_t bo_ogx = (offset_ogx + hid * stride_ox_h) * elem_bytes;
-            const int32_t bo_ogy = (offset_ogy + hid * stride_oy_h) * elem_bytes;
-
-            float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(
-                ogx0, ogx1, g_ogx, bo_ogx, did_pair, did_start, size_half_r);
-            load_payload_vec<RotateStyle, VecPairs>(
-                ogy0, ogy1, g_ogy, bo_ogy, did_pair, did_start, size_half_r);
-
-            float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = 0;
+            for(; hid + 1 < size_min_h; hid += 2)
             {
-                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
-            }
+                float ogx0_a[VecPairs], ogx1_a[VecPairs], ogy0_a[VecPairs], ogy1_a[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_a, ogx1_a, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_a, ogy1_a, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ogx0_b[VecPairs], ogx1_b[VecPairs], ogy0_b[VecPairs], ogy1_b[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_b, ogx1_b, g_ogx, (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_b, ogy1_b, g_ogy, (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
-            store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                     igx0,
-                                                     igx1,
-                                                     (offset_igx + hid * stride_ix_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
-            store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                     igy0,
-                                                     igy1,
-                                                     (offset_igy + hid * stride_iy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+                float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0_a[v] * cos_0[v] + ogx1_a[v] * sin_0[v];
+                    igx1[v] = ogx1_a[v] * cos_1[v] - ogx0_a[v] * sin_1[v];
+                    igy0[v] = ogy0_a[v] * cos_0[v] + ogy1_a[v] * sin_0[v];
+                    igy1[v] = ogy1_a[v] * cos_1[v] - ogy0_a[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0_b[v] * cos_0[v] + ogx1_b[v] * sin_0[v];
+                    igx1[v] = ogx1_b[v] * cos_1[v] - ogx0_b[v] * sin_1[v];
+                    igy0[v] = ogy0_b[v] * cos_0[v] + ogy1_b[v] * sin_0[v];
+                    igy1[v] = ogy1_b[v] * cos_1[v] - ogy0_b[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+            if(hid < size_min_h)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining x-only heads
-        for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+        // Remaining x-only heads, double-buffered
         {
-            float ogx0[VecPairs], ogx1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                    ogx1,
-                                                    g_ogx,
-                                                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float igx0[VecPairs], igx1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_x; hid += 2)
             {
-                igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogx,
+                    (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float igx0[VecPairs], igx1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igx1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igx1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                     igx0,
-                                                     igx1,
-                                                     (offset_igx + hid * stride_ix_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_x)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
-        // Remaining y-only heads
-        for(int32_t hid = size_min_h; hid < size_h_y; hid++)
+        // Remaining y-only heads, double-buffered
         {
-            float ogy0[VecPairs], ogy1[VecPairs];
-            load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                    ogy1,
-                                                    g_ogy,
-                                                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
-                                                    did_pair,
-                                                    did_start,
-                                                    size_half_r);
-            float igy0[VecPairs], igy1[VecPairs];
-            for(int32_t v = 0; v < VecPairs; v++)
+            int32_t hid = size_min_h;
+            for(; hid + 1 < size_h_y; hid += 2)
             {
-                igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                float a0[VecPairs], a1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float b0[VecPairs], b1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogy,
+                    (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                float igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igy1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igy1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
-            store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                     igy0,
-                                                     igy1,
-                                                     (offset_igy + hid * stride_iy_h) * elem_bytes,
-                                                     did_pair,
-                                                     did_start,
-                                                     size_half_r);
+            if(hid < size_h_y)
+            {
+                float ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
         }
 
         // the rest are just forwarded (nope copy, distributed round-robin)
@@ -3807,7 +4159,7 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
 {
     constexpr int32_t num_threads      = 256; // 4 warps x 64 threads/warp
     constexpr int32_t kernel_occupancy = 8;   // __launch_bounds__(256, 8)
-    constexpr float threshold          = 4.0f;
+    constexpr float threshold          = 0.5f;
 
     const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
     const int32_t size_half_r = size_r >> 1;
