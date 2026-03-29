@@ -1040,6 +1040,7 @@ struct OpUncachedFwd
               bool StrideDInXEq1,
               bool StrideDInYEq1,
               int32_t VecPairs = 1,
+              bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
     __device__ __forceinline__ static void
@@ -1090,7 +1091,8 @@ struct OpUncachedFwd
             cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
         constexpr int32_t elem_bytes = sizeof(scalar_t);
 
-        // Loop over shared heads (both x and y), double-buffered
+        // Loop over shared heads (both x and y)
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = 0;
             for(; hid + 1 < size_min_h; hid += 2)
@@ -1164,8 +1166,36 @@ struct OpUncachedFwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = 0; hid < size_min_h; hid++)
+            {
+                float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining x-only heads, double-buffered
+        // Remaining x-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_x; hid += 2)
@@ -1215,8 +1245,28 @@ struct OpUncachedFwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+            {
+                float ix0[VecPairs], ix1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining y-only heads, double-buffered
+        // Remaining y-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_y; hid += 2)
@@ -1250,6 +1300,25 @@ struct OpUncachedFwd
                     did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
+            {
+                float iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float iy0[VecPairs], iy1[VecPairs];
                 load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
@@ -1411,6 +1480,7 @@ struct OpUncachedBwd
               bool StrideDOutGradsXEq1,
               bool StrideDOutGradsYEq1,
               int32_t VecPairs = 1,
+              bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
     __device__ __forceinline__ static void
@@ -1461,7 +1531,8 @@ struct OpUncachedBwd
         load_cos_sin_uncached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, g_f, byte_offset_f, did - did_start, size_half_r);
 
-        // Loop over shared heads (both x and y), double-buffered
+        // Loop over shared heads (both x and y)
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = 0;
             for(; hid + 1 < size_min_h; hid += 2)
@@ -1535,8 +1606,36 @@ struct OpUncachedBwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = 0; hid < size_min_h; hid++)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining x-only heads, double-buffered
+        // Remaining x-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_x; hid += 2)
@@ -1586,8 +1685,28 @@ struct OpUncachedBwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining y-only heads, double-buffered
+        // Remaining y-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_y; hid += 2)
@@ -1621,6 +1740,25 @@ struct OpUncachedBwd
                     did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
+            {
+                float ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float ogy0[VecPairs], ogy1[VecPairs];
                 load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
@@ -1784,6 +1922,7 @@ struct OpCachedFwd
               bool StrideDInXEq1,
               bool StrideDInYEq1,
               int32_t VecPairs = 1,
+              bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
     __device__ __forceinline__ static void
@@ -1836,7 +1975,8 @@ struct OpCachedFwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, true, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
-        // Loop over shared heads (both x and y), double-buffered
+        // Loop over shared heads (both x and y)
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = 0;
             for(; hid + 1 < size_min_h; hid += 2)
@@ -1910,8 +2050,36 @@ struct OpCachedFwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = 0; hid < size_min_h; hid++)
+            {
+                float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining x-only heads, double-buffered
+        // Remaining x-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_x; hid += 2)
@@ -1961,8 +2129,28 @@ struct OpCachedFwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+            {
+                float ix0[VecPairs], ix1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float ox0[VecPairs], ox1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining y-only heads, double-buffered
+        // Remaining y-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_y; hid += 2)
@@ -1996,6 +2184,25 @@ struct OpCachedFwd
                     did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
+            {
+                float iy0[VecPairs], iy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float oy0[VecPairs], oy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float iy0[VecPairs], iy1[VecPairs];
                 load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
@@ -2159,6 +2366,7 @@ struct OpCachedBwd
               bool StrideDOutGradsXEq1,
               bool StrideDOutGradsYEq1,
               int32_t VecPairs = 1,
+              bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
     __device__ __forceinline__ static void
@@ -2211,7 +2419,8 @@ struct OpCachedBwd
         load_cos_sin_cached_vec<RotateStyle, VecPairs, false, ReuseFreqsFrontPart>(
             cos_0, sin_0, cos_1, sin_1, g_c, g_s, byte_offset_f, did - did_start, size_half_r);
 
-        // Loop over shared heads (both x and y), double-buffered
+        // Loop over shared heads (both x and y)
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = 0;
             for(; hid + 1 < size_min_h; hid += 2)
@@ -2285,8 +2494,36 @@ struct OpCachedBwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = 0; hid < size_min_h; hid++)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining x-only heads, double-buffered
+        // Remaining x-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_x; hid += 2)
@@ -2336,8 +2573,28 @@ struct OpCachedBwd
                     did_pair, did_start, size_half_r);
             }
         }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_x; hid++)
+            {
+                float ogx0[VecPairs], ogx1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igx0[VecPairs], igx1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
 
-        // Remaining y-only heads, double-buffered
+        // Remaining y-only heads
+        if constexpr(DoubleBuffer)
         {
             int32_t hid = size_min_h;
             for(; hid + 1 < size_h_y; hid += 2)
@@ -2371,6 +2628,25 @@ struct OpCachedBwd
                     did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
+            {
+                float ogy0[VecPairs], ogy1[VecPairs];
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                float igy0[VecPairs], igy1[VecPairs];
+                opus::static_for<VecPairs>([&](auto _v) {
+                    constexpr int32_t v = _v.value;
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                });
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+            }
+        }
+        else
+        {
+            for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float ogy0[VecPairs], ogy1[VecPairs];
                 load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
@@ -2556,6 +2832,7 @@ template <typename Op,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__
@@ -2610,7 +2887,8 @@ __launch_bounds__(256, 8) __global__
                           StrideDOutYEq1,
                           StrideDInXEq1,
                           StrideDInYEq1,
-                          VecPairs>(p_output_x,
+                          VecPairs,
+                          DoubleBuffer>(p_output_x,
                                     p_output_y,
                                     p_input_x,
                                     p_input_y,
@@ -2643,6 +2921,7 @@ template <typename Op,
           bool StrideDXEq1,
           bool StrideDYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__
@@ -2685,7 +2964,8 @@ __launch_bounds__(256, 8) __global__
                           StrideDYEq1,
                           StrideDXEq1,
                           StrideDYEq1,
-                          VecPairs>(p_inout_x,
+                          VecPairs,
+                          DoubleBuffer>(p_inout_x,
                                     p_inout_y,
                                     p_inout_x,
                                     p_inout_y,
@@ -2843,6 +3123,7 @@ template <typename Op,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__
@@ -2898,7 +3179,8 @@ __launch_bounds__(256, 8) __global__
                           StrideDOutYEq1,
                           StrideDInXEq1,
                           StrideDInYEq1,
-                          VecPairs>(p_output_x,
+                          VecPairs,
+                          DoubleBuffer>(p_output_x,
                                     p_output_y,
                                     p_input_x,
                                     p_input_y,
@@ -2932,6 +3214,7 @@ template <typename Op,
           bool StrideDXEq1,
           bool StrideDYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__
@@ -2975,7 +3258,8 @@ __launch_bounds__(256, 8) __global__
                           StrideDYEq1,
                           StrideDXEq1,
                           StrideDYEq1,
-                          VecPairs>(p_inout_x,
+                          VecPairs,
+                          DoubleBuffer>(p_inout_x,
                                     p_inout_y,
                                     p_inout_x,
                                     p_inout_y,
@@ -3084,6 +3368,7 @@ template <typename Op,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__
@@ -3146,7 +3431,8 @@ __launch_bounds__(256, 8) __global__
                               StrideDOutYEq1,
                               StrideDInXEq1,
                               StrideDInYEq1,
-                              VecPairs>(p_output_x,
+                              VecPairs,
+                          DoubleBuffer>(p_output_x,
                                         p_output_y,
                                         p_input_x,
                                         p_input_y,
@@ -3247,6 +3533,7 @@ template <typename Op,
           bool StrideDXEq1,
           bool StrideDYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
@@ -3297,7 +3584,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
                               StrideDYEq1,
                               StrideDXEq1,
                               StrideDYEq1,
-                              VecPairs>(p_inout_x,
+                              VecPairs,
+                          DoubleBuffer>(p_inout_x,
                                         p_inout_y,
                                         p_inout_x,
                                         p_inout_y,
@@ -3408,6 +3696,7 @@ template <typename Op,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__
@@ -3471,7 +3760,8 @@ __launch_bounds__(256, 8) __global__
                               StrideDOutYEq1,
                               StrideDInXEq1,
                               StrideDInYEq1,
-                              VecPairs>(p_output_x,
+                              VecPairs,
+                          DoubleBuffer>(p_output_x,
                                         p_output_y,
                                         p_input_x,
                                         p_input_y,
@@ -3573,6 +3863,7 @@ template <typename Op,
           bool StrideDXEq1,
           bool StrideDYEq1,
           int32_t VecPairs = 1,
+          bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
 __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
@@ -3624,7 +3915,8 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inpl
                               StrideDYEq1,
                               StrideDXEq1,
                               StrideDYEq1,
-                              VecPairs>(p_inout_x,
+                              VecPairs,
+                          DoubleBuffer>(p_inout_x,
                                         p_inout_y,
                                         p_inout_x,
                                         p_inout_y,
@@ -4215,6 +4507,18 @@ std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
     }                                           \
     }
 
+#define LAUNCH_KERNEL_DOUBLE_BUFFER(DOUBLE_BUFFER, ...) \
+    if(DOUBLE_BUFFER)                                   \
+    {                                                   \
+        constexpr bool DB = true;                       \
+        __VA_ARGS__;                                    \
+    }                                                   \
+    else                                                \
+    {                                                   \
+        constexpr bool DB = false;                      \
+        __VA_ARGS__;                                    \
+    }
+
 template <typename Op,
           int32_t RotateStyle,
           bool ReuseFreqsFrontPart,
@@ -4405,9 +4709,12 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
+    const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
+        LAUNCH_KERNEL_DOUBLE_BUFFER(
+            double_buffer,
         if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
             assert(stride_ix_s == stride_ox_s);
             assert(stride_ix_b == stride_ox_b);
@@ -4428,7 +4735,8 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                                   NopeFirst,
                                                   Stride0Eq1,
                                                   Stride1Eq1,
-                                                  VP><<<grid, block, 0, stream>>>(p_output_x,
+                                                  VP,
+                                                  DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                                   p_output_y,
                                                                                   p_freqs,
                                                                                   size_h_x,
@@ -4459,7 +4767,8 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                                       NopeFirst,
                                                       Stride0Eq1,
                                                       Stride1Eq1,
-                                                      VP>
+                                                      VP,
+                                                      DB>
                     <<<grid, block, 0, stream>>>(p_output_x,
                                                  p_output_y,
                                                  p_freqs,
@@ -4494,7 +4803,8 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                           Stride1Eq1,
                                           Stride2Eq1,
                                           Stride3Eq1,
-                                          VP><<<grid, block, 0, stream>>>(p_output_x,
+                                          VP,
+                                          DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                           p_output_y,
                                                                           p_input_x,
                                                                           p_input_y,
@@ -4539,7 +4849,8 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                               Stride1Eq1,
                                               Stride2Eq1,
                                               Stride3Eq1,
-                                              VP><<<grid, block, 0, stream>>>(p_output_x,
+                                              VP,
+                                              DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                               p_output_y,
                                                                               p_input_x,
                                                                               p_input_y,
@@ -4568,7 +4879,7 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                                                               threads_per_sb,
                                                                               total_sb););
             }
-        });
+        }));
 }
 
 template <typename Op,
@@ -4766,9 +5077,12 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
+    const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
+        LAUNCH_KERNEL_DOUBLE_BUFFER(
+            double_buffer,
         if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
             assert(stride_ix_s == stride_ox_s);
             assert(stride_ix_b == stride_ox_b);
@@ -4789,7 +5103,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                 NopeFirst,
                                                 Stride0Eq1,
                                                 Stride1Eq1,
-                                                VP><<<grid, block, 0, stream>>>(p_output_x,
+                                                VP,
+                                                DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                                 p_output_y,
                                                                                 p_cos,
                                                                                 p_sin,
@@ -4821,7 +5136,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                     NopeFirst,
                                                     Stride0Eq1,
                                                     Stride1Eq1,
-                                                    VP><<<grid, block, 0, stream>>>(p_output_x,
+                                                    VP,
+                                                    DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                                     p_output_y,
                                                                                     p_cos,
                                                                                     p_sin,
@@ -4856,7 +5172,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                         Stride1Eq1,
                                         Stride2Eq1,
                                         Stride3Eq1,
-                                        VP><<<grid, block, 0, stream>>>(p_output_x,
+                                        VP,
+                                        DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                         p_output_y,
                                                                         p_input_x,
                                                                         p_input_y,
@@ -4901,7 +5218,8 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                                                Stride1Eq1,
                                                                                Stride2Eq1,
                                                                                Stride3Eq1,
-                                                                               VP>
+                                                                               VP,
+                                                                               DB>
                                                        <<<grid, block, 0, stream>>>(p_output_x,
                                                                                     p_output_y,
                                                                                     p_input_x,
@@ -4932,7 +5250,7 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                                                     threads_per_sb,
                                                                                     total_sb););
             }
-        });
+        }));
 }
 
 template <typename Op,
@@ -5144,9 +5462,12 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
+    const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
+        LAUNCH_KERNEL_DOUBLE_BUFFER(
+            double_buffer,
         if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
             assert(stride_ix_s == stride_ox_s);
             assert(stride_ix_b == stride_ox_b);
@@ -5167,7 +5488,8 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                          NopeFirst,
                                                          Stride0Eq1,
                                                          Stride1Eq1,
-                                                         VP>
+                                                         VP,
+                                                         DB>
                 <<<grid, block, 0, stream>>>(p_output_x,
                                              p_output_y,
                                              p_cos,
@@ -5202,7 +5524,8 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                              NopeFirst,
                                                              Stride0Eq1,
                                                              Stride1Eq1,
-                                                             VP>
+                                                             VP,
+                                                             DB>
                     <<<grid, block, 0, stream>>>(p_output_x,
                                                  p_output_y,
                                                  p_cos,
@@ -5240,7 +5563,8 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                  Stride1Eq1,
                                                  Stride2Eq1,
                                                  Stride3Eq1,
-                                                 VP><<<grid, block, 0, stream>>>(p_output_x,
+                                                 VP,
+                                                 DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                                  p_output_y,
                                                                                  p_input_x,
                                                                                  p_input_y,
@@ -5288,7 +5612,8 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                      Stride1Eq1,
                                                      Stride2Eq1,
                                                      Stride3Eq1,
-                                                     VP><<<grid, block, 0, stream>>>(p_output_x,
+                                                     VP,
+                                                     DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                                      p_output_y,
                                                                                      p_input_x,
                                                                                      p_input_y,
@@ -5320,7 +5645,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                                                      threads_per_sb,
                                                                                      total_sb););
             }
-        });
+        }));
 }
 
 template <typename Op,
@@ -5540,9 +5865,12 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
     const int32_t total_sb = size_s * size_b;
+    const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
+        LAUNCH_KERNEL_DOUBLE_BUFFER(
+            double_buffer,
         if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
             assert(stride_ix_s == stride_ox_s);
             assert(stride_ix_b == stride_ox_b);
@@ -5563,7 +5891,8 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                                           NopeFirst,
                                                           Stride0Eq1,
                                                           Stride1Eq1,
-                                                          VP>
+                                                          VP,
+                                                          DB>
                 <<<grid, block, 0, stream>>>(p_output_x,
                                              p_output_y,
                                              p_cos,
@@ -5599,7 +5928,8 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                                               NopeFirst,
                                                               Stride0Eq1,
                                                               Stride1Eq1,
-                                                              VP>
+                                                              VP,
+                                                              DB>
                     <<<grid, block, 0, stream>>>(p_output_x,
                                                  p_output_y,
                                                  p_cos,
@@ -5638,7 +5968,8 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                                   Stride1Eq1,
                                                   Stride2Eq1,
                                                   Stride3Eq1,
-                                                  VP>
+                                                  VP,
+                                                  DB>
                 <<<grid, block, 0, stream>>>(p_output_x,
                                              p_output_y,
                                              p_input_x,
@@ -5688,7 +6019,8 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                                       Stride1Eq1,
                                                       Stride2Eq1,
                                                       Stride3Eq1,
-                                                      VP>
+                                                      VP,
+                                                      DB>
                     <<<grid, block, 0, stream>>>(p_output_x,
                                                  p_output_y,
                                                  p_input_x,
@@ -5722,7 +6054,7 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                                  threads_per_sb,
                                                  total_sb););
             }
-        });
+        }));
 }
 
 template <typename Op,
