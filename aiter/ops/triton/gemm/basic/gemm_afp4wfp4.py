@@ -505,8 +505,9 @@ def gemm_afp4wfp4_preshuffle(
         M_POW2 = 16
 
     if use_gluon:
-        layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["NUM_WARPS"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
+        layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
+        config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]  
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
         x_fp4,
         w_preshuf,
@@ -528,13 +529,7 @@ def gemm_afp4wfp4_preshuffle(
         w_scales.stride(0),
         w_scales.stride(1),
         NUM_BUFFERS=2,
-        BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
-        BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
-        BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
-        NUM_WARPS=config["NUM_WARPS"],
-        NUM_KSPLIT=config["NUM_KSPLIT"],
-        SPLITK_BLOCK=config["SPLITK_BLOCK_SIZE"],
-        cache_modifier=config["cache_modifier"],
+        **config,
         **layouts,
         )
         return y
