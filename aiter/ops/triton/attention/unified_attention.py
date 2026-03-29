@@ -111,6 +111,42 @@ def use_2d_kernel(
     )
 
 
+def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
+                               seqused_k, softmax_scale, window_size,
+                               block_table, softcap, alibi_slopes, sinks):
+    """Route decode to CK unified attention if supported. Returns True if handled."""
+    if max_seqlen_q != 1:
+        return False
+    if window_size != (-1, -1):
+        return False
+    if softcap != 0:
+        return False
+    if alibi_slopes is not None or sinks is not None:
+        return False
+
+    head_size = q.shape[2]
+    num_query_heads = q.shape[1]
+    num_kv_heads = k.shape[2]
+    num_queries_per_kv = num_query_heads // num_kv_heads
+
+    # CK only has instances for d64/GQA-8 and d128/MHA
+    if not ((head_size == 64 and num_queries_per_kv == 8) or
+            (head_size == 128 and num_queries_per_kv == 1)):
+        return False
+
+    try:
+        from aiter.ops.unified_attention import unified_attention_fwd
+        import math
+        scale_s = softmax_scale if softmax_scale else 1.0 / math.sqrt(head_size)
+        unified_attention_fwd(
+            out, q, k, v, block_table, seqused_k, cu_seqlens_q,
+            mask_type=2, scale_s=scale_s,
+            scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0)
+        return True
+    except Exception:
+        return False
+
+
 def unified_attention(
     q,
     k,
@@ -136,6 +172,12 @@ def unified_attention(
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
+
+    # Try CK for decode (4-6% faster than Triton on max_seqlen_q==1)
+    if _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
+                                  seqused_k, softmax_scale, window_size,
+                                  block_table, softcap, alibi_slopes, sinks):
+        return
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
