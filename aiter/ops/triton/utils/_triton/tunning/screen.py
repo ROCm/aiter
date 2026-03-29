@@ -107,6 +107,12 @@ def parse_args():
         help="verbose print",
         default=False,
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        help="Timeout in seconds per batch of rocprofv3 (default: 900)",
+        default=900,
+    )
 
     args = parser.parse_args()
     return args
@@ -132,6 +138,7 @@ def main():
 
     force_overwrite = getattr(args, "overwrite")
     verbose = getattr(args, "verbose")
+    batch_timeout = getattr(args, "timeout")
 
     assert M == triton.next_power_of_2(M), "M has to be power of 2"
     assert os.path.isfile(ut_filename), f"{ut_filename} not found"
@@ -286,7 +293,14 @@ def main():
         process = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
-        stdout_data, stderr_data = process.communicate()
+        try:
+            stdout_data, stderr_data = process.communicate(timeout=batch_timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout_data, stderr_data = process.communicate()
+            if verbose:
+                print(f"[Error]: rocprofv3 timed out after {batch_timeout}s for {mnk_str}", flush=True)
+            stderr_data = "TimeoutExpired"
 
         if process.returncode == 0:
             if os.path.isfile(rocprof_filename):
@@ -328,12 +342,15 @@ def main():
             stderr_data = stderr_data.split("\n")
             if verbose:
                 print("[Error]: when running rocprof, error message:", flush=True)
+            # Determine if this is a block-size-dependent error (exclude block)
+            # or a param-specific error (skip batch, don't exclude block)
+            is_block_size_error = False
             for i_line, aline in enumerate(stderr_data):
                 if (
                     "exceeds triton maximum tensor numel" in aline
                     or "OutOfResources" in aline
-                    or "AssertionError" in aline
                 ):
+                    is_block_size_error = True
                     if verbose:
                         print("\t...", flush=True)
                         for j_line in range(
@@ -342,17 +359,36 @@ def main():
                             print(f"\t{stderr_data[j_line]}", flush=True)
                         print("\t...", flush=True)
                     break
+                elif (
+                    "PassManager::run failed" in aline
+                    or "RuntimeError" in aline
+                    or "AssertionError" in aline
+                    or "TimeoutExpired" in aline
+                ):
+                    # Compilation or runtime error for specific param combo,
+                    # not necessarily all configs with this block size
+                    if verbose:
+                        print(f"\tParam-specific error (not excluding block size):", flush=True)
+                        for j_line in range(
+                            max(0, i_line - 5), min(len(stderr_data), i_line + 5)
+                        ):
+                            print(f"\t{stderr_data[j_line]}", flush=True)
+                    break
             else:
                 if verbose:
                     print("\tUn-identified error:", flush=True)
                     for stderr_str in stderr_data:
                         print(f"\t{stderr_str}", flush=True)
 
-            exclude_mnk[tuple(parms_comb_list[i_comb_start][:3])] = 1
-
-            if verbose:
-                print(f"Excluding all {mnk_str} cases", flush=True)
-                print()
+            if is_block_size_error:
+                exclude_mnk[tuple(parms_comb_list[i_comb_start][:3])] = 1
+                if verbose:
+                    print(f"Excluding all {mnk_str} cases", flush=True)
+                    print()
+            else:
+                if verbose:
+                    print(f"Skipping batch {i_comb_start}~{i_comb_end-1} (block size NOT excluded)", flush=True)
+                    print()
 
         i_comb_start = i_comb_end
         date_to_file(log_filename)
