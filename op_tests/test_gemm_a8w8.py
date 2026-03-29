@@ -37,9 +37,13 @@ def is_shape_tuned(
         if os.path.exists(tuned_file):
             try:
                 df = pd.read_csv(tuned_file)
+                gfx = get_gfx()
                 cu_num = get_cu_num()
+                mask = df["cu_num"] == cu_num
+                if "gfx" in df.columns:
+                    mask = mask & (df["gfx"] == gfx)
                 _TUNED_SHAPES_CACHE[tuned_file] = set(
-                    df[df["cu_num"] == cu_num][["M", "N", "K", "q_dtype_w"]].apply(
+                    df[mask][["M", "N", "K", "q_dtype_w"]].apply(
                         tuple, axis=1
                     )
                 )
