@@ -10,7 +10,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight, shuffle_weight_gfx1250
+from aiter.ops.shuffle import shuffle_weight
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -105,7 +105,7 @@ def generate_gemm_afp4wfp4_inputs(
     if shuffle_weight_fg:
         if DEVICE_ARCH == "gfx1250":
             # gfx1250: simple reshape for TDM coalescing (no tile permutation)
-            w_shuffed = shuffle_weight_gfx1250(w)
+            w_shuffed = shuffle_weight(w)
         # else:
         #     use_int4 = False
         #     weight_shuffle_layout = (16, 16)
