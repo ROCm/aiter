@@ -79,7 +79,7 @@ def depreshuffle_b_raw_to_kn(
 ):
     # raw -> logical [BLOCK_K_BYTES, BLOCK_N]
     return (
-        b_raw.reshape((1, BLOCK_N // 16, BLOCK_K_BYTES // 32, 2, 16, 16))
+        b_raw.reshape((BLOCK_N // 16, BLOCK_K_BYTES // 32, 2, 16, 16))
         .permute((0, 3, 1, 2, 4))
         .reshape((BLOCK_N, BLOCK_K_BYTES))
         .permute((1, 0))
