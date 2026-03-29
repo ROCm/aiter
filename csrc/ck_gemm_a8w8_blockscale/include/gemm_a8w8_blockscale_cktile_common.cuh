@@ -295,14 +295,18 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     ck_tile::QuantGemmHostArgs args;
     args.a_ptr = XQ.data_ptr();
 
+    // Declared at function scope so the transposed tensor stays alive
+    // through the async kernel launch.
+    torch::Tensor x_scale_t;
+
     if(eight_warps && !PreshuffleB)
     {
-        torch::Tensor x_scale_t = x_scale.transpose(0, 1).contiguous().view(x_scale.sizes());
-        args.aq_ptr             = x_scale_t.data_ptr();
+        x_scale_t   = x_scale.transpose(0, 1).contiguous().view(x_scale.sizes());
+        args.aq_ptr = x_scale_t.data_ptr();
     }
     else if(!eight_warps && PreshuffleB)
     {
-        torch::Tensor x_scale_t =
+        x_scale_t =
             x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
         args.aq_ptr = x_scale_t.data_ptr();
     }

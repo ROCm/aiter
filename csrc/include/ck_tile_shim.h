@@ -3,7 +3,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Minimal shim providing ck_tile:: types and FMHA enums/structs when
-// compiling without the full Composable Kernel dependency (DISABLE_CK==1).
+// compiling without the full Composable Kernel dependency (ENABLE_CK==0).
 
 #include <hip/hip_runtime.h>
 #include <cstdint>

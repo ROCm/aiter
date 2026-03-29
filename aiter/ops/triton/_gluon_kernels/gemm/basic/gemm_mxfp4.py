@@ -1,5 +1,6 @@
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 SCALE_GROUP_ELEMS = 32
 
@@ -12,18 +13,23 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
 ):
     K_GROUPS = BLOCK_K // SCALE_GROUP_ELEMS
 
-    tiles_per_warp = 1
-    if num_warps == 4:
-        warp_bases = [[0, tiles_per_warp], [tiles_per_warp, 0]]
+    if num_warps == 2:
+        warp_bases= [[0, 1]]
+        reg_bases= []
+    elif num_warps == 4:
+        warp_bases= [[0, 2], [2, 0]]
+        reg_bases= [[1,0],[0,1]]
     else:
-        warp_bases = [[0, tiles_per_warp], [0, tiles_per_warp * 2], [tiles_per_warp, 0]]
+        warp_bases = [[0, 1], [0, 2], [1, 0]]
+        reg_bases = []
+        
 
     # e2m1 uses instr_shape [16,16,64] for operands
     wmma_layout = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=warp_bases,
-        reg_bases=[],
+        reg_bases=reg_bases,
         instr_shape=[16, 16, 64],
     )
     # scaled WMMA accumulator must be [16,16,128]
@@ -31,7 +37,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
         version=3,
         transposed=True,
         warp_bases=warp_bases,
-        reg_bases=[],
+        reg_bases=reg_bases,
         instr_shape=[16, 16, 128],
     )
 
@@ -115,8 +121,23 @@ def store_c_tile(
         mask=mask,
     )
 
+_gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
+    "_gemm_mxfp4_preshuffle_gfx1250_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+        "NUM_KSPLIT",
+    ],
+)
 
-@gluon.jit
+@gluon.jit(repr=_gemm_mxfp4_preshuffle_gfx1250_repr)
 def gemm_mxfp4_preshuffle_gfx1250(
     a_fp4_ptr,
     b_preshuf_ptr,
@@ -140,9 +161,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
     NUM_KSPLIT: gl.constexpr,
+    SPLITK_BLOCK_SIZE: gl.constexpr,
     SPLITK_BLOCK: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
+    num_warps: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     cache_modifier: gl.constexpr,
     wmma_layout: gl.constexpr,
