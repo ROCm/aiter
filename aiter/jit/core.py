@@ -1374,7 +1374,7 @@ def compile_ops(
                                 f" (module_)?aiter.*{el} ", f" {el} ", doc_str
                             )
                         doc_str = re.sub(
-                            r"(module_\w+\.)?aiter_tensor_t",
+                            r"(?:[\w.]+\.)?aiter_tensor_t",
                             "aiter_tensor_t",
                             doc_str,
                         )
