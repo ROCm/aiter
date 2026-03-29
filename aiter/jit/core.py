@@ -1367,9 +1367,7 @@ def compile_ops(
                         doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
                         doc_str = doc_str.replace("typing.SupportsInt", "int")
                         doc_str = doc_str.replace("typing.SupportsFloat", "float")
-                        doc_str = re.sub(
-                            r"\s*\|\s*typing\.SupportsIndex", "", doc_str
-                        )
+                        doc_str = re.sub(r"\s*\|\s*typing\.SupportsIndex", "", doc_str)
                         pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                         doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                         for el in enum_types:
