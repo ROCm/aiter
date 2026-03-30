@@ -5,7 +5,7 @@
 
 import functools
 import re
-import os
+
 from typing import Dict, Optional
 from aiter.utility import dtypes
 
@@ -31,9 +31,10 @@ def _clear_stale_ir_context():
     except Exception:
         pass
 
+
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
-_SBM_SUFFIX_RE = re.compile(r"_sbm(\d+)$")
+_SUFFIX_RE = re.compile(r"(?P<fq>_fq)?(?:_sbm(?P<sbm>\d+))?$")
 
 
 def flydsl_kernel_name(
@@ -46,27 +47,35 @@ def flydsl_kernel_name(
     tile_k: int,
     mode: str = "",
     sort_block_m: int = 0,
+    fuse_fp4_quant: bool = False,
 ) -> str:
-    """Construct kernel name: flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}][_sbm{S}]."""
+    """Construct kernel name: ``flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}][_fq][_sbm{S}]``."""
     name = f"flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     if mode:
         name += f"_{mode}"
+    if fuse_fp4_quant:
+        name += "_fq"
     if sort_block_m > 0 and sort_block_m != tile_m:
         name += f"_sbm{sort_block_m}"
     return name
 
 
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
-    """Lookup kernel params by name (O(1)). Handles ``_sbm{N}`` suffix transparently."""
+    """Lookup kernel params by name. Strips ``_fq`` / ``_sbm{N}`` suffixes transparently."""
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
         return params
-    m = _SBM_SUFFIX_RE.search(name)
-    if m:
+    m = _SUFFIX_RE.search(name)
+    if m and m.group(0):
         base_name = name[: m.start()]
         params = _KERNEL_PARAMS.get(base_name)
         if params is not None:
-            return {**params, "sort_block_m": int(m.group(1))}
+            extra: Dict = {}
+            if m.group("fq"):
+                extra["fuse_fp4_quant"] = True
+            if m.group("sbm") is not None:
+                extra["sort_block_m"] = int(m.group("sbm"))
+            return {**params, **extra}
     return None
 
 
@@ -92,10 +101,7 @@ def get_flydsl_stage1_kernels(
         for tn in tile_ns:
             for tk in tile_ks:
                 for wpe in waves_per_eus:
-                    if tm in [16, 32]:
-                        k_batches = [1, 2, 4, 7]
-                    else:
-                        k_batches = [1]
+                    k_batches = [1]
                     for kb in k_batches:
                         gate_onlys = [False, True] if kb > 1 else [False]
                         for bnt in b_nts:
@@ -370,13 +376,6 @@ def _get_compiled_stage1(
             _gx = _n_in // 2 // tile_n
         _gy = (size_expert_ids_in + persist_m - 1) // persist_m
         _total_wg = _gx * _gy * k_batch
-        if os.environ.get("FLYDSL_GRID_DEBUG"):
-            print(
-                f"[grid] gx={_gx} gy={_gy} gz={k_batch} total_workgroups={_total_wg}"
-                f" tile_m={tile_m} persist_m={persist_m}"
-                f" size_expert_ids={size_expert_ids_in} token_num={token_num}"
-                f" (256 CUs, waves={(_total_wg + 255) // 256})"
-            )
         _clear_stale_ir_context()
 
         if is_fp4:
@@ -448,6 +447,15 @@ def _get_compiled_stage1(
             )
 
     return tensor_api
+
+
+@functools.cache
+def _get_compiled_silu_fq(inter_dim: int, topk: int):
+    """Compile and cache the fused silu_and_mul + mxfp4 quant + scale-sort kernel."""
+    _clear_stale_ir_context()
+    from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
+
+    return build_silu_and_mul_fq_module(inter_dim, topk)
 
 
 @functools.cache
@@ -647,12 +655,18 @@ def flydsl_moe_stage1(
     torch_out_dtype = dtypes.fp4x2 if fuse_fp4_quant else dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
     _is_splitk = k_batch > 1
 
-    if out is None:
-        out = torch.empty(
-            (token_num, topk, inter_dim), dtype=torch_out_dtype, device=a.device
-        )
-
     dev = a.device
+    _splitk_fq = _is_splitk and fuse_fp4_quant
+
+    if out is None:
+        if _splitk_fq:
+            fp4_bytes = token_num * topk * (inter_dim // 2)
+            bf16_elems = (fp4_bytes + 1) // 2
+            out = torch.empty(bf16_elems, dtype=torch_out_dtype, device=dev)
+        else:
+            out = torch.empty(
+                (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
+            )
 
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
@@ -674,26 +688,36 @@ def flydsl_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    _need_quant = fuse_fp4_quant
-    _need_sort = _need_quant and fuse_sort_scale
+    _need_quant = fuse_fp4_quant or _splitk_fq
+    _need_sort = _need_quant and (fuse_sort_scale or _splitk_fq)
 
     _sort_block_m = max(32, tile_m)
     _all_blks = sorted_expert_ids.shape[0]
-    _dense_blks = min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0]) // _sort_block_m
+    _dense_blks = (
+        min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
+        // _sort_block_m
+    )
     _grid_y = min(_dense_blks, _all_blks)
 
     _persist_m = persist_m if persist_m > 0 else 1
 
     # Allocate sorted-scale buffer with padding for tiled layout
     scale_cols = inter_dim // 32
-    sorted_size = max(sorted_token_ids.shape[0],
-                      sorted_expert_ids.shape[0] * _sort_block_m)
+    sorted_size = max(
+        sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * _sort_block_m
+    )
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
     out_scale_sorted_flat = (
         torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
-        if _need_sort else torch.empty(0, dtype=torch.uint8, device=dev)
+        if _need_sort
+        else torch.empty(0, dtype=torch.uint8, device=dev)
     )
+
+    # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
+    # handles activation + quant + scale-sort after the GEMM completes.
+    _gemm_fq = fuse_fp4_quant and not _is_splitk
+    _gemm_fss = fuse_sort_scale and not _is_splitk
 
     tensor_api = _get_compiled_stage1(
         model_dim=model_dim,
@@ -709,8 +733,8 @@ def flydsl_moe_stage1(
         out_dtype=out_dtype,
         act=act,
         persist_m=_persist_m,
-        fuse_fp4_quant=fuse_fp4_quant,
-        fuse_sort_scale=fuse_sort_scale,
+        fuse_fp4_quant=_gemm_fq,
+        fuse_sort_scale=_gemm_fss,
         use_async_copy=use_async_copy,
         k_batch=k_batch,
         waves_per_eu=waves_per_eu,
@@ -734,28 +758,27 @@ def flydsl_moe_stage1(
         out_scale_sorted=out_scale_sorted_flat.view(-1),
     )
 
-    if _is_splitk:
-        if fuse_fp4_quant:
-            from aiter.ops.triton.quant.fused_mxfp4_quant import (
-                fused_silu_mxfp4_quant_moe_sort,
-            )
+    if _splitk_fq:
+        _silu_fq = _get_compiled_silu_fq(inter_dim, topk)
+        num_sorted_rows = sorted_token_ids.shape[0]
+        token_num_t = torch.tensor([token_num], dtype=torch.int32, device=dev)
+        _silu_fq(
+            tmp_out.view(-1, inter_dim * 2),
+            out.view(-1),
+            out_scale_sorted_flat,
+            sorted_token_ids,
+            num_valid_ids,
+            token_num_t,
+            num_sorted_rows,
+        )
+    elif _is_splitk:
+        from aiter.ops.activation import silu_and_mul
 
-            M_flat = token_num * topk
-            out, out_scale_sorted = fused_silu_mxfp4_quant_moe_sort(
-                tmp_out.view(M_flat, inter_dim * 2),
-                out.view(M_flat, inter_dim // 2).view(torch.uint8),
-                sorted_token_ids,
-                num_valid_ids,
-                token_num,
-                topk,
-            )
-            return out, out_scale_sorted
-        else:
-            from aiter.ops.activation import silu_and_mul
-            silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
 
     if fuse_fp4_quant:
         from aiter.utility.dtypes import fp8_e8m0
+
         out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(
             padded_rows, padded_cols
         )

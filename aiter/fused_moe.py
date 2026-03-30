@@ -622,6 +622,7 @@ class MOEMetadata:
     run_1stage: bool = False
     has_bias: bool = False
     use_non_temporal_load: bool = True
+    fuse_fp4_quant: bool = False
 
 
 def _flydsl_stage1_wrapper(
@@ -648,6 +649,8 @@ def _flydsl_stage1_wrapper(
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    _fq = fuse_fp4_quant or parsed.get("fuse_fp4_quant", False)
+    _fss = fuse_sort_scale or (_fq and not fuse_sort_scale)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
@@ -666,8 +669,8 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
-        fuse_fp4_quant=fuse_fp4_quant,
-        fuse_sort_scale=fuse_sort_scale,
+        fuse_fp4_quant=_fq,
+        fuse_sort_scale=_fss,
     )
 
 
@@ -837,13 +840,11 @@ def get_2stage_cfgs(
             return False
         return True
 
-    # cfg = cfg_2stages.get(keys, None)
     cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
-        # cfg = cfg_2stages.get(keys, None)
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
@@ -946,11 +947,6 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if run_1stage:
-        # never hard code block_m for 1-stage since it can be tuned by kernel itself, and we have different heuristics for different quant types
-        # # TODO: enable this approach for other quant types and archs
-        # if q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
-        #     tkn_per_epr = token * topk // expert
-        #     block_m = 64 if tkn_per_epr > 32 else block_m
         return MOEMetadata(
             functools.partial(
                 fused_moe_1stage,
@@ -966,6 +962,7 @@ def get_2stage_cfgs(
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+        _s1_fq = is_flydsl1 and "_fq" in kernelName1
         if is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
@@ -1003,6 +1000,7 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
+            fuse_fp4_quant=_s1_fq,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -1288,7 +1286,17 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    if (
+    if metadata.fuse_fp4_quant and isinstance(a2, tuple):
+        a2_raw, a2_scale = a2[0], a2[1]
+        _inter = a2_raw.shape[-1]
+        _fp4_bytes = token_num * topk * (_inter // 2)
+        a2 = (
+            a2_raw.view(-1)
+            .view(torch.uint8)[:_fp4_bytes]
+            .view(dtypes.fp4x2)
+            .reshape(token_num, topk, -1)
+        )
+    elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
@@ -1802,7 +1810,6 @@ def cktile_moe_stage1(
         else out
     )
 
-    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
@@ -1851,16 +1858,7 @@ def cktile_moe_stage2(
 ):
     token_num = a2.shape[0]
     D = w2.shape[1]
-    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
-    # out = torch.empty(
-    #     (token_num, D),
-    #     dtype=a2.dtype,
-    #     device=a2.device,
-    # )
-    # if zeros_out:
-    #     out.fill_(0)
-    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,
@@ -1941,8 +1939,5 @@ def fused_topk(
         )
 
     del token_expert_indicies  # Not used. Will be used in the future.
-
-    # if renormalize:
-    #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
