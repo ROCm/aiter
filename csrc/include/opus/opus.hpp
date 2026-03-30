@@ -2265,8 +2265,8 @@ struct wmma {
 
     // Scaled WMMA dispatch (gfx1250: f8f6f4 / f4 with E8M0 block-scale)
     // scale_a, scale_b are per-lane E8M0 exponent values; 127 = no scaling (2^0 = 1.0).
-    // BX32: int — 4 packed E8M0 bytes (byte 0 used with scale_sel=0, scale_fmt=0).
-    // BX16: long — 8 packed E8M0 bytes.
+    // BX32: int -- 4 packed E8M0 bytes (byte 0 used with scale_sel=0, scale_fmt=0).
+    // BX16: long -- 8 packed E8M0 bytes.
     // matrix_a_scale_sel controls OPSEL: 0=scale from lanes 0-15, 1=scale from lanes 16-31.
 
     // BX32 scaled dispatch

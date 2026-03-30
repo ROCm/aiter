@@ -281,6 +281,28 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
+    TORCH_CHECK(XQ.stride(-1) == 1,
+                "CKTile blockscale GEMM: XQ inner dim must be contiguous, "
+                "got strides=[",
+                XQ.stride(0),
+                ",",
+                XQ.stride(1),
+                "]");
+    TORCH_CHECK(WQ.stride(-1) == 1,
+                "CKTile blockscale GEMM: WQ inner dim must be contiguous, "
+                "got strides=[",
+                WQ.stride(0),
+                ",",
+                WQ.stride(1),
+                "]");
+    TORCH_CHECK(Y.stride(-1) == 1,
+                "CKTile blockscale GEMM: Y inner dim must be contiguous, "
+                "got strides=[",
+                Y.stride(0),
+                ",",
+                Y.stride(1),
+                "]");
+
     // M, N, K
     const int M = XQ.size(0);
     const int N = WQ.size(0);
@@ -306,8 +328,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     }
     else if(!eight_waves && PreshuffleB)
     {
-        x_scale_t =
-            x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
+        x_scale_t   = x_scale.view({x_scale.size(1), x_scale.size(0)}).transpose(0, 1).contiguous();
         args.aq_ptr = x_scale_t.data_ptr();
     }
     else
@@ -329,13 +350,15 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     const int BQK = ck_tile::integer_divide_ceil(K, BQuantGroupSize::kK);
     const int BQN = ck_tile::integer_divide_ceil(N, BQuantGroupSize::kN);
 
-    const int stride_A = K;
-    const int stride_B = K;
-    const int stride_C = N;
-    // const int stride_AQ = AQK;
-    const int stride_AQ = eight_waves ? M    // Col-Major
-                                      : AQK; // Row-Major
-    const int stride_BQ = BQK;
+    // Read leading-dimension strides from tensor metadata instead of
+    // assuming dense layout.  vLLM's _maybe_pad_fp8_weight can produce
+    // row-major tensors whose leading-dimension stride exceeds the
+    // logical column count (e.g. shape [N,K] with stride [K+pad, 1]).
+    const int stride_A  = XQ.stride(0);
+    const int stride_B  = WQ.stride(0);
+    const int stride_C  = Y.stride(0);
+    const int stride_AQ = eight_waves ? M : static_cast<int>(x_scale.stride(0));
+    const int stride_BQ = w_scale.stride(0);
 
     args.QK_A      = AQK;
     args.QK_B      = BQK;

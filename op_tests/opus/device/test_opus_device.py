@@ -837,7 +837,7 @@ def test_mxfp4_16x16x128(mod):
     return _test_mxfp4(mod, "mxfp4_16x16x128", 16, 16, 128)
 
 
-# ── WMMA Scale tests (gfx1250 only) ─────────────────────────────────────────
+# -- WMMA Scale tests (gfx1250 only) -----------------------------------------
 
 _WMMA_SCALE_ARCHS = {"gfx1250"}
 
@@ -1006,7 +1006,7 @@ def test_tiled_wmma_scale_fp8_4x1(mod):
     )
 
 
-# ── WMMA Scale tests with random per-row/col scale values ───────────────────
+# -- WMMA Scale tests with random per-row/col scale values -------------------
 
 
 def _pack_bx32_scales(exponents):
