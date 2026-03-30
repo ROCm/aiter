@@ -216,7 +216,6 @@ def run_benchmark(custom, args):
 
     @triton.testing.perf_report(create_benchmark_configs(custom, args))
     def bench_mha(
-        
         BATCH,
         HQ,
         HK,

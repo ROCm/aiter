@@ -153,9 +153,9 @@ def _synth_q_lens(total: int, num_seqs: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(num_seqs)]
 
 
-def bench_ck(s: Shape, warmup: int, iters: int) -> float:
+def bench_ck(s: Shape, warmup: int, iters: int, created_input=None) -> float:
     blk = _ck_block_size(s)
-    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = make_tensors(s, block_size_override=blk)
+    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input # make_tensors(s, block_size_override=blk)
     out = torch.empty_like(q)
     mask_type = 2  # causal
 
@@ -175,12 +175,12 @@ def bench_ck(s: Shape, warmup: int, iters: int) -> float:
             scale_s=scale, scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
         )
     torch.cuda.synchronize()
-    return (time.perf_counter() - t0) * 1e3 / iters
+    return (time.perf_counter() - t0) * 1e3 / iters, out
 
 
-def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None) -> float:
-    blk = _ck_block_size(s)
-    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = make_tensors(s, block_size_override=blk)
+def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None, created_input=None) -> float:
+    # blk = _ck_block_size(s)
+    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input # make_tensors(s, block_size_override=blk)
     out = torch.empty_like(q)
 
     kw = dict(
@@ -212,7 +212,7 @@ def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None
         for _ in range(iters):
             ua_mod.unified_attention(**kw)
         torch.cuda.synchronize()
-        return (time.perf_counter() - t0) * 1e3 / iters
+        return (time.perf_counter() - t0) * 1e3 / iters, out
     finally:
         ua_mod.use_2d_kernel = saved
 
@@ -277,8 +277,10 @@ def main() -> int:
                   f"{s.max_seqlen_q:6d} {s.max_seqlen_k:6d} "
                   f"{s.num_query_heads:3d}/{s.num_kv_heads:<2d} {s.head_size:4d} {count:4d}")
 
+        blk = _ck_block_size(s)
+        created_input = make_tensors(s, block_size_override=blk)
         try:
-            ck_ms = bench_ck(s, warmup=args.warmup, iters=args.iters)
+            ck_ms, out_ck = bench_ck(s, warmup=args.warmup, iters=args.iters, created_input=created_input)
         except Exception as e:
             print(f"{prefix} CK err: {e}")
             stats["errors"] += 1
@@ -288,8 +290,8 @@ def main() -> int:
             continue
 
         try:
-            t2d = bench_triton(s, warmup=args.warmup, iters=args.iters, force_2d=True)
-            t3d = bench_triton(s, warmup=args.warmup, iters=args.iters, force_2d=False)
+            t2d, out_triton_2d = bench_triton(s, warmup=args.warmup, iters=args.iters, force_2d=True, created_input=created_input)
+            t3d, out_triton_3d = bench_triton(s, warmup=args.warmup, iters=args.iters, force_2d=False, created_input=created_input)
         except Exception as e:
             print(f"{prefix} {ck_ms:8.4f} Triton err: {e}")
             stats["errors"] += 1
@@ -298,6 +300,21 @@ def main() -> int:
                              s.head_size, count, ck_ms, "", "", "", f"triton_error:{e}"])
             continue
 
+        # print("triton outputs: 2D vs 3D")
+        # print("  out_triton_2d:", out_triton_2d.flatten()[:5])
+        # print("  out_triton_3d:", out_triton_3d.flatten()[:5])
+        # print("  out_ck:       ", out_ck.flatten()[:5])
+        try:
+            torch.testing.assert_close(out_ck, out_triton_2d, rtol=1e-2, atol=1e-2)
+        except Exception as e:
+            print(f"{prefix} output mismatch CK vs Triton 2D: {e}")
+            stats["errors"] += 1
+            csv_rows.append([i, phase, s.num_seqs, s.total_q_tokens, s.max_seqlen_q,
+                             s.max_seqlen_k, s.num_query_heads, s.num_kv_heads,
+                             s.head_size, count, f"{ck_ms:.6f}", f"{t2d:.6f}", f"{t3d:.6f}",
+                             "", f"output_mismatch_ck_vs_t2d:{e}"])
+            continue
+        
         best_triton = min(t2d, t3d)
         best_label = "2D" if t2d <= t3d else "3D"
         ratio = ck_ms / best_triton if best_triton > 0 else float("inf")
