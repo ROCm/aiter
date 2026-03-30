@@ -17,6 +17,7 @@
 
 import functools
 import os
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
@@ -27,6 +28,7 @@ from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
+from aiter.ops.flydsl import flydsl_hgemm
 from torch import Tensor
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -47,6 +49,61 @@ tuned_df = pd.DataFrame(
         "bpreshuffle",
     ]
 )
+
+
+@functools.lru_cache(maxsize=1)
+def get_GEMM_A16W16_flydsl_tuned_files_():
+    model_config_dir = Path(this_dir) / "configs" / "model_configs"
+    tuned_files = [
+        str(path)
+        for path in sorted(model_config_dir.glob("*_flydsl_bf16_tuned_gemm.csv"))
+        if path.is_file() and "untuned" not in str(path)
+    ]
+    dedup_files = []
+    for tuned_file in tuned_files:
+        if tuned_file not in dedup_files and os.path.exists(tuned_file):
+            dedup_files.append(tuned_file)
+    return tuple(dedup_files)
+
+
+@functools.lru_cache(maxsize=1)
+def get_GEMM_A16W16_flydsl_config_():
+    tuned_files = get_GEMM_A16W16_flydsl_tuned_files_()
+    gemm_dict = {}
+    if tuned_files:
+        merge_df = pd.concat(
+            [pd.read_csv(tuned_file) for tuned_file in tuned_files], ignore_index=True
+        )
+        if not merge_df.empty:
+            merge_df = merge_df[merge_df["libtype"] == "flydsl"].sort_values("us")
+            merge_df = merge_df.drop_duplicates(
+                subset=[
+                    "cu_num",
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ],
+                keep="first",
+            )
+            gemm_dict = merge_df.set_index(
+                [
+                    "cu_num",
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ]
+            ).to_dict("index")
+    return gemm_dict
 
 
 @functools.lru_cache(maxsize=1)
@@ -83,12 +140,34 @@ def get_GEMM_A16W16_config(
     bpreshuffle: bool = False,
 ):
     cfg = get_GEMM_A16W16_config_()
+    flydsl_cfg = get_GEMM_A16W16_flydsl_config_()
     cu_num = get_cu_num()
     padded_M = M
     config = None
 
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
+        if flydsl_cfg:
+            config = flydsl_cfg.get(
+                (
+                    cu_num,
+                    padded_M,
+                    N,
+                    K,
+                    bias,
+                    str(dtype),
+                    str(otype),
+                    scaleAB,
+                    bpreshuffle,
+                ),
+                None,
+            )
+            if config is not None:
+                if AITER_LOG_TUNED_CONFIG:
+                    logger.info(
+                        f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {os.pathsep.join(get_GEMM_A16W16_flydsl_tuned_files_())}, libtype is {config['libtype']}, kernel name is {config['kernelName']}"
+                    )
+                return config
         config = cfg.get(
             (
                 cu_num,
@@ -193,6 +272,19 @@ def save_shapes(
         tuned_df.to_csv(untune_path, index=False)
 
 
+def _get_config_int(config: dict, key: str, default: int) -> int:
+    value = config.get(key, default)
+    if value is None or value == "":
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except TypeError:
+        pass
+    value = int(value)
+    return default if value < 0 else value
+
+
 def gen_gemm_a16w16_fake_tensor(
     A: Tensor,
     B: Tensor,
@@ -250,6 +342,23 @@ def gemm_a16w16(
         kernelName = config["kernelName"]
         splitK = config["splitK"]
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
+    elif config is not None and config["libtype"] == "flydsl":
+        out = flydsl_gemm(
+            inp_view,
+            B,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            tile_k=config["tile_k"],
+            tile_m=config["tile_m"],
+            tile_n=config["tile_n"],
+            pack_n=_get_config_int(config, "pack", 1),
+            stages=_get_config_int(config, "stages", 2),
+            split_k=_get_config_int(config, "splitK", 1),
+            bpreshuffle=bpreshuffle,
+        )
     else:
         solution_idx = config["solidx"]
         solfunc = solMap[config["libtype"]]
@@ -389,6 +498,43 @@ def asm_gemm(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
+
+
+def flydsl_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    *,
+    tile_k: int,
+    tile_m: int,
+    tile_n: int,
+    pack_n: int = 1,
+    stages: int = 2,
+    split_k: int = 1,
+    bpreshuffle: bool = False,
+):
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "FlyDSL hgemm does not support scaling yet."
+    out = flydsl_hgemm(
+        inp,
+        weights,
+        tile_k=int(tile_k),
+        tile_m=int(tile_m),
+        tile_n=int(tile_n),
+        pack_n=int(pack_n),
+        stages=int(stages),
+        split_k=int(split_k),
+        b_preshuffle=bpreshuffle,
+    )
+    if bias is not None:
+        out = out if otype is None else out.to(otype)
+        out = out + bias
+    return out
 
 
 def triton_gemm(
