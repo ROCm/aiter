@@ -816,7 +816,6 @@ def flydsl_moe_stage2(
         valid_m_blocks = min(_dense_blks, _all_blks)
 
     # _persist_m = 4 if valid_m_blocks > 256 else 1
-    print(valid_m_blocks)
     _persist_m = 1
 
     tensor_api = _get_compiled_stage2(
@@ -837,6 +836,190 @@ def flydsl_moe_stage2(
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
         total_threads=total_threads,
+    )
+    tensor_api(
+        out,
+        inter_states,
+        w2,
+        flat_a_scale,
+        flat_w_scale,
+        sorted_token_ids,
+        sorted_expert_ids,
+        sw,
+        num_valid_ids,
+        token_num,
+        valid_m_blocks,
+    )
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Stage2 small-shape kernel (FP4, BLOCKSIZE=64, no K-loop)
+# ---------------------------------------------------------------------------
+
+@functools.cache
+def _get_compiled_stage2_small(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    swap_ab: bool = False,
+):
+    from .kernels.mixed_moe_gemm_2stage_small import compile_mixed_moe_gemm2_small
+
+    exe = compile_mixed_moe_gemm2_small(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=experts,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        swap_ab=swap_ab,
+    )
+    _n_in = model_dim
+    _k_in = inter_dim
+
+    def tensor_api(
+        out: torch.Tensor,
+        a: torch.Tensor,
+        w: torch.Tensor,
+        a_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        sorted_expert_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        num_valid_ids: torch.Tensor,
+        token_num: int,
+        blocks: int,
+    ) -> None:
+        _clear_stale_ir_context()
+
+        empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
+        stream = torch.cuda.current_stream()
+        _a = (
+            a.view(torch.uint8)
+            if a.dtype
+            not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+            else a
+        )
+        _w = (
+            w.view(torch.uint8)
+            if w.dtype
+            not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+            else w
+        )
+        _as = (
+            a_scale.view(torch.uint8)
+            if a_scale is not None
+            and a_scale.numel() > 0
+            and a_scale.dtype
+            not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+            else a_scale
+        )
+        _ws = (
+            w_scale.view(torch.uint8)
+            if w_scale is not None
+            and w_scale.numel() > 0
+            and w_scale.dtype
+            not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+            else w_scale
+        )
+        exe(
+            out,
+            _a,
+            _w,
+            _as,
+            _ws,
+            sorted_ids,
+            sorted_expert_ids,
+            topk_weights,
+            num_valid_ids,
+            empty_bias,
+            token_num,
+            _n_in,
+            _k_in,
+            blocks,
+            stream,
+        )
+
+    return tensor_api
+
+
+def flydsl_moe_stage2_small(
+    inter_states: torch.Tensor,
+    w2: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 32,
+    tile_n: int = 32,
+    swap_ab: bool = False,
+    w2_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    sorted_weights: Optional[torch.Tensor] = None,
+    valid_m_blocks: Optional[int] = None,
+) -> torch.Tensor:
+    """Stage2 small-shape kernel (FP4, BLOCKSIZE=64, no K-loop).
+
+    Optimized for small token counts with inter_dim=256 or 512.
+    Always uses AtomicAdd bf16x2 output with topk_weight multiplication.
+
+    swap_ab: if True, swap MFMA operands for a direct epilogue (no CShuffle).
+
+    Args:
+        inter_states: (token_num, topk, inter_dim/2) fp4x2 packed
+        w2: (E, model_dim, inter_dim/2) preshuffled fp4x2
+        sorted_token_ids, sorted_expert_ids, num_valid_ids: from moe_sorting
+        w2_scale: (E, model_dim, inter_dim/32) preshuffled E8M0 scales
+        a2_scale: pre-sorted A scales
+        sorted_weights: topk weights in sorted order
+    """
+    token_num = inter_states.shape[0]
+    E = w2.shape[0]
+    model_dim = w2.shape[1]
+    inter_dim = inter_states.shape[2] * 2  # fp4x2 -> FP4 elements
+
+    torch_out_dtype = torch.bfloat16
+    if out is None:
+        out = torch.zeros(
+            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
+        )
+
+    dev = inter_states.device
+    flat_a_scale = (
+        a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
+    )
+    flat_w_scale = (
+        w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
+    )
+    sw = (
+        sorted_weights
+        if sorted_weights is not None
+        else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
+    )
+
+    if valid_m_blocks is None:
+        _sort_block_m = max(32, tile_m)
+        _all_blks = int(sorted_expert_ids.numel())
+        _dense_blks = min(
+            token_num * topk * _sort_block_m, sorted_token_ids.shape[0]
+        ) // _sort_block_m
+        valid_m_blocks = min(_dense_blks, _all_blks)
+
+    tensor_api = _get_compiled_stage2_small(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        swap_ab=swap_ab,
     )
     tensor_api(
         out,

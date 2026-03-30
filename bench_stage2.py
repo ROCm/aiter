@@ -27,7 +27,7 @@ from aiter.fused_moe import (
 )
 from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4
 from aiter.utility.fp4_utils import e8m0_shuffle, moe_mxfp4_sort
-from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2, flydsl_moe_stage2_small
 from aiter.ops.moe_op import ck_moe_stage2_fwd
 
 torch.set_default_device("cuda")
@@ -200,6 +200,40 @@ def fn_stage2(a2_qt, w2_qt_shuf, sorted_ids, sorted_expert_ids,
     )
 
 
+def call_stage2_small(d, topk, block_m, tile_n=32, swap_ab=False):
+    return flydsl_moe_stage2_small(
+        inter_states=d["a2_qt"],
+        w2=d["w2_qt_shuf"],
+        sorted_token_ids=d["sorted_ids"],
+        sorted_expert_ids=d["sorted_expert_ids"],
+        num_valid_ids=d["num_valid_ids"],
+        topk=topk,
+        tile_m=block_m, tile_n=tile_n,
+        swap_ab=swap_ab,
+        w2_scale=d["w2_scale_shuf"],
+        a2_scale=d["a2_scale_sort"],
+        sorted_weights=d["sorted_weights"],
+    )
+
+
+def fn_stage2_small(a2_qt, w2_qt_shuf, sorted_ids, sorted_expert_ids,
+                    num_valid_ids, w2_scale_shuf, a2_scale_sort,
+                    sorted_weights, topk, block_m, tile_n=32, swap_ab=False):
+    return flydsl_moe_stage2_small(
+        inter_states=a2_qt,
+        w2=w2_qt_shuf,
+        sorted_token_ids=sorted_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        topk=topk,
+        tile_m=block_m, tile_n=tile_n,
+        swap_ab=swap_ab,
+        w2_scale=w2_scale_shuf,
+        a2_scale=a2_scale_sort,
+        sorted_weights=sorted_weights,
+    )
+
+
 def call_ck_stage2(d, topk, block_m):
     token_num = d["a2_qt"].shape[0]
     model_dim = d["model_dim"]
@@ -238,8 +272,8 @@ def main():
     parser.add_argument("--num-iters", type=int, default=100)
     parser.add_argument("--num-warmup", type=int, default=50)
     parser.add_argument("--csv", type=str, default=CSV_PATH)
-    parser.add_argument("--atol", type=float, default=1.0)
-    parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument("--atol", type=float, default=0.001)
+    parser.add_argument("--rtol", type=float, default=0.001)
     parser.add_argument("--swap-ab", action="store_true",
                         help="Also benchmark swap_ab variant")
     parser.add_argument("-t", "--tokens", type=int, nargs="+", default=None,
@@ -254,6 +288,10 @@ def main():
                         help="Block sizes to benchmark (default: 256). Must be multiples of 64.")
     parser.add_argument("--ck", action="store_true",
                         help="Also benchmark CK baseline for comparison")
+    parser.add_argument("--small", action="store_true",
+                        help="Also benchmark small-shape kernel (BLOCKSIZE=64, tile_n=32)")
+    parser.add_argument("--small-tile-n", type=int, nargs="+", default=[32],
+                        help="tile_n values to sweep for small kernel (default: 32)")
     args = parser.parse_args()
 
     cases = load_cases(args.csv, token_filter=args.tokens)
@@ -271,6 +309,8 @@ def main():
         topk = c["topk"]
         model_dim = c["model_dim"]
         inter_dim = c["inter_dim"]
+        # inter_dim = 512
+        inter_dim = 512
 
         torch.cuda.empty_cache()
         print(f"\n  token={token:>5d}  block_m={block_m}  "
@@ -384,6 +424,48 @@ def main():
                 print(f"  {us_ck:.2f} us  [{prec_ck}]")
                 r.update(us_ck=us_ck, err_ck=err_ck, prec_ck=prec_ck)
 
+            # Small kernel (only once per tile_n, not per total_threads)
+            if args.small and tw == args.total_threads[0]:
+              for stn in args.small_tile_n:
+                for sab in ([False, True] if args.swap_ab else [False]):
+                  sab_suffix = "_sab" if sab else ""
+                  stag = f"sm_tn{stn}{sab_suffix}"
+                  try:
+                    small_out = call_stage2_small(
+                        d, topk, block_m, tile_n=stn, swap_ab=sab,
+                    )
+                    torch.cuda.synchronize()
+
+                    err_small = checkAllclose(
+                        ref, small_out,
+                        rtol=args.rtol, atol=args.atol,
+                        msg=f"    [t={token},{tag},{stag}] ",
+                    )
+                    prec_small = "PASS" if err_small == 0 else (
+                        "WARN" if err_small <= 0.05 else "FAIL")
+
+                    small_common = (
+                        d["a2_qt"], d["w2_qt_shuf"],
+                        d["sorted_ids"], d["sorted_expert_ids"], d["num_valid_ids"],
+                        d["w2_scale_shuf"], d["a2_scale_sort"],
+                        d["sorted_weights"],
+                        topk, block_m, stn, sab,
+                    )
+                    print(f"    perf ({tag},{stag})...", end="", flush=True)
+                    _, us_small = run_perftest(
+                        fn_stage2_small, *small_common,
+                        num_iters=ni, num_warmup=nw,
+                    )
+                    print(f"  {us_small:.2f} us  [{prec_small}]")
+                    r[f'us_{stag}'] = us_small
+                    r[f'err_{stag}'] = err_small
+                    r[f'prec_{stag}'] = prec_small
+                  except Exception as e:
+                    print(f"    {stag} failed: {e}")
+                    r[f'us_{stag}'] = 0.0
+                    r[f'err_{stag}'] = 0.0
+                    r[f'prec_{stag}'] = "ERR"
+
             results.append(r)
 
     # Summary
@@ -392,6 +474,7 @@ def main():
     print(f"{'='*150}")
     has_swap = args.swap_ab
     has_ck = args.ck
+    has_small = args.small
 
     cols = [f"{'token':>5s}", f"{'bm':>3s}", f"{'tn':>4s}", f"{'tw':>4s}",
             f"{'flydsl':>10s}", f"{'prec':>4s}"]
@@ -399,6 +482,14 @@ def main():
         cols += [f"{'swap_ab':>10s}", f"{'prec':>4s}", f"{'spd_swap':>8s}"]
     if has_ck:
         cols += [f"{'ck':>10s}", f"{'prec':>4s}", f"{'spd_ck':>8s}"]
+    small_tags = []
+    if has_small:
+        for stn in args.small_tile_n:
+            for sab in ([False, True] if has_swap else [False]):
+                sab_suffix = "_sab" if sab else ""
+                stag = f"sm_tn{stn}{sab_suffix}"
+                small_tags.append(stag)
+                cols += [f"{stag:>10s}", f"{'prec':>4s}", f"{'spd':>8s}"]
     print("  " + "  ".join(cols))
     print("  " + "  ".join("-" * len(c.strip()) for c in cols))
 
@@ -414,6 +505,13 @@ def main():
             spd_ck = r['us_baseline'] / r['us_ck'] if r['us_ck'] > 0 else 0.0
             parts += [f"{r['us_ck']:>10.2f}", f"{r['prec_ck']:>4s}",
                       f"{spd_ck:>7.2f}x"]
+        if has_small:
+          for stag in small_tags:
+            us_sm = r.get(f'us_{stag}', 0.0)
+            prec_sm = r.get(f'prec_{stag}', 'N/A')
+            spd_sm = r['us_baseline'] / us_sm if us_sm > 0 else 0.0
+            parts += [f"{us_sm:>10.2f}", f"{prec_sm:>4s}",
+                      f"{spd_sm:>7.2f}x"]
         print("  " + "  ".join(parts))
 
 

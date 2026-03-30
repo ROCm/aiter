@@ -2519,6 +2519,9 @@ def compile_mixed_moe_gemm2(
                     _tid_val = buffer_ops.buffer_load(
                         sorted_rsrc, _tid_row, vec_width=1, dtype=T.i32
                     )
+                    _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
+                    vector.store(_tid_vec1, lds_tid, [tx])
+                    scf.YieldOp([])
 
                 # Prologue -- B-first.
                 k0 = arith.index(0)
@@ -2531,10 +2534,6 @@ def compile_mixed_moe_gemm2(
                 if not use_async_copy:
                     store_x_tile_to_lds(x_regs0, lds_base_cur)
                 # Preload sorted_idx into lds_tid for epilogue precompute_row
-                with ir.InsertionPoint(_if_tid.then_block):
-                    _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
-                    vector.store(_tid_vec1, lds_tid, [tx])
-                    scf.YieldOp([])
                 gpu.barrier()
 
                 acc = [acc_init] * num_acc_n * m_repeat
@@ -2648,6 +2647,7 @@ def compile_mixed_moe_gemm2(
                             )
 
                 if odd_k_tiles:
+                    epilogue_pf = None
                     if use_async_copy:
                         acc, epilogue_pf = compute_tile(
                             acc,
@@ -2668,22 +2668,22 @@ def compile_mixed_moe_gemm2(
                             a0_prefetch=a0_prefetch_pong,
                             prefetch_epilogue=True,
                         )
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(2)
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(2)
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(2)
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(2)
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(2)
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(2)
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(2)
-                    rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(2)
+                    # rocdl.sched_dsrd(2)
+                    # rocdl.sched_mfma(2)
+                    # rocdl.sched_dsrd(2)
+                    # rocdl.sched_mfma(2)
+                    # rocdl.sched_dsrd(2)
+                    # rocdl.sched_mfma(2)
+                    # rocdl.sched_dsrd(2)
+                    # rocdl.sched_mfma(2)
+                    # rocdl.sched_vmem(1)
+                    # rocdl.sched_mfma(2)
+                    # rocdl.sched_vmem(1)
+                    # rocdl.sched_mfma(2)
+                    # rocdl.sched_vmem(1)
+                    # rocdl.sched_mfma(2)
+                    # rocdl.sched_vmem(1)
+                    # rocdl.sched_mfma(2)
                     rocdl.sched_barrier(0)
                 else:
                     # Tail: 2 remaining tiles.
