@@ -641,7 +641,7 @@ def build_module(
                 f"{AITER_CSRC_DIR}/include",
                 f"{op_dir}/blob",
             ] + extra_include
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
         else:
             old_bd_include_dir = f"{op_dir}/build/include"
@@ -653,7 +653,7 @@ def build_module(
                 hipify,
             )
 
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 bd_include_dir = f"{op_dir}/build/include/torch"
                 os.makedirs(bd_include_dir, exist_ok=True)
                 rename_cpp_to_cu(

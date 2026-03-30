@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 import sys
 import os
 import argparse
@@ -36,6 +36,8 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": [flag_use_v3],
+        "torch_exclude": True,
+        "is_python_module": False,
     }
 
 
@@ -60,6 +62,8 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": flags_extra_cc,
+        "torch_exclude": True,
+        "is_python_module": False,
     }
 
 
