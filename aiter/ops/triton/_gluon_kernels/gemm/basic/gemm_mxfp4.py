@@ -87,7 +87,7 @@ def depreshuffle_b_raw_to_kn(
 
 
 @gluon.jit
-def unswizzle_mx_scale_gfx1250(
+def unshuffle_mx_scale_gfx1250(
     scale_buffer_slice,
     BLOCK_N: gl.constexpr,
     MX_SCALE_BLOCK_K: gl.constexpr,
@@ -387,11 +387,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
         if BLOCK_SIZE_M < 32:
             AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
         else:
-            AS = unswizzle_mx_scale_gfx1250(
+            AS = unshuffle_mx_scale_gfx1250(
                 smem_ASraw.index(slot_c), BLOCK_SIZE_M, K_GROUPS,
                 PRESHUFFLE_FACTOR, SCALE_KWIDTH,
             ).load(layout=a_scale_layout)
-        BS = unswizzle_mx_scale_gfx1250(
+        BS = unshuffle_mx_scale_gfx1250(
             smem_BSraw.index(slot_c), BLOCK_SIZE_N, K_GROUPS,
             PRESHUFFLE_FACTOR, SCALE_KWIDTH,
         ).load(layout=b_scale_layout)
@@ -417,11 +417,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
             if BLOCK_SIZE_M < 32:
                 AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
             else:
-                AS = unswizzle_mx_scale_gfx1250(
+                AS = unshuffle_mx_scale_gfx1250(
                     smem_ASraw.index(slot_c), BLOCK_SIZE_M, K_GROUPS,
                     PRESHUFFLE_FACTOR, SCALE_KWIDTH,
                 ).load(layout=a_scale_layout)
-            BS = unswizzle_mx_scale_gfx1250(
+            BS = unshuffle_mx_scale_gfx1250(
                 smem_BSraw.index(slot_c), BLOCK_SIZE_N, K_GROUPS,
                 PRESHUFFLE_FACTOR, SCALE_KWIDTH,
             ).load(layout=b_scale_layout)

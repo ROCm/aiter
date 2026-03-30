@@ -38,8 +38,8 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     return scales
 
 
-def swizzle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
-    """Swizzle scales for gfx1250 unswizzle pattern in the kernel."""
+def shuffle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
+    """Shuffle scales for gfx1250 unshuffle pattern in the kernel."""
     sm, sn = scales.shape
     scale_kwidth = 4 if sn >= 4 else sn
     num_chunk_n = sm // preshuffle_factor
@@ -51,14 +51,14 @@ def swizzle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
     return data
 
 
-def unswizzle_scales_gfx1250(scales_swizzled: torch.Tensor, preshuffle_factor: int = 32):
-    """Inverse of swizzle_scales_gfx1250."""
-    sm_packed, sn_packed = scales_swizzled.shape
+def unshuffle_scales_gfx1250(scales_shuffled: torch.Tensor, preshuffle_factor: int = 32):
+    """Inverse of shuffle_scales_gfx1250."""
+    sm_packed, sn_packed = scales_shuffled.shape
     sm = sm_packed * preshuffle_factor
     sn = sn_packed // preshuffle_factor
     scale_kwidth = 4 if sn >= 4 else sn
 
-    data = scales_swizzled.view(
+    data = scales_shuffled.view(
         sm // preshuffle_factor, sn // scale_kwidth,
         preshuffle_factor // 4, 4, scale_kwidth,
     )
@@ -124,10 +124,10 @@ def generate_gemm_afp4wfp4_inputs(
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
             if M >= 32:
-                x_scales_shuffled = swizzle_scales_gfx1250(x_scales, preshuffle_factor=32)
+                x_scales_shuffled = shuffle_scales_gfx1250(x_scales, preshuffle_factor=32)
             else:
                 x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = swizzle_scales_gfx1250(w_scales, preshuffle_factor=32)
+            w_scales_shuffled = shuffle_scales_gfx1250(w_scales, preshuffle_factor=32)
         else:
             if M >= 32:
                 x_scales_shuffled = shuffle_scales(x_scales)
