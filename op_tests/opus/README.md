@@ -18,6 +18,7 @@ op_tests/opus/
 │   ├── test_wmma_scale.cu       # WMMA scaled f8f6f4/f4 kernels (gfx1250 only)
 │   ├── test_vector_add.cu       # Vector addition kernel
 │   ├── test_async_load.cu       # Async global->LDS->global copy kernel
+│   ├── test_tr_load_f16.cu      # LDS transpose load kernel (gfx950 only)
 │   ├── test_dtype_convert.cu    # FP32<->BF16/FP16/FP8/FP4 round-trip kernels
 │   ├── test_load_store_if.cu    # Predicated load/store + free function API tests
 │   ├── test_numeric_limits.cu   # opus::numeric_limits kernel
@@ -228,6 +229,7 @@ In `device/test_opus_device.py`:
 | `test_mxfp` | mxfp4_16x16x128 | `mfma<fp4_t,fp4_t,fp32_t,16,16,128>` (scaled overload) | gfx950 |
 | `test_vector_add` | — | `make_gmem`, vectorized `load<N>` / `store<N>` | all |
 | `test_async_load` | — | `make_gmem`, `gmem::async_load`, `s_waitcnt_vmcnt` | all |
+| `test_tr_load_f16` | 32x16 fp16 | `tr_load`, `async_load`, `make_tiled_mma` 32×32×16, `partition_layout_b` | gfx950 |
 | `test_dtype_convert` | fp32<->bf16 scalar | `cast<bf16_t>(fp32_t)` RNE (explicit `0_I` on gfx942, hw default on gfx950) | all |
 | `test_dtype_convert` | fp32<->bf16 x4 vec | `cast<bf16_t>(fp32x4_t)` generic vectorized | all |
 | `test_dtype_convert` | fp32<->fp16 scalar | `cast<fp16_t>(fp32_t)` / `cast<fp32_t>(fp16_t)` | all |
@@ -254,7 +256,7 @@ In `device/test_opus_device.py`:
 | `test_wmma_scale` | per-lane scale fp8 | Random E8M0 per m-row/n-col, bitwise exact | gfx1250 |
 | `test_workgroup_barrier` | cumulative + streamk | `opus::workgroup_barrier` cross-workgroup synchronization | all |
 
-Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 vector_add + 1 async_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
+Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 vector_add + 1 async_load + 1 tr_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
 
 ## Notes
 

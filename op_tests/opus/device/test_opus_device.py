@@ -10,8 +10,9 @@ launcher functions, passing device pointers obtained from torch tensors.
 Covers:
   - MFMA variants (fp32, fp16, bf16, fp8, bf8)
   - MXFP variants (fp8, fp4) -- gfx950 only
-  - vector_add, async_load, dtype_convert, predicated_copy, free_func_add,
-    predicated_async_load, numeric_limits, finfo, mdiv, workgroup_barrier
+  - vector_add, async_load, tr_load_f16, dtype_convert, predicated_copy,
+    free_func_add, predicated_async_load, numeric_limits, finfo, mdiv,
+    workgroup_barrier
 """
 
 import ctypes
@@ -168,6 +169,13 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _I]
         fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
 
+    # -- tr_load_f16 --
+    def run_tr_load_f16(self, Src, Dst):
+        fn = self._lib.run_tr_load_f16
+        fn.restype = None
+        fn.argtypes = [_VP, _VP]
+        fn(self._ptr(Src), self._ptr(Dst))
+
     # -- dtype_convert --
     def run_dtype_convert(self, In, Out, variant):
         fn = getattr(self._lib, f"run_dtype_convert_{variant}")
@@ -252,6 +260,7 @@ _MFMA_ARCHS_GFX942 = {"gfx942"}  # 32x32x8, 16x16x16
 _MFMA_ARCHS_GFX942_GFX950 = {"gfx942", "gfx950"}  # 32x32x16, 16x16x32
 _MFMA_ALL = _MFMA_ARCHS_GFX942 | _MFMA_ARCHS_GFX942_GFX950  # all archs with MFMA
 _WMMA_ARCHS_GFX1250 = {"gfx1250"}  # WMMA 16x16x32 (wave32)
+_TR_LOAD_ARCHS_GFX950 = {"gfx950"}  # smem tr_load
 
 
 # FP8/BF8 torch dtypes differ by architecture:
@@ -1120,6 +1129,31 @@ def test_async_load(mod):
         )
         return 1
     print(f"  PASS: async_load (n={n}), bit-exact copy")
+    return 0
+
+
+def test_tr_load_f16(mod):
+    """16x32 row-major fp16 -> LDS -> tr_load -> MFMA B layout store; expect 32x16 = input.T."""
+    arch = _get_gpu_arch()
+    if arch not in _TR_LOAD_ARCHS_GFX950:
+        print(f"  SKIP: tr_load_f16 requires {_TR_LOAD_ARCHS_GFX950}, got '{arch}'")
+        return 0
+
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    inp = torch.randn(16, 32, device=device, dtype=torch.float16)
+    out = torch.empty(32, 16, device=device, dtype=torch.float16)
+    ref = inp.t().contiguous()
+
+    mod.run_tr_load_f16(inp, out)
+
+    ok = torch.equal(out, ref)
+    max_diff = (out.float() - ref.float()).abs().max().item()
+    if not ok:
+        diff_count = (out != ref).sum().item()
+        print(f"  FAIL: tr_load_f16 max_diff={max_diff:.4f}, {diff_count} mismatches")
+        return 1
+    print(f"  PASS: tr_load_f16 16x32 -> 32x16, max_diff={max_diff:.4f}")
     return 0
 
 
@@ -2030,6 +2064,7 @@ def main():
     failures += test_wmma_scale_16x16x128_fp8_bx32_scaled(mod)
     failures += test_vector_add(mod)
     failures += test_async_load(mod)
+    failures += test_tr_load_f16(mod)
     failures += test_dtype_convert_fp32_bf16(mod)
     failures += test_dtype_convert_fp32_fp16(mod)
     failures += test_dtype_convert_fp32_bf16_vec4(mod)
