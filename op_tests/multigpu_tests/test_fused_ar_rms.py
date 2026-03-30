@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import argparse
 import itertools
+import pandas as pd
 from aiter import dtypes
 
 from aiter.dist.parallel_state import (
@@ -308,65 +309,6 @@ def split_ar_rmsnorm(
 
 
 @benchmark()
-def test_split_ar_rmsnorm(
-    tp_size,
-    pp_size,
-    shape,
-    dtype,
-    withGraph=False,
-    distributed_init_method: Optional[str] = None,
-):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "49373"
-    pool = Pool(processes=tp_size)
-    ref = torch.zeros(shape, dtype=dtype)
-    rets = []
-    cpu_rslt = []
-    weight_list = []
-    res_inp = []
-    # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
-    n = shape[1]
-    eps = 1e-6
-    for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
-        res_inp.append(x)
-        ref += x
-        weight = torch.randn((n,), dtype=dtype)
-        weight_list.append(weight)
-        rets.append(
-            pool.apply_async(
-                split_ar_rmsnorm,
-                args=(
-                    tp_size,
-                    pp_size,
-                    i,
-                    x,
-                    weight,
-                    eps,
-                    withGraph,
-                    distributed_init_method,
-                ),
-            )
-        )
-    pool.close()
-    pool.join()
-    for i in range(tp_size):
-        host_rslt = F.rms_norm(
-            input=(ref + res_inp[i]),
-            normalized_shape=(ref.shape[-1],),
-            weight=weight_list[i],
-            eps=eps,
-        )
-        cpu_rslt.append(host_rslt)
-    rets = [el.get() for el in rets]
-    for out, us in rets:
-        msg = f"test_split_ar_rmsnorm: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        # print(cpu_rslt[out.device.index])
-        checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg)
-
-
-@benchmark()
 def test_fused_ar_rmsnorm(
     tp_size,
     pp_size,
@@ -427,16 +369,24 @@ def test_fused_ar_rmsnorm(
         cpu_rslt.append(host_rslt)
 
     rets = [el.get() for el in rets]
+    all_us = [us for _, us in rets]
+    atol = 5e-2 if post_per_token_quant else 1e-2
+    rtol = atol
+    max_err = 0.0
     for out, us in rets:
         msg = f"test_fused_ar_rmsnorm: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         # print(cpu_rslt[out.device.index])
-        if not post_per_token_quant:
-            checkAllclose(cpu_rslt[out.device.index], out.to(ref), msg=msg)
-        else:
-            checkAllclose(
-                cpu_rslt[out.device.index], out.to(ref), msg=msg, atol=5e-2, rtol=5e-2
-            )
+        err = checkAllclose(
+            cpu_rslt[out.device.index], out.to(ref), msg=msg, atol=atol, rtol=rtol
+        )
+        max_err = max(max_err, err)
         # checkAllclose(ref, out.to(ref), msg=msg)
+    suffix = "quant" if post_per_token_quant else "fused"
+    return {
+        f"{suffix}_min_us": min(all_us),
+        f"{suffix}_max_us": max(all_us),
+        f"{suffix}_err": max_err,
+    }
 
 
 def acc_test(
@@ -591,10 +541,9 @@ parser.add_argument(
     "-s",
     "--shape",
     type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
+    nargs="*",
     default=None,
-    help="shape. e.g. -s 128,8192",
+    help="shape(s). e.g. -s 128,8192 256,7168",
 )
 
 parser.add_argument(
@@ -627,6 +576,16 @@ parser.add_argument(
     help="open cudagraph. e.g. -g 1",
 )
 
+l_test_types = ["fused", "quant"]
+parser.add_argument(
+    "--test",
+    type=str,
+    choices=l_test_types,
+    nargs="*",
+    default=None,
+    help="test type(s) to run. e.g. --test fused quant",
+)
+
 
 if __name__ == "__main__":
     freeze_support()
@@ -636,7 +595,7 @@ if __name__ == "__main__":
     else:
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
-        l_shape = [args.shape]
+        l_shape = args.shape
     if args.tp is not None:
         l_tp = [args.tp]
     if args.pp is not None:
@@ -644,38 +603,54 @@ if __name__ == "__main__":
     if args.graphon is not None:
         print(args.graphon)
         l_graph = [args.graphon]
+    run_tests = args.test if args.test else l_test_types
+    df = []
     for dtype, shape, tp, pp, graph_on in itertools.product(
         l_dtype, l_shape, l_tp, l_pp, l_graph
     ):
-        test_split_ar_rmsnorm(
-            tp,
-            pp,
-            shape,
-            dtype,
-            withGraph=graph_on,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-        )
-        test_fused_ar_rmsnorm(
-            tp,
-            pp,
-            shape,
-            dtype,
-            withGraph=graph_on,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-            post_per_token_quant=False,
-        )
-        test_fused_ar_rmsnorm(
-            tp,
-            pp,
-            shape,
-            dtype,
-            withGraph=graph_on,
-            distributed_init_method=get_distributed_init_method(
-                get_ip(), get_open_port()
-            ),
-            post_per_token_quant=True,
-        )
+        row = {}
+        if "fused" in run_tests:
+            ret = test_fused_ar_rmsnorm(
+                tp,
+                pp,
+                shape,
+                dtype,
+                withGraph=graph_on,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+                post_per_token_quant=False,
+            )
+            row.update(ret)
+        if "quant" in run_tests:
+            ret = test_fused_ar_rmsnorm(
+                tp,
+                pp,
+                shape,
+                dtype,
+                withGraph=graph_on,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+                post_per_token_quant=True,
+            )
+            row.update(ret)
+        df.append(row)
+    df = pd.DataFrame(df)
+    show_cols = [
+        "tp_size",
+        "shape",
+        "dtype",
+        "withGraph",
+        "fused_min_us",
+        "fused_max_us",
+        "fused_err",
+        "quant_min_us",
+        "quant_max_us",
+        "quant_err",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+    logger.info(
+        "fused allreduce rmsnorm summary (markdown):\n%s",
+        df[show_cols].to_markdown(index=False),
+    )
