@@ -11,3 +11,8 @@ from .kernel_supervisor import (
     PhaseResult,
     EscalationRequest,
 )
+from .kernel_discovery import (
+    GemmCategory,
+    DiscoveredKernel,
+    KernelDiscovery,
+)
