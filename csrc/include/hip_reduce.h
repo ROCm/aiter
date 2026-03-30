@@ -97,38 +97,40 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
 
     if constexpr(WarpSize > 4)
     {
-        // row_ror:4
-        // Use rotation instead of shift to avoid leaving invalid values in the destination
-        // registers (asume warp size of at least hardware warp-size)
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(local), local);
+        // row_half_mirror
+        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(local), local);
     }
 
     if constexpr(WarpSize > 8)
     {
-        // row_ror:8
-        // Use rotation instead of shift to avoid leaving invalid values in the destination
-        // registers (asume warp size of at least hardware warp-size)
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(local), local);
+        // row_mirror
+        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(local), local);
     }
 
     if constexpr(WarpSize > 16)
     {
+#if defined(__GFX9__)
         // row_bcast:15
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(local), local);
+#else
+        local = reduce_op(rocprim::warp_shuffle(local, (threadIdx.x ^ 16), WarpSize), local);
+#endif
     }
 
+#if defined(__GFX9__)
     if constexpr(WarpSize > 32)
     {
         // row_bcast:31
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x143>(local), local);
     }
 
-    if constexpr(threadBroadcast && WarpSize > 4)
+    if constexpr(threadBroadcast && WarpSize > 16)
     {
         // Read the result from the last lane of the logical warp
         local = rocprim::warp_shuffle(local, WarpSize - 1, WarpSize);
         // local = thread_broadcast<T, WarpSize, WarpSize>(local, WarpSize - 1);
     }
+#endif
     return local;
 }
 
@@ -165,15 +167,20 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(data), data);
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(data), data);
+#if defined(__GFX9__)
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142, 0xa>(data), data);
         if constexpr(threadBroadcast)
         {
             data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
             // data = thread_broadcast<T, 32, WarpSize>(data, thread_num - 1);
         }
+#else
+        data = reduce_op(rocprim::warp_shuffle(data, (threadIdx.x ^ 16), thread_num), data);
+#endif
     }
+#if defined(__GFX9__)
     else if(thread_num == 64)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
@@ -188,7 +195,7 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
             // data = thread_broadcast<T, 64, WarpSize>(data, thread_num - 1);
         }
     }
-
+#endif
     return data;
 }
 
