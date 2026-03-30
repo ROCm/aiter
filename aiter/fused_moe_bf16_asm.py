@@ -370,14 +370,17 @@ def _asm_moe_2stages_a8(
             sorted_weights if doweight_stage1 else None,
         )
 
-        aiter.smooth_per_token_scaled_quant(
+        aiter.moe_smooth_per_token_scaled_quant(
             a2,
             inter_states.view(M, topk, inter_dim),
             a2_scale,
             fc2_smooth_scale,
             topk_ids,
-            smooth_scale_map_hash=local_expert_hash,
-            enable_ps=True,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            config.block_m,
+            local_expert_hash=local_expert_hash,
         )
 
     asm_moe_stage2(
@@ -453,14 +456,17 @@ def _run_asm_moe_int8(
             # smooth_per_token_scaled_quant for input; keep topk_ids (global) for stage2.
             a8 = torch.empty((topk * M, model_dim), dtype=a8_type, device=device)
             a8_scale = torch.empty((topk * M), dtype=dtypes.fp32, device=device)
-            aiter.smooth_per_token_scaled_quant(
-                a8.view(topk, M, model_dim).transpose(0, 1),
-                hidden_states.view(M, 1, model_dim).expand(-1, topk, -1),
+            aiter.moe_smooth_per_token_scaled_quant(
+                a8,
+                hidden_states,
                 a8_scale,
                 fc1_smooth_scale,
                 topk_ids,
-                smooth_scale_map_hash=local_expert_hash,
-                enable_ps=True,
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                config.block_m,
+                local_expert_hash=local_expert_hash,
             )
             if run_2stage:
                 a8 = a8.view(-1, model_dim).view(topk, M, model_dim)
