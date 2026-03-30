@@ -70,7 +70,7 @@ jobs:
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
-            runner: linux-aiter-mi350-1
+            runner: linux-aiter-mi35x-1
             run_on_pr: true
     runs-on: ${{ matrix.runner }}
     steps:
