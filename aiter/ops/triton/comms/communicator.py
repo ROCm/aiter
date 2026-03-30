@@ -38,6 +38,7 @@ class AiterCommunicator:
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     _HEAP_SIZE = 2**33  # 8 GB
+    _MAX_NUM_TOKENS = 512
 
     def __init__(
         self, group: ProcessGroup, device: Union[int, str, torch.device]
@@ -84,6 +85,10 @@ class AiterCommunicator:
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
         if not inp.is_contiguous():
+            return False
+        # Skip large tensors (e.g. prefill) where per-allreduce host barriers
+        # serialize the GPU pipeline.
+        if inp.shape[0] > self._MAX_NUM_TOKENS:
             return False
         # Need 2 buffers (input + output) from the heap
         buf_size = inp.numel() * inp.element_size()
