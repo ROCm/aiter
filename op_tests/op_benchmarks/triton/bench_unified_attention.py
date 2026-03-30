@@ -15,6 +15,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.attention import unified_attention as ua_mod
 
 
 def default_benchmark_configs():
@@ -193,7 +194,7 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    line_vals = [f"fwd(Triton)", f"fwd(CK)"]
+    line_vals = [f"fwd(Triton_2D)", f"fwd(Triton_3D)", f"fwd(CK)"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -365,7 +366,13 @@ def run_benchmark(custom, args):
                 # else:
                 #     assert False, "CK unified attention failed to run."
 
-            return unified_attention(
+            # saved = ua_mod.use_2d_kernel
+            ua_mod.use_2d_kernel = (lambda *a, **kw: True) if provider=="fwd(Triton_2D)" else (lambda *a, **kw: False)
+
+
+            # ua_mod.use_2d_kernel = saved
+
+            return ua_mod.unified_attention(
                 q=q_input,
                 k=k_input,
                 v=v_input,
