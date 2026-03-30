@@ -18,6 +18,17 @@ def model_benchmark_shapes(args):
     configs = get_model_configs(
         config_path=config_file, models="llama3" if args.model is None else args.model
     )
+    if args.model is None:
+        return [
+            ("llama3-8B",   1,     4096),
+            ("llama3-8B",   4096,  4096),
+            ("llama3-70B",  1,     8192),
+            ("llama3-70B",  128,   8192),
+            ("llama3-70B",  4096,  8192),
+            ("llama3-405B", 1,     16384),
+            ("llama3-405B", 128,   16384),
+            ("llama3-405B", 4096,  16384),
+        ]
     M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
