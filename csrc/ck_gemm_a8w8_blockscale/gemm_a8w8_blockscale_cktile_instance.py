@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices,Inc. All rights reserved.
+from copy import copy
 from dataclasses import dataclass
 import os
 import sys
@@ -35,7 +36,7 @@ class TileKernelInstance:
     TransposeC: bool
     UsePersistentKernel: bool
 
-    BlockPerCu: int  # 1,2
+    BlockPerCu: int  # 1..BLOCK_PER_CU_MAX
 
     @property
     def name(self) -> str:
@@ -80,6 +81,33 @@ class TileKernelInstance:
         )
 
 
+BLOCK_PER_CU_MAX = 4
+
+
+def expand_blockpercu(base_dict, max_bpc=BLOCK_PER_CU_MAX, field_name="BlockPerCu"):
+    """Expand kernel instances with BlockPerCu 1..max_bpc variants.
+
+    For each unique tile configuration (all fields except BlockPerCu),
+    creates variants for every BPC value in 1..max_bpc that doesn't
+    already exist in base_dict.
+    """
+    expanded = dict(base_dict)
+    configs = {}  # tile_config_key -> {bpc: id, ...}
+    for idx, k in base_dict.items():
+        key = tuple(v for f, v in vars(k).items() if f != field_name)
+        configs.setdefault(key, {})[getattr(k, field_name)] = idx
+    next_id = max(base_dict.keys()) + 1
+    for key, existing_bpcs in configs.items():
+        template = base_dict[next(iter(existing_bpcs.values()))]
+        for bpc in range(1, max_bpc + 1):
+            if bpc not in existing_bpcs:
+                inst = copy(template)
+                inst.BlockPerCu = bpc
+                expanded[next_id] = inst
+                next_id += 1
+    return expanded
+
+
 # fmt: off
 # Candidate and default kernel instances for tile gemm a8w8 blockscale
 # These instances are used for generating the kernel code and tuning.
@@ -115,6 +143,9 @@ default_kernels_cktile_dict = {
 
 arch = get_gfx()
 if arch.startswith("gfx95"):
-    candidate_kernels_cktile_dict = kernels_list_95x
+    candidate_kernels_cktile_dict = expand_blockpercu(kernels_list_95x)
 else:
-    candidate_kernels_cktile_dict = kernels_list_942
+    candidate_kernels_cktile_dict = expand_blockpercu(kernels_list_942)
+
+# Name-based reverse lookup for get_tune_dict()
+candidate_kernels_by_name = {v.name: v for v in candidate_kernels_cktile_dict.values()}

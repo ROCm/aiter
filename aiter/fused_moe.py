@@ -624,6 +624,47 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
 
 
+def _flydsl_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    activation=ActivationType.Silu,
+    w1_scale=None,
+    a1_scale=None,
+    sorted_weights=None,
+    **_kwargs,
+):
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    return aiter.ops.flydsl.flydsl_moe_stage1(
+        a=hidden_states,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        act=act,
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+    )
+
+
 def _flydsl_stage2_wrapper(
     inter_states,
     w1,
@@ -643,7 +684,7 @@ def _flydsl_stage2_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    aiter.ops.flydsl.flydsl_moe_stage2(
+    return aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
         sorted_token_ids=sorted_token_ids,
@@ -898,6 +939,47 @@ def get_2stage_cfgs(
             None,
             block_m,
             ksplit,
+            run_1stage,
+        )
+    is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
+    is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
+    if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+        if is_flydsl1:
+            stage1_func = functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kernelName1,
+                activation=activation,
+            )
+        else:
+            stage1_func = functools.partial(
+                ck_moe_stage1,
+                kernelName=kernelName1,
+                activation=activation,
+                quant_type=q_type,
+                dtype=dtype,
+                splitk=ksplit,
+                use_non_temporal_load=use_non_temporal_load,
+            )
+
+        if is_flydsl2:
+            stage2_func = functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kernelName2,
+            )
+        else:
+            stage2_func = functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+                use_non_temporal_load=use_non_temporal_load,
+            )
+
+        return MOEMetadata(
+            stage1_func,
+            stage2_func,
+            block_m,
+            int(ksplit),
             run_1stage,
         )
     if (
@@ -1679,6 +1761,7 @@ def cktile_moe_stage1(
     activation=ActivationType.Silu,
     split_k=1,
     dtype=torch.bfloat16,
+    kernel_name="",
 ):
     token_num = hidden_states.shape[0]
     _, n1, k1 = w1.shape
@@ -1716,6 +1799,7 @@ def cktile_moe_stage1(
         activation,
         block_m,
         split_k,
+        kernel_name,
     )
 
     if split_k > 1:
@@ -1744,9 +1828,8 @@ def cktile_moe_stage2(
     n_pad_zeros=0,
     k_pad_zeros=0,
     bias2=None,
+    kernel_name="",
 ):
-    token_num = a2.shape[0]
-    D = w2.shape[1]
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     # out = torch.empty(
@@ -1773,6 +1856,7 @@ def cktile_moe_stage2(
         bias2,
         activation,
         block_m,
+        kernel_name=kernel_name,
     )
     return out
 
@@ -1794,14 +1878,19 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    if (expert, topk) in [
-        (128, 4),
-        (128, 6),
-        (128, 8),
-        (256, 6),
-        (256, 8),
-        (384, 8),
-    ] and gating_output.dtype in [dtypes.bf16, dtypes.fp32]:
+    if (
+        (expert, topk)
+        in [
+            (128, 4),
+            (128, 6),
+            (128, 8),
+            (256, 6),
+            (256, 8),
+            (384, 8),
+        ]
+        and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
+        and gating_output.is_contiguous()
+    ):
         if topk_weights is None:
             topk_weights = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device

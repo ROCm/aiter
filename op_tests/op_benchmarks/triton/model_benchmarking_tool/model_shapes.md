@@ -77,8 +77,6 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 
 ### MLA — Multi-head Latent Attention (`mla`)
 
-Uses the same shape fields as `mha`:
-
 | Field     | Type   | Description |
 |----------|--------|-------------|
 | `hq`     | int    | Number of query heads. |

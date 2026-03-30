@@ -81,7 +81,7 @@ jobs:
               cd /aiter && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
-              python3 setup.py develop
+              pip install -e .
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
 

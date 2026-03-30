@@ -88,8 +88,6 @@ __global__ void mfma_kernel_generic(
     }
 }
 
-#endif // gfx942 / gfx950 guard
-
 // fp16/bf16 template instantiations
 template __global__ void mfma_kernel_generic<opus::fp16_t, opus::fp16_t, 32, 32, 8>(
     const opus::fp16_t*, const opus::fp16_t*, opus::fp16_t*, int, int, int, int);
@@ -99,6 +97,7 @@ template __global__ void mfma_kernel_generic<opus::fp16_t, opus::fp16_t, 16, 16,
     const opus::fp16_t*, const opus::fp16_t*, opus::fp16_t*, int, int, int, int);
 template __global__ void mfma_kernel_generic<opus::bf16_t, opus::bf16_t, 16, 16, 16>(
     const opus::bf16_t*, const opus::bf16_t*, opus::bf16_t*, int, int, int, int);
+#endif // gfx942 / gfx950 guard
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
