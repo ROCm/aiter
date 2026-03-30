@@ -1,0 +1,25 @@
+{
+    "M_LEQ_64": {
+        "tile_m": 64,
+        "tile_n": 256,
+        "tile_k": 256,
+        "m_warp": 2,
+        "n_warp": 4,
+        "num_buffers": 3,
+        "cluster_n": 2,
+        "use_tdm_load": true,
+        "waves_per_eu": null,
+        "l2_prefetch_distance": 0
+    },
+    "any": {
+        "tile_m": 256,
+        "tile_n": 256,
+        "tile_k": 256,
+        "m_warp": 2,
+        "n_warp": 4,
+        "num_buffers": 2,
+        "use_tdm_load": true,
+        "waves_per_eu": null,
+        "l2_prefetch_distance": 0
+    }
+}
