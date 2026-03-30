@@ -188,6 +188,14 @@ def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
     out = torch.empty_like(q)
 
+    # Disable CK selectors to measure pure Triton performance
+    saved_splitkv = getattr(ua_mod, '_try_ck_splitkv_attention', None)
+    saved_ua = getattr(ua_mod, '_try_ck_unified_attention', None)
+    if saved_splitkv:
+        ua_mod._try_ck_splitkv_attention = lambda *a, **kw: False
+    if saved_ua:
+        ua_mod._try_ck_unified_attention = lambda *a, **kw: False
+
     kw = dict(
         q=q, k=k, v=v, out=out,
         cu_seqlens_q=cu_seqlens_q,
@@ -226,6 +234,10 @@ def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None
         return (time.perf_counter() - t0) * 1e3 / iters, out
     finally:
         ua_mod.use_2d_kernel = saved
+        if saved_splitkv:
+            ua_mod._try_ck_splitkv_attention = saved_splitkv
+        if saved_ua:
+            ua_mod._try_ck_unified_attention = saved_ua
 
 
 def phase_label(s: Shape) -> str:

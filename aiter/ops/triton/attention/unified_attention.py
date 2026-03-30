@@ -131,7 +131,7 @@ def _try_ck_splitkv_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
         return False
 
     block_size = k.shape[1]
-    if block_size < 16 or (block_size & (block_size - 1)) != 0:
+    if block_size < 64 or (block_size & (block_size - 1)) != 0:
         return False
 
     try:
