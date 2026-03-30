@@ -1134,6 +1134,21 @@ namespace py = pybind11;
           py::arg("gating_output"), \
           "Apply topk sigmoid to the gating outputs.");
 
+#define TOPK_SOFTMAX_DECODE_PYBIND                  \
+    m.def("topk_softmax_decode",                    \
+          &aiter::topk_softmax_decode,              \
+          py::arg("gating_output"),                 \
+          py::arg("sorted_token_ids"),              \
+          py::arg("sorted_weights"),                \
+          py::arg("sorted_expert_ids"),             \
+          py::arg("num_valid_ids"),                 \
+          py::arg("moe_buf"),                       \
+          py::arg("num_experts"),                   \
+          py::arg("topk"),                          \
+          py::arg("unit_size"),                     \
+          py::arg("renormalize"),                   \
+          "Fused topk + moe_sorting for M=1 decode.");
+
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \
           &moe_sorting_fwd,                            \
