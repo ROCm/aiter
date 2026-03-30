@@ -41,8 +41,8 @@ def test_mha_with_sink(
     CAUSAL: bool,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
-    # Causal + Dropout use case is disabled in `test_mha_backward`.
-    # FIXME: We should fix it in the base implementation before adding sink to the mix.
+    # Keep sink coverage aligned with the baseline MHA tests.
+    # Causal + dropout backward is still disabled in `test_mha_backward`.
     TEST_BWD: bool = not (CAUSAL and HAS_DROPOUT)
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
@@ -176,8 +176,8 @@ def test_mha_varlen_with_sink(
     CAUSAL: bool,
 ):
     HAS_DROPOUT: bool = DROPOUT > 0.0
-    # Dropout use case is disabled in `test_mha_backward_varlen`.
-    # FIXME: We should fix it in the base implementation before adding sink to the mix.
+    # Keep sink coverage aligned with the baseline MHA tests.
+    # Dropout backward is still disabled in `test_mha_backward_varlen`.
     TEST_BWD: bool = not HAS_DROPOUT
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
