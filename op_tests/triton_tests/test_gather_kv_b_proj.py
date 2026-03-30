@@ -150,7 +150,7 @@ def test_gather_kv_b_proj(
     weight_preshuffle = True
 
     device = "cuda"
-    weight_dtype = torch.float8_e4m3fnuz
+    weight_dtype = dtypes.fp8
 
     # Generate random k_buffer
     k_buffer = torch.randn(

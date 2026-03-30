@@ -31,7 +31,12 @@ __global__ void async_load_kernel(const float* __restrict__ src,
 
     auto g_src = opus::make_gmem(src, static_cast<unsigned int>(n * sizeof(float)));
     g_src.async_load<1>(smem_buf + tid, gid);
+#if defined(__gfx1250__)
+    opus::s_wait_loadcnt(opus::number<0>{});
+    opus::s_wait_asynccnt(opus::number<0>{});
+#else
     opus::s_waitcnt_vmcnt(opus::number<0>{});
+#endif
     __builtin_amdgcn_s_barrier();
 
     dst[gid] = smem_buf[tid];

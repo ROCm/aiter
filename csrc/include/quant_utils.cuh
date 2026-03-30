@@ -932,6 +932,107 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale)
         }                                                                              \
     }
 
+#define DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS(SRC_DTYPE, KV_DTYPE, QUERY_DTYPE, FN)               \
+    if(KV_DTYPE == "auto" && QUERY_DTYPE == "auto")                                               \
+    {                                                                                             \
+        if(SRC_DTYPE == at::ScalarType::Float)                                                    \
+        {                                                                                         \
+            FN(float,                                                                             \
+               float,                                                                             \
+               float,                                                                             \
+               vllm::Fp8KVCacheDataType::kAuto,                                                   \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == at::ScalarType::Half)                                                \
+        {                                                                                         \
+            FN(opus::fp16_t,                                                                      \
+               opus::fp16_t,                                                                      \
+               opus::fp16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kAuto,                                                   \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == at::ScalarType::BFloat16)                                            \
+        {                                                                                         \
+            FN(opus::bf16_t,                                                                      \
+               opus::bf16_t,                                                                      \
+               opus::bf16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kAuto,                                                   \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else                                                                                      \
+        {                                                                                         \
+            TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);                \
+        }                                                                                         \
+    }                                                                                             \
+    else if((KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3") && (QUERY_DTYPE == "auto"))             \
+    {                                                                                             \
+        if(SRC_DTYPE == at::ScalarType::Float)                                                    \
+        {                                                                                         \
+            FN(float,                                                                             \
+               opus::fp8_t,                                                                       \
+               float,                                                                             \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == at::ScalarType::Half)                                                \
+        {                                                                                         \
+            FN(opus::fp16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::fp16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else if(SRC_DTYPE == at::ScalarType::BFloat16)                                            \
+        {                                                                                         \
+            FN(opus::bf16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::bf16_t,                                                                      \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kAuto);                                                  \
+        }                                                                                         \
+        else                                                                                      \
+        {                                                                                         \
+            TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);                \
+        }                                                                                         \
+    }                                                                                             \
+    else if((KV_DTYPE == "fp8" || KV_DTYPE == "fp8_e4m3") &&                                      \
+            (QUERY_DTYPE == "fp8" || QUERY_DTYPE == "fp8_e4m3"))                                  \
+    {                                                                                             \
+        if(SRC_DTYPE == at::ScalarType::Float)                                                    \
+        {                                                                                         \
+            FN(float,                                                                             \
+               opus::fp8_t,                                                                       \
+               opus::fp8_t,                                                                       \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kFp8E4M3);                                               \
+        }                                                                                         \
+        else if(SRC_DTYPE == at::ScalarType::Half)                                                \
+        {                                                                                         \
+            FN(opus::fp16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::fp8_t,                                                                       \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kFp8E4M3);                                               \
+        }                                                                                         \
+        else if(SRC_DTYPE == at::ScalarType::BFloat16)                                            \
+        {                                                                                         \
+            FN(opus::bf16_t,                                                                      \
+               opus::fp8_t,                                                                       \
+               opus::fp8_t,                                                                       \
+               vllm::Fp8KVCacheDataType::kFp8E4M3,                                                \
+               vllm::Fp8KVCacheDataType::kFp8E4M3);                                               \
+        }                                                                                         \
+        else                                                                                      \
+        {                                                                                         \
+            TORCH_CHECK(false, "Unsupported input type of kv cache: ", SRC_DTYPE);                \
+        }                                                                                         \
+    }                                                                                             \
+    else                                                                                          \
+    {                                                                                             \
+        TORCH_CHECK(                                                                              \
+            false, "Unsupported data type of kv cache: ", KV_DTYPE, "Query type: ", QUERY_DTYPE); \
+    }
+
 } // namespace fp8
 #endif // USE_ROCM
 } // namespace vllm

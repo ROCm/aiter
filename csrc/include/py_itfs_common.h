@@ -1,29 +1,42 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
-#include <torch/all.h>
 #include "aiter_hip_common.h"
+#include <torch/all.h>
 
-bool static isGPUArch(const std::vector<std::string> &archs)
+bool static isGPUArch(const std::vector<std::string>& archs)
 {
     hipDeviceProp_t props;
 
     hipGetDeviceProperties(&props, 0);
 
     std::string device_arch = props.gcnArchName;
-    for (std::string arch : archs)
+    for(std::string arch : archs)
     {
         size_t substring = device_arch.find(arch);
-        if (substring != std::string::npos)
+        if(substring != std::string::npos)
         {
             return true;
         }
     }
     return false;
 }
+
+#ifndef AITER_USE_OCP_FP8
+#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx950__) || defined(__gfx12__)
+#define AITER_USE_OCP_FP8 1
+#else
+#define AITER_USE_OCP_FP8 0
+#endif
+#else
+#define AITER_USE_OCP_FP8 0
+#endif
+#endif
+
 #ifdef __HIP_DEVICE_COMPILE__
-#if CK_TILE_USE_OCP_FP8
+#if AITER_USE_OCP_FP8
 const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
 #else
 const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
@@ -31,7 +44,8 @@ const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 #else
 inline at::ScalarType get_torch_fp8()
 {
-    static const auto value = isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
+    static const auto value =
+        isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
     return value;
 }
 #define torch_fp8 get_torch_fp8()
@@ -40,7 +54,7 @@ inline at::ScalarType get_torch_fp8()
 #ifdef TORCH_Float4_e2m1fn_x2
 const constexpr auto torch_fp4x2 = torch::kFloat4_e2m1fn_x2;
 #else
-const constexpr auto torch_fp4x2  = torch::kUInt8;
+const constexpr auto torch_fp4x2 = torch::kUInt8;
 #endif
 
 // clang-format off
@@ -67,16 +81,16 @@ template <> struct t2ck<int8_t> { using type = ck_tile::int8_t; };
 inline std::string torchDTypeToStr(caffe2::TypeMeta dtype)
 {
 #define TYPE_CASE(type, torch_type) \
-    case torch_type:                \
-    {                               \
+    case torch_type: {              \
         return type;                \
     }
 
-    switch (dtype.toScalarType())
+    switch(dtype.toScalarType())
     {
         FOREACH_BUFFER_TORCH_TYPE_MAP(TYPE_CASE);
     default:
-        throw std::runtime_error("CKPyInterface: Unsupported data type " + std::to_string((int8_t)(dtype.toScalarType())));
+        throw std::runtime_error("CKPyInterface: Unsupported data type " +
+                                 std::to_string((int8_t)(dtype.toScalarType())));
     }
 
 #undef TYPE_CASE

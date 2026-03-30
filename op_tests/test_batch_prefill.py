@@ -147,23 +147,12 @@ def should_skip_rocm72_issue(causal, logits_soft_cap):
 
 def check_common_skip_conditions(
     is_input_fp8: bool,
-    dtype,
-    causal: bool,
-    kv_len: int,
-    qo_len: int,
-    contiguous_kv: bool,
     return_lse: bool = False,
 ) -> bool:
     """
     Check common skip conditions shared across test functions.
     Returns True if test should be skipped.
     """
-
-    if skip_test_if(
-        causal and kv_len < qo_len,
-        "kv_len < qo_len is not allowed if causal=True",
-    ):
-        return True
 
     # FP8 is inference-only, no backward pass needed, so LSE is not required
     if skip_test_if(
@@ -671,9 +660,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
     page_size = 1
 
     # Skip conditions
-    if check_common_skip_conditions(
-        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv, return_lse
-    ):
+    if check_common_skip_conditions(is_input_fp8, return_lse):
         return
     if check_layout_skip_conditions(
         "linear",
@@ -820,7 +807,10 @@ def test_batch_prefill_page_size_1_linear_sglang(
             kv_last_page_lens=kv_last_page_len_gpu,
         )
 
-        verify_fp8_output(out_fp8, o_ref)
+        # Causal + kv_len < qo_len: rows with few valid K positions amplify
+        # FP8 quantization error (not averaged over many attention targets)
+        fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+        verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
         rtol, atol = get_tolerances(dtype, is_fp8=True)
         torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
     else:
@@ -933,9 +923,7 @@ def test_batch_prefill(
     k_vector_size_fp8 = get_vector_size(dtypes.fp8)
 
     # Skip conditions
-    if check_common_skip_conditions(
-        is_input_fp8, dtype, causal, kv_len, qo_len, contiguous_kv, return_lse
-    ):
+    if check_common_skip_conditions(is_input_fp8, return_lse):
         return {"status": "skipped"}
     if check_layout_skip_conditions(
         kvcache_layout,
@@ -1106,7 +1094,10 @@ def test_batch_prefill(
             profile=False,
         )
 
-        verify_fp8_output(out_fp8, o_ref)
+        # Causal + kv_len < qo_len: rows with few valid K positions amplify
+        # FP8 quantization error (not averaged over many attention targets)
+        fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+        verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
         rtol, atol = get_tolerances(dtype, is_fp8=False)
         torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
     else:
@@ -1314,82 +1305,9 @@ def vectorize_kv_cache(
     return k_cache, v_cache
 
 
-def varlen_to_paged_kv(k_varlen, v_varlen, kv_lens, page_size=1):
-    """
-    Convert varlen format K/V to paged KV cache format.
-
-    Args:
-        k_varlen: [total_tokens, num_kv_heads, head_dim]
-        v_varlen: [total_tokens, num_kv_heads, head_dim]
-        kv_lens: [batch_size] - length of each sequence
-        page_size: tokens per page
-
-    Returns:
-        kv_data: [total_num_pages, 2, page_size, num_kv_heads, head_dim]
-        kv_indptr: [batch_size + 1]
-        kv_indices: [total_num_pages + padding]
-    """
-    batch_size = len(kv_lens)
-    num_kv_heads = k_varlen.shape[1]
-    head_dim = k_varlen.shape[2]
-    dtype = k_varlen.dtype
-    device = k_varlen.device
-
-    # Calculate number of pages needed
-    max_kv_len = kv_lens.max().item()
-    max_num_pages_per_seq = (max_kv_len + page_size - 1) // page_size
-    total_num_pages = max_num_pages_per_seq * batch_size
-
-    # Create paged KV cache
-    kv_data = torch.zeros(
-        total_num_pages,
-        2,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        dtype=dtype,
-        device=device,
-    )
-
-    # Create page indices (identity mapping for simplicity)
-    kv_indices = torch.arange(total_num_pages, dtype=torch.int32, device="cpu")
-    kv_indices = torch.nn.functional.pad(kv_indices, (0, 128), value=0)
-
-    # Fill in the data
-    kv_indptr = convert_lens_to_indptr(((kv_lens + page_size - 1) // page_size).cpu())
-    cu_kv_lens = convert_lens_to_indptr(kv_lens.cpu())
-
-    for batch_idx in range(batch_size):
-        seq_start = cu_kv_lens[batch_idx].item()
-        seq_end = cu_kv_lens[batch_idx + 1].item()
-        seq_len = seq_end - seq_start
-
-        page_start = kv_indptr[batch_idx].item()
-        num_pages = kv_indptr[batch_idx + 1].item() - page_start
-
-        # Copy K and V data into pages
-        for page_idx in range(num_pages):
-            global_page_idx = page_start + page_idx
-            token_start = page_idx * page_size
-            token_end = min(token_start + page_size, seq_len)
-            tokens_in_page = token_end - token_start
-
-            # K data
-            kv_data[global_page_idx, 0, :tokens_in_page, :, :] = k_varlen[
-                seq_start + token_start : seq_start + token_end, :, :
-            ]
-
-            # V data
-            kv_data[global_page_idx, 1, :tokens_in_page, :, :] = v_varlen[
-                seq_start + token_start : seq_start + token_end, :, :
-            ]
-
-    return kv_data, kv_indptr, kv_indices
-
-
+@pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
+@pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("batch_size", [1, 3])
-@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(6, 1), (8, 1)])
-@pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize(
     "qo_len,kv_len",
     [
@@ -1399,138 +1317,228 @@ def varlen_to_paged_kv(k_varlen, v_varlen, kv_lens, page_size=1):
         (4096, 4096),
     ],
 )
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (16, 1)])
+@pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-def test_batch_prefill_vs_varlen_fp8(
+def test_batch_prefill_linear_vs_vectorized(
+    table_layout,
+    input_dtype,
     batch_size,
+    qo_len,
+    kv_len,
     num_qo_heads,
     num_kv_heads,
     head_dim,
-    qo_len,
-    kv_len,
     causal,
     logits_soft_cap,
 ):
     """
-    Compare FP8 batch_prefill (paged KV) vs FP8 flash_attn_varlen.
-    Both use qr_async pipeline with FP8, should produce identical results.
+    Compare LINEAR vs VECTORIZED layout batch_prefill output.
+
+    Both layouts represent the same logical KV data. Outputs should be
+    consistent regardless of memory layout. Uses a tighter tolerance than
+    the FP32 reference tests to catch layout-specific regressions.
     """
     torch.manual_seed(42)
     dtype = torch.bfloat16
-    quant_dtype = dtypes.fp8
+    is_input_fp8 = input_dtype == dtypes.fp8 or input_dtype == "fp8"
     page_size = 1024
-    k_vector_size = get_vector_size(quant_dtype)
+    k_vector_size = get_vector_size(dtype)
+    k_vector_size_fp8 = get_vector_size(dtypes.fp8)
 
     if skip_test_if(
-        page_size % k_vector_size != 0 or head_dim % k_vector_size != 0,
-        "Vectorized layout requires page/head dim divisible by vector size",
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
     ):
         return
 
-    # Build sequence lengths
+    # Build test tensors
     qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
     kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
-    total_q_tokens = qo_lens.sum().item()
-    total_kv_tokens = kv_lens.sum().item()
-    max_qo_len = qo_lens.max().item()
-    max_kv_len = kv_lens.max().item()
-
-    # Create Q, K, V in varlen format
-    q_bf16 = make_scaled_rand(
-        -10, 10, total_q_tokens, num_qo_heads, head_dim, dtype=dtype
-    )
-    k_bf16 = make_scaled_rand(
-        -5, 5, total_kv_tokens, num_kv_heads, head_dim, dtype=dtype
-    )
-    v_bf16 = make_scaled_rand(
-        -5, 5, total_kv_tokens, num_kv_heads, head_dim, dtype=dtype
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+    q = build_q_tensor_for_test(
+        qo_lens,
+        batch_size,
+        qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        -10,
+        10,
+        is_input_fp8,
     )
 
-    # Quantize to FP8
-    q_fp8, q_descale = per_tensor_quant(q_bf16, quant_dtype=quant_dtype)
-    k_fp8, k_descale = per_tensor_quant(k_bf16, quant_dtype=quant_dtype)
-    v_fp8, v_descale = per_tensor_quant(v_bf16, quant_dtype=quant_dtype)
-
-    cu_seqlens_q = convert_lens_to_indptr(qo_lens).cuda()
-    cu_seqlens_k = convert_lens_to_indptr(kv_lens).cuda()
-
-    # Run flash_attn_varlen FP8
-    out_varlen = aiter.flash_attn_varlen_fp8_pertensor_func(
-        q_fp8,
-        k_fp8,
-        v_fp8,
-        q_descale,
-        k_descale,
-        v_descale,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q=max_qo_len,
-        max_seqlen_k=max_kv_len,
-        min_seqlen_q=0,
-        causal=causal,
-        logits_soft_cap=logits_soft_cap,
-        window_size=(-1, -1),
-    )
-
-    # Convert to paged KV cache format
-    kv_data, kv_indptr, kv_indices = varlen_to_paged_kv(
-        k_fp8, v_fp8, kv_lens, page_size=page_size
-    )
-    kv_last_page_len_gpu = ((kv_lens - 1) % page_size + 1).int().to(0)
-    seqlen_k_gpu = kv_lens.to(0).int()
-    max_num_pages_per_seq = (max_kv_len + page_size - 1) // page_size
-
-    # Build block table
-    block_table_cpu = torch.zeros(
-        (batch_size, max_num_pages_per_seq), dtype=torch.int32
-    )
-    for i in range(batch_size):
-        start, end = kv_indptr[i].item(), kv_indptr[i + 1].item()
-        block_table_cpu[i, : (end - start)] = kv_indices[start:end]
-    block_table_gpu = block_table_cpu.to(0)
-
-    # Extract and vectorize K/V from paged format
-    k_cache_raw, v_cache_raw = split_kv_pages(kv_data)
-    k_paged, v_paged = vectorize_kv_cache(
-        k_cache_raw,
-        v_cache_raw,
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
         num_kv_heads,
         head_dim,
-        page_size,
-        k_vector_size,
+        kv_lens,
+        None if is_input_fp8 else -5,
+        None if is_input_fp8 else 5,
+        dtype,
+        use_uniform=is_input_fp8,
+        contiguous_kv=True,
     )
 
-    # Run batch_prefill FP8
-    out_batch_prefill = aiter.mha_batch_prefill_func(
-        q_fp8,
-        k_paged,
-        v_paged,
-        cu_seqlens_q,
-        kv_indptr.cuda(),
-        kv_indices.cuda(),
-        max_seqlen_q=max_qo_len,
-        max_seqlen_k=max_kv_len,
-        causal=causal,
-        logits_soft_cap=logits_soft_cap,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        kv_last_page_lens=kv_last_page_len_gpu,
-        block_table=block_table_gpu,
-        seqlen_k=seqlen_k_gpu,
+    # Move to GPU
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_cache["kv_indptr_cpu"].to(0)
+    kv_indices_gpu = kv_cache["kv_indices_cpu"].to(0)
+    kv_last_page_len_gpu = kv_cache["kv_last_page_len_cpu"].to(0)
+    max_qo_len = torch.max(qo_lens).item()
+    max_kv_len = torch.max(kv_lens).item()
+
+    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, contiguous_kv=True)
+
+    # Build vLLM block table if needed
+    block_table_gpu = None
+    seqlen_k_gpu = None
+    if table_layout == "vllm":
+        block_table_cpu = build_block_table(
+            kv_cache["kv_indptr_cpu"],
+            kv_cache["kv_indices_cpu"],
+            batch_size,
+            kv_cache["max_num_pages_per_seq"],
+        )
+        block_table_gpu = block_table_cpu.to(0)
+        seqlen_k_gpu = kv_lens.to(0).int()
+
+    if is_input_fp8:
+        q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        k_cache_quant, k_descale = per_tensor_quant(
+            k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+        )
+        v_cache_quant, v_descale = per_tensor_quant(
+            v_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+        )
+
+        # LINEAR layout (dispatches V3)
+        k_linear = k_cache_quant.contiguous()
+        v_linear = v_cache_quant.contiguous()
+
+        # VECTORIZED layout (dispatches V2)
+        k_vec, v_vec = vectorize_kv_cache(
+            k_cache_quant,
+            v_cache_quant,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size_fp8,
+        )
+
+        out_linear = run_ck(
+            batch_size,
+            num_kv_heads,
+            q_quant,
+            k_linear,
+            v_linear,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+        out_vec = run_ck(
+            batch_size,
+            num_kv_heads,
+            q_quant,
+            k_vec,
+            v_vec,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+    else:
+        # LINEAR layout (dispatches V3)
+        k_linear, v_linear = apply_kv_layout(
+            k_cache_ref,
+            v_cache_ref,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+            "linear",
+        )
+
+        # VECTORIZED layout (dispatches V2)
+        k_vec, v_vec = apply_kv_layout(
+            k_cache_ref,
+            v_cache_ref,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+            "vectorized",
+        )
+
+        out_linear = run_ck(
+            batch_size,
+            num_kv_heads,
+            q,
+            k_linear,
+            v_linear,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+        out_vec = run_ck(
+            batch_size,
+            num_kv_heads,
+            q,
+            k_vec,
+            v_vec,
+            q_indptr_gpu,
+            kv_indptr_gpu,
+            kv_indices_gpu,
+            max_qo_len,
+            max_kv_len,
+            causal=causal,
+            logits_soft_cap=logits_soft_cap,
+            kv_last_page_lens=kv_last_page_len_gpu,
+            block_table=block_table_gpu,
+            seqlen_k=seqlen_k_gpu,
+        )
+
+    # Sanity checks
+    assert out_linear.abs().max().item() > 1e-6, "LINEAR output is all zeros!"
+    assert out_vec.abs().max().item() > 1e-6, "VECTORIZED output is all zeros!"
+
+    # LINEAR and VECTORIZED should produce consistent results
+    # Same data, same computation, only memory layout differs
+    max_diff = (out_linear - out_vec).abs().max().item()
+    threshold = 0.017
+    assert max_diff < threshold, (
+        f"LINEAR vs VECTORIZED difference too large: "
+        f"{max_diff} (threshold: {threshold})"
     )
-
-    # Sanity check: outputs should not be all zeros
-    assert (
-        out_varlen.abs().max().item() > 1e-6
-    ), "Varlen output is all zeros - kernel may not have launched!"
-    assert (
-        out_batch_prefill.abs().max().item() > 1e-6
-    ), "Batch_prefill output is all zeros - kernel may not have launched!"
-
-    # Should be nearly identical (same pipeline, same computation)
-    rtol, atol = 1e-4, 1e-4
-    torch.testing.assert_close(out_batch_prefill, out_varlen, rtol=rtol, atol=atol)
 
 
 def per_page_quant(tensor, page_size, quant_dtype):
@@ -1897,12 +1905,6 @@ def run_batch_prefill_kv_blockscale(
             return {"status": "skipped"}
 
     k_vector_size = get_vector_size(quant_dtype)
-
-    if skip_test_if(
-        causal and kv_len < qo_len,
-        "kv_len < qo_len is not allowed if causal=True",
-    ):
-        return {"status": "skipped"}
 
     if skip_test_if(
         should_skip_rocm72_issue(causal, logits_soft_cap),

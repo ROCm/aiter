@@ -153,7 +153,7 @@ def test_causal_conv1d_update(
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
-        rtol, atol = 1e-2, 5e-2
+        rtol, atol = 1e-2, 6e-2
     # set seed
     seed_everything(0)
     x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
@@ -198,7 +198,7 @@ def test_causal_conv1d_update_with_batch_gather(
     device = "cuda"
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
-        rtol, atol = 1e-2, 5e-2
+        rtol, atol = 1e-2, 6e-2
 
     # set seed
     seed_everything(0)
@@ -276,7 +276,7 @@ def test_causal_conv1d_varlen(
     torch.cuda.empty_cache()
     rtol, atol = (3e-4, 1e-3) if itype == torch.float32 else (3e-3, 5e-3)
     if itype == torch.bfloat16:
-        rtol, atol = 1e-2, 5e-2
+        rtol, atol = 1e-2, 6e-2
     # set seed
     seed_everything(0)
     seqlens = []

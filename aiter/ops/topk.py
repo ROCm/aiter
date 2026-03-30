@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
@@ -216,7 +216,7 @@ def top_k_per_row_prefill(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -241,7 +241,7 @@ def top_k_per_row_decode(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
     next_n: int,

@@ -30,12 +30,12 @@ struct __attribute__((packed)) KernelArgs
     p2 _p10;
 };
 
-extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_asm(AiterTensor* out,          // [m ,n]
-                              AiterTensor* input,        // [m ,n]
-                              AiterTensor* residual_in,  // [m ,n]
-                              AiterTensor* residual_out, // [m ,n]
-                              AiterTensor* weight,       // [1 ,n]
-                              AiterTensor* bias,         // [1 ,n]
+AITER_C_ITFS void layernorm2d_with_add_asm(aiter_tensor_t* out,          // [m ,n]
+                              aiter_tensor_t* input,        // [m ,n]
+                              aiter_tensor_t* residual_in,  // [m ,n]
+                              aiter_tensor_t* residual_out, // [m ,n]
+                              aiter_tensor_t* weight,       // [1 ,n]
+                              aiter_tensor_t* bias,         // [1 ,n]
                               float epsilon,
                               hipStream_t stream)
 {
@@ -80,14 +80,14 @@ extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_asm(
                         stream});
 }
 
-extern "C" __attribute__((visibility("default"))) void layernorm2d_with_add_smoothquant_asm(AiterTensor* out,          // [m ,n]
-                                          AiterTensor* input,        // [m ,n]
-                                          AiterTensor* residual_in,  // [m ,n]
-                                          AiterTensor* residual_out, // [m ,n]
-                                          AiterTensor* xscale,       // [1 ,n]
-                                          AiterTensor* yscale,       // [m ,1]
-                                          AiterTensor* weight,       // [1 ,n]
-                                          AiterTensor* bias,         // [1 ,n]
+AITER_C_ITFS void layernorm2d_with_add_smoothquant_asm(aiter_tensor_t* out,          // [m ,n]
+                                          aiter_tensor_t* input,        // [m ,n]
+                                          aiter_tensor_t* residual_in,  // [m ,n]
+                                          aiter_tensor_t* residual_out, // [m ,n]
+                                          aiter_tensor_t* xscale,       // [1 ,n]
+                                          aiter_tensor_t* yscale,       // [m ,1]
+                                          aiter_tensor_t* weight,       // [1 ,n]
+                                          aiter_tensor_t* bias,         // [1 ,n]
                                           float epsilon,
                                           hipStream_t stream)
 {

@@ -65,7 +65,7 @@ expected format of aiter_dtypes: {
 """
 
 
-class AiterTensor(ctypes.Structure):
+class aiter_tensor_t(ctypes.Structure):
     _fields_ = [
         ("ptr", ctypes.c_void_p),
         ("numel_", ctypes.c_size_t),
@@ -78,10 +78,10 @@ class AiterTensor(ctypes.Structure):
 
 
 _EXPECTED_SIZEOF_AITER_TENSOR = (
-    160  # must match sizeof(AiterTensor) in csrc/include/aiter_tensor.h
+    160  # must match sizeof(aiter_tensor_t) in csrc/include/aiter_tensor.h
 )
-assert ctypes.sizeof(AiterTensor) == _EXPECTED_SIZEOF_AITER_TENSOR, (
-    f"AiterTensor layout mismatch: Python sizeof={ctypes.sizeof(AiterTensor)}, "
+assert ctypes.sizeof(aiter_tensor_t) == _EXPECTED_SIZEOF_AITER_TENSOR, (
+    f"aiter_tensor_t layout mismatch: Python sizeof={ctypes.sizeof(aiter_tensor_t)}, "
     f"expected C sizeof={_EXPECTED_SIZEOF_AITER_TENSOR}. "
     f"Check struct field order and alignment against csrc/include/aiter_tensor.h"
 )

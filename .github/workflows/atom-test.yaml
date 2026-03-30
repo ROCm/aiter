@@ -64,13 +64,13 @@ jobs:
             runner: aiter-8gpu-runner
             run_on_pr: true
           - model_name: "gpt-oss-120b"
-            label: MI355
+            label: MI35X
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
-            runner: linux-aiter-mi355-1
+            runner: linux-aiter-mi35x-1
             run_on_pr: true
     runs-on: ${{ matrix.runner }}
     steps:
@@ -101,7 +101,7 @@ jobs:
               cd /app/aiter-test && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
 
