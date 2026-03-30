@@ -149,6 +149,17 @@ class FmoeTuner(TunerCommon):
         kernel_dict = df.groupby(key)["knl_name"].apply(list).to_dict()
         return kernel_dict
 
+    def get_kernels_dict_filtered(self, file, inter_dim, key="tile_m"):
+        """Like get_kernels_dict but filters out kernels whose tile_n doesn't divide inter_dim."""
+        if not os.path.exists(file):
+            print(f"ASM kernel list file not exist: {file}")
+            return {}
+        df = pd.read_csv(file)
+        if "tile_n" in df.columns:
+            df = df[df["tile_n"].apply(lambda tn: inter_dim % tn == 0)]
+        kernel_dict = df.groupby(key)["knl_name"].apply(list).to_dict()
+        return kernel_dict
+
     @staticmethod
     def ck_moe_stage1_fwd_out(
         a1_qt,
@@ -1695,8 +1706,9 @@ class FmoeTuner(TunerCommon):
             quantDtype = "Fp8"
         else:
             quantDtype = ""
-        asm_kernels = self.get_kernels_dict(
-            kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo)
+        asm_kernels = self.get_kernels_dict_filtered(
+            kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo),
+            inter_dim,
         )
         for blockM in blockMs:
             if use_g1u1 and q_dtype_w != torch.int4:
