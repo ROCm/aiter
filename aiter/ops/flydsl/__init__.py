@@ -52,4 +52,5 @@ if is_flydsl_available():
         "flydsl_flash_attn_func",
         "flydsl_qk_norm_rope_quant",
         # "flydsl_gdr_decode",
+        # "flydsl_gdr_prefill",
     ]
