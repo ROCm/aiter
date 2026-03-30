@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2026, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 
 #include "aiter_hip_common.h"
 #include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
@@ -128,6 +128,9 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
 } // namespace vllm
 
 namespace aiter {
+
+#define VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
+    hipFuncSetAttribute(FUNC, hipFuncAttributeMaxDynamicSharedMemorySize, VAL)
 
 void moe_align_block_size(torch::Tensor topk_ids,
                           int64_t num_experts,

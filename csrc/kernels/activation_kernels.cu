@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -11,7 +11,7 @@
 #include "ck_tile/core.hpp"
 #include "ck_tile/ops/elementwise/unary_element_wise_operation.hpp"
 #include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
 #include <hip/hip_bf16.h>

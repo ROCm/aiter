@@ -17,7 +17,7 @@
 #include <cmath>
 #include <type_traits>
 
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
 #include "rope/rope_common.h"

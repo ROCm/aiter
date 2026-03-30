@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include <rocprim/rocprim.hpp>
 
 template <typename T, typename F>
@@ -198,36 +198,43 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
     // static_assert(BlockSize <= 256, "BlockSize > 256 is not supported");
     static constexpr int waves = BlockSize / WARP_SIZE;
     const int wave_size        = WARP_SIZE;
-    int wave_id                = threadIdx.x / wave_size;
-    int lane_id                = threadIdx.x % wave_size;
-    __shared__ float smem[waves];
-
-    local = wave_reduce<T, F, WARP_SIZE, false>(local, reduce_op);
-
-    if(lane_id == wave_size - 1)
+    if constexpr(BlockSize == wave_size)
     {
-        smem[wave_id] = local;
-    }
-    __syncthreads();
-
-    if constexpr(WARP_SIZE % waves == 0)
-    {
-        local = smem[lane_id % waves];
-        local = wave_reduce<T, F, waves, waveBroadcast>(local, reduce_op);
+        local = wave_reduce<T, F, WARP_SIZE, waveBroadcast>(local, reduce_op);
     }
     else
     {
-        if(lane_id < waves)
+        int wave_id = threadIdx.x / wave_size;
+        int lane_id = threadIdx.x % wave_size;
+        __shared__ float smem[waves];
+
+        local = wave_reduce<T, F, WARP_SIZE, false>(local, reduce_op);
+
+        if(lane_id == wave_size - 1)
         {
-            local = smem[lane_id];
+            smem[wave_id] = local;
         }
+        __syncthreads();
 
-        local = wave_reduce<T, F, waves, false>(local, reduce_op);
-
-        if constexpr(waveBroadcast)
+        if constexpr(WARP_SIZE % waves == 0)
         {
-            // Read the result from the last lane of the logical warp
-            local = rocprim::warp_shuffle(local, waves - 1, wave_size);
+            local = smem[lane_id % waves];
+            local = wave_reduce<T, F, waves, waveBroadcast>(local, reduce_op);
+        }
+        else
+        {
+            if(lane_id < waves)
+            {
+                local = smem[lane_id];
+            }
+
+            local = wave_reduce<T, F, waves, false>(local, reduce_op);
+
+            if constexpr(waveBroadcast)
+            {
+                // Read the result from the last lane of the logical warp
+                local = rocprim::warp_shuffle(local, waves - 1, wave_size);
+            }
         }
     }
 

@@ -19,7 +19,7 @@
  * limitations under the License.
  */
 #include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
@@ -742,7 +742,7 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            x += VLLM_LDG(&input[token_idx * TOPK * d + k * d + idx]);
+            x += *(&input[token_idx * TOPK * d + k * d + idx]);
         }
         out[token_idx * d + idx] = x;
     }
