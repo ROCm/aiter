@@ -330,7 +330,7 @@ def run_benchmark(custom, args):
                 sinks=sinks,
             )
 
-        ms = triton.testing.do_bench(fn)
+        ms = triton.testing.do_bench_cudagraph(fn)
 
         run_correctness = args.test
         if run_correctness:
@@ -385,12 +385,14 @@ def run_benchmark(custom, args):
         mem = mem_read + mem_write
 
         # return ms
-        if "ms" in provider:
+        if args.metric == "time":
             return ms
-        elif "TFLOPS" in provider:
+        elif args.metric == "throughput":
             return total_flops / ms * 1e-9
-        else:  # GB/s
+        elif args.metric == "bandwidth":  # GB/s
             return mem / ms * 1e-6
+        else:
+            raise ValueError("Unknown metric: " + args.metric)
 
     bench_mha.run(None, print_data=True)
 
