@@ -150,10 +150,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'",
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -619,9 +616,7 @@
             "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -802,9 +797,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -1270,10 +1263,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'",
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },

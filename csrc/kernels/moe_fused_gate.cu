@@ -17,7 +17,7 @@
  */
 #include "hip_compat.h"
 #include "hip_reduce.h"
-#include "vec_convert.h"
+#include "opus/opus.hpp"
 #include <ATen/hip/HIPContext.h>
 #include <cfloat>
 #include <hip/hip_runtime.h>
@@ -38,8 +38,8 @@ class alignas(Alignment) AlignedArray
     float data[N];
 };
 
-using bfloat16_t = ck_tile::bfloat16_t;
-using float16_t  = ck_tile::half_t;
+using bfloat16_t = opus::bf16_t;
+using float16_t  = opus::fp16_t;
 using float32_t  = float;
 
 // QQ NOTE: to handle the case for at::Half, error: more than one operator ">" matches these
@@ -51,7 +51,7 @@ __device__ inline bool cmp_gt(const T& a, const T& b)
     if constexpr(std::is_same<T, bfloat16_t>::value)
     {
         // at::Half (or float16_t in our native case) causes ambiguity, so we cast to float.
-        return ck_tile::type_convert<float>(a) > ck_tile::type_convert<float>(b);
+        return opus::cast<float>(a) > opus::cast<float>(b);
     }
     else
     {
@@ -66,7 +66,7 @@ __device__ inline bool cmp_eq(const T& a, const T& b)
 {
     if constexpr(std::is_same<T, float16_t>::value || std::is_same<T, bfloat16_t>::value)
     {
-        return ck_tile::type_convert<float>(a) == ck_tile::type_convert<float>(b);
+        return opus::cast<float>(a) == opus::cast<float>(b);
     }
     else
     {
@@ -137,8 +137,8 @@ __device__ void moe_fused_gate_impl(void* input,
     // row_chunk as a pointer to AccessType.
 
     // constexpr uint32_t vec_size = 16 / sizeof(T);
-    using AccessType = ck_tile::vec_t<T, MAX_VPT>;
-    using VecType    = ck_tile::vec_t<float, MAX_VPT>;
+    using AccessType = opus::vector_t<T, MAX_VPT>;
+    using VecType    = opus::vector_t<float, MAX_VPT>;
 
     T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
     VecType row_chunk;
@@ -164,16 +164,16 @@ __device__ void moe_fused_gate_impl(void* input,
     AccessType bias_thread_read_vec = *vec_bias_thread_read_ptr;
     for(int jj = 0; jj < params.VPT; ++jj)
     {
-        row_chunk[jj]  = ck_tile::type_convert<float>(row_chunk_vec(jj));
-        bias_chunk[jj] = ck_tile::type_convert<float>(bias_thread_read_vec(jj));
+        row_chunk[jj]  = opus::cast<float>(row_chunk_vec[jj]);
+        bias_chunk[jj] = opus::cast<float>(bias_thread_read_vec[jj]);
     }
     // #pragma unroll
     // for (int ii = 0; ii < params.VPT / vec_size; ++ii) {
     //   AccessType row_chunk_vec = vec_thread_read_ptr[ii];
     //   AccessType bias_thread_read_vec = vec_bias_thread_read_ptr[ii];
     //   for (int jj = 0; jj < vec_size; ++jj) {
-    //     row_chunk[ii * vec_size + jj] = ck_tile::type_convert<float>(row_chunk_vec(jj));
-    //     bias_chunk[ii * vec_size + jj] = ck_tile::type_convert<float>(bias_thread_read_vec(jj));
+    //     row_chunk[ii * vec_size + jj] = opus::cast<float>(row_chunk_vec(jj));
+    //     bias_chunk[ii * vec_size + jj] = opus::cast<float>(bias_thread_read_vec(jj));
     //   }
     // }
 
@@ -344,7 +344,7 @@ __device__ void moe_fused_gate_impl(void* input,
             // bias_chunk[expert_to_clear_in_thread] = -FLT_MAX;
             //// store output
             // output_ptr[idx] = row_chunk[expert_to_clear_in_thread];
-            indices_ptr[idx] = ck_tile::type_convert<int32_t>(expert);
+            indices_ptr[idx] = static_cast<int32_t>(expert);
         }
         __syncthreads();
 
@@ -364,7 +364,7 @@ __device__ void moe_fused_gate_impl(void* input,
 
         // Use round-robin to select expert
         int64_t expert_offset = thread_row % num_fused_shared_experts;
-        indices_ptr[last_idx] = ck_tile::type_convert<int32_t>(params.NUM_EXPERTS + expert_offset);
+        indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
         // Set the weight to the sum of all weights divided by routed_scaling_factor
         output_ptr[last_idx] = output_sum / routed_scaling_factor;

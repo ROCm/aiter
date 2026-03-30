@@ -3,7 +3,7 @@
 #pragma once
 
 #include "hip_reduce.h"
-#include "opus.hpp"
+#include "opus/opus.hpp"
 // todo: remove this to use aiterTensor dtype
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
@@ -132,13 +132,19 @@ OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x8(const S& s, float scale)
 #else
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x2(const S&, float)
-{ return array<fp4_t, 1>{}; }
+{
+    return array<fp4_t, 1>{};
+}
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x4(const S&, float)
-{ return array<fp4_t, 2>{}; }
+{
+    return array<fp4_t, 2>{};
+}
 template <typename S, std::enable_if_t<std::is_same_v<S, fp16x8_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp16_to_fp4_scaled_x8(const S&, float)
-{ return array<fp4_t, 4>{}; }
+{
+    return array<fp4_t, 4>{};
+}
 #endif
 
 // bf16 -> fp4 larger vectors (bf16x4/x8) using opus bf16_to_fp4_packed_x2
@@ -168,83 +174,113 @@ template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, fp8_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_fp8_scaled_x2(s, inverted_scale); }
+{
+    return fp32_to_fp8_scaled_x2(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, bf8_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_bf8_scaled_x2(s, inverted_scale); }
+{
+    return fp32_to_bf8_scaled_x2(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, i8_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_i8_scaled_x2(s, inverted_scale); }
+{
+    return fp32_to_i8_scaled_x2(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, fp8_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_fp8_scaled_x4(s, inverted_scale); }
+{
+    return fp32_to_fp8_scaled_x4(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, bf8_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_bf8_scaled_x4(s, inverted_scale); }
+{
+    return fp32_to_bf8_scaled_x4(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, i8_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_i8_scaled_x4(s, inverted_scale); }
+{
+    return fp32_to_i8_scaled_x4(s, inverted_scale);
+}
 
 // --- fp4 target: fp32 source (delegates to opus cast<fp4_t>) ---
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x2_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_fp4_packed_x2(s, inverted_scale); }
+{
+    return fp32_to_fp4_packed_x2(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x4_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_fp4_packed_x4(s, inverted_scale); }
+{
+    return fp32_to_fp4_packed_x4(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp32x8_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp32_to_fp4_packed_x8(s, inverted_scale); }
+{
+    return fp32_to_fp4_packed_x8(s, inverted_scale);
+}
 
 // --- fp4 target: bf16 source ---
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, bf16x2_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return bf16_to_fp4_packed_x2(s, inverted_scale); }
+{
+    return bf16_to_fp4_packed_x2(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, bf16x4_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return bf16_to_fp4_scaled_x4(s, inverted_scale); }
+{
+    return bf16_to_fp4_scaled_x4(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, bf16x8_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return bf16_to_fp4_scaled_x8(s, inverted_scale); }
+{
+    return bf16_to_fp4_scaled_x8(s, inverted_scale);
+}
 
 // --- fp4 target: fp16 source ---
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp16x2_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp16_to_fp4_scaled_x2(s, inverted_scale); }
+{
+    return fp16_to_fp4_scaled_x2(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp16x4_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp16_to_fp4_scaled_x4(s, inverted_scale); }
+{
+    return fp16_to_fp4_scaled_x4(s, inverted_scale);
+}
 template <typename D,
           typename S,
           std::enable_if_t<std::is_same_v<S, fp16x8_t> && std::is_same_v<D, fp4_t>, bool> = true>
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
-{ return fp16_to_fp4_scaled_x8(s, inverted_scale); }
+{
+    return fp16_to_fp4_scaled_x8(s, inverted_scale);
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // auto-fold: build flat output vector using x2 primitives in a loop

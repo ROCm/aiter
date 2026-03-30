@@ -21,8 +21,8 @@
 #include "dispatch_utils.h"
 #include "hip_compat.h"
 #include "hip_reduce.h"
+#include "aiter_opus_plus.h"
 #include "py_itfs_common.h"
-#include "vec_convert.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
@@ -304,8 +304,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     // param. In theory, this can support all powers of 2 up to 16. NOTE(woosuk): The original
     // implementation uses CUTLASS aligned array here. We defined our own aligned array and use it
     // here to avoid the dependency on CUTLASS.
-    using AccessType = ck_tile::vec_t<DTYPE, ELTS_PER_LDG>;
-    using ChunkType  = ck_tile::vec_t<float, ELTS_PER_LDG>;
+    using AccessType = opus::vector_t<DTYPE, ELTS_PER_LDG>;
+    using ChunkType  = opus::vector_t<float, ELTS_PER_LDG>;
     using kvp        = hipcub::KeyValuePair<int, float>;
     // hipcub::ArgMax arg_max;
     // hipcub::ArgMin arg_min;
@@ -317,8 +317,11 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 #pragma unroll
     for(int ii = 0; ii < LDG_PER_THREAD; ++ii)
     {
-        row_chunk_vec_ptr[ii] = ck_tile::vec_convert<float, DTYPE, ELTS_PER_LDG>(
-            vec_thread_read_ptr[ii * THREADS_PER_ROW]);
+        AccessType vec = vec_thread_read_ptr[ii * THREADS_PER_ROW];
+        for(int jj = 0; jj < ELTS_PER_LDG; ++jj)
+        {
+            row_chunk_vec_ptr[ii][jj] = static_cast<float>(vec[jj]);
+        }
     }
 
     // Process shared experts: use the thread subgroup working on this row
@@ -790,7 +793,7 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + nu
 
     // Process routing experts with softmax + topk, and shared experts with sigmoid in one kernel
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "topk_softmax", [&] {
-        using input_dtype = typename t2ck<scalar_t>::type;
+        using input_dtype = typename t2opus<scalar_t>::type;
         vllm::moe::topkGatingSoftmaxKernelLauncher(
             reinterpret_cast<input_dtype*>(gating_output.data_ptr()),
             topk_weights.data_ptr<float>(),
