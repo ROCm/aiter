@@ -168,11 +168,14 @@ kernels:
 
 1. Parse and validate `triton-upgrade.yaml`
 2. Test SSH connectivity to each machine, verify GPU availability (`rocm-smi`)
-3. Auto-discover kernels:
-   - Scan `aiter/ops/triton/gemm/basic/gemm_*.py` for kernel files
-   - Match to config files in `aiter/ops/triton/configs/gemm/`
+3. Auto-discover kernels across all GEMM categories:
+   - Scan `aiter/ops/triton/gemm/basic/gemm_*.py` for basic GEMM kernels
+   - Scan `aiter/ops/triton/gemm/batched/batched_gemm_*.py` for batched GEMM kernels
+   - Scan `aiter/ops/triton/gemm/feed_forward/ff_*.py` for feed-forward fused kernels
+   - Scan `aiter/ops/triton/gemm/fused/fused_gemm_*.py` for fused GEMM kernels
+   - Match to config files in `aiter/ops/triton/configs/gemm/` (GEMM-*, BATCHED_GEMM-*, FF-*, FUSED-GEMM-*)
    - Match to ut_* scripts in `aiter/ops/triton/utils/_triton/tunning/`
-   - Match to bench scripts in `op_tests/op_benchmarks/triton/`
+   - Match to bench scripts in `op_tests/op_benchmarks/triton/` (bench_gemm_*, bench_batched_gemm_*, bench_ff_*)
    - Match to test scripts in `op_tests/triton_tests/gemm/`
 4. Apply kernel include/exclude overrides from config
 5. Launch terminal dashboard
@@ -476,6 +479,8 @@ Config files follow the pattern: `<gfx_arch>-GEMM-<VARIANT>[-N=<N>-K=<K>].json`
 
 The mapping from kernel name to VARIANT prefix:
 
+**Basic GEMMs** (`aiter/ops/triton/gemm/basic/`):
+
 | Kernel file | Config VARIANT | Notes |
 |-------------|---------------|-------|
 | `gemm_a8w8.py` | `A8W8` | |
@@ -491,6 +496,42 @@ The mapping from kernel name to VARIANT prefix:
 | `gemm_afp4wfp4.py` | `AFP4WFP4` | Non-preshuffled |
 | `gemm_afp4wfp4.py` (preshuffle) | `AFP4WFP4_PRESHUFFLED` | |
 | `gemm_afp4wfp4_pre_quant_atomic.py` | `AFP4WFP4_PRE_QUANT_ATOMIC` | |
+
+**Batched GEMMs** (`aiter/ops/triton/gemm/batched/`):
+
+| Kernel file | Config VARIANT | Notes |
+|-------------|---------------|-------|
+| `batched_gemm_a8w8.py` | `BATCHED_GEMM-A8W8` | Has B (batch) dimension |
+| `batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant.py` | `BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT` | Long variant name |
+| `batched_gemm_afp4wfp4.py` | `BATCHED_GEMM-AFP4WFP4` | |
+| `batched_gemm_afp4wfp4_pre_quant.py` | `BATCHED_GEMM_PREQUANT-AFP4WFP4` | |
+| `batched_gemm_a16wfp4.py` | `BATCHED_GEMM-A16WFP4` | |
+| `batched_gemm_bf16.py` | `BATCHED_GEMM-A16W16` | |
+
+**Feed-Forward Fused** (`aiter/ops/triton/gemm/feed_forward/`):
+
+| Kernel file | Config VARIANT | Notes |
+|-------------|---------------|-------|
+| `ff_a16w16.py` | (no config) | May not use autotuned configs |
+| `ff_a16w16_fused_gated.py` | `FF-A16W16-fused` | Note: lowercase "fused" |
+| `ff_a16w16_fused_ungated.py` | (shares config with gated) | |
+
+**Fused GEMMs** (`aiter/ops/triton/gemm/fused/`):
+
+| Kernel file | Config VARIANT | Notes |
+|-------------|---------------|-------|
+| `fused_gemm_a8w8_blockscale_a16w16.py` | `FUSED-GEMM-A8W8_BLOCKSCALE-A16W16` | |
+| `fused_gemm_a8w8_blockscale_mul_add.py` | (may share config) | |
+| `fused_gemm_a8w8_blockscale_split_cat.py` | (may share config) | |
+| `fused_gemm_afp4wfp4_a16w16.py` | `FUSED-GEMM-AFP4WFP4-A16W16` | |
+| `fused_gemm_afp4wfp4_mul_add.py` | (may share config) | |
+| `fused_gemm_afp4wfp4_split_cat.py` | (may share config) | |
+
+**Notes on batched/fused kernels:**
+- Batched kernels have a B (batch) dimension in addition to M, N, K. Shape format is (B, N, K) not (M, N, K).
+- Some fused kernels only have gfx942 configs — gfx950 configs may need to be created from scratch.
+- The Script Creator Agent must handle these different shape formats and config patterns.
+- Feed-forward kernels may use different bench scripts (`bench_ff_*.py` vs `bench_gemm_*.py`).
 
 - **Fallback config**: `gfx950-GEMM-A8W8.json` (no N,K suffix) — used when no suffixed config matches
 - **Suffixed config**: `gfx950-GEMM-A8W8-N=128-K=2048.json` — used for specific N,K pairs
