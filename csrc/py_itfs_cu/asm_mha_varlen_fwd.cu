@@ -334,7 +334,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 1 : k.size(1);
-    TORCH_CHECK(!paged_KV || page_block_size % 128 == 0, "Paged KV cache block size must be divisible by 128");
+    TORCH_CHECK(!paged_KV || (page_block_size >= 16 && (page_block_size & (page_block_size - 1)) == 0),
+                "Paged KV cache block size must be a power of 2 >= 16");
 
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
 

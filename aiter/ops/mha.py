@@ -388,12 +388,10 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
-        ]
-        blob_gen_cmd.append(
+            "--receipt 200 --filter {} --output_dir {{}}".format('" "'),
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
-        )
+            "--receipt 200 --output_dir {{}}".format()
+        ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
