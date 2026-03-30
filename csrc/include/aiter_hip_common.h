@@ -4,8 +4,8 @@
 
 #define AITER_C_ITFS extern "C" __attribute__((visibility("default")))
 
-#include "aiter_logger.h"
 #include "aiter_enum.h"
+#include "aiter_logger.h"
 #include "aiter_tensor.h"
 #if !ENABLE_CK
 #include "ck_tile_shim.h"
@@ -147,7 +147,9 @@ class AiterAsmKernel
 
     public:
     AiterAsmKernel(const char* name, const char* hsaco)
-    { load_asm_kernel(name, hsaco, module, kernel_func); };
+    {
+        load_asm_kernel(name, hsaco, module, kernel_func);
+    };
 
     ~AiterAsmKernel() { HIP_CALL(hipModuleUnload(module)); }
 
@@ -270,15 +272,18 @@ static bool is_mi308_device()
     return chip_id == 0x74a2 || chip_id == 0x74a8 || chip_id == 0x74b6 || chip_id == 0x74bc;
 }
 
-class HipDeviceGuard {
-public:
-    explicit HipDeviceGuard(int device_id) {
+class HipDeviceGuard
+{
+    public:
+    explicit HipDeviceGuard(int device_id)
+    {
         HIP_CALL(hipGetDevice(&prev_device_));
         HIP_CALL(hipSetDevice(device_id));
     }
     ~HipDeviceGuard() noexcept { HIP_CALL(hipSetDevice(prev_device_)); }
-    HipDeviceGuard(const HipDeviceGuard&) = delete;
+    HipDeviceGuard(const HipDeviceGuard&)            = delete;
     HipDeviceGuard& operator=(const HipDeviceGuard&) = delete;
-private:
+
+    private:
     int prev_device_{};
 };

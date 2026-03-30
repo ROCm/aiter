@@ -116,3 +116,13 @@ def mhc_pre(
     )
 
     return post_mix, comb_mix, layer_input
+
+
+@compile_ops("module_mhc")
+def mhc_post(
+    out: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+) -> None: ...
