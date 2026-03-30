@@ -2506,7 +2506,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     hipGetDeviceProperties(&dev_prop, dev);
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
-    use_1stage = (use_1stage && (n == 4096 || n == 2048 || n == 1024 || n == 512));
+    use_1stage = (use_1stage && (n == 4096 || n == 2880 || n == 2048 || n == 1024 || n == 512));
 #define DISPATCH_1S_KERNEL(NGPUS, N)                                          \
     case N: {                                                                 \
         allreduce_fusion_kernel_1stage_launcher<T, T, NGPUS, N>(ptrs,         \
@@ -2529,6 +2529,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         switch(n)                                                        \
         {                                                                \
             DISPATCH_1S_KERNEL(NGPUS, 4096)                              \
+            DISPATCH_1S_KERNEL(NGPUS, 2880)                              \
             DISPATCH_1S_KERNEL(NGPUS, 2048)                              \
             DISPATCH_1S_KERNEL(NGPUS, 1024)                              \
             DISPATCH_1S_KERNEL(NGPUS, 512)                               \
@@ -2579,7 +2580,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
     } while(0)
 
-    if(n_bytes % 1024 == 0)
+    if(n_bytes % 16 == 0)
     {
         if(8192 <= n_bytes && n_bytes <= 32768)
         {
@@ -2727,6 +2728,7 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
         switch(n)                                                                            \
         {                                                                                    \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 4096, allreduce_fusion_kernel_split_launcher)  \
+            DISPATCH_AR_FUSION_KERNEL_(NGPUS, 2880, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 2048, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 1024, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 512, allreduce_fusion_kernel_split_launcher)   \
