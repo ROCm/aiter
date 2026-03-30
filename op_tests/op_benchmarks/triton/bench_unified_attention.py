@@ -392,7 +392,7 @@ def run_benchmark(custom, args):
                 sinks=sinks,
             )
 
-        ms = triton.testing.do_bench(fn)
+        ms = triton.testing.do_bench_cudagraph(fn)
 
         run_correctness = args.test
         if run_correctness:
