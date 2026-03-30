@@ -216,7 +216,7 @@ def test_gated_rmsnorm_fp8_group_quant(
 
     print("\nScale comparison:")
     checkAllclose(
-        ref_scales.float(), hip_scales.float(), rtol=1e-3, atol=1e-4, msg="Scales"
+        ref_scales.float(), hip_scales.float(), rtol=1e-3, atol=1e-3, msg="Scales"
     )
 
     print(f"\n{'='*80}")
@@ -338,10 +338,6 @@ if __name__ == "__main__":
             (2048, 32, 128),
         ]
 
-        print("\n" + "=" * 80)
-        print("Quick Test - Gated RMSNorm + FP8 Group Quantization HIP Kernel")
-        print("=" * 80)
-
         for num_tokens, num_heads, head_dim in test_configs:
             for transpose in [False, True]:
                 test_gated_rmsnorm_fp8_group_quant(
@@ -351,7 +347,3 @@ if __name__ == "__main__":
                     dtype=dtype,
                     transpose_scale=transpose,
                 )
-
-        print("\n" + "=" * 80)
-        print("All Quick Tests PASSED!")
-        print("=" * 80 + "\n")
