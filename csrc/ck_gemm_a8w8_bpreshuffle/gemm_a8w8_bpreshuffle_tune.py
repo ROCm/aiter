@@ -424,7 +424,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         tasks = []
         for i in sorted(kernels_list_flydsl.keys()):
             ki = kernels_list_flydsl[i]
-            if M % ki.tile_m != 0 or N % ki.tile_n != 0 or K % ki.tile_k != 0:
+            if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+                continue
+            if M < 16 and ki.tile_m != 16:
                 continue
             kernel_name = ki.name
             info = (info_keys, i, 0, kernel_name, "flydsl")

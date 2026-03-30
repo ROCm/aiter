@@ -95,7 +95,7 @@ _base_tiles_lds2_common = [
     (48,  64,  256), (48,  128, 256), (48,  192, 256), (48,  256, 256),
     # M=64
     (64,  64,  128), (64,  64,  256), (64,  128, 128), (64,  128, 256),
-    (64,  192, 128), (64,  192, 256), (64,  256, 64),  (64,  256, 128),
+    (64,  192, 128), (64,  192, 256), (64,  256, 128),
     (64,  256, 256),
     # M=80
     (80,  64,  256), (80,  128, 256), (80,  192, 256), (80,  256, 256),
@@ -105,7 +105,7 @@ _base_tiles_lds2_common = [
     # M=112
     (112, 64,  256), (112, 128, 256), (112, 192, 256), (112, 256, 256),
     # M=128
-    (128, 64,  128), (128, 64,  256), (128, 128, 64),  (128, 128, 128),
+    (128, 64,  128), (128, 64,  256), (128, 128, 128),
     (128, 128, 256), (128, 192, 128), (128, 192, 256), (128, 256, 128),
     # M=160/192/224/256
     (160, 192, 128),
@@ -114,7 +114,13 @@ _base_tiles_lds2_common = [
     (256, 64,  128), (256, 128, 128), (256, 192, 128),
 ]
 
-# gfx950 has one extra lds_stage=2 tile
+# gfx942-only lds_stage=2 tiles (tile_k=64 not supported on gfx950)
+_base_tiles_lds2_942_extra = [
+    (64,  256, 64),
+    (128, 128, 64),
+]
+
+# gfx950-only lds_stage=2 tile
 _base_tiles_lds2_950_extra = [
     (256, 256, 128),
 ]
@@ -155,7 +161,7 @@ def _build_kernels_list(tiles_lds2, tiles_lds1):
 
 
 kernels_list_942 = _build_kernels_list(
-    _base_tiles_lds2_common, _base_tiles_lds1)
+    _base_tiles_lds2_common + _base_tiles_lds2_942_extra, _base_tiles_lds1)
 kernels_list_950 = _build_kernels_list(
     _base_tiles_lds2_common + _base_tiles_lds2_950_extra, _base_tiles_lds1)
 # fmt: on

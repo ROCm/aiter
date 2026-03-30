@@ -532,11 +532,6 @@ def flydsl_preshuffle_gemm_a8(
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]
 
-    if m % tile_m != 0:
-        raise RuntimeError(
-            f"[FlyDSL] M ({m}) is not a multiple of tile_m ({tile_m}). "
-            f"Arguments not supported! Skipping gemm!"
-        )
     if n % tile_n != 0:
         raise RuntimeError(
             f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "
