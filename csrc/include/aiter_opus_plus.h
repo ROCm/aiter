@@ -4,6 +4,7 @@
 
 #include "hip_reduce.h"
 #include "opus.hpp"
+#include "opus/opus.hpp"
 // todo: remove this to use aiterTensor dtype
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>
@@ -17,14 +18,28 @@ using index_t = int;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // scaled type conversion: v_pk_mul_f32 + v_med3_f32 + v_cvt_pk_{fp8,bf8}_f32
-// Identical ISA to ck_tile::vec_convert for performance parity
+// gfx11/gfx12 can use scalar/package-math style multiplies here.
+#if defined(__gfx11__) || defined(__gfx12__)
+OPUS_D fp32x2_t amd_scalar_mul_f32(fp32x2_t a, fp32x2_t b)
+{
+    fp32x2_t c;
+    c[0] = a[0] * b[0];
+    c[1] = a[1] * b[1];
+    return c;
+}
 
+OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
+{
+    return amd_scalar_mul_f32(a, b);
+}
+#else
 OPUS_D fp32x2_t pk_mul_f32(fp32x2_t a, fp32x2_t b)
 {
     fp32x2_t c;
     asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
     return c;
 }
+#endif
 
 // fp32x2 -> fp8x2 with scale + saturation clamp (E4M3)
 // ISA: v_pk_mul_f32 + v_med3_f32 x2 + v_cvt_pk_fp8_f32
@@ -32,11 +47,8 @@ template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 {
     fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
-#if defined(__gfx950__)
-    constexpr float hi = 448.0f, lo = -448.0f;
-#else
-    constexpr float hi = 240.0f, lo = -240.0f;
-#endif
+    constexpr float hi = finfo<fp8_t>::max();
+    constexpr float lo = finfo<fp8_t>::min();
     float a = tmp[0], b = tmp[1];
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
@@ -61,7 +73,8 @@ template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true
 OPUS_D decltype(auto) fp32_to_bf8_scaled_x2(const S& s, float inverted_scale)
 {
     fp32x2_t tmp       = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
-    constexpr float hi = 57344.0f, lo = -57344.0f;
+    constexpr float hi = finfo<bf8_t>::max();
+    constexpr float lo = finfo<bf8_t>::min();
     float a = tmp[0], b = tmp[1];
     int w;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
