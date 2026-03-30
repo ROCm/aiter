@@ -1049,8 +1049,8 @@ def _ctypes_call(func, fc_name, md_name):
     ----------------------|----------------------|---------
     Tensor                | POINTER(aiter_tensor_t) | aiter_tensor_t*
     Optional[Tensor]      | POINTER(aiter_tensor_t) | aiter_tensor_t* (NULL if None)
-    int                   | c_int                | int
-    Optional[int]         | c_int                | int   (-1 if None)
+    int                   | c_int64              | int64_t
+    Optional[int]         | c_int64              | int64_t (-1 if None)
     str                   | c_char_p             | char* (.encode())
     Optional[str]         | c_char_p             | char* (NULL if None)
     bool                  | c_int                | int   (0 / 1)
@@ -1092,20 +1092,31 @@ def _ctypes_call(func, fc_name, md_name):
             )
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
-        c_func.restype = None
 
         hints = typing.get_type_hints(func)
+
+        ret_hint = hints.get("return")
+        if ret_hint is int:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is float:
+            c_func.restype = ctypes.c_float
+        else:
+            c_func.restype = None
+
         argtypes = []
+        has_tensor = False
         for pname in inspect.signature(func).parameters:
             hint = hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                has_tensor = True
             elif _is_union(origin) and torch.Tensor in type_args:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                has_tensor = True
             elif _is_union(origin) and int in type_args:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
             elif hint is str:
@@ -1113,16 +1124,18 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
             elif hint is int:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif hint is float:
                 argtypes.append(ctypes.c_float)
             else:
                 argtypes.append(ctypes.c_void_p)
-        argtypes.append(ctypes.c_void_p)  # hipStream_t
+        if has_tensor:
+            argtypes.append(ctypes.c_void_p)  # hipStream_t
         c_func.argtypes = argtypes
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
+        _cache["has_tensor"] = has_tensor
 
     def _check_args_before_convert(bound_args, hints):
         for pname, value in bound_args.items():
@@ -1226,16 +1239,17 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 c_args.append(1 if value else 0)
             elif hint is int:
-                c_args.append(ctypes.c_int(value))
+                c_args.append(ctypes.c_int64(value))
             elif hint is float:
                 c_args.append(ctypes.c_float(value))
             else:
                 c_args.append(value)
 
-        c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-        )
-        c_func(*c_args)
+        if _cache.get("has_tensor"):
+            c_args.append(
+                ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+            )
+        return c_func(*c_args)
 
     return caller
 
@@ -1255,7 +1269,7 @@ def compile_ops(
 
             @functools.wraps(func)
             def ctypes_wrapper(*args, **kwargs):
-                ctypes_caller(*args, **kwargs)
+                return ctypes_caller(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", calling_func_=func)
             def ctypes_custom_wrapper(*args, **kwargs):
@@ -1353,6 +1367,7 @@ def compile_ops(
                         doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
                         doc_str = doc_str.replace("typing.SupportsInt", "int")
                         doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                        doc_str = re.sub(r"\s*\|\s*typing\.SupportsIndex", "", doc_str)
                         pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                         doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                         for el in enum_types:
