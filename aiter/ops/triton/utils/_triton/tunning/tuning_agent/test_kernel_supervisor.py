@@ -16,10 +16,13 @@ from .kernel_supervisor import (
     SupervisorState,
     TuningMode,
 )
-from .types import ContainerConfig, RepoConfig, TritonInstallConfig, TuningConfig
+from .types import ContainerConfig, RepoConfig, ShapeResult, TritonInstallConfig, TuningConfig
 from .artifacts import ArtifactManager
 from .notifications import Notifier
 from .subagents.base import SubagentResult
+from .subagents.tuning_agent import TuningAgent
+from .subagents.pattern_analyzer_agent import PatternAnalyzerAgent
+from .subagents.config_generator_agent import ConfigGeneratorAgent
 
 
 # ---------------------------------------------------------------------------
@@ -731,3 +734,471 @@ class TestCheckPhaseTimeout:
         ancient_start = time.time() - (phase_max + 1)
         result = supervisor._check_phase_timeout(Phase.TUNING, ancient_start)
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# Helper: make ShapeResult fixtures
+# ---------------------------------------------------------------------------
+
+
+def make_shape_result(m: int, n: int, k: int, total_ns: float) -> ShapeResult:
+    """Return a ShapeResult with main_ns=total_ns and reduce_ns=0."""
+    return ShapeResult(m=m, n=n, k=k, main_ns=total_ns, reduce_ns=0.0)
+
+
+# ---------------------------------------------------------------------------
+# _identify_regressed_shapes
+# ---------------------------------------------------------------------------
+
+
+class TestIdentifyRegressedShapes:
+    def test_finds_regressions(self, tmp_path: Path) -> None:
+        """baseline=100 ns, untuned=110 ns with 5% threshold => regressed."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.baseline_data = [make_shape_result(128, 256, 256, 100.0)]
+        supervisor.state.untuned_data = [make_shape_result(128, 256, 256, 110.0)]
+        # Default threshold is 5 %; 110 > 100 * 1.05 = 105 => regression
+        regressed = supervisor._identify_regressed_shapes()
+        assert (128, 256, 256) in regressed
+
+    def test_no_regressions_within_threshold(self, tmp_path: Path) -> None:
+        """baseline=100 ns, untuned=104 ns with 5% threshold => not regressed."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.baseline_data = [make_shape_result(128, 256, 256, 100.0)]
+        supervisor.state.untuned_data = [make_shape_result(128, 256, 256, 104.0)]
+        # 104 <= 100 * 1.05 = 105 => no regression
+        regressed = supervisor._identify_regressed_shapes()
+        assert regressed == []
+
+    def test_returns_empty_when_no_baseline(self, tmp_path: Path) -> None:
+        """When baseline_data is None, returns an empty list."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.baseline_data = None
+        supervisor.state.untuned_data = [make_shape_result(128, 256, 256, 110.0)]
+        assert supervisor._identify_regressed_shapes() == []
+
+    def test_returns_empty_when_no_untuned(self, tmp_path: Path) -> None:
+        """When untuned_data is None, returns an empty list."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.baseline_data = [make_shape_result(128, 256, 256, 100.0)]
+        supervisor.state.untuned_data = None
+        assert supervisor._identify_regressed_shapes() == []
+
+    def test_skips_shapes_not_in_baseline(self, tmp_path: Path) -> None:
+        """Shapes present only in untuned_data are silently ignored."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.baseline_data = [make_shape_result(64, 64, 64, 100.0)]
+        supervisor.state.untuned_data = [
+            make_shape_result(64, 64, 64, 104.0),   # not regressed
+            make_shape_result(128, 128, 128, 200.0), # not in baseline => skip
+        ]
+        regressed = supervisor._identify_regressed_shapes()
+        assert regressed == []
+
+    def test_multiple_shapes_partial_regression(self, tmp_path: Path) -> None:
+        """Only the shapes that exceed the threshold appear in the output."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.baseline_data = [
+            make_shape_result(32, 64, 64, 100.0),
+            make_shape_result(64, 64, 64, 100.0),
+        ]
+        supervisor.state.untuned_data = [
+            make_shape_result(32, 64, 64, 110.0),  # 10 % regression => included
+            make_shape_result(64, 64, 64, 103.0),  # 3 % regression => excluded
+        ]
+        regressed = supervisor._identify_regressed_shapes()
+        assert (32, 64, 64) in regressed
+        assert (64, 64, 64) not in regressed
+
+
+# ---------------------------------------------------------------------------
+# _determine_shapes_to_tune
+# ---------------------------------------------------------------------------
+
+
+class TestDetermineShapesToTune:
+    def _set_state_shapes(self, supervisor: KernelSupervisor) -> None:
+        """Populate state.shapes with two ShapeResult objects."""
+        supervisor.state.shapes = [
+            make_shape_result(32, 64, 64, 0.0),
+            make_shape_result(64, 128, 128, 0.0),
+        ]
+
+    def test_full_mode_returns_all_shapes(self, tmp_path: Path) -> None:
+        """In FULL mode every shape from state.shapes is returned."""
+        supervisor = make_supervisor(tmp_path)
+        self._set_state_shapes(supervisor)
+        supervisor.config.tuning_config.mode = TuningMode.FULL
+
+        shapes = supervisor._determine_shapes_to_tune()
+
+        assert (32, 64, 64) in shapes
+        assert (64, 128, 128) in shapes
+        assert len(shapes) == 2
+
+    def test_regression_only_with_regressions(self, tmp_path: Path) -> None:
+        """In REGRESSION_ONLY mode only regressed shapes are returned."""
+        supervisor = make_supervisor(tmp_path)
+        self._set_state_shapes(supervisor)
+        supervisor.config.tuning_config.mode = TuningMode.REGRESSION_ONLY
+
+        # Inject baseline/untuned data so only (32, 64, 64) regresses.
+        supervisor.state.baseline_data = [
+            make_shape_result(32, 64, 64, 100.0),
+            make_shape_result(64, 128, 128, 100.0),
+        ]
+        supervisor.state.untuned_data = [
+            make_shape_result(32, 64, 64, 115.0),   # 15 % => regression
+            make_shape_result(64, 128, 128, 102.0),  # 2 % => no regression
+        ]
+
+        shapes = supervisor._determine_shapes_to_tune()
+
+        assert (32, 64, 64) in shapes
+        assert (64, 128, 128) not in shapes
+
+    def test_regression_only_no_regressions_returns_empty(self, tmp_path: Path) -> None:
+        """In REGRESSION_ONLY mode with no regressions, returns empty list."""
+        supervisor = make_supervisor(tmp_path)
+        self._set_state_shapes(supervisor)
+        supervisor.config.tuning_config.mode = TuningMode.REGRESSION_ONLY
+
+        supervisor.state.baseline_data = [make_shape_result(32, 64, 64, 100.0)]
+        supervisor.state.untuned_data = [make_shape_result(32, 64, 64, 101.0)]
+
+        shapes = supervisor._determine_shapes_to_tune()
+
+        assert shapes == []
+
+
+# ---------------------------------------------------------------------------
+# _run_phase_4_tuning
+# ---------------------------------------------------------------------------
+
+
+class TestRunPhase4Tuning:
+    def test_skips_when_no_shapes_to_tune(self, tmp_path: Path) -> None:
+        """When _determine_shapes_to_tune() returns empty, result has skipped=True."""
+        supervisor = make_supervisor(tmp_path)
+
+        with patch.object(
+            supervisor, "_determine_shapes_to_tune", return_value=[]
+        ):
+            result = supervisor._run_phase_4_tuning()
+
+        assert result.success is True
+        assert result.data.get("skipped") is True
+        assert result.phase == Phase.TUNING
+
+    def test_dispatches_tuning_pipeline_in_order(self, tmp_path: Path) -> None:
+        """All four subagents are dispatched in order when shapes exist."""
+        supervisor = make_supervisor(tmp_path)
+
+        shapes = [(32, 64, 64), (64, 128, 128)]
+
+        # Track dispatch call order.
+        dispatch_order: list = []
+
+        def fake_dispatch(cls, **kwargs):
+            dispatch_order.append(cls)
+            return SubagentResult(success=True, data={})
+
+        with patch.object(
+            supervisor, "_determine_shapes_to_tune", return_value=shapes
+        ), patch.object(supervisor, "_dispatch_subagent", side_effect=fake_dispatch):
+            result = supervisor._run_phase_4_tuning()
+
+        assert result.success is True
+        assert result.phase == Phase.TUNING
+
+        # Verify all four subagents were dispatched.
+        assert TuningAgent in dispatch_order
+        assert PatternAnalyzerAgent in dispatch_order
+        assert ConfigGeneratorAgent in dispatch_order
+
+        # TuningAgent is dispatched twice (scout + full tuning).
+        assert dispatch_order.count(TuningAgent) == 2
+
+        # Order: TuningAgent (scout), PatternAnalyzerAgent, TuningAgent (full), ConfigGeneratorAgent
+        assert dispatch_order[0] is TuningAgent
+        assert dispatch_order[1] is PatternAnalyzerAgent
+        assert dispatch_order[2] is TuningAgent
+        assert dispatch_order[3] is ConfigGeneratorAgent
+
+    def test_result_contains_shapes_tuned_count(self, tmp_path: Path) -> None:
+        """result.data['shapes_tuned'] reflects the number of shapes."""
+        supervisor = make_supervisor(tmp_path)
+
+        shapes = [(32, 64, 64), (64, 128, 128), (128, 256, 256)]
+
+        with patch.object(
+            supervisor, "_determine_shapes_to_tune", return_value=shapes
+        ), patch.object(
+            supervisor, "_dispatch_subagent", return_value=SubagentResult(success=True, data={})
+        ):
+            result = supervisor._run_phase_4_tuning()
+
+        assert result.data["shapes_tuned"] == 3
+
+    def test_result_contains_configs_generated_flag(self, tmp_path: Path) -> None:
+        """result.data['configs_generated'] is True after successful run."""
+        supervisor = make_supervisor(tmp_path)
+
+        shapes = [(32, 64, 64)]
+
+        with patch.object(
+            supervisor, "_determine_shapes_to_tune", return_value=shapes
+        ), patch.object(
+            supervisor, "_dispatch_subagent", return_value=SubagentResult(success=True, data={})
+        ):
+            result = supervisor._run_phase_4_tuning()
+
+        assert result.data.get("configs_generated") is True
+
+
+# ---------------------------------------------------------------------------
+# _run_phase_0_setup
+# ---------------------------------------------------------------------------
+
+
+class TestRunPhase0Setup:
+    def test_phase_0_dispatches_setup_agent(self, tmp_path: Path) -> None:
+        """_run_phase_0_setup calls _dispatch_with_retry with SetupAgent."""
+        from .subagents.setup_agent import SetupAgent
+
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(
+            success=True, data={"container_id": "abc123"}
+        )
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ) as mock_dispatch:
+            phase_result = supervisor._run_phase_0_setup()
+
+        mock_dispatch.assert_called_once()
+        first_arg = mock_dispatch.call_args[0][0]
+        assert first_arg is SetupAgent
+
+    def test_phase_0_returns_phase_result(self, tmp_path: Path) -> None:
+        """_run_phase_0_setup returns a PhaseResult for Phase.SETUP."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            phase_result = supervisor._run_phase_0_setup()
+
+        assert isinstance(phase_result, PhaseResult)
+        assert phase_result.phase == Phase.SETUP
+
+    def test_phase_0_stores_container_id_on_success(self, tmp_path: Path) -> None:
+        """On success, container_id from result data is stored on supervisor."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(
+            success=True, data={"container_id": "ctr_999"}
+        )
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            supervisor._run_phase_0_setup()
+
+        assert supervisor.container_id == "ctr_999"
+
+    def test_phase_0_returns_failure_on_exception(self, tmp_path: Path) -> None:
+        """If _dispatch_with_retry raises, _run_phase_0_setup returns failure."""
+        supervisor = make_supervisor(tmp_path)
+        with patch.object(
+            KernelSupervisor,
+            "_dispatch_with_retry",
+            side_effect=RuntimeError("boom"),
+        ):
+            phase_result = supervisor._run_phase_0_setup()
+
+        assert phase_result.success is False
+        assert "boom" in phase_result.error
+
+    def test_phase_0_records_duration(self, tmp_path: Path) -> None:
+        """duration_seconds is non-negative after _run_phase_0_setup completes."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            phase_result = supervisor._run_phase_0_setup()
+
+        assert phase_result.duration_seconds >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# _run_phase_2_baseline
+# ---------------------------------------------------------------------------
+
+
+class TestRunPhase2Baseline:
+    def test_phase_2_switches_triton_twice(self, tmp_path: Path) -> None:
+        """_run_phase_2_baseline calls _switch_triton for baseline then target."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+        switch_calls: list = []
+
+        def record_switch(repo_config):
+            switch_calls.append(repo_config)
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            with patch.object(
+                KernelSupervisor, "_switch_triton", side_effect=record_switch
+            ):
+                supervisor._run_phase_2_baseline()
+
+        assert len(switch_calls) == 2
+        assert switch_calls[0] is supervisor.config.baseline_repo
+        assert switch_calls[1] is supervisor.config.target_repo
+
+    def test_phase_2_stores_baseline_data(self, tmp_path: Path) -> None:
+        """On success, state.baseline_data is populated from result data."""
+        supervisor = make_supervisor(tmp_path)
+        fake_results = [{"m": 256, "n": 256, "k": 64}]
+        success_result = SubagentResult(
+            success=True, data={"results": fake_results}
+        )
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            with patch.object(KernelSupervisor, "_switch_triton"):
+                supervisor._run_phase_2_baseline()
+
+        assert supervisor.state.baseline_data == fake_results
+
+    def test_phase_2_dispatches_baseline_agent(self, tmp_path: Path) -> None:
+        """_run_phase_2_baseline dispatches BaselineAgent."""
+        from .subagents.baseline_agent import BaselineAgent
+
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ) as mock_dispatch:
+            with patch.object(KernelSupervisor, "_switch_triton"):
+                supervisor._run_phase_2_baseline()
+
+        mock_dispatch.assert_called_once()
+        first_arg = mock_dispatch.call_args[0][0]
+        assert first_arg is BaselineAgent
+
+    def test_phase_2_returns_failure_on_exception(self, tmp_path: Path) -> None:
+        """If _switch_triton raises, _run_phase_2_baseline returns failure."""
+        supervisor = make_supervisor(tmp_path)
+        with patch.object(
+            KernelSupervisor,
+            "_switch_triton",
+            side_effect=RuntimeError("switch failed"),
+        ):
+            phase_result = supervisor._run_phase_2_baseline()
+
+        assert phase_result.success is False
+        assert "switch failed" in phase_result.error
+
+    def test_phase_2_returns_phase_result(self, tmp_path: Path) -> None:
+        """_run_phase_2_baseline returns a PhaseResult for Phase.BASELINE."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            with patch.object(KernelSupervisor, "_switch_triton"):
+                phase_result = supervisor._run_phase_2_baseline()
+
+        assert isinstance(phase_result, PhaseResult)
+        assert phase_result.phase == Phase.BASELINE
+
+
+# ---------------------------------------------------------------------------
+# _run_phase_3_untuned
+# ---------------------------------------------------------------------------
+
+
+class TestRunPhase3Untuned:
+    def test_phase_3_dispatches_validation(self, tmp_path: Path) -> None:
+        """_run_phase_3_untuned dispatches ValidationAgent."""
+        from .subagents.validation_agent import ValidationAgent
+
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ) as mock_dispatch:
+            supervisor._run_phase_3_untuned()
+
+        mock_dispatch.assert_called_once()
+        first_arg = mock_dispatch.call_args[0][0]
+        assert first_arg is ValidationAgent
+
+    def test_phase_3_stores_untuned_data(self, tmp_path: Path) -> None:
+        """On success, state.untuned_data is populated from result data."""
+        supervisor = make_supervisor(tmp_path)
+        fake_results = [{"m": 128, "n": 128, "k": 32}]
+        success_result = SubagentResult(
+            success=True, data={"results": fake_results}
+        )
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            supervisor._run_phase_3_untuned()
+
+        assert supervisor.state.untuned_data == fake_results
+
+    def test_phase_3_returns_phase_result(self, tmp_path: Path) -> None:
+        """_run_phase_3_untuned returns a PhaseResult for Phase.UNTUNED_VALIDATION."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            phase_result = supervisor._run_phase_3_untuned()
+
+        assert isinstance(phase_result, PhaseResult)
+        assert phase_result.phase == Phase.UNTUNED_VALIDATION
+
+    def test_phase_3_passes_gpu_ids(self, tmp_path: Path) -> None:
+        """gpu_ids from config are forwarded to ValidationAgent."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={})
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ) as mock_dispatch:
+            supervisor._run_phase_3_untuned()
+
+        kwargs = mock_dispatch.call_args[1]
+        assert kwargs["gpu_ids"] == supervisor.config.gpu_ids
+
+    def test_phase_3_returns_failure_on_exception(self, tmp_path: Path) -> None:
+        """If _dispatch_with_retry raises, _run_phase_3_untuned returns failure."""
+        supervisor = make_supervisor(tmp_path)
+        with patch.object(
+            KernelSupervisor,
+            "_dispatch_with_retry",
+            side_effect=RuntimeError("validation error"),
+        ):
+            phase_result = supervisor._run_phase_3_untuned()
+
+        assert phase_result.success is False
+        assert "validation error" in phase_result.error
+
+    def test_phase_3_uses_shapes_from_state(self, tmp_path: Path) -> None:
+        """Shapes stored in state are forwarded to ValidationAgent."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.shapes = [(64, 64, 64), (128, 128, 128)]
+        success_result = SubagentResult(success=True, data={})
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ) as mock_dispatch:
+            supervisor._run_phase_3_untuned()
+
+        kwargs = mock_dispatch.call_args[1]
+        assert kwargs["shapes"] == [(64, 64, 64), (128, 128, 128)]
