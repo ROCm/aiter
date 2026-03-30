@@ -1,5 +1,6 @@
 """Tests for KernelSupervisor types, state machine, and checkpoint logic."""
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -18,6 +19,7 @@ from .kernel_supervisor import (
 from .types import ContainerConfig, RepoConfig, TritonInstallConfig, TuningConfig
 from .artifacts import ArtifactManager
 from .notifications import Notifier
+from .subagents.base import SubagentResult
 
 
 # ---------------------------------------------------------------------------
@@ -543,3 +545,189 @@ class TestSupervisorResult:
             summary="done",
         )
         assert Phase.BASELINE in result.phase_results
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_subagent
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchSubagent:
+    def test_dispatch_subagent_success(self, tmp_path: Path) -> None:
+        """A subagent whose run() returns success is returned as-is."""
+        supervisor = make_supervisor(tmp_path)
+        expected = SubagentResult(success=True, data={"key": "val"})
+
+        FakeSubagent = MagicMock()
+        FakeSubagent.return_value.run.return_value = expected
+
+        result = supervisor._dispatch_subagent(FakeSubagent)
+
+        assert result.success is True
+        assert result.data == {"key": "val"}
+
+    def test_dispatch_subagent_passes_kwargs(self, tmp_path: Path) -> None:
+        """Extra kwargs are forwarded to the subagent constructor."""
+        supervisor = make_supervisor(tmp_path)
+        expected = SubagentResult(success=True)
+
+        FakeSubagent = MagicMock()
+        FakeSubagent.return_value.run.return_value = expected
+
+        supervisor._dispatch_subagent(FakeSubagent, extra_flag=True, count=3)
+
+        _, kwargs = FakeSubagent.call_args
+        assert kwargs["extra_flag"] is True
+        assert kwargs["count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_with_retry
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchWithRetry:
+    def test_dispatch_with_retry_succeeds_first_try(self, tmp_path: Path) -> None:
+        """No retry is triggered when the first attempt succeeds."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(success=True, data={"done": True})
+
+        FakeSubagent = MagicMock()
+        FakeSubagent.return_value.run.return_value = success_result
+
+        result = supervisor._dispatch_with_retry(FakeSubagent, max_retries=2)
+
+        assert result.success is True
+        # Should have been instantiated (and run) exactly once
+        assert FakeSubagent.call_count == 1
+
+    def test_dispatch_with_retry_succeeds_on_second(self, tmp_path: Path) -> None:
+        """After one failure the second attempt succeeds and that result is returned."""
+        supervisor = make_supervisor(tmp_path)
+        fail_result = SubagentResult(success=False, error="transient error")
+        ok_result = SubagentResult(success=True, data={"recovered": True})
+
+        instance1 = MagicMock()
+        instance1.run.return_value = fail_result
+        instance2 = MagicMock()
+        instance2.run.return_value = ok_result
+
+        FakeSubagent = MagicMock(side_effect=[instance1, instance2])
+
+        result = supervisor._dispatch_with_retry(FakeSubagent, max_retries=2)
+
+        assert result.success is True
+        assert result.data == {"recovered": True}
+        assert FakeSubagent.call_count == 2
+
+    def test_dispatch_with_retry_exhausts_retries(self, tmp_path: Path) -> None:
+        """When all attempts fail the last failure result is returned."""
+        supervisor = make_supervisor(tmp_path)
+        fail1 = SubagentResult(success=False, error="fail 1")
+        fail2 = SubagentResult(success=False, error="fail 2")
+        fail3 = SubagentResult(success=False, error="fail 3")
+
+        instances = []
+        for r in [fail1, fail2, fail3]:
+            inst = MagicMock()
+            inst.run.return_value = r
+            instances.append(inst)
+
+        FakeSubagent = MagicMock(side_effect=instances)
+
+        result = supervisor._dispatch_with_retry(FakeSubagent, max_retries=2)
+
+        assert result.success is False
+        assert result.error == "fail 3"
+        # 1 initial attempt + 2 retries = 3 total
+        assert FakeSubagent.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# _switch_triton
+# ---------------------------------------------------------------------------
+
+
+class TestSwitchTriton:
+    def _make_repo_config(
+        self,
+        triton_repo: str = "/workspace/triton",
+        triton_branch: str = "target-branch",
+        install_cmd: str = "pip install -e .",
+    ) -> RepoConfig:
+        return RepoConfig(
+            aiter_repo="https://github.com/example/aiter",
+            aiter_branch="main",
+            triton_repo=triton_repo,
+            triton_branch=triton_branch,
+        )
+
+    def test_switch_triton_runs_commands(self, tmp_path: Path) -> None:
+        """_switch_triton calls docker_exec with git checkout and install."""
+        supervisor = make_supervisor(tmp_path)
+        mock_exec = MagicMock()
+        mock_exec.verify_environment.return_value = {
+            "triton_version": "3.0.0",
+            "aiter_branch": "main",
+        }
+        supervisor.executor = mock_exec
+
+        repo_config = self._make_repo_config(
+            triton_repo="/workspace/triton",
+            triton_branch="my-feature-branch",
+        )
+        # Use the default install command from TritonInstallConfig
+        install_cmd = supervisor.config.triton_install.command
+
+        supervisor._switch_triton(repo_config)
+
+        # Verify docker_exec was called at least once
+        assert mock_exec.docker_exec.called
+
+        # Collect all commands passed to docker_exec
+        all_commands = [c[0][0] for c in mock_exec.docker_exec.call_args_list]
+        combined = " ".join(all_commands)
+
+        assert "git checkout" in combined
+        assert "my-feature-branch" in combined
+        assert install_cmd in combined
+
+    def test_switch_triton_raises_on_verify_failure(self, tmp_path: Path) -> None:
+        """If verify_environment raises, _switch_triton propagates the error."""
+        from .remote import RemoteCommandError
+
+        supervisor = make_supervisor(tmp_path)
+        mock_exec = MagicMock()
+        mock_exec.verify_environment.side_effect = RemoteCommandError(
+            "Triton version mismatch"
+        )
+        supervisor.executor = mock_exec
+
+        repo_config = self._make_repo_config()
+
+        with pytest.raises(RemoteCommandError):
+            supervisor._switch_triton(repo_config)
+
+
+# ---------------------------------------------------------------------------
+# _check_phase_timeout
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPhaseTimeout:
+    def test_check_phase_timeout_not_exceeded(self, tmp_path: Path) -> None:
+        """Returns False when elapsed time is less than phase_max."""
+        supervisor = make_supervisor(tmp_path)
+        # Start time is "now" — effectively 0 seconds have elapsed
+        start_time = time.time()
+        result = supervisor._check_phase_timeout(Phase.TUNING, start_time)
+        assert result is False
+
+    def test_check_phase_timeout_exceeded(self, tmp_path: Path) -> None:
+        """Returns True when the start time is in the distant past."""
+        supervisor = make_supervisor(tmp_path)
+        phase_max = supervisor.config.tuning_config.timeouts.phase_max  # default 14400
+        # Simulate start time far in the past
+        ancient_start = time.time() - (phase_max + 1)
+        result = supervisor._check_phase_timeout(Phase.TUNING, ancient_start)
+        assert result is True

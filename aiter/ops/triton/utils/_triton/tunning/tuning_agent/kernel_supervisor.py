@@ -8,15 +8,17 @@ added by subsequent tasks.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from enum import Enum
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, TYPE_CHECKING, Type
 
 from .types import ContainerConfig, RepoConfig, TritonInstallConfig, TuningConfig
 from .remote import RemoteExecutor
 from .artifacts import ArtifactManager
 from .notifications import Notifier
+from .subagents.base import SubagentResult
 
 if TYPE_CHECKING:
     pass
@@ -241,3 +243,132 @@ class KernelSupervisor:
                 return phase
         # All phases complete — return the last one
         return Phase.COMMIT
+
+    # ------------------------------------------------------------------
+    # Subagent dispatch
+    # ------------------------------------------------------------------
+
+    def _dispatch_subagent(self, subagent_class: Type, **kwargs) -> SubagentResult:
+        """Instantiate *subagent_class* and run it, returning the result.
+
+        The subagent is constructed with ``executor``, ``kernel_name``, and
+        ``artifact_dir`` drawn from this supervisor's own attributes, plus any
+        additional *kwargs* passed by the caller.
+
+        Parameters
+        ----------
+        subagent_class:
+            The subagent class to instantiate (must accept the standard
+            ``executor``, ``kernel_name``, ``artifact_dir`` constructor
+            arguments).
+        **kwargs:
+            Extra keyword arguments forwarded verbatim to the constructor.
+
+        Returns
+        -------
+        SubagentResult
+            The result produced by the subagent's :meth:`run` method.
+        """
+        subagent = subagent_class(
+            executor=self.executor,
+            kernel_name=self.config.kernel_name,
+            artifact_dir=self.artifact_manager.remote_dir,
+            **kwargs,
+        )
+        return subagent.run()
+
+    def _dispatch_with_retry(
+        self,
+        subagent_class: Type,
+        max_retries: int = 2,
+        **kwargs,
+    ) -> SubagentResult:
+        """Dispatch *subagent_class* with automatic retry on failure.
+
+        On each attempt a *fresh* subagent instance is created.  If the
+        result's ``success`` flag is ``True`` the result is returned
+        immediately.  After *max_retries* additional attempts (i.e.
+        1 + *max_retries* total calls) the last failure result is returned.
+
+        Parameters
+        ----------
+        subagent_class:
+            The subagent class to instantiate.
+        max_retries:
+            Maximum number of additional attempts after the first failure.
+        **kwargs:
+            Extra keyword arguments forwarded to :meth:`_dispatch_subagent`.
+
+        Returns
+        -------
+        SubagentResult
+            The first successful result, or the result from the final
+            failed attempt.
+        """
+        result: SubagentResult = self._dispatch_subagent(subagent_class, **kwargs)
+        if result.success:
+            return result
+
+        for _ in range(max_retries):
+            result = self._dispatch_subagent(subagent_class, **kwargs)
+            if result.success:
+                return result
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Triton switching
+    # ------------------------------------------------------------------
+
+    def _switch_triton(self, repo_config: RepoConfig) -> None:
+        """Check out a Triton branch and install it inside the container.
+
+        Runs ``git checkout <branch>`` followed by the configured install
+        command inside the container, then calls
+        :meth:`~.remote.RemoteExecutor.verify_environment` to confirm the
+        environment is ready.
+
+        Parameters
+        ----------
+        repo_config:
+            :class:`~.types.RepoConfig` whose ``triton_repo`` and
+            ``triton_branch`` fields identify the target checkout.
+
+        Raises
+        ------
+        Exception
+            Any error raised by ``docker_exec`` or ``verify_environment``
+            is propagated to the caller.
+        """
+        checkout_cmd = (
+            f"cd {repo_config.triton_repo} "
+            f"&& git checkout {repo_config.triton_branch} "
+            f"&& {self.config.triton_install.command}"
+        )
+        self.executor.docker_exec(checkout_cmd)
+        self.executor.verify_environment()
+
+    # ------------------------------------------------------------------
+    # Phase timeout check
+    # ------------------------------------------------------------------
+
+    def _check_phase_timeout(self, phase: Phase, start_time: float) -> bool:
+        """Return ``True`` if the current phase has exceeded its time budget.
+
+        Parameters
+        ----------
+        phase:
+            The :class:`Phase` being executed (reserved for future
+            per-phase timeout configuration).
+        start_time:
+            Unix timestamp (from :func:`time.time`) recorded when the
+            phase began.
+
+        Returns
+        -------
+        bool
+            ``True`` when the elapsed time exceeds
+            ``config.tuning_config.timeouts.phase_max``.
+        """
+        elapsed = time.time() - start_time
+        return elapsed > self.config.tuning_config.timeouts.phase_max
