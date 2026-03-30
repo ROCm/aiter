@@ -1126,7 +1126,6 @@ def _ctypes_call(func, fc_name, md_name):
         so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
         if not os.path.exists(so_path):
             d_args = get_args_of_build(md_name)
-            d_args["torch_exclude"] = True
             build_module(
                 md_name,
                 d_args["srcs"],
