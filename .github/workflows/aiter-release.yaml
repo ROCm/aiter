@@ -42,7 +42,7 @@ on:
         default: 'aiter-k8s-build'
         type: choice
         options:
-          - aiter-k8s-build
+          - build-only-aiter
           - aiter-mi300-1gpu
           - aiter-mi325-1gpu
           - linux-aiter-mi355-1
