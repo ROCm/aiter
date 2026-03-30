@@ -50,8 +50,8 @@ def compile_hgemm_kernel(
     assert BLOCK_K >= 32
     assert BLOCK_M_WARPS * BLOCK_N_WARPS == 4
     assert STAGES in [2, 1]
-    if B_PRE_SHUFFLE == True:
-        assert B_TO_LDS == False
+    if B_PRE_SHUFFLE:
+        assert not B_TO_LDS
 
     # Fixed parameters:
     WMMA_M = 16
@@ -84,7 +84,6 @@ def compile_hgemm_kernel(
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     LDG_A_X_THREADS = BLOCK_K // LDG_VEC_SIZE
-    LDG_B_X_THREADS = BLOCK_K // LDG_VEC_SIZE
     LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
     LDG_REG_A_COUNT = BLOCK_MK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
@@ -114,7 +113,7 @@ def compile_hgemm_kernel(
     if IS_SPLIT_K:
         KERNEL_NAME += f"_SPK{SPLIT_K}"
     elif C_TO_LDS:
-        KERNEL_NAME += f"_CL"
+        KERNEL_NAME += "_CL"
 
     @flyc.kernel
     def hgemm_kernel(
@@ -132,7 +131,6 @@ def compile_hgemm_kernel(
             mfma_fn = rocdl.mfma_f32_16x16x16f16
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
         _i64_type = T.i64
-        c_zero_f = arith.constant(0.0, type=T.f32)
         c_zero_d = arith.constant(0.0, type=dtype_)
         acc_init = arith.constant_vector(0.0, T.f32x4)
 
@@ -144,11 +142,6 @@ def compile_hgemm_kernel(
             base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,)
         )
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        if B_TO_LDS:
-            smem_b_ptr = SmemPtr(
-                base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,)
-            )
-            bs_ = STensor(smem_b_ptr, dtype_, shape=(STAGES, BLOCK_N, BLOCK_K))
         if C_TO_LDS:
             smem_c_ptr = SmemPtr(
                 base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,)
@@ -518,8 +511,6 @@ def compile_hgemm_kernel(
                 rocdl.sched_barrier(0)
 
                 def hot_loop_scheduler():
-                    import math as _math
-
                     def _build_scheduler(numer: int, denom: int):
                         if denom <= 0:
                             return []
@@ -684,17 +675,6 @@ def compile_hgemm_kernel(
                         pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                         linear_bytes_offset = (
                             C_.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
-                        )
-                        byte_offset_i64 = arith.index_cast(T.i64, linear_bytes_offset)
-                        addr_i64 = llvm.AddOp(
-                            out_base_int, byte_offset_i64, llvm.IntegerOverflowFlags(0)
-                        ).result
-                        out_ptr = llvm.IntToPtrOp(_ptr_type, addr_i64).result
-                        out_ptr_v = (
-                            out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
-                        )
-                        pk_val_v = (
-                            pk_val._value if hasattr(pk_val, "_value") else pk_val
                         )
                         # split to vec2s
                         vec2_ty = T.vec(2, dtype_)
