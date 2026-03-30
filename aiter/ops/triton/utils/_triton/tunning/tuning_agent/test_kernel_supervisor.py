@@ -1202,3 +1202,517 @@ class TestRunPhase3Untuned:
 
         kwargs = mock_dispatch.call_args[1]
         assert kwargs["shapes"] == [(64, 64, 64), (128, 128, 128)]
+
+
+# ---------------------------------------------------------------------------
+# _run_phase_5_validation_and_fix
+# ---------------------------------------------------------------------------
+
+
+class TestRunPhase5ValidationAndFix:
+    def test_phase_5_dispatches_validation(self, tmp_path: Path) -> None:
+        """_run_phase_5_validation_and_fix dispatches ValidationAgent."""
+        from .subagents.validation_agent import ValidationAgent
+
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(
+            success=True, data={"regressions": [], "results": []}
+        )
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ) as mock_dispatch:
+            supervisor._run_phase_5_validation_and_fix()
+
+        assert mock_dispatch.called
+        first_arg = mock_dispatch.call_args[0][0]
+        assert first_arg is ValidationAgent
+
+    def test_phase_5_stores_tuned_data(self, tmp_path: Path) -> None:
+        """On success, state.tuned_data is populated from validation results."""
+        supervisor = make_supervisor(tmp_path)
+        fake_results = [{"m": 64, "n": 64, "k": 64}]
+        success_result = SubagentResult(
+            success=True, data={"regressions": [], "results": fake_results}
+        )
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            supervisor._run_phase_5_validation_and_fix()
+
+        assert supervisor.state.tuned_data == fake_results
+
+    def test_phase_5_returns_phase_result(self, tmp_path: Path) -> None:
+        """_run_phase_5_validation_and_fix returns a PhaseResult for VALIDATION_AND_FIX."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(
+            success=True, data={"regressions": [], "results": []}
+        )
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            phase_result = supervisor._run_phase_5_validation_and_fix()
+
+        assert isinstance(phase_result, PhaseResult)
+        assert phase_result.phase == Phase.VALIDATION_AND_FIX
+
+    def test_phase_5_dispatches_regression_fixer_on_regressions(
+        self, tmp_path: Path
+    ) -> None:
+        """When tuned data has regressions, RegressionFixerAgent is dispatched."""
+        from .subagents.regression_fixer_agent import RegressionFixerAgent
+
+        supervisor = make_supervisor(tmp_path)
+        regressions = [
+            {
+                "m": 64,
+                "n": 64,
+                "k": 64,
+                "delta": 0.06,
+                "current_config_file": "/cfg/gemm.json",
+                "bucket": "M_LEQ_16",
+            }
+        ]
+        # First validation call reports regressions; second reports none.
+        validation_with_regressions = SubagentResult(
+            success=True, data={"regressions": regressions, "results": []}
+        )
+        validation_no_regressions = SubagentResult(
+            success=True, data={"regressions": [], "results": []}
+        )
+        fixer_result = SubagentResult(success=True, data={})
+
+        dispatch_retry_calls = [validation_with_regressions, validation_no_regressions]
+
+        dispatched_subagent_classes: list = []
+
+        def fake_dispatch_subagent(cls, **kwargs):
+            dispatched_subagent_classes.append(cls)
+            return fixer_result
+
+        with patch.object(
+            KernelSupervisor,
+            "_dispatch_with_retry",
+            side_effect=dispatch_retry_calls,
+        ), patch.object(
+            KernelSupervisor,
+            "_dispatch_subagent",
+            side_effect=fake_dispatch_subagent,
+        ):
+            result = supervisor._run_phase_5_validation_and_fix()
+
+        assert result.success is True
+        assert RegressionFixerAgent in dispatched_subagent_classes
+
+    def test_phase_5_max_iterations_escalates(self, tmp_path: Path) -> None:
+        """After 3 fix iterations with persistent regressions, an escalation is added."""
+        from .subagents.regression_fixer_agent import RegressionFixerAgent
+
+        supervisor = make_supervisor(tmp_path)
+        regressions = [
+            {
+                "m": 128,
+                "n": 128,
+                "k": 128,
+                "delta": 0.07,
+                "current_config_file": "/cfg/gemm.json",
+                "bucket": "M_LEQ_256",
+            }
+        ]
+        # Validation always returns regressions so we hit max iterations.
+        persistent_validation = SubagentResult(
+            success=True, data={"regressions": regressions, "results": []}
+        )
+        fixer_result = SubagentResult(success=True, data={})
+
+        with patch.object(
+            KernelSupervisor,
+            "_dispatch_with_retry",
+            return_value=persistent_validation,
+        ), patch.object(
+            KernelSupervisor,
+            "_dispatch_subagent",
+            return_value=fixer_result,
+        ):
+            result = supervisor._run_phase_5_validation_and_fix()
+
+        # Should succeed overall (regressions persisted but we just escalate).
+        assert result.success is True
+        # An escalation must be present.
+        assert any(
+            "persist" in esc.message for esc in supervisor.state.escalations
+        ), f"Expected escalation about persisting regressions, got: {supervisor.state.escalations}"
+
+    def test_phase_5_no_regressions_does_not_dispatch_fixer(
+        self, tmp_path: Path
+    ) -> None:
+        """When validation reports zero regressions, RegressionFixerAgent is not dispatched."""
+        from .subagents.regression_fixer_agent import RegressionFixerAgent
+
+        supervisor = make_supervisor(tmp_path)
+        clean_validation = SubagentResult(
+            success=True, data={"regressions": [], "results": []}
+        )
+        dispatched: list = []
+
+        with patch.object(
+            KernelSupervisor,
+            "_dispatch_with_retry",
+            return_value=clean_validation,
+        ), patch.object(
+            KernelSupervisor,
+            "_dispatch_subagent",
+            side_effect=lambda cls, **kw: dispatched.append(cls) or SubagentResult(success=True, data={}),
+        ):
+            supervisor._run_phase_5_validation_and_fix()
+
+        assert RegressionFixerAgent not in dispatched
+
+    def test_phase_5_returns_regression_count_in_data(self, tmp_path: Path) -> None:
+        """phase result data contains regression_count key."""
+        supervisor = make_supervisor(tmp_path)
+        success_result = SubagentResult(
+            success=True, data={"regressions": [], "results": []}
+        )
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=success_result
+        ):
+            phase_result = supervisor._run_phase_5_validation_and_fix()
+
+        assert "regression_count" in phase_result.data
+
+    def test_phase_5_returns_failure_when_validation_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """If ValidationAgent fails, phase result is a failure."""
+        supervisor = make_supervisor(tmp_path)
+        failure_result = SubagentResult(
+            success=False, data={}, error="GPU error"
+        )
+
+        with patch.object(
+            KernelSupervisor, "_dispatch_with_retry", return_value=failure_result
+        ):
+            phase_result = supervisor._run_phase_5_validation_and_fix()
+
+        assert phase_result.success is False
+
+
+# ---------------------------------------------------------------------------
+# _run_phase_6_commit
+# ---------------------------------------------------------------------------
+
+
+class TestRunPhase6Commit:
+    def test_phase_6_creates_approval_request(self, tmp_path: Path) -> None:
+        """_run_phase_6_commit adds an EscalationRequest with approval_required severity."""
+        supervisor = make_supervisor(tmp_path)
+        # auto_approve=True is set in make_supervisor via Notifier(auto_approve=True).
+
+        with patch.object(supervisor.executor, "docker_exec"):
+            supervisor._run_phase_6_commit()
+
+        approval_escalations = [
+            e for e in supervisor.state.escalations if e.severity == "approval_required"
+        ]
+        assert len(approval_escalations) == 1
+        assert "gemm" in approval_escalations[0].message.lower()
+
+    def test_phase_6_approved_runs_git_commit(self, tmp_path: Path) -> None:
+        """When notifier approves, docker_exec is called for the git commit."""
+        supervisor = make_supervisor(tmp_path)
+
+        with patch.object(
+            supervisor.notifier, "request_approval", return_value=True
+        ), patch.object(supervisor.executor, "docker_exec") as mock_exec:
+            result = supervisor._run_phase_6_commit()
+
+        assert result.success is True
+        assert result.data.get("committed") is True
+        mock_exec.assert_called_once()
+        cmd = mock_exec.call_args[0][0]
+        assert "git add" in cmd
+        assert "git commit" in cmd
+
+    def test_phase_6_denied_returns_failure(self, tmp_path: Path) -> None:
+        """When notifier denies, _run_phase_6_commit returns PhaseResult(success=False)."""
+        supervisor = make_supervisor(tmp_path)
+
+        with patch.object(
+            supervisor.notifier, "request_approval", return_value=False
+        ), patch.object(supervisor.executor, "docker_exec") as mock_exec:
+            result = supervisor._run_phase_6_commit()
+
+        assert result.success is False
+        assert result.data.get("committed") is False
+        # docker_exec should NOT be called when denied.
+        mock_exec.assert_not_called()
+
+    def test_phase_6_returns_phase_result(self, tmp_path: Path) -> None:
+        """_run_phase_6_commit returns a PhaseResult for Phase.COMMIT."""
+        supervisor = make_supervisor(tmp_path)
+
+        with patch.object(
+            supervisor.notifier, "request_approval", return_value=True
+        ), patch.object(supervisor.executor, "docker_exec"):
+            result = supervisor._run_phase_6_commit()
+
+        assert isinstance(result, PhaseResult)
+        assert result.phase == Phase.COMMIT
+
+    def test_phase_6_includes_geomean_in_result(self, tmp_path: Path) -> None:
+        """When tuned and baseline data exist, geomean_speedup is computed."""
+        supervisor = make_supervisor(tmp_path)
+        supervisor.state.baseline_data = [ShapeResult(m=64, n=64, k=64, main_ns=200.0)]
+        supervisor.state.tuned_data = [ShapeResult(m=64, n=64, k=64, main_ns=100.0)]
+
+        with patch.object(
+            supervisor.notifier, "request_approval", return_value=True
+        ), patch.object(supervisor.executor, "docker_exec"):
+            result = supervisor._run_phase_6_commit()
+
+        assert result.success is True
+        geomean = result.data.get("geomean_speedup")
+        assert geomean is not None
+        assert geomean > 1.0
+
+    def test_phase_6_returns_failure_on_exception(self, tmp_path: Path) -> None:
+        """If docker_exec raises, _run_phase_6_commit returns failure."""
+        supervisor = make_supervisor(tmp_path)
+
+        with patch.object(
+            supervisor.notifier, "request_approval", return_value=True
+        ), patch.object(
+            supervisor.executor,
+            "docker_exec",
+            side_effect=RuntimeError("git error"),
+        ):
+            result = supervisor._run_phase_6_commit()
+
+        assert result.success is False
+        assert "git error" in result.error
+
+
+# ---------------------------------------------------------------------------
+# run()
+# ---------------------------------------------------------------------------
+
+
+def _make_success_phase_result(phase: Phase) -> PhaseResult:
+    return PhaseResult(
+        phase=phase,
+        success=True,
+        data={},
+        error=None,
+        duration_seconds=0.0,
+    )
+
+
+def _make_failure_phase_result(phase: Phase, error: str = "fail") -> PhaseResult:
+    return PhaseResult(
+        phase=phase,
+        success=False,
+        data={},
+        error=error,
+        duration_seconds=0.0,
+    )
+
+
+class TestRun:
+    def test_run_iterates_all_phases(self, tmp_path: Path) -> None:
+        """run() calls every phase runner in order when all phases succeed."""
+        supervisor = make_supervisor(tmp_path)
+
+        called_phases: list = []
+
+        def make_runner(phase: Phase):
+            def runner(*args, **kwargs):
+                called_phases.append(phase)
+                return _make_success_phase_result(phase)
+            return runner
+
+        with patch.object(KernelSupervisor, "_run_phase_0_setup", make_runner(Phase.SETUP)), \
+             patch.object(KernelSupervisor, "_run_phase_1_discovery", make_runner(Phase.DISCOVERY)), \
+             patch.object(KernelSupervisor, "_run_phase_2_baseline", make_runner(Phase.BASELINE)), \
+             patch.object(KernelSupervisor, "_run_phase_3_untuned", make_runner(Phase.UNTUNED_VALIDATION)), \
+             patch.object(KernelSupervisor, "_run_phase_4_tuning", make_runner(Phase.TUNING)), \
+             patch.object(KernelSupervisor, "_run_phase_5_validation_and_fix", make_runner(Phase.VALIDATION_AND_FIX)), \
+             patch.object(KernelSupervisor, "_run_phase_6_commit", make_runner(Phase.COMMIT)):
+            result = supervisor.run()
+
+        assert result.success is True
+        assert called_phases == [
+            Phase.SETUP,
+            Phase.DISCOVERY,
+            Phase.BASELINE,
+            Phase.UNTUNED_VALIDATION,
+            Phase.TUNING,
+            Phase.VALIDATION_AND_FIX,
+            Phase.COMMIT,
+        ]
+
+    def test_run_returns_supervisor_result(self, tmp_path: Path) -> None:
+        """run() returns a SupervisorResult instance."""
+        supervisor = make_supervisor(tmp_path)
+
+        with patch.object(
+            KernelSupervisor,
+            "_run_phase_0_setup",
+            return_value=_make_success_phase_result(Phase.SETUP),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_1_discovery",
+            return_value=_make_success_phase_result(Phase.DISCOVERY),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_2_baseline",
+            return_value=_make_success_phase_result(Phase.BASELINE),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_3_untuned",
+            return_value=_make_success_phase_result(Phase.UNTUNED_VALIDATION),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_4_tuning",
+            return_value=_make_success_phase_result(Phase.TUNING),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_5_validation_and_fix",
+            return_value=_make_success_phase_result(Phase.VALIDATION_AND_FIX),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_6_commit",
+            return_value=_make_success_phase_result(Phase.COMMIT),
+        ):
+            result = supervisor.run()
+
+        assert isinstance(result, SupervisorResult)
+        assert result.kernel_name == "gemm"
+
+    def test_run_skips_completed_phases(self, tmp_path: Path) -> None:
+        """Phases already marked complete in the artifact manager are skipped."""
+        supervisor = make_supervisor(tmp_path)
+
+        # Mark phases 0 and 1 as already complete.
+        supervisor.artifact_manager.mark_phase_complete(0, {"success": True})
+        supervisor.artifact_manager.mark_phase_complete(1, {"success": True})
+
+        called_phases: list = []
+
+        def make_runner(phase: Phase):
+            def runner(*args, **kwargs):
+                called_phases.append(phase)
+                return _make_success_phase_result(phase)
+            return runner
+
+        with patch.object(KernelSupervisor, "_run_phase_0_setup", make_runner(Phase.SETUP)), \
+             patch.object(KernelSupervisor, "_run_phase_1_discovery", make_runner(Phase.DISCOVERY)), \
+             patch.object(KernelSupervisor, "_run_phase_2_baseline", make_runner(Phase.BASELINE)), \
+             patch.object(KernelSupervisor, "_run_phase_3_untuned", make_runner(Phase.UNTUNED_VALIDATION)), \
+             patch.object(KernelSupervisor, "_run_phase_4_tuning", make_runner(Phase.TUNING)), \
+             patch.object(KernelSupervisor, "_run_phase_5_validation_and_fix", make_runner(Phase.VALIDATION_AND_FIX)), \
+             patch.object(KernelSupervisor, "_run_phase_6_commit", make_runner(Phase.COMMIT)):
+            supervisor.run()
+
+        # Phases 0 and 1 should NOT appear (they were already complete).
+        assert Phase.SETUP not in called_phases
+        assert Phase.DISCOVERY not in called_phases
+        # Phase 2 onward should have run.
+        assert Phase.BASELINE in called_phases
+
+    def test_run_stops_on_failure(self, tmp_path: Path) -> None:
+        """If a phase fails, subsequent phases are not executed."""
+        supervisor = make_supervisor(tmp_path)
+
+        called_phases: list = []
+
+        def make_runner(phase: Phase, succeed: bool = True):
+            def runner(*args, **kwargs):
+                called_phases.append(phase)
+                if succeed:
+                    return _make_success_phase_result(phase)
+                return _make_failure_phase_result(phase)
+            return runner
+
+        with patch.object(KernelSupervisor, "_run_phase_0_setup", make_runner(Phase.SETUP, succeed=True)), \
+             patch.object(KernelSupervisor, "_run_phase_1_discovery", make_runner(Phase.DISCOVERY, succeed=True)), \
+             patch.object(KernelSupervisor, "_run_phase_2_baseline", make_runner(Phase.BASELINE, succeed=False)), \
+             patch.object(KernelSupervisor, "_run_phase_3_untuned", make_runner(Phase.UNTUNED_VALIDATION, succeed=True)), \
+             patch.object(KernelSupervisor, "_run_phase_4_tuning", make_runner(Phase.TUNING, succeed=True)), \
+             patch.object(KernelSupervisor, "_run_phase_5_validation_and_fix", make_runner(Phase.VALIDATION_AND_FIX, succeed=True)), \
+             patch.object(KernelSupervisor, "_run_phase_6_commit", make_runner(Phase.COMMIT, succeed=True)):
+            result = supervisor.run()
+
+        assert result.success is False
+        # Phase 2 (BASELINE) was the failure, so phases 3+ must not have been called.
+        assert Phase.UNTUNED_VALIDATION not in called_phases
+        assert Phase.TUNING not in called_phases
+        assert Phase.VALIDATION_AND_FIX not in called_phases
+        assert Phase.COMMIT not in called_phases
+
+    def test_run_stops_on_failure_adds_escalation(self, tmp_path: Path) -> None:
+        """A fatal escalation is added when a phase fails."""
+        supervisor = make_supervisor(tmp_path)
+
+        with patch.object(
+            KernelSupervisor,
+            "_run_phase_0_setup",
+            return_value=_make_failure_phase_result(Phase.SETUP, error="env broken"),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_1_discovery",
+            return_value=_make_success_phase_result(Phase.DISCOVERY),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_2_baseline",
+            return_value=_make_success_phase_result(Phase.BASELINE),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_3_untuned",
+            return_value=_make_success_phase_result(Phase.UNTUNED_VALIDATION),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_4_tuning",
+            return_value=_make_success_phase_result(Phase.TUNING),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_5_validation_and_fix",
+            return_value=_make_success_phase_result(Phase.VALIDATION_AND_FIX),
+        ), patch.object(
+            KernelSupervisor,
+            "_run_phase_6_commit",
+            return_value=_make_success_phase_result(Phase.COMMIT),
+        ):
+            result = supervisor.run()
+
+        assert result.success is False
+        fatal_escalations = [e for e in result.escalations if e.severity == "fatal"]
+        assert len(fatal_escalations) >= 1
+
+    def test_run_progress_callback_called_per_phase(self, tmp_path: Path) -> None:
+        """Progress callback is invoked once per phase that is run."""
+        callback_calls: list = []
+
+        supervisor = make_supervisor(tmp_path)
+        supervisor.progress_callback = lambda phase, msg: callback_calls.append(phase)
+
+        def make_runner(phase: Phase):
+            def runner(*args, **kwargs):
+                return _make_success_phase_result(phase)
+            return runner
+
+        with patch.object(KernelSupervisor, "_run_phase_0_setup", make_runner(Phase.SETUP)), \
+             patch.object(KernelSupervisor, "_run_phase_1_discovery", make_runner(Phase.DISCOVERY)), \
+             patch.object(KernelSupervisor, "_run_phase_2_baseline", make_runner(Phase.BASELINE)), \
+             patch.object(KernelSupervisor, "_run_phase_3_untuned", make_runner(Phase.UNTUNED_VALIDATION)), \
+             patch.object(KernelSupervisor, "_run_phase_4_tuning", make_runner(Phase.TUNING)), \
+             patch.object(KernelSupervisor, "_run_phase_5_validation_and_fix", make_runner(Phase.VALIDATION_AND_FIX)), \
+             patch.object(KernelSupervisor, "_run_phase_6_commit", make_runner(Phase.COMMIT)):
+            supervisor.run()
+
+        assert len(callback_calls) == len(Phase)
+        assert callback_calls[0] == Phase.SETUP
+        assert callback_calls[-1] == Phase.COMMIT

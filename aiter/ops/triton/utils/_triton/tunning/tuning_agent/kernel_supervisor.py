@@ -27,6 +27,7 @@ from .subagents.validation_agent import ValidationAgent
 from .subagents.tuning_agent import TuningAgent
 from .subagents.pattern_analyzer_agent import PatternAnalyzerAgent
 from .subagents.config_generator_agent import ConfigGeneratorAgent
+from .subagents.regression_fixer_agent import RegressionFixerAgent
 
 if TYPE_CHECKING:
     pass
@@ -749,4 +750,328 @@ class KernelSupervisor:
             },
             error=None,
             duration_seconds=time.time() - start_time,
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 5 runner
+    # ------------------------------------------------------------------
+
+    def _run_phase_5_validation_and_fix(self) -> PhaseResult:
+        """Execute Phase 5: validate tuned configs and fix regressions.
+
+        Steps
+        -----
+        1. Dispatch :class:`~.subagents.validation_agent.ValidationAgent` to
+           collect tuned timings.  Store results in
+           :attr:`~SupervisorState.tuned_data`.
+        2. Compare tuned results against both baseline and untuned data.
+           Classify shapes as regressions vs baseline and/or untuned.
+        3. For each regression, dispatch
+           :class:`~.subagents.regression_fixer_agent.RegressionFixerAgent`.
+        4. Revalidate after fixes.  Repeat the validate → fix → revalidate
+           loop up to **3** iterations.
+        5. If regressions still remain after 3 iterations, add an
+           :class:`EscalationRequest` with ``severity="warning"``.
+
+        Returns
+        -------
+        PhaseResult
+            A :class:`PhaseResult` with ``phase=Phase.VALIDATION_AND_FIX``.
+            ``data`` contains ``{"regression_count": <int>,
+            "iterations": <int>}``.
+        """
+        import os as _os
+
+        start_time = time.time()
+        max_iterations = 3
+        iteration = 0
+        regression_count = 0
+
+        artifact_dir = self.artifact_manager.remote_dir
+        config_dir = _os.path.join(artifact_dir, "configs")
+        old_config_dir = _os.path.join(artifact_dir, "baseline_configs")
+
+        shapes = self.state.shapes or []
+
+        try:
+            for iteration in range(1, max_iterations + 1):
+                # --- Collect tuned timings ---
+                validation_result = self._dispatch_with_retry(
+                    ValidationAgent,
+                    shapes=shapes,
+                    bench_script="",
+                    gpu_ids=self.config.gpu_ids,
+                    baseline_data=self.state.baseline_data,
+                    untuned_data=self.state.untuned_data,
+                )
+
+                if not validation_result.success:
+                    return PhaseResult(
+                        phase=Phase.VALIDATION_AND_FIX,
+                        success=False,
+                        data={"regression_count": regression_count, "iterations": iteration},
+                        error=validation_result.error,
+                        duration_seconds=time.time() - start_time,
+                    )
+
+                self.state.tuned_data = validation_result.data.get("results", [])
+
+                # --- Classify regressions ---
+                regressions: List = validation_result.data.get("regressions", [])
+                regression_count = len(regressions)
+
+                if regression_count == 0:
+                    # No regressions — done.
+                    break
+
+                # --- Dispatch RegressionFixerAgent ---
+                threshold = self.config.tuning_config.thresholds.regression_vs_baseline
+                self._dispatch_subagent(
+                    RegressionFixerAgent,
+                    regressions=regressions,
+                    config_dir=config_dir,
+                    old_config_dir=old_config_dir,
+                    threshold=threshold,
+                )
+
+                if iteration == max_iterations:
+                    # Exhausted all fix iterations — escalate.
+                    self.state.escalations.append(
+                        EscalationRequest(
+                            severity="warning",
+                            message=(
+                                f"Kernel '{self.config.kernel_name}': "
+                                f"{regression_count} regression(s) persist after "
+                                f"{max_iterations} fix iteration(s)."
+                            ),
+                        )
+                    )
+
+            return PhaseResult(
+                phase=Phase.VALIDATION_AND_FIX,
+                success=True,
+                data={"regression_count": regression_count, "iterations": iteration},
+                error=None,
+                duration_seconds=time.time() - start_time,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return PhaseResult(
+                phase=Phase.VALIDATION_AND_FIX,
+                success=False,
+                data={"regression_count": regression_count, "iterations": iteration},
+                error=str(exc),
+                duration_seconds=time.time() - start_time,
+            )
+
+    # ------------------------------------------------------------------
+    # Phase 6 runner
+    # ------------------------------------------------------------------
+
+    def _run_phase_6_commit(self) -> PhaseResult:
+        """Execute Phase 6: generate summary and commit configs with human approval.
+
+        Steps
+        -----
+        1. Compute a summary: geomean speedup, regression count, shapes improved.
+        2. Create an :class:`EscalationRequest` with
+           ``severity="approval_required"`` and ask the human to confirm.
+        3. Call :meth:`~.notifications.Notifier.request_approval`; block until
+           a human approves or denies.
+        4. If approved: run ``git add`` and ``git commit`` inside the container.
+        5. If denied: return ``PhaseResult(success=False)``.
+
+        Returns
+        -------
+        PhaseResult
+            A :class:`PhaseResult` with ``phase=Phase.COMMIT``.  ``data``
+            contains ``{"committed": True}`` on approval, or ``{}`` on denial.
+        """
+        import math as _math
+
+        start_time = time.time()
+
+        try:
+            # --- Build summary statistics ---
+            tuned_data = self.state.tuned_data or []
+            baseline_data = self.state.baseline_data or []
+
+            geomean_speedup: Optional[float] = None
+            shapes_improved = 0
+            regression_count = 0
+
+            if tuned_data and baseline_data:
+                baseline_map: Dict[Tuple[int, int, int], float] = {}
+                for r in baseline_data:
+                    if hasattr(r, "m"):
+                        key = (r.m, r.n, r.k)
+                        baseline_map[key] = r.total_ns
+                    elif isinstance(r, dict):
+                        key = (r.get("m", 0), r.get("n", 0), r.get("k", 0))
+                        baseline_map[key] = r.get("total_ns", 1.0)
+
+                speedups: List[float] = []
+                for r in tuned_data:
+                    if hasattr(r, "m"):
+                        key = (r.m, r.n, r.k)
+                        tuned_ns = r.total_ns
+                    elif isinstance(r, dict):
+                        key = (r.get("m", 0), r.get("n", 0), r.get("k", 0))
+                        tuned_ns = r.get("total_ns", 1.0)
+                    else:
+                        continue
+
+                    baseline_ns = baseline_map.get(key)
+                    if baseline_ns and tuned_ns > 0:
+                        speedup = baseline_ns / tuned_ns
+                        speedups.append(speedup)
+                        if speedup > 1.0:
+                            shapes_improved += 1
+                        elif speedup < 1.0:
+                            regression_count += 1
+
+                if speedups:
+                    log_sum = sum(_math.log(s) for s in speedups)
+                    geomean_speedup = _math.exp(log_sum / len(speedups))
+
+            summary_text = (
+                f"Kernel '{self.config.kernel_name}': "
+                f"geomean_speedup={geomean_speedup:.4f}, "
+                f"shapes_improved={shapes_improved}, "
+                f"regressions={regression_count}."
+            ) if geomean_speedup is not None else (
+                f"Kernel '{self.config.kernel_name}': no comparison data available."
+            )
+
+            # --- Create approval escalation ---
+            approval_request = EscalationRequest(
+                severity="approval_required",
+                message=f"Commit configs for {self.config.kernel_name}?",
+                details=summary_text,
+            )
+            self.state.escalations.append(approval_request)
+
+            # --- Request human approval ---
+            approved = self.notifier.request_approval(
+                question=f"Commit configs for {self.config.kernel_name}?",
+                details=summary_text,
+            )
+
+            if not approved:
+                return PhaseResult(
+                    phase=Phase.COMMIT,
+                    success=False,
+                    data={"committed": False},
+                    error="Commit denied by operator.",
+                    duration_seconds=time.time() - start_time,
+                )
+
+            # --- Run git commit inside container ---
+            commit_message = (
+                f"feat(tuning): update {self.config.kernel_name} configs\n\n"
+                f"{summary_text}"
+            )
+            self.executor.docker_exec(
+                f"git add -A && git commit -m {commit_message!r}"
+            )
+
+            return PhaseResult(
+                phase=Phase.COMMIT,
+                success=True,
+                data={
+                    "committed": True,
+                    "geomean_speedup": geomean_speedup,
+                    "shapes_improved": shapes_improved,
+                    "regression_count": regression_count,
+                    "summary": summary_text,
+                },
+                error=None,
+                duration_seconds=time.time() - start_time,
+            )
+
+        except Exception as exc:  # noqa: BLE001
+            return PhaseResult(
+                phase=Phase.COMMIT,
+                success=False,
+                data={},
+                error=str(exc),
+                duration_seconds=time.time() - start_time,
+            )
+
+    # ------------------------------------------------------------------
+    # Main execution loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> "SupervisorResult":
+        """Run all pipeline phases from the resume point to COMMIT.
+
+        The method honours checkpoint state: any phase already marked complete
+        by the :class:`~.artifacts.ArtifactManager` is skipped.  On the first
+        phase failure an :class:`EscalationRequest` is added and the loop
+        terminates early.
+
+        Returns
+        -------
+        SupervisorResult
+            Final outcome including all :class:`PhaseResult` objects and any
+            escalations raised during the run.
+        """
+        _phase_runners: Dict[Phase, Callable[[], PhaseResult]] = {
+            Phase.SETUP: self._run_phase_0_setup,
+            Phase.DISCOVERY: self._run_phase_1_discovery,
+            Phase.BASELINE: self._run_phase_2_baseline,
+            Phase.UNTUNED_VALIDATION: self._run_phase_3_untuned,
+            Phase.TUNING: self._run_phase_4_tuning,
+            Phase.VALIDATION_AND_FIX: self._run_phase_5_validation_and_fix,
+            Phase.COMMIT: self._run_phase_6_commit,
+        }
+
+        resume_phase = self._get_resume_phase()
+        overall_success = True
+
+        for phase in Phase:
+            if phase < resume_phase:
+                continue
+
+            if self._should_skip_phase(phase):
+                continue
+
+            if self.progress_callback is not None:
+                self.progress_callback(phase, f"Starting phase {phase.name}")
+
+            runner = _phase_runners[phase]
+            result = runner()
+            self._record_phase_complete(phase, result)
+
+            if not result.success:
+                overall_success = False
+                self.state.escalations.append(
+                    EscalationRequest(
+                        severity="fatal",
+                        message=(
+                            f"Phase {phase.name} failed for kernel "
+                            f"'{self.config.kernel_name}': {result.error}"
+                        ),
+                    )
+                )
+                break
+
+        # Build geomean speedup from the COMMIT phase result if available.
+        geomean_speedup: Optional[float] = None
+        commit_result = self.state.phase_results.get(Phase.COMMIT)
+        if commit_result is not None and commit_result.data:
+            geomean_speedup = commit_result.data.get("geomean_speedup")
+
+        summary_parts: List[str] = []
+        for phase, pr in self.state.phase_results.items():
+            status = "OK" if pr.success else "FAIL"
+            summary_parts.append(f"{phase.name}={status}")
+        summary = ", ".join(summary_parts) if summary_parts else "no phases run"
+
+        return SupervisorResult(
+            kernel_name=self.config.kernel_name,
+            success=overall_success,
+            phase_results=dict(self.state.phase_results),
+            escalations=list(self.state.escalations),
+            geomean_speedup=geomean_speedup,
+            summary=summary,
         )
