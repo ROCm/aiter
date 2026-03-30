@@ -142,6 +142,9 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    # compatibility args: routing to topk_softmax_decode is caller-managed
+    gating_output: Optional[torch.Tensor] = None,
+    renormalize: bool = False,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -167,6 +170,8 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        gating_output=gating_output,
+        renormalize=renormalize,
     )
 
 
@@ -194,6 +199,8 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    gating_output: Optional[torch.Tensor] = None,
+    renormalize: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -228,6 +235,8 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    gating_output: Optional[torch.Tensor] = None,
+    renormalize: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -296,16 +305,22 @@ def fused_moe_(
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids,
-        topk_weight,
-        global_E,
-        model_dim,
-        dtype,
-        block_size_M,
-        expert_mask,
-        num_local_tokens,
-        moe_sorting_dispatch_policy,
+
+    # Keep policy outside AITER: caller should choose whether to run
+    # topk_softmax_decode or the regular topk + moe_sorting flow.
+    # Here we always consume provided topk_ids/topk_weight and only run sorting.
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
+        moe_sorting(
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+        )
     )
 
     if metadata.run_1stage:
