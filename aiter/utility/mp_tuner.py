@@ -68,8 +68,8 @@ def worker(
                     if res[i].shape != ref[i].shape:
                         res[i] = res[i].view(-1)[: ref[i].numel()].view(ref[i].shape)
                     if ref[i].dtype.itemsize == 1:
-                        ref[i] = ref[i].to(dtypes.fp32)
-                        res[i] = res[i].to(dtypes.fp32)
+                        ref[i] = ref[i].view(torch.uint8).to(dtypes.fp32)
+                        res[i] = res[i].view(torch.uint8).to(dtypes.fp32)
                     err_ratio = checkAllclose(
                         ref[i],
                         res[i],
@@ -130,6 +130,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         ref,
         *rest,
     ) = group_task[0]
+    _prev_ref_key = (id(ref_func), ref_args)
 
     pid = mp.current_process().pid
     gpuID = GPUIDMap[pid]
@@ -196,7 +197,16 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 else args
             )
 
-            ref = ref if ref_noused is None else ref_noused
+            if ref_noused is not None:
+                ref = ref_noused
+            else:
+                _cur_key = (id(ref_func), ref_args)
+                if _cur_key != _prev_ref_key:
+                    ref_data_idx_i, *rest_i = ref_args
+                    updated = tuple(data[j] for j in ref_data_idx_i) + tuple(rest_i)
+                    ref = ref_func(*updated, **ref_kwargs)
+                    torch.cuda.synchronize()
+                    _prev_ref_key = _cur_key
 
             # Extract rtol, atol from rest if available, otherwise use defaults
             rtol = rest[0] if len(rest) > 0 else 1e-2

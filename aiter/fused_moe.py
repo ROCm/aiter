@@ -671,6 +671,10 @@ def _flydsl_stage1_wrapper(
         sorted_weights=sorted_weights,
         fuse_fp4_quant=_fq,
         fuse_sort_scale=_fss,
+        k_batch=parsed.get("k_batch", 1),
+        waves_per_eu=parsed.get("waves_per_eu", 3),
+        b_nt=parsed.get("b_nt", 2),
+        gate_only=parsed.get("gate_only", False),
     )
 
 
@@ -919,21 +923,6 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
-
-    if (
-        q_type == QuantType.per_1x32
-        and q_dtype_a == dtypes.fp4x2
-        and q_dtype_w == dtypes.fp4x2
-        and is_flydsl_available()
-    ):
-        run_1stage = False
-        _out_str = "bf16" if dtype == dtypes.bf16 else "f16"
-        _valid_tiles = [32, 64, 128]
-        _bm = int(block_m) if block_m else 32
-        _bm = min((t for t in _valid_tiles if t >= _bm), default=128)
-        block_m = _bm
-        kernelName1 = f"flydsl_moe1_afp4_wfp4_{_out_str}_t{_bm}x128x256"
-        kernelName2 = f"flydsl_moe2_afp4_wfp4_{_out_str}_t{_bm}x256x256_atomic"
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
@@ -1276,7 +1265,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        a2,
+        None if metadata.fuse_fp4_quant else a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
@@ -1288,8 +1277,7 @@ def fused_moe_2stages(
     )
     if metadata.fuse_fp4_quant and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
-        _inter = a2_raw.shape[-1]
-        _fp4_bytes = token_num * topk * (_inter // 2)
+        _fp4_bytes = token_num * topk * (inter_dim // 2)
         a2 = (
             a2_raw.view(-1)
             .view(torch.uint8)[:_fp4_bytes]

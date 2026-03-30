@@ -11,27 +11,6 @@ from aiter.utility import dtypes
 
 import torch
 
-
-def _clear_stale_ir_context():
-    """Clear stale MLIR IR context left over from a previous JIT compilation.
-
-    When a @flyc.jit function's compilation crashes or a worker process
-    reuses a context across tasks, ir.Context.current can remain non-None
-    without a matching CompilationContext.  The JIT __call__ then takes
-    its 'nested call' fast-path and the kernel body fails because
-    CompilationContext.get_current() is None.
-
-    Calling this before exe() ensures the normal compilation path is taken.
-    """
-    try:
-        from flydsl._mlir import ir
-
-        while ir.Context.current is not None:
-            ir.Context.current.__exit__(None, None, None)
-    except Exception:
-        pass
-
-
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
 _SUFFIX_RE = re.compile(r"(?P<fq>_fq)?(?:_sbm(?P<sbm>\d+))?$")
@@ -101,8 +80,7 @@ def get_flydsl_stage1_kernels(
         for tn in tile_ns:
             for tk in tile_ks:
                 for wpe in waves_per_eus:
-                    k_batches = [1]
-                    for kb in k_batches:
+                    for kb in k_batches if wpe == 3 else [1]:
                         gate_onlys = [False, True] if kb > 1 else [False]
                         for bnt in b_nts:
                             for go in gate_onlys:
@@ -376,7 +354,6 @@ def _get_compiled_stage1(
             _gx = _n_in // 2 // tile_n
         _gy = (size_expert_ids_in + persist_m - 1) // persist_m
         _total_wg = _gx * _gy * k_batch
-        _clear_stale_ir_context()
 
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
@@ -452,7 +429,6 @@ def _get_compiled_stage1(
 @functools.cache
 def _get_compiled_silu_fq(inter_dim: int, topk: int):
     """Compile and cache the fused silu_and_mul + mxfp4 quant + scale-sort kernel."""
-    _clear_stale_ir_context()
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(inter_dim, topk)
@@ -519,8 +495,6 @@ def _get_compiled_stage2(
                 device=out.device,
                 dtype=out.dtype,
             )
-
-        _clear_stale_ir_context()
 
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
@@ -652,17 +626,21 @@ def flydsl_moe_stage1(
     if a_dtype == "fp4":
         model_dim = model_dim * 2
 
-    torch_out_dtype = dtypes.fp4x2 if fuse_fp4_quant else dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
+    torch_out_dtype = (
+        dtypes.fp4x2
+        if fuse_fp4_quant
+        else dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
+    )
     _is_splitk = k_batch > 1
 
     dev = a.device
     _splitk_fq = _is_splitk and fuse_fp4_quant
 
     if out is None:
-        if _splitk_fq:
-            fp4_bytes = token_num * topk * (inter_dim // 2)
-            bf16_elems = (fp4_bytes + 1) // 2
-            out = torch.empty(bf16_elems, dtype=torch_out_dtype, device=dev)
+        if fuse_fp4_quant:
+            out = torch.empty(
+                (token_num, topk, inter_dim // 2), dtype=torch_out_dtype, device=dev
+            )
         else:
             out = torch.empty(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
@@ -761,14 +739,13 @@ def flydsl_moe_stage1(
     if _splitk_fq:
         _silu_fq = _get_compiled_silu_fq(inter_dim, topk)
         num_sorted_rows = sorted_token_ids.shape[0]
-        token_num_t = torch.tensor([token_num], dtype=torch.int32, device=dev)
         _silu_fq(
             tmp_out.view(-1, inter_dim * 2),
-            out.view(-1),
+            out.view(-1).view(torch.uint8),
             out_scale_sorted_flat,
             sorted_token_ids,
             num_valid_ids,
-            token_num_t,
+            token_num,
             num_sorted_rows,
         )
     elif _is_splitk:

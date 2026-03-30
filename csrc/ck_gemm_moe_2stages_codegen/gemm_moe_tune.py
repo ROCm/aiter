@@ -994,6 +994,7 @@ class FmoeTuner(TunerCommon):
         doweight_stage1=False,
         topk=1,
         blockM=32,
+        fuse_fq=False,
     ):
         ref1 = torch_moe_stage1(
             a1_qt,
@@ -1009,49 +1010,17 @@ class FmoeTuner(TunerCommon):
             doweight=doweight_stage1,
         )
         token_num = a1_qt.shape[0]
+        if fuse_fq:
+            from aiter.ops.quant import per_1x32_f4_quant
+
+            a2, a2_scale = per_1x32_f4_quant(ref1, quant_dtype=dtypes.fp4x2)
+            return a2.view(token_num, topk, -1)
         if quant_type == QuantType.per_1x128:
             ref1, ref_scale = aiter.pertoken_quant(
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
             )
             ref1 = ref1.view(ref1.shape[0], topk, -1)
         return ref1
-
-    @staticmethod
-    def run_torch_moe_stage1_fq(
-        a1_qt,
-        w1_qt,
-        w2_qt,
-        topk_weights,
-        topk_ids,
-        a1_scale,
-        w1_scale,
-        sorted_ids=None,
-        num_valid_ids=None,
-        dtype=dtypes.bf16,
-        activation=ActivationType.Silu,
-        quant_type=QuantType.No,
-        doweight_stage1=False,
-        topk=1,
-        blockM=32,
-    ):
-        ref1 = torch_moe_stage1(
-            a1_qt,
-            w1_qt,
-            w2_qt,
-            topk_weights,
-            topk_ids,
-            activation=activation,
-            quant_type=quant_type,
-            dtype=dtype,
-            a1_scale=a1_scale,
-            w1_scale=w1_scale,
-            doweight=doweight_stage1,
-        )
-        token_num = a1_qt.shape[0]
-        from aiter.ops.quant import per_1x32_f4_quant
-
-        a2, a2_scale = per_1x32_f4_quant(ref1, quant_dtype=dtypes.fp4x2)
-        return a2.view(token_num, topk, -1)
 
     @staticmethod
     def run_torch_moe_stage2(
@@ -1923,19 +1892,27 @@ class FmoeTuner(TunerCommon):
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
-                if is_splitk:
-                    continue
 
-                s1_variants = [(kname, kparams, False)]
-                fq_params = {**kparams, "fuse_fp4_quant": True}
-                s1_variants.append((kname + "_fq", fq_params, True))
+                if is_splitk:
+                    fq_params = {**kparams, "fuse_fp4_quant": True}
+                    s1_variants = [(kname + "_fq", fq_params, True)]
+                else:
+                    s1_variants = [(kname, kparams, False)]
+                    fq_params = {**kparams, "fuse_fp4_quant": True}
+                    s1_variants.append((kname + "_fq", fq_params, True))
 
                 for s1_name, s1_params, is_fq in s1_variants:
-                    ref_func = (
-                        FmoeTuner.run_torch_moe_stage1_fq
-                        if is_fq
-                        else FmoeTuner.run_torch_moe_stage1
+                    ref_args_extra = (
+                        [0, 10, 11, 12, 13, 3, 4, 5, 8],
+                        dtype,
+                        act_type,
+                        q_type,
+                        doweight_stage1,
+                        topk,
+                        blockM,
                     )
+                    if is_fq:
+                        ref_args_extra = ref_args_extra + (True,)
                     tasks_flydsl.append(
                         (
                             (info, "stage1", s1_name, blockM),
@@ -1967,16 +1944,8 @@ class FmoeTuner(TunerCommon):
                                 act_type,
                             ),
                             {},
-                            ref_func,
-                            (
-                                [0, 10, 11, 12, 13, 3, 4, 5, 8],
-                                dtype,
-                                act_type,
-                                q_type,
-                                doweight_stage1,
-                                topk,
-                                blockM,
-                            ),
+                            FmoeTuner.run_torch_moe_stage1,
+                            ref_args_extra,
                             {},
                             (None),
                             0.01,
