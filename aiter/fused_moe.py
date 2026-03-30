@@ -902,6 +902,8 @@ def get_2stage_cfgs(
             )
         )
         use_non_temporal_load = use_nt(token, topk, expert)
+        if get_gfx() == "gfx950" and q_type == QuantType.per_1x128 and ksplit > 1:
+            ksplit = 1
         aiter.logger.info(
             f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
