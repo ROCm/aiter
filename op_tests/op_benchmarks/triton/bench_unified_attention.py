@@ -18,18 +18,42 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 
 
 def default_benchmark_configs():
-    batch_sizes = [1, 4, 8]
-    N_HEADS = [16, 48]
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [8192]
-    HEAD_DIM = 128
-    V_HEAD_DIM = HEAD_DIM
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
-    configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
+    CONFIGS = [
+        {"tag": "b9_sk1001_nb59896", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 1001},
+        {"tag": "b9_sk1001_nb512", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 1001},
+        {"tag": "b64_sk1001_nb59896", "batch": 64, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 1001},
+        {"tag": "b64_sk1001_nb512", "batch": 64, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 1001},
+        {"tag": "b9_sk4096_nb59896", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 4096},
+        {"tag": "b9_sk4096_nb512", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 4096},
+        {"tag": "b256_sk2048_nb59896", "batch": 256, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 2048},
+        {"tag": "b1_sk8192_nb59896", "batch": 1, "hq": 64, "hk": 8, "head_size": 64,
+         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 8192},
     ]
-    return configs
+    return [
+        (cfg["tag"], cfg["batch"], cfg["hq"], cfg["hk"], cfg["sq"], cfg["sk"], cfg["head_size"], cfg["head_size"])
+        for cfg in CONFIGS
+    ]
+
+# def default_benchmark_configs():
+#     batch_sizes = [1, 4, 8]
+#     N_HEADS = [16, 48]
+#     seq_len_q = [1, 1024, 4096]
+#     seq_len_k = [8192]
+#     HEAD_DIM = 128
+#     V_HEAD_DIM = HEAD_DIM
+#     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
+#     configs = [
+#         (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k, HEAD_DIM, V_HEAD_DIM)
+#         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
+#     ]
+#     return configs
 
 
 def make_unified_attn_inputs(
@@ -126,6 +150,7 @@ def create_benchmark_configs(custom, args):
     head_size_v = head_size if not args.dv else args.dv
     decode_p = args.decode
     x_names = [
+        "TAG",
         "BATCH",
         "HQ",
         "HK",
@@ -168,7 +193,7 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    line_vals = [f"fwd"]
+    line_vals = [f"fwd(Triton)", f"fwd(CK)"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -191,6 +216,7 @@ def run_benchmark(custom, args):
 
     @triton.testing.perf_report(create_benchmark_configs(custom, args))
     def bench_mha(
+        
         BATCH,
         HQ,
         HK,
@@ -202,6 +228,7 @@ def run_benchmark(custom, args):
         dtype,
         causal,
         provider,
+        TAG="",
         model=None,
     ):
         varlen = not args.equal_seqlens
@@ -311,27 +338,33 @@ def run_benchmark(custom, args):
             q_input, k_input, v_input = q_fp8, k_fp8, v_fp8
         
         def fn():
-            if args.use_ck:
-                ck_func = lambda: _try_ck_unified_attention(
-                    q=q_input,
-                    k=k_input,
-                    v=v_input,
-                    out=output,
-                    cu_seqlens_q=cu_query_lens,
-                    seqused_k=kv_lens,
-                    max_seqlen_q=max_query_len,
-                    softmax_scale=scale,
-                    window_size=window_size,
-                    block_table=block_tables,
-                    softcap=soft_cap,
-                    sinks=sinks,
-                    alibi_slopes=None
-                )
-                ret_val = ck_func()
-                if ret_val:
-                    return ck_func()
-                else:
-                    assert False, "CK unified attention failed to run."
+            if provider == "fwd(CK)":
+                from aiter.ops.unified_attention import unified_attention_fwd
+                return unified_attention_fwd(
+                    output, q_input, k_input, v_input, block_tables, kv_lens, cu_query_lens,
+                    mask_type=2, scale_s=scale,
+                    scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0)
+                
+                # ck_func = lambda: _try_ck_unified_attention(
+                #     q=q_input,
+                #     k=k_input,
+                #     v=v_input,
+                #     out=output,
+                #     cu_seqlens_q=cu_query_lens,
+                #     seqused_k=kv_lens,
+                #     max_seqlen_q=max_query_len,
+                #     softmax_scale=scale,
+                #     window_size=window_size,
+                #     block_table=v_input,
+                #     softcap=soft_cap,
+                #     sinks=sinks,
+                #     alibi_slopes=None
+                # )
+                # ret_val = ck_func()
+                # if ret_val:
+                #     return ck_func()
+                # else:
+                #     assert False, "CK unified attention failed to run."
 
             return unified_attention(
                 q=q_input,
@@ -376,8 +409,14 @@ def run_benchmark(custom, args):
                 atol, rtol = 1.5e-2, 1e-2
             # print("ref_output:", ref_output.flatten()[:100])
             # print("output:", output.flatten()[:100])
-            
-            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+            try:
+                torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+            except AssertionError as e:
+                print(f"Correctness check failed for provider {provider} with tag {TAG}.")
+                print("key_cache.shape:", key_cache.shape)
+                print(e)
+                raise e
+
 
         # calculate perf metrics
         total_flops = 0
@@ -479,7 +518,7 @@ def parse_args():
     parser.add_argument(
         "-block_size",
         type=parse_int_or_list,
-        default=544,
+        default=64,
         help="block size in kv cache",
     )
 
