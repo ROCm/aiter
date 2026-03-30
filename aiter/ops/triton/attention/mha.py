@@ -38,6 +38,10 @@ def mha_set_use_int64_strides(value: bool):
     _USE_INT64_STRIDES = value
 
 
+def _get_sliding_window_size(window_size: Tuple[int, int]) -> int:
+    return int(window_size[0]) if int(window_size[0]) >= 0 else 0
+
+
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -339,8 +343,14 @@ class _FlashAttnFunc(torch.autograd.Function):
         do_padded = do
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
+        sliding_window = _get_sliding_window_size(ctx.window_size)
 
         if _USE_FUSED_BWD_KERNEL:
+            if sliding_window > 0:
+                raise ValueError(
+                    "Fused backward doesn't support sliding window attention. "
+                    "Disable fused backward or use the one-kernel backward."
+                )
             assert (
                 sink is None and dsink is None
             ), "Fused backward doesn't support sinks."
@@ -392,9 +402,7 @@ class _FlashAttnFunc(torch.autograd.Function):
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
                 sink=sink,
                 dsink=dsink,
-                sliding_window=(
-                    int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0
-                ),
+                sliding_window=sliding_window,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -602,8 +610,14 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         do_padded = do
         if head_size_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
+        sliding_window = _get_sliding_window_size(ctx.window_size)
 
         if _USE_FUSED_BWD_KERNEL:
+            if sliding_window > 0:
+                raise ValueError(
+                    "Fused backward doesn't support sliding window attention. "
+                    "Disable fused backward or use the one-kernel backward."
+                )
             assert (
                 sink is None and dsink is None
             ), "Fused backward doesn't support sinks."
@@ -655,9 +669,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
                 sink=sink,
                 dsink=dsink,
-                sliding_window=(
-                    int(ctx.window_size[0]) if int(ctx.window_size[0]) >= 0 else 0
-                ),
+                sliding_window=sliding_window,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
