@@ -24,6 +24,14 @@ on:
         description: 'Docker image for Python 3.12 build'
         required: true
         default: 'rocm/vllm-dev:nightly'
+      docker_password_secret:
+        description: 'Docker password secret for docker login'
+        required: true
+        default: 'DOCKER_PASSWORD'
+        type: choice
+        options:
+          - DOCKER_PASSWORD
+          - DOCKER_PASSWORD_ROCM
       gpu_archs:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
@@ -88,6 +96,12 @@ jobs:
           set -ex
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Docker login
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -ex
+          echo "${{ secrets[github.event.inputs.docker_password_secret] }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
 
       - name: Run the container
         if: ${{ matrix.build_enabled }}
