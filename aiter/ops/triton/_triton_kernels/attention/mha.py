@@ -693,6 +693,14 @@ def _attn_fwd(
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
+    skipped_blocks = 0
+    if SLIDING_WINDOW > 0:
+        # Skip K blocks that are fully left of the earliest key position
+        # reachable by this Q block. The first retained block can still be
+        # partially outside the window, so we keep the per-element mask below.
+        window_start_n = start_m * BLOCK_M + seqlen_k - seqlen_q - SLIDING_WINDOW
+        skipped_blocks = tl.maximum(window_start_n, 0) // BLOCK_N
+        skipped_blocks = tl.minimum(skipped_blocks, n_blocks)
     if IS_CAUSAL:
         # There are always at least BLOCK_M // BLOCK_N masked blocks.
         # Additionally there might be one more due to dissimilar seqlens.
@@ -702,14 +710,25 @@ def _attn_fwd(
         masked_blocks = padded_block_k
     # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
     # In this case we might exceed n_blocks so pick the min.
-    masked_blocks = min(masked_blocks, n_blocks)
-    n_full_blocks = n_blocks - masked_blocks
-    block_min = 0
+    visible_blocks = n_blocks - skipped_blocks
+    masked_blocks = min(masked_blocks, visible_blocks)
+    n_full_blocks = visible_blocks - masked_blocks
+    block_min = skipped_blocks * BLOCK_N
     block_max = n_blocks * BLOCK_N
+    if skipped_blocks > 0:
+        k_ptrs += skipped_blocks * BLOCK_N * stride_kn
+        if HAS_PE:
+            k_pe_ptrs += skipped_blocks * BLOCK_N * stride_kn
+        v_ptrs += skipped_blocks * BLOCK_N * stride_vn
+        if RETURN_SCORES:
+            s_dmask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
+            philox_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
     if n_full_blocks > 0:
-        block_max = (n_blocks - masked_blocks) * BLOCK_N
+        block_max = block_min + n_full_blocks * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,

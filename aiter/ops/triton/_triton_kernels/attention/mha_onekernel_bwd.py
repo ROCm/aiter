@@ -924,7 +924,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 SLIDING_WINDOW=SLIDING_WINDOW,
             )
             start_m += num_steps * MASK_BLOCK_M1
-            num_steps = tl.cdiv(seqlen_q - start_m, BLOCK_M1)
+            end_m = seqlen_q
+            if SLIDING_WINDOW > 0:
+                end_m = min(start_n + BLOCK_N1 + delta_qk + SLIDING_WINDOW, seqlen_q)
+            num_steps = tl.cdiv(max(end_m - start_m, 0), BLOCK_M1)
             end_m = start_m + num_steps * BLOCK_M1
 
             if DEBUG_TRITON:
@@ -1152,8 +1155,11 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 SLIDING_WINDOW=SLIDING_WINDOW,
             )
             end_n -= num_steps * MASK_BLOCK_N2
-            num_steps = tl.cdiv(end_n, BLOCK_N2)
-            start_n = max(end_n - num_steps * BLOCK_N2, 0)
+            window_start_n = 0
+            if SLIDING_WINDOW > 0:
+                window_start_n = max(start_m - delta_qk - SLIDING_WINDOW, 0)
+            start_n = window_start_n // BLOCK_N2 * BLOCK_N2
+            num_steps = tl.cdiv(max(end_n - start_n, 0), BLOCK_N2)
             if DEBUG_TRITON:
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
