@@ -24,7 +24,7 @@ def default_benchmark_configs():
          "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 1001},
         {"tag": "b9_sk1001_nb512", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
          "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 1001},
-        {"tag": "b64_sk1001_nb59896", "batch": 64, "hq": 64, "hk": 8, "head_size": 64,
+        {"tag": "b64_sk1001_nb59896", "batch": 128, "hq": 64, "hk": 8, "head_size": 64,
          "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 1001},
         {"tag": "b64_sk1001_nb512", "batch": 64, "hq": 64, "hk": 8, "head_size": 64,
          "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 1001},
@@ -39,7 +39,7 @@ def default_benchmark_configs():
     ]
     return [
         (cfg["tag"], cfg["batch"], cfg["hq"], cfg["hk"], cfg["sq"], cfg["sk"], cfg["head_size"], cfg["head_size"])
-        for cfg in CONFIGS
+        for cfg in CONFIGS if cfg["tag"] in ("b64_sk1001_nb59896")
     ]
 
 # def default_benchmark_configs():

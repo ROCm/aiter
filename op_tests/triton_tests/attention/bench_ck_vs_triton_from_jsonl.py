@@ -155,7 +155,7 @@ def _synth_q_lens(total: int, num_seqs: int) -> list[int]:
 
 def bench_ck(s: Shape, warmup: int, iters: int, created_input=None) -> float:
     blk = _ck_block_size(s)
-    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input # make_tensors(s, block_size_override=blk)
+    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
     out = torch.empty_like(q)
     mask_type = 2  # causal
 
@@ -167,20 +167,25 @@ def bench_ck(s: Shape, warmup: int, iters: int, created_input=None) -> float:
         )
     torch.cuda.synchronize()
 
-    t0 = time.perf_counter()
-    for _ in range(iters):
+    # Capture CUDA graph
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
         unified_attention_fwd(
             out, q, k, v, block_tables, seq_lens_k, cu_seqlens_q,
             mask_type=mask_type,
             scale_s=scale, scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
         )
+    
+    # Profile graph execution
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        graph.replay()
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) * 1e3 / iters, out
 
 
 def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None, created_input=None) -> float:
-    # blk = _ck_block_size(s)
-    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input # make_tensors(s, block_size_override=blk)
+    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
     out = torch.empty_like(q)
 
     kw = dict(
@@ -208,9 +213,15 @@ def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None
             ua_mod.unified_attention(**kw)
         torch.cuda.synchronize()
 
+        # Capture CUDA graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            ua_mod.unified_attention(**kw)
+        
+        # Profile graph execution
         t0 = time.perf_counter()
         for _ in range(iters):
-            ua_mod.unified_attention(**kw)
+            graph.replay()
         torch.cuda.synchronize()
         return (time.perf_counter() - t0) * 1e3 / iters, out
     finally:
@@ -224,12 +235,15 @@ def phase_label(s: Shape) -> str:
 
 
 def main() -> int:
+    
+    torch.manual_seed(42)
+    
     ap = argparse.ArgumentParser(
         description="Benchmark CK unified attention vs Triton 2D/3D from JSONL trace."
     )
     ap.add_argument("--jsonl", type=Path, required=True)
     ap.add_argument("--max-shapes", type=int, default=0, help="0 = all unique shapes")
-    ap.add_argument("--warmup", type=int, default=5)
+    ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--out-csv", type=Path, default=None,
                     help="Write per-shape CSV results")
@@ -289,8 +303,13 @@ def main() -> int:
                              s.head_size, count, "", "", "", "", f"ck_error:{e}"])
             continue
 
+        torch.cuda.empty_cache()  # try to reduce OOM risk for Triton runs
+        torch.cuda.synchronize()
+        
         try:
             t2d, out_triton_2d = bench_triton(s, warmup=args.warmup, iters=args.iters, force_2d=True, created_input=created_input)
+            torch.cuda.empty_cache()  # try to reduce OOM risk for Triton runs
+            torch.cuda.synchronize()
             t3d, out_triton_3d = bench_triton(s, warmup=args.warmup, iters=args.iters, force_2d=False, created_input=created_input)
         except Exception as e:
             print(f"{prefix} {ck_ms:8.4f} Triton err: {e}")
