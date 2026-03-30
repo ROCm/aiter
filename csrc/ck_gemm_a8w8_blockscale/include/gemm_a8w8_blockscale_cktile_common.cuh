@@ -135,21 +135,23 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
 
     using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
 
-    using GemmTraits = ck_tile::TileGemmQuantTraits<
-        true, // PadM
-        PadN,
-        PadK,
-        false,       // PreshuffleQuant for A, not supported yet
-        PreshuffleQuantB,       // PreshuffleQuant for B, not supported yet (distinct from PreshuffleB below)
-        PreshuffleB, // PreshuffleB (weight/B matrix preshuffle), supported
-        ALayout,
-        BLayout,
-        CLayout,
-        QuantMode,
-        std::conditional_t<eight_waves, AQLayout_8Warps, AQLayout>,
-        BQLayout,
-        transpose_c,
-        UseDoubleSmemBuffer>;
+    using GemmTraits =
+        ck_tile::TileGemmQuantTraits<true, // PadM
+                                     PadN,
+                                     PadK,
+                                     false,            // PreshuffleQuant for A, not supported yet
+                                     PreshuffleQuantB, // PreshuffleQuant for B, not supported yet
+                                                       // (distinct from PreshuffleB below)
+                                     PreshuffleB,      // PreshuffleB (weight/B matrix preshuffle),
+                                                       // supported
+                                     ALayout,
+                                     BLayout,
+                                     CLayout,
+                                     QuantMode,
+                                     std::conditional_t<eight_waves, AQLayout_8Warps, AQLayout>,
+                                     BQLayout,
+                                     transpose_c,
+                                     UseDoubleSmemBuffer>;
 
     using GemmPipelineProblem = ck_tile::GemmPipelineProblemBase<ADataType,
                                                                  BDataType,
