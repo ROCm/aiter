@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import torch
 from torch.distributed import ProcessGroup
 
@@ -14,6 +15,9 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
+    # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
+    _ar_1stage_override = {"1": True, "0": False}.get(os.environ.get("AITER_AR_1STAGE", ""))
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -205,7 +209,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            use_1stage = True if total_bytes <= 128 * 1024 else False
+            use_1stage = self._ar_1stage_override if self._ar_1stage_override is not None else (total_bytes <= 128 * 1024)
             out, res_out = ca_comm.custom_fused_ar_rms(
                 input_, res_inp_, weight_, eps, use_1stage
             )
@@ -237,7 +241,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             int(input_.shape[-1]) in [512, 1024, 2048, 4096]
             and total_bytes <= 4096 * 1024
         ):
-            use_1stage = True if total_bytes <= 128 * 1024 else False
+            use_1stage = self._ar_1stage_override if self._ar_1stage_override is not None else (total_bytes <= 128 * 1024)
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
             )
