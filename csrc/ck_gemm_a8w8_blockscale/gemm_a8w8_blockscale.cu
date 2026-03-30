@@ -92,7 +92,8 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
                                    torch::Tensor& WQ,
                                    torch::Tensor& x_scale,
                                    torch::Tensor& w_scale,
-                                   torch::Tensor& Y)
+                                   torch::Tensor& Y,
+                                   int splitK)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
@@ -100,14 +101,15 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
     int M = XQ.size(0);
     int N = WQ.size(0);
     int K = XQ.size(1);
+    int KBatch = static_cast<int>(std::pow(2, splitK));
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, 1);
+        blockscale_dispatch<FP32, FP16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, 1);
+        blockscale_dispatch<FP32, BF16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {
