@@ -6,7 +6,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import unified_attention, _try_ck_unified_attention
 from aiter.ops.unified_attention import unified_attention_fwd as ck_unified_attention
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -312,20 +312,7 @@ def run_benchmark(custom, args):
         
         def fn():
             if args.use_ck:
-                return ck_unified_attention(
-                    output=output,
-                    query=q_input,
-                    key_cache=k_input,
-                    value_cache=v_input,
-                    block_tables=block_tables,
-                    seq_lens=kv_lens,
-                    query_start_len=cu_query_lens[:-1],
-                    scale_s=scale,
-                    scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
-                    mask_type=0
-                )
-            else:
-                return unified_attention(
+                ck_func = lambda: _try_ck_unified_attention(
                     q=q_input,
                     k=k_input,
                     v=v_input,
@@ -333,17 +320,38 @@ def run_benchmark(custom, args):
                     cu_seqlens_q=cu_query_lens,
                     seqused_k=kv_lens,
                     max_seqlen_q=max_query_len,
-                    max_seqlen_k=max_kv_len,
                     softmax_scale=scale,
-                    causal=causal,
                     window_size=window_size,
                     block_table=block_tables,
                     softcap=soft_cap,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
                     sinks=sinks,
+                    alibi_slopes=None
                 )
+                ret_val = ck_func()
+                if ret_val:
+                    return ck_func()
+                else:
+                    assert False, "CK unified attention failed to run."
+
+            return unified_attention(
+                q=q_input,
+                k=k_input,
+                v=v_input,
+                out=output,
+                cu_seqlens_q=cu_query_lens,
+                seqused_k=kv_lens,
+                max_seqlen_q=max_query_len,
+                max_seqlen_k=max_kv_len,
+                softmax_scale=scale,
+                causal=causal,
+                window_size=window_size,
+                block_table=block_tables,
+                softcap=soft_cap,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                sinks=sinks,
+            )
 
         ms = triton.testing.do_bench(fn)
 
