@@ -908,7 +908,7 @@ struct AbsMaxFunctor
 template<typename T>
 DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
 {
-    static_assert(sizeof(T) == 4);
+    static_assert(sizeof(T) == 4); 
     int self = opus::lane_id();
     int index = (self & ~(width - 1)) + ((self ^ mask) & (width - 1));
     return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));

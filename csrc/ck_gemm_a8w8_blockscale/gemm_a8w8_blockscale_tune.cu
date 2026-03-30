@@ -7,12 +7,6 @@
 
 #include <torch/extension.h>
 
-#include <cmath>
-#include <functional>
-#include <unordered_map>
-
-#include <torch/extension.h>
-
 #include "gemm_a8w8_blockscale_common.cuh"
 #include "gemm_a8w8_blockscale_lookup.h"
 #include "gemm_a8w8_blockscale_manifest.h"

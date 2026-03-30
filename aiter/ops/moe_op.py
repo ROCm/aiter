@@ -5,7 +5,7 @@ import torch
 from torch import Tensor
 from typing import Optional
 from ..jit.core import compile_ops, AITER_CSRC_DIR
-from .enum import ActivationType, QuantType
+from .enum import ActivationType, Enum, QuantType
 from ..utility import dtypes
 import functools
 
