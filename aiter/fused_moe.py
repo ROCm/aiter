@@ -1933,4 +1933,3 @@ def fused_topk(
     #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
-
