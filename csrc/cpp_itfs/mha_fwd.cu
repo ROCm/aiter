@@ -315,6 +315,8 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.hdim_v,
                        a.nhead_q,
                        a.nhead_k,
+                       0, // num_head_q_total
+                       0, // head_start
                        a.scale_s,
                        a.logits_soft_cap,
                        a.stride_q,

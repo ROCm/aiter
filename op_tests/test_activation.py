@@ -1,8 +1,11 @@
 import torch
+from torch import Tensor, nn
 import torch.nn.functional as F
+import math
 import aiter
 from aiter.test_common import run_perftest, checkAllclose, benchmark
 from aiter import dtypes
+import functools
 import pandas as pd
 import argparse
 
@@ -92,6 +95,83 @@ def test_silu_and_mul(m, n, dtype, output_dtype=None):
     ret["M"] = m
     ret["N"] = n
     ret["us"] = us_aiter
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
+    ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
+    ret["err"] = err
+    return ret
+
+
+class GELUTanh(nn.Module):
+    """
+    A fast C implementation of the tanh approximation of the GeLU activation function. See
+    https://huggingface.co/papers/1606.08415.
+
+    This implementation is equivalent to NewGELU and FastGELU but much faster. However, it is not an exact numerical
+    match due to rounding errors.
+    """
+
+    def __init__(self, use_gelu_tanh_python: bool = False):
+        super().__init__()
+        if use_gelu_tanh_python:
+            self.act = self._gelu_tanh_python
+        else:
+            self.act = functools.partial(nn.functional.gelu, approximate="tanh")
+
+    def _gelu_tanh_python(self, input: Tensor) -> Tensor:
+        return (
+            input
+            * 0.5
+            * (
+                1.0
+                + torch.tanh(
+                    math.sqrt(2.0 / math.pi)
+                    * (input + 0.044715 * torch.pow(input, 3.0))
+                )
+            )
+        )
+
+    def forward(self, input: Tensor) -> Tensor:
+        return self.act(input)
+
+
+def torch_gelu_ref(x: torch.Tensor) -> torch.Tensor:
+    out = GELUTanh()(x)
+    return out
+
+
+def gelu_fast_wrapper(input: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(input)
+    aiter.gelu_fast(out, input)
+    return out
+
+
+@benchmark()
+def test_gelu_fast(m, n, dtype, output_dtype=None):
+    ret = {}
+    input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
+    out_dtype = output_dtype if output_dtype is not None else dtype
+
+    out, us_aiter = run_perftest(gelu_fast_wrapper, input)
+    ref, us_torch = run_perftest(torch_gelu_ref, input)
+
+    if output_dtype is not None:
+        ref = ref.to(output_dtype)
+
+    # Check if the results are close
+    err = checkAllclose(ref, out)
+
+    # Record input/output types for clarity
+    dtype_map = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
+    ret = {}
+    ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
+    ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["M"] = m
+    ret["N"] = n
+    ret["us"] = us_aiter
+    ret["torch_us"] = us_torch
+    ret["speedup_vs_torch"] = us_torch / us_aiter
+    ret["perf_gain_vs_torch_pct"] = (us_torch - us_aiter) / us_torch * 100.0
     ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
     ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
     ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
@@ -206,3 +286,29 @@ df = df[
 
 df_md = df.to_markdown(index=False)
 aiter.logger.info("silu_and_mul summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            ret = test_gelu_fast(m, n, dtype)
+            df.append(ret)
+df = pd.DataFrame(df)
+df = df[
+    [
+        "M",
+        "N",
+        "input_dtype",
+        "output_dtype",
+        "us",
+        "torch_us",
+        "speedup_vs_torch",
+        "perf_gain_vs_torch_pct",
+        "TB/s",
+        "RD TB/s",
+        "WR TB/s",
+        "err",
+    ]
+]
+df_md = df.to_markdown(index=False)
+aiter.logger.info("gelu_fast summary (markdown):\n%s", df_md)
