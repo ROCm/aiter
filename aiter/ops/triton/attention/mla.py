@@ -227,6 +227,10 @@ def mla_decode_fwd(
     out_scale,
     use_gluon: bool,
     shuffled_kv_cache: bool,
+    num_warps: int = None,
+    waves_per_eu: int = None,
+    num_stages: int = None,
+    num_segments: int = None,
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
@@ -308,6 +312,16 @@ def mla_decode_fwd(
         dtype=torch.float32,
         device=q.device,
     )
+
+    if num_warps is not None:
+        attn_config["num_warps"] = num_warps
+    if waves_per_eu is not None:
+        attn_config["waves_per_eu"] = waves_per_eu
+    if num_stages is not None:
+        attn_config["num_stages"] = num_stages
+    if num_segments is not None:
+        attn_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
+        reduce_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
 
     if use_gluon:
         if shuffled_kv_cache:

@@ -736,12 +736,6 @@ class MLAProgram:
         return gl.amd.gfx1250.wmma(self.q_rope, k_rope, S)
 
     @gluon.jit
-    def apply_mask_qk_3D(self, S, seq_offset):
-        seq_mask = seq_offset[None, :] < self.context_len + self.query_pos_qk + 1
-        S = gl.where(self.query_mask_qk & seq_mask, S, float("-inf"))
-        return S
-
-    @gluon.jit
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
@@ -1210,9 +1204,6 @@ def _mla_decode_fwd_kernel(
 
     j_hbm: gl.int32 = segm_idx * tiles_per_segment
     buffer_id: gl.int32 = 0
-    seq_offset = j_hbm * cfg.TILE_SIZE + gl.arange(
-        0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
-    )
     S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
 
     j_hbm, physical_block_idx = pgm.load_physical_block_idx(
@@ -1243,7 +1234,7 @@ def _mla_decode_fwd_kernel(
         S = pgm.compute_qk_rope(k_rope, S)
         S = S * qk_factor
 
-        S = pgm.apply_mask_qk_3D(S, seq_offset)
+        S = gl.where(pgm.query_mask_qk, S, float("-inf"))
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc_0, acc_1 = pgm.softmax_part1(p, L, acc_0, acc_1, alpha)
 
@@ -1254,7 +1245,6 @@ def _mla_decode_fwd_kernel(
         acc_1 = pgm.compute_pkv_lora_trans(p, kv_lora_1_trans, acc_1)
 
         buffer_id = next_buffer_id
-        seq_offset += cfg.TILE_SIZE
 
     S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
     kv_lora_0 = pgm.tdm_shared_load_kv_lora_0(2, buffer_id)
@@ -1265,7 +1255,11 @@ def _mla_decode_fwd_kernel(
     S = pgm.compute_qk_rope(k_rope, S)
     S = S * qk_factor
 
-    S = pgm.apply_mask_qk_3D(S, seq_offset)
+    seq_offset = (pgm.tile_end - 1) * cfg.TILE_SIZE + gl.arange(
+        0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
+    )
+    seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+    S = gl.where(pgm.query_mask_qk & seq_mask, S, float("-inf"))
     p, alpha, M = pgm.softmax_part0(S, M)
     p, L, acc_0, acc_1 = pgm.softmax_part1(p, L, acc_0, acc_1, alpha)
 
