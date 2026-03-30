@@ -40,7 +40,7 @@ def select_2d_config(
     # pure decode config
     else:
         # to not have masking when loading KV
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
@@ -69,7 +69,7 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
