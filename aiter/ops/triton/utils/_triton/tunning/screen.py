@@ -228,7 +228,7 @@ def main():
     echo_to_file(f"Number of combinations = {len(parms_comb_list)}", log_filename, True)
     echo_to_file(f"{s}", log_filename)
     i_comb_start = 0
-    comb_max_batch = 100
+    comb_max_batch = int(os.environ.get("SCREEN_MAX_BATCH", 100))
     date_to_file(log_filename)
     env = os.environ.copy()
     env["HIP_VISIBLE_DEVICES"] = f"{G}"
