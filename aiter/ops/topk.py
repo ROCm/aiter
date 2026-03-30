@@ -82,6 +82,19 @@ def biased_grouped_topk(
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
+    # gfx1250 CK-free: use torch fallback (module_moe_asm not available)
+    from aiter.jit.utils.chip_info import get_gfx
+    if get_gfx().startswith("gfx125"):
+        topk = topk_ids.shape[1]
+        _topk_weights, _topk_ids = biased_grouped_topk_torch(
+            gating_output, correction_bias, topk, need_renorm,
+            num_expert_group, topk_group,
+        )
+        topk_weights.copy_(_topk_weights)
+        topk_ids.copy_(_topk_ids)
+        if routed_scaling_factor != 1.0:
+            topk_weights.mul_(routed_scaling_factor)
+        return topk_weights, topk_ids
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     cu_num = get_cu_num()

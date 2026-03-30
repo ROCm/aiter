@@ -1290,6 +1290,10 @@ def _flash_attn_forward(
         return ret
 
     def can_impl_fmha_v3_fwd():
+        # gfx1250: no ASM V3 kernel blobs
+        from aiter.jit.utils.chip_info import get_gfx as _gfx
+        if _gfx() not in ("gfx942", "gfx950"):
+            return False
         # basic
         ret = alibi_slopes is None
         ret = ret and (bias is None)
@@ -2046,6 +2050,10 @@ def _flash_attn_varlen_forward(
         return ret
 
     def can_impl_fmha_v3_fwd():
+        # gfx1250: no ASM V3 kernel blobs
+        from aiter.jit.utils.chip_info import get_gfx as _gfx
+        if _gfx() not in ("gfx942", "gfx950"):
+            return False
         # basic
         ret = alibi_slopes is None
         ret = ret and (bias is None)
