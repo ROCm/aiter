@@ -2190,9 +2190,11 @@ class FmoeTuner(TunerCommon):
             )
             prorfiles.append(profileDF)
 
-            ## remove invalid candidate (keep err check disabled for now)
+            ## remove invalid candidate
             profileDF = profileDF[
-                (profileDF["us"] != float("-inf")) & (profileDF["us"] != -1)
+                (profileDF["us"] != float("-inf"))
+                & (profileDF["us"] != -1)
+                & (profileDF["err"] <= args.errRatio)
             ]
             # Keep best non-flydsl per (stage, block_m) for fallback before dedup
             _non_flydsl = profileDF[

@@ -356,40 +356,30 @@ def _get_compiled_stage1(
         _total_wg = _gx * _gy * k_batch
 
         if is_fp4:
+            _dlpack_safe = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
             empty_scale = torch.empty(0, device=a.device, dtype=torch.float32)
             stream = torch.cuda.current_stream()
-            _a = (
-                a.view(torch.uint8)
-                if a.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a
-            )
-            _w = (
-                w.view(torch.uint8)
-                if w.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w
-            )
+            _out = out.view(torch.uint8) if out.dtype not in _dlpack_safe else out
+            _a = a.view(torch.uint8) if a.dtype not in _dlpack_safe else a
+            _w = w.view(torch.uint8) if w.dtype not in _dlpack_safe else w
             _as = (
                 a_scale.view(torch.uint8)
                 if a_scale is not None
                 and a_scale.numel() > 0
-                and a_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                and a_scale.dtype not in _dlpack_safe
                 else a_scale
             )
             _ws = (
                 w_scale.view(torch.uint8)
                 if w_scale is not None
                 and w_scale.numel() > 0
-                and w_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                and w_scale.dtype not in _dlpack_safe
                 else w_scale
             )
             _oss = out_scale_sorted if out_scale_sorted is not None else empty_scale
             exe(
-                out,
+                _out,
                 _a,
                 _w,
                 _as,
@@ -497,38 +487,30 @@ def _get_compiled_stage2(
             )
 
         if is_fp4:
+            _dlpack_safe = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
             stream = torch.cuda.current_stream()
-            _a = (
-                a.view(torch.uint8)
-                if a.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a
+            _target = (
+                target.view(torch.uint8) if target.dtype not in _dlpack_safe else target
             )
-            _w = (
-                w.view(torch.uint8)
-                if w.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w
-            )
+            _a = a.view(torch.uint8) if a.dtype not in _dlpack_safe else a
+            _w = w.view(torch.uint8) if w.dtype not in _dlpack_safe else w
             _as = (
                 a_scale.view(torch.uint8)
                 if a_scale is not None
                 and a_scale.numel() > 0
-                and a_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                and a_scale.dtype not in _dlpack_safe
                 else a_scale
             )
             _ws = (
                 w_scale.view(torch.uint8)
                 if w_scale is not None
                 and w_scale.numel() > 0
-                and w_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+                and w_scale.dtype not in _dlpack_safe
                 else w_scale
             )
             exe(
-                target,
+                _target,
                 _a,
                 _w,
                 _as,
