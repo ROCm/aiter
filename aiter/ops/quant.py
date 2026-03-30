@@ -192,6 +192,10 @@ def get_torch_quant(qType):
 
 @functools.lru_cache()
 def get_hip_quant(qType):
+    # gfx1250 fix: HIP quant kernels not available, route to torch fallback
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+    if _get_gfx().startswith("gfx125"):
+        return get_torch_quant(qType)
     tmp = {
         QuantType.No.value: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor.value: per_tensor_quant_hip,

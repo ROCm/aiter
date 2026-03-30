@@ -65,6 +65,11 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
+    # gfx1250 fix: CK/HIP rmsnorm produces all-zeros, use PyTorch fallback
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+    if _get_gfx().startswith("gfx125"):
+        variance = input.float().pow(2).mean(-1, keepdim=True)
+        return (input.float() * torch.rsqrt(variance + epsilon) * weight.float()).to(input.dtype)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
     else:
@@ -82,6 +87,16 @@ def rmsnorm2d_fwd_with_add(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    # gfx1250 fix: fused_add_rms_norm_cu severely incorrect (max_diff 9.5-13.25)
+    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+    if _get_gfx().startswith("gfx125"):
+        # residual = residual_in + input (fused add)
+        res_sum = (residual_in + input).view_as(residual_out)
+        residual_out.copy_(res_sum)
+        # rmsnorm on the updated residual
+        variance = res_sum.float().pow(2).mean(-1, keepdim=True)
+        out.copy_((res_sum.float() * torch.rsqrt(variance + epsilon) * weight.float()).view_as(out).to(out.dtype))
+        return
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         rmsnorm2d_fwd_with_add_ck(
             out,
@@ -140,6 +155,16 @@ def rmsnorm2d_fwd_with_dynamicquant(
             out, input, yscale, weight, epsilon, use_model_sensitive_rmsnorm
         )
     else:
+        # gfx1250 fix: fallback for dynamic quant rmsnorm
+        from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+        if _get_gfx().startswith("gfx125"):
+            variance = input.float().pow(2).mean(-1, keepdim=True)
+            normed = (input.float() * torch.rsqrt(variance + epsilon) * weight.float())
+            amax = normed.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+            yscale_val = amax / 448.0
+            out.copy_(normed.div(yscale_val).to(out.dtype))
+            yscale.copy_(yscale_val.squeeze(-1) if yscale.dim() < yscale_val.dim() else yscale_val)
+            return
         rmsnorm_quant(out, input, yscale, weight, epsilon, group_size, shuffle_scale)
 
 
