@@ -356,10 +356,10 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_bf16*"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
-            filter_fwd += "_logits*"
+            filter_fwd_splitkv2 += "_logits*"
         else:
             md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
+            filter_fwd_splitkv2 += "_nlogits*"
         if bias is not None:
             md_name += "_bias"
             filter_fwd_splitkv2 += "_bias*"
