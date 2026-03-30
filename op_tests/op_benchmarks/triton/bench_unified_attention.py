@@ -177,7 +177,7 @@ def create_benchmark_configs(custom, args):
         batch_size = args.b if args.b else 1
 
     if custom:
-        x_vals_list = [(batch_size, args.hq, hk, args.sq, sk, head_size, head_size_v)]
+        x_vals_list = [("", batch_size, args.hq, hk, args.sq, sk, head_size, head_size_v)]
     else:
         x_vals_list = default_benchmark_configs()
 
