@@ -309,11 +309,9 @@ def run_benchmark(custom, args):
             v_fp8 = (value_cache * (fp8_max / v_abs_max)).to(FP8_TYPE)
 
             q_input, k_input, v_input = q_fp8, k_fp8, v_fp8
-
-        use_ck = True
         
         def fn():
-            if use_ck:
+            if args.use_ck:
                 return ck_unified_attention(
                     output=output,
                     query=q_input,
@@ -368,6 +366,9 @@ def run_benchmark(custom, args):
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
                 atol, rtol = 1.5e-2, 1e-2
+            # print("ref_output:", ref_output.flatten()[:100])
+            # print("output:", output.flatten()[:100])
+            
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
         # calculate perf metrics
@@ -402,9 +403,9 @@ def run_benchmark(custom, args):
         mem = mem_read + mem_write
 
         # return ms
-        if "ms" in provider:
+        if args.metric == "time":
             return ms
-        elif "TFLOPS" in provider:
+        elif args.metric == "throughput":
             return total_flops / ms * 1e-9
         else:  # GB/s
             return mem / ms * 1e-6
@@ -532,15 +533,6 @@ def parse_args():
     )
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="throughput",
-        choices=["time", "throughput", "bandwidth"],
-        default=None,
-        help="Metrics for the kernel benchmark.",
-    )
     parser.add_argument(
         "-use_ck",
         action="store_true",

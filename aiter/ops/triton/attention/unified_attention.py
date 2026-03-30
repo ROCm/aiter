@@ -172,12 +172,6 @@ def unified_attention(
 ):
     assert causal, "Only causal attention is supported"
 
-    # Try CK for decode (4-6% faster than Triton on max_seqlen_q==1)
-    if _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
-                                  seqused_k, softmax_scale, window_size,
-                                  block_table, softcap, alibi_slopes, sinks):
-        return
-
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
