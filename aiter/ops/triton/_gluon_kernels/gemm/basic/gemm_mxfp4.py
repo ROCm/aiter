@@ -77,10 +77,7 @@ def depreshuffle_b_raw_to_kn(
     BLOCK_N: gl.constexpr,
     BLOCK_K_BYTES: gl.constexpr,
 ):
-    # Inverse of shuffle_weight_gfx1250 (2D case):
-    #   shuffle: (N, Kb) -> view(N//16, 16, Kb//32, 2, 16) -> permute(0,2,3,1,4) -> (N//16, Kb*16)
-    #   unshuffle: (N//16, Kb*16) -> view(N//16, Kb//32, 2, 16, 16) -> permute(0,3,1,2,4) -> (N, Kb)
-    # Then transpose to (Kb, N) for dot product.
+    # raw -> logical [BLOCK_K_BYTES, BLOCK_N]
     return (
         b_raw.reshape((BLOCK_N // 16, BLOCK_K_BYTES // 32, 2, 16, 16))
         .permute((0, 3, 1, 2, 4))
@@ -231,9 +228,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
         return
 
     k_tiles: gl.constexpr = (SPLITK_BYTES + BLOCK_K_BYTES - 1) // BLOCK_K_BYTES
+    # Base pointers for this split-K slice; advance by k_tile each iteration
     split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
 
-    # ---- LDS allocations ----
+    # LDS allocations:
+    #   - A is staged into LDS
+    #   - A nad B scales are staged into LDS
     smem_A = gl.allocate_shared_memory(
         a_fp4_ptr.type.element_ty,
         [NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_K_BYTES],
@@ -264,7 +264,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         layout=shared_S,
     )
 
-    # ---- TDM descriptors ----
+    # -------------------- TDM descriptors --------------------
     a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_fp4_ptr,
         shape=(M, K_bytes),
@@ -319,6 +319,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
             slot_p = k_tile_load_idx
             k_tile_p = k_tile_load_idx
 
+            # A/B offsets (bytes-domain for A_fp4 and B_preshuf raw)
             a_offs = [tile_m * BLOCK_SIZE_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
             b_offs = [
                 tile_n * (BLOCK_SIZE_N // 16),
@@ -335,17 +336,19 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
             gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
             gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
-            gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_AS.index(slot_p), pred=1)
-            gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BS.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
         k_tile_load_idx += 1
 
-    # accumulator
+    # accumulator is in vGPR for the whole C tile
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_acc_layout)
 
     # ---- Main pipeline ----
     main_iters: gl.constexpr = k_tiles - (NUM_BUFFERS - 1)
     for _ in range(main_iters):
+        # Load: advance pointers for this k_tile
+        # HBM -> vGPR -> LDS
         slot_p = k_tile_load_idx % NUM_BUFFERS
         k_tile_p = k_tile_load_idx
 
@@ -363,15 +366,19 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
         gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
         gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
-        gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_AS.index(slot_p), pred=1)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BS.index(slot_p), pred=1)
+        gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
+        gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
         k_tile_load_idx += 1
+        # Compute: wait for data we’re about to use
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
         slot_c = k_tile_compute_idx % NUM_BUFFERS
 
+        # LDS -> vGPR
         A = smem_A.index(slot_c).load(layout=dot_a_layout)
+
+        # B operand (raw unshuffle -> logical)
         B = depreshuffle_b_raw_to_kn(
                 smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
             ).load(layout=dot_b_layout)
@@ -402,6 +409,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
             slot_c = k_tile_compute_idx % NUM_BUFFERS
 
             A = smem_A.index(slot_c).load(layout=dot_a_layout)
+
             B = depreshuffle_b_raw_to_kn(
                 smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
             ).load(layout=dot_b_layout)

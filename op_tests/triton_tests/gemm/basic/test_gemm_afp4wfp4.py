@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# from aiter.aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 import pytest
 import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
@@ -20,26 +19,23 @@ pytestmark = pytest.mark.skipif(
 
 
 def shuffle_scales(scales: torch.Tensor):
-    
-    return scales
-    # scales_shuffled = scales.clone()
-    # sm, sn = scales_shuffled.shape
-    # scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-    # scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
-    # scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
-    # return scales_shuffled
+    scales_shuffled = scales.clone()
+    sm, sn = scales_shuffled.shape
+    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
+    return scales_shuffled
 
 
 def un_shuffle_scales(scales_shuffled: torch.Tensor):
-    return scales_shuffled
-    # scales = scales_shuffled.clone()
-    # sm, sn = scales.shape
-    # scales = scales.view(sm * 32, sn // 32)
-    # sm, sn = scales.shape
-    # scales = scales.view(sm // 32, sn // 8, 4, 16, 2, 2, 1)
-    # scales = scales.permute(0, 5, 3, 1, 4, 2, 6).contiguous()
-    # scales = scales.view(sm, sn)
-    # return scales
+    scales = scales_shuffled.clone()
+    sm, sn = scales.shape
+    scales = scales.view(sm * 32, sn // 32)
+    sm, sn = scales.shape
+    scales = scales.view(sm // 32, sn // 8, 4, 16, 2, 2, 1)
+    scales = scales.permute(0, 5, 3, 1, 4, 2, 6).contiguous()
+    scales = scales.view(sm, sn)
+    return scales
 
 
 def shuffle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
@@ -85,6 +81,10 @@ def generate_gemm_afp4wfp4_inputs(
     shuffle_weight_fg=False,
     shuffle_scales_fg=False,
 ):
+    if shuffle_weight_fg:
+        assert (
+            shuffle_scales_fg
+        ), "weight shuffling is only supported with scale shuffling"
 
     torch.manual_seed(5)
     if isinstance(dtype, str):
@@ -119,8 +119,8 @@ def generate_gemm_afp4wfp4_inputs(
     w_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
     )
-    x_scales = x_scales.T.contiguous()
-    w_scales = w_scales.T.contiguous()
+    x_scales = x_scales.T
+    w_scales = w_scales.T
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
             if M >= 32:
@@ -391,7 +391,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         dtype,
         layout=layout,
         output=output,
-        shuffle_scales_fg=False,
+        shuffle_scales_fg=True,
         shuffle_weight_fg=True,
     )
 
