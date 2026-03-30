@@ -24,6 +24,8 @@ from aiter.fused_moe import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
+    shuffle_weight_a16w4,
+    shuffle_scale_a16w4,
 )
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
@@ -217,6 +219,7 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
+        E = w1_qt_shffle.shape[0]
         inter_dim = w1_qt_shffle.shape[1] // 2
         token_num = a1_qt.shape[0]
         out = torch.empty(
@@ -224,6 +227,11 @@ class FmoeTuner(TunerCommon):
             dtype=dtype,
             device=a1_qt.device,
         )
+        # HasBias kernels unconditionally load from the bias pointer on GPU,
+        # so we must provide a valid (zero) tensor instead of None.
+        bias = None
+        if "HasBias" in kernelName:
+            bias = torch.zeros(E, inter_dim * 2, dtype=torch.float32, device=a1_qt.device)
         aiter.moe_cktile2stages_gemm1(
             a1_qt,
             w1_qt_shffle,
@@ -237,7 +245,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             a1_scale,
             w1_scale,
-            None,  # bias
+            bias,
             act_type,
             blockM,
             1,  # split_k
@@ -262,6 +270,7 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
+        E = w2_qt_shffle.shape[0]
         model_dim = w2_qt_shffle.shape[1]
         token_num = a2_qt.shape[0]
         out = torch.zeros(
@@ -269,6 +278,11 @@ class FmoeTuner(TunerCommon):
             dtype=dtype,
             device=a2_qt.device,
         )
+        # HasBias kernels unconditionally load from the bias pointer on GPU,
+        # so we must provide a valid (zero) tensor instead of None.
+        bias = None
+        if "HasBias" in kernelName:
+            bias = torch.zeros(E, model_dim, dtype=torch.float32, device=a2_qt.device)
         aiter.moe_cktile2stages_gemm2(
             a2_qt,
             w2_qt_shffle,
@@ -282,7 +296,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             a2_scale,
             w2_scale,
-            None,  # bias
+            bias,
             0,  # activation (unused for stage2)
             blockM,
             1,  # split_k
@@ -656,10 +670,9 @@ class FmoeTuner(TunerCommon):
             q_type == aiter.QuantType.per_1x32
             and q_dtype_a == dtypes.fp8
             and q_dtype_w == dtypes.fp4x2
-        ):  # a8w4 mxfp4
-            from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
-
-            a1_qt, a1_scale = dynamic_mxfp4_quant(input)
+        ):  # a8w4: CKTile kernel expects fp8 activations, no block scale
+            a1_qt = input.to(dtypes.fp8)
+            a1_scale = None
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
@@ -834,13 +847,23 @@ class FmoeTuner(TunerCommon):
                 )
             )
         elif q_dtype_w == dtypes.fp4x2:
-            w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
-            w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
+            if q_type == QuantType.per_1x32 and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]:
+                # CKTile a16w4/a8w4: use a16w4-specific shuffle
+                w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, use_g1u1)
+                w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+            else:
+                w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
+                w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
-        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        if q_type == QuantType.per_1x32 and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8] and q_dtype_w == dtypes.fp4x2:
+            # CKTile/FlyDSL: a16w4-specific scale shuffle
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, use_g1u1)
+            w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
+        else:
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
         w1_qt_shffle_flydsl = w1_qt_shffle_ck
         w2_qt_shffle_flydsl = w2_qt_shffle_ck
@@ -849,7 +872,7 @@ class FmoeTuner(TunerCommon):
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
-            if q_type == QuantType.per_1x32:
+            if q_type == QuantType.per_1x32 and a1_scale is not None:
                 a1_scale_fp4_sort = moe_mxfp4_sort(
                     a1_scale,  # a1_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
@@ -857,13 +880,28 @@ class FmoeTuner(TunerCommon):
                     token_num=token,
                     block_size=blockM,
                 )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a == dtypes.fp8
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # a8w4: reference needs a1_scale=None (index 3) so it
+                # converts fp8→f32 directly, but the CKTile kernel needs a
+                # valid scale pointer.  Provide all-ones e8m0 in sorted layout
+                # (identity scaling, matching the runtime in fused_moe_2stages).
+                M = sorted_ids.shape[0]
+                a1_scale_fp4_sort = torch.ones(
+                    [M, model_dim // 32],
+                    dtype=dtypes.fp8_e8m0,
+                    device=a1_qt.device,
+                )
             else:
                 a1_scale_fp4_sort = a1_scale
 
             return (
                 a1_qt,  # 0
-                w1_qt_shffle_ck,  # 1
-                w2_qt_shffle_ck,  # 2
+                w1_qt_shffle_ck,  # 1  (CKTile format)
+                w2_qt_shffle_ck,  # 2  (CKTile format)
                 a1_scale,  # 3
                 w1_scale,  # 4
                 sorted_ids,  # 5
@@ -875,8 +913,8 @@ class FmoeTuner(TunerCommon):
                 w2_qt,  # 11
                 topk_weights,  # 12
                 topk_ids,  # 13
-                a1_scale_fp4_sort,  # 14
-                w1_scale_aiter,  # 15
+                a1_scale_fp4_sort,  # 14  (CKTile activation scale)
+                w1_scale_aiter,  # 15  (CKTile/FlyDSL weight scale)
                 w1_qt_shffle_flydsl,  # 16
                 w2_qt_shffle_flydsl,  # 17
                 w1_scale_flydsl,  # 18
@@ -907,21 +945,25 @@ class FmoeTuner(TunerCommon):
                 a2_scale = ref_scale
             elif (
                 q_type == QuantType.per_1x32
+                and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                and q_dtype_w == dtypes.fp4x2
+            ):  # a16w4: stage2 intermediate is bf16, no quantization needed
+                a2_qt = ref1.to(dtype)
+                a2_scale = None
+            elif (
+                q_type == QuantType.per_1x32
                 and q_dtype_a == dtypes.fp8
                 and q_dtype_w == dtypes.fp4x2
-            ):  # a8w4 mxfp4
-                from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
-
-                a2_qt, a2_scale = dynamic_mxfp4_quant(
-                    ref1.view(ref1.shape[0] * topk, -1)
-                )
+            ):  # a8w4: CKTile kernel expects fp8 activations, no block scale
+                a2_qt = ref1.to(dtypes.fp8)
+                a2_scale = None
             else:
                 torch_quant = aiter.get_torch_quant(q_type)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
             a2_qt = a2_qt.view(token, topk, -1)
             if doweight_stage1:
                 sorted_weights = None
-            if q_type == QuantType.per_1x32:
+            if q_type == QuantType.per_1x32 and a2_scale is not None:
                 a2_scale_mxfp4_sort = moe_mxfp4_sort(
                     a2_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
@@ -929,12 +971,24 @@ class FmoeTuner(TunerCommon):
                     token_num=token,
                     block_size=blockM,
                 )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a == dtypes.fp8
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # a8w4: CKTile needs valid all-ones scale (identity)
+                M = sorted_ids.shape[0]
+                a2_scale_mxfp4_sort = torch.ones(
+                    [M, inter_dim // 32],
+                    dtype=dtypes.fp8_e8m0,
+                    device=a2_qt.device,
+                )
             else:
                 a2_scale_mxfp4_sort = a2_scale
             return (
                 a2_qt,  # 0
-                w1_qt_shffle_ck,  # 1
-                w2_qt_shffle_ck,  # 2
+                w1_qt_shffle_ck,  # 1  (CKTile format)
+                w2_qt_shffle_ck,  # 2  (CKTile format)
                 a2_scale,  # 3
                 w2_scale,  # 4
                 sorted_ids,  # 5
@@ -946,8 +1000,8 @@ class FmoeTuner(TunerCommon):
                 w2_qt,  # 11
                 topk_weights,  # 12
                 topk_ids,  # 13
-                a2_scale_mxfp4_sort,  # 14
-                w2_scale_aiter,  # 15
+                a2_scale_mxfp4_sort,  # 14  (CKTile activation scale)
+                w2_scale_aiter,  # 15  (CKTile/FlyDSL weight scale)
                 w1_qt_shffle_flydsl,  # 16
                 w2_qt_shffle_flydsl,  # 17
                 w1_scale_flydsl,  # 18
@@ -1015,7 +1069,7 @@ class FmoeTuner(TunerCommon):
         )
         fc1_smooth_scale = None
         fc2_smooth_scale = None
-        if q_type == QuantType.per_1x32:
+        if q_type == QuantType.per_1x32 and a1_scale is not None:
             a1_scale = moe_mxfp4_sort(
                 a1_scale,
                 sorted_ids,
@@ -1789,25 +1843,36 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        _, ck_stage1_kernels = get_gemm1_kernels_list(
-            dtype2str_dict[q_dtype_a],
-            dtype2str_dict[q_dtype_w],
-            dtype2str_dict[dtype],
-            False,
-            int(q_type),
-            str(act_type).split(".")[-1].lower(),
-            doweight_stage1,
-            True,  # bpreshuffle
-        )
-        _, ck_stage2_kernels = get_gemm2_kernels_list(
-            dtype2str_dict[q_dtype_a],
-            dtype2str_dict[q_dtype_w],
-            dtype2str_dict[dtype],
-            False,
-            int(q_type),
-            not doweight_stage1,
-            True,  # bpreshuffle
-        )
+        # CK2stages codegen has no fp4x2 weight support: the "a8w4" tag
+        # is for int4 (wint4) weights only, and bf16+fp4x2 has no tag at all.
+        if q_dtype_w == dtypes.fp4x2:
+            return tasks_ck
+
+        try:
+            _, ck_stage1_kernels = get_gemm1_kernels_list(
+                dtype2str_dict[q_dtype_a],
+                dtype2str_dict[q_dtype_w],
+                dtype2str_dict[dtype],
+                False,
+                int(q_type),
+                str(act_type).split(".")[-1].lower(),
+                doweight_stage1,
+                True,  # bpreshuffle
+            )
+        except ValueError:
+            return tasks_ck
+        try:
+            _, ck_stage2_kernels = get_gemm2_kernels_list(
+                dtype2str_dict[q_dtype_a],
+                dtype2str_dict[q_dtype_w],
+                dtype2str_dict[dtype],
+                False,
+                int(q_type),
+                not doweight_stage1,
+                True,  # bpreshuffle
+            )
+        except ValueError:
+            return tasks_ck
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
                 for kernel in ck_stage1_kernels.values():
@@ -1851,7 +1916,6 @@ class FmoeTuner(TunerCommon):
                             {},
                             FmoeTuner.run_torch_moe_stage1,
                             (
-                                # [a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
                                 [0, 10, 11, 12, 13, 3, 4],
                                 dtype,
                                 act_type,

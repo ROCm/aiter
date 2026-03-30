@@ -532,7 +532,8 @@ def mp_tuner(
         if shape_grouped:
             result.extend(task_result)
         else:
-            result.append(task_result[0])
+            if task_result:
+                result.append(task_result[0])
 
     # Clean up the pool
     try:
