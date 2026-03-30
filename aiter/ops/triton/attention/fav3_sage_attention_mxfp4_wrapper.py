@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
@@ -50,6 +50,7 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         config: Optional[dict] = None,
         R: torch.Tensor = None,
         BLOCK_R: int = 128,
+        block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ):
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
         bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
@@ -106,6 +107,13 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         assert tuple(qd_mapped) == expected_q_ds, "q_descale mismatch"
         assert tuple(kd_mapped) == expected_k_ds, "k_descale mismatch"
 
+        if block_lut is not None:
+            kv_block_indices, lut_start, lut_count = block_lut
+            use_block_sparse = True
+        else:
+            kv_block_indices = lut_start = lut_count = None
+            use_block_sparse = False
+
         out = fav3_sage_mxfp4_func(
             q=q_quantized,
             k=k_quantized,
@@ -117,6 +125,10 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
             causal=causal,
             layout=layout,
             config=config,
+            kv_block_indices=kv_block_indices,
+            lut_start=lut_start,
+            lut_count=lut_count,
+            use_block_sparse=use_block_sparse,
         )
 
         return out
@@ -139,6 +151,7 @@ def fav3_sage_mxfp4_wrapper(
     config: Optional[dict] = None,
     R: torch.Tensor = None,
     BLOCK_R: int = 128,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """High-precision entry point for MXFP4 SageAttention."""
     for tensor, name in zip([q, k, v], ["q", "k", "v"]):
@@ -149,7 +162,7 @@ def fav3_sage_mxfp4_wrapper(
         ], f"Expected high-precision for {name}, got {tensor.dtype}"
 
     return _FAv3SageMXFP4WrapperFunc.apply(
-        q, k, v, causal, layout, q_smooth, hadamard_rotation, config, R, BLOCK_R
+        q, k, v, causal, layout, q_smooth, hadamard_rotation, config, R, BLOCK_R, block_lut
     )
 
 
@@ -164,6 +177,10 @@ def fav3_sage_mxfp4_func(
     causal: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    kv_block_indices: Optional[torch.Tensor] = None,
+    lut_start: Optional[torch.Tensor] = None,
+    lut_count: Optional[torch.Tensor] = None,
+    use_block_sparse: bool = False,
 ):
     """Direct MXFP4 kernel execution with unused parameters removed."""
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -212,6 +229,18 @@ def fav3_sage_mxfp4_func(
     padded_d_qk = max(16, 1 << (head_size_qk - 1).bit_length())
     padded_d_v = max(16, 1 << (head_size_v - 1).bit_length())
 
+    # Block sparse logic
+    if use_block_sparse:
+        if kv_block_indices is None or lut_start is None or lut_count is None:
+            raise ValueError(
+                "kv_block_indices, lut_start, and lut_count must be provided "
+                "when use_block_sparse=True"
+            )
+    else:
+        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
+
     def grid(META):
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
 
@@ -250,6 +279,9 @@ def fav3_sage_mxfp4_func(
         stride_bn=stride_bn,  # Bias strides
         cu_seqlens_q=None,
         cu_seqlens_k=None,
+        kv_block_indices=kv_block_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
         Q_DTYPE_STR="e2m1",
         K_DTYPE_STR="e2m1",
         HQ=nheads_q,
@@ -263,6 +295,7 @@ def fav3_sage_mxfp4_func(
         BLOCK_DMODEL_QK=padded_d_qk,
         BLOCK_DMODEL_V=padded_d_v,
         USE_BIAS=USE_BIAS,
+        USE_BLOCK_SPARSE=use_block_sparse,
         **config,
     )
 

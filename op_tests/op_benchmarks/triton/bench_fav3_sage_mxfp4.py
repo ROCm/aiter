@@ -15,6 +15,10 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_func,
 )
 
+from aiter.ops.triton.attention.fav3_sage import (
+    block_attn_mask_to_ragged_lut,
+)
+
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
 )
@@ -49,7 +53,7 @@ def layout_preprocess(q, k, v, layout: str, target_layout: str = "bshd"):
     return q, k, v
 
 
-def bench_kernel(q, k, v, args, provider):
+def bench_kernel(q, k, v, args, provider, block_lut=None):
     """Main benchmarking logic for a single configuration."""
     if args.layout == "bshd":
         BATCH, N_CTX_Q, HQ, D_HEAD = q.shape
@@ -73,6 +77,7 @@ def bench_kernel(q, k, v, args, provider):
                 q_smooth=args.qsmooth,
                 hadamard_rotation=args.hadamard_rotate,
                 R=R,
+                block_lut=block_lut,
             )
 
     else:
@@ -102,6 +107,13 @@ def bench_kernel(q, k, v, args, provider):
             q_smoothing=args.qsmooth,
         )
 
+        if block_lut is not None:
+            kv_block_indices, lut_start_t, lut_count_t = block_lut
+            use_block_sparse = True
+        else:
+            kv_block_indices = lut_start_t = lut_count_t = None
+            use_block_sparse = False
+
         def fn():
             return fav3_sage_mxfp4_func(
                 q=q_quantized,
@@ -114,18 +126,29 @@ def bench_kernel(q, k, v, args, provider):
                 causal=args.causal,
                 layout=args.layout,
                 config=config,
+                kv_block_indices=kv_block_indices,
+                lut_start=lut_start_t,
+                lut_count=lut_count_t,
+                use_block_sparse=use_block_sparse,
             )
 
     ms = triton.testing.do_bench(fn)
     # print("kernel (ms)", ms)
 
-    # Metrics calculation (MXFP4 treats elements as 0.5 bytes in memory traffic for Q/K)
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+
+    if block_lut is not None:
+        _, _, lut_count_metric = block_lut
+        cfg = get_sage_fwd_configs_mxfp4()
+        num_sparse_pairs = lut_count_metric.sum().item()
+        sparse_flops = 2.0 * num_sparse_pairs * cfg["BLOCK_M"] * cfg["BLOCK_N"] * (D_HEAD + D_HEAD_V)
+    else:
+        sparse_flops = total_flops
 
     if "ms" in provider:
         return ms
     if "TFLOPS" in provider:
-        return total_flops / ms * 1e-9
+        return sparse_flops / ms * 1e-9
     return ms
 
 
@@ -173,7 +196,20 @@ def run_benchmark(args):
         v = torch.randn((BATCH, HK, N_CTX_K, D_HEAD_V), device=device, dtype=dtype)
 
         q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
-        return bench_kernel(q, k, v, args, provider)
+
+        block_lut = None
+        if getattr(args, "block_sparsity", None) is not None:
+            config = get_sage_fwd_configs_mxfp4()
+            BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+            num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
+            num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
+            block_attn_mask = (
+                torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+                > args.block_sparsity
+            ).to(torch.bool)
+            block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
+
+        return bench_kernel(q, k, v, args, provider, block_lut=block_lut)
 
     bench_mha.run(save_path=None, print_data=True)
 
@@ -232,6 +268,12 @@ def parse_args():
         "-include_quant_overhead",
         action="store_true",
         help="Include quantization overhead to bench.",
+    )
+    parser.add_argument(
+        "-block_sparsity",
+        type=float,
+        default=None,
+        help="Fraction of (q_block, kv_block) pairs disallowed (0=dense, 0.5=50%% masked). Uses random mask.",
     )
 
     return parser.parse_args()
@@ -350,6 +392,12 @@ def main():
         args.hk = args.hq
 
     assert args.BLOCK_R <= args.d, "Rotation block size should be <= d"
+
+    if getattr(args, "block_sparsity", None) is not None:
+        if not (0 <= args.block_sparsity <= 1):
+            raise ValueError(
+                f"-block_sparsity must be in [0, 1], got {args.block_sparsity}"
+            )
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")

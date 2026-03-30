@@ -249,6 +249,7 @@ def _sage_fwd_blocksparse_nomask(
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    USE_BIAS: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
@@ -281,12 +282,19 @@ def _sage_fwd_blocksparse_nomask(
             )
             qk_scaled += alibi_block
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-        if bias_base_ptrs is not None:
+
+        if USE_BIAS:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
+
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-        q_shifted = qk_scaled - m_ij[:, None]
+
+        if USE_BIAS:
+            q_shifted = tl.where(m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None])
+        else:
+            q_shifted = qk_scaled - m_ij[:, None]
+
         if USE_EXP2:
             p = tl.math.exp2(q_shifted)
         else:
@@ -325,7 +333,10 @@ def _sage_fwd_blocksparse_nomask(
                 kv_offs_n[None, :] < seqlen_k
             )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-        m_diff = m_i - m_ij
+        if USE_BIAS:
+            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        else:
+            m_diff = m_i - m_ij
         if USE_EXP2:
             alpha = tl.math.exp2(m_diff)
         else:
@@ -388,6 +399,7 @@ def _sage_fwd_blocksparse_mask(
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
+    USE_BIAS: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     ACCUMULATOR_TYPE,
 ):
@@ -422,15 +434,19 @@ def _sage_fwd_blocksparse_mask(
             )
             qk_scaled += alibi_block
         qk_mask = (offs_m[:, None] < seqlen_q) & (kv_offs_n[None, :] < seqlen_k)
-        if bias_base_ptrs is not None:
+        if USE_BIAS:
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
         qk_scaled = tl.where(qk_mask, qk_scaled, float("-inf"))  # mask padding before softmax
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-        q_shifted = tl.where(
-            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-        )
+        if USE_BIAS:
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+            )
+        else:
+            q_shifted = qk_scaled - m_ij[:, None]
+
         if USE_EXP2:
             p = tl.math.exp2(q_shifted)
         else:
@@ -469,7 +485,10 @@ def _sage_fwd_blocksparse_mask(
                 kv_offs_n[None, :] < seqlen_k
             )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        if USE_BIAS:
+            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
+        else:
+            m_diff = m_i - m_ij
         if USE_EXP2:
             alpha = tl.math.exp2(m_diff)
         else:
@@ -1679,9 +1698,14 @@ def sage_fwd(
             ACTUAL_BLOCK_DMODEL_V,
             USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
+            USE_BIAS=USE_BIAS,
             RETURN_SCORES=RETURN_SCORES,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
+        invalid_q_rows = offs_m >= seqlen_q
+        m_i = tl.where(invalid_q_rows, float("-inf"), m_i)
+        l_i = tl.where(invalid_q_rows, 1.0, l_i)
+        acc = tl.where(invalid_q_rows[:, None], 0.0, acc)
         acc, l_i, m_i = _sage_fwd_blocksparse_mask(
             acc,
             l_i,
@@ -1726,6 +1750,7 @@ def sage_fwd(
             ACTUAL_BLOCK_DMODEL_V,
             USE_ALIBI=USE_ALIBI,
             USE_EXP2=USE_EXP2,
+            USE_BIAS=USE_BIAS,
             RETURN_SCORES=RETURN_SCORES,
             ACCUMULATOR_TYPE=ACCUMULATOR_TYPE,
         )
