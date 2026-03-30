@@ -50,6 +50,9 @@ void rope_cached_positions_offsets_fwd_impl(
     const int32_t stride_o_h = output.stride(2);
     const int32_t stride_o_d = output.stride(3);
 
+    TORCH_CHECK(stride_i_d == 1 && stride_o_d == 1,
+                "rope_cached_positions_offsets_fwd_impl requires all stride_d to be 1");
+
     // Get strides of positions and offsets
     assert(1 == positions.stride(1) && 2 == positions.dim());
     assert(1 == offsets.stride(1)   && 2 == offsets.dim());
