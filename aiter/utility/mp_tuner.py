@@ -468,9 +468,34 @@ def mp_tuner(
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
                     # pool_restart_needed = True
+                elif error_type == "AcceleratorError":
+                    # GPU fault (e.g. illegal memory access): worker returns exception instead of
+                    # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
+                    # more tasks on the same bad GPU. Break immediately to trigger restart and
+                    # terminate the pool before that worker processes further tasks (same as when
+                    # fault used to hang and timeout would eventually break).
+                    error_msg = f"\033[1;31m[GPU Fault]\033[0m Task {k} failed with {error_type}: {e}"
+                    print(error_msg, flush=True)
+                    failed_tasks.append((k, "accelerator error"))
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
+                    completed_this_round.append((k, async_result))
+                    pool_restart_needed = True
+                    break
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
-                    failed_tasks.append((k, "timeout"))
+                    failed_tasks.append((k, "unknown error"))
+
+                    # Always record a dummy result so reconstruction never sees an empty list
+                    # (previously only timeout path did this; async.get() failures left no result_dict[k]).
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
                     completed_this_round.append((k, async_result))
 
                 # Only log error once per error type
@@ -487,16 +512,18 @@ def mp_tuner(
         if pool_restart_needed and remaining_tasks:
             if verbose:
                 print(f"\n{'='*60}")
-                print("? Pool restart needed due to crash. Restarting pool...")
-                print(f"Remaining tasks: {len(remaining_tasks)}")
-                print(f"{'='*60}\n")
+                print(
+                    "? Pool restart needed due to crash. Restarting pool...", flush=True
+                )
+                print(f"Remaining tasks: {len(remaining_tasks)}", flush=True)
+                print(f"{'='*60}\n", flush=True)
 
             # Terminate old pool
             try:
                 pool.terminate()
                 pool.join()
             except Exception as e:
-                print(f"Warning: Error during pool termination: {e}")
+                print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
             pool = mp.Pool(processes=parallel_num)
 
@@ -518,7 +545,8 @@ def mp_tuner(
             # Reset pool restart flag
             pool_restart_needed = False
             print(
-                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n"
+                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n",
+                flush=True,
             )
 
         # Small sleep to avoid busy waiting
@@ -529,6 +557,11 @@ def mp_tuner(
     result = []
     for k in range(len(rets)):
         task_result = result_dict.get(k, [])
+        if not task_result:
+            # Defensive fallback: keep output cardinality stable even if a task result is missing.
+            dummy_results = []
+            add_dummy_result(k, dummy_results)
+            task_result = dummy_results if shape_grouped else [dummy_results[0]]
         if shape_grouped:
             result.extend(task_result)
         else:

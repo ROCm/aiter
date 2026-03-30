@@ -911,6 +911,12 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if not is_shuffled and not run_1stage:
+            logger.warning(
+                f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
+                "Tuned kernels are optimized for preshuffled weights (preshuffle_on). "
+                "Running with preshuffle_off may produce incorrect results."
+            )
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(

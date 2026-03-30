@@ -86,8 +86,8 @@ class FmoeTuner(TunerCommon):
 
             if hasattr(fmoe_module, "cfg_2stages"):
                 fmoe_module.cfg_2stages = None
-            if hasattr(fmoe_module, "_flydsl_fallback_cache"):
-                fmoe_module._flydsl_fallback_cache.clear()
+            if hasattr(fmoe_module, "get_2stage_cfgs"):
+                fmoe_module.get_2stage_cfgs.cache_clear()
         except ImportError:
             pass
 
@@ -2134,6 +2134,13 @@ class FmoeTuner(TunerCommon):
                 else:
                     w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
                     w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+
+                # Preshuffle weights to match production layout (tuner tunes with bpreshuffle=True)
+                w1_qt_fmoe = shuffle_weight(w1_qt, (16, 16))
+                w2_qt_fmoe = shuffle_weight(w2_qt, (16, 16))
+                w1_qt_fmoe.is_shuffled = True
+                w2_qt_fmoe.is_shuffled = True
+
                 score = torch.randn((token, expert), dtype=dtype, device="cuda")
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
                 if q_type == QuantType.per_1x128:
@@ -2156,8 +2163,8 @@ class FmoeTuner(TunerCommon):
                 out, us = run_perftest(
                     fused_moe,
                     a1_qt,
-                    w1_qt,
-                    w2_qt,
+                    w1_qt_fmoe,
+                    w2_qt_fmoe,
                     topk_weights,
                     topk_ids,
                     activation=act_type,

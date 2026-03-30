@@ -181,15 +181,19 @@ class TunerCommon:
         )
         self.parser.add_argument(
             "--run_config",
-            action="store_true",
-            required=False,
-            help="Run production operator benchmark for all shapes and exit (no tuning)",
+            nargs="?",
+            const=True,
+            default=False,
+            metavar="TUNED_CSV",
+            help="Run production operator benchmark and exit (no tuning). "
+            "If a tuned CSV path is given, read shapes and kernels from it; "
+            "otherwise read shapes from -i and run with default kernels.",
         )
         self.parser.add_argument(
             "--compare",
             action="store_true",
             required=False,
-            help="Run benchmark before and after tuning to compare performance improvement",
+            help="Run production-op benchmark before and after tuning to compare performance",
         )
 
     def parse_args(self):
@@ -473,18 +477,20 @@ class TunerCommon:
         to clear only their own caches."""
         pass
 
-    def _set_config_env_for_run_config(self, args):
-        """Set the config env var to point to the -o output file, clear caches,
-        and enable AITER_REBUILD so that post-tune run_config rebuilds with new configs.
+    def _set_config_env_for_run_config(self, args, config_file=None):
+        """Set the config env var to point to a tuned config file, clear caches,
+        and enable AITER_REBUILD so that run_config rebuilds with new configs.
+        *config_file* overrides the default (``-o`` / ``args.tune_file``).
         """
         defaults = self.get_arg_defaults()
         env_name = defaults.get("config_env_name")
         if not env_name:
-            return None
-        output_file = self.get_out_file(args.tune_file)
+            # Must return a 2-tuple: callers always unpack into old_val, old_rebuild.
+            return None, None
+        output_file = config_file if config_file else self.get_out_file(args.tune_file)
         old_val = os.environ.get(env_name)
         os.environ[env_name] = output_file
-        logger.info(f"Setting {env_name}={output_file} for post-tune benchmark")
+        logger.info(f"Setting {env_name}={output_file} for benchmark")
         # Clear operator-specific config caches
         self._clear_op_caches()
         # Enable AITER_REBUILD (level 2: rm .so only, keep build cache for faster rebuild)
@@ -520,39 +526,41 @@ class TunerCommon:
             pass
 
     def _print_benchmark_results(self, label, results):
-        """Print benchmark results in a table format."""
+        """Print benchmark results to stdout (not logger.info) so AITER_LOG_LEVEL=WARNING
+        does not hide --compare / --run_config tables."""
         if not results:
-            logger.info(f"{label}: no results")
+            print(f"{label}: no results", flush=True)
             return
-        logger.info(f"============= {label} Benchmark Results =============")
+        print(f"============= {label} Benchmark Results =============", flush=True)
         header = f"{'Shape':<40} | {'Time(us)':>10} | {'Status':>8}"
-        logger.info(header)
-        logger.info("-" * len(header))
+        print(header, flush=True)
+        print("-" * len(header), flush=True)
         for r in results:
             shape_str = r.get("shape", "unknown")
             us = r.get("us", -1)
             status = r.get("status", "unknown")
             us_str = f"{us:.2f}" if us > 0 else "N/A"
-            logger.info(f"{shape_str:<40} | {us_str:>10} | {status:>8}")
+            print(f"{shape_str:<40} | {us_str:>10} | {status:>8}", flush=True)
 
     def _print_comparison(self, pre_results, post_results):
-        """Print a comparison table between pre-tune and post-tune results."""
+        """Print comparison to stdout; see _print_benchmark_results for rationale."""
         if not pre_results or not post_results:
-            logger.info("Cannot print comparison: missing pre or post results")
+            print("Cannot print comparison: missing pre or post results", flush=True)
             return
         # Build lookup by shape
         post_map = {r["shape"]: r for r in post_results}
-        logger.info("============= Tune Performance Comparison =============")
+        print("============= Tune Performance Comparison =============", flush=True)
         header = f"{'Shape':<40} | {'Pre-tune(us)':>13} | {'Post-tune(us)':>14} | {'Speedup':>8} | {'Status':>8}"
-        logger.info(header)
-        logger.info("-" * len(header))
+        print(header, flush=True)
+        print("-" * len(header), flush=True)
         for pre in pre_results:
             shape = pre["shape"]
             post = post_map.get(shape)
             pre_us = pre.get("us", -1)
             if post is None:
-                logger.info(
-                    f"{shape:<40} | {pre_us:>13.2f} | {'N/A':>14} | {'N/A':>8} | {'MISS':>8}"
+                print(
+                    f"{shape:<40} | {pre_us:>13.2f} | {'N/A':>14} | {'N/A':>8} | {'MISS':>8}",
+                    flush=True,
                 )
                 continue
             post_us = post.get("us", -1)
@@ -565,14 +573,35 @@ class TunerCommon:
             status = "OK" if post_status == "ok" else "ERROR"
             pre_str = f"{pre_us:.2f}" if pre_us > 0 else "N/A"
             post_str = f"{post_us:.2f}" if post_us > 0 else "N/A"
-            logger.info(
-                f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status:>8}"
+            print(
+                f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status:>8}",
+                flush=True,
             )
 
     #
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
+
+        # Resolve --run_config: can be False, True (no file), or a file path string.
+        # Strict semantics:
+        #   --run_config <tuned_csv>  -> tuned kernels using that config file
+        #   --run_config              -> default kernels (no config env override)
+        run_config_file = args.run_config if isinstance(args.run_config, str) else None
+
+        # --run_config with tuned file: load shapes from the tuned CSV.
+        # --run_config without file: keep shapes from -i (pre_process), run default kernels.
+        # --compare: always use untuned shapes from -i (pre_process).
+        if args.run_config and run_config_file:
+            tunedf = self.get_tuned_gemm_list(run_config_file)
+            if not tunedf.empty and self.keys[0] in tunedf.columns:
+                cu = self.get_cu_num()
+                if "cu_num" in tunedf.columns:
+                    tunedf = tunedf[tunedf["cu_num"] == cu]
+                self.untunedf = (
+                    tunedf[self.keys].drop_duplicates().reset_index(drop=True)
+                )
+
         print(self.untunedf)
         output_file = self.get_out_file(args.tune_file)
         if args.verbose:
@@ -580,15 +609,37 @@ class TunerCommon:
 
         # --run_config: only run benchmark and exit (no tuning)
         if args.run_config:
-            logger.info("=== Running production operator benchmark ===")
-            results = self.run_config(args)
-            self._print_benchmark_results("Benchmark", results)
+            if self.untunedf.empty:
+                logger.info("No shapes to benchmark, nothing to run")
+                return pd.DataFrame()
+            if run_config_file:
+                defaults = self.get_arg_defaults()
+                env_name = defaults.get("config_env_name")
+                old_val, old_rebuild = self._set_config_env_for_run_config(
+                    args, config_file=run_config_file
+                )
+                try:
+                    print(
+                        "=== Running production operator benchmark (tuned) ===",
+                        flush=True,
+                    )
+                    results = self.run_config(args)
+                    self._print_benchmark_results("Benchmark (tuned)", results)
+                finally:
+                    self._restore_config_env(env_name, old_val, old_rebuild)
+            else:
+                print(
+                    "=== Running production operator benchmark (default) ===",
+                    flush=True,
+                )
+                results = self.run_config(args)
+                self._print_benchmark_results("Benchmark (default)", results)
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
 
         # --compare: pre-tune benchmark
         pre_tune_results = None
         if args.compare:
-            logger.info("=== Running pre-tune benchmark ===")
+            print("=== Running pre-tune benchmark ===", flush=True)
             pre_tune_results = self.run_config(args)
             self._print_benchmark_results("Pre-tune", pre_tune_results)
 
@@ -603,7 +654,10 @@ class TunerCommon:
                 env_name = defaults.get("config_env_name")
                 old_val, old_rebuild = self._set_config_env_for_run_config(args)
                 try:
-                    logger.info("=== Running post-tune benchmark (verification) ===")
+                    print(
+                        "=== Running post-tune benchmark (verification) ===",
+                        flush=True,
+                    )
                     post_tune_results = self.run_config(args)
                     self._print_benchmark_results("Post-tune", post_tune_results)
                     if pre_tune_results:
@@ -652,25 +706,38 @@ class TunerCommon:
             )
         finally:
             tune_exit = None
-            try:
-                self.tune_summary(tuning_status)
-            except SystemExit as e:
-                tune_exit = e
-            # --compare: post-tune benchmark + comparison
+            summary_exc = None
+            # Run post-tune before tune_summary so verification still runs if summary
+            # raises (e.g. astype/KeyError) or exits; those must not skip --compare.
             if args.compare:
                 defaults = self.get_arg_defaults()
                 env_name = defaults.get("config_env_name")
                 old_val, old_rebuild = self._set_config_env_for_run_config(args)
                 try:
-                    logger.info("=== Running post-tune benchmark (verification) ===")
+                    print(
+                        "=== Running post-tune benchmark (verification) ===",
+                        flush=True,
+                    )
                     post_tune_results = self.run_config(args)
                     self._print_benchmark_results("Post-tune", post_tune_results)
                     if pre_tune_results:
                         self._print_comparison(pre_tune_results, post_tune_results)
                 finally:
                     self._restore_config_env(env_name, old_val, old_rebuild)
+            try:
+                self.tune_summary(tuning_status)
+            except SystemExit as e:
+                tune_exit = e
+            except Exception as e:
+                summary_exc = e
+                logger.error(
+                    f"tune_summary failed (tuning may still have written results): {e}",
+                    exc_info=True,
+                )
             if tune_exit is not None:
                 raise tune_exit
+            if summary_exc is not None:
+                raise summary_exc
 
 
 class GemmCommonTuner(TunerCommon):
@@ -722,7 +789,7 @@ class GemmCommonTuner(TunerCommon):
                 if args.verbose:
                     logger.info("skiped tuned shapes:")
                     print(self.untunedf[mask])
-                self.untunedf = self.untunedf[~mask]
+                self.untunedf = self.untunedf[~mask].reset_index(drop=True)
 
     def calculate(self, results, bpes=(2, 2, 2)):
         """calculate TFLOPS and bandwidth"""
@@ -746,11 +813,15 @@ class GemmCommonTuner(TunerCommon):
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
-            kernelName = (
-                "None"
-                if time == self.INVALID_TIME or time == self.INF_TIME
-                else self.getKernelName(kernelId) if kernelName == "" else kernelName
-            )
+            # Resolve kernel name for both success and failure (profile CSV / debugging).
+            # Treat missing/NA like "" so we always look up CK kernel names; otherwise NaN
+            # would serialize as "Null" via na_rep in to_csv.
+            need_lookup = kernelName == "" or pd.isna(kernelName)
+            resolved = self.getKernelName(kernelId) if need_lookup else kernelName
+            if resolved is None or pd.isna(resolved):
+                kernelName = "None"
+            else:
+                kernelName = str(resolved)
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
 

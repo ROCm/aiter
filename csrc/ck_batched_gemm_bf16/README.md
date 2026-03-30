@@ -106,6 +106,36 @@ If you have built batched_gemm_bf16 kernels before tuning new GEMM shapes, pleas
 --all
 ```
 
+#### `--run_config [TUNED_CSV]`
+- **Type**: Optional argument
+- **Default**: disabled
+- **Description**: Run production-operator benchmark only and exit (no tuning).
+  - `--run_config /path/to/tuned.csv`: read shapes from that tuned CSV and run tuned kernels from that file.
+  - `--run_config` (no path): read shapes from `-i/--untune_file` and run default kernels.
+
+**Examples**:
+```bash
+# benchmark tuned kernels from specified tuned config
+python3 csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py \
+  --run_config aiter/configs/bf16_tuned_batched_gemm.csv
+
+# benchmark default kernels using shapes from -i
+python3 csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py \
+  -i aiter/configs/bf16_untuned_batched_gemm.csv --run_config
+```
+
+#### `--compare`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Run pre-tune and post-tune production benchmark to report speedup.
+  - Pre-tune reads shapes from `-i/--untune_file`.
+  - Post-tune uses configs written to `-o/--tune_file`.
+
+**Example**:
+```bash
+--compare
+```
+
 ### Profiling Configuration
 
 #### `--warmup`
