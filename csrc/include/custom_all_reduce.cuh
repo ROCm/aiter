@@ -2575,7 +2575,9 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             sg_, residual_inp, residual_out, output, weight, eps, rank_, m, n); \
     } while(0)
 
-    if(n_bytes % 1024 == 0)
+    // Support GPT-OSS (e.g. 120B) hidden_size=2880: n_bytes=5760 not multiple of 1024.
+    // Require 16-byte alignment (pack_size alignment for vectorized load).
+    if(n_bytes % 16 == 0)
     {
         if(8192 <= n_bytes && n_bytes <= 32768)
         {
@@ -2631,7 +2633,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                 launch_fused_allreduce_rmsnorm((local_device_load_rmsnorm<T, 256, 2>));
             }
         }
-        else if(1024 <= n_bytes && n_bytes < 4096)
+        else if(1024 <= n_bytes && n_bytes < 4096 && n_bytes % 1024 == 0)
         {
             block.x             = 256;
             int naive_grid_size = (m + 3) / 4;
@@ -2724,6 +2726,7 @@ void dispatchFusedAllReduceRMSNormQuant(hipStream_t stream,
         {                                                                                    \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 4096, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 2048, allreduce_fusion_kernel_split_launcher)  \
+            DISPATCH_AR_FUSION_KERNEL_(NGPUS, 2880, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 1024, allreduce_fusion_kernel_split_launcher)  \
             DISPATCH_AR_FUSION_KERNEL_(NGPUS, 512, allreduce_fusion_kernel_split_launcher)   \
         default: printf("fused allreduce rmsnorm quant N-dim error\n");                      \
