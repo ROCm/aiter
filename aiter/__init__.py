@@ -96,6 +96,7 @@ else:
         from .ops.sample import *  # noqa: F403,E402
         from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
         from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
+        from .ops.fused_qk_rmsnorm_group_quant import *  # noqa: F403,E402
         from .ops.groupnorm import *  # noqa: F403,E402
         from .ops.mhc import *  # noqa: F403,E402
         from .ops.causal_conv1d import *  # noqa: F403,E402
