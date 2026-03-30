@@ -345,7 +345,9 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     int stride_Q       = Q->stride(0) * Q->element_size();
     int stride_KV_head = K->stride(1) * K->element_size();
     int stride_KV_blk  = K->stride(0) * K->element_size();
-    int stride_scale_blk = block_size * sizeof(float);
+    int stride_scale_blk = (K_QScale != nullptr)
+                               ? (K_QScale->stride(0) * K_QScale->element_size())
+                               : (block_size * sizeof(float));
     float k_log2e      = f_log2E;
     float k_scalar     = sqrt(dim);
     k_scalar           = (float)((double)k_log2e / (double)k_scalar);
