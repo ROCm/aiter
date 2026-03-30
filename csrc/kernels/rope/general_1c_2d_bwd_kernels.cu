@@ -30,7 +30,7 @@ void rope_2d_bwd_impl(
     const int stride_i_h = input_grads.stride(2);
     const int stride_i_d = input_grads.stride(3);
 
-    TORCH_CHECK(size_s == img_height * img_width, "rope_2d_fwd_impl - input tensor shape doesn't match image size.");
+    TORCH_CHECK(size_s == img_height * img_width, "rope_2d_bwd_impl - input tensor shape doesn't match image size.");
     TORCH_CHECK(stride_i_d == 1 && stride_o_d == 1,
                 "rope_2d_bwd_impl requires all stride_d to be 1");
 
