@@ -64,4 +64,15 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
                   torch::Tensor topk_indices,   // [tokens, topk]
                   torch::Tensor gating_output); // [tokens, experts]
 
+void topk_softmax_decode(torch::Tensor gating_output,      // [1, E]
+                         torch::Tensor sorted_token_ids,    // [max_num_tokens_padded]
+                         torch::Tensor sorted_weights,      // [max_num_tokens_padded]
+                         torch::Tensor sorted_expert_ids,   // [max_num_m_blocks]
+                         torch::Tensor num_valid_ids,       // [2]
+                         torch::Tensor moe_buf,             // [1, model_dim]
+                         int num_experts,
+                         int topk,
+                         int unit_size,
+                         bool renormalize);
+
 } // namespace aiter

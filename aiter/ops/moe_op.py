@@ -40,6 +40,21 @@ def topk_sigmoid(
 ) -> None: ...
 
 
+@compile_ops("module_topk_softmax_decode")
+def topk_softmax_decode(
+    gating_output: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    moe_buf: Tensor,
+    num_experts: int,
+    topk: int,
+    unit_size: int,
+    renormalize: bool,
+) -> None: ...
+
+
 @compile_ops("module_moe_asm")
 def moe_sum(input: Tensor, output: Tensor) -> None: ...
 
