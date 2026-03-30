@@ -114,7 +114,12 @@ def use_2d_kernel(
 def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
                                seqused_k, softmax_scale, window_size,
                                block_table, softcap, alibi_slopes, sinks):
-    """Route decode to CK unified attention if supported. Returns True if handled."""
+    """Route decode to CK unified attention when CK is faster than Triton.
+
+    CK 2D wins on medium-to-large batch decode (num_seqs >= 64) where it has
+    enough GPU occupancy without split-K. For low-batch (num_seqs < 64),
+    Triton 3D (split-K) is faster due to KV-parallel scheduling.
+    """
     if max_seqlen_q != 1:
         return False
     if window_size != (-1, -1):
@@ -129,14 +134,17 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
 
-    # CK only has instances for d64/GQA-8 and d128/MHA
     if not ((head_size == 64 and num_queries_per_kv == 8) or
             (head_size == 128 and num_queries_per_kv == 1)):
         return False
 
     block_size = k.shape[1]
-    min_block_size = 32
-    if block_size < min_block_size:
+    if block_size < 32:
+        return False
+
+    num_seqs = len(seqused_k)
+    num_2d_prgms = num_kv_heads * num_seqs
+    if num_2d_prgms < 256 * 4:
         return False
 
     try:
@@ -177,6 +185,11 @@ def unified_attention(
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
+
+    if _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
+                                  seqused_k, softmax_scale, window_size,
+                                  block_table, softcap, alibi_slopes, sinks):
+        return
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"

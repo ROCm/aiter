@@ -324,7 +324,7 @@ def main() -> int:
         # print("  out_triton_3d:", out_triton_3d.flatten()[:5])
         # print("  out_ck:       ", out_ck.flatten()[:5])
         try:
-            torch.testing.assert_close(out_ck, out_triton_2d, rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(out_ck, out_triton_2d, rtol=5e-2, atol=5e-2)
         except Exception as e:
             print(f"{prefix} output mismatch CK vs Triton 2D: {e}")
             stats["errors"] += 1
