@@ -101,8 +101,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi355-1
-            label: MI355
+          - runner: linux-aiter-mi35x-1
+            label: MI35X
           - runner: aiter-gfx1100
             label: RDNA3
             optional: true
@@ -278,7 +278,7 @@ jobs:
     # if: ${{ needs.prechecks.outputs.run_ck == 'true' }}
     name: Flash Attention - CK (1 GPU)
     needs: [check-signal, prechecks]
-    runs-on: linux-aiter-mi355-1
+    runs-on: linux-aiter-mi35x-1
 
     steps:
       - name: Checkout aiter repo
