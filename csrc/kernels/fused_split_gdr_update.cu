@@ -200,6 +200,7 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
 
         __syncthreads();
 
+        // Phase 1: Pipelined K-L2-norm + Delta dot
         float4 k_cache[BK4_QTR];
         float k_inv_norm = 1.0f;
         float dot_partial;
@@ -252,6 +253,7 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
         v_local -= dot_partial * exp_g * k_inv_norm;
         v_local *= beta;
 
+        // Phase 2: Fused Decay + State update (reuse cached K, no LDS re-read)
         {
             const float kv = k_inv_norm * v_local;
 #pragma unroll
@@ -263,6 +265,7 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
             }
         }
 
+        // Phase 3: Pipelined Q-L2-norm + Output dot (Q already in smem_q)
         {
             float out_partial = 0.0f;
             float q_sq = 0.0f;
