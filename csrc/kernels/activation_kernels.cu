@@ -11,7 +11,6 @@
 #include "ck_tile/core.hpp"
 #include "ck_tile/ops/elementwise/unary_element_wise_operation.hpp"
 #include "dispatch_utils.h"
-#include "aiter_hip_common.h"
 #include "py_itfs_common.h"
 #include "vec_convert.h"
 #include <hip/hip_bf16.h>

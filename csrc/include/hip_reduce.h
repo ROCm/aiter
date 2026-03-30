@@ -196,8 +196,8 @@ template <typename T, typename F, int BlockSize, bool waveBroadcast = true>
 __device__ constexpr T block_reduce(T local, F reduce_op)
 {
     // static_assert(BlockSize <= 256, "BlockSize > 256 is not supported");
-    static constexpr int waves = BlockSize / WARP_SIZE;
-    const int wave_size        = WARP_SIZE;
+    static constexpr int waves     = BlockSize / WARP_SIZE;
+    static constexpr int wave_size = WARP_SIZE;
     if constexpr(BlockSize == wave_size)
     {
         local = wave_reduce<T, F, WARP_SIZE, waveBroadcast>(local, reduce_op);

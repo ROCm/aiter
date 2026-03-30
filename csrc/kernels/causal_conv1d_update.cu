@@ -24,7 +24,6 @@
 #include "aiter_hip_common.h"
 #include "ck_tile/core.hpp"
 #include "dispatch_utils.h"
-#include "aiter_hip_common.h"
 #include "py_itfs_common.h"
 
 // Helper macros

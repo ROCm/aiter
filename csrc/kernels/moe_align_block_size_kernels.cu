@@ -22,7 +22,6 @@
 
 #include "aiter_hip_common.h"
 #include "dispatch_utils.h"
-#include "aiter_hip_common.h"
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
