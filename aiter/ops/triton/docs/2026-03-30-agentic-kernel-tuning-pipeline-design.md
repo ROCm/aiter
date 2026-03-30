@@ -529,9 +529,9 @@ The mapping from kernel name to VARIANT prefix:
 
 **Notes on batched/fused kernels:**
 - Batched kernels have a B (batch) dimension in addition to M, N, K. Shape format is (B, N, K) not (M, N, K).
-- Some fused kernels only have gfx942 configs — gfx950 configs may need to be created from scratch.
+- Feed-forward and fused kernels currently only have gfx942 config files. They work on gfx950 but need new gfx950-prefixed config files created via tuning. The Discovery Agent should flag these as needing new configs.
 - The Script Creator Agent must handle these different shape formats and config patterns.
-- Feed-forward kernels may use different bench scripts (`bench_ff_*.py` vs `bench_gemm_*.py`).
+- Feed-forward kernels use different bench scripts (`bench_ff_*.py` vs `bench_gemm_*.py`).
 
 - **Fallback config**: `gfx950-GEMM-A8W8.json` (no N,K suffix) — used when no suffixed config matches
 - **Suffixed config**: `gfx950-GEMM-A8W8-N=128-K=2048.json` — used for specific N,K pairs
