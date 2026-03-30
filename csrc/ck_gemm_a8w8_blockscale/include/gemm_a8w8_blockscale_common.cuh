@@ -124,7 +124,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
                                                         torch::Tensor& WQ,
                                                         torch::Tensor& x_scale,
                                                         torch::Tensor& w_scale,
-                                                        torch::Tensor& Y)
+                                                        torch::Tensor& Y,
+                                                        int KBatch = 1)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);
@@ -159,6 +160,11 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
                                              a_element_op,
                                              b_element_op,
                                              cde_element_op);
+
+    if(KBatch > 1)
+    {
+        device_gemm.SetKBatch(&argument, KBatch);
+    }
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 

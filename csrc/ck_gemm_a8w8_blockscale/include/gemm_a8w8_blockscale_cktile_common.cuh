@@ -226,11 +226,6 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         const dim3 grids  = Kernel::GridSize(args.M, args.N, args.k_batch);
         const dim3 blocks = Kernel::BlockSize();
 
-        if(args.k_batch != 1)
-        {
-            throw std::runtime_error("split-k is not supported yet!");
-        }
-
         if(!Kernel::IsSupportedArgument(kargs))
         {
             throw std::runtime_error("Wrong! Arguments not supported! Skipping gemm!\n");
@@ -275,7 +270,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
                                                                torch::Tensor& x_scale,
                                                                torch::Tensor& w_scale,
                                                                torch::Tensor& Y,
-                                                               bool PreshuffleB)
+                                                               bool PreshuffleB,
+                                                               int k_batch = 1)
 {
     // check
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
@@ -329,8 +325,7 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.bq_ptr = w_scale.data_ptr();
     args.c_ptr  = Y.data_ptr();
 
-    // split-k is not supported yet for tile quant gemm, set k_batch to 1
-    args.k_batch = 1;
+    args.k_batch = k_batch;
     args.M       = M;
     args.N       = N;
     args.K       = K;
@@ -357,6 +352,15 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.stride_C  = stride_C;
     args.stride_AQ = stride_AQ;
     args.stride_BQ = stride_BQ;
+
+    // Split-K uses atomic_add into C; zero the output buffer first.
+    if(k_batch > 1)
+    {
+        hipMemsetAsync(Y.data_ptr(),
+                       0,
+                       M * N * sizeof(OutDataType),
+                       at::hip::getCurrentHIPStream());
+    }
 
     // do tile GEMM
     if(PreshuffleB)
