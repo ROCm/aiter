@@ -237,7 +237,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         }
         using k_attr_t = ck_tile::kernel_attr<eight_waves>;
         ck_tile::launch_kernel(
-            ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
+            ck_tile::stream_config{at::hip::getCurrentHIPStream() /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
             ck_tile::make_kernel<GemmConfig::BlockPerCu_v, k_attr_t>(
                 Kernel{}, grids, blocks, 0, kargs));
     };
