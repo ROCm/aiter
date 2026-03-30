@@ -85,15 +85,26 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
+    waves_per_eu = 2
     if shuffled_kv_cache:
         if kv_cache_dtype == torch.bfloat16 and block_size == 64:
-            attn_warps = 1
+            if num_2d_prgms >= 256:
+                attn_warps = 1
+                waves_per_eu = 2
+            else:
+                attn_warps = 2
+                waves_per_eu = 1
         if (
             q_dtype == torch.bfloat16
             and kv_cache_dtype == e4m3_dtype
             and block_size == 128
         ):
-            attn_warps = 1
+            if num_2d_prgms >= 256:
+                attn_warps = 1
+                waves_per_eu = 2
+            else:
+                attn_warps = 2
+                waves_per_eu = 1
 
         assert (
             block_size >= 64
@@ -113,18 +124,17 @@ def select_3d_config(
         reduce_num_warps = 1
 
     attn_stages = 2
-
-    total_num_wg = num_2d_prgms * num_segments
-    waves_per_eu = 2
     occ = waves_per_eu * 4 // attn_warps
 
-    if total_num_wg < occ * target_num_prgms:
-        # occ too high, increase attn_warps to relax occ
-        attn_warps = (waves_per_eu * 4) // max(
-            1, triton.next_power_of_2(total_num_wg // target_num_prgms)
-        )
-        attn_warps = max(attn_warps, 1)
-        attn_warps = min(attn_warps, 4)
+    # # this section increases the num_warps if the occ is too high
+    # total_num_wg = num_2d_prgms * num_segments
+    # if total_num_wg < occ * target_num_prgms:
+    #     # occ too high, increase attn_warps to relax occ
+    #     attn_warps = (waves_per_eu * 4) // max(
+    #         1, triton.next_power_of_2(total_num_wg // target_num_prgms)
+    #     )
+    #     attn_warps = max(attn_warps, 1)
+    #     attn_warps = min(attn_warps, 4)
 
     if (
         2 * attn_stages * TILE_SIZE * head_size * kv_cache_dtype.itemsize * occ
@@ -135,16 +145,16 @@ def select_3d_config(
     attn_config = {
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "num_stages": attn_stages,
         "waves_per_eu": waves_per_eu,
+        "num_stages": attn_stages,
     }
 
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
-        "num_stages": 1,
         "waves_per_eu": 2,
+        "num_stages": 1,
     }
 
     return attn_config, reduce_config
@@ -476,3 +486,5 @@ def unified_attention(
             USE_FP8=output_scale is not None,
             **reduce_config,
         )
+
+        return out

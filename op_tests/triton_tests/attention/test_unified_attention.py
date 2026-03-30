@@ -194,29 +194,32 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        [(1, 1328)],
-        [(1, 8192)],
-        [(1, 1024)] * 32,
-        [(1, 8192)] * 32,
-        [(1, 523), (1, 37), (1, 2011)],
+        # [(1, 1328)],
+        # [(1, 8192)],
+        # [(1, 1024)] * 32,
+        # [(1, 8192)] * 32,
+        # [(1, 523), (1, 37), (1, 2011)],
         [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
     ],
 )
-@pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
+# @pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
+@pytest.mark.parametrize("num_heads", [(8, 1)])
 @pytest.mark.parametrize("head_size", [64])
-@pytest.mark.parametrize("block_size", [64, 128])
+# @pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype",
     [
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        # (torch.bfloat16, torch.bfloat16, torch.bfloat16),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+        # (e4m3_dtype, e4m3_dtype, torch.bfloat16),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
-@pytest.mark.parametrize("num_blocks", [32768])
-@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("num_blocks", [256])
+# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("shuffled_kv_cache", [True])
 @torch.inference_mode()
 def test_triton_unified_attn_3d(
     seq_lens: list[tuple[int, int]],

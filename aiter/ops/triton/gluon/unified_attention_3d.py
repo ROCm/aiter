@@ -997,9 +997,7 @@ class AttentionProgram:
         return S
 
     @gluon.jit
-    def apply_mask_qk_3D(self, S, seq_offset, alibi_slope, qq_bias_row_ptrs):
-        seq_mask = seq_offset[None, :] < self.context_len + self.query_pos_qk + 1
-        S = gl.where(self.query_mask_qk & seq_mask, S, float("-inf"))
+    def apply_addtional_mask_qk(self, S, seq_offset, alibi_slope, qq_bias_row_ptrs):
         if self.cfg.SLIDING_WINDOW > 0:
             S = gl.where(
                 (self.context_len + self.query_pos_qk - seq_offset)
@@ -1029,26 +1027,6 @@ class AttentionProgram:
             # prescale w. RCP_LN2 for later exp2
             S += qq_bias * self.cfg.RCP_LN2
 
-        return S
-
-    @gluon.jit
-    def apply_mask_qk(self, S, j):
-        seq_offset = (
-            j * self.cfg.TILE_SIZE
-            + gl.arange(
-                0,
-                self.cfg.TILE_SIZE,
-                layout=gl.SliceLayout(0, self.cfg.QK_WMMA_LAYOUT),
-            )[None, :]
-        )
-
-        seq_mask = seq_offset <= self.context_len_q_pos_qk
-        if self.cfg.SLIDING_WINDOW > 0:
-            seq_mask = seq_mask & (
-                (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
-            )
-        full_mask = seq_mask
-        S = gl.where(full_mask, S, float("-inf"))
         return S
 
     @gluon.jit
@@ -1558,9 +1536,13 @@ def _unified_attention_gluon_kernel_3d(
 
     j_hbm: gl.int32 = segm_idx * tiles_per_segment
     buffer_id: gl.int32 = 0
-    seq_offset = j_hbm * cfg.TILE_SIZE + gl.arange(
-        0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
+    need_addtional_mask: gl.constexpr = (
+        cfg.SLIDING_WINDOW > 0 or cfg.USE_ALIBI_SLOPES or cfg.USE_QQ_BIAS
     )
+    if need_addtional_mask:
+        seq_offset = j_hbm * cfg.TILE_SIZE + gl.arange(
+            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
+        )
 
     for _ in range(cfg.NUM_STAGES - 1):
         j_hbm, physical_block_idx = pgm.load_physical_block_idx(
@@ -1587,10 +1569,12 @@ def _unified_attention_gluon_kernel_3d(
         S = S * qk_factor
 
         S = pgm.apply_softcap(S)
-        S = pgm.apply_mask_qk_3D(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
-        # if j >= pgm.safe_tile_end or SLIDING_WINDOW > 0:
-        #     S = pgm.apply_mask_qk(S, j)
-
+        S = gl.where(query_mask_qk, S, float("-inf"))
+        if need_addtional_mask:
+            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            S = pgm.apply_addtional_mask_qk(
+                S, seq_offset, alibi_slope, qq_bias_row_ptrs
+            )
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
@@ -1600,8 +1584,12 @@ def _unified_attention_gluon_kernel_3d(
         acc = pgm.compute_pv(p, v, acc)
 
         buffer_id = next_buffer_id
-        seq_offset += cfg.TILE_SIZE
+        if need_addtional_mask:
+            seq_offset += cfg.TILE_SIZE
 
+    seq_offset = (pgm.tile_end - (cfg.NUM_STAGES - 1)) * cfg.TILE_SIZE + gl.arange(
+        0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
+    )
     for _ in range(cfg.NUM_STAGES - 1):
         # Load k_i, v_i from shared into registers
         k = pgm.tdm_shared_load_k(
@@ -1612,24 +1600,25 @@ def _unified_attention_gluon_kernel_3d(
         S = S * qk_factor
 
         S = pgm.apply_softcap(S)
-        S = pgm.apply_mask_qk_3D(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
-        # S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
-
+        seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+        S = gl.where(query_mask_qk & seq_mask, S, float("-inf"))
+        if need_addtional_mask:
+            S = pgm.apply_addtional_mask_qk(
+                S, seq_offset, alibi_slope, qq_bias_row_ptrs
+            )
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+
         v = pgm.tdm_shared_load_v(
             wait_count=(cfg.NUM_STAGES - 2) * 2, buffer_id=buffer_id
         )
         acc = pgm.compute_pv(p, v, acc)
 
-        seq_offset += cfg.TILE_SIZE
+        if cfg.NUM_STAGES > 2:
+            seq_offset += cfg.TILE_SIZE
 
     if v_scale_ptr is not None:
         acc = acc * v_scale
-
-    # Normalize and store output, this is done in reduce kernel for 3D
-    # l_recip = 1 / L[:, None]
-    # acc = acc * l_recip
 
     pgm.store_output_3D(
         acc,
