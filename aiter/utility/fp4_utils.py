@@ -569,8 +569,11 @@ def moe_mxfp4_sort(
         TOPK=topk,
     )
 
-    # Reshape output to block-aligned N dimension.
-    # The sort kernel stores data in BLOCK_SIZE_N=8-wide blocks, so the
-    # view's column count must be 8-aligned for correct strides.
+    # The sort kernel stores data in BLOCK_SIZE_N=8-wide blocks.  Reshape via
+    # the block-aligned column count, then slice back to the actual N_o so the
+    # CK tile GEMM kernel sees the correct scale stride (K/32 columns).
     N_o_aligned = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
-    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o_aligned)
+    scale_out = blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o_aligned)
+    if N_o_aligned != N_o:
+        scale_out = scale_out[:, :N_o].contiguous()
+    return scale_out
