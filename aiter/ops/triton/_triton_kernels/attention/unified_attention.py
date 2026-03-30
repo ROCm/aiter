@@ -4,6 +4,9 @@ import triton
 import triton.language as tl
 import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
+    compute_block_masking,
+)
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -120,6 +123,489 @@ def qk_dot(
         return tl.dot_scaled(Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True)
     else:
         return qk_scale * tl.dot(Q, K)
+
+
+@triton.jit
+def _tile_loop_mask(
+    acc,
+    L,
+    M,
+    tile_range_start,
+    tile_range_end,
+    query_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    k_scale,
+    block_tables_ptr,
+    block_table_offset,
+    base_offset_thd,
+    Q,
+    Q_rope,
+    q_scale_loaded,
+    q_rope_scale_loaded,
+    offs_t,
+    offs_d_qk,
+    offs_d_scale,
+    offs_dv,
+    offs_rope,
+    offs_rope_scale,
+    dim_mask_qk,
+    dim_mask_v,
+    scale_dim_mask,
+    rope_dim_mask,
+    rope_scale_dim_mask,
+    query_pos,
+    query_mask_0,
+    query_mask_1,
+    kv_head_idx,
+    context_len,
+    seq_len,
+    max_seq_prefix_len,
+    qk_scale,
+    alibi_slope,
+    qq_bias_row_ptrs,
+    alibi_slopes_ptr,
+    qq_bias_ptr,
+    sink_ptr,
+    softcap,
+    qq_bias_stride_0,
+    stride_k_cache_0,
+    stride_k_cache_1,
+    stride_k_cache_2,
+    stride_k_cache_3: tl.constexpr,
+    stride_v_cache_0,
+    stride_v_cache_1,
+    stride_v_cache_2,
+    stride_v_cache_3: tl.constexpr,
+    stride_k_cache_scale_0,
+    stride_k_cache_scale_1,
+    stride_k_cache_scale_2,
+    stride_k_cache_scale_3,
+    RCP_LN2,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HEAD_SIZE_V_PADDED: tl.constexpr,
+    USE_ALIBI_SLOPES: tl.constexpr,
+    USE_QQ_BIAS: tl.constexpr,
+    USE_SOFTCAP: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SAGE_MXFP4: tl.constexpr,
+    PRELOAD_V: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+    ROPE_SIZE_PADDED: tl.constexpr,
+    KV_LAYOUT_IS_THD: tl.constexpr,
+    KV_cache_modifier: tl.constexpr,
+):
+    for j in range(tile_range_start, tile_range_end):
+        seq_offset = j * TILE_SIZE + offs_t
+        if TILE_SIZE == BLOCK_SIZE:
+            tile_mask = tl.full((1,), 1, dtype=tl.int1)
+        else:
+            tile_mask = seq_offset < max_seq_prefix_len
+
+        if not KV_LAYOUT_IS_THD:
+            base_offset = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+        else:
+            base_offset = base_offset_thd
+
+        K = kv_load(
+            key_cache_ptr,
+            base_offset[None, :],
+            kv_head_idx,
+            offs_d_qk[:, None],
+            seq_offset[None, :],
+            stride_k_cache_0,
+            stride_k_cache_1,
+            stride_k_cache_2,
+            stride_k_cache_3,
+            dim_mask_qk[:, None],
+            tile_mask[None, :],
+            BLOCK_SIZE,
+            KV_cache_modifier,
+        )
+
+        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+
+        k_scale_loaded = None
+        if SAGE_MXFP4:
+            k_scale_loaded = kv_load(
+                k_scale,
+                base_offset[:, None],
+                kv_head_idx,
+                offs_d_scale[None, :],
+                seq_offset[:, None],
+                stride_k_cache_scale_0,
+                stride_k_cache_scale_1,
+                stride_k_cache_scale_2,
+                stride_k_cache_scale_3,
+                scale_dim_mask[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                "",
+            )
+
+        K = K.to(Q.dtype)
+
+        if HAS_ROPE:
+            K_rope = kv_load(
+                key_cache_ptr,
+                base_offset[None, :],
+                kv_head_idx,
+                offs_rope[:, None],
+                seq_offset[None, :],
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                rope_dim_mask[:, None],
+                tile_mask[None, :],
+                BLOCK_SIZE,
+                "",
+            )
+            if SAGE_MXFP4:
+                k_rope_scale_loaded = kv_load(
+                    k_scale,
+                    base_offset[:, None],
+                    kv_head_idx,
+                    offs_rope_scale[None, :],
+                    seq_offset[:, None],
+                    stride_k_cache_scale_0,
+                    stride_k_cache_scale_1,
+                    stride_k_cache_scale_2,
+                    stride_k_cache_scale_3,
+                    rope_scale_dim_mask[None, :],
+                    tile_mask[:, None],
+                    BLOCK_SIZE,
+                    "",
+                )
+                S += tl.dot_scaled(
+                    Q_rope,
+                    q_rope_scale_loaded,
+                    "e2m1",
+                    K_rope,
+                    k_rope_scale_loaded,
+                    "e2m1",
+                    fast_math=True,
+                )
+            else:
+                S += qk_scale * tl.dot(Q_rope, K_rope)
+
+        if PRELOAD_V:
+            V = kv_load(
+                value_cache_ptr,
+                base_offset[:, None],
+                kv_head_idx,
+                offs_dv[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask_v[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
+            )
+
+        S += qk_dot(Q, K, qk_scale, q_scale_loaded, k_scale_loaded, SAGE_MXFP4)
+
+        if USE_SOFTCAP:
+            S = apply_softcap(S, softcap) * RCP_LN2
+
+        if IS_CAUSAL or SLIDING_WINDOW > 0:
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
+
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
+
+        if SLIDING_WINDOW > 0:
+            S = tl.where(
+                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                S,
+                float("-inf"),
+            )
+
+        if USE_ALIBI_SLOPES:
+            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
+
+        if USE_QQ_BIAS:
+            key_rel_pos = seq_offset - context_len
+            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+            qq_bias = tl.load(
+                qq_bias_row_ptrs + key_rel_pos[None, :],
+                mask=is_query_key[None, :],
+                other=0.0,
+            )
+            S += qq_bias * RCP_LN2
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+
+        P = tl.math.exp2(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.math.exp2(M - m_j)
+        acc = acc * alpha[:, None]
+
+        if not PRELOAD_V:
+            V = kv_load(
+                value_cache_ptr,
+                base_offset[:, None],
+                kv_head_idx,
+                offs_dv[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask_v[None, :],
+                tile_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
+            )
+
+        L = L * alpha + l_j
+        M = m_j
+        acc += tl.dot(P.to(V.dtype), V)
+
+    return acc, L, M
+
+
+@triton.jit
+def _tile_loop_no_mask(
+    acc,
+    L,
+    M,
+    tile_range_start,
+    tile_range_end,
+    query_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    k_scale,
+    block_tables_ptr,
+    block_table_offset,
+    base_offset_thd,
+    Q,
+    Q_rope,
+    q_scale_loaded,
+    q_rope_scale_loaded,
+    offs_t,
+    offs_d_qk,
+    offs_d_scale,
+    offs_dv,
+    offs_rope,
+    offs_rope_scale,
+    dim_mask_qk,
+    dim_mask_v,
+    scale_dim_mask,
+    rope_dim_mask,
+    rope_scale_dim_mask,
+    query_pos,
+    query_mask_0,
+    query_mask_1,
+    kv_head_idx,
+    context_len,
+    seq_len,
+    max_seq_prefix_len,
+    qk_scale,
+    alibi_slope,
+    qq_bias_row_ptrs,
+    alibi_slopes_ptr,
+    qq_bias_ptr,
+    sink_ptr,
+    softcap,
+    qq_bias_stride_0,
+    stride_k_cache_0,
+    stride_k_cache_1,
+    stride_k_cache_2,
+    stride_k_cache_3: tl.constexpr,
+    stride_v_cache_0,
+    stride_v_cache_1,
+    stride_v_cache_2,
+    stride_v_cache_3: tl.constexpr,
+    stride_k_cache_scale_0,
+    stride_k_cache_scale_1,
+    stride_k_cache_scale_2,
+    stride_k_cache_scale_3,
+    RCP_LN2,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HEAD_SIZE_V_PADDED: tl.constexpr,
+    USE_ALIBI_SLOPES: tl.constexpr,
+    USE_QQ_BIAS: tl.constexpr,
+    USE_SOFTCAP: tl.constexpr,
+    SAGE_MXFP4: tl.constexpr,
+    PRELOAD_V: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+    ROPE_SIZE_PADDED: tl.constexpr,
+    KV_LAYOUT_IS_THD: tl.constexpr,
+    KV_cache_modifier: tl.constexpr,
+):
+    no_mask = tl.full((1,), 1, dtype=tl.int1)
+
+    for j in range(tile_range_start, tile_range_end):
+        seq_offset = j * TILE_SIZE + offs_t
+
+        if not KV_LAYOUT_IS_THD:
+            base_offset = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
+        else:
+            base_offset = base_offset_thd
+
+        K = kv_load(
+            key_cache_ptr,
+            base_offset[None, :],
+            kv_head_idx,
+            offs_d_qk[:, None],
+            seq_offset[None, :],
+            stride_k_cache_0,
+            stride_k_cache_1,
+            stride_k_cache_2,
+            stride_k_cache_3,
+            dim_mask_qk[:, None],
+            no_mask[None, :],
+            BLOCK_SIZE,
+            KV_cache_modifier,
+        )
+
+        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+
+        k_scale_loaded = None
+        if SAGE_MXFP4:
+            k_scale_loaded = kv_load(
+                k_scale,
+                base_offset[:, None],
+                kv_head_idx,
+                offs_d_scale[None, :],
+                seq_offset[:, None],
+                stride_k_cache_scale_0,
+                stride_k_cache_scale_1,
+                stride_k_cache_scale_2,
+                stride_k_cache_scale_3,
+                scale_dim_mask[None, :],
+                no_mask[:, None],
+                BLOCK_SIZE,
+                "",
+            )
+
+        K = K.to(Q.dtype)
+
+        if HAS_ROPE:
+            K_rope = kv_load(
+                key_cache_ptr,
+                base_offset[None, :],
+                kv_head_idx,
+                offs_rope[:, None],
+                seq_offset[None, :],
+                stride_k_cache_0,
+                stride_k_cache_1,
+                stride_k_cache_2,
+                stride_k_cache_3,
+                rope_dim_mask[:, None],
+                no_mask[None, :],
+                BLOCK_SIZE,
+                "",
+            )
+            if SAGE_MXFP4:
+                k_rope_scale_loaded = kv_load(
+                    k_scale,
+                    base_offset[:, None],
+                    kv_head_idx,
+                    offs_rope_scale[None, :],
+                    seq_offset[:, None],
+                    stride_k_cache_scale_0,
+                    stride_k_cache_scale_1,
+                    stride_k_cache_scale_2,
+                    stride_k_cache_scale_3,
+                    rope_scale_dim_mask[None, :],
+                    no_mask[:, None],
+                    BLOCK_SIZE,
+                    "",
+                )
+                S += tl.dot_scaled(
+                    Q_rope,
+                    q_rope_scale_loaded,
+                    "e2m1",
+                    K_rope,
+                    k_rope_scale_loaded,
+                    "e2m1",
+                    fast_math=True,
+                )
+            else:
+                S += qk_scale * tl.dot(Q_rope, K_rope)
+
+        if PRELOAD_V:
+            V = kv_load(
+                value_cache_ptr,
+                base_offset[:, None],
+                kv_head_idx,
+                offs_dv[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask_v[None, :],
+                no_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
+            )
+
+        S += qk_dot(Q, K, qk_scale, q_scale_loaded, k_scale_loaded, SAGE_MXFP4)
+
+        if USE_SOFTCAP:
+            S = apply_softcap(S, softcap) * RCP_LN2
+
+        if USE_ALIBI_SLOPES:
+            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
+
+        if USE_QQ_BIAS:
+            key_rel_pos = seq_offset - context_len
+            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+            qq_bias = tl.load(
+                qq_bias_row_ptrs + key_rel_pos[None, :],
+                mask=is_query_key[None, :],
+                other=0.0,
+            )
+            S += qq_bias * RCP_LN2
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+
+        P = tl.math.exp2(S - m_j[:, None])
+        l_j = tl.sum(P, axis=1)
+        alpha = tl.math.exp2(M - m_j)
+        acc = acc * alpha[:, None]
+
+        if not PRELOAD_V:
+            V = kv_load(
+                value_cache_ptr,
+                base_offset[:, None],
+                kv_head_idx,
+                offs_dv[None, :],
+                seq_offset[:, None],
+                stride_v_cache_0,
+                stride_v_cache_1,
+                stride_v_cache_2,
+                stride_v_cache_3,
+                dim_mask_v[None, :],
+                no_mask[:, None],
+                BLOCK_SIZE,
+                KV_cache_modifier,
+            )
+
+        L = L * alpha + l_j
+        M = m_j
+        acc += tl.dot(P.to(V.dtype), V)
+
+    return acc, L, M
 
 
 @triton.jit
@@ -397,243 +883,147 @@ def kernel_unified_attention_2d(
     # this prefix can be skipped)
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
-    # ---- Sliding-window tile pruning --------------------
-    # Default: keep previous global behavior
-    tile_start = 0
-    tile_end = num_tiles
-    if SLIDING_WINDOW > 0:
-        # Query rows covered by this Q-block
-        qpos_lo = q_block_local_idx * BLOCK_Q
-        qpos_hi = tl.minimum(
-            qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
-            cur_batch_query_len - 1,
-        )
-        # For sliding window, each query position q can only attend to
-        # keys in the range [q_abs - SLIDING_WINDOW + 1, q_abs]
-        # where q_abs = context_len + q
-        # The union of allowed key positions for this Q-block is:
-        # [context_len + qpos_lo - SLIDING_WINDOW + 1, context_len + qpos_hi]
-        first_allowed_key = context_len + qpos_lo - SLIDING_WINDOW + 1
-        last_allowed_key = context_len + qpos_hi
-        # Convert to tile indices and clamp
-        tile_start = tl.maximum(0, first_allowed_key // TILE_SIZE)
-        tile_end = tl.minimum((last_allowed_key // TILE_SIZE) + 1, num_tiles)
-
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    # iterate through tiles (now limited to the sliding window range)
 
-    if KV_LAYOUT_IS_THD:  # No need to page inside the loop as its a contiguous layout.
-        base_offset = tl.load(key_start_len_ptr + seq_idx).to(tl.int64)
+    if KV_LAYOUT_IS_THD:
+        base_offset_thd = tl.load(key_start_len_ptr + seq_idx).to(tl.int64)
     else:
         block_table_offset = seq_idx * block_table_stride
+        base_offset_thd = 0
 
-    for j in range(tile_start, tile_end):
-        seq_offset = j * TILE_SIZE + offs_t
-        # to reduce the masking effect when not needed
-        if TILE_SIZE == BLOCK_SIZE:
-            tile_mask = tl.full((1,), 1, dtype=tl.int1)
-        else:
-            tile_mask = seq_offset < max_seq_prefix_len
+    if not KV_LAYOUT_IS_THD:
+        _bt_offset = block_table_offset
+    else:
+        _bt_offset = 0
 
-        if (
-            not KV_LAYOUT_IS_THD
-        ):  # Need to page inside the loop as its not a contiguous layout.
-            base_offset = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-            ).to(tl.int64)
+    # define placeholder variables for unused variables
+    if not HAS_ROPE:
+        Q_rope = Q
+        offs_rope = offs_d_qk
+        offs_rope_scale = offs_d_scale
+        rope_dim_mask = dim_mask_qk
+        rope_scale_dim_mask = scale_dim_mask
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K = kv_load(
-            key_cache_ptr,
-            base_offset[None, :],
-            kv_head_idx,
-            offs_d_qk[:, None],
-            seq_offset[None, :],
-            stride_k_cache_0,
-            stride_k_cache_1,
-            stride_k_cache_2,
-            stride_k_cache_3,
-            dim_mask_qk[:, None],
-            tile_mask[None, :],
-            BLOCK_SIZE,
-            KV_cache_modifier,
+    if not (HAS_ROPE and SAGE_MXFP4):
+        q_rope_scale_loaded = q_scale_loaded
+
+    if not USE_ALIBI_SLOPES:
+        alibi_slope = tl.zeros([1], dtype=tl.float32)
+
+    if not USE_QQ_BIAS:
+        qq_bias_row_ptrs = query_ptr
+    # -------------------------------------------------------------
+
+    USE_SLIDING_WINDOW: tl.constexpr = SLIDING_WINDOW > 0
+    # compute_block_masking assumes BLOCK_M == BLOCK_N (i.e. the Q-block and KV-tile have the same width).
+    # In unified_attention, BLOCK_Q (query block) can be smaller than
+    # TILE_SIZE (KV tile).  When IS_CAUSAL and no sliding window, this
+    # mismatch causes an off-by-one in the causal diagonal boundary.
+    # This leads to the last tile with diagonal boundary being classified as "full" instead of "back_masked".
+    #
+    # The fix: when BLOCK_Q < TILE_SIZE under pure causal (no sliding
+    # window), conservatively demote the last "full" tile to "back_masked"
+    # so it goes through _tile_loop_mask which applies the causal check.
+    NEEDS_BACK_CORRECTION: tl.constexpr = (
+        IS_CAUSAL and (not USE_SLIDING_WINDOW) and (BLOCK_Q < TILE_SIZE)
+    )
+
+    (
+        n_front_skip,
+        n_front_masked,
+        n_full,
+        n_back_masked,
+        n_extra_tokens,
+    ) = compute_block_masking(
+        seq_len,
+        cur_batch_query_len,
+        q_block_local_idx,
+        IS_CAUSAL,
+        USE_SLIDING_WINDOW,
+        SLIDING_WINDOW - 1 if USE_SLIDING_WINDOW else 0,
+        0,
+        BLOCK_Q,
+        TILE_SIZE,
+    )
+
+    if NEEDS_BACK_CORRECTION:
+        extra = tl.minimum(n_full, 1)
+        n_full = n_full - extra
+        n_back_masked = n_back_masked + extra
+
+    front_start = n_front_skip
+    full_start = front_start + n_front_masked
+    back_start = full_start + n_full
+    back_end = back_start + n_back_masked
+
+    if n_front_masked > 0 and USE_SLIDING_WINDOW:
+        acc, L, M = _tile_loop_mask(
+            acc, L, M, front_start, full_start,
+            query_ptr, key_cache_ptr, value_cache_ptr, k_scale,
+            block_tables_ptr, _bt_offset, base_offset_thd,
+            Q, Q_rope, q_scale_loaded, q_rope_scale_loaded,
+            offs_t, offs_d_qk, offs_d_scale, offs_dv,
+            offs_rope, offs_rope_scale,
+            dim_mask_qk, dim_mask_v, scale_dim_mask, rope_dim_mask, rope_scale_dim_mask,
+            query_pos, query_mask_0, query_mask_1,
+            kv_head_idx, context_len, seq_len, max_seq_prefix_len, qk_scale,
+            alibi_slope, qq_bias_row_ptrs, alibi_slopes_ptr, qq_bias_ptr,
+            sink_ptr, softcap, qq_bias_stride_0,
+            stride_k_cache_0, stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
+            stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3,
+            stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3,
+            RCP_LN2,
+            BLOCK_SIZE, TILE_SIZE, BLOCK_M, HEAD_SIZE_V_PADDED,
+            USE_ALIBI_SLOPES, USE_QQ_BIAS, USE_SOFTCAP, SLIDING_WINDOW,
+            IS_CAUSAL, SAGE_MXFP4, PRELOAD_V, HAS_ROPE, ROPE_SIZE_PADDED,
+            KV_LAYOUT_IS_THD, KV_cache_modifier,
         )
 
-        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
-
-        k_scale_loaded = None
-        if SAGE_MXFP4:
-            k_scale_loaded = kv_load(
-                k_scale,
-                base_offset[:, None],
-                kv_head_idx,
-                offs_d_scale[None, :],
-                seq_offset[:, None],
-                stride_k_cache_scale_0,
-                stride_k_cache_scale_1,
-                stride_k_cache_scale_2,
-                stride_k_cache_scale_3,
-                scale_dim_mask[None, :],
-                tile_mask[:, None],
-                BLOCK_SIZE,
-                "",
-            )
-
-        K = K.to(Q.dtype)
-
-        if HAS_ROPE:
-            K_rope = kv_load(
-                key_cache_ptr,
-                base_offset[None, :],
-                kv_head_idx,
-                offs_rope[:, None],
-                seq_offset[None, :],
-                stride_k_cache_0,
-                stride_k_cache_1,
-                stride_k_cache_2,
-                stride_k_cache_3,
-                rope_dim_mask[:, None],
-                tile_mask[None, :],
-                BLOCK_SIZE,
-                "",
-            )
-            if SAGE_MXFP4:
-                # Do not transpose rhs mxfp4 scale!
-                k_rope_scale_loaded = kv_load(
-                    k_scale,
-                    base_offset[:, None],
-                    kv_head_idx,
-                    offs_rope_scale[None, :],
-                    seq_offset[:, None],
-                    stride_k_cache_scale_0,
-                    stride_k_cache_scale_1,
-                    stride_k_cache_scale_2,
-                    stride_k_cache_scale_3,
-                    rope_scale_dim_mask[None, :],
-                    tile_mask[:, None],
-                    BLOCK_SIZE,
-                    "",
-                )
-                S += tl.dot_scaled(
-                    Q_rope,
-                    q_rope_scale_loaded,
-                    "e2m1",
-                    K_rope,
-                    k_rope_scale_loaded,
-                    "e2m1",
-                    fast_math=True,
-                )
-            else:
-                S += qk_scale * tl.dot(Q_rope, K_rope)
-
-        if PRELOAD_V:
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V = kv_load(
-                value_cache_ptr,
-                base_offset[:, None],
-                kv_head_idx,
-                offs_dv[None, :],
-                seq_offset[:, None],
-                stride_v_cache_0,
-                stride_v_cache_1,
-                stride_v_cache_2,
-                stride_v_cache_3,
-                dim_mask_v[None, :],
-                tile_mask[:, None],
-                BLOCK_SIZE,
-                KV_cache_modifier,
-            )
-
-        S += qk_dot(
-            Q,
-            K,
-            qk_scale,
-            q_scale_loaded,
-            k_scale_loaded,
-            SAGE_MXFP4,
+    if n_full > 0:
+        acc, L, M = _tile_loop_no_mask(
+            acc, L, M, full_start, back_start,
+            query_ptr, key_cache_ptr, value_cache_ptr, k_scale,
+            block_tables_ptr, _bt_offset, base_offset_thd,
+            Q, Q_rope, q_scale_loaded, q_rope_scale_loaded,
+            offs_t, offs_d_qk, offs_d_scale, offs_dv,
+            offs_rope, offs_rope_scale,
+            dim_mask_qk, dim_mask_v, scale_dim_mask, rope_dim_mask, rope_scale_dim_mask,
+            query_pos, query_mask_0, query_mask_1,
+            kv_head_idx, context_len, seq_len, max_seq_prefix_len, qk_scale,
+            alibi_slope, qq_bias_row_ptrs, alibi_slopes_ptr, qq_bias_ptr,
+            sink_ptr, softcap, qq_bias_stride_0,
+            stride_k_cache_0, stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
+            stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3,
+            stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3,
+            RCP_LN2,
+            BLOCK_SIZE, TILE_SIZE, BLOCK_M, HEAD_SIZE_V_PADDED,
+            USE_ALIBI_SLOPES, USE_QQ_BIAS, USE_SOFTCAP,
+            SAGE_MXFP4, PRELOAD_V, HAS_ROPE, ROPE_SIZE_PADDED,
+            KV_LAYOUT_IS_THD, KV_cache_modifier,
         )
 
-        if USE_SOFTCAP:
-            # softcap here uses exp2 and consumes RCP_LN2 conversion.
-            # multiply by RCP_LN2 again to be used in later exp2
-            S = apply_softcap(S, softcap) * RCP_LN2
-
-        if IS_CAUSAL or SLIDING_WINDOW > 0:
-            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
-        else:
-            seq_mask = seq_offset[None, :] < seq_len
-
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+    if n_back_masked > 0:
+        acc, L, M = _tile_loop_mask(
+            acc, L, M, back_start, back_end,
+            query_ptr, key_cache_ptr, value_cache_ptr, k_scale,
+            block_tables_ptr, _bt_offset, base_offset_thd,
+            Q, Q_rope, q_scale_loaded, q_rope_scale_loaded,
+            offs_t, offs_d_qk, offs_d_scale, offs_dv,
+            offs_rope, offs_rope_scale,
+            dim_mask_qk, dim_mask_v, scale_dim_mask, rope_dim_mask, rope_scale_dim_mask,
+            query_pos, query_mask_0, query_mask_1,
+            kv_head_idx, context_len, seq_len, max_seq_prefix_len, qk_scale,
+            alibi_slope, qq_bias_row_ptrs, alibi_slopes_ptr, qq_bias_ptr,
+            sink_ptr, softcap, qq_bias_stride_0,
+            stride_k_cache_0, stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
+            stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3,
+            stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3,
+            RCP_LN2,
+            BLOCK_SIZE, TILE_SIZE, BLOCK_M, HEAD_SIZE_V_PADDED,
+            USE_ALIBI_SLOPES, USE_QQ_BIAS, USE_SOFTCAP, SLIDING_WINDOW,
+            IS_CAUSAL, SAGE_MXFP4, PRELOAD_V, HAS_ROPE, ROPE_SIZE_PADDED,
+            KV_LAYOUT_IS_THD, KV_cache_modifier,
         )
-
-        if SLIDING_WINDOW > 0:
-            S = tl.where(
-                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
-                S,
-                float("-inf"),
-            )
-
-        if USE_ALIBI_SLOPES:
-            # prescale w. RCP_LN2 for later exp2
-            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
-
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
-                other=0.0,
-            )
-            # prescale w. RCP_LN2 for later exp2
-            S += qq_bias * RCP_LN2
-
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-
-        # P : (BLOCK_M, TILE_SIZE)
-        P = tl.math.exp2(S - m_j[:, None])
-
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
-
-        # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2(M - m_j)
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
-
-        if not PRELOAD_V:
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V = kv_load(
-                value_cache_ptr,
-                base_offset[:, None],
-                kv_head_idx,
-                offs_dv[None, :],
-                seq_offset[:, None],
-                stride_v_cache_0,
-                stride_v_cache_1,
-                stride_v_cache_2,
-                stride_v_cache_3,
-                dim_mask_v[None, :],
-                tile_mask[:, None],
-                BLOCK_SIZE,
-                KV_cache_modifier,
-            )
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -947,221 +1337,147 @@ def kernel_unified_attention_3d(
     num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    if KV_LAYOUT_IS_THD:  # No need to page inside the loop as its a contiguous layout.
-        base_offset = tl.load(key_start_len_ptr + seq_idx).to(tl.int64)
+    if KV_LAYOUT_IS_THD:
+        base_offset_thd = tl.load(key_start_len_ptr + seq_idx).to(tl.int64)
+        _bt_offset = 0
     else:
-        block_table_offset = seq_idx * block_table_stride
+        _bt_offset = block_table_offset
+        base_offset_thd = 0
 
-    # iterate through tiles within current segment
-    for j in range(
-        segm_idx * tiles_per_segment,
-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
-    ):
-        seq_offset = j * TILE_SIZE + offs_t
-        if TILE_SIZE == BLOCK_SIZE:
-            tile_mask = tl.full((1,), 1, dtype=tl.int1)
-        else:
-            tile_mask = seq_offset < max_seq_prefix_len
+    if not HAS_ROPE:
+        Q_rope = Q
+        offs_rope = offs_d_qk
+        offs_rope_scale = offs_d_scale
+        rope_dim_mask = dim_mask_qk
+        rope_scale_dim_mask = scale_dim_mask
 
-        if (
-            not KV_LAYOUT_IS_THD
-        ):  # Need to page inside the loop as its not a contiguous layout.
-            base_offset = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-            ).to(tl.int64)
+    if not (HAS_ROPE and SAGE_MXFP4):
+        q_rope_scale_loaded = q_scale_loaded
 
-        S = tl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32)
+    if not USE_ALIBI_SLOPES:
+        alibi_slope = tl.zeros([1], dtype=tl.float32)
+    if not USE_QQ_BIAS:
+        qq_bias_row_ptrs = query_ptr
 
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K = kv_load(
-            key_cache_ptr,
-            base_offset[None, :],
-            kv_head_idx,
-            offs_d_qk[:, None],
-            seq_offset[None, :],
-            stride_k_cache_0,
-            stride_k_cache_1,
-            stride_k_cache_2,
-            stride_k_cache_3,
-            dim_mask_qk[:, None],
-            tile_mask[None, :],
-            BLOCK_SIZE,
-            KV_cache_modifier,
+    USE_SLIDING_WINDOW: tl.constexpr = SLIDING_WINDOW > 0
+    # compute_block_masking assumes BLOCK_M == BLOCK_N (i.e. the Q-block and KV-tile have the same width).
+    # In unified_attention, BLOCK_Q (query block) can be smaller than
+    # TILE_SIZE (KV tile).  When IS_CAUSAL and no sliding window, this
+    # mismatch causes an off-by-one in the causal diagonal boundary.
+    # This leads to the last tile with diagonal boundary being classified as "full" instead of "back_masked".
+    #
+    # The fix: when BLOCK_Q < TILE_SIZE under pure causal (no sliding
+    # window), conservatively demote the last "full" tile to "back_masked"
+    # so it goes through _tile_loop_mask which applies the causal check.
+    NEEDS_BACK_CORRECTION: tl.constexpr = (
+        IS_CAUSAL and (not USE_SLIDING_WINDOW) and (BLOCK_Q < TILE_SIZE)
+    )
+
+    (
+        n_front_skip,
+        n_front_masked,
+        n_full,
+        n_back_masked,
+        n_extra_tokens,
+    ) = compute_block_masking(
+        seq_len,
+        cur_batch_query_len,
+        q_block_local_idx,
+        IS_CAUSAL,
+        USE_SLIDING_WINDOW,
+        SLIDING_WINDOW - 1 if USE_SLIDING_WINDOW else 0,
+        0,
+        BLOCK_Q,
+        TILE_SIZE,
+    )
+
+    if NEEDS_BACK_CORRECTION:
+        extra = tl.minimum(n_full, 1)
+        n_full = n_full - extra
+        n_back_masked = n_back_masked + extra
+
+    front_start = n_front_skip
+    full_start = front_start + n_front_masked
+    back_start = full_start + n_full
+    back_end = back_start + n_back_masked
+
+    seg_lo = segm_idx * tiles_per_segment
+    seg_hi = tl.minimum((segm_idx + 1) * tiles_per_segment, num_tiles)
+
+    fm_lo = tl.maximum(seg_lo, front_start)
+    fm_hi = tl.minimum(seg_hi, full_start)
+    if fm_hi > fm_lo and USE_SLIDING_WINDOW:
+        acc, L, M = _tile_loop_mask(
+            acc, L, M, fm_lo, fm_hi,
+            query_ptr, key_cache_ptr, value_cache_ptr, k_scale,
+            block_tables_ptr, _bt_offset, base_offset_thd,
+            Q, Q_rope, q_scale_loaded, q_rope_scale_loaded,
+            offs_t, offs_d_qk, offs_d_scale, offs_dv,
+            offs_rope, offs_rope_scale,
+            dim_mask_qk, dim_mask_v, scale_dim_mask, rope_dim_mask, rope_scale_dim_mask,
+            query_pos, query_mask_0, query_mask_1,
+            kv_head_idx, context_len, seq_len, max_seq_prefix_len, qk_scale,
+            alibi_slope, qq_bias_row_ptrs, alibi_slopes_ptr, qq_bias_ptr,
+            sink_ptr, softcap, qq_bias_stride_0,
+            stride_k_cache_0, stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
+            stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3,
+            stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3,
+            RCP_LN2,
+            BLOCK_SIZE, TILE_SIZE, BLOCK_M, HEAD_SIZE_V_PADDED,
+            USE_ALIBI_SLOPES, USE_QQ_BIAS, USE_SOFTCAP, SLIDING_WINDOW,
+            IS_CAUSAL, SAGE_MXFP4, PRELOAD_V, HAS_ROPE, ROPE_SIZE_PADDED,
+            KV_LAYOUT_IS_THD, KV_cache_modifier,
         )
 
-        k_scale_loaded = None
-        if SAGE_MXFP4:
-            k_scale_loaded = kv_load(
-                k_scale,
-                base_offset[:, None],
-                kv_head_idx,
-                offs_d_scale[None, :],
-                seq_offset[:, None],
-                stride_k_cache_scale_0,
-                stride_k_cache_scale_1,
-                stride_k_cache_scale_2,
-                stride_k_cache_scale_3,
-                scale_dim_mask[None, :],
-                tile_mask[:, None],
-                BLOCK_SIZE,
-                "",
-            )
-
-        K = K.to(Q.dtype)
-
-        if HAS_ROPE:
-            K_rope = kv_load(
-                key_cache_ptr,
-                base_offset[None, :],
-                kv_head_idx,
-                offs_rope[:, None],
-                seq_offset[None, :],
-                stride_k_cache_0,
-                stride_k_cache_1,
-                stride_k_cache_2,
-                stride_k_cache_3,
-                rope_dim_mask[:, None],
-                tile_mask[None, :],
-                BLOCK_SIZE,
-                "",
-            )
-            if SAGE_MXFP4:
-                # Do not transpose rhs mxfp4 scale!
-                k_rope_scale_loaded = kv_load(
-                    k_scale,
-                    base_offset[:, None],
-                    kv_head_idx,
-                    offs_rope_scale[None, :],
-                    seq_offset[:, None],
-                    stride_k_cache_scale_0,
-                    stride_k_cache_scale_1,
-                    stride_k_cache_scale_2,
-                    stride_k_cache_scale_3,
-                    rope_scale_dim_mask[None, :],
-                    tile_mask[:, None],
-                    BLOCK_SIZE,
-                    "",
-                )
-                S += tl.dot_scaled(
-                    Q_rope,
-                    q_rope_scale_loaded,
-                    "e2m1",
-                    K_rope,
-                    k_rope_scale_loaded,
-                    "e2m1",
-                    fast_math=True,
-                )
-            else:
-                S += qk_scale * tl.dot(Q_rope, K_rope)
-
-        if PRELOAD_V:
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V = kv_load(
-                value_cache_ptr,
-                base_offset[:, None],
-                kv_head_idx,
-                offs_dv[None, :],
-                seq_offset[:, None],
-                stride_v_cache_0,
-                stride_v_cache_1,
-                stride_v_cache_2,
-                stride_v_cache_3,
-                dim_mask_v[None, :],
-                tile_mask[:, None],
-                BLOCK_SIZE,
-                KV_cache_modifier,
-            )
-
-        S += qk_dot(
-            Q,
-            K,
-            qk_scale,
-            q_scale_loaded,
-            k_scale_loaded,
-            SAGE_MXFP4,
+    fl_lo = tl.maximum(seg_lo, full_start)
+    fl_hi = tl.minimum(seg_hi, back_start)
+    if fl_hi > fl_lo:
+        acc, L, M = _tile_loop_no_mask(
+            acc, L, M, fl_lo, fl_hi,
+            query_ptr, key_cache_ptr, value_cache_ptr, k_scale,
+            block_tables_ptr, _bt_offset, base_offset_thd,
+            Q, Q_rope, q_scale_loaded, q_rope_scale_loaded,
+            offs_t, offs_d_qk, offs_d_scale, offs_dv,
+            offs_rope, offs_rope_scale,
+            dim_mask_qk, dim_mask_v, scale_dim_mask, rope_dim_mask, rope_scale_dim_mask,
+            query_pos, query_mask_0, query_mask_1,
+            kv_head_idx, context_len, seq_len, max_seq_prefix_len, qk_scale,
+            alibi_slope, qq_bias_row_ptrs, alibi_slopes_ptr, qq_bias_ptr,
+            sink_ptr, softcap, qq_bias_stride_0,
+            stride_k_cache_0, stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
+            stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3,
+            stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3,
+            RCP_LN2,
+            BLOCK_SIZE, TILE_SIZE, BLOCK_M, HEAD_SIZE_V_PADDED,
+            USE_ALIBI_SLOPES, USE_QQ_BIAS, USE_SOFTCAP,
+            SAGE_MXFP4, PRELOAD_V, HAS_ROPE, ROPE_SIZE_PADDED,
+            KV_LAYOUT_IS_THD, KV_cache_modifier,
         )
 
-        if USE_SOFTCAP:
-            # softcap here uses exp2 and consumes RCP_LN2 conversion.
-            # multiply by RCP_LN2 again to be used in later exp2
-            S = apply_softcap(S, softcap) * RCP_LN2
-
-        if IS_CAUSAL or SLIDING_WINDOW > 0:
-            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
-        else:
-            seq_mask = seq_offset[None, :] < seq_len
-
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+    bm_lo = tl.maximum(seg_lo, back_start)
+    bm_hi = tl.minimum(seg_hi, back_end)
+    if bm_hi > bm_lo:
+        acc, L, M = _tile_loop_mask(
+            acc, L, M, bm_lo, bm_hi,
+            query_ptr, key_cache_ptr, value_cache_ptr, k_scale,
+            block_tables_ptr, _bt_offset, base_offset_thd,
+            Q, Q_rope, q_scale_loaded, q_rope_scale_loaded,
+            offs_t, offs_d_qk, offs_d_scale, offs_dv,
+            offs_rope, offs_rope_scale,
+            dim_mask_qk, dim_mask_v, scale_dim_mask, rope_dim_mask, rope_scale_dim_mask,
+            query_pos, query_mask_0, query_mask_1,
+            kv_head_idx, context_len, seq_len, max_seq_prefix_len, qk_scale,
+            alibi_slope, qq_bias_row_ptrs, alibi_slopes_ptr, qq_bias_ptr,
+            sink_ptr, softcap, qq_bias_stride_0,
+            stride_k_cache_0, stride_k_cache_1, stride_k_cache_2, stride_k_cache_3,
+            stride_v_cache_0, stride_v_cache_1, stride_v_cache_2, stride_v_cache_3,
+            stride_k_cache_scale_0, stride_k_cache_scale_1, stride_k_cache_scale_2, stride_k_cache_scale_3,
+            RCP_LN2,
+            BLOCK_SIZE, TILE_SIZE, BLOCK_M, HEAD_SIZE_V_PADDED,
+            USE_ALIBI_SLOPES, USE_QQ_BIAS, USE_SOFTCAP, SLIDING_WINDOW,
+            IS_CAUSAL, SAGE_MXFP4, PRELOAD_V, HAS_ROPE, ROPE_SIZE_PADDED,
+            KV_LAYOUT_IS_THD, KV_cache_modifier,
         )
-
-        if SLIDING_WINDOW > 0:
-            S = tl.where(
-                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
-                S,
-                float("-inf"),
-            )
-
-        if USE_ALIBI_SLOPES:
-            # prescale w. RCP_LN2 for later exp2
-            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
-
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
-                other=0.0,
-            )
-            # prescale w. RCP_LN2 for later exp2
-            S += qq_bias * RCP_LN2
-
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-
-        # P : (BLOCK_M, TILE_SIZE,)
-        P = tl.math.exp2(S - m_j[:, None])
-
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
-
-        # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2(M - m_j)
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
-
-        if not PRELOAD_V:
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V = kv_load(
-                value_cache_ptr,
-                base_offset[:, None],
-                kv_head_idx,
-                offs_dv[None, :],
-                seq_offset[:, None],
-                stride_v_cache_0,
-                stride_v_cache_1,
-                stride_v_cache_2,
-                stride_v_cache_3,
-                dim_mask_v[None, :],
-                tile_mask[:, None],
-                BLOCK_SIZE,
-                KV_cache_modifier,
-            )
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc += tl.dot(P.to(V.dtype), V)
 
     segm_output_offset = (
         query_offset_0[:, None].to(tl.int64)

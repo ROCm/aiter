@@ -350,7 +350,7 @@ def run_benchmark(custom, args):
         num_contexts = len(cu_query_lens) - 1
         for i in range(num_contexts):
             seqlen_q = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
-            seqlen_k = (cu_key_lens[i + 1] - cu_key_lens[i]).item()
+            seqlen_k = kv_lens[i].item()
             if causal:
                 valid_out_elements = (
                     ((seqlen_k**2 + seqlen_k) / 2)
@@ -362,7 +362,7 @@ def run_benchmark(custom, args):
                 total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
 
         total_num_tokens_q = cu_query_lens[-1].item()
-        total_num_tokens_k = cu_key_lens[-1].item()
+        total_num_tokens_k = kv_lens.sum().item()
 
         q_size = total_num_tokens_q * HQ * D_HEAD * query.element_size()
         k_size = total_num_tokens_k * HK * D_HEAD * key_cache.element_size()
