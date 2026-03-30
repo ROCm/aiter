@@ -64,7 +64,19 @@
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_nmask_gqa8_decode_t.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_decode_t.cpp'",
             "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_nmask_gqa8_decode_t.cpp'",
-            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_decode_t.cpp'"
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_decode_t.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_nmask_gqa8_bs32_decode.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_bs32_decode.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_nmask_gqa8_bs32_decode.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_bs32_decode.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_nmask_gqa8_bs32_decode_s.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_bs32_decode_s.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_nmask_gqa8_bs32_decode_s.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_bs32_decode_s.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_nmask_gqa8_bs32_decode_t.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_bf16_mask_gqa8_bs32_decode_t.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_nmask_gqa8_bs32_decode_t.cpp'",
+            "f'{CK_DIR}/example/ck_tile/42_unified_attention/instances/unified_attention_d64_fp16_mask_gqa8_bs32_decode_t.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -581,6 +593,22 @@
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/topk_sigmoid_kernels.cu'",
             "f'{CK_DIR}/example/ck_tile/09_topk_softmax/topk_softmax_api.cpp'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{CK_DIR}/example/ck_tile/09_topk_softmax'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_grouped_topk_decode": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/grouped_topk_decode_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/grouped_topk_decode_kernels.cu'",
+            "f'{CK_DIR}/example/ck_tile/09_topk_softmax/topk_grouped_decode_api.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

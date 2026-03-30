@@ -98,9 +98,8 @@ def ck_compatible(s: Shape) -> tuple[bool, str]:
     else:
         return False, f"unsupported head_size={s.head_size}"
 
-    min_blk = 64 if s.head_size <= 64 else 32
-    if s.block_size < min_blk:
-        pass  # we'll override block_size at runtime to min_blk
+    if s.block_size < 32:
+        return False, f"block_size={s.block_size} < 32 (CK minimum)"
 
     if s.window_size != (-1, -1):
         return False, f"sliding window {s.window_size} not supported"
@@ -112,8 +111,9 @@ def ck_compatible(s: Shape) -> tuple[bool, str]:
 
 
 def _ck_block_size(s: Shape) -> int:
-    """CK compile-time kPageBlockSize: 64 for HeadSize<=64, 32 otherwise."""
-    return 64 if s.head_size <= 64 else 32
+    """CK block size: use native block_size if supported, else round up to minimum."""
+    min_blk = 32
+    return max(s.block_size, min_blk)
 
 
 def make_tensors(s: Shape, device: str = "cuda", block_size_override: int | None = None):

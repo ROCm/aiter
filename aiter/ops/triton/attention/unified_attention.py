@@ -134,6 +134,11 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
             (head_size == 128 and num_queries_per_kv == 1)):
         return False
 
+    block_size = k.shape[1]
+    min_block_size = 32
+    if block_size < min_block_size:
+        return False
+
     try:
         from aiter.ops.unified_attention import unified_attention_fwd
         import math
@@ -171,6 +176,7 @@ def unified_attention(
     sinks=None,
 ):
     assert causal, "Only causal attention is supported"
+    assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
