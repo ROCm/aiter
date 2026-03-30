@@ -16,7 +16,6 @@
  * limitations under the License.
  */
 #include "hip_float8.h"
-#include "vec_convert.h"
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_bfloat16.h>
