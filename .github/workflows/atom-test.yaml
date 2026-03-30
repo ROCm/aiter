@@ -64,7 +64,7 @@ jobs:
             runner: aiter-8gpu-runner
             run_on_pr: true
           - model_name: "gpt-oss-120b"
-            label: MI355
+            label: MI35X
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |

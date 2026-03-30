@@ -240,10 +240,10 @@ jobs:
         run: |
           docker rm -f triton_test || true
 
-  # Step 2b: MI355 matrix jobs (opt-in via ci:triton-355 label)
+  # Step 2b: MI35X matrix jobs (opt-in via ci:triton-355 label)
   triton-mi355:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-355') }}
-    name: Triton Tests (MI355) / Shard ${{ matrix.shard }}
+    name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
     needs: [split_triton_tests, build-triton, check-signal]
     strategy:
@@ -342,7 +342,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: triton-test-mi355-shard-${{ matrix.shard }}
+          name: triton-test-mi35x-shard-${{ matrix.shard }}
           path: test-reports/triton.xml
 
       - name: Cleanup container
@@ -352,32 +352,32 @@ jobs:
 
   triton-mi355-test-finish:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'ci:triton-355') }}
-    name: Triton MI355 Test Results
+    name: Triton MI35X Test Results
     runs-on: ubuntu-latest
     needs: [triton-mi355]
     steps:
-      - name: Download all MI355 test reports
+      - name: Download all MI35X test reports
         uses: actions/download-artifact@v4
         with:
-          pattern: triton-test-mi355-shard-*
+          pattern: triton-test-mi35x-shard-*
           path: .
 
-      - name: Check Triton MI355 Test Results
+      - name: Check Triton MI35X Test Results
         run: |
           set -ex
-          echo "Checking Triton MI355 Test Results..."
+          echo "Checking Triton MI35X Test Results..."
           all_passed=true
           for shard in {0..7}; do
-            if [ ! -f triton-test-mi355-shard-${shard}/triton.xml ]; then
-              echo "MI355 test report for shard ${shard} not found."
+            if [ ! -f triton-test-mi35x-shard-${shard}/triton.xml ]; then
+              echo "MI35X test report for shard ${shard} not found."
               all_passed=false
               break
             fi
           done
           if [ "$all_passed" = true ]; then
-            echo "All MI355 tests passed."
+            echo "All MI35X tests passed."
           else
-            echo "MI355 test failures or errors detected."
+            echo "MI35X test failures or errors detected."
             exit 1
           fi
 

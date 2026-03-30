@@ -102,7 +102,7 @@ jobs:
       matrix:
         include:
           - runner: linux-aiter-mi35x-1
-            label: MI355
+            label: MI35X
           - runner: aiter-gfx1100
             label: RDNA3
             optional: true

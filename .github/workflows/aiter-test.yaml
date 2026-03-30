@@ -211,23 +211,23 @@ jobs:
       matrix:
         include:
           - runner: linux-aiter-mi35x-1
-            label: MI355
+            label: MI35X
             shard_total: 5
             shard_idx: 0
           - runner: linux-aiter-mi35x-1
-            label: MI355
+            label: MI35X
             shard_total: 5
             shard_idx: 1
           - runner: linux-aiter-mi35x-1
-            label: MI355
+            label: MI35X
             shard_total: 5
             shard_idx: 2
           - runner: linux-aiter-mi35x-1
-            label: MI355
+            label: MI35X
             shard_total: 5
             shard_idx: 3
           - runner: linux-aiter-mi35x-1
-            label: MI355
+            label: MI35X
             shard_total: 5
             shard_idx: 4
           - runner: aiter-1gpu-runner
@@ -422,7 +422,7 @@ jobs:
       matrix:
         include:
           - runner: linux-aiter-mi35x-8
-            label: MI355
+            label: MI35X
           - runner: aiter-8gpu-runner
             label: MI325
     runs-on: ${{ matrix.runner }}
