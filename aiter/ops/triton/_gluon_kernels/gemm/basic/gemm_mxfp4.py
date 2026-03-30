@@ -87,16 +87,25 @@ def depreshuffle_b_raw_to_kn(
 
 
 @gluon.jit
-def unshuffle_scales_32(
-    scales_shuf,
-    BLOCK_X: gl.constexpr,
-    K_GROUPS: gl.constexpr,
+def unswizzle_mx_scale_gfx1250(
+    scale_buffer_slice,
+    BLOCK_N: gl.constexpr,
+    MX_SCALE_BLOCK_K: gl.constexpr,
+    PRESHUFFLE_FACTOR: gl.constexpr,
+    SCALE_KWIDTH: gl.constexpr,
 ):
-    # One shared unshuffle for A/B scales
     return (
-        scales_shuf.reshape((BLOCK_X // 32, K_GROUPS // 8, 4, 16, 2, 2, 1))
-        .permute((0, 5, 3, 1, 4, 2, 6))
-        .reshape((BLOCK_X, K_GROUPS))
+        scale_buffer_slice.reshape(
+            (
+                BLOCK_N // PRESHUFFLE_FACTOR,
+                MX_SCALE_BLOCK_K // SCALE_KWIDTH,
+                PRESHUFFLE_FACTOR // 4,
+                4,
+                SCALE_KWIDTH,
+            )
+        )
+        .permute((0, 3, 2, 1, 4))
+        .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
     )
 
 
@@ -200,6 +209,10 @@ def gemm_mxfp4_preshuffle_gfx1250(
     gl.static_assert(BLOCK_SIZE_K % 32 == 0)
     gl.static_assert(K_GROUPS * 32 == BLOCK_SIZE_K)
 
+    # Scale preshuffle constants for gfx1250
+    PRESHUFFLE_FACTOR: gl.constexpr = 32
+    SCALE_KWIDTH: gl.constexpr = 4 if K_GROUPS >= 4 else K_GROUPS
+
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
 
@@ -231,7 +244,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
         [NUM_BUFFERS, BLOCK_SIZE_N // 16, BLOCK_K_BYTES * 16],
         layout=shared_B,
     )
-    # A scales: M>=32 uses preshuffled (M//32, K) layout; M<32 uses (M, K//32) per row
+    # A scales: M>=32 uses preshuffled (M//PRESHUFFLE_FACTOR, K*PRESHUFFLE_FACTOR) layout;
+    #           M<32 uses (M, K//32) per row
     if BLOCK_SIZE_M < 32:
         smem_ASraw = gl.allocate_shared_memory(
             a_scale_ptr.type.element_ty,
@@ -241,12 +255,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
     else:
         smem_ASraw = gl.allocate_shared_memory(
             a_scale_ptr.type.element_ty,
-            [NUM_BUFFERS, BLOCK_SIZE_M // 32, K_GROUPS * 32],
+            [NUM_BUFFERS, BLOCK_SIZE_M // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR],
             layout=shared_S,
         )
     smem_BSraw = gl.allocate_shared_memory(
         b_scale_ptr.type.element_ty,
-        [NUM_BUFFERS, BLOCK_SIZE_N // 32, K_GROUPS * 32],
+        [NUM_BUFFERS, BLOCK_SIZE_N // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR],
         layout=shared_S,
     )
 
@@ -268,8 +282,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
         layout=shared_B,
     )
 
-    grid_m32 = gl.cdiv(M, 32)
-    grid_n32 = gl.cdiv(N, 32)
+    grid_m_as = gl.cdiv(M, PRESHUFFLE_FACTOR)
+    grid_n_bs = gl.cdiv(N, PRESHUFFLE_FACTOR)
     k_scale_cols = K_elems // SCALE_GROUP_ELEMS
 
     if BLOCK_SIZE_M < 32:
@@ -283,16 +297,16 @@ def gemm_mxfp4_preshuffle_gfx1250(
     else:
         as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=a_scale_ptr,
-            shape=(grid_m32, K_elems),
+            shape=(grid_m_as, k_scale_cols * PRESHUFFLE_FACTOR),
             strides=(stride_as_m, stride_as_k),
-            block_shape=(BLOCK_SIZE_M // 32, K_GROUPS * 32),
+            block_shape=(BLOCK_SIZE_M // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR),
             layout=shared_S,
         )
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=b_scale_ptr,
-        shape=(grid_n32, K_elems),
+        shape=(grid_n_bs, k_scale_cols * PRESHUFFLE_FACTOR),
         strides=(stride_bs_n, stride_bs_k),
-        block_shape=(BLOCK_SIZE_N // 32, K_GROUPS * 32),
+        block_shape=(BLOCK_SIZE_N // PRESHUFFLE_FACTOR, K_GROUPS * PRESHUFFLE_FACTOR),
         layout=shared_S,
     )
 
@@ -312,13 +326,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
                 (split_k0_bytes + k_tile_p * BLOCK_K_BYTES) * 16,
             ]
 
-            # Scale offsets are in groups-domain -> element-domain (groups*32)
+            # Scale offsets in preshuffled domain
             g0 = split_k0_groups + k_tile_p * K_GROUPS
             if BLOCK_SIZE_M < 32:
                 as_offs = [tile_m * BLOCK_SIZE_M, g0]
             else:
-                as_offs = [tile_m * (BLOCK_SIZE_M // 32), g0 * 32]
-            bs_offs = [tile_n * (BLOCK_SIZE_N // 32), g0 * 32]
+                as_offs = [tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
+            bs_offs = [tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
 
             gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
             gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
@@ -347,8 +361,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
         if BLOCK_SIZE_M < 32:
             as_offs = [tile_m * BLOCK_SIZE_M, g0]
         else:
-            as_offs = [tile_m * (BLOCK_SIZE_M // 32), g0 * 32]
-        bs_offs = [tile_n * (BLOCK_SIZE_N // 32), g0 * 32]
+            as_offs = [tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
+        bs_offs = [tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
 
         gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
         gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
@@ -369,15 +383,17 @@ def gemm_mxfp4_preshuffle_gfx1250(
                 smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
             ).load(layout=dot_b_layout)
 
-        # scales: unshuffle -> load with wmma scale layouts
+        # scales: unswizzle -> load with wmma scale layouts
         if BLOCK_SIZE_M < 32:
             AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
         else:
-            AS = unshuffle_scales_32(
-                smem_ASraw.index(slot_c), BLOCK_X=BLOCK_SIZE_M, K_GROUPS=K_GROUPS
+            AS = unswizzle_mx_scale_gfx1250(
+                smem_ASraw.index(slot_c), BLOCK_SIZE_M, K_GROUPS,
+                PRESHUFFLE_FACTOR, SCALE_KWIDTH,
             ).load(layout=a_scale_layout)
-        BS = unshuffle_scales_32(
-            smem_BSraw.index(slot_c), BLOCK_X=BLOCK_SIZE_N, K_GROUPS=K_GROUPS
+        BS = unswizzle_mx_scale_gfx1250(
+            smem_BSraw.index(slot_c), BLOCK_SIZE_N, K_GROUPS,
+            PRESHUFFLE_FACTOR, SCALE_KWIDTH,
         ).load(layout=b_scale_layout)
 
         acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
@@ -401,11 +417,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
             if BLOCK_SIZE_M < 32:
                 AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
             else:
-                AS = unshuffle_scales_32(
-                    smem_ASraw.index(slot_c), BLOCK_X=BLOCK_SIZE_M, K_GROUPS=K_GROUPS
+                AS = unswizzle_mx_scale_gfx1250(
+                    smem_ASraw.index(slot_c), BLOCK_SIZE_M, K_GROUPS,
+                    PRESHUFFLE_FACTOR, SCALE_KWIDTH,
                 ).load(layout=a_scale_layout)
-            BS = unshuffle_scales_32(
-                smem_BSraw.index(slot_c), BLOCK_X=BLOCK_SIZE_N, K_GROUPS=K_GROUPS
+            BS = unswizzle_mx_scale_gfx1250(
+                smem_BSraw.index(slot_c), BLOCK_SIZE_N, K_GROUPS,
+                PRESHUFFLE_FACTOR, SCALE_KWIDTH,
             ).load(layout=b_scale_layout)
 
             acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
