@@ -183,35 +183,29 @@ class AITER_CONFIG(object):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
-        source_pairs = []
+        df_list = []
         ## merge config files
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
         import pandas as pd
 
-        for i, path in enumerate(path_list):
-            if not os.path.exists(path):
-                logger.info(f"path {i+1}: {path} (not exist)")
-                continue
-
-            df = pd.read_csv(path)
-            if source_pairs:
-                base_path, base_df = source_pairs[0]
-                base_cols = [c for c in base_df.columns if c != "_tag"]
+        df_list.append(pd.read_csv(path_list[0]))
+        for i, path in enumerate(path_list[1:]):
+            if os.path.exists(path):
+                df = pd.read_csv(path)
+                base_cols = [c for c in df_list[0].columns if c != "_tag"]
                 new_cols = [c for c in df.columns if c != "_tag"]
-                if base_cols != new_cols:
-                    raise ValueError(
-                        f"Column mismatch between {base_path} and {path}, "
-                        f"{base_cols}, {new_cols}"
-                    )
+                assert (
+                    base_cols == new_cols
+                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
 
-            source_pairs.append((path, df))
-
-        if not source_pairs:
-            raise FileNotFoundError(
-                f"No existing config files found in '{file_path}' when merging '{merge_name}'."
-            )
-
-        merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
+                df_list.append(df)
+            else:
+                logger.info(f"path {i+1}: {path} (not exist)")
+        merge_df = (
+            pd.concat([df for df in df_list if not df.empty], ignore_index=True)
+            if df_list
+            else pd.DataFrame()
+        )
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
@@ -229,49 +223,17 @@ class AITER_CONFIG(object):
             if "cu_num" not in keys:
                 keys.append("cu_num")
             dedup_keys = keys + ["_tag"] if has_tag else keys
-            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
+            sorted_df = merge_df.sort_values("us")
+            duplicated_mask = sorted_df.duplicated(subset=dedup_keys, keep="first")
             if duplicated_mask.any():
-                dup_count = int(duplicated_mask.sum())
-                dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
-                if "us" not in merge_df.columns:
-                    raise RuntimeError(
-                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                        f"No 'us' column to determine best performing entry. "
-                        f"Please remove duplicates manually.\n"
-                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
-                    )
-
-                # Auto-dedup: globally determine best row (lowest 'us') per shape
-                best_row_index = set(
-                    merge_df.sort_values("us", kind="stable")
-                    .drop_duplicates(subset=dedup_keys, keep="first")
-                    .index
+                dup_rows = sorted_df[duplicated_mask]
+                logger.warning(
+                    f"Dropping {len(dup_rows)} duplicate rows during merge of '{merge_name}':\n"
+                    f"{dup_rows.to_string(index=False)}"
                 )
-
-                saved_files = []
-                offset = 0
-                for src_path, src_df in source_pairs:
-                    start, end = offset, offset + len(src_df)
-                    offset = end
-                    file_rows = merge_df.iloc[start:end]
-                    new_src_df = file_rows[
-                        file_rows.index.isin(best_row_index)
-                    ].reset_index(drop=True)
-                    if len(new_src_df) < len(src_df):
-                        new_src_df.to_csv(src_path, index=False)
-                        saved_files.append(
-                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
-                        )
-                saved_info = (
-                    "\n".join(saved_files) if saved_files else "  (no files updated)"
-                )
-                raise RuntimeError(
-                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
-                    f"Updated files:\n{saved_info}"
-                )
+            merge_df = sorted_df.drop_duplicates(
+                subset=dedup_keys, keep="first"
+            ).reset_index(drop=True)
         else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
@@ -1100,8 +1062,8 @@ def _ctypes_call(func, fc_name, md_name):
     ----------------------|----------------------|---------
     Tensor                | POINTER(aiter_tensor_t) | aiter_tensor_t*
     Optional[Tensor]      | POINTER(aiter_tensor_t) | aiter_tensor_t* (NULL if None)
-    int                   | c_int                | int
-    Optional[int]         | c_int                | int   (-1 if None)
+    int                   | c_int64              | int64_t
+    Optional[int]         | c_int64              | int64_t (-1 if None)
     str                   | c_char_p             | char* (.encode())
     Optional[str]         | c_char_p             | char* (NULL if None)
     bool                  | c_int                | int   (0 / 1)
@@ -1167,7 +1129,7 @@ def _ctypes_call(func, fc_name, md_name):
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
                 has_tensor = True
             elif _is_union(origin) and int in type_args:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
             elif hint is str:
@@ -1175,7 +1137,7 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
             elif hint is int:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif hint is float:
                 argtypes.append(ctypes.c_float)
             else:
@@ -1290,7 +1252,7 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 c_args.append(1 if value else 0)
             elif hint is int:
-                c_args.append(ctypes.c_int(value))
+                c_args.append(ctypes.c_int64(value))
             elif hint is float:
                 c_args.append(ctypes.c_float(value))
             else:
@@ -1418,6 +1380,7 @@ def compile_ops(
                         doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
                         doc_str = doc_str.replace("typing.SupportsInt", "int")
                         doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                        doc_str = re.sub(r"\s*\|\s*typing\.SupportsIndex", "", doc_str)
                         pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                         doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                         for el in enum_types:

@@ -24,4 +24,10 @@ void mhc_pre_big_fuse(torch::Tensor& post_mix,        // (m, hc_mult)
                       float hc_sinkhorn_eps    = 1e-6,
                       float hc_post_mult_value = 1.0,
                       int sinkhorn_repeat      = 20);
+void mhc_post(torch::Tensor& out,            // (m, hc_mult, hidden_size)
+              torch::Tensor& x,              // (m, hidden_size)
+              torch::Tensor& residual,       // (m, hc_mult, hidden_size)
+              torch::Tensor& post_layer_mix, // (m, hc_mult)
+              torch::Tensor& comb_res_mix    // (m, hc_mult, hc_mult)
+);
 } // namespace aiter
