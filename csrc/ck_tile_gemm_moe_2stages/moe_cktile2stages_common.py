@@ -227,6 +227,7 @@ a4w4_gemm1_kernels_list_gfx950= {
 # gemm2 out:bf16 AB:fp4/fp4 (MXFP4 quantized activations x MXFP4 weights)
 a4w4_gemm2_kernels_list_gfx950= {
     #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    # KPerBlock min=256 for fp4 (CK tile mixed_prec pipeline requires K1*K2=256)
     0: kernelInstance(       2,        256,       16,        128,       256,          16,         16,         128,          1,        4,            2,),
     1: kernelInstance(       2,        256,       32,        256,       256,          16,         16,         128,          1,        4,            2,),
     3: kernelInstance(       2,        256,       64,        256,       256,          16,         16,         128,          1,        4,            1,),
@@ -544,7 +545,8 @@ struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
 {{
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
-        // Apply shape heuristics to find a suitable kernel implementation.
+        // KPerBlock=256 is the minimum for fp4 (CK tile mixed_prec pipeline
+        // requires K1*K2=256). The kernel handles K < KPerBlock via masking.
         if (block_m == 16)
         {{
             return {(2, 0)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
