@@ -39,8 +39,8 @@
 #include <utility>
 
 // ---------------------------------------------------------------------------
-// AITER_CTYPES_ERROR_DEF -- place once at file scope in each .cu / .cpp that
-// is compiled into its own .so and called via ctypes.
+// AITER_CTYPES_ERROR_DEF -- place once at file scope in ONE translation unit
+// per shared object (.so) that is called via ctypes.
 // Requires: aiter_hip_common.h included first (provides AITER_C_ITFS).
 // Defines:
 //   - thread_local g_aiter_last_error  (TLS error storage)
@@ -49,7 +49,7 @@
 //   - extern "C" aiter_clear_last_error
 // ---------------------------------------------------------------------------
 #define AITER_CTYPES_ERROR_DEF                                                    \
-    static thread_local std::string g_aiter_last_error;                         \
+    thread_local std::string g_aiter_last_error;                                \
                                                                                 \
     AITER_C_ITFS int aiter_ctypes_abi_version()                                   \
     {                                                                           \
@@ -66,6 +66,13 @@
     {                                                                           \
         g_aiter_last_error.clear();                                             \
     }
+
+// ---------------------------------------------------------------------------
+// AITER_CTYPES_ERROR_DECL -- use in additional translation units within the
+// same .so when AITER_CTYPES_ERROR_DEF is defined elsewhere.
+// ---------------------------------------------------------------------------
+#define AITER_CTYPES_ERROR_DECL                                                   \
+    extern thread_local std::string g_aiter_last_error
 
 // ---------------------------------------------------------------------------
 // aiter_safe_call -- wraps a callable (typically a lambda) with try/catch.

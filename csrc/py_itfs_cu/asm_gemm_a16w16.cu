@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "aiter_ctypes_error.h"
 #include "asm_bf16gemm_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -192,7 +193,11 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
     return result.first->second.get();
 }
 
-AITER_C_ITFS void gemm_a16w16_asm(aiter_tensor_t* A,
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    gemm_a16w16_asm,
+    (aiter_tensor_t* A,
                      aiter_tensor_t* B,
                      aiter_tensor_t* out,
                      aiter_tensor_t* semaphore,
@@ -200,7 +205,8 @@ AITER_C_ITFS void gemm_a16w16_asm(aiter_tensor_t* A,
                      int          splitK,
                      const char*  kernelName,
                      int          bpreshuffle,
-                     hipStream_t  stream)
+                     hipStream_t  stream),
+    (A, B, out, semaphore, bias, splitK, kernelName, bpreshuffle, stream))
 {
     AITER_CHECK(A->dtype() == AITER_DTYPE_bf16 || A->dtype() == AITER_DTYPE_fp16,
                 "GEMM A16W16 asm: A must be Bf16 or Fp16, got ", AiterDtype_to_str(A->dtype()));
@@ -262,5 +268,5 @@ AITER_C_ITFS void gemm_a16w16_asm(aiter_tensor_t* A,
 
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
-
+    return 0;
 }

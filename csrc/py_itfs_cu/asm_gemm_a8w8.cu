@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "aiter_ctypes_error.h"
 #include "asm_i8gemm_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -121,7 +122,11 @@ static std::tuple<std::string, int> get_heuristic_kernel(
     return std::make_tuple(selectedKernelName, selectedsplitK);
 }
 
-AITER_C_ITFS void gemm_a8w8_asm(
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    gemm_a8w8_asm,
+    (
     aiter_tensor_t* A,       // A:[M, K] i8
     aiter_tensor_t* B,       // B:[N, K] i8 -> shuffle layout(32,16)
     aiter_tensor_t* A_scale, // A_scale:[M, 1] f32
@@ -131,7 +136,8 @@ AITER_C_ITFS void gemm_a8w8_asm(
     aiter_tensor_t* bias,    // bias:[1, N] f32
     int          bpreshuffle,
     int          splitK,
-    hipStream_t  stream)
+    hipStream_t  stream),
+    (A, B, A_scale, B_scale, out, kernelName, bias, bpreshuffle, splitK, stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16,
                 "GEMM A8W8 asm only support BFloat16 output now!");
@@ -273,4 +279,5 @@ AITER_C_ITFS void gemm_a8w8_asm(
                              1,
                              1,
                              stream});
+    return 0;
 }

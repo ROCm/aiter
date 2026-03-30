@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "aiter_ctypes_error.h"
 #include "asm_fmoe_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -333,7 +334,11 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& ava
     return selectedTile;
 };
 
-AITER_C_ITFS void fmoe(
+AITER_CTYPES_ERROR_DECL;
+
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    fmoe,
+    (
     aiter_tensor_t* out,               // [token_cnt, dim]
     aiter_tensor_t* input,             // [token_cnt, dim] M,K
     aiter_tensor_t* gate,              // [expert, inter_dim, dim] N,K
@@ -343,7 +348,8 @@ AITER_C_ITFS void fmoe(
     aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
     aiter_tensor_t* num_valid_ids,     // [1]
     int topk,
-    hipStream_t stream)
+    hipStream_t stream),
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     // g1u0
@@ -374,9 +380,12 @@ AITER_C_ITFS void fmoe(
                                   nullptr,
                                   nullptr,
                                   stream);
+    return 0;
 }
 
-AITER_C_ITFS void fmoe_int8_g1u0(
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    fmoe_int8_g1u0,
+    (
     aiter_tensor_t* out,               // [token_cnt, dim]
     aiter_tensor_t* input,             // [token_cnt, dim] M,K
     aiter_tensor_t* gate,              // [expert, inter_dim, dim] N,K
@@ -391,7 +400,8 @@ AITER_C_ITFS void fmoe_int8_g1u0(
     aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
-    hipStream_t stream)
+    hipStream_t stream),
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, fc2_smooth_scale, activation, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -497,9 +507,12 @@ AITER_C_ITFS void fmoe_int8_g1u0(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
+    return 0;
 }
 
-AITER_C_ITFS void fmoe_g1u1(
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    fmoe_g1u1,
+    (
     aiter_tensor_t* out,               // [token_cnt, dim]
     aiter_tensor_t* input,             // [token_cnt, dim] M,K
     aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
@@ -515,7 +528,8 @@ AITER_C_ITFS void fmoe_g1u1(
     const char* kernel_name,
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
-    hipStream_t stream)
+    hipStream_t stream),
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -634,9 +648,12 @@ AITER_C_ITFS void fmoe_g1u1(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
+    return 0;
 }
 
-AITER_C_ITFS void fmoe_g1u1_tkw1(
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    fmoe_g1u1_tkw1,
+    (
     aiter_tensor_t* out,               // [token_cnt, dim]
     aiter_tensor_t* input,             // [token_cnt, dim] M,K
     aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
@@ -652,7 +669,8 @@ AITER_C_ITFS void fmoe_g1u1_tkw1(
     const char* kernel_name,
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
-    hipStream_t stream)
+    hipStream_t stream),
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -701,9 +719,12 @@ AITER_C_ITFS void fmoe_g1u1_tkw1(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
+    return 0;
 }
 
-AITER_C_ITFS void fmoe_int8_g1u0_a16(
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    fmoe_int8_g1u0_a16,
+    (
     aiter_tensor_t* out,               // [token_cnt, dim]
     aiter_tensor_t* input,             // [token_cnt, dim] M,K
     aiter_tensor_t* gate,              // [expert, inter_dim, dim] N,K
@@ -718,7 +739,8 @@ AITER_C_ITFS void fmoe_int8_g1u0_a16(
     aiter_tensor_t* fc1_smooth_scale,  // [expert, 1, dim]
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
-    hipStream_t stream)
+    hipStream_t stream),
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, activation, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -759,9 +781,12 @@ AITER_C_ITFS void fmoe_int8_g1u0_a16(
                                         fc2_scale,
                                         fc2_smooth_scale,
                                         stream);
+    return 0;
 }
 
-AITER_C_ITFS void fmoe_g1u1_a16(
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    fmoe_g1u1_a16,
+    (
     aiter_tensor_t* out,               // [token_cnt, dim]
     aiter_tensor_t* input,             // [token_cnt, dim] M,K
     aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
@@ -776,7 +801,8 @@ AITER_C_ITFS void fmoe_g1u1_a16(
     aiter_tensor_t* fc1_smooth_scale,  // [expert, 1, dim]
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
-    hipStream_t stream)
+    hipStream_t stream),
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, activation, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -832,9 +858,12 @@ AITER_C_ITFS void fmoe_g1u1_a16(
                                         fc2_scale,
                                         fc2_smooth_scale,
                                         stream);
+    return 0;
 }
 
-AITER_C_ITFS void fmoe_fp8_blockscale_g1u1(
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    fmoe_fp8_blockscale_g1u1,
+    (
     aiter_tensor_t* out,               // [token_cnt, dim]
     aiter_tensor_t* input,             // [token_cnt, dim] M,K
     aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
@@ -853,7 +882,8 @@ AITER_C_ITFS void fmoe_fp8_blockscale_g1u1(
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     int block_size_M,
-    hipStream_t stream)
+    hipStream_t stream),
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc_scale_blkn, fc_scale_blkk, fc2_smooth_scale, activation, block_size_M, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -895,4 +925,5 @@ AITER_C_ITFS void fmoe_fp8_blockscale_g1u1(
     }
     else
         AITER_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
+    return 0;
 }

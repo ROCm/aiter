@@ -1121,13 +1121,16 @@ def _ctypes_call(func, fc_name, md_name):
 
         hints = typing.get_type_hints(func)
 
-        ret_hint = hints.get("return")
-        if ret_hint is int:
-            c_func.restype = ctypes.c_int
-        elif ret_hint is float:
-            c_func.restype = ctypes.c_float
-        else:
-            c_func.restype = None
+        # In ctypes status mode, C API return value is always int status.
+        # Keep restype as c_int regardless of Python annotation (often -> None).
+        if not ctypes_status_mode:
+            ret_hint = hints.get("return")
+            if ret_hint is int:
+                c_func.restype = ctypes.c_int
+            elif ret_hint is float:
+                c_func.restype = ctypes.c_float
+            else:
+                c_func.restype = None
 
         argtypes = []
         has_tensor = False
@@ -1300,11 +1303,10 @@ def _ctypes_call(func, fc_name, md_name):
                 if err_clear is not None:
                     err_clear()
                 raise RuntimeError(f"{fc_name} failed: {msg}")
-        if _cache.get("has_tensor"):
-            c_args.append(
-                ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-            )
-        return c_func(*c_args)
+        if ctypes_status_mode:
+            # C-ABI status mode: return code is internal status only.
+            return None
+        return ret
 
     return caller
 
