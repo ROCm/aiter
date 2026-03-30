@@ -27,12 +27,12 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
-    if installed_flydsl_version != _REQUIRED_FLYDSL_VERSION:
-        raise ImportError(
-            "Unsupported `flydsl` version: "
-            f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
-            f"got `{installed_flydsl_version}`."
-        )
+    # if installed_flydsl_version != _REQUIRED_FLYDSL_VERSION:
+    #     raise ImportError(
+    #         "Unsupported `flydsl` version: "
+    #         f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
+    #         f"got `{installed_flydsl_version}`."
+    #     )
 
     from .gemm_kernels import (
         flydsl_preshuffle_gemm_a8,
