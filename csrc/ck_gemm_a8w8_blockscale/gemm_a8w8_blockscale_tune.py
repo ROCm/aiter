@@ -207,6 +207,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         useSplitK,
         seed,
         preshuffleB,
+        run_kwargs,
     ):
         cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
@@ -252,7 +253,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             splitK,
                             preshuffleB,
                         ),
-                        {},
+                        run_kwargs,
                         run_torch,
                         (
                             ref_data_idx,
@@ -273,6 +274,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         useSplitK,
         seed,
         preshuffleB,
+        run_kwargs,
     ):
         cu_num, M, N, K = info_keys
         kernel_list = (
@@ -312,7 +314,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             splitK,
                             preshuffleB,
                         ),
-                        {},
+                        run_kwargs,
                         run_torch,
                         (
                             ref_data_idx,
@@ -328,9 +330,13 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         return tasks_ck
 
     def run_config(self, args):
-        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale,
+            gemm_a8w8_blockscale_bpreshuffle,
+        )
         from aiter.test_common import run_perftest, checkAllclose
 
+        is_preshuffle = args.preshuffle
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
@@ -342,15 +348,26 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t = (
                     generate_data(M, N, K, 0)
                 )
-                out, us = run_perftest(
-                    gemm_a8w8_blockscale,
-                    x,
-                    weight,
-                    x_scale,
-                    w_scale,
-                    num_warmup=args.warmup,
-                    num_iters=args.iters,
-                )
+                if is_preshuffle:
+                    out, us = run_perftest(
+                        gemm_a8w8_blockscale_bpreshuffle,
+                        x,
+                        weight_shuffle,
+                        x_scale_t,
+                        w_scale,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
+                else:
+                    out, us = run_perftest(
+                        gemm_a8w8_blockscale,
+                        x,
+                        weight,
+                        x_scale,
+                        w_scale,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
                 ref = run_torch(x, weight, x_scale, w_scale)
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
                 status = "ok" if err_ratio <= args.errRatio else "mismatch"
@@ -371,6 +388,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         shape_grouped = False
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        run_kwargs = {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+        }
         task = []
         tasks_data = []  # [(kernel_nums, datas)]
         seed = 10000
@@ -385,25 +406,41 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             if args.libtype == "ck" or args.libtype == "both":
                 task.extend(
                     self.get_gemm_a8w8_blockscale_tune_task(
-                        info_keys, useSplitK, seed, isPreshuffleB
+                        info_keys,
+                        useSplitK,
+                        seed,
+                        isPreshuffleB,
+                        run_kwargs,
                     )
                 )
             if args.libtype == "cktile" or args.libtype == "both":
                 task.extend(
                     self.get_gemm_a8w8_blockscale_cktile_tune_task(
-                        info_keys, useSplitK, seed, isPreshuffleB
+                        info_keys,
+                        useSplitK,
+                        seed,
+                        isPreshuffleB,
+                        run_kwargs,
                     )
                 )
             if args.libtype == "all":
                 for preshuffleB in [True, False]:
                     task.extend(
                         self.get_gemm_a8w8_blockscale_cktile_tune_task(
-                            info_keys, useSplitK, seed, preshuffleB
+                            info_keys,
+                            useSplitK,
+                            seed,
+                            preshuffleB,
+                            run_kwargs,
                         )
                     )
                     task.extend(
                         self.get_gemm_a8w8_blockscale_tune_task(
-                            info_keys, useSplitK, seed, preshuffleB
+                            info_keys,
+                            useSplitK,
+                            seed,
+                            preshuffleB,
+                            run_kwargs,
                         )
                     )
             total_kernel_nums = len(task)
@@ -411,7 +448,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
-            ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped, errRatio)
+            ret = mp_tuner(
+                task,
+                tasks_data,
+                mp_num,
+                False,
+                shape_grouped,
+                errRatio,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
         # print(ret)
         return ret
 

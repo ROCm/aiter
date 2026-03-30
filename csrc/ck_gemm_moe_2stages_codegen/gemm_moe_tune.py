@@ -22,7 +22,9 @@ from aiter.fused_moe import (
     torch_moe,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_weight,
+)
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
     rearrange_4bit_elements,
@@ -348,12 +350,11 @@ class FmoeTuner(TunerCommon):
     def run_flydsl_stage1_out(
         a1_qt,
         w1_qt_shffle_ck,
-        w2_qt_shffle_ck,
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
         num_valid_ids,
-        w1_scale,
+        w1_scale_aiter,
         a1_scale,
         dtype,
         topk,
@@ -362,6 +363,7 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
+        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
         return flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_qt_shffle_ck,
@@ -375,7 +377,8 @@ class FmoeTuner(TunerCommon):
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
-            w1_scale=w1_scale,
+            act=act,
+            w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
         )
@@ -383,15 +386,13 @@ class FmoeTuner(TunerCommon):
     @staticmethod
     def run_flydsl_stage2_out(
         a2_qt,
-        w1_qt,
-        w2_shuffled,
+        w2_shuffled_flydsl,
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
         num_valid_ids,
-        w2_scale_shuffled,
+        w2_scale_shuffled_flydsl,
         a2_scale,
-        moe_buf,
         dtype,
         topk,
         kparams,
@@ -401,11 +402,10 @@ class FmoeTuner(TunerCommon):
     ):
         return flydsl_moe_stage2(
             inter_states=a2_qt,
-            w2=w2_shuffled,
+            w2=w2_shuffled_flydsl,
             sorted_token_ids=sorted_ids,
             sorted_expert_ids=sorted_expert_ids,
             num_valid_ids=num_valid_ids,
-            out=moe_buf,
             topk=topk,
             tile_m=kparams["tile_m"],
             tile_n=kparams["tile_n"],
@@ -414,7 +414,7 @@ class FmoeTuner(TunerCommon):
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
             mode=kparams.get("mode", "atomic"),
-            w2_scale=w2_scale_shuffled,
+            w2_scale=w2_scale_shuffled_flydsl,
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
         )
@@ -853,6 +853,11 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_ck = w2_qt_shffle
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+
+        w1_qt_shffle_flydsl = w1_qt_shffle_ck
+        w2_qt_shffle_flydsl = w2_qt_shffle_ck
+        w1_scale_flydsl = w1_scale_aiter
+        w2_scale_flydsl = w2_scale_aiter
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
@@ -883,7 +888,11 @@ class FmoeTuner(TunerCommon):
                 topk_weights,  # 12
                 topk_ids,  # 13
                 a1_scale_fp4_sort,  # 14
-                w1_scale_aiter,
+                w1_scale_aiter,  # 15
+                w1_qt_shffle_flydsl,  # 16
+                w2_qt_shffle_flydsl,  # 17
+                w1_scale_flydsl,  # 18
+                w2_scale_flydsl,  # 19
             )
         elif stage == 2:
             ref1 = FmoeTuner.run_torch_moe_stage1(
@@ -950,7 +959,11 @@ class FmoeTuner(TunerCommon):
                 topk_weights,  # 12
                 topk_ids,  # 13
                 a2_scale_mxfp4_sort,  # 14
-                w2_scale_aiter,
+                w2_scale_aiter,  # 15
+                w1_qt_shffle_flydsl,  # 16
+                w2_qt_shffle_flydsl,  # 17
+                w1_scale_flydsl,  # 18
+                w2_scale_flydsl,  # 19
             )
 
     @staticmethod
@@ -1954,18 +1967,16 @@ class FmoeTuner(TunerCommon):
         b_dtype_str = "fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
-        if a_dtype_str != "fp4":
-            flydsl_s1_kernels = get_flydsl_stage1_kernels(
-                a_dtype_str, b_dtype_str, out_dtype_str
-            )
-        else:
-            # TODO: stage1 support fp4
-            flydsl_s1_kernels = {}
+        flydsl_s1_kernels = get_flydsl_stage1_kernels(
+            a_dtype_str, b_dtype_str, out_dtype_str
+        )
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
         )
 
         for blockM in blockMs:
+            # per_1x32 fp4 sorting requires block size to be a multiple of 32, so
+            # the tile_m=16 FlyDSL candidate is invalid for this tuning path.
             if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
@@ -1993,7 +2004,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage1_out,
                         (
-                            [0, 1, 2, 5, 6, 7, 8, 15, 14],
+                            [0, 1, 5, 6, 7, 8, 15, 14],
                             dtype,
                             topk,
                             kparams,
@@ -2044,7 +2055,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 10, 2, 5, 6, 7, 8, 15, 14, 9],
+                            [0, 17, 5, 6, 7, 8, 19, 14],
                             dtype,
                             topk,
                             kparams,

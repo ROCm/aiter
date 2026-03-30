@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import functools
 import os
 import re
@@ -27,6 +27,7 @@ GFX_MAP = {
     15: "gfx1153",
     16: "gfx1200",
     17: "gfx1201",
+    18: "gfx1250",
 }
 
 

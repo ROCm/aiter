@@ -3,7 +3,7 @@
 import torch
 from ..jit.utils.chip_info import get_gfx
 from ..ops.enum import QuantType, ActivationType
-from .aiter_types import aiter_dtypes, AiterTensor
+from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
 
 defaultDtypes = {
@@ -40,13 +40,15 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
-def torch_to_aiter(tensor: torch.Tensor) -> AiterTensor:
-    """torch.Tensor -> AiterTensor, zero-copy, points to the same GPU memory."""
-    assert tensor.is_cuda, "AiterTensor only supports CUDA tensors"
-    assert tensor.ndim <= 8, f"AiterTensor supports at most 8 dims, got {tensor.ndim}"
+def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
+    """torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
+    assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
+    assert (
+        tensor.ndim <= 8
+    ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
     assert tensor.dtype in _torch_to_aiter_dtype, f"Unsupported dtype: {tensor.dtype}"
 
-    at = AiterTensor()
+    at = aiter_tensor_t()
     at.ptr = tensor.data_ptr()
     at.numel_ = tensor.numel()
     at.ndim = tensor.ndim

@@ -5,7 +5,6 @@
 
 import functools
 from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -44,7 +43,6 @@ def _fwd_kernel_stage2_asm(
     cur_split_end = tl.load(num_kv_splits_indptr + cur_batch + 1)
     num_max_kv_splits = tl.load(num_kv_splits_indptr + BATCH_NUM)
     cur_kv_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
-
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
 
@@ -135,6 +133,11 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         num_kv_splits = min(
             num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
         )
+        if num_kv_splits > 1:
+            num_kv_splits = min(
+                num_kv_splits,
+                (abs(total_kv / bs - max_seqlen_q) // min_block_n + 1),
+            )
 
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
@@ -188,6 +191,7 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     io_transformed = False
+    qseqlen_folded = False
 
     if not persistent_mode:
         if num_kv_splits is None or num_kv_splits_indptr is None:
@@ -196,6 +200,13 @@ def mla_decode_fwd(
             )
 
         mgc = 64 if max_seqlen_q == 1 and nhead == 16 else 16
+        mgc = (
+            32
+            if (
+                nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
+            )
+            else mgc
+        )
 
         MAYBE_FINAL_OUT = True
 
@@ -307,9 +318,22 @@ def mla_decode_fwd(
         elif nhead in range(32, 128 + 1, 16) and persistent_mode:
             # we use nhead=16 to simulate such cases by customized metadata
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-            total_s = ori_total_s * (ori_nhead // 16)
+            fold_factor = ori_nhead // 16
+            use_qseqlen_fold = (
+                get_gfx() == "gfx950"
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q * fold_factor == 4
+            )
+
+            total_s = ori_total_s * fold_factor
             nhead = 16
-            if max_seqlen_q == 1:
+
+            if use_qseqlen_fold:
+                max_seqlen_q = max_seqlen_q * fold_factor
+                q = q.view(total_s, nhead, -1)
+                qseqlen_folded = True
+            elif max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
             else:
                 q = (
@@ -409,7 +433,7 @@ def mla_decode_fwd(
         if return_logits:
             logits = logits.view(-1, 1, ori_nhead, v_head_dim)
 
-        if max_seqlen_q == 1:
+        if max_seqlen_q == 1 or qseqlen_folded:
             q = q.view(ori_total_s, ori_nhead, -1)
             o = o.view(ori_total_s, ori_nhead, -1)
             if final_lse is not None:
