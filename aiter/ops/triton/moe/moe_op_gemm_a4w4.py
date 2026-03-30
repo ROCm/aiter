@@ -370,6 +370,7 @@ def moe_gemm_a4w4(
     limit=1.0,
     unpadded_N=None,
     unpadded_K=None,
+    config=None,
     backend: Optional[Literal["triton", "gluon"]] = None,
 ):
     """
@@ -408,7 +409,8 @@ def moe_gemm_a4w4(
     if unpadded_K and block_m == 16:
         K = unpadded_K
     # compute optimization flags
-    config = get_kernel_config(M, N, K, routing_data, use_gluon=use_gluon)
+    if config is None:
+        config = get_kernel_config(M, N, K, routing_data, use_gluon=use_gluon)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
