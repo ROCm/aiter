@@ -116,5 +116,42 @@ class SetupAgent(BaseSubagent):
            - Persist via ``self._write_json_artifact("setup_info.json", ...)``.
            - Return the dict so the orchestrator can log it.
         """
-        # TODO: implement steps above
-        return {"status": "not_implemented"}
+        executor = self.executor
+        repo_config = self.repo_config
+        triton_install_config = self.triton_install_config
+
+        # Step 1: Create container on the remote machine.
+        if self.run_script:
+            executor.create_container(image=self.image, run_script=self.run_script)
+        else:
+            executor.create_container(image=self.image, name=f"tuning-{self.kernel_name}")
+
+        # Step 2: Clone aiter repo inside the container.
+        executor.docker_exec(
+            f"git clone --branch {repo_config.aiter_branch} --single-branch"
+            f" {repo_config.aiter_repo} /workspace/aiter"
+        )
+
+        # Step 3: Clone triton repo inside the container.
+        executor.docker_exec(
+            f"git clone --branch {repo_config.triton_branch} --single-branch"
+            f" {repo_config.triton_repo} /workspace/triton"
+        )
+
+        # Step 4: Install triton.
+        executor.docker_exec(
+            f"cd /workspace/triton && {triton_install_config.command}"
+        )
+
+        # Step 5: Install aiter.
+        executor.docker_exec("cd /workspace/aiter && pip install -e .")
+
+        # Step 6: Verify environment.
+        env_info = executor.verify_environment()
+
+        # Step 7: Return result.
+        return {
+            "container_id": executor.container_id,
+            "triton_version": env_info["triton_version"],
+            "aiter_branch": env_info["aiter_branch"],
+        }
