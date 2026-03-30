@@ -569,5 +569,8 @@ def moe_mxfp4_sort(
         TOPK=topk,
     )
 
-    # Reshape the output to the final shape
-    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)
+    # Reshape output to block-aligned N dimension.
+    # The sort kernel stores data in BLOCK_SIZE_N=8-wide blocks, so the
+    # view's column count must be 8-aligned for correct strides.
+    N_o_aligned = triton.cdiv(N_o, BLOCK_SIZE_N) * BLOCK_SIZE_N
+    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o_aligned)
