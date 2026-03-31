@@ -30,7 +30,9 @@ def parse_args():
         default="",
         help="Comma-separated job names to skip.",
     )
-    parser.add_argument("--out-matrix", required=True, help="Output path for matrix JSON.")
+    parser.add_argument(
+        "--out-matrix", required=True, help="Output path for matrix JSON."
+    )
     parser.add_argument(
         "--out-workflow-map",
         required=True,
@@ -45,16 +47,8 @@ def parse_csv(raw: str):
 
 def discover_workflows(workflow_dir: Path):
     return sorted(
-        [
-            path.name
-            for path in workflow_dir.glob("*.yml")
-            if path.is_file()
-        ]
-        + [
-            path.name
-            for path in workflow_dir.glob("*.yaml")
-            if path.is_file()
-        ]
+        [path.name for path in workflow_dir.glob("*.yml") if path.is_file()]
+        + [path.name for path in workflow_dir.glob("*.yaml") if path.is_file()]
     )
 
 
@@ -89,7 +83,9 @@ def main():
         for job in jobs:
             matrix.append({"workflow": workflow_file, "job_name": job})
 
-    Path(args.out_matrix).write_text(json.dumps(matrix, ensure_ascii=False), encoding="utf-8")
+    Path(args.out_matrix).write_text(
+        json.dumps(matrix, ensure_ascii=False), encoding="utf-8"
+    )
     Path(args.out_workflow_map).write_text(
         json.dumps(workflow_map, ensure_ascii=False), encoding="utf-8"
     )

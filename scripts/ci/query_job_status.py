@@ -14,14 +14,18 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Query GitHub Actions jobs and print status summary."
     )
-    parser.add_argument("--repo", required=True, help="GitHub repository in owner/repo format.")
+    parser.add_argument(
+        "--repo", required=True, help="GitHub repository in owner/repo format."
+    )
     parser.add_argument(
         "--workflows",
         required=True,
         help="Comma-separated workflow file names.",
     )
     parser.add_argument("--job", default="", help="Optional exact job name filter.")
-    parser.add_argument("--hours", type=int, default=24, help="Lookback window in hours.")
+    parser.add_argument(
+        "--hours", type=int, default=24, help="Lookback window in hours."
+    )
     parser.add_argument(
         "--runner-report",
         action="store_true",
@@ -58,7 +62,9 @@ def split_csv(raw: str):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-def list_recent_runs(owner: str, repo: str, workflow: str, token: str, lookback: datetime):
+def list_recent_runs(
+    owner: str, repo: str, workflow: str, token: str, lookback: datetime
+):
     page = 1
     while True:
         payload = github_get(
@@ -172,7 +178,9 @@ def main():
 
     if args.runner_report:
         rows = []
-        for (workflow, runner_name, runner_group), counts in sorted(runner_stats.items()):
+        for (workflow, runner_name, runner_group), counts in sorted(
+            runner_stats.items()
+        ):
             rows.append(
                 [
                     workflow,
