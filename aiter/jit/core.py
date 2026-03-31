@@ -194,28 +194,9 @@ class AITER_CONFIG(object):
                 df = pd.read_csv(path)
                 base_cols = [c for c in df_list[0].columns if c != "_tag"]
                 new_cols = [c for c in df.columns if c != "_tag"]
-                if base_cols != new_cols:
-                    is_flydsl_gemm_cfg = (
-                        merge_name == "bf16_tuned_gemm"
-                        and path.endswith("_flydsl_bf16_tuned_gemm.csv")
-                        and set(base_cols).issubset(new_cols)
-                    )
-                    if is_flydsl_gemm_cfg:
-                        keep_cols = base_cols + (
-                            ["_tag"] if "_tag" in df.columns else []
-                        )
-                        dropped_cols = [c for c in df.columns if c not in keep_cols]
-                        logger.info(
-                            "Projecting FlyDSL GEMM config %s during merge of '%s'; dropped columns: %s",
-                            path,
-                            merge_name,
-                            dropped_cols,
-                        )
-                        df = df[keep_cols].copy()
-                    else:
-                        assert (
-                            base_cols == new_cols
-                        ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
+                assert (
+                    base_cols == new_cols
+                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
 
                 df_list.append(df)
             else:

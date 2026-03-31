@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from itertools import product
+from typing import Dict, Optional
 
 import torch
 
 from ..shuffle import shuffle_weight
 from .kernels.splitk_hgemm import compile_hgemm_kernel
+
+from aiter.jit.utils.chip_info import get_gfx
 
 __all__ = [
     "flydsl_hgemm",
@@ -20,6 +23,123 @@ SPLIT_K_COUNTER_MAX_LEN = 128
 SPLIT_K_SIGNAL_STATE_COUNT = 3
 SPLIT_K_GLOBAL_SEMAPHORE: dict[torch.device, torch.Tensor] = {}
 SPLIT_K_GLOBAL_SEMAPHORE_STATE: dict[torch.device, int] = {}
+
+
+_SPLITK_HGEMM_KERNELS: Dict[str, Dict] = {}
+
+
+def flydsl_kernel_name(
+    stage: int,
+    dtype: str,
+    out_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    split_k: int,
+    block_m_warp: int,
+    block_n_warp: int,
+    async_copy: bool,
+    b_to_lds: bool,
+    b_preshuffle: bool,
+    c_to_lds: bool,
+) -> str:
+    """Construct kernel name: flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}]."""
+    name = (
+        f"flydsl_gemm{stage}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
+    )
+    name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}"
+    name += f"_async_copy{async_copy}_b_to_lds{b_to_lds}_b_preshuffle{b_preshuffle}_c_to_lds{c_to_lds}"
+    name += f"_{get_gfx()}"
+    return name
+
+
+def get_flydsl_splitk_hgemm_kernel_params(name: str) -> Optional[Dict]:
+    """Lookup kernel params by name (O(1))."""
+    return _SPLITK_HGEMM_KERNELS.get(name)
+
+
+def get_flydsl_splitk_hgemm_kernels(dtype: str, out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for all supported configs."""
+    kernels = {}
+    tile_ns = [64, 128, 256]
+    tile_ks = [64, 128]
+    tile_ms = [16, 32, 48, 64, 96, 128]
+    split_ks = [1, 2, 4, 8]
+    stages = [1, 2]
+    block_m_warps = [1]
+    block_n_warps = [4]
+    async_copy = [True, False]
+    b_to_lds = [True, False]
+    b_preshuffle = [True, False]
+    c_to_lds = [True, False]
+
+    for (
+        tile_m,
+        tile_n,
+        tile_k,
+        split_k,
+        stage,
+        block_m_warp,
+        block_n_warp,
+        use_async_copy,
+        use_b_to_lds,
+        use_b_preshuffle,
+        use_c_to_lds,
+    ) in product(
+        tile_ms,
+        tile_ns,
+        tile_ks,
+        split_ks,
+        stages,
+        block_m_warps,
+        block_n_warps,
+        async_copy,
+        b_to_lds,
+        b_preshuffle,
+        c_to_lds,
+    ):
+        params = {
+            "stage": stage,
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "tile_k": tile_k,
+            "split_k": split_k,
+            "block_m_warps": block_m_warp,
+            "block_n_warps": block_n_warp,
+            "async_copy": use_async_copy,
+            "b_to_lds": use_b_to_lds,
+            "b_preshuffle": use_b_preshuffle,
+            "c_to_lds": use_c_to_lds,
+        }
+        name = flydsl_kernel_name(
+            stage,
+            dtype,
+            out_dtype,
+            tile_m,
+            tile_n,
+            tile_k,
+            split_k,
+            block_m_warp,
+            block_n_warp,
+            use_async_copy,
+            use_b_to_lds,
+            use_b_preshuffle,
+            use_c_to_lds,
+        )
+        kernels[name] = params
+    return kernels
+
+
+def _register_all_configs():
+    """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
+    for dtype in ("bf16", "f16"):
+        for out_dtype in ("f16", "bf16"):
+            _SPLITK_HGEMM_KERNELS.update(
+                get_flydsl_splitk_hgemm_kernels(dtype, out_dtype)
+            )
+
+
+_register_all_configs()
 
 
 def _to_kernel_dtype(dtype: torch.dtype) -> str:
