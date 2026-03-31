@@ -9,7 +9,8 @@
     "num_stages": 2,
     "waves_per_eu": 1,
     "matrix_instr_nonkdim": 16,
-    "cache_modifier": null
+    "cache_modifier": null,
+    "NUM_BUFFERS": 2
   },
   "any": {
     "BLOCK_SIZE_M": 128,
@@ -21,6 +22,7 @@
     "num_stages": 2,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
-    "cache_modifier": null
+    "cache_modifier": null,
+    "NUM_BUFFERS": 2
   }
 }

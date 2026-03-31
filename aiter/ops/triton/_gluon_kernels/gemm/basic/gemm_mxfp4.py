@@ -370,8 +370,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
         gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
         k_tile_load_idx += 1
-        # Compute: wait for data we’re about to use
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        # Wait for current tile’s data (4 TDM ops per tile)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
 
         slot_c = k_tile_compute_idx % NUM_BUFFERS
 
@@ -404,9 +404,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         if k_tile_compute_idx < k_tiles:
             slot_c = k_tile_compute_idx % NUM_BUFFERS
 
-            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
-
-            slot_c = k_tile_compute_idx % NUM_BUFFERS
+            gl.amd.gfx1250.tdm.async_wait(0)
 
             A = smem_A.index(slot_c).load(layout=dot_a_layout)
 

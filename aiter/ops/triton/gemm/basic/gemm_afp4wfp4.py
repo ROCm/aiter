@@ -528,7 +528,6 @@ def gemm_afp4wfp4_preshuffle(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
-        NUM_BUFFERS=2,
         **config,
         **layouts,
         )
