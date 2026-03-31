@@ -472,6 +472,7 @@ class TestThresholdFiltering(unittest.TestCase):
         executor.docker_exec.side_effect = [
             _completed(stdout="/scout/screen-0.log"),
             _completed(stdout=log_lines),
+            _completed(stdout=""),                       # write artifact
         ]
         agent = _make_agent(executor=executor)
         result = agent._execute()
@@ -534,6 +535,7 @@ class TestHistoricalDataWeight(unittest.TestCase):
             _completed(stdout="/scout/screen-0.log"),   # ls scout
             _completed(stdout=scout_log),               # cat scout
             _completed(stdout=history_json),            # cat history/patterns.json
+            _completed(stdout=""),                      # write artifact
         ]
         agent = _make_agent(executor=executor, history_dir="/history")
         result = agent._execute()
@@ -751,14 +753,13 @@ class TestExecuteWritesArtifact(unittest.TestCase):
         executor.docker_exec.side_effect = [
             _completed(stdout="/scout/screen-0.log"),
             _completed(stdout=SCREEN_LOG_TWO_CONFIGS),
+            _completed(stdout=""),  # write artifact via docker_exec
         ]
-        # ssh_run is called by _write_json_artifact; return a successful result.
-        executor.ssh_run.return_value = _completed(stdout="")
         agent = _make_agent(executor=executor)
         agent._execute()
 
-        # _write_json_artifact calls ssh_run with "printf '%s' ... > <path>".
-        calls = executor.ssh_run.call_args_list
+        # _write_json_artifact calls docker_exec with "printf '%s' ... > <path>".
+        calls = executor.docker_exec.call_args_list
         artifact_calls = [c for c in calls if "printf" in str(c)]
         self.assertGreater(len(artifact_calls), 0)
 
@@ -793,6 +794,7 @@ class TestExecuteRunMethod(unittest.TestCase):
         executor.ssh_run = MagicMock(return_value=_completed(stdout=""))
         executor.kill_stale_gpu_processes = MagicMock(return_value=[])
         executor.docker_exec.side_effect = [
+            _completed(stdout=""),                # mkdir (preflight)
             _completed(returncode=1, stdout=""),  # ls — no files
             _completed(stdout=""),                # write artifact
         ]
@@ -806,6 +808,7 @@ class TestExecuteRunMethod(unittest.TestCase):
         executor.ssh_run = MagicMock(return_value=_completed(stdout=""))
         executor.kill_stale_gpu_processes = MagicMock(return_value=[])
         executor.docker_exec.side_effect = [
+            _completed(stdout=""),                # mkdir (preflight)
             _completed(returncode=1, stdout=""),  # ls — no files
             _completed(stdout=""),                # write artifact
         ]

@@ -420,9 +420,15 @@ class TestExecuteSavesArtifact(unittest.TestCase):
         def _side_effect(cmd_list, **kwargs):
             ssh_cmd = " ".join(cmd_list)
             if "printf" in ssh_cmd:
-                # The last element of cmd_list is the remote shell command:
-                #   printf '%s' '<escaped_json>' > <path>
+                # The last element of cmd_list is the remote shell command.
+                # Since _write_json_artifact uses docker_exec, cmd_list[-1] is:
+                #   docker exec <id> bash -c '<shlex-quoted inner cmd>'
+                # where the inner cmd is: printf '%s' '<escaped_json>' > <path>
+                import shlex as _shlex
                 remote_cmd = cmd_list[-1]
+                if "bash -c " in remote_cmd:
+                    inner_part = remote_cmd.split("bash -c ", 1)[1]
+                    remote_cmd = _shlex.split(inner_part)[0]
                 marker = "printf '%s' '"
                 start = remote_cmd.index(marker) + len(marker)
                 end = remote_cmd.rindex("'", 0, remote_cmd.rindex(">"))
