@@ -773,7 +773,7 @@ static void launch_topk_softmax(aiter_tensor_t* topk_weights,
                                 aiter_tensor_t* token_expert_indices,
                                 aiter_tensor_t* gating_output,
                                 int need_renorm,
-                                int num_shared_experts,
+                                int64_t num_shared_experts,
                                 const char* shared_expert_scoring_func,
                                 hipStream_t stream)
 {
@@ -796,7 +796,7 @@ static void launch_topk_softmax(aiter_tensor_t* topk_weights,
 
     const bool is_pow_2          = (num_routing_experts != 0) && ((num_routing_experts & (num_routing_experts - 1)) == 0);
     const bool needs_workspace   = !is_pow_2 || num_routing_experts > 256;
-    const int64_t workspace_size = needs_workspace ? num_tokens * num_routing_experts : 0;
+    const int64_t workspace_size = needs_workspace ? (int64_t)num_tokens * num_routing_experts : 0;
 
     float* softmax_workspace = nullptr;
     if(workspace_size > 0)
@@ -833,7 +833,7 @@ void topk_softmax(aiter_tensor_t* topk_weights,         // [num_tokens, topk + n
                   aiter_tensor_t* token_expert_indices, // [num_tokens, topk]
                   aiter_tensor_t* gating_output,        // [num_tokens, num_experts + num_shared_experts]
                   int need_renorm,
-                  int num_shared_experts,
+                  int64_t num_shared_experts,
                   const char* shared_expert_scoring_func,
                   hipStream_t stream)
 {

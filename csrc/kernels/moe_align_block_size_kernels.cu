@@ -122,8 +122,8 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
 
 AITER_C_ITFS
 void moe_align_block_size(aiter_tensor_t* topk_ids,
-                          int num_experts,
-                          int block_size,
+                          int64_t num_experts,
+                          int64_t block_size,
                           aiter_tensor_t* sorted_token_ids,
                           aiter_tensor_t* experts_ids,
                           aiter_tensor_t* token_nums,

@@ -550,6 +550,12 @@ void moe_fused_gate(aiter_tensor_t* input,
     const int out_stride = topk_ids->stride(0);
     AITER_CHECK(topk_weights->stride(0) == out_stride,
                 "topk_weights and topk_ids must have the same stride in dim 0");
+    AITER_CHECK(topk_weights->dtype() == AITER_DTYPE_fp32,
+                "topk_weights.dtype() must be fp32");
+    AITER_CHECK(topk_ids->dtype() == AITER_DTYPE_i32,
+                "topk_ids.dtype() must be i32");
+    AITER_CHECK(input->dtype() == bias->dtype(),
+                "input.dtype() must match bias.dtype()");
 
     // Compute grid dimensions based on runtime value for num_expert_group.
     int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);

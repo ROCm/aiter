@@ -1246,8 +1246,8 @@ void biased_grouped_topk(aiter_tensor_t* gating_output,   // [num_tokens, num_ex
                          aiter_tensor_t* correction_bias, // [num_expert]
                          aiter_tensor_t* topk_weights,    // [num_tokens, topk]
                          aiter_tensor_t* topk_ids,        // [num_tokens, topk]
-                         int num_expert_group,
-                         int topk_grp,
+                         int64_t num_expert_group,
+                         int64_t topk_grp,
                          int need_renorm,
                          float routed_scaling_factor,
                          hipStream_t stream)
@@ -1261,6 +1261,10 @@ void biased_grouped_topk(aiter_tensor_t* gating_output,   // [num_tokens, num_ex
                 "topk_ids.stride(0) == topk_weights.stride(0)");
     AITER_CHECK(gating_output->dtype() == correction_bias->dtype(),
                 "gating_output.dtype() == correction_bias.dtype()");
+    AITER_CHECK(topk_weights->dtype() == AITER_DTYPE_fp32,
+                "topk_weights.dtype() must be fp32");
+    AITER_CHECK(topk_ids->dtype() == AITER_DTYPE_i32,
+                "topk_ids.dtype() must be i32");
 
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
                         (topk_grp == 4);
@@ -1337,8 +1341,8 @@ AITER_C_ITFS
 void grouped_topk(aiter_tensor_t* gating_output, // [num_tokens, num_experts]
                   aiter_tensor_t* topk_weights,  // [num_tokens, topk]
                   aiter_tensor_t* topk_ids,      // [num_tokens, topk]
-                  int num_expert_group,
-                  int topk_grp,
+                  int64_t num_expert_group,
+                  int64_t topk_grp,
                   int need_renorm,
                   int is_softmax,
                   float routed_scaling_factor,
@@ -1351,6 +1355,10 @@ void grouped_topk(aiter_tensor_t* gating_output, // [num_tokens, num_experts]
     size_t stride_tk = topk_ids->stride(0);
     AITER_CHECK(stride_tk == (size_t)topk_weights->stride(0),
                 "topk_ids.stride(0) == topk_weights.stride(0)");
+    AITER_CHECK(topk_weights->dtype() == AITER_DTYPE_fp32,
+                "topk_weights.dtype() must be fp32");
+    AITER_CHECK(topk_ids->dtype() == AITER_DTYPE_i32,
+                "topk_ids.dtype() must be i32");
 
     if(gating_output->dtype() == AITER_DTYPE_bf16)
     {
