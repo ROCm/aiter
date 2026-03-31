@@ -339,7 +339,10 @@ def model_benchmark_configs(
         if args.sq:
             sq_sk_pairs = [(args.sq, args.sk if args.sk else args.sq)]
         else:
-            sq_sk_pairs = [(2**i, 2**i) for i in range(1, 14)]
+            # Prefill (sq == sk) + decode (sq=1, sk=context)
+            prefill = [(2**i, 2**i) for i in range(2, 14, 2)]  # 4..4096
+            decode = [(1, 2**i) for i in range(8, 14)]  # 256..8192
+            sq_sk_pairs = prefill + decode
         for (sq, sk), lay, d in itertools.product(sq_sk_pairs, layouts, dtypes):
             fa_configs.append(
                 BenchConfig(
