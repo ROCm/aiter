@@ -2,6 +2,7 @@ import torch
 import warnings
 import argparse
 import itertools
+import dataclasses
 from dataclasses import dataclass
 from typing import Callable
 import triton
@@ -80,6 +81,19 @@ class BenchConfig:
     @property
     def is_decode(self) -> bool:
         return self.function == "fwd_kvcache"
+
+    @property
+    def estimated_memory(self) -> int:
+        """Estimate GPU memory in bytes for q, k, v, o (and grads for bwd)."""
+        elem = {"fp8": 1, "fp16": 2, "bf16": 2, "fp32": 4}.get(self.dtype_str, 2)
+        q = self.batch * self.sq * self.hq * self.d_head * elem
+        k = self.batch * self.sk * self.hk * self.d_head * elem
+        v = self.batch * self.sk * self.hk * self.d_head_v * elem
+        o = self.batch * self.sq * self.hq * self.d_head_v * elem
+        total = q + k + v + o
+        if self.is_bwd:
+            total *= 2  # grads are same size as inputs
+        return total
 
     def to_tuple(self) -> tuple:
         return (
@@ -387,8 +401,28 @@ class _CsvWriter:
         print(msg, flush=True)
 
 
+def _filter_by_memory(configs: list[BenchConfig], threshold: float = 0.90) -> list[BenchConfig]:
+    """Remove configs whose estimated memory exceeds threshold of GPU VRAM."""
+    total_mem = torch.cuda.get_device_properties(0).total_memory
+    limit = int(total_mem * threshold)
+    kept = []
+    for c in configs:
+        if c.estimated_memory > limit:
+            print(
+                f"[SKIP] {c} — estimated {c.estimated_memory / 1e9:.1f}GB "
+                f"exceeds {threshold:.0%} of {total_mem / 1e9:.1f}GB VRAM",
+                flush=True,
+            )
+        else:
+            kept.append(c)
+    return kept
+
+
 def run_benchmark(run: BenchRun):
     torch.manual_seed(20)
+    filtered = _filter_by_memory(run.configs)
+    if len(filtered) < len(run.configs):
+        run = dataclasses.replace(run, configs=filtered)
     total = len(run.configs)
     counter = 0
     csv = _CsvWriter(run)
