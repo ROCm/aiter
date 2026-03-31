@@ -1708,9 +1708,9 @@ def ck_moe_stage1(
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
     if is_splitk:
-        # CK splitK kernel hipMemsetAsync zeros sorted_size * w1.shape[1] floats
+        # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
-        tmp_out = torch.zeros(
+        tmp_out = torch.empty(
             (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
     else:
@@ -1775,6 +1775,12 @@ def cktile_moe_stage1(
         D = D * 8
 
     out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
+    # WARNING: when split_k > 1, this allocation has the same undersized buffer
+    # pattern fixed in ck_moe_stage1 (see ROCm/aiter#2508). If the CK tile
+    # kernel calls hipMemsetAsync with sorted_size rows, this will overflow.
+    # When fp32 splitk is enabled, apply the same fix: use sorted_size =
+    # min(token_num * topk * block_m, sorted_token_ids.shape[0]) and slice
+    # valid_out = tmp_out[:token_num * topk, :] before silu_and_mul/gelu_and_mul.
     tmp_out = (
         torch.zeros(
             (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
