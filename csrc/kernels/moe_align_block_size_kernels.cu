@@ -14,14 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-
-#include <ATen/ATen.h>
-
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
 #include "hip_compat.h"
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
@@ -127,36 +120,52 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
 }
 } // namespace vllm
 
-namespace aiter {
-
-void moe_align_block_size(torch::Tensor topk_ids,
-                          int64_t num_experts,
-                          int64_t block_size,
-                          torch::Tensor sorted_token_ids,
-                          torch::Tensor experts_ids,
-                          torch::Tensor token_nums,
-                          torch::Tensor num_tokens_post_pad)
+AITER_C_ITFS
+void moe_align_block_size(aiter_tensor_t* topk_ids,
+                          int num_experts,
+                          int block_size,
+                          aiter_tensor_t* sorted_token_ids,
+                          aiter_tensor_t* experts_ids,
+                          aiter_tensor_t* token_nums,
+                          aiter_tensor_t* num_tokens_post_pad,
+                          hipStream_t stream)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(topk_ids));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    VLLM_DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
-        // Optimized shared memory: O(num_experts) instead of O(num_experts^2)
-        // expert_token_counts[num_experts] + cumsum[num_experts + 1] + write_positions[num_experts]
-        const int32_t shared_mem = (3 * num_experts + 1) * sizeof(int32_t);
+    const HipDeviceGuard device_guard(topk_ids->device_id);
+    // Optimized shared memory: O(num_experts) instead of O(num_experts^2)
+    // expert_token_counts[num_experts] + cumsum[num_experts + 1] + write_positions[num_experts]
+    const int32_t shared_mem = (3 * num_experts + 1) * sizeof(int32_t);
 
-        // set dynamic shared mem
-        auto kernel = vllm::moe_align_block_size_kernel<scalar_t>;
+    if(topk_ids->dtype() == AITER_DTYPE_i32)
+    {
+        auto kernel = vllm::moe_align_block_size_kernel<int32_t>;
         HIP_CALL(
             VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
-        kernel<<<1, num_experts, shared_mem, stream>>>(topk_ids.data_ptr<scalar_t>(),
-                                                       sorted_token_ids.data_ptr<int32_t>(),
-                                                       experts_ids.data_ptr<int32_t>(),
-                                                       token_nums.data_ptr<int32_t>(),
-                                                       num_tokens_post_pad.data_ptr<int32_t>(),
+        kernel<<<1, num_experts, shared_mem, stream>>>(static_cast<int32_t*>(topk_ids->ptr),
+                                                       static_cast<int32_t*>(sorted_token_ids->ptr),
+                                                       static_cast<int32_t*>(experts_ids->ptr),
+                                                       static_cast<int32_t*>(token_nums->ptr),
+                                                       static_cast<int32_t*>(num_tokens_post_pad->ptr),
                                                        num_experts,
                                                        block_size,
-                                                       topk_ids.numel());
-    });
+                                                       topk_ids->numel());
+    }
+    else if(topk_ids->dtype() == AITER_DTYPE_i64)
+    {
+        auto kernel = vllm::moe_align_block_size_kernel<int64_t>;
+        HIP_CALL(
+            VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
+        kernel<<<1, num_experts, shared_mem, stream>>>(static_cast<int64_t*>(topk_ids->ptr),
+                                                       static_cast<int32_t*>(sorted_token_ids->ptr),
+                                                       static_cast<int32_t*>(experts_ids->ptr),
+                                                       static_cast<int32_t*>(token_nums->ptr),
+                                                       static_cast<int32_t*>(num_tokens_post_pad->ptr),
+                                                       num_experts,
+                                                       block_size,
+                                                       topk_ids->numel());
+    }
+    else
+    {
+        AITER_CHECK(false, "moe_align_block_size: unsupported topk_ids dtype: ",
+                    AiterDtype_to_str(topk_ids->dtype()));
+    }
 }
-
-} // namespace aiter

@@ -432,7 +432,6 @@
     },
     "module_moe_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/moe_op_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
@@ -446,6 +445,7 @@
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
         ]

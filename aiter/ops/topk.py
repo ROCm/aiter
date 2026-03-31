@@ -3,7 +3,7 @@
 
 # user interface
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -12,7 +12,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
-@compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
+@compile_ops("module_moe_asm", fc_name="biased_grouped_topk", ffi_type="ctypes")
 def biased_grouped_topk_hip(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -25,7 +25,7 @@ def biased_grouped_topk_hip(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", ffi_type="ctypes")
 def grouped_topk(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -38,27 +38,7 @@ def grouped_topk(
 ) -> None: ...
 
 
-def gen_moe_fused_gate_fake_tensor(
-    input: torch.Tensor,
-    bias: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    num_expert_group: int,
-    topk_group: int,
-    topk: int,
-    n_share_experts_fusion: int,
-    routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    output = torch.empty_like(
-        topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
-    )
-
-    indices = torch.empty_like(topk_ids, dtype=topk_ids.dtype, device=topk_ids.device)
-
-    return [output, indices]
-
-
-@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
+@compile_ops("module_moe_asm", ffi_type="ctypes")
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -69,7 +49,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]: ...
+) -> None: ...
 
 
 def biased_grouped_topk(
