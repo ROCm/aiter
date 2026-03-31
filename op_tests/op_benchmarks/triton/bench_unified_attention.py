@@ -44,7 +44,10 @@ def make_inputs(
     head_size_v,
     block_size,
     num_blocks,
-    use_out_scale,
+    fp8_q,
+    fp8_kv,
+    fp8_output,
+    out_scale_value,
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(0)
@@ -83,14 +86,14 @@ def make_inputs(
     kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
     query_lens_t = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
 
-    q_fp8, q_descale = quantize_to_fp8(query)
-    k_fp8, k_descale = quantize_to_fp8(key_cache)
-    v_fp8, v_descale = quantize_to_fp8(value_cache)
+    q_fp8, q_descale = (quantize_to_fp8(query) if fp8_q else (None, None))
+    k_fp8, k_descale = (quantize_to_fp8(key_cache) if fp8_kv else (None, None))
+    v_fp8, v_descale = (quantize_to_fp8(value_cache) if fp8_kv else (None, None))
 
     out_scale = None
     out_dtype = torch.bfloat16
-    if use_out_scale:
-        out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
+    if fp8_output:
+        out_scale = torch.tensor([out_scale_value], dtype=torch.float32, device="cuda")
         out_dtype = FP8_TYPE
 
     output = torch.empty(
@@ -120,8 +123,24 @@ def make_inputs(
     )
 
 
+def _mode_label(args):
+    parts = []
+    if args.fp8:
+        parts.append("fp8")
+    elif args.fp8_kv:
+        parts.append("fp8_kv")
+    else:
+        parts.append("bf16")
+    if args.fp8_output:
+        parts.append("fp8out")
+    return "_".join(parts) + "_fwd"
+
+
 def run_benchmark(custom, args):
     torch.manual_seed(20)
+
+    any_fp8 = args.fp8 or args.fp8_kv or args.fp8_output
+    label = _mode_label(args)
 
     def create_configs():
         hk = args.hq if not args.hk else args.hk
@@ -155,11 +174,11 @@ def run_benchmark(custom, args):
             x_names=x_names,
             x_vals=x_vals_list,
             line_arg="provider",
-            line_vals=["fp8_fwd"],
-            line_names=["fp8_fwd"],
+            line_vals=[label],
+            line_names=[label],
             styles=[("red", "-")],
             ylabel=unit,
-            plot_name="bench_unified_attention_fp8",
+            plot_name=f"bench_unified_attention_{label}",
             args={},
         )]
 
@@ -204,8 +223,15 @@ def run_benchmark(custom, args):
             head_size_v=D_HEAD_V,
             block_size=block_size,
             num_blocks=num_blocks,
-            use_out_scale=args.out_scale,
+            fp8_q=args.fp8,
+            fp8_kv=args.fp8 or args.fp8_kv,
+            fp8_output=args.fp8_output,
+            out_scale_value=args.out_scale,
         )
+
+        q_tensor = inputs["q_fp8"] if args.fp8 else inputs["query"]
+        k_tensor = inputs["k_fp8"] if (args.fp8 or args.fp8_kv) else inputs["key_cache"]
+        v_tensor = inputs["v_fp8"] if (args.fp8 or args.fp8_kv) else inputs["value_cache"]
 
         window_size = (
             (args.sliding_window - 1, 0)
@@ -215,9 +241,9 @@ def run_benchmark(custom, args):
 
         def fn():
             return unified_attention(
-                q=inputs["q_fp8"],
-                k=inputs["k_fp8"],
-                v=inputs["v_fp8"],
+                q=q_tensor,
+                k=k_tensor,
+                v=v_tensor,
                 out=inputs["output"],
                 cu_seqlens_q=inputs["cu_query_lens"],
                 seqused_k=inputs["kv_lens"],
@@ -276,9 +302,9 @@ def run_benchmark(custom, args):
 
         total_q = cu_query_lens[-1].item()
         total_k = seqlens_k.sum().item()
-        q_bytes = total_q * HQ * D_HEAD * inputs["q_fp8"].element_size()
-        k_bytes = total_k * HK * D_HEAD * inputs["k_fp8"].element_size()
-        v_bytes = total_k * HK * D_HEAD_V * inputs["v_fp8"].element_size()
+        q_bytes = total_q * HQ * D_HEAD * q_tensor.element_size()
+        k_bytes = total_k * HK * D_HEAD * k_tensor.element_size()
+        v_bytes = total_k * HK * D_HEAD_V * v_tensor.element_size()
         o_bytes = total_q * HQ * D_HEAD_V * inputs["output"].element_size()
         mem = q_bytes + k_bytes + v_bytes + o_bytes
 
@@ -301,7 +327,7 @@ def parse_int_or_list(value):
 
 
 def parse_args():
-    parser = get_parser(kernel_name="UnifiedAttention_FP8")
+    parser = get_parser(kernel_name="Unified Attention")
 
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
@@ -327,8 +353,20 @@ def parse_args():
         help="Use equal sequence lengths (no varlen); default is random varlen",
     )
     parser.add_argument(
-        "-out_scale", action="store_true", default=False,
-        help="Enable FP8 output with output_scale",
+        "-fp8", action="store_true", default=False,
+        help="Quantize Q, K, V to FP8 e4m3 with per-tensor descales",
+    )
+    parser.add_argument(
+        "-fp8_kv", action="store_true", default=False,
+        help="Quantize only K, V to FP8 e4m3 (Q stays bf16)",
+    )
+    parser.add_argument(
+        "-fp8_output", action="store_true", default=False,
+        help="Output tensor in FP8 with output_scale",
+    )
+    parser.add_argument(
+        "-out_scale", type=float, default=1.0,
+        help="Output scale factor when -fp8_output is set (default: 1.0)",
     )
     parser.add_argument(
         "-decode", nargs="?", const=1.0, default=0.0, type=float, metavar="P",
@@ -344,6 +382,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.fp8 and args.fp8_kv:
+        raise ValueError("-fp8 already quantizes K/V; -fp8_kv is redundant. Use one or the other.")
+
     custom_config = False
 
     if args.hq or args.hk or args.d or args.dv:
