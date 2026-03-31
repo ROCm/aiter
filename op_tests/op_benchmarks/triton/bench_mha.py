@@ -381,6 +381,23 @@ def run_benchmark(run: BenchRun):
             f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} causal={causal}",
             flush=True,
         )
+        try:
+            return _run_single_benchmark(
+                model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
+                causal, function, dtype, impl, fused, torch_dtype, unit,
+                dropout, sm_scale, device, run,
+            )
+        except Exception as e:
+            print(f"  [SKIP] {e}", flush=True)
+            return 0
+        finally:
+            torch.cuda.empty_cache()
+
+    def _run_single_benchmark(
+        model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
+        causal, function, dtype, impl, fused, torch_dtype, unit,
+        dropout, sm_scale, device, run,
+    ):
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         is_bwd = function.startswith("bwd")
         is_varlen = "varlen" in function
