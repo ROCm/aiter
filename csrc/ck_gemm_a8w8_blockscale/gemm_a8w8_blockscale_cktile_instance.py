@@ -38,15 +38,13 @@ class TileKernelInstance:
 
     BlockPerCu: int  # 1..BLOCK_PER_CU_MAX
 
-    AQRowMajor: bool = False  # When True, 8-warp kernels read x_scale in
-    # row-major layout natively, skipping the host-side transpose.
+    # When True, 8-warp kernels read x_scale in row-major layout natively, 
+    # skipping the host-side transpose.
+    AQRowMajor: bool = False  
 
     @property
     def is_eight_warp(self) -> bool:
-        return (
-            self.M_Warp * self.N_Warp * self.K_Warp == 8
-            and self.K_Warp_Tile == 128
-        )
+        return self.M_Warp * self.N_Warp * self.K_Warp == 8 and self.K_Warp_Tile == 128
 
     @property
     def name(self) -> str:
