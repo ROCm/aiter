@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
-from aiter import dtypes
+from aiter import dtypes, get_gfx
 import argparse
 
 
@@ -97,13 +97,18 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)
-    (c, res_c, *_), avg_c = run_asm(input, weight, bias, 1e-5, residual=res)
-
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
+    has_asm = get_gfx() != "gfx950"
+    if has_asm:
+        (c, res_c, *_), avg_c = run_asm(input, weight, bias, 1e-5, residual=res)
+        msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
+    else:
+        print(f"[skip] layernorm2d_with_add_asm is not available on {get_gfx()}")
+        msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
     checkAllclose(res_a, res_b, msg="res check")
-    checkAllclose(a, c, atol=0.03, msg="asm")
-    checkAllclose(res_a, res_c, atol=0.01, msg="asm res")
+    if has_asm:
+        checkAllclose(a, c, atol=0.03, msg="asm")
+        checkAllclose(res_a, res_c, atol=0.01, msg="asm res")
 
 
 parser = argparse.ArgumentParser(
