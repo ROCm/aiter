@@ -268,6 +268,9 @@ def gemm_a16w16(
                 scale_c,
                 config=flydsl_config,
             )
+        else:
+            # clean up the config to avoid using the invalid config
+            config = None
     if config is not None and config["libtype"] == "asm":
         kernelName = config["kernelName"]
         splitK = config["splitK"]
