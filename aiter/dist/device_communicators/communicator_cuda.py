@@ -16,7 +16,9 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 class CudaCommunicator(DeviceCommunicatorBase):
     # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
-    _ar_1stage_override = {"1": True, "0": False}.get(os.environ.get("AITER_AR_1STAGE", ""))
+    _ar_1stage_override = {"1": True, "0": False}.get(
+        os.environ.get("AITER_AR_1STAGE", "")
+    )
 
     def __init__(
         self,
@@ -152,7 +154,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self._all2all_manager_created = True
 
     def all_reduce(
-        self, input_, use_new: bool = True, ca_fp8_quant: bool = False
+        self,
+        input_,
+        use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
     ) -> torch.Tensor:
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -173,9 +179,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
-            out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
-            assert out is not None
-            return out
+            inp_size = input_.numel() * input_.element_size()
+            if not prefill_support and inp_size > 64 * 1024 * 1024:
+                pass  # fall through to rccl for large prefill tensors
+            else:
+                out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
+                assert out is not None
+                return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
@@ -195,7 +205,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def fused_allreduce_rmsnorm(
-        self, input_, res_inp_, weight_, eps
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
@@ -209,15 +224,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and ca_comm.should_custom_ar(input_)
             and can_use_fuse_ar_rms
         ):
-            use_1stage = self._ar_1stage_override if self._ar_1stage_override is not None else (total_bytes <= 128 * 1024)
-            out, res_out = ca_comm.custom_fused_ar_rms(
-                input_, res_inp_, weight_, eps, use_1stage
-            )
-            assert out is not None
-            assert res_out is not None
-            return out, res_out
+            if not prefill_support and total_bytes > 64 * 1024 * 1024:
+                pass  # fall through to rccl for large prefill tensors
+            else:
+                use_1stage = (
+                    self._ar_1stage_override
+                    if self._ar_1stage_override is not None
+                    else (total_bytes <= 128 * 1024)
+                )
+                out, res_out = ca_comm.custom_fused_ar_rms(
+                    input_, res_inp_, weight_, eps, use_1stage
+                )
+                assert out is not None
+                assert res_out is not None
+                return out, res_out
         # call split kernel
-        ar_out = self.all_reduce(input_)
+        ar_out = self.all_reduce(input_, prefill_support=prefill_support)
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
@@ -234,19 +256,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out, residual_out
 
     def fused_allreduce_rmsnorm_quant(
-        self, input_, res_inp_, weight_, eps
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_bytes = input_.numel() * input_.element_size()
         if (
             int(input_.shape[-1]) in [512, 1024, 2048, 4096]
             and total_bytes <= 4096 * 1024
+            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
-            use_1stage = self._ar_1stage_override if self._ar_1stage_override is not None else (total_bytes <= 128 * 1024)
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
             )
         else:
-            out_, res_out = self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+            out_, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, prefill_support
+            )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
         assert out is not None

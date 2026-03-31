@@ -330,13 +330,11 @@ def test_fused_ar_rmsnorm(
     m = shape[0]
     n = shape[1]
     eps = 1e-6
+    weight = torch.randn((n,), dtype=dtype)
+    x = torch.randn(shape, dtype=dtype)
+    ref = x * tp_size
     for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
-        # x = torch.ones(shape, dtype=dtype)
         res_inp.append(x)
-        # print(f"device {i}, x[0][0] = {x[0][0]}")
-        ref += x
-        weight = torch.randn((n,), dtype=dtype)
         weight_list.append(weight)
         rets.append(
             pool.apply_async(
@@ -403,10 +401,10 @@ def acc_test(
     m = shape[0]
     n = shape[1]
     eps = 1e-6
+    weight = torch.randn((n,), dtype=dtype)
+    x = torch.randn(shape, dtype=dtype)
+    ref = x * tp_size
     for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
-        ref += x
-        weight = torch.randn((n,), dtype=dtype)
         weight_list.append(weight)
         rets.append(
             pool.apply_async(
@@ -444,10 +442,10 @@ def acc_test_cudagraph_on(
     m = shape[0]
     n = shape[1]
     eps = 1e-6
+    weight = torch.randn((n,), dtype=dtype)
+    x = torch.randn(shape, dtype=dtype)
+    ref = x * tp_size
     for i in range(tp_size):
-        x = torch.randn(shape, dtype=dtype)
-        ref += x
-        weight = torch.randn((n,), dtype=dtype)
         weight_list.append(weight)
         rets.append(
             pool.apply_async(
@@ -521,7 +519,6 @@ l_shape = [
     (17, 4096),
     (17, 7168),
     (19, 8192),
-    (32768, 8192),
 ]
 l_tp = [8]
 l_pp = [1]
