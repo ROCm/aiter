@@ -278,6 +278,7 @@ def run_benchmark(custom, args):
                 k_descale=inputs["k_descale"],
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
+                out_dtype=inputs["output"].dtype,
             )
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
