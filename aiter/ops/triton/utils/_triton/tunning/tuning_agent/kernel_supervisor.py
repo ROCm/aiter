@@ -350,7 +350,7 @@ class KernelSupervisor:
             is propagated to the caller.
         """
         checkout_cmd = (
-            f"cd {repo_config.triton_repo} "
+            f"cd /workspace/triton "
             f"&& git checkout {repo_config.triton_branch} "
             f"&& {self.config.triton_install.command}"
         )
@@ -1040,7 +1040,9 @@ class KernelSupervisor:
 
             runner = _phase_runners[phase]
             result = runner()
-            self._record_phase_complete(phase, result)
+
+            if result.success:
+                self._record_phase_complete(phase, result)
 
             if not result.success:
                 overall_success = False

@@ -1,5 +1,7 @@
 """SSH + Docker exec remote execution wrapper for the agentic Triton tuning pipeline."""
 
+import os
+import re
 import shlex
 import subprocess
 import time
@@ -39,7 +41,7 @@ class RemoteExecutor:
         """Build an SSH command list with standard options."""
         return [
             "ssh",
-            "-i", self.machine.ssh_key,
+            "-i", os.path.expanduser(self.machine.ssh_key),
             "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=10",
             "-o", "BatchMode=yes",
@@ -140,10 +142,17 @@ class RemoteExecutor:
                 returncode=None,
             )
 
+        if not re.match(r'^[a-zA-Z0-9_-]+$', self.container_id):
+            raise RemoteCommandError("Invalid container ID")
+
         docker_parts: List[str] = ["docker", "exec"]
 
         if env:
             for key, value in env.items():
+                if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
+                    raise RemoteCommandError(
+                        f"Invalid environment variable name: {key!r}"
+                    )
                 docker_parts += ["-e", f"{key}={shlex.quote(value)}"]
 
         if workdir:
@@ -200,8 +209,9 @@ class RemoteExecutor:
     def destroy_container(self) -> None:
         """Stop and remove the current container, then clear :attr:`container_id`."""
         cid = self.container_id
-        self.ssh_run(f"docker stop {cid}", check=False)
-        self.ssh_run(f"docker rm {cid}", check=False)
+        quoted_cid = shlex.quote(cid) if cid is not None else ""
+        self.ssh_run(f"docker stop {quoted_cid}", check=False)
+        self.ssh_run(f"docker rm {quoted_cid}", check=False)
         self.container_id = None
 
     # ------------------------------------------------------------------

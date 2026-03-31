@@ -126,21 +126,36 @@ class SetupAgent(BaseSubagent):
         else:
             executor.create_container(image=self.image, name=f"tuning-{self.kernel_name}")
 
+        # Normalise repo_config: accept both dataclass objects and plain dicts.
+        def _get(obj, attr, default=None):
+            if isinstance(obj, dict):
+                return obj.get(attr, default)
+            return getattr(obj, attr, default)
+
+        aiter_branch = _get(repo_config, "aiter_branch") or _get(repo_config, "branch")
+        aiter_repo = _get(repo_config, "aiter_repo") or _get(repo_config, "url")
+        triton_branch = _get(repo_config, "triton_branch")
+        triton_repo = _get(repo_config, "triton_repo")
+
+        # Normalise triton_install_config: accept both dataclass objects and plain dicts.
+        install_command = _get(triton_install_config, "command")
+
         # Step 2: Clone aiter repo inside the container.
         executor.docker_exec(
-            f"git clone --branch {repo_config.aiter_branch} --single-branch"
-            f" {repo_config.aiter_repo} /workspace/aiter"
+            f"git clone --branch {aiter_branch} --single-branch"
+            f" {aiter_repo} /workspace/aiter"
         )
 
         # Step 3: Clone triton repo inside the container.
-        executor.docker_exec(
-            f"git clone --branch {repo_config.triton_branch} --single-branch"
-            f" {repo_config.triton_repo} /workspace/triton"
-        )
+        if triton_branch and triton_repo:
+            executor.docker_exec(
+                f"git clone --branch {triton_branch} --single-branch"
+                f" {triton_repo} /workspace/triton"
+            )
 
         # Step 4: Install triton.
         executor.docker_exec(
-            f"cd /workspace/triton && {triton_install_config.command}"
+            f"cd /workspace/triton && {install_command}"
         )
 
         # Step 5: Install aiter.

@@ -122,8 +122,8 @@ class BaseSubagent(ABC):
         3. If either *expected_triton_commit* or *expected_aiter_branch* were
            supplied to the constructor, verify the container environment.
         """
-        # Ensure artifact directory exists on the remote host.
-        self.executor.ssh_run(f"mkdir -p {self.artifact_dir}", check=True)
+        # Ensure artifact directory exists inside the container.
+        self.executor.docker_exec(f"mkdir -p {self.artifact_dir}")
 
         # Free GPUs from any lingering processes.
         self.executor.kill_stale_gpu_processes()
