@@ -351,14 +351,14 @@ def kernel_unified_attention_2d(
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     one_over_L = 1.0 / L[:, None]
+    if v_scale is not None:
+        one_over_L *= tl.load(v_scale)
+    if out_scale is not None:
+        one_over_L *= tl.load(out_scale)
+    
     acc = acc * one_over_L
 
-    if v_scale is not None:
-        _v_ds = tl.load(v_scale)
-        acc *= _v_ds
-
     if USE_FP8_OUTPUT:
-        acc = acc * tl.load(out_scale)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     output_offset = (
@@ -763,9 +763,9 @@ def reduce_segments(
 
     if v_scale is not None:
         acc = acc * tl.load(v_scale)
-
+    if out_scale_inv is not None:
+         acc = acc * tl.load(out_scale_inv)
     if USE_FP8_OUTPUT:
-        acc = acc * tl.load(out_scale_inv)
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     # write result

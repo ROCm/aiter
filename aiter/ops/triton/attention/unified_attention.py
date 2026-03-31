@@ -11,7 +11,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 )
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
-
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 def select_2d_config(
     block_size,
@@ -211,7 +211,7 @@ def unified_attention(
             q_scale=q_descale,
             k_scale=k_descale,
             v_scale=v_descale,
-            out_scale=1 / output_scale if output_scale is not None else 1.0,
+            out_scale=output_scale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
@@ -239,7 +239,7 @@ def unified_attention(
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
-            USE_FP8_OUTPUT=output_scale is not None,
+            USE_FP8_OUTPUT=out.dtype==e4m3_dtype,
             ALL_DECODE=ALL_DECODE,
             **config,
         )
@@ -331,7 +331,7 @@ def unified_attention(
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
             v_scale=v_descale,
-            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+            out_scale_inv=output_scale,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
@@ -339,6 +339,6 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            USE_FP8_OUTPUT=output_scale is not None,
+            USE_FP8_OUTPUT=out.dtype==e4m3_dtype,
             **reduce_config,
         )
