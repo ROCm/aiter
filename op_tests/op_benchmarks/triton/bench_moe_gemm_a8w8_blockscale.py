@@ -191,7 +191,9 @@ def bench_mlp_single_weight_init(
             x_scale = torch.rand((batch, k_blocks_x), dtype=torch.float32, device=dev)
         else:
             m_blocks = num_blocks(batch, group_shape_m)
-            x_scale = torch.rand((m_blocks, k_blocks_x), dtype=torch.float32, device=dev)
+            x_scale = torch.rand(
+                (m_blocks, k_blocks_x), dtype=torch.float32, device=dev
+            )
 
     if w_dtype_str == "fp8":
         w_static_scale = torch.tensor(1e-4, device=dev)
@@ -212,9 +214,15 @@ def bench_mlp_single_weight_init(
     M, K = xg.shape
     K, N = wg.shape
     config, _ = _get_config(M, N, K)
-    config["BLOCK_SIZE_M"] = 128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
-    config["BLOCK_SIZE_N"] = 128 if config["BLOCK_SIZE_N"] > 128 else config["BLOCK_SIZE_N"]
-    config["BLOCK_SIZE_K"] = 128 if config["BLOCK_SIZE_K"] > 128 else config["BLOCK_SIZE_K"]
+    config["BLOCK_SIZE_M"] = (
+        128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
+    )
+    config["BLOCK_SIZE_N"] = (
+        128 if config["BLOCK_SIZE_N"] > 128 else config["BLOCK_SIZE_N"]
+    )
+    config["BLOCK_SIZE_K"] = (
+        128 if config["BLOCK_SIZE_K"] > 128 else config["BLOCK_SIZE_K"]
+    )
 
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):
@@ -223,39 +231,115 @@ def bench_mlp_single_weight_init(
 
         if x_dtype_str == "fp8" and w_dtype_str == "fp8":
             x = moe_gemm_a8w8_blockscale(
-                x, w1, None, None, x_static_scale, w_static_scale, None, b1, rdata,
-                gather_indx=gather_indx, out_dtype=x_dtype, apply_swiglu=True,
+                x,
+                w1,
+                None,
+                None,
+                x_static_scale,
+                w_static_scale,
+                None,
+                b1,
+                rdata,
+                gather_indx=gather_indx,
+                out_dtype=x_dtype,
+                apply_swiglu=True,
             )
             x = moe_gemm_a8w8_blockscale(
-                x, w2, None, None, x_static_scale, w_static_scale, None, b2, rdata,
-                out_dtype=x_dtype, scatter_indx=scatter_indx,
+                x,
+                w2,
+                None,
+                None,
+                x_static_scale,
+                w_static_scale,
+                None,
+                b2,
+                rdata,
+                out_dtype=x_dtype,
+                scatter_indx=scatter_indx,
             )
         elif x_dtype_str == "fp8" and w_dtype_str == "bs8":
             x = moe_gemm_a8w8_blockscale(
-                x, w1, None, w1_scale, x_static_scale, None, None, b1, rdata,
-                gather_indx=gather_indx, out_dtype=x_dtype, apply_swiglu=True,
+                x,
+                w1,
+                None,
+                w1_scale,
+                x_static_scale,
+                None,
+                None,
+                b1,
+                rdata,
+                gather_indx=gather_indx,
+                out_dtype=x_dtype,
+                apply_swiglu=True,
             )
             x = moe_gemm_a8w8_blockscale(
-                x, w2, None, w2_scale, x_static_scale, None, None, b2, rdata,
-                out_dtype=x_dtype, scatter_indx=scatter_indx,
+                x,
+                w2,
+                None,
+                w2_scale,
+                x_static_scale,
+                None,
+                None,
+                b2,
+                rdata,
+                out_dtype=x_dtype,
+                scatter_indx=scatter_indx,
             )
         elif x_dtype_str == "bs8" and w_dtype_str == "fp8":
             x = moe_gemm_a8w8_blockscale(
-                x, w1, x_scale, None, None, w_static_scale, None, b1, rdata,
-                gather_indx=gather_indx, out_dtype=x_dtype, apply_swiglu=True,
+                x,
+                w1,
+                x_scale,
+                None,
+                None,
+                w_static_scale,
+                None,
+                b1,
+                rdata,
+                gather_indx=gather_indx,
+                out_dtype=x_dtype,
+                apply_swiglu=True,
             )
             x = moe_gemm_a8w8_blockscale(
-                x, w2, x_scale, None, None, w_static_scale, None, b2, rdata,
-                out_dtype=x_dtype, scatter_indx=scatter_indx,
+                x,
+                w2,
+                x_scale,
+                None,
+                None,
+                w_static_scale,
+                None,
+                b2,
+                rdata,
+                out_dtype=x_dtype,
+                scatter_indx=scatter_indx,
             )
         else:
             x = moe_gemm_a8w8_blockscale(
-                x, w1, x_scale, w1_scale, None, None, None, b1, rdata,
-                out_dtype=x_dtype, gather_indx=gather_indx, apply_swiglu=True,
+                x,
+                w1,
+                x_scale,
+                w1_scale,
+                None,
+                None,
+                None,
+                b1,
+                rdata,
+                out_dtype=x_dtype,
+                gather_indx=gather_indx,
+                apply_swiglu=True,
             )
             x = moe_gemm_a8w8_blockscale(
-                x, w2, x_scale, w2_scale, None, None, None, b2, rdata,
-                out_dtype=x_dtype, scatter_indx=scatter_indx,
+                x,
+                w2,
+                x_scale,
+                w2_scale,
+                None,
+                None,
+                None,
+                b2,
+                rdata,
+                out_dtype=x_dtype,
+                scatter_indx=scatter_indx,
             )
 
     proton.finalize()

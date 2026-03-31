@@ -55,7 +55,9 @@ def compute_roofline(
     """
     # validate input args
     if not isinstance(intensity_proxy_name, str):
-        raise TypeError("intensity_proxy must be a string naming a parameter in target_fn")
+        raise TypeError(
+            "intensity_proxy must be a string naming a parameter in target_fn"
+        )
 
     # determine position of intensity_proxy in target_fn signature
     sig = inspect.signature(bench_fn)

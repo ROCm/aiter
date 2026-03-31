@@ -97,7 +97,7 @@ def compute_roofline(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     fieldnames = [
-        intensity_proxy_name, # e.g. "batch"
+        intensity_proxy_name,  # e.g. "batch"
         "total_latency_us",
         "kernel_latency_us",
         "tflops",
