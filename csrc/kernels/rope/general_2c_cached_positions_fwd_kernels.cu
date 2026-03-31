@@ -77,14 +77,14 @@ void rope_cached_positions_2c_fwd_impl(
         reuse_freqs_front_part,
         nope_first,
         "dispatch_2c_sbhd_cached_indirect<OpCachedFwd, ...>",
-        dispatch_2c_sbhd_cached_indirect<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, scalar_t_0, scalar_t_1, scalar_t_pos>(
+        dispatch_2c_sbhd_cached_indirect<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, scalar_t_0, scalar_t_1, pos_t>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
             input_y.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
             sin.data_ptr<scalar_t_1>(),
-            positions.data_ptr<scalar_t_pos>(),
+            positions.data_ptr<pos_t>(),
             max_position,
             size_s, size_b, size_h_x, size_h_y, size_d,
             size_f, // size of last dimension of freqs.

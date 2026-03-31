@@ -88,7 +88,7 @@ void rope_cached_positions_offsets_2c_fwd_impl(
             input_y.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
             sin.data_ptr<scalar_t_1>(),
-            positions.data_ptr<scalar_t_pos>(),
+            positions.data_ptr<pos_t>(),
             offsets.data_ptr<int64_t>(),
             max_position,
             size_s, size_b, size_h_x, size_h_y, size_d,

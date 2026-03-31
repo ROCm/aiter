@@ -68,7 +68,7 @@ void rope_cached_positions_fwd_impl(
             input.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
             sin.data_ptr<scalar_t_1>(),
-            positions.data_ptr<scalar_t_pos>(),
+            positions.data_ptr<pos_t>(),
             max_position,
             size_s, size_b, size_h, size_d,
             size_f, // size of last dimension of freqs.

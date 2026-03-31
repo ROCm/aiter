@@ -6376,13 +6376,13 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 }
 } // namespace aiter
 
-/* POSITIONS_ST -> scalar_t_pos (int32_t / int64_t). Use positions.scalar_type() when a positions tensor exists. */
+/* POSITIONS_ST -> pos_t (int32_t / int64_t). Use positions.scalar_type() when a positions tensor exists. */
 #define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
     TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
     switch((POSITIONS_ST))                                                        \
     {                                                                             \
     case at::ScalarType::Long: {                                                  \
-        using scalar_t_pos = int64_t;                                             \
+        using pos_t = int64_t;                                                    \
         DISPATCH_ROPE_TYPES_PARAMS(                                               \
             TYPE0,                                                                \
             TYPE1,                                                                \
@@ -6394,7 +6394,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
         break;                                                                    \
     }                                                                             \
     case at::ScalarType::Int: {                                                   \
-        using scalar_t_pos = int32_t;                                             \
+        using pos_t = int32_t;                                                    \
         DISPATCH_ROPE_TYPES_PARAMS(                                               \
             TYPE0,                                                                \
             TYPE1,                                                                \
