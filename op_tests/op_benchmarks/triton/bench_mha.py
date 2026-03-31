@@ -406,11 +406,12 @@ def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     """Skip large configs to avoid OOM on RDNA (16GB VRAM)."""
     if not get_arch().is_rdna:
         return configs
-    limit = int(16 * 1024**3 * 0.9)
+    vram = 16 * 1024**3
+    limit = int(vram * 0.9)
     kept = []
     for c in configs:
         if c.estimated_memory > limit:
-            print(f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds 16GB", flush=True)
+            print(f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM", flush=True)
         else:
             kept.append(c)
     return kept
