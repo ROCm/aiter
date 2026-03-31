@@ -9,6 +9,7 @@ from aiter.ops.triton.attention.mha import (
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
+    mha_set_impl,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
@@ -21,8 +22,10 @@ from aiter.test_mha_common import (
 )
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 
 arch = get_arch()
+_supports_fp8 = arch in FP8_ARCHS
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -172,6 +175,8 @@ def test_mha(
 
     dropout_mask = None
     if FP8:
+        if not _supports_fp8:
+            pytest.skip(f"FP8 not supported on {arch}")
         if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
             pytest.skip(
                 "FP8 mode does not support dropout_p, return_lse, or return_attn_probs"
@@ -410,6 +415,8 @@ def test_mha_varlen(
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
     if FP8:
+        if not _supports_fp8:
+            pytest.skip(f"FP8 not supported on {arch}")
         if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
             pytest.skip(
                 "FP8 varlen mode does not support dropout_p, return_lse, or return_attn_probs"
@@ -535,6 +542,8 @@ def test_mha_backward(
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
+    if FP8 and not _supports_fp8:
+        pytest.skip(f"FP8 not supported on {arch}")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     if FP8 and HAS_DROPOUT:
@@ -625,6 +634,8 @@ def test_mha_backward_varlen(
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
+    if FP8 and not _supports_fp8:
+        pytest.skip(f"FP8 not supported on {arch}")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     if FP8 and HAS_DROPOUT:
@@ -1569,3 +1580,138 @@ def test_mha_varlen_with_sink(
         rtol=5e-2,  # higher tolerance due to summation over exp
         msg=lambda msg: f"bwd dsink mismatch\n\n{msg}\n",
     )
+
+
+@pytest.mark.parametrize(
+    "BATCH, SEQLEN_Q, SEQLEN_K, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ, CAUSAL, VARLEN, BWD",
+    [
+        (1, 128, 128, 8, 8, 64, True, False, False),  # fwd causal
+        (2, 256, 256, 16, 4, 128, False, False, False),  # fwd GQA non-causal
+        (1, 128, 128, 8, 8, 64, True, True, False),  # fwd_varlen causal
+        (1, 128, 128, 8, 8, 64, True, False, True),  # bwd causal
+        (1, 128, 128, 8, 8, 64, True, True, True),  # bwd_varlen causal
+    ],
+)
+def test_mha_dao_ai(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    VARLEN: bool,
+    BWD: bool,
+    dtype=torch.float16,
+):
+    """Sanity test: verify dao_ai impl dispatch wiring for fwd/bwd x varlen."""
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    mha_set_impl("dao_ai")
+
+    q = torch.randn(
+        BATCH,
+        SEQLEN_Q,
+        NUM_Q_HEADS,
+        HEAD_SZ,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=BWD,
+    )
+    k = torch.randn(
+        BATCH,
+        SEQLEN_K,
+        NUM_K_HEADS,
+        HEAD_SZ,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=BWD,
+    )
+    v = torch.randn(
+        BATCH,
+        SEQLEN_K,
+        NUM_K_HEADS,
+        HEAD_SZ,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=BWD,
+    )
+
+    if VARLEN:
+        query_padding_mask = generate_random_padding_mask(
+            SEQLEN_Q, BATCH, "cuda", mode="full"
+        )
+        key_padding_mask = generate_random_padding_mask(
+            SEQLEN_K, BATCH, "cuda", mode="full"
+        )
+        (
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q,
+            k,
+            v,
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+        q_unpad.requires_grad_(BWD)
+        k_unpad.requires_grad_(BWD)
+        v_unpad.requires_grad_(BWD)
+
+        with torch.set_grad_enabled(BWD):
+            triton_out = flash_attn_varlen_func(
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=CAUSAL,
+            )
+    else:
+        query_padding_mask = None
+        key_padding_mask = None
+        with torch.set_grad_enabled(BWD):
+            triton_out = flash_attn_func(q, k, v, causal=CAUSAL)
+
+    # Forward check
+    torch_out, _, _ = attention_ref(
+        q,
+        k,
+        v,
+        causal=CAUSAL,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+    )
+    if VARLEN:
+        triton_out_padded = output_pad_fn(triton_out)
+        torch.testing.assert_close(triton_out_padded, torch_out, atol=1e-2, rtol=1e-2)
+    else:
+        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+    # Backward check
+    if BWD:
+        if VARLEN:
+            do = torch.randn_like(q)
+            triton_out = output_pad_fn(triton_out)
+            triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+                triton_out, (q_unpad, k_unpad, v_unpad), do
+            )
+            triton_dq = dq_pad_fn(triton_dq)
+            triton_dk = dk_pad_fn(triton_dk)
+            triton_dv = dk_pad_fn(triton_dv)
+        else:
+            do = torch.randn_like(q)
+            triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+                triton_out, (q, k, v), do
+            )
+        for name, grad in [("dq", triton_dq), ("dk", triton_dk), ("dv", triton_dv)]:
+            assert not grad.isnan().any(), f"dao_ai backward produced NaN in {name}"
+
+    mha_set_impl("default")

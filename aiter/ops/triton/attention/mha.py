@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
@@ -27,6 +27,15 @@ def mha_set_use_fused_bwd_kernel(value: bool):
     """
     global _USE_FUSED_BWD_KERNEL
     _USE_FUSED_BWD_KERNEL = value
+
+
+_MHA_IMPL: Literal["default", "dao_ai"] = "default"
+
+
+def mha_set_impl(impl: Literal["default", "dao_ai"]):
+    """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
+    global _MHA_IMPL
+    _MHA_IMPL = impl
 
 
 _USE_INT64_STRIDES = True
@@ -165,89 +174,126 @@ def _flash_attn_forward(
         s_dmask = None
         dropout_mask = None
 
-    if config is None:
-        config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
+    if _MHA_IMPL == "dao_ai":
+        assert sink is None, "dao_ai impl does not support attention sink."
+        assert (
+            pe_head_dim == 0
+        ), "dao_ai impl does not support positional encoding (pe_head_dim > 0)."
+        assert (
+            not IS_FP8
+        ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
+        if is_varlen:
+            o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
+                q,
+                k,
+                v,
+                o,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k=None,
+                leftpad_k=None,
+                block_table_=None,
+                alibi_slopes=alibi_slopes,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                zero_tensors=False,
+                causal=causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                return_softmax=return_softmax,
+            )
+        else:
+            o, softmax_lse, s_dmask, _ = flash_attn_2.fwd(
+                q,
+                k,
+                v,
+                o,
+                alibi_slopes,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                return_softmax=return_softmax,
+            )
+        # Verify softmax_lse shape contract:
+        #   non-varlen: (batch, nheads_q, seqlen_q)
+        #   varlen:     (nheads_q, total_q)  — transposed vs default impl
+        if is_varlen:
+            assert softmax_lse.shape == (
+                num_q_heads,
+                q.shape[0],
+            ), f"dao_ai varlen softmax_lse shape {softmax_lse.shape} != expected ({num_q_heads}, {q.shape[0]})"
+        else:
+            assert (
+                softmax_lse.shape[0] == batch and softmax_lse.shape[1] == num_q_heads
+            ), f"dao_ai softmax_lse shape {softmax_lse.shape} != expected (batch={batch}, nheads={num_q_heads}, ...)"
+    else:
+        if config is None:
+            config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
-    """
-    # Tuned for gfx942
-    config = {
-        "BLOCK_M": 128,
-        "BLOCK_N": 64,
-        "waves_per_eu": 2,
-        "num_warps": 4,
-        "num_ctas": 1,
-        "num_stages": 1,
-    }
-    # Dropout significantly increases VGPR usage so use small tiles
-    if enable_dropout or q.dtype == torch.float32:
-        config = {
-            "BLOCK_M": 32,
-            "BLOCK_N": 32,
-            "waves_per_eu": 1,
-            "num_warps": 2,
-            "num_ctas": 1,
-            "num_stages": 1,
-        }
-    """
+        grid = lambda META: (  # noqa: E731
+            batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
+        )
 
-    grid = lambda META: (  # noqa: E731
-        batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
-    )
-
-    _attn_fwd[grid](
-        q,
-        k,
-        v,
-        descale_q,
-        descale_k,
-        descale_v,
-        o,
-        alibi_slopes,
-        s_dmask,
-        dropout_mask,
-        softmax_lse,
-        sink,
-        *q_strides,
-        *k_strides,
-        *v_strides,
-        descale_q.stride(0) if descale_q is not None else 0,
-        descale_k.stride(0) if descale_k is not None else 0,
-        descale_v.stride(0) if descale_v is not None else 0,
-        *o_strides,
-        alibi_slopes.stride(0) if alibi_slopes is not None else 0,
-        alibi_slopes.stride(1) if alibi_slopes is not None else 0,
-        s_dmask.stride(0) if s_dmask is not None else 0,
-        s_dmask.stride(1) if s_dmask is not None else 0,
-        s_dmask.stride(2) if s_dmask is not None else 0,
-        s_dmask.stride(3) if s_dmask is not None else 0,
-        stride_lse_z if softmax_lse is not None else 0,
-        stride_lse_h if softmax_lse is not None else 0,
-        stride_lse_m if softmax_lse is not None else 0,
-        softmax_scale,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        dropout_p,
-        philox_seed,
-        philox_offset,
-        SEQLEN_Q=max_seqlen_q,
-        SEQLEN_K=max_seqlen_k,
-        IS_CAUSAL=causal,
-        NUM_Q_HEADS=num_q_heads,
-        NUM_K_HEADS=num_k_heads,
-        BLOCK_DMODEL=v_head_dim,
-        BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-        BLOCK_DMODEL_PE=pe_head_dim,
-        RETURN_SCORES=return_softmax,
-        ENABLE_DROPOUT=enable_dropout,
-        IS_FP8=IS_FP8,
-        FP8_MAX=FP8_MAX,
-        VARLEN=is_varlen,
-        BATCH=batch,
-        NUM_XCD=get_num_xcds(),
-        USE_INT64_STRIDES=_USE_INT64_STRIDES,
-        ENABLE_SINK=sink is not None,
-        **config,
-    )
+        _attn_fwd[grid](
+            q,
+            k,
+            v,
+            descale_q,
+            descale_k,
+            descale_v,
+            o,
+            alibi_slopes,
+            s_dmask,
+            dropout_mask,
+            softmax_lse,
+            sink,
+            *q_strides,
+            *k_strides,
+            *v_strides,
+            descale_q.stride(0) if descale_q is not None else 0,
+            descale_k.stride(0) if descale_k is not None else 0,
+            descale_v.stride(0) if descale_v is not None else 0,
+            *o_strides,
+            alibi_slopes.stride(0) if alibi_slopes is not None else 0,
+            alibi_slopes.stride(1) if alibi_slopes is not None else 0,
+            s_dmask.stride(0) if s_dmask is not None else 0,
+            s_dmask.stride(1) if s_dmask is not None else 0,
+            s_dmask.stride(2) if s_dmask is not None else 0,
+            s_dmask.stride(3) if s_dmask is not None else 0,
+            stride_lse_z if softmax_lse is not None else 0,
+            stride_lse_h if softmax_lse is not None else 0,
+            stride_lse_m if softmax_lse is not None else 0,
+            softmax_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            SEQLEN_Q=max_seqlen_q,
+            SEQLEN_K=max_seqlen_k,
+            IS_CAUSAL=causal,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_K_HEADS=num_k_heads,
+            BLOCK_DMODEL=v_head_dim,
+            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE=pe_head_dim,
+            RETURN_SCORES=return_softmax,
+            ENABLE_DROPOUT=enable_dropout,
+            IS_FP8=IS_FP8,
+            FP8_MAX=FP8_MAX,
+            VARLEN=is_varlen,
+            BATCH=batch,
+            NUM_XCD=get_num_xcds(),
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
+            ENABLE_SINK=sink is not None,
+            **config,
+        )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset
 
@@ -338,11 +384,9 @@ class _FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
-        if _USE_FUSED_BWD_KERNEL:
-            assert (
-                sink is None and dsink is None
-            ), "Fused backward doesn't support sinks."
-            flash_attn_fused_backward(
+        if _MHA_IMPL == "dao_ai":
+            assert sink is None, "dao_ai impl does not support attention sink."
+            flash_attn_2.bwd(
                 do_padded,
                 q,
                 k,
@@ -352,45 +396,69 @@ class _FlashAttnFunc(torch.autograd.Function):
                 dq,
                 dk,
                 dv,
-                dbias,
-                ctx.softmax_scale,
                 ctx.alibi_slopes,
+                ctx.dropout_p,
+                ctx.softmax_scale,
                 ctx.causal,
-                None,
-                None,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                deterministic=ctx.deterministic,
             )
         else:
-            flash_attn_onekernel_backward(
-                do_padded,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                dbias,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
-                None,
-                None,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                sink=sink,
-                dsink=dsink,
-            )
+            if _USE_FUSED_BWD_KERNEL:
+                assert (
+                    sink is None and dsink is None
+                ), "Fused backward doesn't support sinks."
+                flash_attn_fused_backward(
+                    do_padded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    softmax_lse,
+                    dq,
+                    dk,
+                    dv,
+                    dbias,
+                    ctx.softmax_scale,
+                    ctx.alibi_slopes,
+                    ctx.causal,
+                    None,
+                    None,
+                    max_seqlen_q=q.shape[1],
+                    max_seqlen_k=k.shape[1],
+                    dropout_p=ctx.dropout_p,
+                    philox_seed=ctx.philox_seed,
+                    philox_offset=ctx.philox_offset,
+                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                )
+            else:
+                flash_attn_onekernel_backward(
+                    do_padded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    softmax_lse,
+                    dq,
+                    dk,
+                    dv,
+                    dbias,
+                    ctx.softmax_scale,
+                    ctx.alibi_slopes,
+                    ctx.causal,
+                    None,
+                    None,
+                    max_seqlen_q=q.shape[1],
+                    max_seqlen_k=k.shape[1],
+                    dropout_p=ctx.dropout_p,
+                    philox_seed=ctx.philox_seed,
+                    philox_offset=ctx.philox_offset,
+                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                    sink=sink,
+                    dsink=dsink,
+                )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -598,11 +666,9 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         if head_size_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
 
-        if _USE_FUSED_BWD_KERNEL:
-            assert (
-                sink is None and dsink is None
-            ), "Fused backward doesn't support sinks."
-            flash_attn_fused_backward(
+        if _MHA_IMPL == "dao_ai":
+            assert sink is None, "dao_ai impl does not support attention sink."
+            flash_attn_2.varlen_bwd(
                 do_padded,
                 q,
                 k,
@@ -612,45 +678,74 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 dq,
                 dk,
                 dv,
-                dbias,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                ctx.alibi_slopes,
                 max_seqlen_q=ctx.max_seqlen_q,
                 max_seqlen_k=ctx.max_seqlen_k,
                 dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                softmax_scale=ctx.softmax_scale,
+                zero_tensors=False,
+                causal=ctx.causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                deterministic=False,
             )
         else:
-            flash_attn_onekernel_backward(
-                do_padded,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dq,
-                dk,
-                dv,
-                dbias,
-                ctx.softmax_scale,
-                ctx.alibi_slopes,
-                ctx.causal,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q=ctx.max_seqlen_q,
-                max_seqlen_k=ctx.max_seqlen_k,
-                dropout_p=ctx.dropout_p,
-                philox_seed=ctx.philox_seed,
-                philox_offset=ctx.philox_offset,
-                USE_INT64_STRIDES=_USE_INT64_STRIDES,
-                sink=sink,
-                dsink=dsink,
-            )
+            if _USE_FUSED_BWD_KERNEL:
+                assert (
+                    sink is None and dsink is None
+                ), "Fused backward doesn't support sinks."
+                flash_attn_fused_backward(
+                    do_padded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    softmax_lse,
+                    dq,
+                    dk,
+                    dv,
+                    dbias,
+                    ctx.softmax_scale,
+                    ctx.alibi_slopes,
+                    ctx.causal,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    dropout_p=ctx.dropout_p,
+                    philox_seed=ctx.philox_seed,
+                    philox_offset=ctx.philox_offset,
+                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                )
+            else:
+                flash_attn_onekernel_backward(
+                    do_padded,
+                    q,
+                    k,
+                    v,
+                    out,
+                    softmax_lse,
+                    dq,
+                    dk,
+                    dv,
+                    dbias,
+                    ctx.softmax_scale,
+                    ctx.alibi_slopes,
+                    ctx.causal,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    dropout_p=ctx.dropout_p,
+                    philox_seed=ctx.philox_seed,
+                    philox_offset=ctx.philox_offset,
+                    USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                    sink=sink,
+                    dsink=dsink,
+                )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]

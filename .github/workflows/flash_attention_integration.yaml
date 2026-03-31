@@ -129,18 +129,21 @@ jobs:
           RUN pip install --upgrade pip
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
-          # Clone flash-attention and override aiter submodule with local checkout
+          # Install aiter from PR branch, then flash-attention with aiter submodule override
           COPY . /aiter
+          RUN cd /aiter && pip install --no-build-isolation -e .
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
               rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
               cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
               cd /flash-attention && \
               FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-              pip install --no-build-isolation .
+              pip install --no-build-isolation --no-deps .
 
           RUN echo "=== Installed versions ===" && \
               pip show flash-attn && \
-              pip show amd-aiter
+              pip show amd-aiter && \
+              echo "=== Verify aiter is installed from PR branch ===" && \
+              python -c "import aiter, pathlib; loc = str(pathlib.Path(aiter.__file__).resolve().parent); assert loc.startswith('/aiter'), f'FATAL: aiter installed from {loc}, expected /aiter (PR branch). Base image aiter was not overridden.'"
 
           WORKDIR /flash-attention
           EOF
@@ -171,6 +174,22 @@ jobs:
             --name fa_triton_test \
             fa_triton_test:ci
 
+      - name: Run benchmarks
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          docker exec fa_triton_test bash -c "
+            cd /flash-attention
+            FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+            python benchmarks/benchmark_flash_attention.py
+          " |& tee benchmark_fa_triton_${{ matrix.label }}.log
+          docker exec fa_triton_test bash -c "
+            cd /aiter
+            python op_tests/op_benchmarks/triton/bench_mha.py \
+              -impl dao_ai -metric throughput -o /tmp/bench_dao_ai
+          " |& tee benchmark_mha_daoai_${{ matrix.label }}.log
+          docker cp fa_triton_test:/tmp/bench_dao_ai/ bench_dao_ai_${{ matrix.label }}/ 2>/dev/null || true
+
       - name: Run correctness tests
         timeout-minutes: 360
         run: |
@@ -193,22 +212,15 @@ jobs:
             "
           fi
 
-      - name: Run benchmarks
-        timeout-minutes: 30
-        run: |
-          set -o pipefail
-          docker exec fa_triton_test bash -c "
-            cd /flash-attention
-            FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
-            python benchmarks/benchmark_flash_attention.py
-          " |& tee benchmark_triton_${{ matrix.label }}.log
-
       - name: Upload benchmark results
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: flash-attention-triton-benchmark-${{ matrix.label }}
-          path: benchmark_triton_${{ matrix.label }}.log
+          path: |
+            benchmark_fa_triton_${{ matrix.label }}.log
+            benchmark_mha_daoai_${{ matrix.label }}.log
+            bench_dao_ai_${{ matrix.label }}/
 
       - name: Clean Up
         if: always()
@@ -360,7 +372,7 @@ jobs:
           # docker exec fa_ck_test bash -c "
           #   cd /flash-attention
           #   python benchmarks/benchmark_flash_attention.py
-          # " |& tee benchmark_ck.log
+          # " |& tee benchmark_fa_ck.log
 
       - name: Upload benchmark results
         if: success()
