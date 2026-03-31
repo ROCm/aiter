@@ -27,14 +27,53 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
+@dataclass
+class BenchRun:
+    configs: list["BenchConfig"]
+    mode: str  # "fwd" or "bwd"
+    torch_dtype: torch.dtype
+    unit: str  # "ms", "TFLOPS", "GB/s"
+    plot_name: str
+    sink: bool
+    equal_seqlens: bool
+    save_path: str | None
+    profile_dir: str | None
+    print_vgpr: bool
+    bench_torch: bool
+
+
 @dataclass(frozen=True)
-class Provider:
-    label: str
-    make_fn: Callable[..., Callable]
+class BenchConfig:
+    name: str
+    batch: int
+    hq: int
+    hk: int
+    sq: int
+    sk: int
+    d_head: int
+    d_head_v: int
+    causal: bool
+    layout: str  # "bshd" or "thd"
+    dtype_str: str  # "bf16", "fp16", "fp32", "fp8"
+    impl: str = "default"  # "default" or "dao_ai"
+    fused: bool = False
 
-
-# Registry populated by create_benchmark_configs, looked up by bench_mha
-_PROVIDERS: dict[str, Provider] = {}
+    def to_tuple(self) -> tuple:
+        return (
+            self.name,
+            self.batch,
+            self.hq,
+            self.hk,
+            self.sq,
+            self.sk,
+            self.d_head,
+            self.d_head_v,
+            self.causal,
+            self.layout,
+            self.dtype_str,
+            self.impl,
+            self.fused,
+        )
 
 
 def _make_bf16_fn(q, k, v, **kw):
@@ -143,42 +182,73 @@ def _make_fp8_varlen_fn(q, k, v, **kw):
     )
 
 
-def nonvarlen_benchmark_configs(causal=None):
-    batch_sizes = [1, 4, 16]
+_MAKE_FN = {
+    ("bf16", "bshd"): _make_bf16_fn,
+    ("bf16", "thd"): _make_bf16_varlen_fn,
+    ("fp16", "bshd"): _make_bf16_fn,
+    ("fp16", "thd"): _make_bf16_varlen_fn,
+    ("fp32", "bshd"): _make_bf16_fn,
+    ("fp32", "thd"): _make_bf16_varlen_fn,
+    ("fp8", "bshd"): _make_fp8_fn,
+    ("fp8", "thd"): _make_fp8_varlen_fn,
+    ("bf16_fused", "bshd"): _make_bf16_fused_fn,
+    ("bf16_fused", "thd"): _make_bf16_fused_varlen_fn,
+    ("fp16_fused", "bshd"): _make_bf16_fused_fn,
+    ("fp16_fused", "thd"): _make_bf16_fused_varlen_fn,
+    ("fp32_fused", "bshd"): _make_bf16_fused_fn,
+    ("fp32_fused", "thd"): _make_bf16_fused_varlen_fn,
+}
+
+
+def get_make_fn(dtype: str, layout: str, fused: bool = False) -> Callable:
+    key = (f"{dtype}_fused" if fused else dtype, layout)
+    return _MAKE_FN[key]
+
+
+def synthetic_benchmark_configs(
+    causal: bool | None,
+    d_head: int,
+    d_head_v: int,
+    layout: str,
+    dtypes: list[str],
+    impl: str,
+    fused: bool,
+) -> list[BenchConfig]:
+    batch_sizes = [1, 4, 8, 16]
     head_configs = [(16, 16), (48, 48), (32, 8)]  # (HQ, HK): MHA and GQA
     seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192, 16384]
     causals = [causal] if causal is not None else [False, True]
-    configs = [
-        (batch_size, hq, hk, sq, sk, c)
-        for batch_size, (hq, hk), sq, sk, c in itertools.product(
-            batch_sizes, head_configs, seq_len_q, seq_len_k, causals
+    return [
+        BenchConfig(
+            name=f"B{b}_HQ{hq}_HK{hk}",
+            batch=b,
+            hq=hq,
+            hk=hk,
+            sq=sq,
+            sk=sk,
+            d_head=d_head,
+            d_head_v=d_head_v,
+            causal=c,
+            layout=layout,
+            dtype_str=d,
+            impl=impl,
+            fused=fused and d != "fp8",
+        )
+        for b, (hq, hk), sq, sk, c, d in itertools.product(
+            batch_sizes, head_configs, seq_len_q, seq_len_k, causals, dtypes
         )
     ]
-    return configs
 
 
-def varlen_benchmark_configs(causal=None):
-    batch_sizes = [1, 4, 8]
-    head_configs = [(16, 16), (48, 48), (32, 8)]  # (HQ, HK): MHA and GQA
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192, 16384]
-    causals = [causal] if causal is not None else [False, True]
-    configs = [
-        (batch_size, hq, hk, sq, sk, c)
-        for batch_size, (hq, hk), sq, sk, c in itertools.product(
-            batch_sizes, head_configs, seq_len_q, seq_len_k, causals
-        )
-    ]
-    return configs
-
-
-def model_benchmark_configs(args):
+def model_benchmark_configs(
+    args, dtypes: list[str], impl: str, fused: bool, model: str = "all"
+) -> list[BenchConfig]:
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models=args.model)
-    fa_configs = []
+    configs = get_model_configs(config_path=config_file, models=model)
+    fa_configs: list[BenchConfig] = []
     batch_size = args.b if args.b else 1
-    causal = args.causal
+    causal = args.causal if args.causal is not None else True
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -187,36 +257,27 @@ def model_benchmark_configs(args):
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        N_CTX_Q = args.sq if args.sq else [2**i for i in range(1, 14)]
-        N_CTX_K = args.sk if args.sk else N_CTX_Q
         HEAD_DIM = config["hidden_size"] // HQ
-        if isinstance(N_CTX_Q, list):
-            for seq_len in N_CTX_Q:
-                fa_configs.append(
-                    (
-                        model_name,
-                        batch_size,
-                        HQ,
-                        HK,
-                        seq_len,
-                        seq_len,
-                        HEAD_DIM,
-                        HEAD_DIM,
-                        causal,
-                    )
-                )
+        if args.sq:
+            sq_sk_pairs = [(args.sq, args.sk if args.sk else args.sq)]
         else:
+            sq_sk_pairs = [(2**i, 2**i) for i in range(1, 14)]
+        for (sq, sk), d in itertools.product(sq_sk_pairs, dtypes):
             fa_configs.append(
-                (
-                    model_name,
-                    batch_size,
-                    HQ,
-                    HK,
-                    N_CTX_Q,
-                    N_CTX_K,
-                    HEAD_DIM,
-                    HEAD_DIM,
-                    causal,
+                BenchConfig(
+                    name=model_name,
+                    batch=batch_size,
+                    hq=HQ,
+                    hk=HK,
+                    sq=sq,
+                    sk=sk,
+                    d_head=HEAD_DIM,
+                    d_head_v=HEAD_DIM,
+                    causal=causal,
+                    layout="thd",
+                    dtype_str=d,
+                    impl=impl,
+                    fused=fused and d != "fp8",
                 )
             )
 
@@ -254,121 +315,36 @@ def pad_rearrange_dropout_mask(
     return padded_dropout_mask
 
 
-def create_benchmark_configs(custom, args):
-    dtype = arg_to_torch_dtype[args.tensor_dtype]
-    hk = args.hq if not args.hk else args.hk
-    sk = args.sq if not args.sk else args.sk
-    head_size = 128 if not args.d else args.d
-    head_size_v = head_size if not args.dv else args.dv
-    mode = args.mode
-    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "causal"]
-    causal = args.causal
-    varlen = args.layout == "thd"
-
-    configs = []
-    plot_name = get_caller_name_no_ext()
-    extra_args = {
-        "D_HEAD": head_size,
-        "D_HEAD_V": head_size_v,
-        "dtype": dtype,
-        "mode": mode,
-    }
-
-    if custom:
-        x_vals_list = [
-            (args.b, args.hq, hk, args.sq, sk, causal if causal is not None else False)
-        ]
-    else:
-        if varlen:
-            x_vals_list = varlen_benchmark_configs(causal)
-        else:
-            x_vals_list = nonvarlen_benchmark_configs(causal)
-
-        if args.model:
-            x_vals_list = model_benchmark_configs(args)
-            x_names = [
-                "model",
-                "BATCH",
-                "HQ",
-                "HK",
-                "N_CTX_Q",
-                "N_CTX_K",
-                "D_HEAD",
-                "D_HEAD_V",
-                "causal",
-            ]
-            plot_name = f"fused-attention-{mode}-layout-{args.layout}-dtype-{args.dtype}-causal-{causal}"
-            extra_args = {"dtype": dtype, "mode": mode}
-
-    if args.metric == "time":
-        unit = "ms"
-    elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
-    else:
-        raise ValueError("Unknown metric: " + args.metric)
-
-    dtype_to_fn = {
-        "bf16": _make_bf16_varlen_fn if varlen else _make_bf16_fn,
-        "fp16": _make_bf16_varlen_fn if varlen else _make_bf16_fn,
-        "fp32": _make_bf16_varlen_fn if varlen else _make_bf16_fn,
-        "fp8": _make_fp8_varlen_fn if varlen else _make_fp8_fn,
-    }
-    bf16_fused_fn = _make_bf16_fused_varlen_fn if varlen else _make_bf16_fused_fn
-
-    impl_suffix = f"-{args.impl}" if args.impl != "default" else ""
-
-    providers = []
-    for d in args.dtypes:
-        label = d.upper()
-        if mode == "bwd":
-            if args.fused_bwd and d != "fp8":
-                providers.append(
-                    Provider(f"{label}-fused-bwd{impl_suffix}({unit})", bf16_fused_fn)
-                )
-            else:
-                providers.append(
-                    Provider(f"{label}-bwd{impl_suffix}({unit})", dtype_to_fn[d])
-                )
-        else:
-            providers.append(
-                Provider(f"{label}-fwd{impl_suffix}({unit})", dtype_to_fn[d])
-            )
-
-    if args.bench_torch:
-        bf16_fn = dtype_to_fn["bf16"]
-        providers = [
-            Provider(f"Triton({unit})", bf16_fn),
-            Provider(f"Torch({unit})", bf16_fn),
-        ]
-
-    _PROVIDERS.clear()
-    for p in providers:
-        _PROVIDERS[p.label] = p
-    line_vals = [p.label for p in providers]
-
-    configs.append(
+def _make_triton_benchmark(run: BenchRun) -> list:
+    x_names = [
+        "name", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
+        "D_HEAD", "D_HEAD_V", "causal", "layout", "dtype", "impl", "fused",
+    ]
+    return [
         triton.testing.Benchmark(
             x_names=x_names,
-            x_vals=x_vals_list,
+            x_vals=[c.to_tuple() for c in run.configs],
             line_arg="provider",
-            line_vals=line_vals,
-            line_names=line_vals,
-            styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
-            ylabel=unit,
-            plot_name=plot_name,
-            args=extra_args,
+            line_vals=[run.unit],
+            line_names=[run.unit],
+            styles=[("red", "-")],
+            ylabel=run.unit,
+            plot_name=run.plot_name,
+            args={
+                "torch_dtype": run.torch_dtype,
+                "mode": run.mode,
+                "unit": run.unit,
+            },
         )
-    )
-    return configs
+    ]
 
 
-def run_benchmark(custom, args):
+def run_benchmark(run: BenchRun):
     torch.manual_seed(20)
 
-    @triton.testing.perf_report(create_benchmark_configs(custom, args))
+    @triton.testing.perf_report(_make_triton_benchmark(run))
     def bench_mha(
+        name,
         BATCH,
         HQ,
         HK,
@@ -376,12 +352,16 @@ def run_benchmark(custom, args):
         N_CTX_K,
         D_HEAD,
         D_HEAD_V,
-        dtype,
         causal,
+        layout,
+        dtype,
+        impl,
+        fused,
+        torch_dtype,
         mode,
+        unit,
         provider,
         dropout=0.0,
-        model=None,
         sm_scale=None,
         device="cuda",
     ):
@@ -389,9 +369,11 @@ def run_benchmark(custom, args):
         requires_grad = mode == "bwd"
         return_lse = True
         return_attn_probs = False
-        varlen = args.layout == "thd"
+        varlen = layout == "thd"
         has_pe = D_HEAD > D_HEAD_V
-        provider_obj = _PROVIDERS[provider]
+        if impl != "default":
+            mha_set_impl(impl)
+        make_fn = get_make_fn(dtype, layout, fused)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
@@ -401,24 +383,24 @@ def run_benchmark(custom, args):
         q = torch.randn(
             (BATCH, N_CTX_Q, HQ, D_HEAD),
             device=device,
-            dtype=dtype,
+            dtype=torch_dtype,
             requires_grad=requires_grad,
         )
         k = torch.randn(
             (BATCH, N_CTX_K, HK, D_HEAD),
             device=device,
-            dtype=dtype,
+            dtype=torch_dtype,
             requires_grad=requires_grad,
         )
         v = torch.randn(
             (BATCH, N_CTX_K, HK, D_HEAD_V),
             device=device,
-            dtype=dtype,
+            dtype=torch_dtype,
             requires_grad=requires_grad,
         )
         sink = (
             torch.randn((HQ,), device=device, dtype=dtype, requires_grad=requires_grad)
-            if args.sink
+            if run.sink
             else None
         )
 
@@ -428,10 +410,10 @@ def run_benchmark(custom, args):
         # Input preparation
         if varlen:
             query_padding_mask = generate_random_padding_mask(
-                N_CTX_Q, BATCH, device, mode="full" if args.equal_seqlens else "random"
+                N_CTX_Q, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
             key_padding_mask = generate_random_padding_mask(
-                N_CTX_K, BATCH, device, mode="full" if args.equal_seqlens else "random"
+                N_CTX_K, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
             (
                 q_unpad,
@@ -495,7 +477,7 @@ def run_benchmark(custom, args):
             return_attn_probs=return_attn_probs,
             sink=sink,
             has_pe=has_pe,
-            has_sink=args.sink,
+            has_sink=run.sink,
         )
         if varlen:
             fn_kwargs.update(
@@ -504,7 +486,7 @@ def run_benchmark(custom, args):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
             )
-        fn = provider_obj.make_fn(q_input, k_input, v_input, **fn_kwargs)
+        fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
         if fn is None:
             return 0
 
@@ -526,7 +508,7 @@ def run_benchmark(custom, args):
                     )
                     return grads
 
-        if args.profile is not None:
+        if run.profile_dir is not None:
             import os
 
             # Warmup
@@ -548,7 +530,9 @@ def run_benchmark(custom, args):
                 torch.cuda.synchronize()
             prof.stop()
 
-            shape_str = f"B{BATCH}_HQ{HQ}_HK{HK}_SQ{N_CTX_Q}_SK{N_CTX_K}_D{D_HEAD}"
+            shape_str = (
+                f"{name}_B{BATCH}_HQ{HQ}_HK{HK}_SQ{N_CTX_Q}_SK{N_CTX_K}_D{D_HEAD}"
+            )
             print(f"\n--- Profile: {mode} {shape_str} ---")
             print(
                 prof.key_averages().table(
@@ -556,7 +540,7 @@ def run_benchmark(custom, args):
                     row_limit=30,
                 )
             )
-            trace_dir = os.path.join(args.profile, f"{mode}_{shape_str}")
+            trace_dir = os.path.join(run.profile_dir, f"{mode}_{shape_str}")
             os.makedirs(trace_dir, exist_ok=True)
             prof.export_chrome_trace(os.path.join(trace_dir, "trace.json"))
             return 0
@@ -588,18 +572,17 @@ def run_benchmark(custom, args):
             mem_write = q_size + k_size + v_size
         mem = mem_read + mem_write
 
-        # return ms
-        if "ms" in provider:
+        if unit == "ms":
             return ms
-        elif "TFLOPS" in provider:
+        elif unit == "TFLOPS":
             return total_flops / ms * 1e-9
         else:  # GB/s
             return mem / ms * 1e-6
 
     try:
-        bench_mha.run(save_path=args.o, print_data=True)
+        bench_mha.run(save_path=run.save_path, print_data=True)
     except Exception as e:
-        print(f"\n[WARN] {args.mode} benchmark failed: {e}", flush=True)
+        print(f"\n[WARN] {run.mode} benchmark failed: {e}", flush=True)
 
 
 def supported_layouts():
@@ -622,7 +605,16 @@ def str2bool(v):
         raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
-def parse_args(args: list[str] | None = None) -> argparse.Namespace:
+VALID_DTYPES = {"fp16", "bf16", "fp32", "fp8"}
+
+arg_to_torch_dtype = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+}
+
+
+def parse_args(args: list[str] | None = None) -> BenchRun:
     parser = get_parser(kernel_name="FlashAttention")
     parser.add_argument(
         "-mode", type=str, default="fwd", help="fwd:forward kernel, bwd:backward kernel"
@@ -655,7 +647,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
+    parser.add_argument("--layout", type=str, default="bshd", help=supported_layouts())
     parser.add_argument(
         "-metric",
         nargs="?",
@@ -696,92 +688,121 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         choices=["default", "dao_ai"],
         help="MHA forward implementation: default (_attn_fwd) or dao_ai (flash_attn_triton_amd)",
     )
-    return parser.parse_args(args=args)
+    parsed = parser.parse_args(args=args)
 
+    # Validate dtypes
+    dtypes = [d.strip() for d in parsed.dtype.split(",")]
+    for d in dtypes:
+        assert d in VALID_DTYPES, f"Unknown dtype '{d}'. Supported: {sorted(VALID_DTYPES)}"
+    tensor_dtype_str = next((d for d in dtypes if d != "fp8"), "bf16")
+    torch_dtype = arg_to_torch_dtype[tensor_dtype_str]
 
-VALID_DTYPES = {"fp16", "bf16", "fp32", "fp8"}
+    assert parsed.layout in ("bshd", "thd"), (
+        f"{parsed.layout} is not a supported layout. Use 'bshd' or 'thd'."
+    )
 
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-}
-
-
-def post_process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, bool]:
-    if args.model:
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = True
-        if args.layout is None:  # User didn't specify -layout
-            args.layout = "thd"
-        print(
-            f"Note: using -model config defaults: causal={True}, layout={'thd'}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
+    custom = bool(parsed.hq or parsed.hk or parsed.d or parsed.dv)
+    if custom:
+        if not parsed.dv:
+            parsed.dv = parsed.d
+        assert parsed.b and parsed.hq and parsed.sq and parsed.d and parsed.dv, (
+            "Custom config requires: -b, -hq, -sq, -d (and optionally -dv)."
         )
-    else:
-        # causal=None means iterate both True and False in default configs
-        if args.layout is None:  # User didn't specify -layout
-            args.layout = "bshd"
+    if parsed.model:
+        assert not custom, (
+            "--model sets hq, hk, d from the config. Do not provide them."
+        )
 
-    custom_config = False
-
-    assert (
-        args.layout == "thd" or not args.equal_seqlens or args.model
-    ), "Equal sequence lengths arg must be used with the thd layout or a model config."
-    if args.hq or args.hk or args.d or args.dv:
-        custom_config = True
-        if not args.dv:
-            args.dv = args.d
-        assert (
-            args.b and args.hq and args.sq and args.d and args.dv
-        ), "If custom config is specified, please provide \
-                all of batch, number of Q heads, Q sequence length \
-                and head size."
-
-    if args.model:
-        assert not (
-            args.hq or args.hk or args.d or args.dv
-        ), "Specifying model fixes hq, hk and d already. Do not provide them!"
-
-    args.dtypes = [d.strip() for d in args.dtype.split(",")]
-    for d in args.dtypes:
-        assert (
-            d in VALID_DTYPES
-        ), f"Unknown dtype '{d}'. Supported: {sorted(VALID_DTYPES)}"
-    # Tensor dtype is the first non-fp8 dtype, or bf16 if only fp8
-    args.tensor_dtype = next((d for d in args.dtypes if d != "fp8"), "bf16")
-
-    assert (
-        args.layout in supported_layouts()
-    ), f"{args.layout} is not in supported layouts: {supported_layouts()}."
-
-    if args.layout == "thd" and args.equal_seqlens:
+    if parsed.layout == "thd" and parsed.equal_seqlens:
         warnings.warn(
             "Using 'thd' layout with equal_seqlen=True incurs an extra sequence length lookup cost "
             "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
             category=RuntimeWarning,
         )
 
-    return args, custom_config
+    # Resolve metric/unit
+    metric = parsed.metric or "throughput"
+    unit_map = {"throughput": "TFLOPS", "time": "ms", "bandwidth": "GB/s"}
+    unit = unit_map[metric]
+
+    # Build configs
+    impl = parsed.impl
+    fused = parsed.fused_bwd
+    d_head = parsed.d if parsed.d else 128
+    d_head_v = parsed.dv if parsed.dv else d_head
+
+    if custom:
+        hk = parsed.hk if parsed.hk else parsed.hq
+        sk = parsed.sk if parsed.sk else parsed.sq
+        causals = [parsed.causal] if parsed.causal is not None else [False, True]
+        configs = [
+            BenchConfig(
+                name=f"custom_B{parsed.b}_HQ{parsed.hq}_HK{hk}",
+                batch=parsed.b,
+                hq=parsed.hq,
+                hk=hk,
+                sq=parsed.sq,
+                sk=sk,
+                d_head=d_head,
+                d_head_v=d_head_v,
+                causal=c,
+                layout=parsed.layout,
+                dtype_str=d,
+                impl=impl,
+                fused=fused and d != "fp8",
+            )
+            for c, d in itertools.product(causals, dtypes)
+        ]
+    elif parsed.model:
+        configs = model_benchmark_configs(
+            parsed, dtypes=dtypes, impl=impl, fused=fused, model=parsed.model,
+        )
+    else:
+        # Default: model configs (thd, causal) then synthetic (bshd, iterate causal)
+        configs = model_benchmark_configs(
+            parsed, dtypes=dtypes, impl=impl, fused=fused, model="all",
+        )
+        configs += synthetic_benchmark_configs(
+            causal=parsed.causal,
+            d_head=d_head,
+            d_head_v=d_head_v,
+            layout=parsed.layout,
+            dtypes=dtypes,
+            impl=impl,
+            fused=fused,
+        )
+
+    plot_name = f"{get_caller_name_no_ext()}_{parsed.mode}"
+
+    return BenchRun(
+        configs=configs,
+        mode=parsed.mode,
+        torch_dtype=torch_dtype,
+        unit=unit,
+        plot_name=plot_name,
+        sink=parsed.sink,
+        equal_seqlens=parsed.equal_seqlens,
+        save_path=parsed.o,
+        profile_dir=parsed.profile,
+        print_vgpr=parsed.print_vgpr,
+        bench_torch=parsed.bench_torch,
+    )
 
 
 def main(args: list[str] | None = None) -> None:
-    parsed_args = parse_args(args=args)
-    parsed_args, custom_config = post_process_args(parsed_args)
+    run = parse_args(args=args)
 
-    if parsed_args.impl != "default":
-        mha_set_impl(parsed_args.impl)
-
-    if parsed_args.print_vgpr:
-        assert not parsed_args.bench_torch, "Do not use -bench_torch with -print_vgpr."
+    if run.print_vgpr:
+        assert not run.bench_torch, "Do not use -bench_torch with -print_vgpr."
         print("Retrieving VGPR usage for Triton kernels...")
 
         def fun():
-            return run_benchmark(custom_config, parsed_args)
+            return run_benchmark(run)
 
         print_vgpr(fun, get_caller_name_no_ext())
         return
 
-    run_benchmark(custom_config, parsed_args)
+    run_benchmark(run)
 
 
 if __name__ == "__main__":
