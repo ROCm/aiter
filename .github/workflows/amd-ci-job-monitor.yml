@@ -111,7 +111,7 @@ jobs:
   matrix-reports:
     name: ${{ matrix.workflow }} - ${{ matrix.job_name }}
     needs: parse-workflows
-    if: ${{ !inputs.job_filter && needs.parse-workflows.outputs.matrix != '[]' }}
+    if: ${{ github.event_name != 'pull_request' && !inputs.job_filter && needs.parse-workflows.outputs.matrix != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -161,10 +161,11 @@ jobs:
 
       - name: Generate runner fleet report
         run: |
+          HOURS="${{ github.event_name == 'pull_request' && '1' || (inputs.hours || '24') }}"
           python scripts/ci/query_job_status.py \
             --repo "${{ github.repository }}" \
             --workflows "${{ needs.parse-workflows.outputs.workflow_list }}" \
-            --hours "${{ inputs.hours || '24' }}" \
+            --hours "${HOURS}" \
             --runner-report \
             --summary | tee runner-fleet-report.md
 
