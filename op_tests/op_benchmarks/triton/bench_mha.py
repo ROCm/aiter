@@ -9,6 +9,7 @@ from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
+    mha_set_impl,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
@@ -142,28 +143,32 @@ def _make_fp8_varlen_fn(q, k, v, **kw):
     )
 
 
-def nonvarlen_benchmark_configs():
+def nonvarlen_benchmark_configs(causal=None):
     batch_sizes = [1, 4, 16]
-    N_HEADS = [16, 48]
+    head_configs = [(16, 16), (48, 48), (32, 8)]  # (HQ, HK): MHA and GQA
     seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
+    seq_len_k = [163, 8192, 16384]
+    causals = [causal] if causal is not None else [False, True]
     configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
+        (batch_size, hq, hk, sq, sk, c)
+        for batch_size, (hq, hk), sq, sk, c in itertools.product(
+            batch_sizes, head_configs, seq_len_q, seq_len_k, causals
+        )
     ]
     return configs
 
 
-def varlen_benchmark_configs():
+def varlen_benchmark_configs(causal=None):
     batch_sizes = [1, 4, 8]
-    N_HEADS = [16, 48]
+    head_configs = [(16, 16), (48, 48), (32, 8)]  # (HQ, HK): MHA and GQA
     seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
+    seq_len_k = [163, 8192, 16384]
+    causals = [causal] if causal is not None else [False, True]
     configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
+        (batch_size, hq, hk, sq, sk, c)
+        for batch_size, (hq, hk), sq, sk, c in itertools.product(
+            batch_sizes, head_configs, seq_len_q, seq_len_k, causals
+        )
     ]
     return configs
 
@@ -173,6 +178,7 @@ def model_benchmark_configs(args):
     configs = get_model_configs(config_path=config_file, models=args.model)
     fa_configs = []
     batch_size = args.b if args.b else 1
+    causal = args.causal
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -196,11 +202,12 @@ def model_benchmark_configs(args):
                         seq_len,
                         HEAD_DIM,
                         HEAD_DIM,
+                        causal,
                     )
                 )
         else:
             fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM, HEAD_DIM)
+                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM, HEAD_DIM, causal)
             )
 
     return fa_configs
@@ -244,7 +251,7 @@ def create_benchmark_configs(custom, args):
     head_size = 128 if not args.d else args.d
     head_size_v = head_size if not args.dv else args.dv
     mode = args.mode
-    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
+    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "causal"]
     causal = args.causal
     varlen = args.layout == "thd"
 
@@ -254,17 +261,16 @@ def create_benchmark_configs(custom, args):
         "D_HEAD": head_size,
         "D_HEAD_V": head_size_v,
         "dtype": dtype,
-        "causal": causal,
         "mode": mode,
     }
 
     if custom:
-        x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+        x_vals_list = [(args.b, args.hq, hk, args.sq, sk, causal if causal is not None else False)]
     else:
         if varlen:
-            x_vals_list = varlen_benchmark_configs()  # Assume this exists
+            x_vals_list = varlen_benchmark_configs(causal)
         else:
-            x_vals_list = nonvarlen_benchmark_configs()  # Assume this exists
+            x_vals_list = nonvarlen_benchmark_configs(causal)
 
         if args.model:
             x_vals_list = model_benchmark_configs(args)
@@ -277,9 +283,10 @@ def create_benchmark_configs(custom, args):
                 "N_CTX_K",
                 "D_HEAD",
                 "D_HEAD_V",
+                "causal",
             ]
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-dtype-{args.dtype}-causal-{causal}"
-            extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
+            extra_args = {"dtype": dtype, "mode": mode}
 
     if args.metric == "time":
         unit = "ms"
@@ -298,16 +305,24 @@ def create_benchmark_configs(custom, args):
     }
     bf16_fused_fn = _make_bf16_fused_varlen_fn if varlen else _make_bf16_fused_fn
 
+    impl_suffix = f"-{args.impl}" if args.impl != "default" else ""
+
     providers = []
     for d in args.dtypes:
         label = d.upper()
         if mode == "bwd":
             if args.fused_bwd and d != "fp8":
-                providers.append(Provider(f"{label}-fused-bwd({unit})", bf16_fused_fn))
+                providers.append(
+                    Provider(f"{label}-fused-bwd{impl_suffix}({unit})", bf16_fused_fn)
+                )
             else:
-                providers.append(Provider(f"{label}-bwd({unit})", dtype_to_fn[d]))
+                providers.append(
+                    Provider(f"{label}-bwd{impl_suffix}({unit})", dtype_to_fn[d])
+                )
         else:
-            providers.append(Provider(f"{label}-fwd({unit})", dtype_to_fn[d]))
+            providers.append(
+                Provider(f"{label}-fwd{impl_suffix}({unit})", dtype_to_fn[d])
+            )
 
     if args.bench_torch:
         bf16_fn = dtype_to_fn["bf16"]
@@ -662,6 +677,13 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-sink", action="store_true", default=False, help="use attention sink"
     )
+    parser.add_argument(
+        "-impl",
+        type=str,
+        default="default",
+        choices=["default", "dao_ai"],
+        help="MHA forward implementation: default (_attn_fwd) or dao_ai (flash_attn_triton_amd)",
+    )
     return parser.parse_args(args=args)
 
 
@@ -684,9 +706,7 @@ def post_process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, boo
             f"Note: using -model config defaults: causal={True}, layout={'thd'}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
         )
     else:
-        # the defaults for causal and varlen when not using the -model
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = False
+        # causal=None means iterate both True and False in default configs
         if args.layout is None:  # User didn't specify -layout
             args.layout = "bshd"
 
@@ -735,6 +755,9 @@ def post_process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, boo
 def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
     parsed_args, custom_config = post_process_args(parsed_args)
+
+    if parsed_args.impl != "default":
+        mha_set_impl(parsed_args.impl)
 
     if parsed_args.print_vgpr:
         assert not parsed_args.bench_torch, "Do not use -bench_torch with -print_vgpr."

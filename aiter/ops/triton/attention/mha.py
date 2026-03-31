@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 import torch
 import triton
 import triton.language as tl
@@ -27,6 +27,15 @@ def mha_set_use_fused_bwd_kernel(value: bool):
     """
     global _USE_FUSED_BWD_KERNEL
     _USE_FUSED_BWD_KERNEL = value
+
+
+_MHA_IMPL = "default"
+
+
+def mha_set_impl(impl: Literal["default", "dao_ai"]):
+    """Set MHA forward implementation: 'default' (_attn_fwd) or 'dao_ai' (flash_attn_triton_amd)."""
+    global _MHA_IMPL
+    _MHA_IMPL = impl
 
 
 _USE_INT64_STRIDES = True
@@ -164,6 +173,47 @@ def _flash_attn_forward(
     else:
         s_dmask = None
         dropout_mask = None
+
+    if _MHA_IMPL == "dao_ai":
+        if is_varlen:
+            o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
+                q,
+                k,
+                v,
+                o,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_k=None,
+                leftpad_k=None,
+                block_table_=None,
+                alibi_slopes=alibi_slopes,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                zero_tensors=False,
+                causal=causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                return_softmax=return_softmax,
+            )
+        else:
+            o, softmax_lse, s_dmask, _ = flash_attn_2.fwd(
+                q,
+                k,
+                v,
+                o,
+                alibi_slopes,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left=-1,
+                window_size_right=-1,
+                softcap=0.0,
+                return_softmax=return_softmax,
+            )
+        return o, softmax_lse, s_dmask, philox_seed, philox_offset
 
     if config is None:
         config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)

@@ -201,14 +201,41 @@ jobs:
             cd /flash-attention
             FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
             python benchmarks/benchmark_flash_attention.py
-          " |& tee benchmark_triton_${{ matrix.label }}.log
+          " |& tee benchmark_fa_triton_${{ matrix.label }}.log
+
+      - name: Run dao_ai kernel benchmark
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          docker exec fa_triton_test bash -c "
+            cd /aiter
+            python op_tests/op_benchmarks/triton/bench_mha.py \
+              -impl dao_ai -metric throughput -o /tmp/bench_dao_ai
+          " |& tee benchmark_mha_daoai_${{ matrix.label }}.log
+          docker cp fa_triton_test:/tmp/bench_dao_ai/bench_mha.csv \
+            benchmark_mha_daoai_${{ matrix.label }}.csv 2>/dev/null || true
+
+      - name: Run dao_ai model benchmark
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          docker exec fa_triton_test bash -c "
+            cd /aiter
+            python op_tests/op_benchmarks/triton/bench_mha.py \
+              -impl dao_ai -metric throughput --model all -o /tmp/bench_dao_ai_model
+          " |& tee benchmark_mha_daoai_model_${{ matrix.label }}.log
+          docker cp fa_triton_test:/tmp/bench_dao_ai_model/*.csv \
+            benchmark_mha_daoai_model_${{ matrix.label }}.csv 2>/dev/null || true
 
       - name: Upload benchmark results
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: flash-attention-triton-benchmark-${{ matrix.label }}
-          path: benchmark_triton_${{ matrix.label }}.log
+          path: |
+            benchmark_fa_triton_${{ matrix.label }}.log
+            benchmark_mha_daoai_${{ matrix.label }}.*
+            benchmark_mha_daoai_model_${{ matrix.label }}.*
 
       - name: Clean Up
         if: always()
@@ -360,7 +387,7 @@ jobs:
           # docker exec fa_ck_test bash -c "
           #   cd /flash-attention
           #   python benchmarks/benchmark_flash_attention.py
-          # " |& tee benchmark_ck.log
+          # " |& tee benchmark_fa_ck.log
 
       - name: Upload benchmark results
         if: success()
