@@ -189,10 +189,10 @@ def test_fmoe(
             out_b = ref2
             avg_b = 9999
             print("asm g1u1 only support quant/smoothquant Now")
-        elif get_gfx() == "gfx950":
+        elif get_gfx() != "gfx942":
             out_b = ref2
             avg_b = 9999
-            print(f"skip asm g1u0 no-quant on {get_gfx()}: fmoe_[fb]16.co is not available")
+            print(f"skip asm g1u0 no-quant on {get_gfx()}: only runs on gfx942")
         else:
             out_b, avg_b = asm_moe_test(
                 input, w1b, w2b, topk_weights, topk_ids, activation=activation

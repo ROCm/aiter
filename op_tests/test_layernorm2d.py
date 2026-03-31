@@ -97,7 +97,7 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)
-    has_asm = get_gfx() != "gfx950"
+    has_asm = get_gfx() == "gfx942"
     if has_asm:
         (c, res_c, *_), avg_c = run_asm(input, weight, bias, 1e-5, residual=res)
         msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"

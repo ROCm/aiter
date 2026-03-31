@@ -19,6 +19,7 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter import ActivationType
 from aiter import pertoken_quant
 from aiter import dtypes
+from aiter import get_gfx
 import argparse
 
 BLOCK_SIZE_M = 32
@@ -364,7 +365,7 @@ parser.add_argument(
         "g1u1_no_quant",
         "g1u1_int8quant",
         "g1u1_fp8quant",
-        ##"g1u0_int8smoothquant", err in mi355 and not used, so comment out
+        "g1u0_int8smoothquant",
         "g1u1_int8smoothquant",
         "g1u1_fp8smoothquant",
     ],
@@ -443,6 +444,7 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+gpu_arch = get_gfx()
 
 for test in args.test:
     print(f"\nRunning test: {test}")
@@ -519,6 +521,9 @@ for test in args.test:
                                 ep=ep,
                             )
     elif test == "g1u0_int8smoothquant":
+        if gpu_arch != "gfx942":
+            print(f"skip {test} on {gpu_arch}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:
