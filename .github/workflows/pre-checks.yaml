@@ -51,16 +51,23 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set +e
           ruff check . \
             --output-format=rdjson \
-            --exit-zero \
-            --no-fix \
-          | reviewdog \
+            --no-fix > ruff.rdjson
+          ruff_exit=$?
+          set -e
+
+          reviewdog \
             -f=rdjson \
             -name="ruff" \
-            -reporter=github-pr-review \
-            -filter-mode=diff_context \
-            -fail-on-error=true
+            -reporter=github-check \
+            -fail-level=none < ruff.rdjson || echo "reviewdog failed (non-blocking)"
+
+          if [ "$ruff_exit" -ne 0 ]; then
+            echo "Ruff reported style issues."
+            exit "$ruff_exit"
+          fi
 
   upload-success-artifact:
     name: Upload Success Signal
