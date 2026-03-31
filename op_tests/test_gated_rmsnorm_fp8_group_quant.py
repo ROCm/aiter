@@ -11,7 +11,9 @@ Tests the fused HIP kernel that performs:
 Constraint: ONLY supports head_dim=128 and group_size=128
 """
 
+import pandas as pd
 import torch
+import aiter
 from aiter.ops.quant import per_group_quant_hip
 from aiter.test_common import checkAllclose, perftest
 import argparse
@@ -201,14 +203,14 @@ def test_gated_rmsnorm_fp8_group_quant(
     ref_scales_flat = ref_scales_expanded.reshape(num_tokens, -1)[
         :, : ref_quant.shape[1]
     ]
-    ref_dequant = ref_quant.float() * ref_scales_flat
+    ref_dequant = ref_quant.float()
 
     # For HIP: scales are same shape
     hip_scales_expanded = hip_scales.unsqueeze(-1).expand(-1, -1, group_size)
     hip_scales_flat = hip_scales_expanded.reshape(num_tokens, -1)[
         :, : hip_quant.shape[1]
     ]
-    hip_dequant = hip_quant.float() * hip_scales_flat
+    hip_dequant = hip_quant.float()
 
     checkAllclose(
         ref_dequant, hip_dequant, rtol=1e-2, atol=1e-2, msg="Dequantized values"
@@ -241,16 +243,29 @@ if __name__ == "__main__":
     parser.add_argument("--num_tokens", type=int, default=None, help="Number of tokens")
     parser.add_argument("--num_heads", type=int, default=None, help="Number of heads")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
-    parser.add_argument(
-        "--benchmark", action="store_true", help="Run comprehensive benchmark"
-    )
 
     args = parser.parse_args()
 
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}
     dtype = dtype_map[args.dtype]
+    if args.num_tokens is not None and args.num_heads is not None:
+        # Single test with command line args
+        test_gated_rmsnorm_fp8_group_quant(
+            num_tokens=args.num_tokens,
+            num_heads=args.num_heads,
+            head_dim=128,  # Fixed constraint
+            dtype=dtype,
+            transpose_scale=False,
+        )
+        test_gated_rmsnorm_fp8_group_quant(
+            num_tokens=args.num_tokens,
+            num_heads=args.num_heads,
+            head_dim=128,  # Fixed constraint
+            dtype=dtype,
+            transpose_scale=True,
+        )
+    else:
 
-    if args.benchmark:
         # Comprehensive benchmark configurations
         # head_dim=128, group_size=128 are fixed constraints
         test_configs = [
@@ -288,62 +303,8 @@ if __name__ == "__main__":
                 result["transpose_scale"] = transpose
                 results.append(result)
 
-        # Summary table
-        print("\n" + "=" * 80)
-        print("BENCHMARK SUMMARY")
-        print("=" * 80)
-        print(
-            f"{'Tokens':>8} {'Heads':>6} {'Transpose':>10} {'Ref (us)':>10} {'HIP (us)':>10} "
-            f"{'Speedup':>8} {'Ref BW':>10} {'HIP BW':>10}"
+        df = pd.DataFrame(results)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info(
+            "gated_rmsnorm_fp8_group_quant summary (markdown):\n%s", df_md
         )
-        print("-" * 80)
-
-        for r in results:
-            print(
-                f"{r['num_tokens']:>8} {r['num_heads']:>6} {str(r['transpose_scale']):>10} "
-                f"{r['ref_time_us']:>10.2f} {r['hip_time_us']:>10.2f} "
-                f"{r['speedup']:>8.2f}x {r['ref_bw_gbs']:>9.2f}G {r['hip_bw_gbs']:>9.2f}G"
-            )
-
-        # Calculate average speedup
-        avg_speedup = sum(r["speedup"] for r in results) / len(results)
-        avg_hip_bw = sum(r["hip_bw_gbs"] for r in results) / len(results)
-
-        print("-" * 80)
-        print(f"Average Speedup: {avg_speedup:.2f}x")
-        print(f"Average HIP Bandwidth: {avg_hip_bw:.2f} GB/s")
-        print("=" * 80 + "\n")
-
-    elif args.num_tokens is not None and args.num_heads is not None:
-        # Single test with command line args
-        test_gated_rmsnorm_fp8_group_quant(
-            num_tokens=args.num_tokens,
-            num_heads=args.num_heads,
-            head_dim=128,  # Fixed constraint
-            dtype=dtype,
-            transpose_scale=False,
-        )
-        test_gated_rmsnorm_fp8_group_quant(
-            num_tokens=args.num_tokens,
-            num_heads=args.num_heads,
-            head_dim=128,  # Fixed constraint
-            dtype=dtype,
-            transpose_scale=True,
-        )
-    else:
-        # Default quick test
-        test_configs = [
-            (128, 32, 128),
-            (1024, 32, 128),
-            (2048, 32, 128),
-        ]
-
-        for num_tokens, num_heads, head_dim in test_configs:
-            for transpose in [False, True]:
-                test_gated_rmsnorm_fp8_group_quant(
-                    num_tokens=num_tokens,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                    transpose_scale=transpose,
-                )
