@@ -3414,7 +3414,7 @@ __launch_bounds__(256, 8) __global__
     const int32_t bid = sb_idx / size_s;
 
     const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
-    const int64_t pos     = static_cast<int64_t>(p_indirect_buffer[ib_idx]);
+    const pos_t pos       = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
     {
@@ -3570,7 +3570,7 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
     const int32_t bid = sb_idx / size_s;
 
     const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
-    const int64_t pos     = static_cast<int64_t>(p_indirect_buffer[ib_idx]);
+    const pos_t pos       = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
     {
