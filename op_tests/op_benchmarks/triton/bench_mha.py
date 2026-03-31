@@ -346,10 +346,39 @@ def _make_triton_benchmark(run: BenchRun) -> list:
     ]
 
 
+def _write_csv(run: BenchRun, results: list[tuple[BenchConfig, float | None]]) -> None:
+    """Write benchmark results to CSV. Called even if the run crashes partway."""
+    if not run.save_path or not results:
+        return
+    import os
+    os.makedirs(run.save_path, exist_ok=True)
+    csv_path = os.path.join(run.save_path, f"{run.plot_name}.csv")
+    header = [
+        "model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
+        "D_HEAD", "D_HEAD_V", "causal", "function", "dtype", "impl", "fused",
+        run.unit,
+    ]
+    with open(csv_path, "w") as f:
+        f.write(",".join(header) + "\n")
+        for config, value in results:
+            if value is None:
+                continue
+            row = ",".join(str(x) for x in config.to_tuple()) + f",{value}\n"
+            f.write(row)
+    written = sum(1 for _, v in results if v is not None)
+    skipped = len(results) - written
+    msg = f"\nResults written to {csv_path} ({written} rows"
+    if skipped:
+        msg += f", {skipped} skipped"
+    msg += ")"
+    print(msg, flush=True)
+
+
 def run_benchmark(run: BenchRun):
     torch.manual_seed(20)
     total = len(run.configs)
     counter = 0
+    results: list[tuple[BenchConfig, float | None]] = []
 
     @triton.testing.perf_report(_make_triton_benchmark(run))
     def bench_mha(
@@ -382,16 +411,18 @@ def run_benchmark(run: BenchRun):
             flush=True,
         )
         try:
-            return _run_single_benchmark(
+            value = _run_single_benchmark(
                 model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
                 causal, function, dtype, impl, fused, torch_dtype, unit,
                 dropout, sm_scale, device, run,
             )
         except Exception as e:
             print(f"  [SKIP] {e}", flush=True)
-            return 0
+            value = None
         finally:
             torch.cuda.empty_cache()
+        results.append((run.configs[counter - 1], value))
+        return value if value is not None else 0
 
     def _run_single_benchmark(
         model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
@@ -649,9 +680,11 @@ def run_benchmark(run: BenchRun):
             return mem / ms * 1e-6
 
     try:
-        bench_mha.run(save_path=run.save_path, print_data=True)
+        bench_mha.run(print_data=True)
     except Exception as e:
         print(f"\n[WARN] benchmark failed: {e}", flush=True)
+    finally:
+        _write_csv(run, results)
 
 
 # argparse lacks support for boolean argument type (sigh...)
