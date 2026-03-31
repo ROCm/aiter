@@ -537,7 +537,7 @@ void moe_fused_gate(aiter_tensor_t* input,
                     int64_t topk_group,
                     int64_t topk,
                     int64_t num_fused_shared_experts,
-                    double routed_scaling_factor,
+                    float routed_scaling_factor,
                     hipStream_t stream)
 {
     const HipDeviceGuard device_guard(input->device_id);
