@@ -58,6 +58,14 @@ class BenchConfig:
     fused: bool = False
     model: str | None = None
 
+    def __str__(self) -> str:
+        label = self.model or "custom"
+        return (
+            f"{label} B={self.batch} HQ={self.hq} HK={self.hk} "
+            f"sq={self.sq} sk={self.sk} d={self.d_head} "
+            f"{self.layout} {self.mode} {self.dtype_str} causal={self.causal}"
+        )
+
     def to_tuple(self) -> tuple:
         return (
             self.model,
@@ -451,6 +459,8 @@ def _make_triton_benchmark(run: BenchRun) -> list:
 
 def run_benchmark(run: BenchRun):
     torch.manual_seed(20)
+    total = len(run.configs)
+    counter = 0
 
     @triton.testing.perf_report(_make_triton_benchmark(run))
     def bench_mha(
@@ -475,6 +485,14 @@ def run_benchmark(run: BenchRun):
         sm_scale=None,
         device="cuda",
     ):
+        nonlocal counter
+        counter += 1
+        label = model or "custom"
+        print(
+            f"[{counter}/{total}] {label} B={BATCH} HQ={HQ} HK={HK} "
+            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {layout} {mode} {dtype} causal={causal}",
+            flush=True,
+        )
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         requires_grad = mode == "bwd"
         return_lse = True
