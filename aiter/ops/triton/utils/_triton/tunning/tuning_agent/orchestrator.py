@@ -313,9 +313,10 @@ class Orchestrator:
 
         # Overall geomean across all kernels.
         overall_geomean: Optional[float] = None
-        if geomeans:
-            log_sum = sum(math.log(g) for g in geomeans if g and g > 0)
-            overall_geomean = math.exp(log_sum / len(geomeans))
+        valid_geomeans = [g for g in geomeans if g and g > 0]
+        if valid_geomeans:
+            log_sum = sum(math.log(g) for g in valid_geomeans)
+            overall_geomean = math.exp(log_sum / len(valid_geomeans))
 
         return {
             "run_id": self.run_id,

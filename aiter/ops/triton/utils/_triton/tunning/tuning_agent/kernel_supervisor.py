@@ -697,8 +697,9 @@ class KernelSupervisor:
             )
 
         artifact_dir = self.artifact_manager.remote_dir
-        scout_results_dir = _os.path.join(artifact_dir, "scout_results")
-        tuning_logs_dir = _os.path.join(artifact_dir, "tuning_logs")
+        tunning_dir = "/workspace/aiter/aiter/ops/triton/utils/_triton/tunning"
+        scout_results_dir = tunning_dir  # screen.py writes logs here
+        tuning_logs_dir = tunning_dir    # screen.py writes logs here
         config_dir = _os.path.join(artifact_dir, "configs")
 
         # Broad search space used for scouting.
@@ -897,7 +898,7 @@ class KernelSupervisor:
                     break
 
                 # --- Dispatch RegressionFixerAgent ---
-                threshold = self.config.tuning_config.thresholds.regression_vs_baseline
+                threshold = self.config.tuning_config.thresholds.regression_vs_baseline / 100.0
                 self._dispatch_subagent(
                     RegressionFixerAgent,
                     regressions=regressions,
