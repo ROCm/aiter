@@ -407,7 +407,7 @@ def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     if not get_arch().is_rdna:
         return configs
     vram = 16 * 1024**3
-    limit = int(vram * 0.9)
+    limit = vram * 0.8
     kept = []
     for c in configs:
         if c.estimated_memory > limit:
