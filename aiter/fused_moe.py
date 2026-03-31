@@ -608,8 +608,10 @@ def get_padded_M(M):
     padded_m = M
     if M < 32768:
         padded_m = nextPow2(padded_m)
-    else:
+    elif M < 131072:
         padded_m = 32768
+    else:
+        padded_m = 131072
     return padded_m
 
 
