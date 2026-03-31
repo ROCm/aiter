@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from typing import Callable
 
 from flydsl._mlir import ir
+import flydsl.expr as fx
 from flydsl.expr.typing import T
 
 
@@ -69,7 +70,7 @@ def default_epilog(
     """
     bx_m_v = bx_m
     lane_div_16_mul4 = lane_div_16 * 4
-    ii_idx_list = [arith.constant(ii, index=True) for ii in range(4)]
+    ii_idx_list = [fx.Index(ii) for ii in range(4)]
 
     for mi in range_constexpr(m_repeat):
         mi_base = arith.constant(mi * 16, index=True)
@@ -177,10 +178,10 @@ def c_shuffle_epilog(
     m_reps_shuffle = int(tile_m) // CShuffleMLane
     n_reps_shuffle = int(tile_n) // (CShuffleNLane * EVec)
 
-    c_nlane = arith.constant(CShuffleNLane, index=True)
-    m_lane = tx / c_nlane
+    c_nlane = fx.Index(CShuffleNLane)
+    m_lane = tx // c_nlane
     n_lane = tx % c_nlane
-    c_evec = arith.constant(EVec, index=True)
+    c_evec = fx.Index(EVec)
 
     if frag_elem_type is None:
         frag_elem_type = T.f16
@@ -188,19 +189,13 @@ def c_shuffle_epilog(
     bx_m_v = bx_m
     by_n_v = by_n
 
-    # Batch-precompute all row contexts (sorted_idx loads) before the store loop.
-    # This issues all buffer_load instructions upfront so the compiler can pipeline
-    # them instead of serializing each load with s_waitcnt vmcnt(0).
-    _precomputed_rows = []
     for mr in range_constexpr(m_reps_shuffle):
         row_base_m = arith.constant(mr * CShuffleMLane, index=True)
         row_local = row_base_m + m_lane
         row = bx_m_v + row_local
 
         row_ctx_raw = (
-            precompute_row(row_local=row_local, row=row)
-            if precompute_row is not None
-            else None
+            precompute_row(row_local=row_local, row=row) if precompute_row is not None else None
         )
 
         # Optional row-level predicate: if `precompute_row` returns `(ctx, pred_i1)` and `scf`
@@ -214,12 +209,6 @@ def c_shuffle_epilog(
             and len(row_ctx_raw) == 2
         ):
             row_ctx, row_pred = row_ctx_raw
-
-        _precomputed_rows.append((row_local, row, row_ctx, row_pred))
-
-    # Now perform LDS reads and stores using the pre-fetched row contexts.
-    for mr in range_constexpr(m_reps_shuffle):
-        row_local, row, row_ctx, row_pred = _precomputed_rows[mr]
 
         def _do_store_row():
             row_base_lds = row_local * tile_n_idx
@@ -315,3 +304,4 @@ def mfma_epilog(
         precompute_row=precompute_row,
         store_pair=store_pair,
     )
+
