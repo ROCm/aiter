@@ -344,7 +344,7 @@ def model_benchmark_configs(
     configs = get_model_configs(config_path=config_file, models=model or "all")
     layouts = [layout] if layout else ["thd", "bshd"]
     fa_configs: list[BenchConfig] = []
-    causals = [args.causal] if args.causal is not None else [True, False]
+    causals = [args.causal] if args.causal is not None else [True]
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -360,9 +360,9 @@ def model_benchmark_configs(
         else:
             # (batch, sq, sk) triplets for realistic serving scenarios
             # Prefill: few concurrent prefills, sq == sk
-            prefill = [(4, s, s) for s in [128, 256, 512, 1024, 2048, 4096, 8192]]
+            prefill = [(4, s, s) for s in [256, 1024, 4096, 8192]]
             # Decode: many concurrent decodes, sq=1
-            decode = [(32, 1, s) for s in [256, 512, 1024, 2048, 4096, 8192]]
+            decode = [(32, 1, s) for s in [1024, 4096, 8192]]
             scenarios = prefill + decode
             if args.b:
                 scenarios = [(args.b, sq, sk) for (_, sq, sk) in scenarios]
