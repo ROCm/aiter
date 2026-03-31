@@ -166,4 +166,10 @@ jobs:
             --workflows "${{ needs.parse-workflows.outputs.workflow_list }}" \
             --hours "${{ inputs.hours || '24' }}" \
             --runner-report \
-            --summary
+            --summary | tee runner-fleet-report.md
+
+          {
+            echo "## Runner Fleet Summary"
+            echo ""
+            cat runner-fleet-report.md
+          } >> "$GITHUB_STEP_SUMMARY"

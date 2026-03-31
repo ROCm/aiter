@@ -157,7 +157,7 @@ def main():
         print("No matching job records in the selected time window.")
         return
 
-    if args.summary:
+    if args.summary and not args.runner_report:
         print("=== Job Status Report ===")
         print(
             tabulate(
