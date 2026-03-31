@@ -6,6 +6,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Callable
 import triton
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -401,24 +402,15 @@ class _CsvWriter:
         print(msg, flush=True)
 
 
-def _filter_by_memory(configs: list[BenchConfig], threshold: float = 0.90) -> list[BenchConfig]:
-    """Remove configs whose estimated memory exceeds threshold of GPU VRAM."""
-    free_mem, total_mem = torch.cuda.mem_get_info(0)
-    # Use free memory as the baseline — total_memory can be inflated by GTT on ROCm
-    limit = int(free_mem * threshold)
-    print(
-        f"GPU memory: {free_mem / 1e9:.1f}GB free / {total_mem / 1e9:.1f}GB total, "
-        f"limit: {limit / 1e9:.1f}GB ({threshold:.0%} of free)",
-        flush=True,
-    )
+def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
+    """Skip large configs to avoid OOM on RDNA (16GB VRAM)."""
+    if not get_arch().is_rdna:
+        return configs
+    limit = 16 * 1024**3
     kept = []
     for c in configs:
         if c.estimated_memory > limit:
-            print(
-                f"[SKIP] {c} — estimated {c.estimated_memory / 1e9:.1f}GB "
-                f"exceeds {threshold:.0%} of {total_mem / 1e9:.1f}GB VRAM",
-                flush=True,
-            )
+            print(f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds 16GB", flush=True)
         else:
             kept.append(c)
     return kept
