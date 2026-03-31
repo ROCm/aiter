@@ -205,44 +205,66 @@ def get_make_fn(dtype: str, layout: str, fused: bool = False) -> Callable:
     return _MAKE_FN[key]
 
 
-def synthetic_benchmark_configs(
-    causal: bool | None,
-    d_head: int,
-    d_head_v: int,
-    layout: str,
+def edge_case_configs(
     dtypes: list[str],
     impl: str,
     fused: bool,
 ) -> list[BenchConfig]:
-    batch_sizes = [1, 4, 8, 16]
-    head_configs = [(16, 16), (48, 48), (32, 8)]  # (HQ, HK): MHA and GQA
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192, 16384]
-    causals = [causal] if causal is not None else [False, True]
-    return [
-        BenchConfig(
-            name=f"B{b}_HQ{hq}_HK{hk}",
-            batch=b,
-            hq=hq,
-            hk=hk,
-            sq=sq,
-            sk=sk,
-            d_head=d_head,
-            d_head_v=d_head_v,
-            causal=c,
-            layout=layout,
-            dtype_str=d,
-            impl=impl,
-            fused=fused and d != "fp8",
-        )
-        for b, (hq, hk), sq, sk, c, d in itertools.product(
-            batch_sizes, head_configs, seq_len_q, seq_len_k, causals, dtypes
-        )
-    ]
+    """Configs covering gaps in model benchmarks: decode, non-causal,
+    mismatched sq/sk, non-power-of-2 seqlens, batched, bshd layout."""
+    d_head = 128
+    configs: list[BenchConfig] = []
+
+    # Decode: sq=1, large KV cache
+    for (hq, hk), sk, b, d in itertools.product(
+        [(32, 8), (64, 8)], [4096, 8192], [1, 8], dtypes,
+    ):
+        configs.append(BenchConfig(
+            name=f"decode_HQ{hq}_HK{hk}",
+            batch=b, hq=hq, hk=hk, sq=1, sk=sk,
+            d_head=d_head, d_head_v=d_head, causal=True,
+            layout="thd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
+        ))
+
+    # Non-causal (cross-attention): sq != sk
+    for (hq, hk), (sq, sk), d in itertools.product(
+        [(32, 32), (64, 8)], [(512, 1024), (1024, 4096)], dtypes,
+    ):
+        configs.append(BenchConfig(
+            name=f"cross_HQ{hq}_HK{hk}",
+            batch=4, hq=hq, hk=hk, sq=sq, sk=sk,
+            d_head=d_head, d_head_v=d_head, causal=False,
+            layout="bshd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
+        ))
+
+    # Non-power-of-2 seqlens
+    for (hq, hk), (sq, sk), d in itertools.product(
+        [(32, 8)], [(163, 163), (1000, 2000)], dtypes,
+    ):
+        configs.append(BenchConfig(
+            name=f"odd_seq_HQ{hq}_HK{hk}",
+            batch=4, hq=hq, hk=hk, sq=sq, sk=sk,
+            d_head=d_head, d_head_v=d_head, causal=True,
+            layout="thd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
+        ))
+
+    # Batched bshd (training-like)
+    for (hq, hk), sq, b, d in itertools.product(
+        [(32, 8), (64, 8)], [1024, 4096], [4, 16], dtypes,
+    ):
+        configs.append(BenchConfig(
+            name=f"train_HQ{hq}_HK{hk}",
+            batch=b, hq=hq, hk=hk, sq=sq, sk=sq,
+            d_head=d_head, d_head_v=d_head, causal=True,
+            layout="bshd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
+        ))
+
+    return configs
 
 
 def model_benchmark_configs(
-    args, dtypes: list[str], impl: str, fused: bool, model: str = "all"
+    args, *, dtypes: list[str], impl: str, fused: bool, layout: str,
+    model: str = "all",
 ) -> list[BenchConfig]:
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=model)
@@ -274,7 +296,7 @@ def model_benchmark_configs(
                     d_head=HEAD_DIM,
                     d_head_v=HEAD_DIM,
                     causal=causal,
-                    layout="thd",
+                    layout=layout,
                     dtype_str=d,
                     impl=impl,
                     fused=fused and d != "fp8",
@@ -756,20 +778,16 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     elif parsed.model:
         configs = model_benchmark_configs(
             parsed, dtypes=dtypes, impl=impl, fused=fused, model=parsed.model,
+            layout=parsed.layout,
         )
     else:
-        # Default: model configs (thd, causal) then synthetic (bshd, iterate causal)
+        # Default: model configs then edge cases
         configs = model_benchmark_configs(
             parsed, dtypes=dtypes, impl=impl, fused=fused, model="all",
-        )
-        configs += synthetic_benchmark_configs(
-            causal=parsed.causal,
-            d_head=d_head,
-            d_head_v=d_head_v,
             layout=parsed.layout,
-            dtypes=dtypes,
-            impl=impl,
-            fused=fused,
+        )
+        configs += edge_case_configs(
+            dtypes=dtypes, impl=impl, fused=fused,
         )
 
     plot_name = f"{get_caller_name_no_ext()}_{parsed.mode}"
