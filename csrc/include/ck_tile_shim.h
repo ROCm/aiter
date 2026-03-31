@@ -13,6 +13,14 @@
 #include <stdexcept>
 #include <utility>
 
+#ifndef CK_TILE_HOST_DEVICE
+#define CK_TILE_HOST_DEVICE __host__ __device__
+#endif
+
+#ifndef CK_TILE_DEVICE
+#define CK_TILE_DEVICE __device__
+#endif
+
 namespace ck_tile {
 
 using index_t      = int32_t;
@@ -33,7 +41,65 @@ struct stream_config
 template <typename T>
 constexpr T log2e_v = static_cast<T>(1.4426950408889634);
 
-inline int get_warp_size() { return 64; }
+__host__ __device__ constexpr int get_warp_size() { return 64; }
+
+__host__ __device__ constexpr int next_power_of_two(int x)
+{
+    --x;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
+}
+
+template <typename To, typename From>
+__host__ __device__ constexpr To type_convert(From val)
+{
+    return static_cast<To>(val);
+}
+
+template <typename T>
+__host__ __device__ constexpr T integer_least_multiple(T x, T y)
+{
+    return ((x + y - 1) / y) * y;
+}
+
+template <typename T>
+__host__ __device__ constexpr T integer_divide_ceil(T x, T y)
+{
+    return (x + y - 1) / y;
+}
+
+template <typename T>
+__host__ __device__ constexpr T min(T a, T b)
+{
+    return (a < b) ? a : b;
+}
+
+template <typename T>
+__host__ __device__ constexpr T max(T a, T b)
+{
+    return (a > b) ? a : b;
+}
+
+__device__ inline int get_lane_id()
+{
+    return __lane_id();
+}
+
+template <typename T>
+__device__ inline T warp_shuffle(T val, int src_lane)
+{
+    return __shfl(val, src_lane, 64);
+}
+
+template <typename T>
+__device__ inline T warp_shuffle_up(T val, unsigned int delta)
+{
+    return __shfl_up(val, delta, 64);
+}
 
 template <typename... Callables>
 float launch_kernel(const stream_config& s, Callables&&... callables)

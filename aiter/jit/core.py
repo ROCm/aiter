@@ -26,6 +26,7 @@ from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 
 aiter_lib = None
 
@@ -740,7 +741,7 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
-        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+        if get_gfx() in ("gfx950", "gfx1250") and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
         if not torch_exclude:
@@ -787,9 +788,7 @@ def build_module(
                 f"{CK_3RDPARTY_DIR}/library/include",
             ]
         else:
-            # When CK is not available, define AITER_CK_FREE for all modules
-            # so headers use lightweight shims instead of ck_tile/core.hpp
-            flags_cc.append("-DAITER_CK_FREE=1")
+            pass
 
         if os.path.isdir(HIP_KITTENS_DIR):
             extra_include_paths += [

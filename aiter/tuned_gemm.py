@@ -246,11 +246,11 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
-    if config is not None and config["libtype"] == "asm":
+    if config is not None and config["libtype"] == "asm" and get_gfx() != "gfx1250":
         kernelName = config["kernelName"]
         splitK = config["splitK"]
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
-    else:
+    elif config is not None and config["libtype"] != "asm":
         solution_idx = config["solidx"]
         solfunc = solMap[config["libtype"]]
         out = solfunc(
@@ -264,6 +264,9 @@ def gemm_a16w16(
             scale_c,
             bpreshuffle,
         )
+    else:
+        # gfx1250 fallback: asm not available, use F.linear
+        out = F.linear(inp_view, B, bias)
     if batched:
         out = out.view(*A.shape[:-1], B.shape[0])
     if otype is not None and out.dtype != otype:
