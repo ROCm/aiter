@@ -9,7 +9,6 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 
-
 FP8_TYPE = e4m3_dtype
 FP8_MAX = torch.finfo(FP8_TYPE).max
 
@@ -22,10 +21,7 @@ def default_benchmark_configs():
     head_dim = 128
     v_head_dim = head_dim
     configs = list(itertools.product(batch_sizes, n_heads, seq_len_q, seq_len_k))
-    return [
-        (bs, nh, nh, sq, sk, head_dim, v_head_dim)
-        for bs, nh, sq, sk in configs
-    ]
+    return [(bs, nh, nh, sq, sk, head_dim, v_head_dim) for bs, nh, sq, sk in configs]
 
 
 def quantize_to_fp8(tensor):
@@ -59,35 +55,51 @@ def make_inputs(
 
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens_list)
-    scale = head_size_qk ** -0.5
+    scale = head_size_qk**-0.5
 
     query = torch.randn(
-        sum(query_lens), num_query_heads, head_size_qk,
-        dtype=torch.bfloat16, device="cuda",
+        sum(query_lens),
+        num_query_heads,
+        head_size_qk,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size_qk,
-        dtype=torch.bfloat16, device="cuda",
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_qk,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     value_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size_v,
-        dtype=torch.bfloat16, device="cuda",
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size_v,
+        dtype=torch.bfloat16,
+        device="cuda",
     )
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq),
-        dtype=torch.int32, device="cuda",
+        0,
+        num_blocks,
+        (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
     )
     cu_query_lens = torch.tensor(
-        [0] + query_lens, dtype=torch.int32, device="cuda",
+        [0] + query_lens,
+        dtype=torch.int32,
+        device="cuda",
     ).cumsum(dim=0, dtype=torch.int32)
     kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
     query_lens_t = torch.tensor(query_lens, dtype=torch.int32, device="cuda")
 
-    q_fp8, q_descale = (quantize_to_fp8(query) if fp8_q else (None, None))
-    k_fp8, k_descale = (quantize_to_fp8(key_cache) if fp8_kv else (None, None))
-    v_fp8, v_descale = (quantize_to_fp8(value_cache) if fp8_kv else (None, None))
+    q_fp8, q_descale = quantize_to_fp8(query) if fp8_q else (None, None)
+    k_fp8, k_descale = quantize_to_fp8(key_cache) if fp8_kv else (None, None)
+    v_fp8, v_descale = quantize_to_fp8(value_cache) if fp8_kv else (None, None)
 
     out_scale = None
     out_dtype = torch.bfloat16
@@ -96,8 +108,11 @@ def make_inputs(
         out_dtype = FP8_TYPE
 
     output = torch.empty(
-        cu_query_lens[-1].item(), num_query_heads, head_size_v,
-        dtype=out_dtype, device="cuda",
+        cu_query_lens[-1].item(),
+        num_query_heads,
+        head_size_v,
+        dtype=out_dtype,
+        device="cuda",
     )
 
     return dict(
@@ -149,8 +164,14 @@ def run_benchmark(custom, args):
         decode_p = args.decode
 
         x_names = [
-            "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
-            "D_HEAD", "D_HEAD_V", "DECODE_P",
+            "BATCH",
+            "HQ",
+            "HK",
+            "N_CTX_Q",
+            "N_CTX_K",
+            "D_HEAD",
+            "D_HEAD_V",
+            "DECODE_P",
         ]
 
         if isinstance(args.sq, list):
@@ -161,7 +182,9 @@ def run_benchmark(custom, args):
             batch_size = args.b if args.b else 1
 
         if custom:
-            x_vals_list = [(batch_size, args.hq, hk, args.sq, sk, head_size, head_size_v)]
+            x_vals_list = [
+                (batch_size, args.hq, hk, args.sq, sk, head_size, head_size_v)
+            ]
         else:
             x_vals_list = default_benchmark_configs()
 
@@ -169,36 +192,49 @@ def run_benchmark(custom, args):
 
         unit = {"time": "ms", "throughput": "TFLOPS", "bandwidth": "GB/s"}[args.metric]
 
-        return [triton.testing.Benchmark(
-            x_names=x_names,
-            x_vals=x_vals_list,
-            line_arg="provider",
-            line_vals=[label],
-            line_names=[label],
-            styles=[("red", "-")],
-            ylabel=unit,
-            plot_name=f"bench_unified_attention_{label}",
-            args={},
-        )]
+        return [
+            triton.testing.Benchmark(
+                x_names=x_names,
+                x_vals=x_vals_list,
+                line_arg="provider",
+                line_vals=[label],
+                line_names=[label],
+                styles=[("red", "-")],
+                ylabel=unit,
+                plot_name=f"bench_unified_attention_{label}",
+                args={},
+            )
+        ]
 
     @triton.testing.perf_report(create_configs())
     def bench_fn(
-        BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
-        DECODE_P, provider,
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        DECODE_P,
+        provider,
     ):
         varlen = not args.equal_seqlens
 
         if isinstance(N_CTX_Q, list):
             seqlens_q = torch.tensor(N_CTX_Q, dtype=torch.int32, device="cuda")
         elif varlen:
-            seqlens_q = torch.randint(1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda")
+            seqlens_q = torch.randint(
+                1, N_CTX_Q + 1, (BATCH,), dtype=torch.int32, device="cuda"
+            )
         else:
             seqlens_q = torch.full((BATCH,), N_CTX_Q, dtype=torch.int32, device="cuda")
 
         if isinstance(N_CTX_K, list):
             seqlens_k = torch.tensor(N_CTX_K, dtype=torch.int32, device="cuda")
         elif varlen:
-            seqlens_k = torch.randint(1, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda")
+            seqlens_k = torch.randint(
+                1, N_CTX_K + 1, (BATCH,), dtype=torch.int32, device="cuda"
+            )
         else:
             seqlens_k = torch.full((BATCH,), N_CTX_K, dtype=torch.int32, device="cuda")
 
@@ -213,7 +249,9 @@ def run_benchmark(custom, args):
         block_size = args.block_size if args.block_size else 512
         max_num_blocks_per_seq = (seqlens_k.max().item() + block_size - 1) // block_size
         min_required_blocks = BATCH * max_num_blocks_per_seq
-        num_blocks = args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
+        num_blocks = (
+            args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
+        )
 
         inputs = make_inputs(
             seq_lens=list(zip(seqlens_q.tolist(), seqlens_k.tolist())),
@@ -230,7 +268,9 @@ def run_benchmark(custom, args):
 
         q_tensor = inputs["q_fp8"] if args.fp8 else inputs["query"]
         k_tensor = inputs["k_fp8"] if (args.fp8 or args.fp8_kv) else inputs["key_cache"]
-        v_tensor = inputs["v_fp8"] if (args.fp8 or args.fp8_kv) else inputs["value_cache"]
+        v_tensor = (
+            inputs["v_fp8"] if (args.fp8 or args.fp8_kv) else inputs["value_cache"]
+        )
 
         window_size = (
             (args.sliding_window - 1, 0)
@@ -300,7 +340,7 @@ def run_benchmark(custom, args):
         for i in range(num_contexts):
             sq = (cu_query_lens[i + 1] - cu_query_lens[i]).item()
             sk = seqlens_k[i].item()
-            valid = sq * sk - ((sq ** 2 - sq) / 2)
+            valid = sq * sk - ((sq**2 - sq) / 2)
             total_flops += valid * HQ * (D_HEAD + D_HEAD_V) * 2.0
 
         total_q = cu_query_lens[-1].item()
@@ -336,47 +376,72 @@ def parse_args():
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument(
-        "-sq", type=parse_int_or_list, default=0,
+        "-sq",
+        type=parse_int_or_list,
+        default=0,
         help="Query sequence length (single int or comma-separated list)",
     )
     parser.add_argument(
-        "-sk", type=parse_int_or_list, default=0,
+        "-sk",
+        type=parse_int_or_list,
+        default=0,
         help="Key sequence length (single int or comma-separated list, defaults to sq if 0)",
     )
     parser.add_argument("-d", type=int, default=0, help="Q/K head size")
     parser.add_argument("-dv", type=int, default=0, help="V head size (defaults to -d)")
-    parser.add_argument("-num_blocks", type=int, default=0, help="KV cache blocks (0=auto)")
+    parser.add_argument(
+        "-num_blocks", type=int, default=0, help="KV cache blocks (0=auto)"
+    )
     parser.add_argument("-block_size", type=int, default=0, help="KV cache block size")
     parser.add_argument(
-        "-test", action="store_true", default=False,
+        "-test",
+        action="store_true",
+        default=False,
         help="Verify correctness against reference implementation for each shape",
     )
     parser.add_argument(
-        "-equal_seqlens", action="store_true", default=False,
+        "-equal_seqlens",
+        action="store_true",
+        default=False,
         help="Use equal sequence lengths (no varlen); default is random varlen",
     )
     parser.add_argument(
-        "-fp8", action="store_true", default=False,
+        "-fp8",
+        action="store_true",
+        default=False,
         help="Quantize Q, K, V to FP8 e4m3 with per-tensor descales",
     )
     parser.add_argument(
-        "-fp8_kv", action="store_true", default=False,
+        "-fp8_kv",
+        action="store_true",
+        default=False,
         help="Quantize only K, V to FP8 e4m3 (Q stays bf16)",
     )
     parser.add_argument(
-        "-fp8_output", action="store_true", default=False,
+        "-fp8_output",
+        action="store_true",
+        default=False,
         help="Output tensor in FP8 with output_scale",
     )
     parser.add_argument(
-        "-out_scale", type=float, default=1.0,
+        "-out_scale",
+        type=float,
+        default=1.0,
         help="Output scale factor when -fp8_output is set (default: 1.0)",
     )
     parser.add_argument(
-        "-decode", nargs="?", const=1.0, default=0.0, type=float, metavar="P",
+        "-decode",
+        nargs="?",
+        const=1.0,
+        default=0.0,
+        type=float,
+        metavar="P",
         help="Portion of decode samples (seqlen_q=1) in batch; omit P for all=1.0",
     )
     parser.add_argument(
-        "-sliding_window", type=int, default=None,
+        "-sliding_window",
+        type=int,
+        default=None,
         help="Sliding window size (default: disabled)",
     )
 
@@ -387,7 +452,9 @@ def main():
     args = parse_args()
 
     if args.fp8 and args.fp8_kv:
-        raise ValueError("-fp8 already quantizes K/V; -fp8_kv is redundant. Use one or the other.")
+        raise ValueError(
+            "-fp8 already quantizes K/V; -fp8_kv is redundant. Use one or the other."
+        )
 
     custom_config = False
 
