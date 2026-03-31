@@ -327,7 +327,6 @@ def test_fused_ar_rmsnorm(
     weight_list = []
     res_inp = []
     # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
     n = shape[1]
     eps = 1e-6
     weight = torch.randn((n,), dtype=dtype)
@@ -398,7 +397,6 @@ def acc_test(
     cpu_rslt = []
     weight_list = []
     # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
     n = shape[1]
     eps = 1e-6
     weight = torch.randn((n,), dtype=dtype)
@@ -439,7 +437,6 @@ def acc_test_cudagraph_on(
     cpu_rslt = []
     weight_list = []
     # print(type(shape[0]), shape[1], ref.device)
-    m = shape[0]
     n = shape[1]
     eps = 1e-6
     weight = torch.randn((n,), dtype=dtype)
