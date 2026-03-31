@@ -3,6 +3,11 @@ name: AMD CI Job Monitor
 on:
   schedule:
     - cron: "0 0 * * *"
+  pull_request:
+    paths:
+      - ".github/workflows/amd-ci-job-monitor.yml"
+      - "scripts/ci/list_jobs.py"
+      - "scripts/ci/query_job_status.py"
   workflow_dispatch:
     inputs:
       hours:
