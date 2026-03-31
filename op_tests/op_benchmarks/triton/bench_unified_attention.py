@@ -21,25 +21,25 @@ from aiter.ops.triton.attention import unified_attention as ua_mod
 def default_benchmark_configs():
     CONFIGS = [
         {"tag": "b9_sk1001_nb59896", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 1001},
+         "block_size": 32, "num_blocks": 59896, "sq": 1, "sk": 1001},
         {"tag": "b9_sk1001_nb512", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 1001},
+         "block_size": 32, "num_blocks": 512, "sq": 1, "sk": 1001},
         {"tag": "b64_sk1001_nb59896", "batch": 128, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 1001},
+         "block_size": 32, "num_blocks": 59896, "sq": 1, "sk": 1001},
         {"tag": "b64_sk1001_nb512", "batch": 64, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 1001},
+         "block_size": 32, "num_blocks": 512, "sq": 1, "sk": 1001},
         {"tag": "b9_sk4096_nb59896", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 4096},
+         "block_size": 32, "num_blocks": 59896, "sq": 1, "sk": 4096},
         {"tag": "b9_sk4096_nb512", "batch": 9, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 512, "sq": 1, "sk": 4096},
+         "block_size": 32, "num_blocks": 512, "sq": 1, "sk": 4096},
         {"tag": "b256_sk2048_nb59896", "batch": 256, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 2048},
+         "block_size": 32, "num_blocks": 59896, "sq": 1, "sk": 2048},
         {"tag": "b1_sk8192_nb59896", "batch": 1, "hq": 64, "hk": 8, "head_size": 64,
-         "block_size": 64, "num_blocks": 59896, "sq": 1, "sk": 8192},
+         "block_size": 32, "num_blocks": 59896, "sq": 1, "sk": 8192},
     ]
     return [
         (cfg["tag"], cfg["batch"], cfg["hq"], cfg["hk"], cfg["sq"], cfg["sk"], cfg["head_size"], cfg["head_size"])
-        for cfg in CONFIGS if cfg["tag"] in ("b64_sk1001_nb59896")
+        for cfg in CONFIGS
     ]
 
 # def default_benchmark_configs():
