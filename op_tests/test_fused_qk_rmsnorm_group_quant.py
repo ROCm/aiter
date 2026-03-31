@@ -189,34 +189,11 @@ def _focus_summary_df(df: pd.DataFrame) -> pd.DataFrame:
         "uplift",
         "triton_bw_TBps",
         "hip_bw_TBps",
-        "hip_bw_peak_ratio",
         "triton_error_rate",
         "hip_error_rate",
-        "triton_mae",
-        "hip_mae",
         "note",
     ]
     return df[[c for c in focus_cols if c in df.columns]]
-
-
-def _error_stats(
-    ref: torch.Tensor,
-    pred: torch.Tensor,
-    atol: float,
-    rtol: float,
-) -> dict[str, float | int]:
-    ref_f = ref.float()
-    pred_f = pred.float()
-    diff = (pred_f - ref_f).abs()
-    tol = atol + rtol * ref_f.abs()
-    err_mask = diff > tol
-    return {
-        "err_cnt": int(err_mask.sum().item()),
-        "total_cnt": int(err_mask.numel()),
-        "err_rate": float(err_mask.float().mean().item()),
-        "abs_err_sum": float(diff.sum().item()),
-        "max_abs_err": float(diff.max().item()),
-    }
 
 
 @perftest()
@@ -534,8 +511,8 @@ def test_fused_qk_rmsnorm_group_quant_hip(
     (x1_q_hip, x1_s_hip), x1_hip, x2_hip, res_hip = hip_out
 
     if quant_out_dtype == dtypes.fp8:
-        q_atol = 0.15
-        q_rtol = 0.15
+        q_atol = 0.05
+        q_rtol = 0.05
         x1_deq_torch = _upcast_group_fp8(
             x1_q_torch,
             _recover_row_major_scale(x1_s_torch, transpose_scale),
@@ -586,36 +563,14 @@ def test_fused_qk_rmsnorm_group_quant_hip(
             msg=f"check dequantized x1, m={m}, n1={n1}, n2={n2}",
         )
 
-    triton_err_total = 0
-    triton_elem_total = 0
-    triton_abs_err_sum = 0.0
-    triton_max_abs_err = None
-    hip_err_total = 0
-    hip_elem_total = 0
-    hip_abs_err_sum = 0.0
-    hip_max_abs_err = 0.0
-
-    x1_err_triton = None
+    triton_error_rate = None
+    hip_error_rate = checkAllclose(
+        x1_deq_torch, x1_deq_hip, rtol=q_rtol, atol=q_atol, printLog=False
+    )
     if has_triton:
-        x1_err_triton = _error_stats(
-            x1_deq_torch, x1_deq_triton, atol=q_atol, rtol=q_rtol
+        triton_error_rate = checkAllclose(
+            x1_deq_torch, x1_deq_triton, rtol=q_rtol, atol=q_atol, printLog=False
         )
-        triton_err_total += int(x1_err_triton["err_cnt"])
-        triton_elem_total += int(x1_err_triton["total_cnt"])
-        triton_abs_err_sum += float(x1_err_triton["abs_err_sum"])
-        triton_max_abs_err = float(x1_err_triton["max_abs_err"])
-    x1_err_hip = _error_stats(x1_deq_torch, x1_deq_hip, atol=q_atol, rtol=q_rtol)
-    hip_err_total += int(x1_err_hip["err_cnt"])
-    hip_elem_total += int(x1_err_hip["total_cnt"])
-    hip_abs_err_sum += float(x1_err_hip["abs_err_sum"])
-    hip_max_abs_err = max(hip_max_abs_err, float(x1_err_hip["max_abs_err"]))
-
-    x2_err_triton = None
-    x2_err_hip = None
-    res_err_triton = None
-    res_err_hip = None
-    x1_unq_err_triton = None
-    x1_unq_err_hip = None
 
     if x2 is not None:
         if has_triton:
@@ -641,19 +596,6 @@ def test_fused_qk_rmsnorm_group_quant_hip(
                 atol=0.02,
                 msg=f"check x2, m={m}, n2={n2}",
             )
-            x2_err_triton = _error_stats(x2_torch, x2_triton, atol=0.02, rtol=0.02)
-            triton_err_total += int(x2_err_triton["err_cnt"])
-            triton_elem_total += int(x2_err_triton["total_cnt"])
-            triton_abs_err_sum += float(x2_err_triton["abs_err_sum"])
-            triton_max_abs_err = max(
-                0.0 if triton_max_abs_err is None else triton_max_abs_err,
-                float(x2_err_triton["max_abs_err"]),
-            )
-        x2_err_hip = _error_stats(x2_torch, x2_hip, atol=0.02, rtol=0.02)
-        hip_err_total += int(x2_err_hip["err_cnt"])
-        hip_elem_total += int(x2_err_hip["total_cnt"])
-        hip_abs_err_sum += float(x2_err_hip["abs_err_sum"])
-        hip_max_abs_err = max(hip_max_abs_err, float(x2_err_hip["max_abs_err"]))
 
     if res1 is not None:
         if has_triton:
@@ -679,19 +621,6 @@ def test_fused_qk_rmsnorm_group_quant_hip(
                 atol=0.02,
                 msg=f"check residual, m={m}, n1={n1}",
             )
-            res_err_triton = _error_stats(res_torch, res_triton, atol=0.02, rtol=0.02)
-            triton_err_total += int(res_err_triton["err_cnt"])
-            triton_elem_total += int(res_err_triton["total_cnt"])
-            triton_abs_err_sum += float(res_err_triton["abs_err_sum"])
-            triton_max_abs_err = max(
-                0.0 if triton_max_abs_err is None else triton_max_abs_err,
-                float(res_err_triton["max_abs_err"]),
-            )
-        res_err_hip = _error_stats(res_torch, res_hip, atol=0.02, rtol=0.02)
-        hip_err_total += int(res_err_hip["err_cnt"])
-        hip_elem_total += int(res_err_hip["total_cnt"])
-        hip_abs_err_sum += float(res_err_hip["abs_err_sum"])
-        hip_max_abs_err = max(hip_max_abs_err, float(res_err_hip["max_abs_err"]))
 
     if output_unquantized_inp1:
         if has_triton:
@@ -717,32 +646,6 @@ def test_fused_qk_rmsnorm_group_quant_hip(
                 atol=0.02,
                 msg=f"check unquantized x1, m={m}, n1={n1}",
             )
-            x1_unq_err_triton = _error_stats(x1_torch, x1_triton, atol=0.02, rtol=0.02)
-            triton_err_total += int(x1_unq_err_triton["err_cnt"])
-            triton_elem_total += int(x1_unq_err_triton["total_cnt"])
-            triton_abs_err_sum += float(x1_unq_err_triton["abs_err_sum"])
-            triton_max_abs_err = max(
-                0.0 if triton_max_abs_err is None else triton_max_abs_err,
-                float(x1_unq_err_triton["max_abs_err"]),
-            )
-        x1_unq_err_hip = _error_stats(x1_torch, x1_hip, atol=0.02, rtol=0.02)
-        hip_err_total += int(x1_unq_err_hip["err_cnt"])
-        hip_elem_total += int(x1_unq_err_hip["total_cnt"])
-        hip_abs_err_sum += float(x1_unq_err_hip["abs_err_sum"])
-        hip_max_abs_err = max(hip_max_abs_err, float(x1_unq_err_hip["max_abs_err"]))
-
-    triton_error_rate = (
-        triton_err_total / triton_elem_total
-        if has_triton and triton_elem_total > 0
-        else None
-    )
-    hip_error_rate = hip_err_total / hip_elem_total
-    triton_mae = (
-        triton_abs_err_sum / triton_elem_total
-        if has_triton and triton_elem_total > 0
-        else None
-    )
-    hip_mae = hip_abs_err_sum / hip_elem_total
 
     io_bytes = _calc_io_bytes(
         x1=x1,
@@ -770,7 +673,7 @@ def test_fused_qk_rmsnorm_group_quant_hip(
         aiter.logger.info(
             "[result] %s | time(us): triton=%.2f hip=%.2f uplift=%.1f%% | "
             "bw(TB/s): triton=%.3f hip=%.3f hip/mi308_peak=%.1f%% | "
-            "err: triton_rate=%.6f hip_rate=%.6f triton_mae=%.6e hip_mae=%.6e",
+            "err: triton_rate=%.6f hip_rate=%.6f",
             info,
             triton_us,
             hip_us,
@@ -780,36 +683,27 @@ def test_fused_qk_rmsnorm_group_quant_hip(
             (hip_bw_tbps / MI308_BW_MAX_TBPS) * 100.0,
             triton_error_rate,
             hip_error_rate,
-            triton_mae,
-            hip_mae,
         )
     else:
         aiter.logger.info(
             "[result] %s | time(us): hip=%.2f | "
             "bw(TB/s): hip=%.3f hip/mi308_peak=%.1f%% | "
-            "err: hip_rate=%.6f hip_mae=%.6e",
+            "err: hip_rate=%.6f",
             info,
             hip_us,
             hip_bw_tbps,
             (hip_bw_tbps / MI308_BW_MAX_TBPS) * 100.0,
             hip_error_rate,
-            hip_mae,
         )
 
     return {
         "dtype": str(dtype),
         "quant_type": quant_out_dtype_name,
-        "quant_out_dtype": quant_out_dtype_name,
         "gfx": gfx,
         "token": token,
         "num_head1": num_head1,
         "num_head2": num_head2,
         "head_dim": head_dim,
-        "heads1": num_head1,
-        "heads2": num_head2,
-        "M": m,
-        "N1": n1,
-        "N2": n2,
         "residual": add_residual,
         "triton_us": triton_us,
         "hip_us": hip_us,
@@ -818,32 +712,6 @@ def test_fused_qk_rmsnorm_group_quant_hip(
         "hip_bw_TBps": hip_bw_tbps,
         "triton_error_rate": triton_error_rate,
         "hip_error_rate": hip_error_rate,
-        "triton_mae": triton_mae,
-        "hip_mae": hip_mae,
-        "triton_max_abs_err": triton_max_abs_err,
-        "hip_max_abs_err": hip_max_abs_err,
-        "x1_deq_err_rate_triton": (
-            None if x1_err_triton is None else float(x1_err_triton["err_rate"])
-        ),
-        "x1_deq_err_rate_hip": float(x1_err_hip["err_rate"]),
-        "x2_err_rate_triton": (
-            None if x2_err_triton is None else float(x2_err_triton["err_rate"])
-        ),
-        "x2_err_rate_hip": (
-            None if x2_err_hip is None else float(x2_err_hip["err_rate"])
-        ),
-        "res_err_rate_triton": (
-            None if res_err_triton is None else float(res_err_triton["err_rate"])
-        ),
-        "res_err_rate_hip": (
-            None if res_err_hip is None else float(res_err_hip["err_rate"])
-        ),
-        "x1_unq_err_rate_triton": (
-            None if x1_unq_err_triton is None else float(x1_unq_err_triton["err_rate"])
-        ),
-        "x1_unq_err_rate_hip": (
-            None if x1_unq_err_hip is None else float(x1_unq_err_hip["err_rate"])
-        ),
         "note": "",
     }
 

@@ -16,6 +16,7 @@ template <typename DTYPE_I,
           typename DTYPE_O,
           int BlockSize,
           int thread_data_size,
+          int ReduceThreadSize,
           bool ADD_RESIDUAL,
           bool OUTPUT_UNQUANT,
           bool interleave = false>
@@ -260,8 +261,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             }
         }
 
-        int reduce_thread_size = group_size / thread_data_size;
-        float max = multithread_reduce_max_dpp(thread_max, reduce_thread_size);
+        constexpr int reduce_thread_size = ReduceThreadSize;
+        float max = multithread_reduce_max_dpp<ReduceThreadSize>(thread_max);
         if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
         {
             auto fp4_scale = [](float tmp) {
@@ -405,7 +406,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     }
 }
 
-#define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, interleave) \
+#define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, interleave) \
     AITER_DISPATCH_FLOATING16_TYPES(inp1.scalar_type(), "fused_qk_rmsnorm_group_quant_kernel", [&] {                             \
         using DTYPE_I = typename t2opus<scalar_t>::type;                                                                          \
         using DTYPE_OO = DTYPE_O;                                                                                                 \
@@ -415,6 +416,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                          DTYPE_OO,                                                                                \
                                          BlockSize,                                                                               \
                                          thread_data_size,                                                                        \
+                                         ReduceThreadSize,                                                                        \
                                          ADD_RESIDUAL,                                                                            \
                                          OUTPUT_UNQUANT,                                                                          \
                                          interleave><<<grid, block, 0, stream>>>(                                                \
@@ -444,10 +446,10 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             transpose_scale);                                                                                                     \
     });
 
-#define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT) \
-    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, false)
+#define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
+    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, false)
 
-#define FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT) \
+#define FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
     do                                                                                                          \
     {                                                                                                           \
         if(quant_is_fp8)                                                                                        \
@@ -455,6 +457,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t,                                                    \
                                                BlockSize,                                                       \
                                                thread_data_size,                                                \
+                                               ReduceThreadSize,                                                \
                                                ADD_RESIDUAL,                                                    \
                                                OUTPUT_UNQUANT);                                                 \
         }                                                                                                       \
@@ -463,30 +466,46 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp4_t,                                                    \
                                                BlockSize,                                                       \
                                                thread_data_size,                                                \
+                                               ReduceThreadSize,                                                \
                                                ADD_RESIDUAL,                                                    \
                                                OUTPUT_UNQUANT);                                                 \
         }                                                                                                       \
     } while(0)
 
-#define FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT) \
-    FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t, BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT)
+#define FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
+    FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT)
 
-#define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT) \
-    FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT)
+#define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
+    FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT)
 
-#define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS)                          \
+#define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, RTS)                     \
     do                                                                       \
     {                                                                        \
         if(has_residual)                                                      \
         {                                                                    \
-            if(output_unquantized_inp1) { MACRO(BS, TDS, true, true); }      \
-            else                        { MACRO(BS, TDS, true, false); }     \
+            if(output_unquantized_inp1) { MACRO(BS, TDS, RTS, true, true); } \
+            else                        { MACRO(BS, TDS, RTS, true, false); }\
         }                                                                    \
         else                                                                 \
         {                                                                    \
-            if(output_unquantized_inp1) { MACRO(BS, TDS, false, true); }     \
-            else                        { MACRO(BS, TDS, false, false); }    \
+            if(output_unquantized_inp1) { MACRO(BS, TDS, RTS, false, true); }\
+            else                        { MACRO(BS, TDS, RTS, false, false);}\
         }                                                                    \
+    } while(0)
+
+#define DISPATCH_REDUCE_THREAD_SIZE_(MACRO, BS, TDS)                                              \
+    do                                                                                             \
+    {                                                                                              \
+        const int _rts = static_cast<int>(group_size) / (TDS);                                    \
+        switch(_rts) {                                                                             \
+            case (128 / (TDS)): DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, (128 / (TDS))); break; \
+            case (64 / (TDS)):  DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, (64 / (TDS)));  break; \
+            case (32 / (TDS)):  DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, (32 / (TDS)));  break; \
+            default:                                                                               \
+                TORCH_CHECK(false, __func__,                                                       \
+                            " unsupported reduce_thread_size=", _rts);                             \
+                break;                                                                             \
+        }                                                                                          \
     } while(0)
 
 void fused_qk_rmsnorm_group_quant(
@@ -733,39 +752,39 @@ void fused_qk_rmsnorm_group_quant(
     {
         if(quant_is_fp4)
         {
-            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 64, 8);
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 64, 8);
         }
         else
         {
-            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, 64, 4);
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, 64, 4);
         }
     }
     else if(max_n <= 512)
     {
-        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 64, 8);
+        DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 64, 8);
     }
     else if(max_n <= 1024)
     {
-        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 128, 8);
+        DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 128, 8);
     }
     else if(max_n <= 2048)
     {
         if(get_gpu_arch() == "gfx950" && has_residual && group_size <= WARP_SIZE * 8)
         {
-            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 8);
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 8);
         }
         else
         {
-            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 128, 16);
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 128, 16);
         }
     }
     else if(max_n <= 4096)
     {
-        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 16);
+        DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 16);
     }
     else
     {
-        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 512, 16);
+        DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 512, 16);
     }
 }
 
