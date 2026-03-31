@@ -55,9 +55,10 @@ void rope_cached_positions_fwd_impl(
     const int32_t max_position = cos.size(0);
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    DISPATCH_ROPE_TYPES_PARAMS(
+    DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(
         input.scalar_type(),
         cos.scalar_type(),
+        positions.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
@@ -67,7 +68,7 @@ void rope_cached_positions_fwd_impl(
             input.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
             sin.data_ptr<scalar_t_1>(),
-            positions.data_ptr<int64_t>(),
+            positions.data_ptr<scalar_t_pos>(),
             max_position,
             size_s, size_b, size_h, size_d,
             size_f, // size of last dimension of freqs.
