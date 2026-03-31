@@ -812,6 +812,92 @@ class KernelSupervisor:
         )
 
     # ------------------------------------------------------------------
+    # Phase 5 helpers
+    # ------------------------------------------------------------------
+
+    def _enrich_regressions(
+        self,
+        regressions: List[Dict],
+        config_dir: str,
+    ) -> List[Dict]:
+        """Enrich regression dicts with ``current_config_file`` and ``bucket``.
+
+        For each regression dict produced by
+        :class:`~.subagents.validation_agent.ValidationAgent` (which only
+        contains ``m``, ``n``, ``k``, ``delta``, ``classification``), derive
+        the two additional keys required by
+        :class:`~.subagents.regression_fixer_agent.RegressionFixerAgent`.
+
+        Parameters
+        ----------
+        regressions:
+            List of regression dicts from ValidationAgent.
+        config_dir:
+            Remote path to the directory that holds the config JSON files.
+
+        Returns
+        -------
+        list
+            New list of dicts, each extended with ``current_config_file`` and
+            ``bucket``.
+        """
+        import os as _os
+
+        kernel_variant: str = self.config.kernel_name
+        gfx_arch: str = self.config.gpu_arch or "gfx950"
+
+        enriched = []
+        for reg in regressions:
+            m: int = reg["m"]
+            n: int = reg["n"]
+            k: int = reg["k"]
+
+            # --- Derive current_config_file ---
+            suffixed_name = f"{gfx_arch}-GEMM-{kernel_variant}-N={n}-K={k}.json"
+            suffixed_path = _os.path.join(config_dir, suffixed_name)
+            try:
+                check = self.executor.docker_exec(
+                    f"test -f {suffixed_path} && echo exists"
+                )
+                use_suffixed = "exists" in (check.stdout or "")
+            except Exception:
+                use_suffixed = False
+
+            if use_suffixed:
+                current_config_file = suffixed_path
+            else:
+                fallback_name = f"{gfx_arch}-GEMM-{kernel_variant}.json"
+                current_config_file = _os.path.join(config_dir, fallback_name)
+
+            # --- Derive bucket from M ---
+            if m <= 8:
+                bucket = "M_LEQ_8"
+            elif m <= 31:
+                bucket = "M_LEQ_31"
+            elif m <= 32:
+                bucket = "M_LEQ_32"
+            elif m <= 64:
+                bucket = "M_LEQ_64"
+            elif m <= 128:
+                bucket = "M_LEQ_128"
+            elif m <= 256:
+                bucket = "M_LEQ_256"
+            elif m <= 512:
+                bucket = "M_LEQ_512"
+            else:
+                bucket = "any"
+
+            enriched.append(
+                {
+                    **reg,
+                    "current_config_file": current_config_file,
+                    "bucket": bucket,
+                }
+            )
+
+        return enriched
+
+    # ------------------------------------------------------------------
     # Phase 5 runner
     # ------------------------------------------------------------------
 
@@ -897,11 +983,12 @@ class KernelSupervisor:
                     # No regressions — done.
                     break
 
-                # --- Dispatch RegressionFixerAgent ---
+                # --- Enrich regressions and dispatch RegressionFixerAgent ---
                 threshold = self.config.tuning_config.thresholds.regression_vs_baseline / 100.0
+                enriched = self._enrich_regressions(regressions, config_dir)
                 self._dispatch_subagent(
                     RegressionFixerAgent,
-                    regressions=regressions,
+                    regressions=enriched,
                     config_dir=config_dir,
                     old_config_dir=old_config_dir,
                     threshold=threshold,
