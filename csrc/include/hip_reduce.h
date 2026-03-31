@@ -78,6 +78,25 @@ __device__ inline T thread_broadcast(T val, int idx)
     return __builtin_bit_cast(T, a);
 }
 
+template <typename T>
+__device__ inline std::
+    enable_if_t<std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(int) == 0), T>
+    warp_permlanex16(const T& input)
+{
+    constexpr int words = sizeof(T) / sizeof(int);
+    struct V
+    {
+        int w[words];
+    };
+    auto a = __builtin_bit_cast(V, input);
+#pragma unroll
+    for(int i = 0; i < words; i++)
+    {
+        a.w[i] = __builtin_amdgcn_permlanex16(a.w[i], a.w[i], 0x76543210u, 0xfedcba98u, true, true);
+    }
+    return __builtin_bit_cast(T, a);
+}
+
 // copied from
 // https://github.com/ROCm/rocPRIM/blob/3b6802d397c4e5266bb6ba7ea8c924d239288608/rocprim/include/rocprim/warp/detail/warp_reduce_dpp.hpp
 template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
@@ -113,7 +132,8 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
         // row_bcast:15
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(local), local);
 #else
-        local = reduce_op(rocprim::warp_shuffle(local, (threadIdx.x ^ 16), WarpSize), local);
+        // local = reduce_op(rocprim::detail::warp_swizzle<T, 0x401F>(local), local);
+        local = reduce_op(warp_permlanex16(local), local);
 #endif
     }
 
@@ -177,7 +197,8 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
             // data = thread_broadcast<T, 32, WarpSize>(data, thread_num - 1);
         }
 #else
-        data = reduce_op(rocprim::warp_shuffle(data, (threadIdx.x ^ 16), thread_num), data);
+        // data = reduce_op(rocprim::detail::warp_swizzle<T, 0x401F>(data), data);
+        data = reduce_op(warp_permlanex16(data), data);
 #endif
     }
 #if defined(__GFX9__)
