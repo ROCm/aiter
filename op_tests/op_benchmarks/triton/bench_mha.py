@@ -44,7 +44,6 @@ class BenchRun:
 
 @dataclass(frozen=True)
 class BenchConfig:
-    name: str
     batch: int
     hq: int
     hk: int
@@ -57,10 +56,11 @@ class BenchConfig:
     dtype_str: str  # "bf16", "fp16", "fp32", "fp8"
     impl: str = "default"  # "default" or "dao_ai"
     fused: bool = False
+    model: str | None = None
 
     def to_tuple(self) -> tuple:
         return (
-            self.name,
+            self.model,
             self.batch,
             self.hq,
             self.hk,
@@ -224,7 +224,6 @@ def edge_case_configs(
     ):
         configs.append(
             BenchConfig(
-                name=f"decode_HQ{hq}_HK{hk}",
                 batch=b,
                 hq=hq,
                 hk=hk,
@@ -248,7 +247,6 @@ def edge_case_configs(
     ):
         configs.append(
             BenchConfig(
-                name=f"cross_HQ{hq}_HK{hk}",
                 batch=4,
                 hq=hq,
                 hk=hk,
@@ -272,7 +270,6 @@ def edge_case_configs(
     ):
         configs.append(
             BenchConfig(
-                name=f"odd_seq_HQ{hq}_HK{hk}",
                 batch=4,
                 hq=hq,
                 hk=hk,
@@ -297,7 +294,6 @@ def edge_case_configs(
     ):
         configs.append(
             BenchConfig(
-                name=f"train_HQ{hq}_HK{hk}",
                 batch=b,
                 hq=hq,
                 hk=hk,
@@ -322,11 +318,12 @@ def model_benchmark_configs(
     dtypes: list[str],
     impl: str,
     fused: bool,
-    layout: str,
-    model: str = "all",
+    layout: str | None = None,
+    model: str | None = None,
 ) -> list[BenchConfig]:
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models=model)
+    configs = get_model_configs(config_path=config_file, models=model or "all")
+    layouts = [layout] if layout else ["thd", "bshd"]
     fa_configs: list[BenchConfig] = []
     batch_size = args.b if args.b else 1
     causal = args.causal if args.causal is not None else True
@@ -343,10 +340,10 @@ def model_benchmark_configs(
             sq_sk_pairs = [(args.sq, args.sk if args.sk else args.sq)]
         else:
             sq_sk_pairs = [(2**i, 2**i) for i in range(1, 14)]
-        for (sq, sk), d in itertools.product(sq_sk_pairs, dtypes):
+        for (sq, sk), lay, d in itertools.product(sq_sk_pairs, layouts, dtypes):
             fa_configs.append(
                 BenchConfig(
-                    name=model_name,
+                    model=model_name,
                     batch=batch_size,
                     hq=HQ,
                     hk=HK,
@@ -355,7 +352,7 @@ def model_benchmark_configs(
                     d_head=HEAD_DIM,
                     d_head_v=HEAD_DIM,
                     causal=causal,
-                    layout=layout,
+                    layout=lay,
                     dtype_str=d,
                     impl=impl,
                     fused=fused and d != "fp8",
@@ -398,7 +395,7 @@ def pad_rearrange_dropout_mask(
 
 def _make_triton_benchmark(run: BenchRun) -> list:
     x_names = [
-        "name",
+        "model",
         "BATCH",
         "HQ",
         "HK",
@@ -436,7 +433,7 @@ def run_benchmark(run: BenchRun):
 
     @triton.testing.perf_report(_make_triton_benchmark(run))
     def bench_mha(
-        name,
+        model,
         BATCH,
         HQ,
         HK,
@@ -623,7 +620,7 @@ def run_benchmark(run: BenchRun):
             prof.stop()
 
             shape_str = (
-                f"{name}_B{BATCH}_HQ{HQ}_HK{HK}_SQ{N_CTX_Q}_SK{N_CTX_K}_D{D_HEAD}"
+                f"{model}_B{BATCH}_HQ{HQ}_HK{HK}_SQ{N_CTX_Q}_SK{N_CTX_K}_D{D_HEAD}"
             )
             print(f"\n--- Profile: {mode} {shape_str} ---")
             print(
@@ -739,7 +736,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument("--layout", type=str, default="bshd", help=supported_layouts())
+    parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
     parser.add_argument(
         "-metric",
         nargs="?",
@@ -792,6 +789,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     torch_dtype = arg_to_torch_dtype[tensor_dtype_str]
 
     assert parsed.layout in (
+        None,
         "bshd",
         "thd",
     ), f"{parsed.layout} is not a supported layout. Use 'bshd' or 'thd'."
@@ -808,7 +806,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
             not custom
         ), "--model sets hq, hk, d from the config. Do not provide them."
 
-    if parsed.layout == "thd" and parsed.equal_seqlens:
+    if parsed.layout in ("thd", None) and parsed.equal_seqlens:
         warnings.warn(
             "Using 'thd' layout with equal_seqlen=True incurs an extra sequence length lookup cost "
             "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
@@ -830,9 +828,10 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         hk = parsed.hk if parsed.hk else parsed.hq
         sk = parsed.sk if parsed.sk else parsed.sq
         causals = [parsed.causal] if parsed.causal is not None else [False, True]
+        custom_layout = parsed.layout or "bshd"
         configs = [
             BenchConfig(
-                name=f"custom_B{parsed.b}_HQ{parsed.hq}_HK{hk}",
+                model=f"custom_B{parsed.b}_HQ{parsed.hq}_HK{hk}",
                 batch=parsed.b,
                 hq=parsed.hq,
                 hk=hk,
@@ -841,7 +840,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
                 d_head=d_head,
                 d_head_v=d_head_v,
                 causal=c,
-                layout=parsed.layout,
+                layout=custom_layout,
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
@@ -858,16 +857,9 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
             layout=parsed.layout,
         )
     else:
-        # Default: model configs then edge cases
+        # Default: all models, both layouts (None = thd + bshd)
         configs = model_benchmark_configs(
             parsed,
-            dtypes=dtypes,
-            impl=impl,
-            fused=fused,
-            model="all",
-            layout=parsed.layout,
-        )
-        configs += edge_case_configs(
             dtypes=dtypes,
             impl=impl,
             fused=fused,
