@@ -26,6 +26,7 @@ def ref_paged_attn(
     kv_lens: list[int],
     block_tables: torch.Tensor,
     scale: float,
+    out_dtype: torch.dtype,
     sliding_window: Optional[int] = None,
     soft_cap: Optional[float] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -37,7 +38,6 @@ def ref_paged_attn(
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
-    orig_dtype = query.dtype
     outputs: list[torch.Tensor] = []
     start_idx = 0
     query = query.to(torch.float32)
@@ -95,7 +95,7 @@ def ref_paged_attn(
     out = torch.cat(outputs, dim=0)
     if output_scale is not None:
         out = out / output_scale
-    return out.to(orig_dtype)
+    return out.to(out_dtype)
 
 
 @pytest.mark.parametrize(
@@ -180,7 +180,7 @@ def test_triton_unified_attn(
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
     maybe_quantized_value_cache = value_cache
-    q_descale = None  # Not yet supported
+    q_descale = None
     k_descale = None
     v_descale = None
     out_scale = None
@@ -230,6 +230,7 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         output_scale=out_scale,
+        out_dtype=out_dtype
     )
     atol, rtol = 1.5e-2, 1e-2
     if kv_dtype.itemsize == 1:
