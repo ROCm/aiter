@@ -315,6 +315,7 @@ def run_aiter_asm_ps(
     softmax_scale,
     mask,
     quant_type: QuantType = QuantType.per_Token,
+    wave_per_tg: int = 4,
 ):
     return aiter.pa_persistent_fwd(
         Q=Q,
@@ -336,6 +337,7 @@ def run_aiter_asm_ps(
         softmax_scale=softmax_scale,
         mask=mask,
         quant_type=quant_type,
+        wave_per_tg=wave_per_tg,
     )
 
 
@@ -439,6 +441,7 @@ def test_pa_ps(
     dump_metadata: bool = False,
     profile_ps: bool = False,
     quant_type: QuantType = QuantType.per_Token,
+    wave_per_tg: int = 4,
 ) -> dict:
     ret = {}
     seed = 0
@@ -671,6 +674,7 @@ def test_pa_ps(
             reduce_partial_map=reduce_partial_map,
             softmax_scale=scale,
             mask=1,
+            wave_per_tg=wave_per_tg,
         )
 
         _, us_pa_nops = run_aiter_asm(
@@ -713,6 +717,7 @@ def test_pa_ps(
                 reduce_partial_map=reduce_partial_map,
                 softmax_scale=scale,
                 mask=1,
+                wave_per_tg=wave_per_tg,
             )
         )
 
@@ -774,6 +779,7 @@ def test_pa_ps(
             softmax_scale=scale,
             mask=1,
             quant_type=quant_type,
+            wave_per_tg=wave_per_tg,
         )
 
         # _, us_asm_noquant = run_aiter_asm(
@@ -916,6 +922,14 @@ parser.add_argument(
     help="""Use per-block quantization instead of per-token. Default: False.
     --per_block_quant # Enable per-block quantization""",
 )
+parser.add_argument(
+    "--wave_per_tg",
+    type=int,
+    choices=[4, 8],
+    default=4,
+    help="""Use 4-wave or 8-wave kernel, only small part of kernels are
+    supported now""",
+)
 args = parser.parse_args()
 
 # Convert string to QuantType enum
@@ -944,6 +958,7 @@ for dtype in args.dtype:
             args.dump_metadata,
             args.profile,
             getattr(QuantType, args.quant_type),
+            args.wave_per_tg,
         )
         df.append(ret)
     df = pd.DataFrame(df)
