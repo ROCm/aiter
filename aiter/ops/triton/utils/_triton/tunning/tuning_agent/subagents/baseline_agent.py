@@ -193,7 +193,11 @@ class BaselineAgent(BaseSubagent):
             results.append(ShapeResult(m=m, n=n, k=k, main_ns=main_ns, reduce_ns=reduce_ns))
 
         # Serialise results as a list of dicts (dataclasses are not JSON-native).
-        serialisable = [asdict(r) for r in results]
+        # Use an explicit dict to include the total_ns property which asdict() omits.
+        serialisable = [
+            {"m": r.m, "n": r.n, "k": r.k, "main_ns": r.main_ns, "reduce_ns": r.reduce_ns, "total_ns": r.total_ns}
+            for r in results
+        ]
         results_path = self._write_json_artifact("baseline_results.json", serialisable)
 
         return {

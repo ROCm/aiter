@@ -530,6 +530,8 @@ class KernelSupervisor:
                 kernel_source_path="",
                 config_dir="",
                 model_shapes_path=None,
+                config_variant=self.config.kernel_name,
+                gfx_arch=self.config.gpu_arch or "gfx950",
             )
             if result.success:
                 self.state.shapes = result.data.get("shapes", [])
@@ -539,7 +541,7 @@ class KernelSupervisor:
                         ScriptCreatorAgent,
                         kernel_source_path="",
                         template_dir="",
-                        missing_scripts=missing_scripts,
+                        missing_scripts=[{"type": s, "target_path": ""} for s in missing_scripts],
                     )
             return PhaseResult(
                 phase=Phase.DISCOVERY,
@@ -746,7 +748,7 @@ class KernelSupervisor:
 
         # Derive the narrowed search space from pattern analysis results.
         narrowed_search_space: Dict = pattern_agent_result.data.get(
-            "narrowed_search_space", broad_search_space
+            "search_space", broad_search_space
         )
 
         # 3. Full tuning: dispatch TuningAgent with all shapes and narrowed space.

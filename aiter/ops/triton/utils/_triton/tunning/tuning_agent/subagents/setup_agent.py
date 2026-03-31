@@ -76,6 +76,11 @@ class SetupAgent(BaseSubagent):
         self.repo_config = repo_config
         self.triton_install_config = triton_install_config
 
+    def _preflight(self):
+        """Skip container-based preflight — container doesn't exist yet."""
+        # Only kill stale GPU processes on the host
+        self.executor.kill_stale_gpu_processes()
+
     def _execute(self) -> dict:
         """Bootstrap the container environment on the remote host.
 
