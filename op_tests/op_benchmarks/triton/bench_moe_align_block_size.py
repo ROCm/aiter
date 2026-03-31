@@ -145,15 +145,9 @@ arg_to_torch_dtype = {
 def main():
     args = parse_args()
     custom_config = False
-    # This benchmark only exposes -M and -block_size on the CLI today.
-    # Guard against missing attributes to avoid AttributeError.
-    if (
-        getattr(args, "M", 0)
-        and getattr(args, "K", 0)
-        and getattr(args, "N", 0)
-        and getattr(args, "E", 0)
-        and getattr(args, "top_k", 0)
-    ):
+    # For sizing/custom configs, this benchmark currently only uses -M and -block_size
+    # from the CLI today. Guard against missing attributes to avoid AttributeError.
+    if all(getattr(args, name, 0) for name in ("M", "K", "N", "E", "top_k")):
         custom_config = True
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
