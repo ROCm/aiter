@@ -55,6 +55,44 @@ def topk_softmax_decode(
 ) -> None: ...
 
 
+@compile_ops("module_grouped_topk_decode")
+def grouped_topk_decode(
+    gating_output: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    moe_buf: Tensor,
+    num_experts: int,
+    topk: int,
+    unit_size: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    correction_bias: Optional[Tensor] = None,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
+
+
+@compile_ops("module_moe_asm")
+def grouped_topk_moe_sorting(
+    gating_output: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    moe_buf: Tensor,
+    num_expert_group: int,
+    topk_grp: int,
+    topk: int,
+    unit_size: int,
+    need_renorm: bool,
+    is_softmax: bool,
+    correction_bias: Tensor,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
+
+
 @compile_ops("module_moe_asm")
 def moe_sum(input: Tensor, output: Tensor) -> None: ...
 

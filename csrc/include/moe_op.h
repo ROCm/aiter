@@ -4,6 +4,22 @@
 #include "aiter_enum.h"
 #include <torch/extension.h>
 
+void grouped_topk_moe_sorting(
+    torch::Tensor& gating_output,       // [1, E]
+    torch::Tensor& sorted_token_ids,    // [max_num_tokens_padded]
+    torch::Tensor& sorted_weights,      // [max_num_tokens_padded]
+    torch::Tensor& sorted_expert_ids,   // [max_num_m_blocks]
+    torch::Tensor& num_valid_ids,       // [2]
+    torch::Tensor& moe_buf,            // [1, model_dim]
+    int num_expert_group,
+    int topk_grp,
+    int topk,
+    int unit_size,
+    bool need_renorm,
+    bool is_softmax,
+    torch::Tensor& correction_bias,
+    float routed_scaling_factor = 1.0f);
+
 void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_experts]
                          torch::Tensor& correction_bias, // [num_expert]
                          torch::Tensor& topk_weights,    // [num_tokens, topk]
@@ -74,5 +90,20 @@ void topk_softmax_decode(torch::Tensor gating_output,      // [1, E]
                          int topk,
                          int unit_size,
                          bool renormalize);
+
+void grouped_topk_decode(torch::Tensor gating_output,      // [1, E]
+                         torch::Tensor sorted_token_ids,    // [max_num_tokens_padded]
+                         torch::Tensor sorted_weights,      // [max_num_tokens_padded]
+                         torch::Tensor sorted_expert_ids,   // [max_num_m_blocks]
+                         torch::Tensor num_valid_ids,       // [2]
+                         torch::Tensor moe_buf,             // [1, model_dim]
+                         int num_experts,
+                         int topk,
+                         int unit_size,
+                         bool renormalize,
+                         int num_expert_group,
+                         int topk_group,
+                         c10::optional<torch::Tensor> correction_bias,
+                         double routed_scaling_factor);
 
 } // namespace aiter

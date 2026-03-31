@@ -74,6 +74,8 @@ def main():
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
+    parser.add_argument("--use-graph", action="store_true",
+                        help="Use HIP/CUDA graph capture to eliminate launch overhead")
     args = parser.parse_args()
 
     dtype = dtypes.bf16 if args.dtype == "bf16" else dtypes.fp16
@@ -82,6 +84,8 @@ def main():
     M = 1
 
     configs = [
+        (512, 8),
+        (256, 8),
         (128, 8),
         (128, 6),
         (128, 4),
@@ -90,6 +94,8 @@ def main():
         (32, 4),
     ]
 
+    mode_label = "graph" if args.use_graph else "eager"
+    print(f"Mode: {mode_label}")
     print(f"{'E':>5}  {'topk':>5}  {'separate_us':>12}  {'fused_us':>12}  {'speedup':>8}")
     print("-" * 55)
 
@@ -103,30 +109,50 @@ def main():
             gating_output, topk, E, BLOCK_SIZE_M, True, model_dim, dtype
         )
 
-        # Warmup
         for _ in range(args.warmup):
             fn_sep()
             fn_fused()
         torch.cuda.synchronize()
 
-        # Benchmark separate
-        torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(args.iters):
-            fn_sep()
-        end.record()
-        torch.cuda.synchronize()
-        sep_us = start.elapsed_time(end) * 1000 / args.iters
 
-        # Benchmark fused
-        start.record()
-        for _ in range(args.iters):
-            fn_fused()
-        end.record()
-        torch.cuda.synchronize()
-        fused_us = start.elapsed_time(end) * 1000 / args.iters
+        if args.use_graph:
+            graph_sep = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph_sep):
+                fn_sep()
+
+            graph_fused = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph_fused):
+                fn_fused()
+
+            start.record()
+            for _ in range(args.iters):
+                graph_sep.replay()
+            end.record()
+            torch.cuda.synchronize()
+            sep_us = start.elapsed_time(end) * 1000 / args.iters
+
+            start.record()
+            for _ in range(args.iters):
+                graph_fused.replay()
+            end.record()
+            torch.cuda.synchronize()
+            fused_us = start.elapsed_time(end) * 1000 / args.iters
+        else:
+            start.record()
+            for _ in range(args.iters):
+                fn_sep()
+            end.record()
+            torch.cuda.synchronize()
+            sep_us = start.elapsed_time(end) * 1000 / args.iters
+
+            start.record()
+            for _ in range(args.iters):
+                fn_fused()
+            end.record()
+            torch.cuda.synchronize()
+            fused_us = start.elapsed_time(end) * 1000 / args.iters
 
         speedup = sep_us / fused_us if fused_us > 0 else float("inf")
         print(f"{E:>5}  {topk:>5}  {sep_us:>12.2f}  {fused_us:>12.2f}  {speedup:>8.2f}x")

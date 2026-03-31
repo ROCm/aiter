@@ -1124,7 +1124,8 @@ namespace py = pybind11;
           &aiter::moe_align_block_size,                                        \
           "Aligning the number of tokens to be processed by each expert such " \
           "that it is divisible by the block size.");                          \
-    m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
+    m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()"); \
+    GROUPED_TOPK_MOE_SORTING_PYBIND
 
 #define MOE_TOPK_PYBIND             \
     m.def("topk_sigmoid",           \
@@ -1148,6 +1149,44 @@ namespace py = pybind11;
           py::arg("unit_size"),                     \
           py::arg("renormalize"),                   \
           "Fused topk + moe_sorting for M=1 decode.");
+
+#define GROUPED_TOPK_DECODE_PYBIND                  \
+    m.def("grouped_topk_decode",                    \
+          &aiter::grouped_topk_decode,              \
+          py::arg("gating_output"),                 \
+          py::arg("sorted_token_ids"),              \
+          py::arg("sorted_weights"),                \
+          py::arg("sorted_expert_ids"),             \
+          py::arg("num_valid_ids"),                 \
+          py::arg("moe_buf"),                       \
+          py::arg("num_experts"),                   \
+          py::arg("topk"),                          \
+          py::arg("unit_size"),                     \
+          py::arg("renormalize"),                   \
+          py::arg("num_expert_group"),              \
+          py::arg("topk_group"),                    \
+          py::arg("correction_bias") = py::none(),  \
+          py::arg("routed_scaling_factor") = 1.0,   \
+          "Fused grouped_topk + moe_sorting for M=1 decode.");
+
+#define GROUPED_TOPK_MOE_SORTING_PYBIND                 \
+    m.def("grouped_topk_moe_sorting",                   \
+          &grouped_topk_moe_sorting,                    \
+          py::arg("gating_output"),                     \
+          py::arg("sorted_token_ids"),                  \
+          py::arg("sorted_weights"),                    \
+          py::arg("sorted_expert_ids"),                 \
+          py::arg("num_valid_ids"),                     \
+          py::arg("moe_buf"),                           \
+          py::arg("num_expert_group"),                  \
+          py::arg("topk_grp"),                          \
+          py::arg("topk"),                              \
+          py::arg("unit_size"),                         \
+          py::arg("need_renorm"),                       \
+          py::arg("is_softmax"),                        \
+          py::arg("correction_bias"),                   \
+          py::arg("routed_scaling_factor") = 1.0f,      \
+          "Fused grouped_topk + moe_sorting HIP kernel for M=1 decode.");
 
 #define MOE_SORTING_PYBIND                             \
     m.def("moe_sorting_fwd",                           \

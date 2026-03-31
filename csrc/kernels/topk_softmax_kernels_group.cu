@@ -612,6 +612,312 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     }
 }
 
+// M=1 decode variant: same grouped topk logic but emits moe_sorting output directly.
+// Fuses grouped_topk + moe_sorting into a single kernel launch for decode latency.
+template <typename DTYPE_I,
+          typename f32vec,
+          int NUM_GRP,
+          bool need_renorm,
+          bool isBiased,
+          bool isSoftmax>
+__global__ void
+grouped_topk_moe_sorting_kernel(
+    DTYPE_I* __restrict__ gating_output,          // [1, num_experts]
+    const DTYPE_I* __restrict__ correction_bias,  // [num_experts] or nullptr
+    int* __restrict__ sorted_token_ids,           // [max_num_tokens_padded]
+    float* __restrict__ sorted_weights,           // [max_num_tokens_padded]
+    int* __restrict__ sorted_expert_ids,          // [max_num_m_blocks]
+    int* __restrict__ num_valid_ids,              // [2]
+    void* __restrict__ moe_buf,                   // [1, model_dim] to zero
+    const int num_experts,
+    const int topk,
+    const int topk_group,
+    const int unit_size,
+    const int moe_buf_bytes,
+    const float routed_scaling_factor)
+{
+    static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
+    static constexpr int THREAD_PER_GRP = (WARP_SIZE + NUM_GRP - 1) / NUM_GRP;
+    const int experts_per_group = num_experts / NUM_GRP;
+    extern __shared__ char shared_mem[];
+
+    char* ptr     = shared_mem;
+    float* scores = reinterpret_cast<float*>(ptr);
+    ptr += num_experts * sizeof(float);
+
+    float* group_scores = reinterpret_cast<float*>(ptr);
+    ptr += NUM_GRP * sizeof(float);
+
+    f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
+    using cktype_i                = typename t2ck<DTYPE_I>::type;
+    static constexpr int vec_size = ck_tile::vector_traits<f32vec>::vector_size;
+    using vec_i                   = ck_tile::ext_vector_t<cktype_i, vec_size>;
+    const int num_experts_vec     = num_experts / vec_size;
+
+    // --- Phase 1: Compute scores (sigmoid or softmax) — same as grouped_topk_kernel ---
+    if constexpr(!isSoftmax)
+    {
+        auto const* input_ptr = gating_output;
+        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        {
+            vec_i tmp = reinterpret_cast<vec_i const*>(input_ptr)[e];
+            vec_i tmp2;
+            f32vec tmp2_f32;
+            if constexpr(isBiased)
+                tmp2 = reinterpret_cast<vec_i const*>(correction_bias)[e];
+            f32vec gating;
+#pragma unroll
+            for(size_t i = 0; i < vec_size; i++)
+            {
+                gating[i] = ck_tile::type_convert<float>(tmp[i]);
+                gating[i] = 1.0f / (1.0f + expf(-gating[i]));
+                if constexpr(isBiased)
+                {
+                    tmp2_f32[i] = ck_tile::type_convert<float>(tmp2[i]);
+                    gating[i] += tmp2_f32[i];
+                }
+            }
+            scores_vec[e] = gating;
+        }
+        __syncthreads();
+    }
+    else
+    {
+        __shared__ float sdata;
+        float max_val = -INFINITY;
+        for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        {
+            float gating = gating_output[e];
+            scores[e]    = gating;
+            if(gating > max_val)
+                max_val = gating;
+        }
+        __syncthreads();
+#pragma unroll
+        for(int i = 0; i < 6; i++)
+        {
+            int offset    = 1 << i;
+            float tmp_val = __shfl_down(max_val, offset);
+            if(tmp_val > max_val)
+                max_val = tmp_val;
+        }
+        if(threadIdx.x == 0)
+            sdata = max_val;
+        __syncthreads();
+        max_val          = sdata;
+        float thread_sum = 0.0;
+        for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        {
+            scores[e] = expf(scores[e] - max_val);
+            thread_sum += scores[e];
+        }
+        __syncthreads();
+        thread_sum = wave_reduce(thread_sum, [](float a, float b) { return a + b; });
+        for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
+            scores[e] /= thread_sum;
+        __syncthreads();
+    }
+
+    // --- Phase 2: Group scoring + selection — same as grouped_topk_kernel ---
+    if constexpr(isBiased)
+    {
+        constexpr int lane_steps = [&]() {
+            if constexpr(THREAD_PER_GRP == 8) return 3;
+            if constexpr(THREAD_PER_GRP == 4) return 2;
+            if constexpr(THREAD_PER_GRP == 2) return 1;
+            else return 0;
+        }();
+        const int lane_id = threadIdx.x % THREAD_PER_GRP;
+        for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
+        {
+            float max1 = -INFINITY, max2 = -INFINITY;
+            const int start = g * experts_per_group;
+            const int end   = experts_per_group / vec_size;
+            f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
+            for(int e = lane_id; e < end; e += THREAD_PER_GRP)
+            {
+                auto s_vec = sc[e];
+                for(int j = 0; j < vec_size; j++)
+                {
+                    auto s_tmp = s_vec[j];
+                    max2       = s_tmp > max2 ? s_tmp : max2;
+                    max2       = s_tmp > max1 ? max1 : max2;
+                    max1       = s_tmp > max1 ? s_tmp : max1;
+                }
+            }
+            {
+                constexpr int row_mask    = 0xf;
+                constexpr int bank_mask   = 0xf;
+                constexpr bool bound_ctrl = true;
+                constexpr auto get_dpp_i = [&](auto i_step) {
+                    if constexpr(i_step.value == 0) return 0xb1;
+                    if constexpr(i_step.value == 1) return 0x4e;
+                    if constexpr(i_step.value == 2) return 0x141;
+                    else return 0xffff;
+                };
+                ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
+                    constexpr int dpp_i = get_dpp_i(i_step);
+                    float remote_max_1  = __builtin_bit_cast(float,
+                        __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max1), dpp_i, row_mask, bank_mask, bound_ctrl));
+                    float remote_max_2 = __builtin_bit_cast(float,
+                        __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
+                    max2 = remote_max_1 > max2 ? remote_max_1 : max2;
+                    max2 = remote_max_1 > max1 ? max1 : max2;
+                    max1 = remote_max_1 > max1 ? remote_max_1 : max1;
+                    max2 = max2 > remote_max_2 ? max2 : remote_max_2;
+                });
+            }
+            if(lane_id == 0)
+                group_scores[g] = max1 + max2;
+        }
+        __syncthreads();
+    }
+    else
+    {
+#pragma unroll
+        for(int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
+        {
+            float max1      = -INFINITY;
+            const int start = g * experts_per_group;
+            const int end   = start + experts_per_group;
+            for(int e = start; e < end; ++e)
+                max1 = scores[e] > max1 ? scores[e] : max1;
+            group_scores[g] = max1;
+        }
+        __syncthreads();
+    }
+
+    for(int k = 0; k < topk_group; k++)
+    {
+        float max_val = -INFINITY;
+        int max_idx   = NUM_GRP;
+#pragma unroll
+        for(int g = 0; g < NUM_GRP; g++)
+        {
+            auto gs_tmp = group_scores[g];
+            max_idx     = gs_tmp > max_val ? g : max_idx;
+            max_val     = gs_tmp > max_val ? gs_tmp : max_val;
+        }
+        group_scores[max_idx] = -INFINITY;
+    }
+
+    for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+    {
+        int group_idx = e * vec_size / experts_per_group;
+        if(group_scores[group_idx] != -INFINITY)
+            scores_vec[e] = -INFINITY;
+    }
+    __syncthreads();
+
+    // --- Phase 3: Flat topk + renormalize — same as grouped_topk_kernel ---
+    float sum = 0.0f;
+    int topk_indice;
+    float topk_value;
+    for(int k = 0; k < topk; ++k)
+    {
+        float max_val = -INFINITY;
+        int max_idx   = k;
+        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        {
+            f32vec tmp = scores_vec[e];
+#pragma unroll
+            for(size_t i = 0; i < vec_size; i++)
+            {
+                if(tmp[i] > max_val)
+                {
+                    max_val = tmp[i];
+                    max_idx = e * vec_size + i;
+                }
+            }
+        }
+        warpReduceMax(max_val, max_idx);
+        {
+            if constexpr(isBiased)
+                max_val -= correction_bias[max_idx];
+            scores[max_idx] = -INFINITY;
+            topk_indice = threadIdx.x == k ? max_idx : topk_indice;
+            topk_value  = threadIdx.x == k ? max_val : topk_value;
+            if(need_renorm)
+                sum += max_val;
+        }
+    }
+
+    if(need_renorm)
+        sum = routed_scaling_factor / sum;
+    else
+        sum = routed_scaling_factor;
+
+    // --- Phase 4: Emit moe_sorting output (thread 0 collects from lanes, sorts, writes) ---
+    // Each lane k (k < topk) holds its topk_indice (expert_id) and topk_value (weight).
+    // Broadcast all k results to shared memory for sorting.
+    int* s_expert_ids   = reinterpret_cast<int*>(ptr);
+    ptr += topk * sizeof(int);
+    float* s_weights    = reinterpret_cast<float*>(ptr);
+    ptr += topk * sizeof(float);
+    int* s_slots        = reinterpret_cast<int*>(ptr);
+
+    if(static_cast<int>(threadIdx.x) < topk)
+    {
+        s_expert_ids[threadIdx.x] = topk_indice;
+        s_weights[threadIdx.x]    = topk_value * sum;
+        s_slots[threadIdx.x]      = threadIdx.x;
+    }
+    __syncthreads();
+
+    if(threadIdx.x == 0)
+    {
+        // Insertion sort by expert_id ascending (k <= 8, trivial)
+        for(int i = 1; i < topk; i++)
+        {
+            int key_eid    = s_expert_ids[i];
+            float key_w    = s_weights[i];
+            int key_slot   = s_slots[i];
+            int j          = i - 1;
+            while(j >= 0 && s_expert_ids[j] > key_eid)
+            {
+                s_expert_ids[j + 1] = s_expert_ids[j];
+                s_weights[j + 1]    = s_weights[j];
+                s_slots[j + 1]      = s_slots[j];
+                j--;
+            }
+            s_expert_ids[j + 1] = key_eid;
+            s_weights[j + 1]    = key_w;
+            s_slots[j + 1]      = key_slot;
+        }
+
+        int sentinel = (topk << 24) | 1;
+        int write_offset    = 0;
+        int expert_tile_idx = 0;
+
+        for(int i = 0; i < topk; i++)
+        {
+            int packed_id = (s_slots[i] << 24) | 0;
+            sorted_token_ids[write_offset] = packed_id;
+            sorted_weights[write_offset]   = s_weights[i];
+
+            for(int p = 1; p < unit_size; p++)
+            {
+                sorted_token_ids[write_offset + p] = sentinel;
+                sorted_weights[write_offset + p]   = 0.0f;
+            }
+            sorted_expert_ids[expert_tile_idx] = s_expert_ids[i];
+            write_offset += unit_size;
+            expert_tile_idx++;
+        }
+        num_valid_ids[0] = topk * unit_size;
+        num_valid_ids[1] = 1;
+    }
+
+    // Zero moe_buf cooperatively
+    if(moe_buf != nullptr)
+    {
+        int* buf = reinterpret_cast<int*>(moe_buf);
+        int total_ints = moe_buf_bytes / sizeof(int);
+        for(int i = threadIdx.x; i < total_ints; i += blockDim.x)
+            buf[i] = 0;
+    }
+}
+
 template <typename DTYPE_I,
           typename f32vec,
           int NUM_GRP,
@@ -1301,3 +1607,130 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
 #undef LAUNCHER3
 #undef LAUNCHER2
 #undef LAUNCH_KERNEL
+
+// --- Host launcher for grouped_topk_moe_sorting_kernel ---
+#define LAUNCH_GROUPED_DECODE_KERNEL(VEC_F, NUM_GRP, need_renorm_, isBiased_, isSoftmax_)        \
+    VLLM_DISPATCH_FLOATING_TYPES(                                                                 \
+        gating_output.scalar_type(), "grouped_topk_moe_sorting_kernel", [&] {                    \
+            hipLaunchKernelGGL(                                                                   \
+                (aiter::grouped_topk_moe_sorting_kernel<scalar_t, VEC_F, NUM_GRP,                \
+                                                         need_renorm_, isBiased_, isSoftmax_>),  \
+                dim3(1), dim3(64), shared_mem_size, stream,                                      \
+                gating_output.data_ptr<scalar_t>(),                                              \
+                has_bias ? correction_bias.data_ptr<scalar_t>() : nullptr,                       \
+                sorted_token_ids.data_ptr<int>(),                                                \
+                sorted_weights.data_ptr<float>(),                                                \
+                sorted_expert_ids.data_ptr<int>(),                                               \
+                num_valid_ids.data_ptr<int>(),                                                   \
+                moe_buf.data_ptr(),                                                              \
+                num_experts, topk, topk_grp, unit_size, moe_buf_bytes,                           \
+                routed_scaling_factor);                                                          \
+        });
+
+void grouped_topk_moe_sorting(
+    torch::Tensor& gating_output,       // [1, E]
+    torch::Tensor& sorted_token_ids,    // [max_num_tokens_padded]
+    torch::Tensor& sorted_weights,      // [max_num_tokens_padded]
+    torch::Tensor& sorted_expert_ids,   // [max_num_m_blocks]
+    torch::Tensor& num_valid_ids,       // [2]
+    torch::Tensor& moe_buf,            // [1, model_dim]
+    int num_expert_group,
+    int topk_grp,
+    int topk,
+    int unit_size,
+    bool need_renorm,
+    bool is_softmax,
+    torch::Tensor& correction_bias,
+    float routed_scaling_factor)
+{
+    TORCH_CHECK(gating_output.size(0) == 1,
+                "grouped_topk_moe_sorting only supports M=1 (decode)");
+
+    int num_experts  = gating_output.size(1);
+    bool has_bias    = correction_bias.numel() > 0 && correction_bias.data_ptr() != nullptr;
+    int moe_buf_bytes = moe_buf.numel() * moe_buf.element_size();
+
+    size_t shared_mem_size = num_experts * sizeof(float) + num_expert_group * sizeof(float)
+                             + topk * sizeof(int) + topk * sizeof(float) + topk * sizeof(int);
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    using f32vec = ck_tile::ext_vector_t<float, 4>;
+
+    if(has_bias && !is_softmax)
+    {
+        if(need_renorm)
+        {
+            switch(num_expert_group)
+            {
+            case 1: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 1, true, true, false) break;
+            case 2: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 2, true, true, false) break;
+            case 4: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 4, true, true, false) break;
+            case 8: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 8, true, true, false) break;
+            case 16: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 16, true, true, false) break;
+            default: TORCH_CHECK(false, "Unsupported num_expert_group: ", num_expert_group);
+            }
+        }
+        else
+        {
+            switch(num_expert_group)
+            {
+            case 1: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 1, false, true, false) break;
+            case 2: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 2, false, true, false) break;
+            case 4: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 4, false, true, false) break;
+            case 8: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 8, false, true, false) break;
+            case 16: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 16, false, true, false) break;
+            default: TORCH_CHECK(false, "Unsupported num_expert_group: ", num_expert_group);
+            }
+        }
+    }
+    else if(!has_bias && is_softmax)
+    {
+        if(need_renorm)
+        {
+            switch(num_expert_group)
+            {
+            case 1: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 1, true, false, true) break;
+            case 8: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 8, true, false, true) break;
+            default: TORCH_CHECK(false, "Unsupported num_expert_group: ", num_expert_group);
+            }
+        }
+        else
+        {
+            switch(num_expert_group)
+            {
+            case 1: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 1, false, false, true) break;
+            case 8: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 8, false, false, true) break;
+            default: TORCH_CHECK(false, "Unsupported num_expert_group: ", num_expert_group);
+            }
+        }
+    }
+    else
+    {
+        if(need_renorm)
+        {
+            switch(num_expert_group)
+            {
+            case 1: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 1, true, false, false) break;
+            case 2: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 2, true, false, false) break;
+            case 4: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 4, true, false, false) break;
+            case 8: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 8, true, false, false) break;
+            case 16: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 16, true, false, false) break;
+            default: TORCH_CHECK(false, "Unsupported num_expert_group: ", num_expert_group);
+            }
+        }
+        else
+        {
+            switch(num_expert_group)
+            {
+            case 1: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 1, false, false, false) break;
+            case 2: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 2, false, false, false) break;
+            case 4: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 4, false, false, false) break;
+            case 8: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 8, false, false, false) break;
+            case 16: LAUNCH_GROUPED_DECODE_KERNEL(f32vec, 16, false, false, false) break;
+            default: TORCH_CHECK(false, "Unsupported num_expert_group: ", num_expert_group);
+            }
+        }
+    }
+}

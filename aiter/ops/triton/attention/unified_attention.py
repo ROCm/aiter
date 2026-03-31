@@ -169,8 +169,9 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
                                block_table, softcap, alibi_slopes, sinks):
     """Route decode to CK unified attention when CK is faster than Triton.
 
-    CK 2D wins on medium-to-large batch decode (num_seqs >= 128) where it has
-    enough GPU occupancy without split-K.
+    CK 2D wins in a medium-batch sweet spot where there are enough workgroups
+    for full GPU occupancy but not so many that per-workgroup overhead dominates.
+    Empirically: 1024 <= num_kv_heads * num_seqs <= 2048.
     """
     if max_seqlen_q != 1:
         return False
@@ -196,7 +197,7 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
 
     num_seqs = len(seqused_k)
     num_2d_prgms = num_kv_heads * num_seqs
-    if num_2d_prgms < 256 * 4:
+    if num_2d_prgms < 1024 or num_2d_prgms > 2048:
         return False
 
     try:
