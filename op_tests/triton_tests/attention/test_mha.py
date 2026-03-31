@@ -9,6 +9,7 @@ from aiter.ops.triton.attention.mha import (
     flash_attn_varlen_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
+    mha_set_impl,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
@@ -151,6 +152,7 @@ def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 @pytest.mark.parametrize("FP8", [(True), (False)])
+@pytest.mark.parametrize("IMPL", ["default", "dao_ai"])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -163,9 +165,11 @@ def test_mha(
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
     FP8: bool,
+    IMPL: str,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
+    mha_set_impl(IMPL)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -349,6 +353,7 @@ def test_mha_int64_strides(
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 @pytest.mark.parametrize("FP8", [(False), (True)])
+@pytest.mark.parametrize("IMPL", ["default", "dao_ai"])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -361,10 +366,12 @@ def test_mha_varlen(
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
     FP8: bool,
+    IMPL: str,
     dtype=torch.float16,
 ):
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
+    mha_set_impl(IMPL)
     torch.manual_seed(20)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -518,6 +525,7 @@ def test_mha_varlen(
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("FUSED", [False, True])
 @pytest.mark.parametrize("FP8", [True, False])
+@pytest.mark.parametrize("IMPL", ["default", "dao_ai"])
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -529,11 +537,13 @@ def test_mha_backward(
     DROPOUT: float,
     FUSED: bool,
     FP8: bool,
+    IMPL: str,
     dtype=torch.float16,
 ):
     HAS_DROPOUT = DROPOUT > 0.0
     torch.cuda.empty_cache()
     torch.manual_seed(20)
+    mha_set_impl(IMPL)
 
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
@@ -608,6 +618,7 @@ def test_mha_backward(
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("FUSED", [False, True])
 @pytest.mark.parametrize("FP8", [True, False])
+@pytest.mark.parametrize("IMPL", ["default", "dao_ai"])
 def test_mha_backward_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -619,11 +630,13 @@ def test_mha_backward_varlen(
     DROPOUT: float,
     FUSED: bool,
     FP8: bool,
+    IMPL: str,
     dtype=torch.float16,
 ):
     HAS_DROPOUT = DROPOUT > 0.0
     torch.cuda.empty_cache()
     torch.manual_seed(20)
+    mha_set_impl(IMPL)
 
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
