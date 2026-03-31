@@ -29,7 +29,7 @@ def mha_set_use_fused_bwd_kernel(value: bool):
     _USE_FUSED_BWD_KERNEL = value
 
 
-_MHA_IMPL = "default"
+_MHA_IMPL: Literal["default", "dao_ai"] = "default"
 
 
 def mha_set_impl(impl: Literal["default", "dao_ai"]):
