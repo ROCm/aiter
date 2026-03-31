@@ -724,7 +724,7 @@ class KernelSupervisor:
             TuningAgent,
             shapes_to_tune=shapes_to_tune[: max(1, len(shapes_to_tune) // 10)],
             search_space=broad_search_space,
-            ut_script="ut_gemm.py",
+            ut_script=self._ut_script or "ut_gemm.py",
             gpu_ids=self.config.gpu_ids,
             tunning_dir="/workspace/aiter/aiter/ops/triton/utils/_triton/tunning",
         )
@@ -761,7 +761,7 @@ class KernelSupervisor:
             TuningAgent,
             shapes_to_tune=shapes_to_tune,
             search_space=narrowed_search_space,
-            ut_script="ut_gemm.py",
+            ut_script=self._ut_script or "ut_gemm.py",
             gpu_ids=self.config.gpu_ids,
             tunning_dir="/workspace/aiter/aiter/ops/triton/utils/_triton/tunning",
         )
