@@ -18,6 +18,10 @@ BLOCK_SIZES = [16, 64, 48]
 NUM_BLOCKS = [32768, 2048]
 
 
+def uniform_random(shape, start=0, end=1, dtype=None, device=None):
+    return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -187,12 +191,20 @@ def test_triton_unified_attn(
     # QKV are drawn from N(0, 1): no need to calculate the descales from the original tensors
     # generate random descales for testing
     if use_kv_descale:
-        k_descale = torch.rand(1, dtype=torch.float32, device="cuda")
-        v_descale = torch.rand(1, dtype=torch.float32, device="cuda")
+        k_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
+        v_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
     if use_out_scale:
-        out_scale = 1 / torch.rand(1, dtype=torch.float32, device="cuda")
+        out_scale = 1 / uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
     if use_q_descale:
-        q_descale = torch.rand(1, dtype=torch.float32, device="cuda")
+        q_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
 
     unified_attention(
         q=maybe_quantized_query,
