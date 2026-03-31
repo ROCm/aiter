@@ -403,10 +403,12 @@ class _CsvWriter:
 
 def _filter_by_memory(configs: list[BenchConfig], threshold: float = 0.90) -> list[BenchConfig]:
     """Remove configs whose estimated memory exceeds threshold of GPU VRAM."""
-    total_mem = torch.cuda.get_device_properties(0).total_memory
-    limit = int(total_mem * threshold)
+    free_mem, total_mem = torch.cuda.mem_get_info(0)
+    # Use free memory as the baseline — total_memory can be inflated by GTT on ROCm
+    limit = int(free_mem * threshold)
     print(
-        f"GPU VRAM: {total_mem / 1e9:.1f}GB, memory limit: {limit / 1e9:.1f}GB ({threshold:.0%})",
+        f"GPU memory: {free_mem / 1e9:.1f}GB free / {total_mem / 1e9:.1f}GB total, "
+        f"limit: {limit / 1e9:.1f}GB ({threshold:.0%} of free)",
         flush=True,
     )
     kept = []
