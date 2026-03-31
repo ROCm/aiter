@@ -279,7 +279,10 @@ def run_benchmark(custom, args):
                 v_descale=inputs["v_descale"],
                 output_scale=inputs["out_scale"],
             )
-            atol, rtol = 1.5e-1, 1.5e-1
+            if any_fp8:
+                atol, rtol = 1.5e-1, 1.5e-1
+            else:
+                atol, rtol = 1.5e-2, 1e-2
             out_f32 = inputs["output"].to(torch.float32)
             ref_f32 = ref_output.to(torch.float32)
             max_diff = torch.max(torch.abs(out_f32 - ref_f32)).item()
