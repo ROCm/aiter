@@ -741,9 +741,9 @@ class TestCheckPhaseTimeout:
 # ---------------------------------------------------------------------------
 
 
-def make_shape_result(m: int, n: int, k: int, total_ns: float) -> ShapeResult:
-    """Return a ShapeResult with main_ns=total_ns and reduce_ns=0."""
-    return ShapeResult(m=m, n=n, k=k, main_ns=total_ns, reduce_ns=0.0)
+def make_shape_result(m: int, n: int, k: int, total_ns: float) -> dict:
+    """Return a shape result dict matching what subagents return."""
+    return {"m": m, "n": n, "k": k, "main_ns": total_ns, "reduce_ns": 0, "total_ns": total_ns}
 
 
 # ---------------------------------------------------------------------------

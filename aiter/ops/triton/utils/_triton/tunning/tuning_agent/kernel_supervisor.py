@@ -99,6 +99,7 @@ class SupervisorConfig:
     tuning_config: TuningConfig
     gpu_ids: List[int]
     kernel_overrides: Optional[dict] = None
+    gpu_arch: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -406,19 +407,21 @@ class KernelSupervisor:
 
         threshold = self.config.tuning_config.thresholds.regression_vs_baseline
 
-        # Build a lookup from (M, N, K) -> ShapeResult for the baseline.
-        baseline_map: Dict[Tuple[int, int, int], ShapeResult] = {
-            (r.m, r.n, r.k): r for r in self.state.baseline_data
+        # Build a lookup from (M, N, K) -> result dict for the baseline.
+        baseline_map: Dict[Tuple[int, int, int], dict] = {
+            (r["m"], r["n"], r["k"]): r for r in self.state.baseline_data
+        }
+        untuned_map: Dict[Tuple[int, int, int], dict] = {
+            (r["m"], r["n"], r["k"]): r for r in self.state.untuned_data
         }
 
         regressed: List[Tuple[int, int, int]] = []
-        for untuned_result in self.state.untuned_data:
-            key = (untuned_result.m, untuned_result.n, untuned_result.k)
+        for key, untuned_result in untuned_map.items():
             baseline_result = baseline_map.get(key)
             if baseline_result is None:
                 continue
-            limit = baseline_result.total_ns * (1 + threshold / 100)
-            if untuned_result.total_ns > limit:
+            limit = baseline_result["total_ns"] * (1 + threshold / 100)
+            if untuned_result["total_ns"] > limit:
                 regressed.append(key)
 
         return regressed
@@ -446,7 +449,11 @@ class KernelSupervisor:
         mode = self.config.tuning_config.mode
         if mode == TuningMode.FULL or mode == TuningMode.FULL.value:
             shapes = self.state.shapes or []
-            return [(r.m, r.n, r.k) for r in shapes] if shapes and hasattr(shapes[0], "m") else list(shapes)
+            if shapes and isinstance(shapes[0], dict):
+                return [(r["m"], r["n"], r["k"]) for r in shapes]
+            elif shapes and hasattr(shapes[0], "m"):
+                return [(r.m, r.n, r.k) for r in shapes]
+            return list(shapes)
 
         # REGRESSION_ONLY
         return self._identify_regressed_shapes()
@@ -761,11 +768,20 @@ class KernelSupervisor:
             )
 
         # 4. Config generation.
+        # Extract ut_script from discovery phase results if available.
+        discovery_phase_result = self.state.phase_results.get(Phase.DISCOVERY)
+        ut_script: str = "ut_gemm.py"
+        if discovery_phase_result is not None and discovery_phase_result.data:
+            discovered_ut = discovery_phase_result.data.get("ut_script")
+            if discovered_ut:
+                ut_script = discovered_ut
         config_gen_result = self._dispatch_subagent(
             ConfigGeneratorAgent,
             tuning_logs_dir=tuning_logs_dir,
             config_dir=config_dir,
             kernel_variant=self.config.kernel_name,
+            ut_script=ut_script,
+            gfx_arch=self.config.gpu_arch or "gfx950",
         )
         if not config_gen_result.success:
             return PhaseResult(
@@ -829,6 +845,19 @@ class KernelSupervisor:
         shapes = self.state.shapes or []
 
         try:
+            # Convert list-of-dicts to the shape-keyed dict format expected
+            # by ValidationAgent._classify(): {"M{m}_N{n}_K{k}": {...}, ...}
+            def _to_shape_dict(data_list):
+                if not data_list:
+                    return None
+                return {
+                    f"M{r['m']}_N{r['n']}_K{r['k']}": r
+                    for r in data_list
+                }
+
+            baseline_dict = _to_shape_dict(self.state.baseline_data)
+            untuned_dict = _to_shape_dict(self.state.untuned_data)
+
             for iteration in range(1, max_iterations + 1):
                 # --- Collect tuned timings ---
                 validation_result = self._dispatch_with_retry(
@@ -837,8 +866,8 @@ class KernelSupervisor:
                     bench_script="",
                     gpu_ids=self.config.gpu_ids,
                     kernel_variant=self.config.kernel_name,
-                    baseline_data=self.state.baseline_data,
-                    untuned_data=self.state.untuned_data,
+                    baseline_data=baseline_dict,
+                    untuned_data=untuned_dict,
                 )
 
                 if not validation_result.success:

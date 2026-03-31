@@ -199,4 +199,5 @@ class BaselineAgent(BaseSubagent):
         return {
             "shapes_collected": len(results),
             "results_path": results_path,
+            "results": serialisable,
         }
