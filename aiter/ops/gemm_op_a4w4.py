@@ -102,6 +102,14 @@ def gemm_a4w4(
         raise RuntimeError(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
         )
+    if gfx_arch == "gfx1250":
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
+            gemm_afp4wfp4,
+        )
+        result = gemm_afp4wfp4(
+            A.view(m, k // 2), B, A_scale, B_scale, dtype=dtype, y=out,
+        )
+        return result[:m].view(*A.shape[:-1], n)
     tuned_config = get_GEMM_config(m, n, k)
     # splitK = None
     splitK = 0

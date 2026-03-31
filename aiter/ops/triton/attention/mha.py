@@ -190,6 +190,16 @@ def _flash_attn_forward(
         }
     """
 
+    # Ensure integer args are native Python int (not numpy.int32) for Triton
+    max_seqlen_q = int(max_seqlen_q)
+    max_seqlen_k = int(max_seqlen_k)
+    v_head_dim = int(v_head_dim)
+    pe_head_dim = int(pe_head_dim)
+    BLOCK_DMODEL_POW2 = int(BLOCK_DMODEL_POW2)
+    batch = int(batch)
+    num_q_heads = int(num_q_heads)
+    num_k_heads = int(num_k_heads)
+
     grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
     )

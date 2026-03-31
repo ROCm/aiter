@@ -160,11 +160,11 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
                                                         qo_state.get_end(curr_batch));
                         work_info.kv_start = curr_kv_begin + curr_kv_block;
-                        work_info.kv_end   = ck_tile::min(work_info.kv_start + consuming_blks),
+                        work_info.kv_end   = ck_tile::min(work_info.kv_start + consuming_blks,
                         integer_divide_ceil_power2(curr_kv_end * params.kv_granularity -
                                                        (num_qo_tiles - 1 - qo_tile_idx),
                                                    params.kv_granularity,
-                                                   params.kv_granularity_log2);
+                                                   params.kv_granularity_log2));
                         work_info.kv_offset = 0;
                         work_info.q_head_range =
                             qo_state.get_q_head_range(khead_idx * params.qhead_granularity,

@@ -94,6 +94,8 @@ def get_gfx_custom_op_core() -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_gfx():
+    if os.getenv("USE_450", "0") != "0":
+        return "gfx1250"
     gfx_num = get_gfx_custom_op()
     return GFX_MAP.get(gfx_num, "unknown")
 
