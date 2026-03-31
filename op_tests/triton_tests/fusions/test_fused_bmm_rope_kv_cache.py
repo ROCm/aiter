@@ -83,10 +83,8 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     )
 
     if cache_dtype == torch.uint8:
-        if arch_info.get_arch() in ["gfx950"]:
-            cache_dtype_actual = torch.float8_e4m3fn
-        else:
-            cache_dtype_actual = torch.float8_e4m3fnuz
+        from aiter.utility.dtypes import fp8
+        cache_dtype_actual = fp8
 
     kv_cache = torch.zeros(
         (num_kv_cahce_tokens, KH, D_lora + D), dtype=cache_dtype, device="cuda"
@@ -258,10 +256,8 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     )
 
     if cache_dtype == torch.uint8:
-        if arch_info.get_arch() in ["gfx950"]:
-            cache_dtype_actual = torch.float8_e4m3fn
-        else:
-            cache_dtype_actual = torch.float8_e4m3fnuz
+        from aiter.utility.dtypes import fp8
+        cache_dtype_actual = fp8
 
     kv_cache = torch.zeros(
         (num_kv_cahce_tokens, KH, D_q_nope + D), dtype=cache_dtype, device="cuda"

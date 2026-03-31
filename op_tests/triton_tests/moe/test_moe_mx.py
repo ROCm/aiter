@@ -305,7 +305,8 @@ def test_fused_moe(
     swizzle_mx_scale: bool,
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
         pytest.skip("MXFP4 not supported on this architecture")

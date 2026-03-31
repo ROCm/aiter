@@ -172,7 +172,8 @@ def _get_alibi_slopes(total_num_heads: int, device: torch.tensor) -> torch.Tenso
 
 def seed_everything(seed):
     random.seed(seed)
-    torch.manual_seed(seed)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(seed)
 
 
 def input_helper(

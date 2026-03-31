@@ -52,7 +52,8 @@ def generate_test_data(
     Pay attention: This function changes the random seed
     """
     random.seed(t.seed)
-    torch.manual_seed(t.seed)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(t.seed)
     torch.cuda.manual_seed(t.seed)
     torch.backends.cudnn.deterministic = True
 

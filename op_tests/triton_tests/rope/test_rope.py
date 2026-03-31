@@ -57,7 +57,8 @@ def generate_rope_inputs(
     dtype: torch.dtype,
     bwd: bool = False,
 ):
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
     random.seed(20)
 
     device = "cuda"
@@ -1037,7 +1038,8 @@ def test_rope_2d_fwd(
     inplace: bool,
     dtype: torch.dtype,
 ):
-    torch.manual_seed(20)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(20)
 
     x = torch.randn((B, height * width, H, D), dtype=dtype, device="cuda")
 

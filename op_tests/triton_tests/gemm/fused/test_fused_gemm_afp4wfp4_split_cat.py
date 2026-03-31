@@ -101,7 +101,8 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     - y: (M, D, S3)
     """
 
-    torch.manual_seed(5)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(5)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 

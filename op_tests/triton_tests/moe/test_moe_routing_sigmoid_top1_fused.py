@@ -47,7 +47,8 @@ def test_routing_sigmoid_top1(M, N, K, dtype):
 
     TOPK = 1
 
-    torch.manual_seed(7)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(7)
 
     device = "cuda"
 

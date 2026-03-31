@@ -27,7 +27,8 @@ def generate_sparse_seq_len(
     sparsity: float,
     device: torch.device,
 ) -> torch.Tensor:
-    torch.manual_seed(1)  # for reproducibility
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(1)  # for reproducibility
 
     if sparsity == 0.0:
         return torch.zeros(size=(size,), device=device, dtype=torch.int)
@@ -166,7 +167,8 @@ def test_hstu_attention(
     alpha = 1.0 / attn_dim * 10000
 
     # generate inputs
-    torch.manual_seed(1001)  # for reproducibility
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(1001)  # for reproducibility
     lengths = generate_sparse_seq_len(
         size=batch_size,
         max_seq_len=max_seq_len,

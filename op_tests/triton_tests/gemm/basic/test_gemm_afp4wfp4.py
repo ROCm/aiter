@@ -53,7 +53,8 @@ def generate_gemm_afp4wfp4_inputs(
             shuffle_scales_fg
         ), "weight shuffling is only supported with scale shuffling"
 
-    torch.manual_seed(5)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(5)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 

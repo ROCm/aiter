@@ -377,7 +377,8 @@ def test_gemm_a8wfp4(
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    torch.manual_seed(42)  # for reproducibility
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(42)  # for reproducibility
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
