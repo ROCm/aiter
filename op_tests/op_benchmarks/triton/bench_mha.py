@@ -404,7 +404,9 @@ class _CsvWriter:
 
 def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     """Skip large configs to avoid OOM on RDNA (16GB VRAM)."""
-    if not get_arch().is_rdna:
+    arch = get_arch()
+    print(f"GPU arch: {arch.name} (is_rdna={arch.is_rdna})", flush=True)
+    if not arch.is_rdna:
         return configs
     limit = 16 * 1024**3
     kept = []
