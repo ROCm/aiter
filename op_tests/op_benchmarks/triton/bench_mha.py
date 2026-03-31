@@ -217,53 +217,112 @@ def edge_case_configs(
 
     # Decode: sq=1, large KV cache
     for (hq, hk), sk, b, d in itertools.product(
-        [(32, 8), (64, 8)], [4096, 8192], [1, 8], dtypes,
+        [(32, 8), (64, 8)],
+        [4096, 8192],
+        [1, 8],
+        dtypes,
     ):
-        configs.append(BenchConfig(
-            name=f"decode_HQ{hq}_HK{hk}",
-            batch=b, hq=hq, hk=hk, sq=1, sk=sk,
-            d_head=d_head, d_head_v=d_head, causal=True,
-            layout="thd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
-        ))
+        configs.append(
+            BenchConfig(
+                name=f"decode_HQ{hq}_HK{hk}",
+                batch=b,
+                hq=hq,
+                hk=hk,
+                sq=1,
+                sk=sk,
+                d_head=d_head,
+                d_head_v=d_head,
+                causal=True,
+                layout="thd",
+                dtype_str=d,
+                impl=impl,
+                fused=fused and d != "fp8",
+            )
+        )
 
     # Non-causal (cross-attention): sq != sk
     for (hq, hk), (sq, sk), d in itertools.product(
-        [(32, 32), (64, 8)], [(512, 1024), (1024, 4096)], dtypes,
+        [(32, 32), (64, 8)],
+        [(512, 1024), (1024, 4096)],
+        dtypes,
     ):
-        configs.append(BenchConfig(
-            name=f"cross_HQ{hq}_HK{hk}",
-            batch=4, hq=hq, hk=hk, sq=sq, sk=sk,
-            d_head=d_head, d_head_v=d_head, causal=False,
-            layout="bshd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
-        ))
+        configs.append(
+            BenchConfig(
+                name=f"cross_HQ{hq}_HK{hk}",
+                batch=4,
+                hq=hq,
+                hk=hk,
+                sq=sq,
+                sk=sk,
+                d_head=d_head,
+                d_head_v=d_head,
+                causal=False,
+                layout="bshd",
+                dtype_str=d,
+                impl=impl,
+                fused=fused and d != "fp8",
+            )
+        )
 
     # Non-power-of-2 seqlens
     for (hq, hk), (sq, sk), d in itertools.product(
-        [(32, 8)], [(163, 163), (1000, 2000)], dtypes,
+        [(32, 8)],
+        [(163, 163), (1000, 2000)],
+        dtypes,
     ):
-        configs.append(BenchConfig(
-            name=f"odd_seq_HQ{hq}_HK{hk}",
-            batch=4, hq=hq, hk=hk, sq=sq, sk=sk,
-            d_head=d_head, d_head_v=d_head, causal=True,
-            layout="thd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
-        ))
+        configs.append(
+            BenchConfig(
+                name=f"odd_seq_HQ{hq}_HK{hk}",
+                batch=4,
+                hq=hq,
+                hk=hk,
+                sq=sq,
+                sk=sk,
+                d_head=d_head,
+                d_head_v=d_head,
+                causal=True,
+                layout="thd",
+                dtype_str=d,
+                impl=impl,
+                fused=fused and d != "fp8",
+            )
+        )
 
     # Batched bshd (training-like)
     for (hq, hk), sq, b, d in itertools.product(
-        [(32, 8), (64, 8)], [1024, 4096], [4, 16], dtypes,
+        [(32, 8), (64, 8)],
+        [1024, 4096],
+        [4, 16],
+        dtypes,
     ):
-        configs.append(BenchConfig(
-            name=f"train_HQ{hq}_HK{hk}",
-            batch=b, hq=hq, hk=hk, sq=sq, sk=sq,
-            d_head=d_head, d_head_v=d_head, causal=True,
-            layout="bshd", dtype_str=d, impl=impl, fused=fused and d != "fp8",
-        ))
+        configs.append(
+            BenchConfig(
+                name=f"train_HQ{hq}_HK{hk}",
+                batch=b,
+                hq=hq,
+                hk=hk,
+                sq=sq,
+                sk=sq,
+                d_head=d_head,
+                d_head_v=d_head,
+                causal=True,
+                layout="bshd",
+                dtype_str=d,
+                impl=impl,
+                fused=fused and d != "fp8",
+            )
+        )
 
     return configs
 
 
 def model_benchmark_configs(
-    args, *, dtypes: list[str], impl: str, fused: bool, layout: str,
+    args,
+    *,
+    dtypes: list[str],
+    impl: str,
+    fused: bool,
+    layout: str,
     model: str = "all",
 ) -> list[BenchConfig]:
     config_file = args.model_configs
@@ -339,8 +398,19 @@ def pad_rearrange_dropout_mask(
 
 def _make_triton_benchmark(run: BenchRun) -> list:
     x_names = [
-        "name", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
-        "D_HEAD", "D_HEAD_V", "causal", "layout", "dtype", "impl", "fused",
+        "name",
+        "BATCH",
+        "HQ",
+        "HK",
+        "N_CTX_Q",
+        "N_CTX_K",
+        "D_HEAD",
+        "D_HEAD_V",
+        "causal",
+        "layout",
+        "dtype",
+        "impl",
+        "fused",
     ]
     return [
         triton.testing.Benchmark(
@@ -715,25 +785,28 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     # Validate dtypes
     dtypes = [d.strip() for d in parsed.dtype.split(",")]
     for d in dtypes:
-        assert d in VALID_DTYPES, f"Unknown dtype '{d}'. Supported: {sorted(VALID_DTYPES)}"
+        assert (
+            d in VALID_DTYPES
+        ), f"Unknown dtype '{d}'. Supported: {sorted(VALID_DTYPES)}"
     tensor_dtype_str = next((d for d in dtypes if d != "fp8"), "bf16")
     torch_dtype = arg_to_torch_dtype[tensor_dtype_str]
 
-    assert parsed.layout in ("bshd", "thd"), (
-        f"{parsed.layout} is not a supported layout. Use 'bshd' or 'thd'."
-    )
+    assert parsed.layout in (
+        "bshd",
+        "thd",
+    ), f"{parsed.layout} is not a supported layout. Use 'bshd' or 'thd'."
 
     custom = bool(parsed.hq or parsed.hk or parsed.d or parsed.dv)
     if custom:
         if not parsed.dv:
             parsed.dv = parsed.d
-        assert parsed.b and parsed.hq and parsed.sq and parsed.d and parsed.dv, (
-            "Custom config requires: -b, -hq, -sq, -d (and optionally -dv)."
-        )
+        assert (
+            parsed.b and parsed.hq and parsed.sq and parsed.d and parsed.dv
+        ), "Custom config requires: -b, -hq, -sq, -d (and optionally -dv)."
     if parsed.model:
-        assert not custom, (
-            "--model sets hq, hk, d from the config. Do not provide them."
-        )
+        assert (
+            not custom
+        ), "--model sets hq, hk, d from the config. Do not provide them."
 
     if parsed.layout == "thd" and parsed.equal_seqlens:
         warnings.warn(
@@ -777,17 +850,27 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         ]
     elif parsed.model:
         configs = model_benchmark_configs(
-            parsed, dtypes=dtypes, impl=impl, fused=fused, model=parsed.model,
+            parsed,
+            dtypes=dtypes,
+            impl=impl,
+            fused=fused,
+            model=parsed.model,
             layout=parsed.layout,
         )
     else:
         # Default: model configs then edge cases
         configs = model_benchmark_configs(
-            parsed, dtypes=dtypes, impl=impl, fused=fused, model="all",
+            parsed,
+            dtypes=dtypes,
+            impl=impl,
+            fused=fused,
+            model="all",
             layout=parsed.layout,
         )
         configs += edge_case_configs(
-            dtypes=dtypes, impl=impl, fused=fused,
+            dtypes=dtypes,
+            impl=impl,
+            fused=fused,
         )
 
     plot_name = f"{get_caller_name_no_ext()}_{parsed.mode}"
