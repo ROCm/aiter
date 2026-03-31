@@ -742,6 +742,7 @@ def reduce_segments(
     )
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
+        offs_d = tl.arange(0, HEAD_SIZE_PADDED)
         dim_mask = offs_d < HEAD_SIZE
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
