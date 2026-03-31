@@ -806,7 +806,7 @@ def build_module(
                 f"{AITER_CSRC_DIR}/include",
                 f"{op_dir}/blob",
             ] + _extra_inc
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
         else:
             old_bd_include_dir = f"{op_dir}/build/include"
@@ -818,7 +818,7 @@ def build_module(
                 hipify,
             )
 
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 bd_include_dir = f"{op_dir}/build/include/torch"
                 os.makedirs(bd_include_dir, exist_ok=True)
                 rename_cpp_to_cu(
@@ -923,9 +923,22 @@ def _get_ck_exclude_modules():
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
-        "module_rope_general_bwd",
-        "module_rope_general_fwd",
-        "module_rope_pos_fwd",
+        "module_rope_1c_uncached_fwd",
+        "module_rope_1c_uncached_bwd",
+        "module_rope_2c_uncached_fwd",
+        "module_rope_2c_uncached_bwd",
+        "module_rope_1c_cached_fwd",
+        "module_rope_1c_cached_bwd",
+        "module_rope_2c_cached_fwd",
+        "module_rope_2c_cached_bwd",
+        "module_rope_1c_thd_fwd",
+        "module_rope_1c_thd_bwd",
+        "module_rope_1c_2d_fwd",
+        "module_rope_1c_2d_bwd",
+        "module_rope_1c_cached_positions_fwd",
+        "module_rope_2c_cached_positions_fwd",
+        "module_rope_1c_cached_positions_offsets_fwd",
+        "module_rope_2c_cached_positions_offsets_fwd",
         "module_sample",
         "module_topk_plain",
     }
@@ -1197,6 +1210,10 @@ def _ctypes_call(func, fc_name, md_name):
         _ensure_loaded()
         c_func = _cache["c_func"]
 
+        if AITER_LOG_MORE == 2:
+            from ..test_common import log_args
+
+            log_args(func, *args, **kwargs)
         sig = inspect.signature(func)
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
