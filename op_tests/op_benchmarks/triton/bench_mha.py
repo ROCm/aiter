@@ -188,23 +188,36 @@ def get_make_fn(function: str, dtype: str) -> Callable:
     return _MAKE_FN[function]
 
 
-# (batch, sq, sk, causal, functions)
-# Each scenario declares which functions are relevant for it
+PREFILL_FNS = ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]
+DECODE_FNS = ["fwd_kvcache"]
 
-PREFILL_SCENARIOS = [
-    (4, 256, 256, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
-    (4, 1024, 1024, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
-    (4, 4096, 4096, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
-    (4, 8192, 8192, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
-    # Cross-attention
-    (4, 1024, 4096, False, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
-]
 
-DECODE_SCENARIOS = [
-    (32, 1, 1024, True, ["fwd_kvcache"]),
-    (32, 1, 4096, True, ["fwd_kvcache"]),
-    (32, 1, 8192, True, ["fwd_kvcache"]),
-]
+def make_workloads(
+    num_tokens: int,
+    max_num_seqs: int,
+) -> tuple[list[tuple], list[tuple]]:
+    """Generate realistic workloads from vLLM scheduler parameters.
+
+    Prefill: batch × sq = num_tokens (token budget per step).
+    Decode: batch = min(num_tokens, max_num_seqs), sq=1.
+    Returns (prefill_workloads, decode_workloads).
+    Each entry is (batch, sq, sk, causal, functions).
+    """
+    prefill_seqlens = [256, 1024, num_tokens]
+    prefill = [
+        (num_tokens // sq, sq, sq, True, PREFILL_FNS)
+        for sq in prefill_seqlens
+    ]
+    # Cross-attention (non-causal, sq != sk)
+    prefill.append((num_tokens // 1024, 1024, 4096, False, PREFILL_FNS))
+
+    decode_batch = min(num_tokens, max_num_seqs)
+    decode = [
+        (decode_batch, 1, sk, True, DECODE_FNS)
+        for sk in [1024, 4096, 8192]
+    ]
+
+    return prefill, decode
 
 
 def model_benchmark_configs(
@@ -231,18 +244,20 @@ def model_benchmark_configs(
         if args.sq:
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
-            scenarios = [(b, args.sq, args.sk if args.sk else args.sq, causal, functions)]
+            workloads = [(b, args.sq, args.sk if args.sk else args.sq, causal, functions)]
         else:
-            scenarios = PREFILL_SCENARIOS + DECODE_SCENARIOS
+            # Realistic serving on MI350 node: 8192 token budget per step, 64 concurrent decodes
+            prefill, decode = make_workloads(num_tokens=8192, max_num_seqs=64)
+            workloads = prefill + decode
             if args.b:
-                scenarios = [(args.b, sq, sk, c, fns) for (_, sq, sk, c, fns) in scenarios]
+                workloads = [(args.b, sq, sk, c, fns) for (_, sq, sk, c, fns) in workloads]
             if args.causal is not None:
-                scenarios = [(b, sq, sk, c, fns) for (b, sq, sk, c, fns) in scenarios if c == args.causal]
+                workloads = [(b, sq, sk, c, fns) for (b, sq, sk, c, fns) in workloads if c == args.causal]
 
-        for (b, sq, sk, causal, scenario_fns), d in itertools.product(
-            scenarios, dtypes
+        for (b, sq, sk, causal, workload_fns), d in itertools.product(
+            workloads, dtypes
         ):
-            for fn in scenario_fns:
+            for fn in workload_fns:
                 if fn not in functions:
                     continue
                 fa_configs.append(
