@@ -76,8 +76,63 @@ def _read_json(path: str) -> dict:
 
 
 def _make_executor() -> MagicMock:
-    """Return a mock RemoteExecutor (never actually called in these tests)."""
-    return MagicMock()
+    """Return a mock RemoteExecutor whose docker_exec reads/writes local files.
+
+    The mock handles two command patterns used by _load_json / _write_json:
+
+    * ``cat '<path>'``  — reads the local file and returns its content as stdout.
+    * ``printf '%s' '<json>' > '<path>'``  — writes the JSON payload to the file.
+
+    All other commands return a successful empty result.
+    """
+    import shlex as _shlex
+
+    executor = MagicMock()
+
+    def _docker_exec_side_effect(cmd, **kwargs):
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = ""
+        result.stderr = ""
+
+        stripped = cmd.strip()
+
+        # Handle: cat '<path>'
+        if stripped.startswith("cat "):
+            path = _shlex.split(stripped[4:])[0]
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    result.stdout = fh.read()
+            except FileNotFoundError:
+                result.returncode = 1
+                result.stderr = f"cat: {path}: No such file or directory"
+            return result
+
+        # Handle: printf '%s' '<json>' > '<path>'
+        # We parse using shlex to reliably split quoted tokens.
+        if stripped.startswith("printf "):
+            try:
+                # Split on the redirection operator to separate command from dest.
+                redir_idx = stripped.rfind(" > ")
+                if redir_idx != -1:
+                    cmd_part = stripped[:redir_idx]
+                    dest_part = stripped[redir_idx + 3:]
+                    path = _shlex.split(dest_part)[0]
+                    # cmd_part is: printf '%s' '<json_content>'
+                    tokens = _shlex.split(cmd_part)
+                    # tokens[0]='printf', tokens[1]='%s', tokens[2]=json_content
+                    if len(tokens) >= 3:
+                        content = tokens[2]
+                        with open(path, "w", encoding="utf-8") as fh:
+                            fh.write(content)
+            except Exception:  # noqa: BLE001
+                pass
+            return result
+
+        return result
+
+    executor.docker_exec.side_effect = _docker_exec_side_effect
+    return executor
 
 
 def _make_agent(

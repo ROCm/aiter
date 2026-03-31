@@ -18,7 +18,7 @@ a fallback file, a new suffixed config is created instead.
 import json
 import os
 import re
-import shutil
+import shlex
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional
 
@@ -63,17 +63,36 @@ def _is_suffixed(config_path: str) -> bool:
     return bool(_SUFFIXED_RE.search(os.path.basename(config_path)))
 
 
-def _load_json(path: str) -> Dict[str, Any]:
-    """Load and return parsed JSON from *path*."""
+def _load_json(path: str, executor=None) -> Dict[str, Any]:
+    """Load and return parsed JSON from *path*.
+
+    When *executor* is provided the file is read from inside the Docker
+    container via ``docker_exec("cat <path>")``.  Otherwise a local
+    ``open()`` is used (kept for unit-test compatibility only).
+    """
+    if executor is not None:
+        result = executor.docker_exec(f"cat {shlex.quote(path)}")
+        return json.loads(result.stdout)
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
-def _write_json(path: str, data: Dict[str, Any]) -> None:
-    """Serialise *data* as indented JSON and write it to *path*."""
+def _write_json(path: str, data: Dict[str, Any], executor=None) -> None:
+    """Serialise *data* as indented JSON and write it to *path*.
+
+    When *executor* is provided the file is written inside the Docker
+    container via ``docker_exec("printf '%s' <json> > <path>")``.
+    Otherwise a local ``open()`` is used (kept for unit-test compatibility
+    only).
+    """
+    serialised = json.dumps(data, indent=2) + "\n"
+    if executor is not None:
+        executor.docker_exec(
+            f"printf '%s' {shlex.quote(serialised)} > {shlex.quote(path)}"
+        )
+        return
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
-        fh.write("\n")
+        fh.write(serialised)
 
 
 def _find_matching_bucket(
@@ -253,9 +272,9 @@ class RegressionFixerAgent(BaseSubagent):
             self.old_config_dir, os.path.basename(current_config_file)
         )
         try:
-            current_config = _load_json(current_config_file)
-            old_config = _load_json(old_config_file)
-        except (FileNotFoundError, json.JSONDecodeError):
+            current_config = _load_json(current_config_file, self.executor)
+            old_config = _load_json(old_config_file, self.executor)
+        except (FileNotFoundError, json.JSONDecodeError, Exception):
             # If we cannot load either file, we cannot compare — fall through
             # to the file-type-based rules.
             current_config = None
@@ -303,15 +322,15 @@ class RegressionFixerAgent(BaseSubagent):
             file cannot be read/written.
         """
         try:
-            current_config = _load_json(config_path)
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            current_config = _load_json(config_path, self.executor)
+        except Exception as exc:
             raise SubagentError(
                 f"Cannot read current config {config_path!r}: {exc}"
             ) from exc
 
         try:
-            old_config = _load_json(old_config_path)
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            old_config = _load_json(old_config_path, self.executor)
+        except Exception as exc:
             raise SubagentError(
                 f"Cannot read old config {old_config_path!r}: {exc}"
             ) from exc
@@ -324,7 +343,7 @@ class RegressionFixerAgent(BaseSubagent):
 
         # Replace only the target bucket; leave all other buckets intact.
         current_config[bucket_name] = old_config[old_bucket_key]
-        _write_json(config_path, current_config)
+        _write_json(config_path, current_config, self.executor)
 
     def promote_to_suffixed(
         self,
@@ -370,15 +389,15 @@ class RegressionFixerAgent(BaseSubagent):
         new_path = _derive_suffixed_filename(fallback_path, n, k)
 
         try:
-            fallback_config = _load_json(fallback_path)
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            fallback_config = _load_json(fallback_path, self.executor)
+        except Exception as exc:
             raise SubagentError(
                 f"Cannot read fallback config {fallback_path!r}: {exc}"
             ) from exc
 
         try:
-            old_fallback_config = _load_json(old_fallback_path)
-        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            old_fallback_config = _load_json(old_fallback_path, self.executor)
+        except Exception as exc:
             raise SubagentError(
                 f"Cannot read old fallback config {old_fallback_path!r}: {exc}"
             ) from exc
@@ -396,7 +415,7 @@ class RegressionFixerAgent(BaseSubagent):
         new_config[bucket_name] = old_fallback_config[old_bucket_key]
 
         # Write to the NEW suffixed file — the fallback is never touched.
-        _write_json(new_path, new_config)
+        _write_json(new_path, new_config, self.executor)
         return new_path
 
     # ------------------------------------------------------------------

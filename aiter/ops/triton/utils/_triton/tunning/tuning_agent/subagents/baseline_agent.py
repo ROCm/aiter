@@ -163,11 +163,7 @@ class BaselineAgent(BaseSubagent):
             f"--shape {m} {n} {k} --metric time --layout TN"
         )
 
-        result = self.executor.docker_exec(rocprof_cmd, check=True)
-        if result.returncode != 0:
-            raise SubagentError(
-                f"rocprof failed for shape ({m},{n},{k}): {result.stderr}"
-            )
+        self.executor.docker_exec(rocprof_cmd, check=True)
 
         # Read back the generated stats CSV.
         read_result = self.executor.docker_exec(f"cat {stats_csv}", check=True)

@@ -8,6 +8,7 @@ added by subsequent tasks.
 
 from __future__ import annotations
 
+import shlex
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -182,6 +183,8 @@ class KernelSupervisor:
         self.notifier = notifier
         self.progress_callback = progress_callback
         self.state = SupervisorState()
+        self._bench_script: str = ""
+        self._ut_script: str = ""
 
     # ------------------------------------------------------------------
     # Checkpoint helpers
@@ -535,6 +538,8 @@ class KernelSupervisor:
             )
             if result.success:
                 self.state.shapes = result.data.get("shapes", [])
+                self._bench_script = result.data.get("bench_script", "")
+                self._ut_script = result.data.get("ut_script", "")
                 missing_scripts = result.data.get("missing_scripts", [])
                 if missing_scripts:
                     self._dispatch_with_retry(
@@ -580,7 +585,7 @@ class KernelSupervisor:
             result = self._dispatch_with_retry(
                 BaselineAgent,
                 shapes=shapes,
-                bench_script="",
+                bench_script=self._bench_script,
                 gpu_id=self.config.gpu_ids[0],
                 kernel_variant=self.config.kernel_name,
             )
@@ -622,7 +627,7 @@ class KernelSupervisor:
             result = self._dispatch_with_retry(
                 ValidationAgent,
                 shapes=shapes,
-                bench_script="",
+                bench_script=self._bench_script,
                 gpu_ids=self.config.gpu_ids,
                 kernel_variant=self.config.kernel_name,
             )
@@ -721,7 +726,7 @@ class KernelSupervisor:
             search_space=broad_search_space,
             ut_script="ut_gemm.py",
             gpu_ids=self.config.gpu_ids,
-            tunning_dir=artifact_dir,
+            tunning_dir="/workspace/aiter/aiter/ops/triton/utils/_triton/tunning",
         )
         if not scout_agent_result.success:
             return PhaseResult(
@@ -758,7 +763,7 @@ class KernelSupervisor:
             search_space=narrowed_search_space,
             ut_script="ut_gemm.py",
             gpu_ids=self.config.gpu_ids,
-            tunning_dir=artifact_dir,
+            tunning_dir="/workspace/aiter/aiter/ops/triton/utils/_triton/tunning",
         )
         if not full_tuning_result.success:
             return PhaseResult(
@@ -865,7 +870,7 @@ class KernelSupervisor:
                 validation_result = self._dispatch_with_retry(
                     ValidationAgent,
                     shapes=shapes,
-                    bench_script="",
+                    bench_script=self._bench_script,
                     gpu_ids=self.config.gpu_ids,
                     kernel_variant=self.config.kernel_name,
                     baseline_data=baseline_dict,
@@ -1037,8 +1042,14 @@ class KernelSupervisor:
                 f"feat(tuning): update {self.config.kernel_name} configs\n\n"
                 f"{summary_text}"
             )
+            # Write commit message to a temp file to avoid shell-quoting issues
+            # with newlines, then use `git commit -F` to read it.
             self.executor.docker_exec(
-                f"git add -A && git commit -m {commit_message!r}"
+                f"printf '%s' {shlex.quote(commit_message)} > /tmp/commit_msg.txt"
+            )
+            self.executor.docker_exec(
+                "cd /workspace/aiter && git add -A aiter/ops/triton/configs/ "
+                "&& git commit -F /tmp/commit_msg.txt"
             )
 
             return PhaseResult(

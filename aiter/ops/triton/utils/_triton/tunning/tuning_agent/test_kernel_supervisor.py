@@ -1432,10 +1432,10 @@ class TestRunPhase6Commit:
 
         assert result.success is True
         assert result.data.get("committed") is True
-        mock_exec.assert_called_once()
-        cmd = mock_exec.call_args[0][0]
-        assert "git add" in cmd
-        assert "git commit" in cmd
+        assert mock_exec.call_count >= 1
+        all_cmds = " ".join(c[0][0] for c in mock_exec.call_args_list)
+        assert "git add" in all_cmds
+        assert "git commit" in all_cmds
 
     def test_phase_6_denied_returns_failure(self, tmp_path: Path) -> None:
         """When notifier denies, _run_phase_6_commit returns PhaseResult(success=False)."""
