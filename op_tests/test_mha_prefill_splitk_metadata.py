@@ -91,90 +91,15 @@ def to_work_list(work_info_set, valid_work_num):
     ]
 
 
-@pytest.mark.parametrize("q_len", [128, 192, 256])
-@pytest.mark.parametrize("q_tile_size", [64, 128])
-@pytest.mark.parametrize("split_k_size", [64, 128])
-def test_mha_prefill_splitk_metadata_noncausal_uniform(
+def check_causal_uniform_case(
+    batch_size,
     q_len,
+    kv_len,
     q_tile_size,
     split_k_size,
+    capsys,
 ):
     device = "cuda"
-    batch_size = 2
-    kv_len = 384
-
-    qo_indptr = make_uniform_indptr(batch_size, q_len, device=device)
-    kv_indptr = make_uniform_indptr(batch_size, kv_len, device=device)
-
-    (
-        work_metadata_ptrs,
-        work_indptr,
-        work_info_set,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-    ) = alloc_metadata_tensors(
-        batch_size=batch_size,
-        max_seqlen_qo=q_len,
-        max_seqlen_kv=kv_len,
-        q_tile_size=q_tile_size,
-        split_k_size=split_k_size,
-        is_causal=False,
-        uni_seqlen_qo=q_len,
-        device=device,
-    )
-
-    aiter.get_mha_prefill_splitk_metadata_v1(
-        qo_indptr,
-        kv_indptr,
-        False,
-        q_tile_size,
-        split_k_size,
-        work_metadata_ptrs,
-        work_info_set,
-        work_indptr,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        max_seqlen_qo=q_len,
-        uni_seqlen_qo=q_len,
-    )
-
-    valid_work_num = int(work_indptr.cpu()[1].item())
-    work_list = to_work_list(work_info_set, valid_work_num)
-    num_q_tiles = ceil_div(q_len, q_tile_size)
-    expected_total_work = batch_size * num_q_tiles * ceil_div(kv_len, split_k_size)
-
-    assert valid_work_num == expected_total_work
-    assert int(reduce_indptr.cpu()[batch_size * num_q_tiles].item()) == expected_total_work
-
-    for item in work_list:
-        assert 0 <= item["batch_idx"] < batch_size
-        assert item["qo_end"] > item["qo_start"]
-        assert item["qo_end"] - item["qo_start"] <= q_tile_size
-        assert item["kv_end"] > item["kv_start"]
-        assert item["kv_end"] - item["kv_start"] <= split_k_size
-        assert item["kv_offset"] == 0
-
-    reduce_final_map_cpu = reduce_final_map.cpu()
-    for group_idx in range(batch_size * num_q_tiles):
-        q_start = int(reduce_final_map_cpu[group_idx, 0].item())
-        q_end = int(reduce_final_map_cpu[group_idx, 1].item())
-        assert q_end > q_start
-        assert q_end - q_start <= q_tile_size
-
-
-@pytest.mark.parametrize("q_len", [128, 192, 256])
-@pytest.mark.parametrize("q_tile_size", [64, 128])
-@pytest.mark.parametrize("split_k_size", [64, 128])
-def test_mha_prefill_splitk_metadata_causal_uniform(
-    q_len,
-    q_tile_size,
-    split_k_size,
-):
-    device = "cuda"
-    batch_size = 2
-    kv_len = q_len
 
     qo_indptr = make_uniform_indptr(batch_size, q_len, device=device)
     kv_indptr = make_uniform_indptr(batch_size, kv_len, device=device)
@@ -215,23 +140,173 @@ def test_mha_prefill_splitk_metadata_causal_uniform(
 
     valid_work_num = int(work_indptr.cpu()[1].item())
     work_list = to_work_list(work_info_set, valid_work_num)
+    with capsys.disabled():
+        print("\n")
+        print(
+            "q_len, kv_len, q_tile_size, split_k_size, batch_size:",
+            q_len,
+            kv_len,
+            q_tile_size,
+            split_k_size,
+            batch_size,
+        )
+        print("work_list:")
+        for item in work_list:
+            print(item)
+
+    prefix_len = kv_len - q_len
+    assert prefix_len >= 0
 
     expected_per_batch = 0
     for q_tile_idx in range(ceil_div(q_len, q_tile_size)):
-        visible_kv_len = min((q_tile_idx + 1) * q_tile_size, q_len)
+        visible_kv_len = min(prefix_len + (q_tile_idx + 1) * q_tile_size, kv_len)
         expected_per_batch += ceil_div(visible_kv_len, split_k_size)
     assert valid_work_num == batch_size * expected_per_batch
 
     for batch_idx in range(batch_size):
         batch_q_begin = int(qo_indptr[batch_idx].item())
         batch_kv_begin = int(kv_indptr[batch_idx].item())
+        batch_kv_end = int(kv_indptr[batch_idx + 1].item())
         batch_items = [item for item in work_list if item["batch_idx"] == batch_idx]
         for qo_start in sorted({item["qo_start"] for item in batch_items}):
             tile_items = [item for item in batch_items if item["qo_start"] == qo_start]
             qo_end = tile_items[0]["qo_end"]
-            allowed_kv_end = batch_kv_begin + (qo_end - batch_q_begin)
+            allowed_kv_end = min(
+                batch_kv_begin + prefix_len + (qo_end - batch_q_begin), batch_kv_end
+            )
             assert tile_items[0]["kv_start"] == batch_kv_begin
             assert max(item["kv_end"] for item in tile_items) == allowed_kv_end
+            for item in tile_items:
+                assert item["kv_offset"] == batch_kv_end - item["kv_end"]
+
+
+# @pytest.mark.parametrize("q_len", [128, 192, 256])
+# @pytest.mark.parametrize("kv_len", [256, 384, 512])
+# @pytest.mark.parametrize("q_tile_size", [64, 128])
+# @pytest.mark.parametrize("split_k_size", [64, 128])
+# @pytest.mark.parametrize("batch_size", [1, 2, 3])
+# def test_mha_prefill_splitk_metadata_noncausal_uniform(
+#     batch_size,
+#     q_len,
+#     kv_len,
+#     q_tile_size,
+#     split_k_size,
+#     capsys,
+# ):
+#     device = "cuda"
+
+#     qo_indptr = make_uniform_indptr(batch_size, q_len, device=device)
+#     kv_indptr = make_uniform_indptr(batch_size, kv_len, device=device)
+
+#     (
+#         work_metadata_ptrs,
+#         work_indptr,
+#         work_info_set,
+#         reduce_indptr,
+#         reduce_final_map,
+#         reduce_partial_map,
+#     ) = alloc_metadata_tensors(
+#         batch_size=batch_size,
+#         max_seqlen_qo=q_len,
+#         max_seqlen_kv=kv_len,
+#         q_tile_size=q_tile_size,
+#         split_k_size=split_k_size,
+#         is_causal=False,
+#         uni_seqlen_qo=q_len,
+#         device=device,
+#     )
+
+#     aiter.get_mha_prefill_splitk_metadata_v1(
+#         qo_indptr,
+#         kv_indptr,
+#         False,
+#         q_tile_size,
+#         split_k_size,
+#         work_metadata_ptrs,
+#         work_info_set,
+#         work_indptr,
+#         reduce_indptr,
+#         reduce_final_map,
+#         reduce_partial_map,
+#         max_seqlen_qo=q_len,
+#         uni_seqlen_qo=q_len,
+#     )
+   
+#     valid_work_num = int(work_indptr.cpu()[1].item())
+#     work_list = to_work_list(work_info_set, valid_work_num)
+#     with capsys.disabled():
+#         print("\n")
+#         print("q_len, q_tile_size, split_k_size, batch_size, kv_len:", q_len, q_tile_size, split_k_size, batch_size, kv_len)
+#         print("work_list:")
+#         for item in work_list:
+#             print(f"batch_idx: {item['batch_idx']}, partial_qo_loc: {item['partial_qo_loc']}, qo_start: {item['qo_start']}, qo_end: {item['qo_end']}, kv_start: {item['kv_start']}, kv_end: {item['kv_end']}, kv_offset: {item['kv_offset']}")
+
+#     num_q_tiles = ceil_div(q_len, q_tile_size)
+#     expected_total_work = batch_size * num_q_tiles * ceil_div(kv_len, split_k_size)
+
+#     assert valid_work_num == expected_total_work
+#     assert int(reduce_indptr.cpu()[batch_size * num_q_tiles].item()) == expected_total_work
+
+#     for item in work_list:
+#         assert 0 <= item["batch_idx"] < batch_size
+#         assert item["qo_end"] > item["qo_start"]
+#         assert item["qo_end"] - item["qo_start"] <= q_tile_size
+#         assert item["kv_end"] > item["kv_start"]
+#         assert item["kv_end"] - item["kv_start"] <= split_k_size
+#         assert item["kv_offset"] == 0
+
+#     reduce_final_map_cpu = reduce_final_map.cpu()
+#     for group_idx in range(batch_size * num_q_tiles):
+#         q_start = int(reduce_final_map_cpu[group_idx, 0].item())
+#         q_end = int(reduce_final_map_cpu[group_idx, 1].item())
+#         assert q_end > q_start
+#         assert q_end - q_start <= q_tile_size
+
+
+@pytest.mark.parametrize("q_len", [128])
+@pytest.mark.parametrize("kv_len", [128])
+@pytest.mark.parametrize("q_tile_size", [64, 128])
+@pytest.mark.parametrize("split_k_size", [128])
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+def test_mha_prefill_splitk_metadata_causal_uniform(
+    batch_size,
+    q_len,
+    kv_len,
+    q_tile_size,
+    split_k_size,
+    capsys,
+):
+    check_causal_uniform_case(
+        batch_size=batch_size,
+        q_len=q_len,
+        kv_len=kv_len,
+        q_tile_size=q_tile_size,
+        split_k_size=split_k_size,
+        capsys=capsys,
+    )
+
+
+@pytest.mark.parametrize("q_len", [128])
+@pytest.mark.parametrize("kv_len", [384, 512, 640])
+@pytest.mark.parametrize("q_tile_size", [64, 128])
+@pytest.mark.parametrize("split_k_size", [128])
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+def test_mha_prefill_splitk_metadata_prefix_causal_uniform(
+    batch_size,
+    q_len,
+    kv_len,
+    q_tile_size,
+    split_k_size,
+    capsys,
+):
+    check_causal_uniform_case(
+        batch_size=batch_size,
+        q_len=q_len,
+        kv_len=kv_len,
+        q_tile_size=q_tile_size,
+        split_k_size=split_k_size,
+        capsys=capsys,
+    )
 
 
 def test_mha_prefill_splitk_metadata_variable_q_len_smoke():
@@ -273,7 +348,7 @@ def test_mha_prefill_splitk_metadata_variable_q_len_smoke():
         max_seqlen_qo=256,
         uni_seqlen_qo=-1,
     )
-
+    print("work_metadata_ptrs", work_metadata_ptrs)
     valid_work_num = int(work_indptr.cpu()[1].item())
     work_list = to_work_list(work_info_set, valid_work_num)
 

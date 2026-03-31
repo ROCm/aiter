@@ -1,0 +1,153 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.4.2, pluggy-1.6.0 -- /opt/venv/bin/python
+cachedir: .pytest_cache
+rootdir: /workspace/aiter-fresh
+configfile: pyproject.toml
+collecting ... collected 18 items
+
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[1-128-64-384-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 384 64 128 1
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 320}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 256}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[1-128-64-512-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 512 64 128 1
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 448}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 384}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[1-128-64-640-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 640 64 128 1
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 576}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 512}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[1-128-128-384-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 384 128 128 1
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 256}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[1-128-128-512-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 512 128 128 1
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 384}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[1-128-128-640-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 640 128 128 1
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 512}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[2-128-64-384-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 384 64 128 2
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 320}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 256}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 192, 'kv_start': 384, 'kv_end': 448, 'kv_offset': 320}
+{'batch_idx': 1, 'partial_qo_loc': 192, 'qo_start': 192, 'qo_end': 256, 'kv_start': 384, 'kv_end': 512, 'kv_offset': 256}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[2-128-64-512-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 512 64 128 2
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 448}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 384}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 192, 'kv_start': 512, 'kv_end': 576, 'kv_offset': 448}
+{'batch_idx': 1, 'partial_qo_loc': 192, 'qo_start': 192, 'qo_end': 256, 'kv_start': 512, 'kv_end': 640, 'kv_offset': 384}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[2-128-64-640-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 640 64 128 2
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 576}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 512}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 192, 'kv_start': 640, 'kv_end': 704, 'kv_offset': 576}
+{'batch_idx': 1, 'partial_qo_loc': 192, 'qo_start': 192, 'qo_end': 256, 'kv_start': 640, 'kv_end': 768, 'kv_offset': 512}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[2-128-128-384-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 384 128 128 2
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 256}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 256, 'kv_start': 384, 'kv_end': 512, 'kv_offset': 256}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[2-128-128-512-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 512 128 128 2
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 384}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 256, 'kv_start': 512, 'kv_end': 640, 'kv_offset': 384}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[2-128-128-640-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 640 128 128 2
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 512}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 256, 'kv_start': 640, 'kv_end': 768, 'kv_offset': 512}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[3-128-64-384-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 384 64 128 3
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 320}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 256}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 192, 'kv_start': 384, 'kv_end': 448, 'kv_offset': 320}
+{'batch_idx': 1, 'partial_qo_loc': 192, 'qo_start': 192, 'qo_end': 256, 'kv_start': 384, 'kv_end': 512, 'kv_offset': 256}
+{'batch_idx': 2, 'partial_qo_loc': 256, 'qo_start': 256, 'qo_end': 320, 'kv_start': 768, 'kv_end': 832, 'kv_offset': 320}
+{'batch_idx': 2, 'partial_qo_loc': 320, 'qo_start': 320, 'qo_end': 384, 'kv_start': 768, 'kv_end': 896, 'kv_offset': 256}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[3-128-64-512-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 512 64 128 3
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 448}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 384}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 192, 'kv_start': 512, 'kv_end': 576, 'kv_offset': 448}
+{'batch_idx': 1, 'partial_qo_loc': 192, 'qo_start': 192, 'qo_end': 256, 'kv_start': 512, 'kv_end': 640, 'kv_offset': 384}
+{'batch_idx': 2, 'partial_qo_loc': 256, 'qo_start': 256, 'qo_end': 320, 'kv_start': 1024, 'kv_end': 1088, 'kv_offset': 448}
+{'batch_idx': 2, 'partial_qo_loc': 320, 'qo_start': 320, 'qo_end': 384, 'kv_start': 1024, 'kv_end': 1152, 'kv_offset': 384}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[3-128-64-640-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 640 64 128 3
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 64, 'kv_start': 0, 'kv_end': 64, 'kv_offset': 576}
+{'batch_idx': 0, 'partial_qo_loc': 64, 'qo_start': 64, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 512}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 192, 'kv_start': 640, 'kv_end': 704, 'kv_offset': 576}
+{'batch_idx': 1, 'partial_qo_loc': 192, 'qo_start': 192, 'qo_end': 256, 'kv_start': 640, 'kv_end': 768, 'kv_offset': 512}
+{'batch_idx': 2, 'partial_qo_loc': 256, 'qo_start': 256, 'qo_end': 320, 'kv_start': 1280, 'kv_end': 1344, 'kv_offset': 576}
+{'batch_idx': 2, 'partial_qo_loc': 320, 'qo_start': 320, 'qo_end': 384, 'kv_start': 1280, 'kv_end': 1408, 'kv_offset': 512}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[3-128-128-384-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 384 128 128 3
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 256}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 256, 'kv_start': 384, 'kv_end': 512, 'kv_offset': 256}
+{'batch_idx': 2, 'partial_qo_loc': 256, 'qo_start': 256, 'qo_end': 384, 'kv_start': 768, 'kv_end': 896, 'kv_offset': 256}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[3-128-128-512-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 512 128 128 3
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 384}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 256, 'kv_start': 512, 'kv_end': 640, 'kv_offset': 384}
+{'batch_idx': 2, 'partial_qo_loc': 256, 'qo_start': 256, 'qo_end': 384, 'kv_start': 1024, 'kv_end': 1152, 'kv_offset': 384}
+PASSED
+op_tests/test_mha_prefill_splitk_metadata.py::test_mha_prefill_splitk_metadata_causal_uniform[3-128-128-640-128] 
+
+q_len, kv_len, q_tile_size, split_k_size, batch_size: 128 640 128 128 3
+work_list:
+{'batch_idx': 0, 'partial_qo_loc': 0, 'qo_start': 0, 'qo_end': 128, 'kv_start': 0, 'kv_end': 128, 'kv_offset': 512}
+{'batch_idx': 1, 'partial_qo_loc': 128, 'qo_start': 128, 'qo_end': 256, 'kv_start': 640, 'kv_end': 768, 'kv_offset': 512}
+{'batch_idx': 2, 'partial_qo_loc': 256, 'qo_start': 256, 'qo_end': 384, 'kv_start': 1280, 'kv_end': 1408, 'kv_offset': 512}
+PASSED
+
+============================== 18 passed in 3.53s ==============================

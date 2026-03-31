@@ -86,13 +86,21 @@ void get_mha_prefill_splitk_metadata_v1(
         const int32_t qo_end = p_seqlens_qo[bid + 1];
         const int32_t kv_begin = p_seqlens_kv[bid];
         const int32_t kv_end_total = p_seqlens_kv[bid + 1];
+        const int32_t q_len = qo_end - qo_begin;
+        const int32_t kv_len = kv_end_total - kv_begin;
+
+        TORCH_CHECK(!is_causal || kv_len >= q_len,
+                    __func__,
+                    ": causal mode expects kv_len >= q_len for each batch");
 
         for(int32_t qo_start = qo_begin; qo_start < qo_end; qo_start += q_tile_size)
         {
             const int32_t qo_end_tile = std::min(qo_start + q_tile_size, qo_end);
             const int32_t local_q_end = qo_end_tile - qo_begin;
+            const int32_t prefix_len = kv_len - q_len;
             const int32_t allowed_kv_end =
-                is_causal ? std::min(kv_begin + local_q_end, kv_end_total) : kv_end_total;
+                is_causal ? std::min(kv_begin + prefix_len + local_q_end, kv_end_total)
+                          : kv_end_total;
 
             TORCH_CHECK(reduce_group_idx < reduce_group_capacity,
                         __func__,
@@ -116,7 +124,7 @@ void get_mha_prefill_splitk_metadata_v1(
                 work_info.qo_end = qo_end_tile;
                 work_info.kv_start = kv_start;
                 work_info.kv_end = kv_end;
-                work_info.kv_offset = 0;
+                work_info.kv_offset = kv_end_total - kv_end;
                 p_work_info_set[work_idx] = work_info;
                 p_reduce_partial_map[work_idx] = partial_qo_loc;
                 ++work_idx;

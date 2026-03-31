@@ -884,13 +884,11 @@ def get_mha_prefill_splitk_metadata_info_v1(
         num_kv_splits_per_q_tile = math.ceil(max_seqlen_kv / split_k_size)
         max_work_per_batch = num_q_tiles_per_batch * num_kv_splits_per_q_tile
     else:
+        assert max_seqlen_kv >= q_len
+        prefix_len = max_seqlen_kv - q_len
         max_work_per_batch = 0
         for q_tile_idx in range(num_q_tiles_per_batch):
-            visible_kv_len = min(
-                (q_tile_idx + 1) * q_tile_size,
-                q_len,
-                max_seqlen_kv,
-            )
+            visible_kv_len = min(prefix_len + (q_tile_idx + 1) * q_tile_size, max_seqlen_kv)
             max_work_per_batch += math.ceil(visible_kv_len / split_k_size)
 
     total_q_tiles = batch_size * num_q_tiles_per_batch
