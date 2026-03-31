@@ -22,7 +22,6 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
 
-torch.manual_seed(0)
 
 
 def rmsnorm(input, weight, eps=1e-6):
@@ -169,7 +168,7 @@ def test_fused_rms_quant(
     shuffle: bool,
     scale_shuffle_padding: bool,
 ):
-
+    torch.manual_seed(0)
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
