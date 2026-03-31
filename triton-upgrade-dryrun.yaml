@@ -1,0 +1,42 @@
+baseline:
+  aiter_repo: https://github.com/ROCm/aiter.git
+  aiter_branch: main
+  triton_repo: https://github.com/ROCm/triton.git
+  triton_branch: triton_3_4
+
+target:
+  aiter_repo: https://github.com/ROCm/aiter.git
+  aiter_branch: alizaidy/gfx950-kernel-fixes-cherry-picked
+  triton_repo: https://github.com/ROCm/triton.git
+  triton_branch: main
+
+machines:
+  - host: localhost
+    user: root
+    ssh_key: ~/.ssh/id_rsa
+    gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+
+container:
+  image: rocm/pytorch:latest
+
+gpu:
+  arch: gfx950
+
+triton_install:
+  command: "pip install -e ."
+
+tuning:
+  mode: regression_only
+  scout_fraction: 0.15
+  thresholds:
+    regression_vs_baseline: 5
+    regression_vs_untuned: 2
+  timeouts:
+    command_default: 300
+    tuning_per_shape: 1800
+    progress_check: 120
+    phase_max: 14400
+
+kernels:
+  exclude: []
+  include: []

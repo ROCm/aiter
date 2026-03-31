@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -53,9 +54,11 @@ class Orchestrator:
         run_id: Optional[str] = None,
         dashboard: Optional[Dashboard] = None,
         notifier: Optional[Notifier] = None,
+        results_dir: Optional[str] = None,
     ) -> None:
         self.config = config
         self.repo_root = repo_root
+        self.results_dir = results_dir or os.path.expanduser("~/.tuning_results")
 
         if run_id is None:
             run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
