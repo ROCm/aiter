@@ -1197,6 +1197,10 @@ def _ctypes_call(func, fc_name, md_name):
         _ensure_loaded()
         c_func = _cache["c_func"]
 
+        if AITER_LOG_MORE == 2:
+            from ..test_common import log_args
+
+            log_args(func, *args, **kwargs)
         sig = inspect.signature(func)
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
