@@ -22,8 +22,10 @@ from aiter.test_mha_common import (
 )
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 
 arch = get_arch()
+_supports_fp8 = arch in FP8_ARCHS
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -176,7 +178,7 @@ def test_mha(
 
     dropout_mask = None
     if FP8:
-        if not arch.supports_fp8:
+        if not _supports_fp8:
             pytest.skip(f"FP8 not supported on {arch.name}")
         if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
             pytest.skip(
@@ -419,7 +421,7 @@ def test_mha_varlen(
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
     if FP8:
-        if not arch.supports_fp8:
+        if not _supports_fp8:
             pytest.skip(f"FP8 not supported on {arch.name}")
         if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
             pytest.skip(
@@ -549,7 +551,7 @@ def test_mha_backward(
     torch.manual_seed(20)
     mha_set_impl(IMPL)
 
-    if FP8 and not arch.supports_fp8:
+    if FP8 and not _supports_fp8:
         pytest.skip(f"FP8 not supported on {arch.name}")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
@@ -644,7 +646,7 @@ def test_mha_backward_varlen(
     torch.manual_seed(20)
     mha_set_impl(IMPL)
 
-    if FP8 and not arch.supports_fp8:
+    if FP8 and not _supports_fp8:
         pytest.skip(f"FP8 not supported on {arch.name}")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
