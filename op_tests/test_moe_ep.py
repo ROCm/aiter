@@ -375,7 +375,7 @@ parser.add_argument(
           or -t g1u1_no_quant
           or -t g1u1_int8quant
           or -t g1u1_fp8quant
-          ## (or -t g1u0_int8smoothquant)
+          or -t g1u0_int8smoothquant (only runs on gfx942)
           or -t g1u1_int8smoothquant
           or -t g1u1_fp8smoothquant""",
 )
