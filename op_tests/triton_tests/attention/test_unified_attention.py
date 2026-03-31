@@ -129,9 +129,9 @@ def test_triton_unified_attn(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     out_dtype: torch.dtype,
+    use_q_descale: bool,
     use_kv_descale: bool,
     use_out_scale: bool,
-    use_q_descale: bool,
 ) -> None:
 
     torch.manual_seed(0)
