@@ -12,6 +12,9 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 from aiter.ops.triton.gluon.unified_attention_3d import (
     _unified_attention_gluon_kernel_3d,
 )
+from aiter.ops.triton.gluon.unified_attention_3d_unroll2 import (
+    _unified_attention_gluon_kernel_3d_unroll2,
+)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
@@ -87,18 +90,14 @@ def select_3d_config(
     attn_warps = 2
     waves_per_eu = 2
     if shuffled_kv_cache:
-        if kv_cache_dtype == torch.bfloat16 and block_size == 64:
+        if kv_cache_dtype == torch.bfloat16:
             if num_2d_prgms >= 256:
                 attn_warps = 1
                 waves_per_eu = 2
             else:
                 attn_warps = 2
                 waves_per_eu = 1
-        if (
-            q_dtype == torch.bfloat16
-            and kv_cache_dtype == e4m3_dtype
-            and block_size == 128
-        ):
+        else:
             if num_2d_prgms >= 256:
                 attn_warps = 1
                 waves_per_eu = 2
@@ -361,6 +360,8 @@ def unified_attention(
         )
 
         if IS_DEVICE_ARCH_GFX12:
+            print(attn_config)
+            # _unified_attention_gluon_kernel_3d_unroll2[
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -382,6 +383,7 @@ def unified_attention(
                 num_seqs=num_seqs,
                 num_blocks=num_blocks,
                 block_table_stride=block_table.stride(0),
+                max_num_blocks_per_seq=block_table.shape[1],
                 query_stride_0=q.stride(0),
                 query_stride_1=q.stride(1),
                 qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,

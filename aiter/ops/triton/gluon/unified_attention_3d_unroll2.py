@@ -390,6 +390,7 @@ class AttentionProgram:
 
     tile_start: gl.tensor
     tile_end: gl.tensor
+    half_tile_end: gl.tensor
     safe_tile_end: gl.tensor
     kv_head_idx: gl.tensor
     context_len: gl.tensor
@@ -417,6 +418,7 @@ class AttentionProgram:
 
     qq_bias_stride_0: gl.tensor
     softcap: gl.tensor
+    last_itr_has_two_tiles: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -432,6 +434,7 @@ class AttentionProgram:
         segm_expsum_ptr,
         tile_start,
         tile_end,
+        half_tile_end,
         safe_tile_end,
         kv_head_idx,
         context_len,
@@ -457,6 +460,7 @@ class AttentionProgram:
         stride_v_cache_3,
         qq_bias_stride_0,
         softcap,
+        last_itr_has_two_tiles,
     ):
         self.cfg = cfg
         self.q = q
@@ -471,6 +475,7 @@ class AttentionProgram:
         self.v_desc = v_desc
         self.tile_start = tile_start
         self.tile_end = tile_end
+        self.half_tile_end = half_tile_end
         self.safe_tile_end = safe_tile_end
         self.context_len = context_len
         self.context_len_q_pos_qk = context_len_q_pos_qk
@@ -494,6 +499,7 @@ class AttentionProgram:
         self.stride_v_cache_3 = stride_v_cache_3
         self.qq_bias_stride_0 = qq_bias_stride_0
         self.softcap = softcap
+        self.last_itr_has_two_tiles = last_itr_has_two_tiles
 
     @gluon.jit
     def initialize(
@@ -633,6 +639,8 @@ class AttentionProgram:
         num_tiles = (max_seq_prefix_len + cfg.BLOCK_SIZE - 1) // cfg.BLOCK_SIZE
         tile_start = segm_idx * tiles_per_segment
         tile_end = min((segm_idx + 1) * tiles_per_segment, num_tiles)
+        last_itr_has_two_tiles = (tile_end - tile_start) % 2 == 0
+        half_tile_end = tile_start + (tile_end - tile_start) // 2
         if cfg.SLIDING_WINDOW > 0:
             qpos_lo = q_block_local_idx * cfg.BLOCK_Q
             qpos_hi = gl.minimum(
@@ -671,6 +679,7 @@ class AttentionProgram:
             segm_expsum_ptr,
             tile_start,
             tile_end,
+            half_tile_end,
             safe_tile_end,
             kv_head_idx,
             context_len,
@@ -696,6 +705,7 @@ class AttentionProgram:
             stride_v_cache_3,
             qq_bias_stride_0,
             softcap,
+            last_itr_has_two_tiles,
         )
 
     @gluon.jit
@@ -712,7 +722,6 @@ class AttentionProgram:
         segm_idx,
         query_offset_1,
         query_mask_1,
-        # qk_factor,
     ):
         if self.cfg.USE_SINKS:
             if segm_idx == 0:
@@ -724,7 +733,7 @@ class AttentionProgram:
                         mask=query_mask_1,
                         other=float("-inf"),
                     ).to(dtype=gl.float32)
-                    * self.cfg.RCP_LN2  # / qk_factor
+                    * self.cfg.RCP_LN2
                 )
             else:
                 M = gl.full(
@@ -983,6 +992,14 @@ class AttentionProgram:
             )
 
     @gluon.jit
+    def maybe_cast_k(self, k):
+        if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
+            k = k.to(self.q.dtype)
+        elif self.cfg.IS_KV_FP8:
+            k = k.to(self.q.dtype)
+        return k
+
+    @gluon.jit
     def compute_qk(self, k):
         S = gl.zeros(
             [self.cfg.BLOCK_M, self.cfg.TILE_SIZE],
@@ -1037,21 +1054,10 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part0(self, S, M):
         m_ij = gl.maximum(M, gl.max(S, axis=1))
-        # m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         p = gl.exp2(S - m_ij[:, None])
         alpha = gl.exp2(M - m_ij)
         return p, alpha, m_ij
-
-    # @gluon.jit
-    # def softmax_part0(self, S, M, qk_factor):
-    #     m_ij = gl.maximum(M, gl.max(S, axis=1))
-    #     # m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-    #     m_ij_scaled = m_ij * qk_factor
-    #     q_shifted = S * qk_factor - m_ij_scaled[:, None]
-    #     p = gl.exp2(q_shifted)
-    #     m_diff_scaled = M * qk_factor - m_ij_scaled
-    #     alpha = gl.exp2(m_diff_scaled)
-    #     return p, alpha, m_ij
 
     @gluon.jit
     def softmax_part1(self, p, L, acc, alpha):
@@ -1061,15 +1067,30 @@ class AttentionProgram:
         return p, L, acc
 
     @gluon.jit
-    def compute_pv(self, p, v, acc):
+    def maybe_cast_p(self, p):
         if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
-            v = v.to(gl.bfloat16)
         elif self.cfg.IS_KV_FP8:
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
-            v = v.to(gl.bfloat16)
         else:
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        return p
+
+    @gluon.jit
+    def maybe_cast_v(self, v):
+        if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
+            v = v.to(gl.bfloat16)
+        elif self.cfg.IS_KV_FP8:
+            v = v.to(gl.bfloat16)
+        return v
+
+    @gluon.jit
+    def compute_pv(self, p, v, acc):
+        p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
+            v = v.to(gl.bfloat16)
+        elif self.cfg.IS_KV_FP8:
+            v = v.to(gl.bfloat16)
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         acc = gl.amd.gfx1250.wmma(p, v, acc)
         return acc
@@ -1254,7 +1275,7 @@ def get_seq_metadata(
 
 
 unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
-    "_unified_attention_gluon_kernel_3d",
+    "_unified_attention_gluon_kernel_3d_unroll2",
     [
         "num_query_heads",
         "num_queries_per_kv",
@@ -1275,7 +1296,7 @@ unified_attention_gluon_kernel_3d_repr = make_kernel_repr(
 
 
 @gluon.jit(repr=unified_attention_gluon_kernel_3d_repr)
-def _unified_attention_gluon_kernel_3d(
+def _unified_attention_gluon_kernel_3d_unroll2(
     segm_output_ptr,  # [num_tokens, num_query_heads, num_segments, head_size]
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
@@ -1324,7 +1345,7 @@ def _unified_attention_gluon_kernel_3d(
     num_warps: gl.constexpr,  # int
     waves_per_eu: gl.constexpr,  # int
     num_stages: gl.constexpr,  # int
-    num_ctas: gl.constexpr = 1,  # int
+    num_ctas: gl.constexpr = 1,  # int  # pyright: ignore[reportUnusedParameter]
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
@@ -1548,7 +1569,6 @@ def _unified_attention_gluon_kernel_3d(
         segm_idx,
         query_offset_1_qk,
         query_mask_1_qk,
-        # qk_factor,
     )
 
     j_hbm: gl.int32 = segm_idx * tiles_per_segment
@@ -1561,86 +1581,162 @@ def _unified_attention_gluon_kernel_3d(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
         )
 
-    j_hbm, physical_block_idx = pgm.load_physical_block_idx(
+    # first half
+    j_hbm, physical_block_idx_0 = pgm.load_physical_block_idx(
         j_hbm, block_tables_ptr_shifted
     )
-    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mask(
+
+    # second half
+    j_hbm, physical_block_idx_1 = pgm.load_physical_block_idx_with_mask(
         j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
     )
-    pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
-    pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=buffer_id)
-    physical_block_idx = next_physical_block_idx
+    pgm.tdm_load_global_to_shared_k(physical_block_idx_0, buffer_id=0)
+    pgm.tdm_load_global_to_shared_v(physical_block_idx_0, buffer_id=0)
 
-    # Main attention loop over KV tiles (staged, num_stages=2)
-    for j in range(pgm.tile_start, pgm.tile_end - (cfg.NUM_STAGES - 1)):
-        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mask(
+    # first half
+    # j_hbm, physical_block_idx_0 = pgm.load_physical_block_idx_with_mask(
+    #     j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
+    # )
+    k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=0)
+
+    # second half
+    pgm.tdm_load_global_to_shared_k(physical_block_idx_1, buffer_id=1)
+    pgm.tdm_load_global_to_shared_v(physical_block_idx_1, buffer_id=1)
+    # j_hbm, physical_block_idx_1 = pgm.load_physical_block_idx_with_mask(
+    #     j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
+    # )
+
+    # first half
+    # k = pgm.maybe_cast_k(k)
+    S = pgm.compute_qk(k)
+    S = S * qk_factor
+    v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=0)
+    # v = pgm.maybe_cast_v(v)
+    S_MASKED = pgm.apply_softcap(S)
+
+    for j in range(pgm.tile_start, pgm.half_tile_end - 1):
+        # first half
+        # j_hbm, next_physical_block_idx_0 = pgm.load_physical_block_idx_with_mask(
+        #     j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
+        # )
+        j_hbm, physical_block_idx_0 = pgm.load_physical_block_idx_with_mask(
             j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
         )
-        k = pgm.tdm_shared_load_k(
-            wait_count=(cfg.NUM_STAGES - 2) * 2 + 1, buffer_id=buffer_id
-        )
-        next_buffer_id = pgm.get_next_buffer_id(buffer_id)
-        # Prefetch next tile (shared is free since k, v are in registers)
-        pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=next_buffer_id)
-        pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=next_buffer_id)
 
-        # Compute attention for current tile
+        # second half
+        k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=1)
+
+        # first half
+        pgm.tdm_load_global_to_shared_k(physical_block_idx_0, buffer_id=0)
+        pgm.tdm_load_global_to_shared_v(physical_block_idx_0, buffer_id=0)
+        # physical_block_idx_0 = next_physical_block_idx_0
+
+        # second half
+        # k = pgm.maybe_cast_k(k)
         S = pgm.compute_qk(k)
         S = S * qk_factor
 
-        S = pgm.apply_softcap(S)
-        if need_addtional_mask:
-            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
-            S = pgm.apply_addtional_mask_qk(
-                S, seq_offset, alibi_slope, qq_bias_row_ptrs
-            )
-        # p, alpha, M = pgm.softmax_part0(S, M, qk_factor)
-        p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-
-        v = pgm.tdm_shared_load_v(
-            wait_count=(cfg.NUM_STAGES - 1) * 2, buffer_id=buffer_id
-        )
-        acc = pgm.compute_pv(p, v, acc)
-
-        buffer_id = next_buffer_id
-        physical_block_idx = next_physical_block_idx
+        # first half
         if need_addtional_mask:
             seq_offset += cfg.TILE_SIZE
+            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            S_MASKED = pgm.apply_addtional_mask_qk(
+                S_MASKED, seq_offset, alibi_slope, qq_bias_row_ptrs
+            )
+        p, alpha, M = pgm.softmax_part0(S_MASKED, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+        # p = pgm.maybe_cast_p(p)
+        acc = pgm.compute_pv(p, v, acc)
+
+        # second half
+        v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=1)
+        # v = pgm.maybe_cast_v(v)
+        S_MASKED = pgm.apply_softcap(S)
+
+        # second half
+        # j_hbm, next_physical_block_idx_1 = pgm.load_physical_block_idx_with_mask(
+        #     j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
+        # )
+        j_hbm, physical_block_idx_1 = pgm.load_physical_block_idx_with_mask(
+            j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
+        )
+        # second half
+        pgm.tdm_load_global_to_shared_k(physical_block_idx_1, buffer_id=1)
+        pgm.tdm_load_global_to_shared_v(physical_block_idx_1, buffer_id=1)
+        # physical_block_idx_1 = next_physical_block_idx_1
+
+        # second half
+        if need_addtional_mask:
+            seq_offset += cfg.TILE_SIZE
+            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            S_MASKED = pgm.apply_addtional_mask_qk(
+                S_MASKED, seq_offset, alibi_slope, qq_bias_row_ptrs
+            )
+        p, alpha, M = pgm.softmax_part0(S_MASKED, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+        # p = pgm.maybe_cast_p(p)
+        acc = pgm.compute_pv(p, v, acc)
+
+        # first half
+        k = pgm.tdm_shared_load_k(wait_count=3, buffer_id=0)
+        # k = pgm.maybe_cast_k(k)
+        S = pgm.compute_qk(k)
+        S = S * qk_factor
+        v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=0)
+        # v = pgm.maybe_cast_v(v)
+        S_MASKED = pgm.apply_softcap(S)
 
     if not need_addtional_mask:
-        seq_offset = (pgm.tile_end - (cfg.NUM_STAGES - 1)) * cfg.TILE_SIZE + gl.arange(
+        seq_offset = (pgm.tile_end - 1) * cfg.TILE_SIZE + gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
         )
-    for _ in range(cfg.NUM_STAGES - 1):
-        # Load k_i, v_i from shared into registers
-        k = pgm.tdm_shared_load_k(
-            wait_count=(cfg.NUM_STAGES - 2) * 2 + 1, buffer_id=buffer_id
-        )
-        # Compute attention for current tile
-        S = pgm.compute_qk(k)
-        S = S * qk_factor
-
-        S = pgm.apply_softcap(S)
-        seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
-        S = gl.where(seq_mask, S, float("-inf"))
+    else:
+        seq_offset += cfg.TILE_SIZE
+    if pgm.last_itr_has_two_tiles:
+        # first half
         if need_addtional_mask:
-            S = pgm.apply_addtional_mask_qk(
-                S, seq_offset, alibi_slope, qq_bias_row_ptrs
+            seq_offset += cfg.TILE_SIZE
+            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            S_MASKED = pgm.apply_addtional_mask_qk(
+                S_MASKED, seq_offset, alibi_slope, qq_bias_row_ptrs
             )
-        # p, alpha, M = pgm.softmax_part0(S, M, qk_factor)
-        p, alpha, M = pgm.softmax_part0(S, M)
+        p, alpha, M = pgm.softmax_part0(S_MASKED, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
-
-        v = pgm.tdm_shared_load_v(
-            wait_count=(cfg.NUM_STAGES - 2) * 2, buffer_id=buffer_id
-        )
+        # p = pgm.maybe_cast_p(p)
         acc = pgm.compute_pv(p, v, acc)
 
-        if cfg.NUM_STAGES > 2:
-            seq_offset += cfg.TILE_SIZE
+        # second half
+        k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=1)
+        # k = pgm.maybe_cast_k(k)
+        S = pgm.compute_qk(k)
+        S = S * qk_factor
+        S_MASKED = pgm.apply_softcap(S)
+        seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+        S_MASKED = gl.where(seq_mask, S_MASKED, float("-inf"))
+        if need_addtional_mask:
+            S_MASKED = pgm.apply_addtional_mask_qk(
+                S_MASKED, seq_offset, alibi_slope, qq_bias_row_ptrs
+            )
+        p, alpha, M = pgm.softmax_part0(S_MASKED, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
-    # M = M * qk_factor
+        v = pgm.tdm_shared_load_v(wait_count=0, buffer_id=1)
+        # p = pgm.maybe_cast_p(p)
+        # v = pgm.maybe_cast_v(v)
+        acc = pgm.compute_pv(p, v, acc)
+    else:
+        # first half
+        seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+        S_MASKED = gl.where(seq_mask, S_MASKED, float("-inf"))
+        if need_addtional_mask:
+            seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+            S_MASKED = pgm.apply_addtional_mask_qk(
+                S_MASKED, seq_offset, alibi_slope, qq_bias_row_ptrs
+            )
+        p, alpha, M = pgm.softmax_part0(S_MASKED, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+        # p = pgm.maybe_cast_p(p)
+        acc = pgm.compute_pv(p, v, acc)
 
     if v_scale_ptr is not None:
         acc = acc * v_scale
