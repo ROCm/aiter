@@ -230,7 +230,7 @@ def test_triton_unified_attn(
         k_descale=k_descale,
         v_descale=v_descale,
         output_scale=out_scale,
-        out_dtype=out_dtype
+        out_dtype=out_dtype,
     )
     atol, rtol = 1.5e-2, 1e-2
     if kv_dtype.itemsize == 1:
