@@ -144,7 +144,7 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
-    custom_config = False    
+    custom_config = False
     # This benchmark only exposes -M and -block_size on the CLI today.
     # Guard against missing attributes to avoid AttributeError.
     if (
