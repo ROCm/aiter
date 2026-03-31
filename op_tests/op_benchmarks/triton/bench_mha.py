@@ -346,39 +346,52 @@ def _make_triton_benchmark(run: BenchRun) -> list:
     ]
 
 
-def _write_csv(run: BenchRun, results: list[tuple[BenchConfig, float | None]]) -> None:
-    """Write benchmark results to CSV. Called even if the run crashes partway."""
-    if not run.save_path or not results:
-        return
-    import os
-    os.makedirs(run.save_path, exist_ok=True)
-    csv_path = os.path.join(run.save_path, f"{run.plot_name}.csv")
-    header = [
-        "model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
-        "D_HEAD", "D_HEAD_V", "causal", "function", "dtype", "impl", "fused",
-        run.unit,
-    ]
-    with open(csv_path, "w") as f:
-        f.write(",".join(header) + "\n")
-        for config, value in results:
-            if value is None:
-                continue
+class _CsvWriter:
+    """Incrementally writes benchmark results to CSV."""
+
+    def __init__(self, run: BenchRun):
+        self._path: str | None = None
+        self._written = 0
+        self._skipped = 0
+        if not run.save_path:
+            return
+        import os
+        os.makedirs(run.save_path, exist_ok=True)
+        self._path = os.path.join(run.save_path, f"{run.plot_name}.csv")
+        header = [
+            "model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
+            "D_HEAD", "D_HEAD_V", "causal", "function", "dtype", "impl", "fused",
+            run.unit,
+        ]
+        with open(self._path, "w") as f:
+            f.write(",".join(header) + "\n")
+
+    def write(self, config: BenchConfig, value: float | None) -> None:
+        if self._path is None:
+            return
+        if value is None:
+            self._skipped += 1
+            return
+        with open(self._path, "a") as f:
             row = ",".join(str(x) for x in config.to_tuple()) + f",{value}\n"
             f.write(row)
-    written = sum(1 for _, v in results if v is not None)
-    skipped = len(results) - written
-    msg = f"\nResults written to {csv_path} ({written} rows"
-    if skipped:
-        msg += f", {skipped} skipped"
-    msg += ")"
-    print(msg, flush=True)
+        self._written += 1
+
+    def summary(self) -> None:
+        if self._path is None:
+            return
+        msg = f"\nResults written to {self._path} ({self._written} rows"
+        if self._skipped:
+            msg += f", {self._skipped} skipped"
+        msg += ")"
+        print(msg, flush=True)
 
 
 def run_benchmark(run: BenchRun):
     torch.manual_seed(20)
     total = len(run.configs)
     counter = 0
-    results: list[tuple[BenchConfig, float | None]] = []
+    csv = _CsvWriter(run)
 
     @triton.testing.perf_report(_make_triton_benchmark(run))
     def bench_mha(
@@ -421,7 +434,7 @@ def run_benchmark(run: BenchRun):
             value = None
         finally:
             torch.cuda.empty_cache()
-        results.append((run.configs[counter - 1], value))
+        csv.write(run.configs[counter - 1], value)
         return value if value is not None else 0
 
     def _run_single_benchmark(
@@ -684,7 +697,7 @@ def run_benchmark(run: BenchRun):
     except Exception as e:
         print(f"\n[WARN] benchmark failed: {e}", flush=True)
     finally:
-        _write_csv(run, results)
+        csv.summary()
 
 
 # argparse lacks support for boolean argument type (sigh...)
