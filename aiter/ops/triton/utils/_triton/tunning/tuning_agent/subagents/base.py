@@ -169,7 +169,7 @@ class BaseSubagent(ABC):
         json_content = json.dumps(data, indent=2)
         # Write via a shell here-string to avoid creating a local temp file.
         escaped = json_content.replace("'", "'\\''")
-        self.executor.ssh_run(
+        self.executor.docker_exec(
             f"printf '%s' '{escaped}' > {remote_path}",
             check=True,
         )
@@ -194,7 +194,7 @@ class BaseSubagent(ABC):
             If the remote command fails or the content is not valid JSON.
         """
         remote_path = os.path.join(self.artifact_dir, filename)
-        result = self.executor.ssh_run(f"cat {remote_path}", check=True)
+        result = self.executor.docker_exec(f"cat {remote_path}", check=True)
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:

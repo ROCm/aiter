@@ -154,9 +154,10 @@ class SetupAgent(BaseSubagent):
             )
 
         # Step 4: Install triton.
-        executor.docker_exec(
-            f"cd /workspace/triton && {install_command}"
-        )
+        if triton_branch and triton_repo:
+            executor.docker_exec(
+                f"cd /workspace/triton && {install_command}"
+            )
 
         # Step 5: Install aiter.
         executor.docker_exec("cd /workspace/aiter && pip install -e .")

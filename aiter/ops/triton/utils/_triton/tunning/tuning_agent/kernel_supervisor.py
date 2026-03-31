@@ -476,6 +476,8 @@ class KernelSupervisor:
                 repo_config={
                     "url": self.config.target_repo.aiter_repo,
                     "branch": self.config.target_repo.aiter_branch,
+                    "triton_repo": self.config.target_repo.triton_repo,
+                    "triton_branch": self.config.target_repo.triton_branch,
                 },
                 triton_install_config={
                     "method": "source",
@@ -613,6 +615,7 @@ class KernelSupervisor:
                 shapes=shapes,
                 bench_script="",
                 gpu_ids=self.config.gpu_ids,
+                kernel_variant=self.config.kernel_name,
             )
             if result.success:
                 self.state.untuned_data = result.data.get("results", [])
@@ -711,12 +714,28 @@ class KernelSupervisor:
             gpu_ids=self.config.gpu_ids,
             tunning_dir=artifact_dir,
         )
+        if not scout_agent_result.success:
+            return PhaseResult(
+                phase=Phase.TUNING,
+                success=False,
+                data={},
+                error=scout_agent_result.error,
+                duration_seconds=time.time() - start_time,
+            )
 
         # 2. Pattern analysis: dispatch PatternAnalyzerAgent.
         pattern_agent_result = self._dispatch_subagent(
             PatternAnalyzerAgent,
             scout_results_dir=scout_results_dir,
         )
+        if not pattern_agent_result.success:
+            return PhaseResult(
+                phase=Phase.TUNING,
+                success=False,
+                data={},
+                error=pattern_agent_result.error,
+                duration_seconds=time.time() - start_time,
+            )
 
         # Derive the narrowed search space from pattern analysis results.
         narrowed_search_space: Dict = pattern_agent_result.data.get(
@@ -732,6 +751,14 @@ class KernelSupervisor:
             gpu_ids=self.config.gpu_ids,
             tunning_dir=artifact_dir,
         )
+        if not full_tuning_result.success:
+            return PhaseResult(
+                phase=Phase.TUNING,
+                success=False,
+                data={},
+                error=full_tuning_result.error,
+                duration_seconds=time.time() - start_time,
+            )
 
         # 4. Config generation.
         config_gen_result = self._dispatch_subagent(
@@ -740,6 +767,14 @@ class KernelSupervisor:
             config_dir=config_dir,
             kernel_variant=self.config.kernel_name,
         )
+        if not config_gen_result.success:
+            return PhaseResult(
+                phase=Phase.TUNING,
+                success=False,
+                data={},
+                error=config_gen_result.error,
+                duration_seconds=time.time() - start_time,
+            )
 
         return PhaseResult(
             phase=Phase.TUNING,
@@ -801,6 +836,7 @@ class KernelSupervisor:
                     shapes=shapes,
                     bench_script="",
                     gpu_ids=self.config.gpu_ids,
+                    kernel_variant=self.config.kernel_name,
                     baseline_data=self.state.baseline_data,
                     untuned_data=self.state.untuned_data,
                 )

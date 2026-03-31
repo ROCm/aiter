@@ -208,6 +208,8 @@ class RemoteExecutor:
 
     def destroy_container(self) -> None:
         """Stop and remove the current container, then clear :attr:`container_id`."""
+        if not self.container_id:
+            return
         cid = self.container_id
         quoted_cid = shlex.quote(cid) if cid is not None else ""
         self.ssh_run(f"docker stop {quoted_cid}", check=False)
@@ -234,7 +236,7 @@ class RemoteExecutor:
         scp_src = f"{self.machine.user}@{self.machine.host}:{tmp_path}"
         scp_cmd = [
             "scp",
-            "-i", self.machine.ssh_key,
+            "-i", os.path.expanduser(self.machine.ssh_key),
             "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=10",
             scp_src,
@@ -262,7 +264,7 @@ class RemoteExecutor:
         scp_dst = f"{self.machine.user}@{self.machine.host}:{tmp_path}"
         scp_cmd = [
             "scp",
-            "-i", self.machine.ssh_key,
+            "-i", os.path.expanduser(self.machine.ssh_key),
             "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=10",
             local_path,
