@@ -1707,13 +1707,18 @@ def ck_moe_stage1(
 ):
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
-    tmp_out = (
-        torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+    if is_splitk:
+        # CK kernel uses sorted_size as its M dimension and scatters output via
+        # sorted_token_ids.  The output buffer must have at least sorted_size rows
+        # so that the kernel's tile-based writes stay in bounds.
+        sorted_size = min(
+            token_num * topk * block_m, sorted_token_ids.shape[0]
         )
-        if is_splitk
-        else out
-    )
+        tmp_out = torch.zeros(
+            (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+        )
+    else:
+        tmp_out = out
     aiter.ck_moe_stage1_fwd(
         hidden_states,
         w1,
@@ -1735,10 +1740,11 @@ def ck_moe_stage1(
         out.dtype,
     )
     if is_splitk:
+        valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
+            aiter.silu_and_mul(out, valid_out)
         else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+            aiter.gelu_and_mul(out, valid_out)
     return out
 
 
