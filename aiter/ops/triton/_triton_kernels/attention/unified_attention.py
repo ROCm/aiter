@@ -355,7 +355,7 @@ def kernel_unified_attention_2d(
         one_over_L *= tl.load(v_scale)
     if out_scale is not None:
         one_over_L *= tl.load(out_scale)
-    
+
     acc = acc * one_over_L
 
     if USE_FP8_OUTPUT:
@@ -764,7 +764,7 @@ def reduce_segments(
     if v_scale is not None:
         acc = acc * tl.load(v_scale)
     if out_scale_inv is not None:
-         acc = acc * tl.load(out_scale_inv)
+        acc = acc * tl.load(out_scale_inv)
     if USE_FP8_OUTPUT:
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 

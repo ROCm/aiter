@@ -354,7 +354,9 @@ def run_benchmark(custom, args):
             try:
                 torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
             except AssertionError as e:
-                print(f"Output does not match reference implementation for shape (BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V): {BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V}")
+                print(
+                    f"Output does not match reference implementation for shape (BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V): {BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V}"
+                )
                 print(e)
         # calculate perf metrics
         total_flops = 0
