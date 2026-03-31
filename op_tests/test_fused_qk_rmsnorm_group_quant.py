@@ -122,7 +122,9 @@ def run_torch_ref(
         x1_q, x1_s = _per_token_group_fp8_quant_ref(x1_norm, group_size, dtypes.fp8)
     elif quant_out_dtype == dtypes.fp4x2:
         if transpose_scale:
-            raise ValueError("fp4x2 path currently does not support transpose_scale=True")
+            raise ValueError(
+                "fp4x2 path currently does not support transpose_scale=True"
+            )
         x1_q, x1_s = _per_token_group_fp4x2_quant_ref(x1_norm, group_size)
     else:
         raise ValueError(f"Unsupported quant_out_dtype={quant_out_dtype}")
@@ -336,12 +338,17 @@ def test_fused_qk_rmsnorm_group_quant_hip(
     assert num_head2 >= 0
     assert head_dim > 0
     if quant_out_dtype == dtypes.fp4x2:
-        if getattr(torch, "float4_e2m1fn_x2", None) is None or dtypes.fp4x2 == torch.uint8:
+        if (
+            getattr(torch, "float4_e2m1fn_x2", None) is None
+            or dtypes.fp4x2 == torch.uint8
+        ):
             raise RuntimeError(
                 "fp4x2 quant_out_dtype was requested but torch.float4_e2m1fn_x2 is unavailable"
             )
         if transpose_scale:
-            raise ValueError("fp4x2 path currently does not support transpose_scale=True")
+            raise ValueError(
+                "fp4x2 path currently does not support transpose_scale=True"
+            )
     quant_out_dtype_name = (
         "fp8"
         if quant_out_dtype == dtypes.fp8
@@ -530,13 +537,17 @@ def test_fused_qk_rmsnorm_group_quant_hip(
         q_atol = 0.15
         q_rtol = 0.15
         x1_deq_torch = _upcast_group_fp8(
-            x1_q_torch, _recover_row_major_scale(x1_s_torch, transpose_scale), group_size
+            x1_q_torch,
+            _recover_row_major_scale(x1_s_torch, transpose_scale),
+            group_size,
         )
         x1_deq_hip = _upcast_group_fp8(
             x1_q_hip, _recover_row_major_scale(x1_s_hip, transpose_scale), group_size
         )
         x1_deq_triton = _upcast_group_fp8(
-            x1_q_triton, _recover_row_major_scale(x1_s_triton, transpose_scale), group_size
+            x1_q_triton,
+            _recover_row_major_scale(x1_s_triton, transpose_scale),
+            group_size,
         )
     elif quant_out_dtype == dtypes.fp4x2:
         q_atol = 0.5
@@ -586,7 +597,9 @@ def test_fused_qk_rmsnorm_group_quant_hip(
 
     x1_err_triton = None
     if has_triton:
-        x1_err_triton = _error_stats(x1_deq_torch, x1_deq_triton, atol=q_atol, rtol=q_rtol)
+        x1_err_triton = _error_stats(
+            x1_deq_torch, x1_deq_triton, atol=q_atol, rtol=q_rtol
+        )
         triton_err_total += int(x1_err_triton["err_cnt"])
         triton_elem_total += int(x1_err_triton["total_cnt"])
         triton_abs_err_sum += float(x1_err_triton["abs_err_sum"])
@@ -853,7 +866,7 @@ if __name__ == "__main__":
     l_num_head1 = [12]
     l_num_head2 = [4]
     l_head_dim = [128]
-    l_residual = [0,1]
+    l_residual = [0, 1]
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
