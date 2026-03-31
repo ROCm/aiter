@@ -1736,11 +1736,11 @@ def ck_moe_stage1(
         out.dtype,
     )
     if is_splitk:
-        valid_out = tmp_out[: token_num * topk, :].contiguous()
+        valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+            aiter.silu_and_mul(out, valid_out)
         else:
-            aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
+            aiter.gelu_and_mul(out, valid_out)
     return out
 
 
