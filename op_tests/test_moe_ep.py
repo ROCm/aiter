@@ -364,7 +364,7 @@ parser.add_argument(
         "g1u1_no_quant",
         "g1u1_int8quant",
         "g1u1_fp8quant",
-        "g1u0_int8smoothquant",
+        ##"g1u0_int8smoothquant", err in mi355 and not used, so comment out
         "g1u1_int8smoothquant",
         "g1u1_fp8smoothquant",
     ],
@@ -374,7 +374,7 @@ parser.add_argument(
           or -t g1u1_no_quant
           or -t g1u1_int8quant
           or -t g1u1_fp8quant
-          or -t g1u0_int8smoothquant
+          ## (or -t g1u0_int8smoothquant)
           or -t g1u1_int8smoothquant
           or -t g1u1_fp8smoothquant""",
 )
