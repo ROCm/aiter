@@ -8,7 +8,6 @@
 #include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
-#include <cstdlib>
 #include <type_traits>
 
 namespace aiter {
@@ -262,7 +261,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
         }
 
         int reduce_thread_size = group_size / thread_data_size;
-        float max = multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
+        float max = multithread_reduce_max_dpp(thread_max, reduce_thread_size);
         if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
         {
             auto fp4_scale = [](float tmp) {
@@ -474,6 +473,21 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 
 #define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT) \
     FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT)
+
+#define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS)                          \
+    do                                                                       \
+    {                                                                        \
+        if(has_residual)                                                      \
+        {                                                                    \
+            if(output_unquantized_inp1) { MACRO(BS, TDS, true, true); }      \
+            else                        { MACRO(BS, TDS, true, false); }     \
+        }                                                                    \
+        else                                                                 \
+        {                                                                    \
+            if(output_unquantized_inp1) { MACRO(BS, TDS, false, true); }     \
+            else                        { MACRO(BS, TDS, false, false); }    \
+        }                                                                    \
+    } while(0)
 
 void fused_qk_rmsnorm_group_quant(
     torch::Tensor& q_out_quantized,
@@ -713,426 +727,45 @@ void fused_qk_rmsnorm_group_quant(
                 " reduce_thread_size is not power of 2");
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp1));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
-    const int cu_num = get_num_cu_func();
-    (void)cu_num;
-    const bool is_gfx950 = (get_gpu_arch() == "gfx950");
+    (void)get_num_cu_func();
 
     if(max_n <= 128)
     {
         if(quant_is_fp4)
         {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, false, false);
-                }
-            }
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 64, 8);
         }
         else
         {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 4, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 4, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 4, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 4, false, false);
-                }
-            }
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, 64, 4);
         }
     }
     else if(max_n <= 512)
     {
-        if(has_residual)
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, true, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, true, false);
-            }
-        }
-        else
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, false, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(64, 8, false, false);
-            }
-        }
+        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 64, 8);
     }
     else if(max_n <= 1024)
     {
-        if(has_residual)
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 8, true, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 8, true, false);
-            }
-        }
-        else
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 8, false, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 8, false, false);
-            }
-        }
+        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 128, 8);
     }
     else if(max_n <= 2048)
     {
-        // gfx950 fp8 single-launch tuner for <=2K bucket.
-        // Configs:
-        //   0 -> 128x16 (legacy)
-        //   1 -> 64x32
-        //   2 -> 256x8
-        //   3 -> 128x8
-        //   4 -> 256x16
-        //   5 -> 64x16
-        //   6 -> 128x32
-        // Override via: AITER_FUSED_QK_RMS_2048_CFG=<0|1|2|3|4|5|6>.
-        auto valid_group_cfg = [&](int tuned_thread_data_size) {
-            if(group_size % tuned_thread_data_size != 0)
-            {
-                return false;
-            }
-            if(group_size > WARP_SIZE * tuned_thread_data_size)
-            {
-                return false;
-            }
-            const int tuned_reduce_thread_size = group_size / tuned_thread_data_size;
-            return (tuned_reduce_thread_size & (tuned_reduce_thread_size - 1)) == 0;
-        };
-
-        int cfg_2048 = 0;
-        if(is_gfx950 && quant_is_fp8)
+        if(get_gpu_arch() == "gfx950" && has_residual && group_size <= WARP_SIZE * 8)
         {
-            // Data-driven default on gfx950 fp8:
-            // - residual=True : 256x8 (cfg=2) performs better in <=2048 bucket
-            // - residual=False: keep 128x16 legacy (cfg=0)
-            cfg_2048 = has_residual ? 2 : 0;
-            if(const char* env_cfg = std::getenv("AITER_FUSED_QK_RMS_2048_CFG"))
-            {
-                cfg_2048 = std::atoi(env_cfg);
-            }
-        }
-
-        auto dispatch_128x16 = [&]() {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 16, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 16, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 16, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(128, 16, false, false);
-                }
-            }
-        };
-        auto dispatch_64x32 = [&]() {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 32, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 32, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 32, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 32, false, false);
-                }
-            }
-        };
-        auto dispatch_256x8 = [&]() {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 8, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 8, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 8, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 8, false, false);
-                }
-            }
-        };
-        auto dispatch_128x8 = [&]() {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 8, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 8, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 8, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 8, false, false);
-                }
-            }
-        };
-        auto dispatch_256x16 = [&]() {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 16, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 16, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 16, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(256, 16, false, false);
-                }
-            }
-        };
-        auto dispatch_64x16 = [&]() {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 16, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 16, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 16, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(64, 16, false, false);
-                }
-            }
-        };
-        auto dispatch_128x32 = [&]() {
-            if(has_residual)
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 32, true, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 32, true, false);
-                }
-            }
-            else
-            {
-                if(output_unquantized_inp1)
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 32, false, true);
-                }
-                else
-                {
-                    FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(128, 32, false, false);
-                }
-            }
-        };
-
-        auto covers_max_n = [&](int block_size, int tuned_thread_data_size) {
-            return block_size * tuned_thread_data_size >= max_n;
-        };
-        const bool can_128x16 = valid_group_cfg(16) && covers_max_n(128, 16);
-        const bool can_64x32 = valid_group_cfg(32) && covers_max_n(64, 32);
-        const bool can_256x8 = valid_group_cfg(8) && covers_max_n(256, 8);
-        const bool can_128x8 = valid_group_cfg(8) && covers_max_n(128, 8);
-        const bool can_256x16 = valid_group_cfg(16) && covers_max_n(256, 16);
-        const bool can_64x16 = valid_group_cfg(16) && covers_max_n(64, 16);
-        const bool can_128x32 = valid_group_cfg(32) && covers_max_n(128, 32);
-
-        if(cfg_2048 == 1 && can_64x32)
-        {
-            dispatch_64x32();
-        }
-        else if(cfg_2048 == 2 && can_256x8)
-        {
-            dispatch_256x8();
-        }
-        else if(cfg_2048 == 3 && can_128x8)
-        {
-            dispatch_128x8();
-        }
-        else if(cfg_2048 == 4 && can_256x16)
-        {
-            dispatch_256x16();
-        }
-        else if(cfg_2048 == 5 && can_64x16)
-        {
-            dispatch_64x16();
-        }
-        else if(cfg_2048 == 6 && can_128x32)
-        {
-            dispatch_128x32();
-        }
-        else if(can_128x16)
-        {
-            dispatch_128x16();
-        }
-        else if(can_256x8)
-        {
-            dispatch_256x8();
-        }
-        else if(can_128x8)
-        {
-            dispatch_128x8();
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 8);
         }
         else
         {
-            TORCH_CHECK(false,
-                        __func__,
-                        " no valid <=2048 config for group_size=",
-                        group_size,
-                        ", cfg_2048=",
-                        cfg_2048);
+            DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 128, 16);
         }
     }
     else if(max_n <= 4096)
     {
-        if(has_residual)
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(256, 16, true, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(256, 16, true, false);
-            }
-        }
-        else
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(256, 16, false, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(256, 16, false, false);
-            }
-        }
+        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 16);
     }
     else
     {
-        if(has_residual)
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(512, 16, true, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(512, 16, true, false);
-            }
-        }
-        else
-        {
-            if(output_unquantized_inp1)
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(512, 16, false, true);
-            }
-            else
-            {
-                FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(512, 16, false, false);
-            }
-        }
+        DISPATCH_RESIDUAL_UNQUANT_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 512, 16);
     }
 }
 
