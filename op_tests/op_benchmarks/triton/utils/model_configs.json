@@ -200,14 +200,14 @@
       "vocab_size": 32064
     }
   },
-  "command-r": {
+  "commandr": {
     "Plus": {
       "num_attention_heads": 96,
       "num_key_value_heads": 96,
       "hidden_size": 12288
     }
   },
-  "gpt-oss": {
+  "gptoss": {
     "120B": {
       "num_attention_heads": 64,
       "num_key_value_heads": 8,
