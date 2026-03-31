@@ -156,7 +156,7 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Docker login
-        if: ${{ matrix.build_enabled }}
+        if: ${{ matrix.build_enabled && github.event.inputs.docker_password_secret != '' }}
         run: |
           set -ex
           echo "${{ secrets[github.event.inputs.docker_password_secret] }}" | docker login -u "${{ github.event.inputs.docker_username }}" --password-stdin
