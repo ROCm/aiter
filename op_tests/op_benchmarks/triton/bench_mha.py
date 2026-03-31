@@ -30,7 +30,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 @dataclass
 class BenchRun:
     configs: list["BenchConfig"]
-    mode: str  # "fwd" or "bwd"
     torch_dtype: torch.dtype
     unit: str  # "ms", "TFLOPS", "GB/s"
     plot_name: str
@@ -53,6 +52,7 @@ class BenchConfig:
     d_head_v: int
     causal: bool
     layout: str  # "bshd" or "thd"
+    mode: str  # "fwd" or "bwd"
     dtype_str: str  # "bf16", "fp16", "fp32", "fp8"
     impl: str = "default"  # "default" or "dao_ai"
     fused: bool = False
@@ -70,6 +70,7 @@ class BenchConfig:
             self.d_head_v,
             self.causal,
             self.layout,
+            self.mode,
             self.dtype_str,
             self.impl,
             self.fused,
@@ -207,6 +208,7 @@ def get_make_fn(dtype: str, layout: str, fused: bool = False) -> Callable:
 
 def edge_case_configs(
     dtypes: list[str],
+    modes: list[str],
     impl: str,
     fused: bool,
 ) -> list[BenchConfig]:
@@ -216,10 +218,11 @@ def edge_case_configs(
     configs: list[BenchConfig] = []
 
     # Decode: sq=1, large KV cache
-    for (hq, hk), sk, b, d in itertools.product(
+    for (hq, hk), sk, b, m, d in itertools.product(
         [(32, 8), (64, 8)],
         [4096, 8192],
         [1, 8],
+        modes,
         dtypes,
     ):
         configs.append(
@@ -233,6 +236,7 @@ def edge_case_configs(
                 d_head_v=d_head,
                 causal=True,
                 layout="thd",
+                mode=m,
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
@@ -240,9 +244,10 @@ def edge_case_configs(
         )
 
     # Non-causal (cross-attention): sq != sk
-    for (hq, hk), (sq, sk), d in itertools.product(
+    for (hq, hk), (sq, sk), m, d in itertools.product(
         [(32, 32), (64, 8)],
         [(512, 1024), (1024, 4096)],
+        modes,
         dtypes,
     ):
         configs.append(
@@ -256,6 +261,7 @@ def edge_case_configs(
                 d_head_v=d_head,
                 causal=False,
                 layout="bshd",
+                mode=m,
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
@@ -263,9 +269,10 @@ def edge_case_configs(
         )
 
     # Non-power-of-2 seqlens
-    for (hq, hk), (sq, sk), d in itertools.product(
+    for (hq, hk), (sq, sk), m, d in itertools.product(
         [(32, 8)],
         [(163, 163), (1000, 2000)],
+        modes,
         dtypes,
     ):
         configs.append(
@@ -279,6 +286,7 @@ def edge_case_configs(
                 d_head_v=d_head,
                 causal=True,
                 layout="thd",
+                mode=m,
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
@@ -286,10 +294,11 @@ def edge_case_configs(
         )
 
     # Batched bshd (training-like)
-    for (hq, hk), sq, b, d in itertools.product(
+    for (hq, hk), sq, b, m, d in itertools.product(
         [(32, 8), (64, 8)],
         [1024, 4096],
         [4, 16],
+        modes,
         dtypes,
     ):
         configs.append(
@@ -303,6 +312,7 @@ def edge_case_configs(
                 d_head_v=d_head,
                 causal=True,
                 layout="bshd",
+                mode=m,
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
@@ -316,6 +326,7 @@ def model_benchmark_configs(
     args,
     *,
     dtypes: list[str],
+    modes: list[str],
     impl: str,
     fused: bool,
     layout: str | None = None,
@@ -325,8 +336,7 @@ def model_benchmark_configs(
     configs = get_model_configs(config_path=config_file, models=model or "all")
     layouts = [layout] if layout else ["thd", "bshd"]
     fa_configs: list[BenchConfig] = []
-    batch_size = args.b if args.b else 1
-    causal = args.causal if args.causal is not None else True
+    causals = [args.causal] if args.causal is not None else [True, False]
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -337,25 +347,33 @@ def model_benchmark_configs(
         )
         HEAD_DIM = config["hidden_size"] // HQ
         if args.sq:
-            sq_sk_pairs = [(args.sq, args.sk if args.sk else args.sq)]
+            b = args.b if args.b else 1
+            scenarios = [(b, args.sq, args.sk if args.sk else args.sq)]
         else:
-            # Prefill (sq == sk) + decode (sq=1, sk=context)
-            prefill = [(2**i, 2**i) for i in range(2, 14, 2)]  # 4..4096
-            decode = [(1, 2**i) for i in range(8, 14)]  # 256..8192
-            sq_sk_pairs = prefill + decode
-        for (sq, sk), lay, d in itertools.product(sq_sk_pairs, layouts, dtypes):
+            # (batch, sq, sk) triplets for realistic serving scenarios
+            # Prefill: few concurrent prefills, sq == sk
+            prefill = [(4, s, s) for s in [128, 256, 512, 1024, 2048, 4096, 8192]]
+            # Decode: many concurrent decodes, sq=1
+            decode = [(32, 1, s) for s in [256, 512, 1024, 2048, 4096, 8192]]
+            scenarios = prefill + decode
+            if args.b:
+                scenarios = [(args.b, sq, sk) for (_, sq, sk) in scenarios]
+        for (b, sq, sk), lay, c, m, d in itertools.product(
+            scenarios, layouts, causals, modes, dtypes
+        ):
             fa_configs.append(
                 BenchConfig(
                     model=model_name,
-                    batch=batch_size,
+                    batch=b,
                     hq=HQ,
                     hk=HK,
                     sq=sq,
                     sk=sk,
                     d_head=HEAD_DIM,
                     d_head_v=HEAD_DIM,
-                    causal=causal,
+                    causal=c,
                     layout=lay,
+                    mode=m,
                     dtype_str=d,
                     impl=impl,
                     fused=fused and d != "fp8",
@@ -408,6 +426,7 @@ def _make_triton_benchmark(run: BenchRun) -> list:
         "D_HEAD_V",
         "causal",
         "layout",
+        "mode",
         "dtype",
         "impl",
         "fused",
@@ -424,7 +443,6 @@ def _make_triton_benchmark(run: BenchRun) -> list:
             plot_name=run.plot_name,
             args={
                 "torch_dtype": run.torch_dtype,
-                "mode": run.mode,
                 "unit": run.unit,
             },
         )
@@ -446,11 +464,11 @@ def run_benchmark(run: BenchRun):
         D_HEAD_V,
         causal,
         layout,
+        mode,
         dtype,
         impl,
         fused,
         torch_dtype,
-        mode,
         unit,
         provider,
         dropout=0.0,
@@ -674,7 +692,7 @@ def run_benchmark(run: BenchRun):
     try:
         bench_mha.run(save_path=run.save_path, print_data=True)
     except Exception as e:
-        print(f"\n[WARN] {run.mode} benchmark failed: {e}", flush=True)
+        print(f"\n[WARN] benchmark failed: {e}", flush=True)
 
 
 def supported_layouts():
@@ -709,7 +727,7 @@ arg_to_torch_dtype = {
 def parse_args(args: list[str] | None = None) -> BenchRun:
     parser = get_parser(kernel_name="FlashAttention")
     parser.add_argument(
-        "-mode", type=str, default="fwd", help="fwd:forward kernel, bwd:backward kernel"
+        "-mode", type=str, default=None, help="fwd, bwd, or omit for both"
     )
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
@@ -824,6 +842,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     # Build configs
     impl = parsed.impl
     fused = parsed.fused_bwd
+    modes = [parsed.mode] if parsed.mode else ["fwd", "bwd"]
     d_head = parsed.d if parsed.d else 128
     d_head_v = parsed.dv if parsed.dv else d_head
 
@@ -844,38 +863,38 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
                 d_head_v=d_head_v,
                 causal=c,
                 layout=custom_layout,
+                mode=m,
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
             )
-            for c, d in itertools.product(causals, dtypes)
+            for c, m, d in itertools.product(causals, modes, dtypes)
         ]
     elif parsed.model:
         configs = model_benchmark_configs(
             parsed,
             dtypes=dtypes,
+            modes=modes,
             impl=impl,
             fused=fused,
             model=parsed.model,
             layout=parsed.layout,
         )
     else:
-        # Default: all models, both layouts (None = thd + bshd)
+        # Default: all models, both layouts, both modes
         configs = model_benchmark_configs(
             parsed,
             dtypes=dtypes,
+            modes=modes,
             impl=impl,
             fused=fused,
         )
 
-    plot_name = f"{get_caller_name_no_ext()}_{parsed.mode}"
-
     return BenchRun(
         configs=configs,
-        mode=parsed.mode,
         torch_dtype=torch_dtype,
         unit=unit,
-        plot_name=plot_name,
+        plot_name=get_caller_name_no_ext(),
         sink=parsed.sink,
         equal_seqlens=parsed.equal_seqlens,
         save_path=parsed.o,
