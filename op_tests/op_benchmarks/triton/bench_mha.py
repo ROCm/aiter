@@ -451,10 +451,12 @@ def run_benchmark(run: BenchRun):
     ):
         nonlocal counter
         counter += 1
+        config = run.configs[counter - 1]
         label = model or "custom"
+        mem_gb = config.estimated_memory / 1e9
         print(
             f"[{counter}/{total}] {label} B={BATCH} HQ={HQ} HK={HK} "
-            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} causal={causal}",
+            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} causal={causal} ({mem_gb:.1f}GB)",
             flush=True,
         )
         try:
@@ -468,7 +470,7 @@ def run_benchmark(run: BenchRun):
             value = None
         finally:
             torch.cuda.empty_cache()
-        csv.write(run.configs[counter - 1], value)
+        csv.write(config, value)
         return value if value is not None else 0
 
     def _run_single_benchmark(
