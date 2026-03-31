@@ -1,0 +1,205 @@
+/usr/local/lib/python3.12/dist-packages/pylama/lint/__init__.py:10: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import iter_entry_points
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /root/aiter
+configfile: pyproject.toml
+plugins: repeat-0.9.4, pylama-8.4.1, forked-1.6.0, xdist-3.8.0
+collecting ... [aiter] import [module_aiter_enum] under /root/aiter/aiter/jit/module_aiter_enum.so
+collected 64 items
+
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0053763436153531075 (threshold = 0.02)
+-- RMS relative error = 0.00010801242024172097 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007692301645874977 (threshold = 0.02)
+-- RMS relative error = 0.0001313405082328245 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0067568072117865086 (threshold = 0.02)
+-- RMS relative error = 0.00012415385572239757 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.0077519770711660385 (threshold = 0.02)
+-- RMS relative error = 0.00014338437176775187 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.005565784405916929 (threshold = 0.02)
+-- RMS relative error = 0.0012685998808592558 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.008286499418318272 (threshold = 0.02)
+-- RMS relative error = 0.0012232456356287003 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.004864479415118694 (threshold = 0.02)
+-- RMS relative error = 0.0012004858581349254 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-False-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.006637909449636936 (threshold = 0.02)
+-- RMS relative error = 0.0012239390052855015 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.005586623214185238 (threshold = 0.02)
+-- RMS relative error = 8.25141542009078e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007812493480741978 (threshold = 0.02)
+-- RMS relative error = 0.0001090926889446564 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.006622516084462404 (threshold = 0.02)
+-- RMS relative error = 7.689258200116456e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.0076336027123034 (threshold = 0.02)
+-- RMS relative error = 0.00010298912093276158 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.003891033586114645 (threshold = 0.02)
+-- RMS relative error = 0.001115310238674283 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.009010054171085358 (threshold = 0.02)
+-- RMS relative error = 0.0011062631383538246 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.005692291539162397 (threshold = 0.02)
+-- RMS relative error = 0.0011067403247579932 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-False-True-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.008869593031704426 (threshold = 0.02)
+-- RMS relative error = 0.0011122575961053371 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.005475843325257301 (threshold = 0.02)
+-- RMS relative error = 0.00011865945998579264 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007751960773020983 (threshold = 0.02)
+-- RMS relative error = 0.0001381814799970016 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.007692244835197926 (threshold = 0.02)
+-- RMS relative error = 0.00013664684956893325 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007751960773020983 (threshold = 0.02)
+-- RMS relative error = 0.00014260323951020837 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.003831429174169898 (threshold = 0.02)
+-- RMS relative error = 0.0008332467987202108 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.0060606240294873714 (threshold = 0.02)
+-- RMS relative error = 0.000715156551450491 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0038910619914531708 (threshold = 0.02)
+-- RMS relative error = 0.0008775605238042772 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-False-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.005825216881930828 (threshold = 0.02)
+-- RMS relative error = 0.000710788881406188 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.004694849252700806 (threshold = 0.02)
+-- RMS relative error = 6.90775050316006e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007751960773020983 (threshold = 0.02)
+-- RMS relative error = 0.00011606804037000984 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.004115238320082426 (threshold = 0.02)
+-- RMS relative error = 5.83346227358561e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007751960773020983 (threshold = 0.02)
+-- RMS relative error = 0.00011663704208331183 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0037735644727945328 (threshold = 0.02)
+-- RMS relative error = 0.0008281954796984792 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007407407741993666 (threshold = 0.02)
+-- RMS relative error = 0.000763576477766037 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0034451752435415983 (threshold = 0.02)
+-- RMS relative error = 0.0008071104530245066 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[False-True-True-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.006527765654027462 (threshold = 0.02)
+-- RMS relative error = 0.0007561895181424916 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.005235612392425537 (threshold = 0.02)
+-- RMS relative error = 8.90931551111862e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.00763360783457756 (threshold = 0.02)
+-- RMS relative error = 0.0001337372959824279 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.004347846377640963 (threshold = 0.02)
+-- RMS relative error = 4.825738869840279e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007812499068677425 (threshold = 0.02)
+-- RMS relative error = 0.00013534899335354567 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.005395291838794947 (threshold = 0.02)
+-- RMS relative error = 0.0012394513469189405 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.006802710238844156 (threshold = 0.02)
+-- RMS relative error = 0.0012209366541355848 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.004810248501598835 (threshold = 0.02)
+-- RMS relative error = 0.0012305222917348146 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-False-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.009968375787138939 (threshold = 0.02)
+-- RMS relative error = 0.0012298263609409332 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.004209136590361595 (threshold = 0.02)
+-- RMS relative error = 6.834841042291373e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007751921657472849 (threshold = 0.02)
+-- RMS relative error = 0.00010535174806136638 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0077520026825368404 (threshold = 0.02)
+-- RMS relative error = 0.00010063539957627654 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.0078125 (threshold = 0.02)
+-- RMS relative error = 0.00011273552809143439 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.007555084303021431 (threshold = 0.02)
+-- RMS relative error = 0.0011407529236748815 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.010814310982823372 (threshold = 0.02)
+-- RMS relative error = 0.0011066982988268137 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.003830467350780964 (threshold = 0.02)
+-- RMS relative error = 0.0010944763198494911 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-False-True-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.012024697847664356 (threshold = 0.02)
+-- RMS relative error = 0.001105945440940559 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.007246317807585001 (threshold = 0.02)
+-- RMS relative error = 0.00014370604185387492 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007692244835197926 (threshold = 0.02)
+-- RMS relative error = 0.0001418972242390737 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0026917564682662487 (threshold = 0.02)
+-- RMS relative error = 5.875822535017505e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007575780153274536 (threshold = 0.02)
+-- RMS relative error = 0.0001461308856960386 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0036630143877118826 (threshold = 0.02)
+-- RMS relative error = 0.000807682634331286 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007633610628545284 (threshold = 0.02)
+-- RMS relative error = 0.0007154495106078684 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0038901979569345713 (threshold = 0.02)
+-- RMS relative error = 0.0008564916788600385 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-False-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.00591717753559351 (threshold = 0.02)
+-- RMS relative error = 0.0007080498617142439 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-False-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0025142275262624025 (threshold = 0.02)
+-- RMS relative error = 3.6284251109464094e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-False-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007633610628545284 (threshold = 0.02)
+-- RMS relative error = 0.00011782690125983208 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-True-False-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.007575780153274536 (threshold = 0.02)
+-- RMS relative error = 9.90329499472864e-05 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-True-False-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.0077518741600215435 (threshold = 0.02)
+-- RMS relative error = 0.00011795693717431277 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-False-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.007633610628545284 (threshold = 0.02)
+-- RMS relative error = 0.0007959365611895919 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-False-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.00857532024383545 (threshold = 0.02)
+-- RMS relative error = 0.000773710897192359 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-True-True-16-256-256-mxfloat8_e4m3fn-128-4-True] -- maximum relative error = 0.0036100989673286676 (threshold = 0.02)
+-- RMS relative error = 0.0008093089563772082 (threshold = 0.004)
+PASSED
+op_tests/triton_tests/moe/test_moe_gemm_a8w4.py::test_op[True-True-True-True-True-300-400-800-mxfloat8_e4m3fn-8-4-False] -- maximum relative error = 0.007338203024119139 (threshold = 0.02)
+-- RMS relative error = 0.0007788438233546913 (threshold = 0.004)
+PASSED
+
+============================== 64 passed in 9.45s ==============================

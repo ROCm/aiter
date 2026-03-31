@@ -1,0 +1,120 @@
+/usr/local/lib/python3.12/dist-packages/pylama/lint/__init__.py:10: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import iter_entry_points
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /root/aiter
+configfile: pyproject.toml
+plugins: repeat-0.9.4, pylama-8.4.1, forked-1.6.0, xdist-3.8.0
+collecting ... [aiter] import [module_aiter_enum] under /root/aiter/aiter/jit/module_aiter_enum.so
+collected 96 items
+
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-True-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-True-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-True-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-True-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-False-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-False-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-False-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[triton-False-1-False-False-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-True-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-True-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-True-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-True-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-False-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-False-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-False-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-False-False-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-True-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-True-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-True-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-True-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-False-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-False-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-False-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-False-1-True-False-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-True-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-True-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-True-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-True-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-False-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-False-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-False-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-1-False-False-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-True-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-True-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-True-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-True-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-False-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-False-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-False-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-4-False-False-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-True-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-True-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-True-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-True-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-False-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-False-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-False-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_triton_unified_attn[gluon-True-8-False-False-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] SKIPPED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-64-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-64-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-16-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[False-1-None-4096-None-dtype0-256-16-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-64-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-64-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-16-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-1-None-4096-None-dtype0-256-16-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-64-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-64-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-16-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-None-16-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-64-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-64-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-64-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-64-128-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-16-64-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-16-64-num_heads0-seq_lens1] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-16-128-num_heads0-seq_lens0] PASSED
+op_tests/triton_tests/attention/test_unified_attention.py::test_gluon_unified_attn_2d[True-4-None-4096-None-dtype0-256-16-128-num_heads0-seq_lens1] PASSED
+
+=============================== warnings summary ===============================
+../triton/python/triton/runtime/autotuner.py:101
+../triton/python/triton/runtime/autotuner.py:101
+../triton/python/triton/runtime/autotuner.py:101
+../triton/python/triton/runtime/autotuner.py:101
+../triton/python/triton/runtime/autotuner.py:101
+../triton/python/triton/runtime/autotuner.py:101
+  /root/triton/python/triton/runtime/autotuner.py:101: DeprecationWarning: warmup, rep, and use_cuda_graph parameters are deprecated. See https://github.com/triton-lang/triton/pull/4496 for details.
+    warnings.warn(("warmup, rep, and use_cuda_graph parameters are deprecated. See "
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============ 84 passed, 12 skipped, 6 warnings in 306.01s (0:05:06) ============

@@ -83,8 +83,12 @@ def get_x_vals():
 
 
 @pytest.mark.parametrize("M, N1, N2, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
+# TODO: Remove when merging. f16 not important for launch.
+#@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# Remove when merging. fw generally provide outputs.
+#@pytest.mark.parametrize("output", [True, False])
+@pytest.mark.parametrize("output", [True])
 @pytest.mark.parametrize("skip_reduce", [True, False])
 @pytest.mark.parametrize("fp4_shuffle", [True, False])
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):

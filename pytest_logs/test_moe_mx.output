@@ -1,0 +1,259 @@
+/usr/local/lib/python3.12/dist-packages/pylama/lint/__init__.py:10: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import iter_entry_points
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /root/aiter
+configfile: pyproject.toml
+plugins: repeat-0.9.4, pylama-8.4.1, forked-1.6.0, xdist-3.8.0
+collecting ... [aiter] import [module_aiter_enum] under /root/aiter/aiter/jit/module_aiter_enum.so
+collected 60 items
+
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_0] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-16-256-256-128-4] x.shape=torch.Size([16, 128]) x_f32.shape=torch.Size([16, 256]) x_scales.shape=torch.Size([16, 8])
+x.shape=torch.Size([128, 256, 128]) x_f32.shape=torch.Size([128, 256, 256]) x_scales.shape=torch.Size([128, 256, 8])
+b_ref.shape=torch.Size([128, 256, 256]) b_tri.shape=torch.Size([128, 256, 128]) b_tri., b_mx_scales.shape=torch.Size([128, 256, 8])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-3-1] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([3, 704, 400]) x_f32.shape=torch.Size([3, 704, 800]) x_scales.shape=torch.Size([3, 704, 25])
+b_ref.shape=torch.Size([3, 704, 800]) b_tri.shape=torch.Size([3, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([3, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-8-2] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([8, 704, 400]) x_f32.shape=torch.Size([8, 704, 800]) x_scales.shape=torch.Size([8, 704, 25])
+b_ref.shape=torch.Size([8, 704, 800]) b_tri.shape=torch.Size([8, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([8, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-64-14336-4096-8-2] x.shape=torch.Size([64, 2048]) x_f32.shape=torch.Size([64, 4096]) x_scales.shape=torch.Size([64, 128])
+x.shape=torch.Size([8, 14336, 2048]) x_f32.shape=torch.Size([8, 14336, 4096]) x_scales.shape=torch.Size([8, 14336, 128])
+b_ref.shape=torch.Size([8, 14336, 4096]) b_tri.shape=torch.Size([8, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-8-2] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([8, 14336, 64]) x_f32.shape=torch.Size([8, 14336, 128]) x_scales.shape=torch.Size([8, 14336, 4])
+b_ref.shape=torch.Size([8, 14336, 128]) b_tri.shape=torch.Size([8, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-16-14336-4096-4-1] x.shape=torch.Size([16, 2048]) x_f32.shape=torch.Size([16, 4096]) x_scales.shape=torch.Size([16, 128])
+x.shape=torch.Size([4, 14336, 2048]) x_f32.shape=torch.Size([4, 14336, 4096]) x_scales.shape=torch.Size([4, 14336, 128])
+b_ref.shape=torch.Size([4, 14336, 4096]) b_tri.shape=torch.Size([4, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-1-14336-128-4-2] x.shape=torch.Size([1, 64]) x_f32.shape=torch.Size([1, 128]) x_scales.shape=torch.Size([1, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-3-14336-128-4-2] x.shape=torch.Size([3, 64]) x_f32.shape=torch.Size([3, 128]) x_scales.shape=torch.Size([3, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-1-1] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([1, 14336, 64]) x_f32.shape=torch.Size([1, 14336, 128]) x_scales.shape=torch.Size([1, 14336, 4])
+b_ref.shape=torch.Size([1, 14336, 128]) b_tri.shape=torch.Size([1, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([1, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-64-7186-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 7186, 64]) x_f32.shape=torch.Size([8, 7186, 128]) x_scales.shape=torch.Size([8, 7186, 4])
+b_ref.shape=torch.Size([8, 7186, 128]) b_tri.shape=torch.Size([8, 7186, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 7186, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-64-3584-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 3584, 64]) x_f32.shape=torch.Size([8, 3584, 128]) x_scales.shape=torch.Size([8, 3584, 4])
+b_ref.shape=torch.Size([8, 3584, 128]) b_tri.shape=torch.Size([8, 3584, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 3584, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-64-1792-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 1792, 64]) x_f32.shape=torch.Size([8, 1792, 128]) x_scales.shape=torch.Size([8, 1792, 4])
+b_ref.shape=torch.Size([8, 1792, 128]) b_tri.shape=torch.Size([8, 1792, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 1792, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_1] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-1-1024-16384-2-1] x.shape=torch.Size([1, 8192]) x_f32.shape=torch.Size([1, 16384]) x_scales.shape=torch.Size([1, 512])
+x.shape=torch.Size([2, 1024, 8192]) x_f32.shape=torch.Size([2, 1024, 16384]) x_scales.shape=torch.Size([2, 1024, 512])
+b_ref.shape=torch.Size([2, 1024, 16384]) b_tri.shape=torch.Size([2, 1024, 8192]) b_tri., b_mx_scales.shape=torch.Size([2, 1024, 512])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_0] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-16-256-256-128-4] x.shape=torch.Size([16, 128]) x_f32.shape=torch.Size([16, 256]) x_scales.shape=torch.Size([16, 8])
+x.shape=torch.Size([128, 256, 128]) x_f32.shape=torch.Size([128, 256, 256]) x_scales.shape=torch.Size([128, 256, 8])
+b_ref.shape=torch.Size([128, 256, 256]) b_tri.shape=torch.Size([128, 256, 128]) b_tri., b_mx_scales.shape=torch.Size([128, 256, 8])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-3-1] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([3, 704, 400]) x_f32.shape=torch.Size([3, 704, 800]) x_scales.shape=torch.Size([3, 704, 25])
+b_ref.shape=torch.Size([3, 704, 800]) b_tri.shape=torch.Size([3, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([3, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-8-2] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([8, 704, 400]) x_f32.shape=torch.Size([8, 704, 800]) x_scales.shape=torch.Size([8, 704, 25])
+b_ref.shape=torch.Size([8, 704, 800]) b_tri.shape=torch.Size([8, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([8, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-64-14336-4096-8-2] x.shape=torch.Size([64, 2048]) x_f32.shape=torch.Size([64, 4096]) x_scales.shape=torch.Size([64, 128])
+x.shape=torch.Size([8, 14336, 2048]) x_f32.shape=torch.Size([8, 14336, 4096]) x_scales.shape=torch.Size([8, 14336, 128])
+b_ref.shape=torch.Size([8, 14336, 4096]) b_tri.shape=torch.Size([8, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-8-2] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([8, 14336, 64]) x_f32.shape=torch.Size([8, 14336, 128]) x_scales.shape=torch.Size([8, 14336, 4])
+b_ref.shape=torch.Size([8, 14336, 128]) b_tri.shape=torch.Size([8, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-16-14336-4096-4-1] x.shape=torch.Size([16, 2048]) x_f32.shape=torch.Size([16, 4096]) x_scales.shape=torch.Size([16, 128])
+x.shape=torch.Size([4, 14336, 2048]) x_f32.shape=torch.Size([4, 14336, 4096]) x_scales.shape=torch.Size([4, 14336, 128])
+b_ref.shape=torch.Size([4, 14336, 4096]) b_tri.shape=torch.Size([4, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-1-14336-128-4-2] x.shape=torch.Size([1, 64]) x_f32.shape=torch.Size([1, 128]) x_scales.shape=torch.Size([1, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-3-14336-128-4-2] x.shape=torch.Size([3, 64]) x_f32.shape=torch.Size([3, 128]) x_scales.shape=torch.Size([3, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-1-1] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([1, 14336, 64]) x_f32.shape=torch.Size([1, 14336, 128]) x_scales.shape=torch.Size([1, 14336, 4])
+b_ref.shape=torch.Size([1, 14336, 128]) b_tri.shape=torch.Size([1, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([1, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-64-7186-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 7186, 64]) x_f32.shape=torch.Size([8, 7186, 128]) x_scales.shape=torch.Size([8, 7186, 4])
+b_ref.shape=torch.Size([8, 7186, 128]) b_tri.shape=torch.Size([8, 7186, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 7186, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-64-3584-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 3584, 64]) x_f32.shape=torch.Size([8, 3584, 128]) x_scales.shape=torch.Size([8, 3584, 4])
+b_ref.shape=torch.Size([8, 3584, 128]) b_tri.shape=torch.Size([8, 3584, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 3584, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-64-1792-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 1792, 64]) x_f32.shape=torch.Size([8, 1792, 128]) x_scales.shape=torch.Size([8, 1792, 4])
+b_ref.shape=torch.Size([8, 1792, 128]) b_tri.shape=torch.Size([8, 1792, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 1792, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_1] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-True-mxfp4_e2m1-mxfp4_e2m1-1-1024-16384-2-1] x.shape=torch.Size([1, 8192]) x_f32.shape=torch.Size([1, 16384]) x_scales.shape=torch.Size([1, 512])
+x.shape=torch.Size([2, 1024, 8192]) x_f32.shape=torch.Size([2, 1024, 16384]) x_scales.shape=torch.Size([2, 1024, 512])
+b_ref.shape=torch.Size([2, 1024, 16384]) b_tri.shape=torch.Size([2, 1024, 8192]) b_tri., b_mx_scales.shape=torch.Size([2, 1024, 512])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_0] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-16-256-256-128-4] x.shape=torch.Size([16, 128]) x_f32.shape=torch.Size([16, 256]) x_scales.shape=torch.Size([16, 8])
+x.shape=torch.Size([128, 256, 128]) x_f32.shape=torch.Size([128, 256, 256]) x_scales.shape=torch.Size([128, 256, 8])
+b_ref.shape=torch.Size([128, 256, 256]) b_tri.shape=torch.Size([128, 256, 128]) b_tri., b_mx_scales.shape=torch.Size([128, 256, 8])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-3-1] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([3, 704, 400]) x_f32.shape=torch.Size([3, 704, 800]) x_scales.shape=torch.Size([3, 704, 25])
+b_ref.shape=torch.Size([3, 704, 800]) b_tri.shape=torch.Size([3, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([3, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-8-2] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([8, 704, 400]) x_f32.shape=torch.Size([8, 704, 800]) x_scales.shape=torch.Size([8, 704, 25])
+b_ref.shape=torch.Size([8, 704, 800]) b_tri.shape=torch.Size([8, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([8, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-64-14336-4096-8-2] x.shape=torch.Size([64, 2048]) x_f32.shape=torch.Size([64, 4096]) x_scales.shape=torch.Size([64, 128])
+x.shape=torch.Size([8, 14336, 2048]) x_f32.shape=torch.Size([8, 14336, 4096]) x_scales.shape=torch.Size([8, 14336, 128])
+b_ref.shape=torch.Size([8, 14336, 4096]) b_tri.shape=torch.Size([8, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-8-2] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([8, 14336, 64]) x_f32.shape=torch.Size([8, 14336, 128]) x_scales.shape=torch.Size([8, 14336, 4])
+b_ref.shape=torch.Size([8, 14336, 128]) b_tri.shape=torch.Size([8, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-16-14336-4096-4-1] x.shape=torch.Size([16, 2048]) x_f32.shape=torch.Size([16, 4096]) x_scales.shape=torch.Size([16, 128])
+x.shape=torch.Size([4, 14336, 2048]) x_f32.shape=torch.Size([4, 14336, 4096]) x_scales.shape=torch.Size([4, 14336, 128])
+b_ref.shape=torch.Size([4, 14336, 4096]) b_tri.shape=torch.Size([4, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-1-14336-128-4-2] x.shape=torch.Size([1, 64]) x_f32.shape=torch.Size([1, 128]) x_scales.shape=torch.Size([1, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-3-14336-128-4-2] x.shape=torch.Size([3, 64]) x_f32.shape=torch.Size([3, 128]) x_scales.shape=torch.Size([3, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-1-1] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([1, 14336, 64]) x_f32.shape=torch.Size([1, 14336, 128]) x_scales.shape=torch.Size([1, 14336, 4])
+b_ref.shape=torch.Size([1, 14336, 128]) b_tri.shape=torch.Size([1, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([1, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-64-7186-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 7186, 64]) x_f32.shape=torch.Size([8, 7186, 128]) x_scales.shape=torch.Size([8, 7186, 4])
+b_ref.shape=torch.Size([8, 7186, 128]) b_tri.shape=torch.Size([8, 7186, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 7186, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-64-3584-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 3584, 64]) x_f32.shape=torch.Size([8, 3584, 128]) x_scales.shape=torch.Size([8, 3584, 4])
+b_ref.shape=torch.Size([8, 3584, 128]) b_tri.shape=torch.Size([8, 3584, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 3584, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-64-1792-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 1792, 64]) x_f32.shape=torch.Size([8, 1792, 128]) x_scales.shape=torch.Size([8, 1792, 4])
+b_ref.shape=torch.Size([8, 1792, 128]) b_tri.shape=torch.Size([8, 1792, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 1792, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_1] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-False-mxfp4_e2m1-mxfp4_e2m1-1-1024-16384-2-1] x.shape=torch.Size([1, 8192]) x_f32.shape=torch.Size([1, 16384]) x_scales.shape=torch.Size([1, 512])
+x.shape=torch.Size([2, 1024, 8192]) x_f32.shape=torch.Size([2, 1024, 16384]) x_scales.shape=torch.Size([2, 1024, 512])
+b_ref.shape=torch.Size([2, 1024, 16384]) b_tri.shape=torch.Size([2, 1024, 8192]) b_tri., b_mx_scales.shape=torch.Size([2, 1024, 512])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_0] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-16-256-256-128-4] x.shape=torch.Size([16, 128]) x_f32.shape=torch.Size([16, 256]) x_scales.shape=torch.Size([16, 8])
+x.shape=torch.Size([128, 256, 128]) x_f32.shape=torch.Size([128, 256, 256]) x_scales.shape=torch.Size([128, 256, 8])
+b_ref.shape=torch.Size([128, 256, 256]) b_tri.shape=torch.Size([128, 256, 128]) b_tri., b_mx_scales.shape=torch.Size([128, 256, 8])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-3-1] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([3, 704, 400]) x_f32.shape=torch.Size([3, 704, 800]) x_scales.shape=torch.Size([3, 704, 25])
+b_ref.shape=torch.Size([3, 704, 800]) b_tri.shape=torch.Size([3, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([3, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-1000-704-800-8-2] x.shape=torch.Size([1000, 400]) x_f32.shape=torch.Size([1000, 800]) x_scales.shape=torch.Size([1000, 25])
+x.shape=torch.Size([8, 704, 400]) x_f32.shape=torch.Size([8, 704, 800]) x_scales.shape=torch.Size([8, 704, 25])
+b_ref.shape=torch.Size([8, 704, 800]) b_tri.shape=torch.Size([8, 704, 400]) b_tri., b_mx_scales.shape=torch.Size([8, 704, 25])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-64-14336-4096-8-2] x.shape=torch.Size([64, 2048]) x_f32.shape=torch.Size([64, 4096]) x_scales.shape=torch.Size([64, 128])
+x.shape=torch.Size([8, 14336, 2048]) x_f32.shape=torch.Size([8, 14336, 4096]) x_scales.shape=torch.Size([8, 14336, 128])
+b_ref.shape=torch.Size([8, 14336, 4096]) b_tri.shape=torch.Size([8, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-8-2] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([8, 14336, 64]) x_f32.shape=torch.Size([8, 14336, 128]) x_scales.shape=torch.Size([8, 14336, 4])
+b_ref.shape=torch.Size([8, 14336, 128]) b_tri.shape=torch.Size([8, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-16-14336-4096-4-1] x.shape=torch.Size([16, 2048]) x_f32.shape=torch.Size([16, 4096]) x_scales.shape=torch.Size([16, 128])
+x.shape=torch.Size([4, 14336, 2048]) x_f32.shape=torch.Size([4, 14336, 4096]) x_scales.shape=torch.Size([4, 14336, 128])
+b_ref.shape=torch.Size([4, 14336, 4096]) b_tri.shape=torch.Size([4, 14336, 2048]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 128])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-1-14336-128-4-2] x.shape=torch.Size([1, 64]) x_f32.shape=torch.Size([1, 128]) x_scales.shape=torch.Size([1, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-3-14336-128-4-2] x.shape=torch.Size([3, 64]) x_f32.shape=torch.Size([3, 128]) x_scales.shape=torch.Size([3, 4])
+x.shape=torch.Size([4, 14336, 64]) x_f32.shape=torch.Size([4, 14336, 128]) x_scales.shape=torch.Size([4, 14336, 4])
+b_ref.shape=torch.Size([4, 14336, 128]) b_tri.shape=torch.Size([4, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([4, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-16-14336-128-1-1] x.shape=torch.Size([16, 64]) x_f32.shape=torch.Size([16, 128]) x_scales.shape=torch.Size([16, 4])
+x.shape=torch.Size([1, 14336, 64]) x_f32.shape=torch.Size([1, 14336, 128]) x_scales.shape=torch.Size([1, 14336, 4])
+b_ref.shape=torch.Size([1, 14336, 128]) b_tri.shape=torch.Size([1, 14336, 64]) b_tri., b_mx_scales.shape=torch.Size([1, 14336, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-64-7186-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 7186, 64]) x_f32.shape=torch.Size([8, 7186, 128]) x_scales.shape=torch.Size([8, 7186, 4])
+b_ref.shape=torch.Size([8, 7186, 128]) b_tri.shape=torch.Size([8, 7186, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 7186, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-64-3584-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 3584, 64]) x_f32.shape=torch.Size([8, 3584, 128]) x_scales.shape=torch.Size([8, 3584, 4])
+b_ref.shape=torch.Size([8, 3584, 128]) b_tri.shape=torch.Size([8, 3584, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 3584, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-64-1792-128-8-2] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 1792, 64]) x_f32.shape=torch.Size([8, 1792, 128]) x_scales.shape=torch.Size([8, 1792, 4])
+b_ref.shape=torch.Size([8, 1792, 128]) b_tri.shape=torch.Size([8, 1792, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 1792, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_1] x.shape=torch.Size([64, 64]) x_f32.shape=torch.Size([64, 128]) x_scales.shape=torch.Size([64, 4])
+x.shape=torch.Size([8, 64, 64]) x_f32.shape=torch.Size([8, 64, 128]) x_scales.shape=torch.Size([8, 64, 4])
+b_ref.shape=torch.Size([8, 64, 128]) b_tri.shape=torch.Size([8, 64, 64]) b_tri., b_mx_scales.shape=torch.Size([8, 64, 4])
+PASSED
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-True-True-mxfp4_e2m1-mxfp4_e2m1-1-1024-16384-2-1] x.shape=torch.Size([1, 8192]) x_f32.shape=torch.Size([1, 16384]) x_scales.shape=torch.Size([1, 512])
+x.shape=torch.Size([2, 1024, 8192]) x_f32.shape=torch.Size([2, 1024, 16384]) x_scales.shape=torch.Size([2, 1024, 512])
+b_ref.shape=torch.Size([2, 1024, 16384]) b_tri.shape=torch.Size([2, 1024, 8192]) b_tri., b_mx_scales.shape=torch.Size([2, 1024, 512])
+PASSED
+
+=============================== warnings summary ===============================
+op_tests/triton_tests/moe/test_moe_mx.py::test_fused_moe[False-False-False-mxfp4_e2m1-mxfp4_e2m1-64-64-128-8-2_0]
+  /root/aiter/aiter/ops/triton/utils/moe_config_utils.py:65: UserWarning: No MoE configuration found for device 'gfx1250' with dtype 'MX_FP4'. Using default configuration.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 60 passed, 1 warning in 45.82s ========================

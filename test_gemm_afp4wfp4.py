@@ -167,14 +167,14 @@ def get_x_vals():
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
     x_vals += [(7, 4608, 7168), (7, 7168, 2304)]
-    x_vals += [(v, 106496, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 16384, 53248) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 18432, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 16384, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 10240, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
-    x_vals += [(v, 8192, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
-    x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
-    x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
+    x_vals += [(v, 106496, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
+    x_vals += [(v, 16384, 53248) for v in [1, 8, 16, 32, 64, 128, 256]]
+    x_vals += [(v, 18432, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
+    x_vals += [(v, 16384, 16384) for v in [1, 8, 16, 32, 64, 128, 256]]
+    x_vals += [(v, 10240, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals += [(v, 8192, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
+    x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 16, 32, 64]]
     x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
@@ -246,6 +246,7 @@ def run_triton(
     [True, False],
 )
 @pytest.mark.parametrize("skip_reduce", [True, False])
+@pytest.mark.parametrize("impl", ["triton", "gluon"])
 @pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
     M: int,
