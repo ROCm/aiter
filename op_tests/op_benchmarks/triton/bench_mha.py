@@ -405,6 +405,10 @@ def _filter_by_memory(configs: list[BenchConfig], threshold: float = 0.90) -> li
     """Remove configs whose estimated memory exceeds threshold of GPU VRAM."""
     total_mem = torch.cuda.get_device_properties(0).total_memory
     limit = int(total_mem * threshold)
+    print(
+        f"GPU VRAM: {total_mem / 1e9:.1f}GB, memory limit: {limit / 1e9:.1f}GB ({threshold:.0%})",
+        flush=True,
+    )
     kept = []
     for c in configs:
         if c.estimated_memory > limit:
