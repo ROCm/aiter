@@ -15,6 +15,149 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
 import os
 
+_FP8_DTYPES = {
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    )
+    if dtype is not None
+}
+
+
+def _should_force_triton_mla() -> bool:
+    return get_gfx() == "gfx1250"
+
+
+def _is_fp8_tensor(x: torch.Tensor) -> bool:
+    return x.dtype in _FP8_DTYPES
+
+
+def _dequantize_triton_mla_tensor(
+    x: torch.Tensor, scale: Optional[torch.Tensor], compute_dtype: torch.dtype
+) -> torch.Tensor:
+    out = x.to(compute_dtype)
+    if scale is not None and _is_fp8_tensor(x):
+        out = out * scale.to(device=out.device, dtype=compute_dtype)
+    return out
+
+
+def _split_mla_prefix_and_extend_kv(
+    qo_indptr: torch.Tensor, kv_indptr: torch.Tensor, kv_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prefix_kv_indices = []
+    extend_kv_indices = []
+    prefix_lens = [0]
+
+    for seq_idx in range(qo_indptr.shape[0] - 1):
+        q_start = qo_indptr[seq_idx].item()
+        q_end = qo_indptr[seq_idx + 1].item()
+        kv_start = kv_indptr[seq_idx].item()
+        kv_end = kv_indptr[seq_idx + 1].item()
+
+        q_len = q_end - q_start
+        kv_len = kv_end - kv_start
+        prefix_len = kv_len - q_len
+        assert prefix_len >= 0, f"invalid MLA lengths: {q_len=} exceeds {kv_len=}"
+
+        seq_kv_indices = kv_indices[kv_start:kv_end]
+        if prefix_len > 0:
+            prefix_kv_indices.append(seq_kv_indices[:prefix_len])
+        if q_len > 0:
+            extend_kv_indices.append(seq_kv_indices[prefix_len:])
+        prefix_lens.append(prefix_lens[-1] + prefix_len)
+
+    prefix_indptr = torch.tensor(
+        prefix_lens, dtype=kv_indptr.dtype, device=kv_indptr.device
+    )
+    prefix_kv_indices = (
+        torch.cat(prefix_kv_indices)
+        if prefix_kv_indices
+        else kv_indices.new_empty((0,), dtype=kv_indices.dtype)
+    )
+    extend_kv_indices = (
+        torch.cat(extend_kv_indices)
+        if extend_kv_indices
+        else kv_indices.new_empty((0,), dtype=kv_indices.dtype)
+    )
+    return prefix_indptr, prefix_kv_indices, extend_kv_indices
+
+
+def _mla_fwd_triton(
+    q: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    o: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    sm_scale: float,
+    logit_cap: float,
+    q_scale: Optional[torch.Tensor] = None,
+    kv_scale: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    from aiter.ops.triton.attention.extend_attention import extend_attention_fwd
+
+    assert page_size == 1, "gfx1250 Triton MLA only supports page_size == 1"
+    assert kv_buffer.shape[1] == 1, "gfx1250 Triton MLA only supports page_size == 1"
+    assert torch.all(kv_last_page_lens == 1).item(), (
+        "gfx1250 Triton MLA only supports kv_last_page_lens == 1"
+    )
+    assert torch.is_floating_point(q), f"unsupported q dtype for Triton MLA: {q.dtype}"
+    assert torch.is_floating_point(kv_buffer), (
+        f"unsupported kv dtype for Triton MLA: {kv_buffer.dtype}"
+    )
+
+    compute_dtype = (
+        torch.float32 if _is_fp8_tensor(q) or _is_fp8_tensor(kv_buffer) else q.dtype
+    )
+    # Reuse Triton extend attention by splitting the KV cache into prefix and current tokens.
+    prefix_indptr, prefix_kv_indices, extend_kv_indices = _split_mla_prefix_and_extend_kv(
+        qo_indptr, kv_indptr, kv_indices
+    )
+
+    _, _, nhead_kv, _ = kv_buffer.shape
+    v_head_dim = o.shape[-1]
+    k_buffer = _dequantize_triton_mla_tensor(
+        kv_buffer.reshape(-1, nhead_kv, kv_buffer.shape[-1]),
+        kv_scale,
+        compute_dtype,
+    ).contiguous()
+    v_buffer = k_buffer[..., :v_head_dim].contiguous()
+    q_extend = _dequantize_triton_mla_tensor(q, q_scale, compute_dtype).contiguous()
+    k_extend = torch.index_select(k_buffer, 0, extend_kv_indices).contiguous()
+    v_extend = k_extend[..., :v_head_dim].contiguous()
+
+    triton_out = (
+        o
+        if o.dtype == compute_dtype
+        else torch.empty_like(o, dtype=compute_dtype, device=o.device)
+    )
+    extend_attention_fwd(
+        q_extend,
+        k_extend,
+        v_extend,
+        triton_out,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        prefix_indptr,
+        prefix_kv_indices,
+        None,
+        True,
+        None,
+        max_seqlen_q,
+        sm_scale=sm_scale,
+        logit_cap=logit_cap,
+    )
+    if triton_out is not o:
+        o.copy_(triton_out.to(dtype=o.dtype))
+    return o, None
+
 
 @triton.jit
 def _fwd_kernel_stage2_asm(
@@ -182,6 +325,23 @@ def mla_decode_fwd(
 
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    if _should_force_triton_mla():
+        return _mla_fwd_triton(
+            q,
+            kv_buffer,
+            o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            page_size,
+            sm_scale,
+            logit_cap,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
 
     ori_total_s, ori_nhead, ori_v_head_dim = o.shape
     total_s, nhead, v_head_dim = o.shape
@@ -485,11 +645,26 @@ def mla_prefill_fwd(
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
+    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     bs, nhead, v_head_dim = o.shape
+
+    if _should_force_triton_mla():
+        return _mla_fwd_triton(
+            q,
+            kv_buffer,
+            o,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            page_size,
+            sm_scale,
+            logit_cap,
+        )
 
     num_kv_splits = 1
 
