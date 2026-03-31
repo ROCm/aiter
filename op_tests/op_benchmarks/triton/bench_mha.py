@@ -8,6 +8,7 @@ import triton
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
+    flash_attn_with_kvcache,
     mha_set_use_fused_bwd_kernel,
     mha_set_impl,
 )
@@ -41,6 +42,9 @@ class BenchRun:
     bench_torch: bool
 
 
+VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
+
+
 @dataclass(frozen=True)
 class BenchConfig:
     batch: int
@@ -51,8 +55,7 @@ class BenchConfig:
     d_head: int
     d_head_v: int
     causal: bool
-    layout: str  # "bshd" or "thd"
-    mode: str  # "fwd" or "bwd"
+    function: str  # "fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"
     dtype_str: str  # "bf16", "fp16", "fp32", "fp8"
     impl: str = "default"  # "default" or "dao_ai"
     fused: bool = False
@@ -63,8 +66,20 @@ class BenchConfig:
         return (
             f"{label} B={self.batch} HQ={self.hq} HK={self.hk} "
             f"sq={self.sq} sk={self.sk} d={self.d_head} "
-            f"{self.layout} {self.mode} {self.dtype_str} causal={self.causal}"
+            f"{self.function} {self.dtype_str} causal={self.causal}"
         )
+
+    @property
+    def is_varlen(self) -> bool:
+        return "varlen" in self.function
+
+    @property
+    def is_bwd(self) -> bool:
+        return self.function.startswith("bwd")
+
+    @property
+    def is_decode(self) -> bool:
+        return self.function == "fwd_kvcache"
 
     def to_tuple(self) -> tuple:
         return (
@@ -77,16 +92,14 @@ class BenchConfig:
             self.d_head,
             self.d_head_v,
             self.causal,
-            self.layout,
-            self.mode,
+            self.function,
             self.dtype_str,
             self.impl,
             self.fused,
         )
 
 
-def _make_bf16_fn(q, k, v, **kw):
-    mha_set_use_fused_bwd_kernel(False)
+def _make_attn_fn(q, k, v, **kw):
     return lambda: flash_attn_func(
         q,
         k,
@@ -100,48 +113,7 @@ def _make_bf16_fn(q, k, v, **kw):
     )
 
 
-def _make_bf16_varlen_fn(q, k, v, **kw):
-    mha_set_use_fused_bwd_kernel(False)
-    return lambda: flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        kw["cu_seqlens_q"],
-        kw["cu_seqlens_k"],
-        kw["max_seqlen_q"],
-        kw["max_seqlen_k"],
-        dropout_p=kw["dropout"],
-        softmax_scale=kw["sm_scale"],
-        causal=kw["causal"],
-        return_lse=kw["return_lse"],
-        return_attn_probs=kw["return_attn_probs"],
-        sink=kw["sink"],
-    )
-
-
-def _make_bf16_fused_fn(q, k, v, **kw):
-    if kw.get("has_pe") or kw.get("has_sink"):
-        warnings.warn("Skipping: PE or sink not supported for this provider.")
-        return None
-    mha_set_use_fused_bwd_kernel(True)
-    return lambda: flash_attn_func(
-        q,
-        k,
-        v,
-        dropout_p=kw["dropout"],
-        softmax_scale=kw["sm_scale"],
-        causal=kw["causal"],
-        return_lse=kw["return_lse"],
-        return_attn_probs=kw["return_attn_probs"],
-        sink=kw["sink"],
-    )
-
-
-def _make_bf16_fused_varlen_fn(q, k, v, **kw):
-    if kw.get("has_pe") or kw.get("has_sink"):
-        warnings.warn("Skipping: PE or sink not supported for this provider.")
-        return None
-    mha_set_use_fused_bwd_kernel(True)
+def _make_varlen_fn(q, k, v, **kw):
     return lambda: flash_attn_varlen_func(
         q,
         k,
@@ -160,10 +132,6 @@ def _make_bf16_fused_varlen_fn(q, k, v, **kw):
 
 
 def _make_fp8_fn(q, k, v, **kw):
-    if kw.get("has_pe") or kw.get("has_sink"):
-        warnings.warn("Skipping: PE or sink not supported for this provider.")
-        return None
-    mha_set_use_fused_bwd_kernel(False)
     return lambda: flash_attn_fp8_func(
         q,
         k,
@@ -174,10 +142,6 @@ def _make_fp8_fn(q, k, v, **kw):
 
 
 def _make_fp8_varlen_fn(q, k, v, **kw):
-    if kw.get("has_pe") or kw.get("has_sink"):
-        warnings.warn("Skipping: PE or sink not supported for this provider.")
-        return None
-    mha_set_use_fused_bwd_kernel(False)
     return lambda: flash_attn_varlen_fp8_func(
         q,
         k,
@@ -191,160 +155,70 @@ def _make_fp8_varlen_fn(q, k, v, **kw):
     )
 
 
+def _make_kvcache_fn(q, k_cache, v_cache, **kw):
+    return lambda: flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=kw["cache_seqlens"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+    )
+
+
+# Dispatch: function -> make_fn
+# fwd/bwd share the same make_fn (bwd is layered on top via autograd.grad)
 _MAKE_FN = {
-    ("bf16", "bshd"): _make_bf16_fn,
-    ("bf16", "thd"): _make_bf16_varlen_fn,
-    ("fp16", "bshd"): _make_bf16_fn,
-    ("fp16", "thd"): _make_bf16_varlen_fn,
-    ("fp32", "bshd"): _make_bf16_fn,
-    ("fp32", "thd"): _make_bf16_varlen_fn,
-    ("fp8", "bshd"): _make_fp8_fn,
-    ("fp8", "thd"): _make_fp8_varlen_fn,
-    ("bf16_fused", "bshd"): _make_bf16_fused_fn,
-    ("bf16_fused", "thd"): _make_bf16_fused_varlen_fn,
-    ("fp16_fused", "bshd"): _make_bf16_fused_fn,
-    ("fp16_fused", "thd"): _make_bf16_fused_varlen_fn,
-    ("fp32_fused", "bshd"): _make_bf16_fused_fn,
-    ("fp32_fused", "thd"): _make_bf16_fused_varlen_fn,
+    "fwd": _make_attn_fn,
+    "bwd": _make_attn_fn,
+    "fwd_varlen": _make_varlen_fn,
+    "bwd_varlen": _make_varlen_fn,
+    "fwd_kvcache": _make_kvcache_fn,
+}
+
+_MAKE_FN_FP8 = {
+    "fwd": _make_fp8_fn,
+    "fwd_varlen": _make_fp8_varlen_fn,
 }
 
 
-def get_make_fn(dtype: str, layout: str, fused: bool = False) -> Callable:
-    key = (f"{dtype}_fused" if fused else dtype, layout)
-    return _MAKE_FN[key]
+def get_make_fn(function: str, dtype: str) -> Callable:
+    if dtype == "fp8":
+        return _MAKE_FN_FP8[function]
+    return _MAKE_FN[function]
 
 
-def edge_case_configs(
-    dtypes: list[str],
-    modes: list[str],
-    impl: str,
-    fused: bool,
-) -> list[BenchConfig]:
-    """Configs covering gaps in model benchmarks: decode, non-causal,
-    mismatched sq/sk, non-power-of-2 seqlens, batched, bshd layout."""
-    d_head = 128
-    configs: list[BenchConfig] = []
+# (batch, sq, sk, causal, functions)
+# Each scenario declares which functions are relevant for it
 
-    # Decode: sq=1, large KV cache
-    for (hq, hk), sk, b, m, d in itertools.product(
-        [(32, 8), (64, 8)],
-        [4096, 8192],
-        [1, 8],
-        modes,
-        dtypes,
-    ):
-        configs.append(
-            BenchConfig(
-                batch=b,
-                hq=hq,
-                hk=hk,
-                sq=1,
-                sk=sk,
-                d_head=d_head,
-                d_head_v=d_head,
-                causal=True,
-                layout="thd",
-                mode=m,
-                dtype_str=d,
-                impl=impl,
-                fused=fused and d != "fp8",
-            )
-        )
+PREFILL_SCENARIOS = [
+    (4, 256, 256, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
+    (4, 1024, 1024, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
+    (4, 4096, 4096, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
+    (4, 8192, 8192, True, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
+    # Cross-attention
+    (4, 1024, 4096, False, ["fwd", "bwd", "fwd_varlen", "bwd_varlen"]),
+]
 
-    # Non-causal (cross-attention): sq != sk
-    for (hq, hk), (sq, sk), m, d in itertools.product(
-        [(32, 32), (64, 8)],
-        [(512, 1024), (1024, 4096)],
-        modes,
-        dtypes,
-    ):
-        configs.append(
-            BenchConfig(
-                batch=4,
-                hq=hq,
-                hk=hk,
-                sq=sq,
-                sk=sk,
-                d_head=d_head,
-                d_head_v=d_head,
-                causal=False,
-                layout="bshd",
-                mode=m,
-                dtype_str=d,
-                impl=impl,
-                fused=fused and d != "fp8",
-            )
-        )
-
-    # Non-power-of-2 seqlens
-    for (hq, hk), (sq, sk), m, d in itertools.product(
-        [(32, 8)],
-        [(163, 163), (1000, 2000)],
-        modes,
-        dtypes,
-    ):
-        configs.append(
-            BenchConfig(
-                batch=4,
-                hq=hq,
-                hk=hk,
-                sq=sq,
-                sk=sk,
-                d_head=d_head,
-                d_head_v=d_head,
-                causal=True,
-                layout="thd",
-                mode=m,
-                dtype_str=d,
-                impl=impl,
-                fused=fused and d != "fp8",
-            )
-        )
-
-    # Batched bshd (training-like)
-    for (hq, hk), sq, b, m, d in itertools.product(
-        [(32, 8), (64, 8)],
-        [1024, 4096],
-        [4, 16],
-        modes,
-        dtypes,
-    ):
-        configs.append(
-            BenchConfig(
-                batch=b,
-                hq=hq,
-                hk=hk,
-                sq=sq,
-                sk=sq,
-                d_head=d_head,
-                d_head_v=d_head,
-                causal=True,
-                layout="bshd",
-                mode=m,
-                dtype_str=d,
-                impl=impl,
-                fused=fused and d != "fp8",
-            )
-        )
-
-    return configs
+DECODE_SCENARIOS = [
+    (32, 1, 1024, True, ["fwd_kvcache"]),
+    (32, 1, 4096, True, ["fwd_kvcache"]),
+    (32, 1, 8192, True, ["fwd_kvcache"]),
+]
 
 
 def model_benchmark_configs(
     args,
     *,
     dtypes: list[str],
-    modes: list[str],
+    functions: list[str],
     impl: str,
     fused: bool,
-    layout: str | None = None,
     model: str | None = None,
 ) -> list[BenchConfig]:
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=model or "all")
-    layouts = [layout] if layout else ["thd", "bshd"]
     fa_configs: list[BenchConfig] = []
-    causals = [args.causal] if args.causal is not None else [True]
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
@@ -356,37 +230,38 @@ def model_benchmark_configs(
         HEAD_DIM = config["hidden_size"] // HQ
         if args.sq:
             b = args.b if args.b else 1
-            scenarios = [(b, args.sq, args.sk if args.sk else args.sq)]
+            causal = args.causal if args.causal is not None else True
+            scenarios = [(b, args.sq, args.sk if args.sk else args.sq, causal, functions)]
         else:
-            # (batch, sq, sk) triplets for realistic serving scenarios
-            # Prefill: few concurrent prefills, sq == sk
-            prefill = [(4, s, s) for s in [256, 1024, 4096, 8192]]
-            # Decode: many concurrent decodes, sq=1
-            decode = [(32, 1, s) for s in [1024, 4096, 8192]]
-            scenarios = prefill + decode
+            scenarios = PREFILL_SCENARIOS + DECODE_SCENARIOS
             if args.b:
-                scenarios = [(args.b, sq, sk) for (_, sq, sk) in scenarios]
-        for (b, sq, sk), lay, c, m, d in itertools.product(
-            scenarios, layouts, causals, modes, dtypes
+                scenarios = [(args.b, sq, sk, c, fns) for (_, sq, sk, c, fns) in scenarios]
+            if args.causal is not None:
+                scenarios = [(b, sq, sk, c, fns) for (b, sq, sk, c, fns) in scenarios if c == args.causal]
+
+        for (b, sq, sk, causal, scenario_fns), d in itertools.product(
+            scenarios, dtypes
         ):
-            fa_configs.append(
-                BenchConfig(
-                    model=model_name,
-                    batch=b,
-                    hq=HQ,
-                    hk=HK,
-                    sq=sq,
-                    sk=sk,
-                    d_head=HEAD_DIM,
-                    d_head_v=HEAD_DIM,
-                    causal=c,
-                    layout=lay,
-                    mode=m,
-                    dtype_str=d,
-                    impl=impl,
-                    fused=fused and d != "fp8",
+            for fn in scenario_fns:
+                if fn not in functions:
+                    continue
+                fa_configs.append(
+                    BenchConfig(
+                        model=model_name,
+                        batch=b,
+                        hq=HQ,
+                        hk=HK,
+                        sq=sq,
+                        sk=sk,
+                        d_head=HEAD_DIM,
+                        d_head_v=HEAD_DIM,
+                        causal=causal,
+                        function=fn,
+                        dtype_str=d,
+                        impl=impl,
+                        fused=fused and d != "fp8",
+                    )
                 )
-            )
 
     return fa_configs
 
@@ -433,8 +308,7 @@ def _make_triton_benchmark(run: BenchRun) -> list:
         "D_HEAD",
         "D_HEAD_V",
         "causal",
-        "layout",
-        "mode",
+        "function",
         "dtype",
         "impl",
         "fused",
@@ -473,8 +347,7 @@ def run_benchmark(run: BenchRun):
         D_HEAD,
         D_HEAD_V,
         causal,
-        layout,
-        mode,
+        function,
         dtype,
         impl,
         fused,
@@ -490,18 +363,24 @@ def run_benchmark(run: BenchRun):
         label = model or "custom"
         print(
             f"[{counter}/{total}] {label} B={BATCH} HQ={HQ} HK={HK} "
-            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {layout} {mode} {dtype} causal={causal}",
+            f"sq={N_CTX_Q} sk={N_CTX_K} d={D_HEAD} {function} {dtype} causal={causal}",
             flush=True,
         )
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
-        requires_grad = mode == "bwd"
+        is_bwd = function.startswith("bwd")
+        is_varlen = "varlen" in function
+        is_decode = function == "fwd_kvcache"
+        requires_grad = is_bwd
         return_lse = True
         return_attn_probs = False
-        varlen = layout == "thd"
         has_pe = D_HEAD > D_HEAD_V
         if impl != "default":
             mha_set_impl(impl)
-        make_fn = get_make_fn(dtype, layout, fused)
+        if (fused or dtype == "fp8") and (has_pe or run.sink):
+            warnings.warn("Skipping: PE or sink not supported with fused bwd / fp8.")
+            return 0
+        mha_set_use_fused_bwd_kernel(fused)
+        make_fn = get_make_fn(function, dtype)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
@@ -536,7 +415,27 @@ def run_benchmark(run: BenchRun):
         total_flops = 0.0
 
         # Input preparation
-        if varlen:
+        if is_decode:
+            # KV cache: q is (B, 1, Hq, D), k/v caches are (B, sk, Hk, D)
+            q_input = q[:, :N_CTX_Q, :, :]  # (B, sq, Hq, D)
+            k_cache = k[:, :N_CTX_K, :, :]  # (B, sk, Hk, D)
+            v_cache = v[:, :N_CTX_K, :, :D_HEAD_V]
+            cache_seqlens = torch.full(
+                (BATCH,), N_CTX_K, dtype=torch.int32, device=device
+            )
+            total_flops += (
+                2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
+            )
+
+            fn_kwargs = dict(
+                sm_scale=sm_scale,
+                causal=causal,
+                cache_seqlens=cache_seqlens,
+            )
+            fn = make_fn(q_input, k_cache, v_cache, **fn_kwargs)
+            if fn is None:
+                return 0
+        elif is_varlen:
             query_padding_mask = generate_random_padding_mask(
                 N_CTX_Q, BATCH, device, mode="full" if run.equal_seqlens else "random"
             )
@@ -579,6 +478,24 @@ def run_benchmark(run: BenchRun):
                     total_flops += valid_out_elements * HQ * (D_HEAD + D_HEAD_V) * 2.0
                 else:
                     total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
+
+            fn_kwargs = dict(
+                sm_scale=sm_scale,
+                causal=causal,
+                dropout=dropout,
+                return_lse=return_lse,
+                return_attn_probs=return_attn_probs,
+                sink=sink,
+                has_pe=has_pe,
+                has_sink=run.sink,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+            )
+            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+            if fn is None:
+                return 0
         else:
             q_input, k_input, v_input = q, k, v
 
@@ -596,29 +513,21 @@ def run_benchmark(run: BenchRun):
                     2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
                 )
 
-        # Build fn from provider
-        fn_kwargs = dict(
-            sm_scale=sm_scale,
-            causal=causal,
-            dropout=dropout,
-            return_lse=return_lse,
-            return_attn_probs=return_attn_probs,
-            sink=sink,
-            has_pe=has_pe,
-            has_sink=run.sink,
-        )
-        if varlen:
-            fn_kwargs.update(
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
+            fn_kwargs = dict(
+                sm_scale=sm_scale,
+                causal=causal,
+                dropout=dropout,
+                return_lse=return_lse,
+                return_attn_probs=return_attn_probs,
+                sink=sink,
+                has_pe=has_pe,
+                has_sink=run.sink,
             )
-        fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
-        if fn is None:
-            return 0
+            fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
+            if fn is None:
+                return 0
 
-        if mode == "bwd":
+        if is_bwd:
             with torch.enable_grad():
                 triton_out = fn()[0]
                 d_out = torch.randn_like(triton_out)
@@ -661,24 +570,24 @@ def run_benchmark(run: BenchRun):
             shape_str = (
                 f"{model}_B{BATCH}_HQ{HQ}_HK{HK}_SQ{N_CTX_Q}_SK{N_CTX_K}_D{D_HEAD}"
             )
-            print(f"\n--- Profile: {mode} {shape_str} ---")
+            print(f"\n--- Profile: {function} {shape_str} ---")
             print(
                 prof.key_averages().table(
                     sort_by="self_cuda_time_total",
                     row_limit=30,
                 )
             )
-            trace_dir = os.path.join(run.profile_dir, f"{mode}_{shape_str}")
+            trace_dir = os.path.join(run.profile_dir, f"{function}_{shape_str}")
             os.makedirs(trace_dir, exist_ok=True)
             prof.export_chrome_trace(os.path.join(trace_dir, "trace.json"))
             return 0
 
         ms = triton.testing.do_bench(fn)
 
-        if mode == "bwd":
+        if is_bwd:
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 
-        if varlen:
+        if is_varlen:
             total_num_tokens_q = cu_seqlens_q[-1].item()
             total_num_tokens_k = cu_seqlens_k[-1].item()
         else:
@@ -688,16 +597,16 @@ def run_benchmark(run: BenchRun):
         k_size = total_num_tokens_k * HK * D_HEAD * k.element_size()
         v_size = total_num_tokens_k * HK * D_HEAD_V * v.element_size()
         o_size = total_num_tokens_q * HQ * D_HEAD_V * q.element_size()
-        if mode == "fwd":
-            # read q, k, v
-            mem_read = q_size + k_size + v_size
-            # write o
-            mem_write = o_size
-        else:
+        if is_bwd:
             # read q, k, v, do
             mem_read = q_size + k_size + v_size + o_size
             # write dq, dk, dv
             mem_write = q_size + k_size + v_size
+        else:
+            # read q, k, v
+            mem_read = q_size + k_size + v_size
+            # write o
+            mem_write = o_size
         mem = mem_read + mem_write
 
         if unit == "ms":
@@ -711,14 +620,6 @@ def run_benchmark(run: BenchRun):
         bench_mha.run(save_path=run.save_path, print_data=True)
     except Exception as e:
         print(f"\n[WARN] benchmark failed: {e}", flush=True)
-
-
-def supported_layouts():
-    layouts = (
-        "bshd: Q, K, V are individual tensors of [batch, seqlen_q/k, num_heads, head_size]. "
-        "thd: Q, K, V are individual tensors of [total_q/k, num_heads, head_size]. "
-    )
-    return layouts
 
 
 # argparse lacks support for boolean argument type (sigh...)
@@ -745,7 +646,10 @@ arg_to_torch_dtype = {
 def parse_args(args: list[str] | None = None) -> BenchRun:
     parser = get_parser(kernel_name="FlashAttention")
     parser.add_argument(
-        "-mode", type=str, default=None, help="fwd, bwd, or omit for both"
+        "-fn",
+        type=str,
+        default=None,
+        help=f"Function to benchmark: {sorted(VALID_FUNCTIONS)}. Omit for all.",
     )
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
@@ -756,7 +660,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         "-equal_seqlens",
         action="store_true",
         default=False,
-        help="If specified, uses equal sequence lengths with thd layout, i.e t = b * sq",
+        help="If specified, uses equal sequence lengths with varlen functions, i.e t = b * sq",
     )
     parser.add_argument(
         "-d",
@@ -775,7 +679,6 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
     parser.add_argument(
         "-metric",
         nargs="?",
@@ -827,11 +730,11 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     tensor_dtype_str = next((d for d in dtypes if d != "fp8"), "bf16")
     torch_dtype = arg_to_torch_dtype[tensor_dtype_str]
 
-    assert parsed.layout in (
-        None,
-        "bshd",
-        "thd",
-    ), f"{parsed.layout} is not a supported layout. Use 'bshd' or 'thd'."
+    # Validate function
+    if parsed.fn:
+        assert (
+            parsed.fn in VALID_FUNCTIONS
+        ), f"Unknown function '{parsed.fn}'. Supported: {sorted(VALID_FUNCTIONS)}"
 
     custom = bool(parsed.hq or parsed.hk or parsed.d or parsed.dv)
     if custom:
@@ -845,13 +748,6 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
             not custom
         ), "--model sets hq, hk, d from the config. Do not provide them."
 
-    if parsed.layout in ("thd", None) and parsed.equal_seqlens:
-        warnings.warn(
-            "Using 'thd' layout with equal_seqlen=True incurs an extra sequence length lookup cost "
-            "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
-            category=RuntimeWarning,
-        )
-
     # Resolve metric/unit
     metric = parsed.metric or "throughput"
     unit_map = {"throughput": "TFLOPS", "time": "ms", "bandwidth": "GB/s"}
@@ -860,7 +756,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     # Build configs
     impl = parsed.impl
     fused = parsed.fused_bwd
-    modes = [parsed.mode] if parsed.mode else ["fwd", "bwd"]
+    functions = [parsed.fn] if parsed.fn else sorted(VALID_FUNCTIONS)
     d_head = parsed.d if parsed.d else 128
     d_head_v = parsed.dv if parsed.dv else d_head
 
@@ -868,7 +764,6 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         hk = parsed.hk if parsed.hk else parsed.hq
         sk = parsed.sk if parsed.sk else parsed.sq
         causals = [parsed.causal] if parsed.causal is not None else [False, True]
-        custom_layout = parsed.layout or "bshd"
         configs = [
             BenchConfig(
                 model=f"custom_B{parsed.b}_HQ{parsed.hq}_HK{hk}",
@@ -880,30 +775,27 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
                 d_head=d_head,
                 d_head_v=d_head_v,
                 causal=c,
-                layout=custom_layout,
-                mode=m,
+                function=fn,
                 dtype_str=d,
                 impl=impl,
                 fused=fused and d != "fp8",
             )
-            for c, m, d in itertools.product(causals, modes, dtypes)
+            for c, fn, d in itertools.product(causals, functions, dtypes)
         ]
     elif parsed.model:
         configs = model_benchmark_configs(
             parsed,
             dtypes=dtypes,
-            modes=modes,
+            functions=functions,
             impl=impl,
             fused=fused,
             model=parsed.model,
-            layout=parsed.layout,
         )
     else:
-        # Default: all models, both layouts, both modes
         configs = model_benchmark_configs(
             parsed,
             dtypes=dtypes,
-            modes=modes,
+            functions=functions,
             impl=impl,
             fused=fused,
         )
