@@ -565,7 +565,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_enum"]
+rebuilded_list = ["module_aiter_enum", "module_aiter_tensor"]
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -844,7 +844,7 @@ def build_module(
                 f"{AITER_CSRC_DIR}/include",
                 f"{op_dir}/blob",
             ] + _extra_inc
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
         else:
             old_bd_include_dir = f"{op_dir}/build/include"
@@ -856,7 +856,7 @@ def build_module(
                 hipify,
             )
 
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 bd_include_dir = f"{op_dir}/build/include/torch"
                 os.makedirs(bd_include_dir, exist_ok=True)
                 rename_cpp_to_cu(
@@ -961,9 +961,22 @@ def _get_ck_exclude_modules():
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
-        "module_rope_general_bwd",
-        "module_rope_general_fwd",
-        "module_rope_pos_fwd",
+        "module_rope_1c_uncached_fwd",
+        "module_rope_1c_uncached_bwd",
+        "module_rope_2c_uncached_fwd",
+        "module_rope_2c_uncached_bwd",
+        "module_rope_1c_cached_fwd",
+        "module_rope_1c_cached_bwd",
+        "module_rope_2c_cached_fwd",
+        "module_rope_2c_cached_bwd",
+        "module_rope_1c_thd_fwd",
+        "module_rope_1c_thd_bwd",
+        "module_rope_1c_2d_fwd",
+        "module_rope_1c_2d_bwd",
+        "module_rope_1c_cached_positions_fwd",
+        "module_rope_2c_cached_positions_fwd",
+        "module_rope_1c_cached_positions_offsets_fwd",
+        "module_rope_2c_cached_positions_offsets_fwd",
         "module_sample",
         "module_topk_plain",
     }
@@ -1087,8 +1100,8 @@ def _ctypes_call(func, fc_name, md_name):
     ----------------------|----------------------|---------
     Tensor                | POINTER(aiter_tensor_t) | aiter_tensor_t*
     Optional[Tensor]      | POINTER(aiter_tensor_t) | aiter_tensor_t* (NULL if None)
-    int                   | c_int                | int
-    Optional[int]         | c_int                | int   (-1 if None)
+    int                   | c_int64              | int64_t
+    Optional[int]         | c_int64              | int64_t (-1 if None)
     str                   | c_char_p             | char* (.encode())
     Optional[str]         | c_char_p             | char* (NULL if None)
     bool                  | c_int                | int   (0 / 1)
@@ -1099,8 +1112,10 @@ def _ctypes_call(func, fc_name, md_name):
     """
     import ctypes
     import inspect
+
     import torch
-    from ..utility.dtypes import torch_to_aiter, aiter_tensor_t
+
+    from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
 
     _cache = {}
     _arg_checked = False
@@ -1128,20 +1143,31 @@ def _ctypes_call(func, fc_name, md_name):
             )
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
-        c_func.restype = None
 
         hints = typing.get_type_hints(func)
+
+        ret_hint = hints.get("return")
+        if ret_hint is int:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is float:
+            c_func.restype = ctypes.c_float
+        else:
+            c_func.restype = None
+
         argtypes = []
+        has_tensor = False
         for pname in inspect.signature(func).parameters:
             hint = hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                has_tensor = True
             elif _is_union(origin) and torch.Tensor in type_args:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                has_tensor = True
             elif _is_union(origin) and int in type_args:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
             elif hint is str:
@@ -1149,16 +1175,18 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
             elif hint is int:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif hint is float:
                 argtypes.append(ctypes.c_float)
             else:
                 argtypes.append(ctypes.c_void_p)
-        argtypes.append(ctypes.c_void_p)  # hipStream_t
+        if has_tensor:
+            argtypes.append(ctypes.c_void_p)  # hipStream_t
         c_func.argtypes = argtypes
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
+        _cache["has_tensor"] = has_tensor
 
     def _check_args_before_convert(bound_args, hints):
         for pname, value in bound_args.items():
@@ -1220,6 +1248,10 @@ def _ctypes_call(func, fc_name, md_name):
         _ensure_loaded()
         c_func = _cache["c_func"]
 
+        if AITER_LOG_MORE == 2:
+            from ..test_common import log_args
+
+            log_args(func, *args, **kwargs)
         sig = inspect.signature(func)
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
@@ -1262,16 +1294,17 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 c_args.append(1 if value else 0)
             elif hint is int:
-                c_args.append(ctypes.c_int(value))
+                c_args.append(ctypes.c_int64(value))
             elif hint is float:
                 c_args.append(ctypes.c_float(value))
             else:
                 c_args.append(value)
 
-        c_args.append(
-            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-        )
-        c_func(*c_args)
+        if _cache.get("has_tensor"):
+            c_args.append(
+                ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+            )
+        return c_func(*c_args)
 
     return caller
 
@@ -1291,7 +1324,7 @@ def compile_ops(
 
             @functools.wraps(func)
             def ctypes_wrapper(*args, **kwargs):
-                ctypes_caller(*args, **kwargs)
+                return ctypes_caller(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", calling_func_=func)
             def ctypes_custom_wrapper(*args, **kwargs):
@@ -1314,11 +1347,8 @@ def compile_ops(
                         rebuilded_list.append(md_name)
                         raise ModuleNotFoundError("start rebuild")
                     if module is None:
-                        try:
-                            module = get_module(md_name)
-                        except Exception:
-                            md = custom_build_args.get("md_name", md_name)
-                            module = get_module(md)
+                        md = custom_build_args.get("md_name", md_name)
+                        module = get_module(md)
                 except ModuleNotFoundError:
                     d_args = get_args_of_build(md_name)
                     d_args.update(custom_build_args)
@@ -1392,17 +1422,30 @@ def compile_ops(
                         doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
                         doc_str = doc_str.replace("typing.SupportsInt", "int")
                         doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                        doc_str = re.sub(r"\s*\|\s*typing\.SupportsIndex", "", doc_str)
                         pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                         doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                         for el in enum_types:
                             doc_str = re.sub(
                                 f" (module_)?aiter.*{el} ", f" {el} ", doc_str
                             )
+                        doc_str = re.sub(
+                            r"(?:[\w.]+\.)?aiter_tensor_t",
+                            "aiter_tensor_t",
+                            doc_str,
+                        )
+                        try:
+                            aiter_tensor_t = get_module(
+                                "module_aiter_tensor"
+                            ).aiter_tensor_t
+                        except Exception:
+                            aiter_tensor_t = object
                         namespace = {
                             "List": List,
                             "Optional": Optional,
                             "torch": torch,
                             "typing": typing,
+                            "aiter_tensor_t": aiter_tensor_t,
                         }
 
                         exec(

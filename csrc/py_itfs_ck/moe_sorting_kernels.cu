@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "py_itfs_common.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -33,12 +33,13 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int workspace_size = moe_sorting_get_workspace_size(num_tokens, num_experts, topk, dispatch_policy);
-    void* ws_ptr       = nullptr;
+    torch::Tensor ws;
+    void* ws_ptr = nullptr;
     if(workspace_size > 0)
     {
-        auto ws = torch::empty({workspace_size},
+        ws     = torch::empty({workspace_size},
                                torch::TensorOptions().dtype(dtype).device(device_of(topk_ids)));
-        ws_ptr  = ws.data_ptr();
+        ws_ptr = ws.data_ptr();
     }
 
     moe_sorting(
