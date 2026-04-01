@@ -41,7 +41,7 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
-@compile_ops("module_aiter_tensor", "make_aiter_tensor")
+@compile_ops("module_aiter_core", "make_aiter_tensor")
 def _make_aiter_tensor(data_ptr, numel, ndim, shape, strides, dtype, device_id): ...
 
 
@@ -50,7 +50,7 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
 
     Unlike torch_to_aiter() which returns a ctypes aiter_tensor_t struct,
     this function constructs a *pybind11* aiter_tensor_t via
-    module_aiter_tensor.  The two types are not interchangeable.
+    module_aiter_core.  The two types are not interchangeable.
     """
     return _make_aiter_tensor(
         tensor.data_ptr(),

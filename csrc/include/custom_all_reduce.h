@@ -39,26 +39,22 @@ void all_reduce(fptr_t _fa,
                 int64_t reg_inp_ptr,
                 int64_t reg_inp_bytes,
                 int64_t reg_out_ptr,
-                int64_t reg_out_bytes,
-                int64_t stream);
+                int64_t reg_out_bytes);
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
                     int64_t reg_ptr,
-                    int64_t reg_bytes,
-                    int64_t stream);
+                    int64_t reg_bytes);
 void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t dim,
-                    int64_t stream);
+                    int64_t dim);
 void all_gather_unreg(fptr_t _fa,
                       const aiter_tensor_t& inp,
                       int64_t reg_buffer,
                       const aiter_tensor_t& out,
                       int64_t reg_bytes,
-                      int64_t dim,
-                      int64_t stream);
+                      int64_t dim);
 void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& inp,
                              const aiter_tensor_t& res_inp,
@@ -68,8 +64,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              double eps,
                              int64_t reg_ptr,
                              int64_t reg_bytes,
-                             bool use_1stage,
-                             int64_t stream);
+                             bool use_1stage);
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,
@@ -80,8 +75,7 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    double eps,
                                    int64_t reg_ptr,
                                    int64_t reg_bytes,
-                                   bool use_1stage,
-                                   int64_t stream);
+                                   bool use_1stage);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_input_buffer(fptr_t _fa,
@@ -100,7 +94,7 @@ void register_graph_buffers(fptr_t _fa,
                             const std::vector<int64_t>& handle_ptrs,
                             const std::vector<int64_t>& offset_ptrs);
 #ifdef USE_ROCM
-int64_t allocate_meta_buffer(int64_t size, int64_t stream);
+int64_t allocate_meta_buffer(int64_t size);
 void free_meta_buffer(int64_t ptr);
 void get_meta_buffer_ipc_handle(int64_t inp_ptr, int64_t out_handle_ptr);
 #endif

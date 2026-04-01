@@ -565,7 +565,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_enum", "module_aiter_tensor"]
+rebuilded_list = ["module_aiter_core"]
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -1315,6 +1315,7 @@ def compile_ops(
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
     ffi_type: str = "pybind",
+    develop: bool = False,
 ):
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
@@ -1436,7 +1437,7 @@ def compile_ops(
                         )
                         try:
                             aiter_tensor_t = get_module(
-                                "module_aiter_tensor"
+                                "module_aiter_core"
                             ).aiter_tensor_t
                         except Exception:
                             aiter_tensor_t = object
@@ -1502,6 +1503,13 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
 
+                if develop and _md_name != "module_aiter_core":
+                    import torch
+
+                    stream = torch.cuda.current_stream()
+                    get_module("module_aiter_core")._set_current_hip_stream(
+                        stream.cuda_stream
+                    )
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
