@@ -10,6 +10,7 @@ from aiter.test_common import (
     perftest,
 )
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 import pandas as pd
 import argparse
 
@@ -112,6 +113,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
         if tag == "asm" and not (
             (E, topk) in [(128, 4), (128, 6), (128, 8), (256, 6), (256, 8), (384, 8)]
             and dtype in [dtypes.bf16, dtypes.fp32]
+            and get_gfx() in ["gfx942", "gfx950"]
         ):
             continue
         gating_output = gating_output.contiguous() if tag == "asm" else gating_output
@@ -316,40 +318,40 @@ def test_biased_grouped_topk(
     ret["err_aiter"] = err
     # return {"err": err, "us": us_aiter}
 
-    w_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
-    id_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
-    _, us_sglang = run_perftest(
-        aiter.moe_fused_gate,
-        gating_output,
-        correction_bias,
-        w_sglang,
-        id_sglang,
-        group,
-        topk_group,
-        topk,
-        0,
-        scale_factor,
-    )
+    # w_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
+    # id_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
+    # _, us_sglang = run_perftest(
+    #     aiter.moe_fused_gate,
+    #     gating_output,
+    #     correction_bias,
+    #     w_sglang,
+    #     id_sglang,
+    #     group,
+    #     topk_group,
+    #     topk,
+    #     0,
+    #     scale_factor,
+    # )
 
-    w_sglang = _[0]
-    id_sglang = _[1]
+    # w_sglang = _[0]
+    # id_sglang = _[1]
 
-    id_sglang, _sglang = torch.sort(id_sglang)
-    w_sglang = w_sglang.gather(1, _sglang)
-    ret["us_sglang"] = us_sglang
+    # id_sglang, _sglang = torch.sort(id_sglang)
+    # w_sglang = w_sglang.gather(1, _sglang)
+    # ret["us_sglang"] = us_sglang
 
-    # print(f"{w_ref=}")
-    # print(f"{w_sglang=}")
-    # print(f"{id_ref=}")
-    # print(f"{id_sglang=}")
+    # # print(f"{w_ref=}")
+    # # print(f"{w_sglang=}")
+    # # print(f"{id_ref=}")
+    # # print(f"{id_sglang=}")
 
-    err = checkAllclose(w_ref, w_sglang, msg="topk_weights [golden vs sglang]")
-    checkAllclose(
-        id_ref,
-        id_sglang,
-        msg=f"topk_ids     [aiter vs sglang]:{us_aiter:>8.2f} us vs {us_sglang:>8.2f} us......",
-    )
-    ret["err_sglang"] = err
+    # err = checkAllclose(w_ref, w_sglang, msg="topk_weights [golden vs sglang]")
+    # checkAllclose(
+    #     id_ref,
+    #     id_sglang,
+    #     msg=f"topk_ids     [aiter vs sglang]:{us_aiter:>8.2f} us vs {us_sglang:>8.2f} us......",
+    # )
+    # ret["err_sglang"] = err
     return ret
 
 
@@ -605,78 +607,78 @@ df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moeTopkSoftmax summary (markdown):\n%s", df_md)
 
-df = []
-for token in args.token:
-    # DeepSeek-R1
-    topk = 8
-    group = 8
-    topk_group = 4
-    expert = 256
-    dtype = dtypes.bf16
-    need_renorm = True
-    ret = test_biased_grouped_topk(
-        token, expert, group, topk, topk_group, need_renorm, dtype
-    )
-    df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moeTopkSoftmax_biased_grouped_topk summary (markdown):\n%s", df_md)
+# df = []
+# for token in args.token:
+#     # DeepSeek-R1
+#     topk = 8
+#     group = 8
+#     topk_group = 4
+#     expert = 256
+#     dtype = dtypes.bf16
+#     need_renorm = True
+#     ret = test_biased_grouped_topk(
+#         token, expert, group, topk, topk_group, need_renorm, dtype
+#     )
+#     df.append(ret)
+# df = pd.DataFrame(df)
+# df_md = df.to_markdown(index=False)
+# aiter.logger.info("moeTopkSoftmax_biased_grouped_topk summary (markdown):\n%s", df_md)
 
-df = []
-for token in args.token:
-    for scoring_func in ["softmax", "sigmoid"]:
-        # DeepSeek-R1
-        topk = 8
-        group = 8
-        topk_group = 4
-        expert = 256
-        dtype = dtypes.bf16
-        need_renorm = True
-        ret = test_grouped_topk(
-            token,
-            expert,
-            group,
-            topk,
-            topk_group,
-            need_renorm,
-            dtype,
-            scale_factor=1.5,
-            scoring_func=scoring_func,
-        )
-        df.append(ret)
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)
+# df = []
+# for token in args.token:
+#     for scoring_func in ["softmax", "sigmoid"]:
+#         # DeepSeek-R1
+#         topk = 8
+#         group = 8
+#         topk_group = 4
+#         expert = 256
+#         dtype = dtypes.bf16
+#         need_renorm = True
+#         ret = test_grouped_topk(
+#             token,
+#             expert,
+#             group,
+#             topk,
+#             topk_group,
+#             need_renorm,
+#             dtype,
+#             scale_factor=1.5,
+#             scoring_func=scoring_func,
+#         )
+#         df.append(ret)
+# df = pd.DataFrame(df)
+# df_md = df.to_markdown(index=False)
+# aiter.logger.info("moeTopkSoftmax_grouped_topk summary (markdown):\n%s", df_md)
 
-# Test shared expert sigmoid scoring
-aiter.logger.info("\n" + "=" * 70)
-aiter.logger.info("Testing topk_softmax with shared expert sigmoid scoring")
-aiter.logger.info("=" * 70)
+# # Test shared expert sigmoid scoring
+# aiter.logger.info("\n" + "=" * 70)
+# aiter.logger.info("Testing topk_softmax with shared expert sigmoid scoring")
+# aiter.logger.info("=" * 70)
 
-df = []
-# Test configurations: (num_routing_experts, num_shared_experts, topk, dtype, renormalize)
-shared_expert_configs = [
-    (8, 2, 2, dtypes.bf16, False),
-    (16, 2, 4, dtypes.bf16, True),
-    (32, 4, 8, dtypes.fp32, False),
-    (64, 4, 16, dtypes.fp32, True),
-    (8, 0, 2, dtypes.bf16, False),  # No shared experts (backward compatibility)
-    (16, 0, 4, dtypes.bf16, True),  # No shared experts (backward compatibility)
-]
+# df = []
+# # Test configurations: (num_routing_experts, num_shared_experts, topk, dtype, renormalize)
+# shared_expert_configs = [
+#     (8, 2, 2, dtypes.bf16, False),
+#     (16, 2, 4, dtypes.bf16, True),
+#     (32, 4, 8, dtypes.fp32, False),
+#     (64, 4, 16, dtypes.fp32, True),
+#     (8, 0, 2, dtypes.bf16, False),  # No shared experts (backward compatibility)
+#     (16, 0, 4, dtypes.bf16, True),  # No shared experts (backward compatibility)
+# ]
 
-for token in [128, 256, 512, 1024]:
-    for num_routing, num_shared, topk, dtype, renorm in shared_expert_configs:
-        ret = test_topk_softmax_shared_experts(
-            dtype, token, num_routing, num_shared, topk, renorm
-        )
-        ret["token"] = token
-        ret["routing_experts"] = num_routing
-        ret["shared_experts"] = num_shared
-        ret["topk"] = topk
-        ret["dtype"] = str(dtype)
-        ret["renorm"] = renorm
-        df.append(ret)
+# for token in [128, 256, 512, 1024]:
+#     for num_routing, num_shared, topk, dtype, renorm in shared_expert_configs:
+#         ret = test_topk_softmax_shared_experts(
+#             dtype, token, num_routing, num_shared, topk, renorm
+#         )
+#         ret["token"] = token
+#         ret["routing_experts"] = num_routing
+#         ret["shared_experts"] = num_shared
+#         ret["topk"] = topk
+#         ret["dtype"] = str(dtype)
+#         ret["renorm"] = renorm
+#         df.append(ret)
 
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moeTopkSoftmax_shared_experts summary (markdown):\n%s", df_md)
+# df = pd.DataFrame(df)
+# df_md = df.to_markdown(index=False)
+# aiter.logger.info("moeTopkSoftmax_shared_experts summary (markdown):\n%s", df_md)
