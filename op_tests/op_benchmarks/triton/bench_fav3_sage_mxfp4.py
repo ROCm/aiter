@@ -28,7 +28,10 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
 )
 
-from aiter.test_mha_common import attention_ref
+from aiter.test_mha_common import (
+    attention_ref,
+    attention_ref_block_sparse,
+)
 from op_tests.triton_tests.attention.test_fav3_sage import (
     compare_accuracy,
     check_attention_outputs,
@@ -156,25 +159,46 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
         if args.layout == "bhsd":
             current_primary = current_primary.permute(0, 2, 1, 3)
 
-        q_ref, k_ref, v_ref = layout_preprocess(
-            q, k, v, layout=args.layout, target_layout="bshd"
-        )
-        sm_scale = D_HEAD**-0.5
         ref_name = getattr(args, "ref", None) or "torch"
+        if block_attn_mask is not None:
+            if ref_name != "torch":
+                raise ValueError(f"Reference kernel {ref_name} not supported for block sparsity")
 
-        if ref_name == "fav2":
-            ref_out = fav2_forward_func(
-                q_ref, k_ref, v_ref,
-                dropout_p=0.0, softmax_scale=sm_scale,
-                causal=False, return_lse=False, return_attn_probs=False,
-            )()
-        else:
-            ref_out = attention_ref(
-                q_ref, k_ref, v_ref,
-                dropout_p=0.0, dropout_mask=None, causal=False,
+            q_bshd, k_bshd, v_bshd = layout_preprocess(
+                q, k, v, layout=args.layout, target_layout="bshd"
             )
+            config = get_sage_fwd_configs_mxfp4()
+            ref_out = attention_ref_block_sparse(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                block_attn_mask,
+                config["BLOCK_M"],
+                config["BLOCK_N"],
+                dropout_p=0.0,
+                dropout_mask=None,
+                upcast=True,
+            )
+            reference_primary = ref_out[0]
+        else:
+            q_ref, k_ref, v_ref = layout_preprocess(
+                q, k, v, layout=args.layout, target_layout="bshd"
+            )
+            sm_scale = D_HEAD**-0.5
 
-        reference_primary = primary_output(ref_out)
+            if ref_name == "fav2":
+                ref_out = fav2_forward_func(
+                    q_ref, k_ref, v_ref,
+                    dropout_p=0.0, softmax_scale=sm_scale,
+                    causal=False, return_lse=False, return_attn_probs=False,
+                )()
+            else:
+                ref_out = attention_ref(
+                    q_ref, k_ref, v_ref,
+                    dropout_p=0.0, dropout_mask=None, causal=False,
+                )
+
+            reference_primary = primary_output(ref_out)
         compare_accuracy(current_primary, reference_primary)
         check_attention_outputs(current_primary, reference_primary, fp8=False)
 
