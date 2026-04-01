@@ -461,6 +461,7 @@ def test_gluon_unified_attn_2d_noncausal(
         shuffled_kv_cache=shuffled_kv_cache,
         subtile=True,
         remove_indirect_access=remove_indirect_access,
+        num_buffers=3,
     )
     ref_output = ref_paged_attn(
         query=query,

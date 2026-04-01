@@ -35,6 +35,8 @@ parser.add_argument('--waves_per_eu', type=int, default=1, help='')
 parser.add_argument('--num_warps', type=int, default=4, help='')
 parser.add_argument('--block_m', type=int, default=128, help='')
 parser.add_argument('--remove_indirect_access', type=int, default=1, help='')
+parser.add_argument('--num_buffers', type=int, default=2, help='')
+
 args = parser.parse_args()
 print(args)
 
@@ -42,6 +44,7 @@ args.window_size = 0
 args.num_kv_blocks = 1
 args.use_tdm = 1
 args.shuffled_kv_cache = 0
+args.causal=0
 
 block_size = args.block_size
 soft_cap = None
@@ -59,7 +62,7 @@ kv_dtype = torch.bfloat16
             scale,
             window_size,
             block_tables,
-            q_descale, k_descale, v_descale, output_scale) = generate_data(seq_lens, num_blocks=128, block_size=block_size, head_size=args.head_size, 
+            q_descale, k_descale, v_descale, output_scale) = generate_data(seq_lens, num_blocks=1024, block_size=block_size, head_size=args.head_size, 
                                                              num_heads=(args.num_heads_q, args.num_heads_k), sliding_window=args.window_size,
                                                              q_dtype=q_dtype, kv_dtype=kv_dtype, shuffled_kv_cache=args.shuffled_kv_cache, remove_indirect_access=args.remove_indirect_access,)
 output_scale = None
@@ -92,7 +95,7 @@ func = lambda:  gluon_unified_attention_2d(
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len,
         softmax_scale=scale,
-        causal=True,
+        causal=args.causal,
         window_size=window_size,
         block_table=block_tables.cuda(),
         softcap=soft_cap if soft_cap is not None else 0,
@@ -108,6 +111,8 @@ func = lambda:  gluon_unified_attention_2d(
         shuffled_kv_cache=args.shuffled_kv_cache,
         num_warps=args.num_warps,
         block_m=args.block_m,
+        remove_indirect_access=args.remove_indirect_access,
+        num_buffers=args.num_buffers,
     )
 
 
