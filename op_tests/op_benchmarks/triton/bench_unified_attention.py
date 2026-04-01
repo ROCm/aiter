@@ -198,7 +198,8 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    line_vals = [f"fwd(Gluon_2D)"]  # [f"fwd(Triton_2D)", f"fwd(Triton_3D)", f"fwd(Gluon_2D)", f"fwd(CK)"]
+    line_vals = [f"fwd(Gluon_2D)"]  # TODO: get this to work and add with others
+    line_vals = [f"fwd(Triton_2D)", f"fwd(Triton_3D)", f"fwd(CK)"]
 
     configs.append(
         triton.testing.Benchmark(
