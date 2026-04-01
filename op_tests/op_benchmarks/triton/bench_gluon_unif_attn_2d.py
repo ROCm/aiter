@@ -263,7 +263,7 @@ def create_configs():
     for q_heads in [64, 8]:
         for seq_l in [1024, 2048, 4096, 8192]:
             x_vals.append(
-                [q_heads, q_heads // 8, 64, seq_l, seq_l, 1, 0, 64, 0, 0, 0, 1, 1]
+                [q_heads, q_heads // 8, 64, seq_l, seq_l, 1, 0, 64, 0, 0, 0, 0, 1]
             )
     sub_config = triton.testing.Benchmark(
         x_names=x_names,
@@ -380,7 +380,7 @@ def run_benchmark(configs):
             v_descale=v_descale,
             sinks=sinks,
             output_scale=output_scale,
-            use_tdm=use_tdm,
+            use_tdm=False,
             num_kv_blocks=num_kv_blocks,
             new_kv_layout=new_kv_layout,
             waves_per_eu=waves_per_eu,

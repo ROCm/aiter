@@ -17,6 +17,10 @@ from op_tests.triton_tests.attention.test_unified_attention import ref_paged_att
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.attention import unified_attention as ua_mod
 
+from aiter.ops.triton.gluon.unified_attention_2d import (
+    unified_attention as gluon_unified_attention_2d,
+)
+
 
 def default_benchmark_configs():
     CONFIGS = [
@@ -39,7 +43,7 @@ def default_benchmark_configs():
     ]
     return [
         (cfg["tag"], cfg["batch"], cfg["hq"], cfg["hk"], cfg["sq"], cfg["sk"], cfg["head_size"], cfg["head_size"])
-        for cfg in CONFIGS if cfg["tag"] in ("b64_sk1001_nb59896")
+        for cfg in CONFIGS #  if cfg["tag"] in ("b64_sk1001_nb59896")
     ]
 
 # def default_benchmark_configs():
@@ -194,7 +198,7 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    line_vals = [f"fwd(Triton_2D)", f"fwd(Triton_3D)", f"fwd(CK)"]
+    line_vals = [f"fwd(Gluon_2D)"]  # [f"fwd(Triton_2D)", f"fwd(Triton_3D)", f"fwd(Gluon_2D)", f"fwd(CK)"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -345,6 +349,37 @@ def run_benchmark(custom, args):
                     mask_type=2, scale_s=scale,
                     scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0)
                 
+            elif provider == "fwd(Gluon_2D)":
+                return gluon_unified_attention_2d(
+                    q=q_input,
+                    k=k_input,
+                    v=v_input,
+                    out=output,
+                    cu_seqlens_q=cu_query_lens,
+                    seqused_k=kv_lens,
+                    max_seqlen_q=max_query_len,
+                    max_seqlen_k=max_kv_len,
+                    softmax_scale=scale,
+                    causal=True,
+                    window_size=window_size,
+                    block_table=block_tables,
+                    softcap=soft_cap if soft_cap is not None else 0,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
+                    output_scale=None,
+                    use_tdm=False,
+                    # num_kv_blocks=num_kv_blocks,
+                    # new_kv_layout=new_kv_layout,
+                    # waves_per_eu=waves_per_eu,
+                    # shuffled_kv_cache=shuffled_kv_cache,
+                    # num_warps=num_warps,
+                    # block_m=block_m,
+                )
+            
+            
+            
                 # ck_func = lambda: _try_ck_unified_attention(
                 #     q=q_input,
                 #     k=k_input,

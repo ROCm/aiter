@@ -7,9 +7,9 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
-from aiter.ops.triton.gluon.unified_attention_3d import (
-    unified_attention as gluon_unified_attention,
-)
+# from aiter.ops.triton.gluon.unified_attention_3d import (
+#     unified_attention as gluon_unified_attention,
+# )
 from aiter.ops.triton.gluon.unified_attention_2d import (
     unified_attention as gluon_unified_attention_2d,
 )
