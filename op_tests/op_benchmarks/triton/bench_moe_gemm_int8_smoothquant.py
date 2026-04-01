@@ -74,7 +74,7 @@ def compute_roofline(
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    results = []  # list[(proxy_val, perf_dict)]
+    results: list[tuple[str, dict[str, int | float]]] = []
     print("=========================================")
     print(f"{out_path}...")
     print("=========================================")
