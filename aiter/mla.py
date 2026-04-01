@@ -322,7 +322,14 @@ def mla_decode_fwd(
                 get_gfx() == "gfx950"
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
-                and (max_seqlen_q * (ori_nhead // 16) == 4 or max_seqlen_q * (ori_nhead // 32) == 4)
+                and (
+                    (max_seqlen_q * (ori_nhead // 16) == 4)
+                    or (
+                        (ori_nhead % 32 == 0)
+                        and (ori_nhead > 32)
+                        and (max_seqlen_q * (ori_nhead // 32) == 4)
+                    )
+                )
             )
 
             if use_qseqlen_fold and (max_seqlen_q * (ori_nhead // 32) == 4):
@@ -337,19 +344,6 @@ def mla_decode_fwd(
                 max_seqlen_q = max_seqlen_q * fold_factor
                 q = q.view(total_s, nhead, -1)
                 qseqlen_folded = True
-                # q = (
-                #     q.reshape(
-                #         ori_total_s // max_seqlen_q,
-                #         max_seqlen_q,
-                #         fold_factor,
-                #         nhead,
-                #         -1,
-                #     )
-                #     .reshape(total_s, nhead, -1)
-                # )
-                # max_seqlen_q = max_seqlen_q * fold_factor
-                # qseqlen_folded = True
-                # o_orig = o
             elif max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
             else:

@@ -409,7 +409,15 @@ def torch_mla_extend_split_kv(
             get_gfx() == "gfx950"
             and is_fp8_q
             and is_fp8_kvc
-            and (max_seqlen_q * (nheads // 16)) == 4 or max_seqlen_q * (nheads // 32) == 4)
+            and (
+                (max_seqlen_q * (nheads // 16)) == 4
+                or (
+                    (nheads % 32 == 0)
+                    and (nheads > 32)
+                    and (max_seqlen_q * (nheads // 32) == 4)
+                )
+            )
+        )
 
         if use_qseqlen_fold and (max_seqlen_q * (nheads // 32) == 4):
             fold_factor = nheads // 32
@@ -525,7 +533,14 @@ def torch_mla_extend_split_kv(
         partial_lse,
     )
 
-    return partial_o, partial_lse, final_out, final_lse, io_transformed, use_qseqlen_fold
+    return (
+        partial_o,
+        partial_lse,
+        final_out,
+        final_lse,
+        io_transformed,
+        use_qseqlen_fold,
+    )
 
 
 def torch_mla_reduce_v1(

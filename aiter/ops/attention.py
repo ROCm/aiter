@@ -926,7 +926,14 @@ def get_mla_metadata_info_v1(
         and q_dtype == dtypes.fp8
         and kv_dtype == dtypes.fp8
         and num_head_qo > 16
-        and (max_seqlen_qo * (num_head_qo // 16) == 4 or max_seqlen_qo * (num_head_qo // 32) == 4)
+        and (
+            (max_seqlen_qo * (num_head_qo // 16) == 4)
+            or (
+                (num_head_qo % 32 == 0)
+                and (num_head_qo > 32)
+                and (max_seqlen_qo * (num_head_qo // 32) == 4)
+            )
+        )
     )
 
     max_qo_tiles_per_batch = (
