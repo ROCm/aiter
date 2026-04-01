@@ -106,24 +106,24 @@ inline void load_asm_kernel(const char* name,
                             hipModule_t& module,
                             hipFunction_t& kernel_func)
 {
-    const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-    std::string arch_name     = get_gpu_arch();
-    if(AITER_ASM_DIR != nullptr)
+    std::string arch_name = get_gpu_arch();
+#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
+    std::string fname  = "hsa/" + arch_name + "/" + hsaco;
+    auto hasco_obj     = AITER_EMBEDDED_HSA_MAP.find(fname);
+    if(hasco_obj != AITER_EMBEDDED_HSA_MAP.end() && hasco_obj->second.data() != nullptr)
     {
-        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
-        AITER_LOG_INFO("hipModuleLoad: " << hsa_path << " GetFunction: " << name);
-        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
+        AITER_LOG_INFO("hipModuleLoad (embedded): " << fname << " GetFunction: " << name);
+        HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
     }
     else
-    {
-#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
-        std::string fname = "hsa/" + arch_name + "/" + hsaco;
-        auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
-        CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
-        CHECK_COND(hasco_obj->second.data() != nullptr);
-        AITER_LOG_INFO("hipModuleLoad: " << fname << " GetFunction: " << name);
-        HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
 #endif
+    {
+        const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
+        AITER_CHECK(AITER_ASM_DIR != nullptr,
+                     "No embedded HSA for ", hsaco, " and AITER_ASM_DIR is not set");
+        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
+        AITER_LOG_INFO("hipModuleLoad (ASM_DIR): " << hsa_path << " GetFunction: " << name);
+        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
     }
     HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
     AITER_LOG_INFO("hipModuleGetFunction: " << name << " Success");
