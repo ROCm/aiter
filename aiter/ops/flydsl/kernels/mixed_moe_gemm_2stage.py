@@ -256,26 +256,14 @@ def compile_mixed_moe_gemm1(
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
         ):
-            # unwrap tensor handles to memrefs for ext dialect helpers
-            arg_out = arg_out.value
-            arg_x = arg_x.value
-            arg_w = arg_w.value
-            arg_scale_x = arg_scale_x.value
-            arg_scale_w = arg_scale_w.value
-            arg_sorted_token_ids = arg_sorted_token_ids.value
-            arg_expert_ids = arg_expert_ids.value
-            arg_sorted_weights = arg_sorted_weights.value
-            arg_max_token_ids = arg_max_token_ids.value
-            arg_bias = arg_bias.value
-
-            tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
-            _inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
-            k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
+            tokens_in = arith.index_cast(T.index, i32_tokens_in)
+            _inter_in = arith.index_cast(T.index, i32_inter_in)
+            k_in = arith.index_cast(T.index, i32_k_in)
             size_expert_ids_in = arith.index_cast(
-                ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
+                T.index, i32_size_expert_ids_in
             )
-            tokens_i32_v = i32_tokens_in.ir_value()
-            k_i32_v = i32_k_in.ir_value()
+            tokens_i32_v = i32_tokens_in
+            k_i32_v = i32_k_in
 
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
             f32 = T.f32
@@ -520,7 +508,7 @@ def compile_mixed_moe_gemm1(
                 )  # todo fix
                 _ifexpert_of = scf.IfOp(exp_valid)
                 with _if_then(_ifexpert_of):
-                    expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
+                    expert_idx = arith.index_cast(T.index, expert_i32)
                     inter2_idx = arith.constant(2 * inter_dim, index=True)
                     expert_off_idx = expert_idx * inter2_idx  # index
 
@@ -596,7 +584,7 @@ def compile_mixed_moe_gemm1(
                         ts_valid = arith.andi(row_valid, arith.andi(t_valid, s_valid))
                         x_row_valid.append(ts_valid)
                         t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
-                        t_idx = arith.index_cast(ir.IndexType.get(), t_safe)
+                        t_idx = arith.index_cast(T.index, t_safe)
                         x_row_base_div4.append(t_idx * c_k_div4)
 
                     vec4_i32 = T.vec(4, i32)
@@ -1569,9 +1557,9 @@ def compile_mixed_moe_gemm1(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
 
-        inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value())
+        inter_in = arith.index_cast(T.index, i32_inter_in)
         gx = inter_in / arith.constant(tile_n, index=True)
-        gy = arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
+        gy = arith.index_cast(T.index, i32_size_expert_ids_in)
 
         moe_gemm1(
             arg_out,
@@ -1821,22 +1809,11 @@ def compile_mixed_moe_gemm2(
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
         ):
-            arg_out = arg_out.value
-            arg_x = arg_x.value
-            arg_w = arg_w.value
-            arg_scale_x = arg_scale_x.value
-            arg_scale_w = arg_scale_w.value
-            arg_sorted_token_ids = arg_sorted_token_ids.value
-            arg_expert_ids = arg_expert_ids.value
-            arg_sorted_weights = arg_sorted_weights.value
-            arg_num_valid_ids = arg_num_valid_ids.value
-            arg_bias = arg_bias.value
-
-            tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
-            n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
-            k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
+            tokens_in = arith.index_cast(T.index, i32_tokens_in)
+            n_in = arith.index_cast(T.index, i32_n_in)
+            k_in = arith.index_cast(T.index, i32_k_in)
             size_expert_ids_in = arith.index_cast(
-                ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
+                T.index, i32_size_expert_ids_in
             )
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
             f32 = T.f32
@@ -1861,7 +1838,7 @@ def compile_mixed_moe_gemm2(
             m_in = tokens_in * topk_idx
             # fly.make_shape requires i32/i64, not index
             m_i32_v = arith.index_cast(T.i32, m_in)
-            k_i32_v = i32_k_in.ir_value()
+            k_i32_v = i32_k_in
             _layout_x = fx.make_layout((m_i32_v, k_i32_v), stride=(k_i32_v, 1))
 
             # B preshuffle layout: [experts*model_dim, inter_dim]
@@ -1983,7 +1960,7 @@ def compile_mixed_moe_gemm2(
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
-            num_valid_idx = arith.index_cast(ir.IndexType.get(), num_valid_i32)
+            num_valid_idx = arith.index_cast(T.index, num_valid_i32)
 
             # fp16 path ignores scales completely (implicit scale=1.0).
             if is_f16_a:
@@ -2068,7 +2045,7 @@ def compile_mixed_moe_gemm2(
             expert_i32 = buffer_ops.buffer_load(
                 expert_rsrc, bx, vec_width=1, dtype=T.i32
             )
-            expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
+            expert_idx = arith.index_cast(T.index, expert_i32)
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
@@ -2192,7 +2169,7 @@ def compile_mixed_moe_gemm2(
                     t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
                     s_safe = arith.select(ts_valid, s_i32, arith.constant(0))
                     row_ts_i32 = t_safe * topk_i32 + s_safe
-                    row_ts_idx = arith.index_cast(ir.IndexType.get(), row_ts_i32)
+                    row_ts_idx = arith.index_cast(T.index, row_ts_i32)
 
                     # Base row offset in dword units: row_ts_idx * (k_in/4)
                     x_row_base_div4.append(row_ts_idx * c_k_div4)
@@ -2822,7 +2799,7 @@ def compile_mixed_moe_gemm2(
                     _llvm_ptr_ty, arg_out
                 )
                 out_base_i64 = llvm.ptrtoint(T.i64, out_base_ptr)
-                out_base_idx = arith.index_cast(ir.IndexType.get(), out_base_i64)
+                out_base_idx = arith.index_cast(T.index, out_base_i64)
 
                 def write_row_to_lds(
                     *,
@@ -2905,8 +2882,8 @@ def compile_mixed_moe_gemm2(
                     fused = row_ctx
                     t = fused & mask24_i32
                     s = fused >> 24
-                    t_idx = arith.index_cast(ir.IndexType.get(), t)
-                    s_idx = arith.index_cast(ir.IndexType.get(), s)
+                    t_idx = arith.index_cast(T.index, t)
+                    s_idx = arith.index_cast(T.index, s)
                     n_byte_stride = arith.constant(
                         model_dim * out_elem_bytes, index=True
                     )
@@ -3026,11 +3003,11 @@ def compile_mixed_moe_gemm2(
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
 
-        n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
+        n_in = arith.index_cast(T.index, i32_n_in)
         gx = n_in / arith.constant(tile_n, index=True)
         _c_pm_l = arith.constant(persist_m, index=True)
         gy = (
-            arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value())
+            arith.index_cast(T.index, i32_size_expert_ids_in)
             + _c_pm_l
             - arith.constant(1, index=True)
         ) / _c_pm_l
