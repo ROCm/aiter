@@ -44,7 +44,7 @@ def ensure_spawn_method():
 
 
 def perftest(
-    num_iters=101, num_warmup=50, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -80,6 +80,7 @@ def perftest(
                     end_event.record()
                     end_event.synchronize()
                     latencies.append(start_event.elapsed_time(end_event))
+                    torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
 
@@ -197,7 +198,7 @@ def run_perftest(
     func,
     *args,
     num_iters=101,
-    num_warmup=50,
+    num_warmup=2,
     testGraph=False,
     num_rotate_args=0,
     needTrace=False,
