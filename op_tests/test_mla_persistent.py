@@ -411,15 +411,11 @@ def torch_mla_extend_split_kv(
             and is_fp8_kvc
             and (
                 (max_seqlen_q * (nheads // 16)) == 4
-                or (
-                    (nheads % 32 == 0)
-                    and (nheads > 32)
-                    and (max_seqlen_q * (nheads // 32) == 4)
-                )
+                or (nheads == 64 and max_seqlen_q == 2)
             )
         )
 
-        if use_qseqlen_fold and (max_seqlen_q * (nheads // 32) == 4):
+        if use_qseqlen_fold and nheads == 64 and max_seqlen_q == 2:
             fold_factor = nheads // 32
             nheads = 32
         else:

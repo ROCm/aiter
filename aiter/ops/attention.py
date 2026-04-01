@@ -928,11 +928,7 @@ def get_mla_metadata_info_v1(
         and num_head_qo > 16
         and (
             (max_seqlen_qo * (num_head_qo // 16) == 4)
-            or (
-                (num_head_qo % 32 == 0)
-                and (num_head_qo > 32)
-                and (max_seqlen_qo * (num_head_qo // 32) == 4)
-            )
+            or (num_head_qo == 64 and max_seqlen_qo == 2)
         )
     )
 
