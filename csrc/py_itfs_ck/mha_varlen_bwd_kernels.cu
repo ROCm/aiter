@@ -42,7 +42,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::hip::getCurrentHIPStream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -173,6 +172,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     const ck_tile::index_t nsplits = launcher.dq_acc_splits;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    auto stream = at::hip::getCurrentHIPStream();
 
     auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
