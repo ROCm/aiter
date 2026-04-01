@@ -693,7 +693,7 @@ mha_varlen_fwd(
         if (paged_KV)
         {
             int num_splits = 0;
-            num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
+            num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads_k, max_seqlen_q, head_size_v, 0, num_splits);
             TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
             TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
 
