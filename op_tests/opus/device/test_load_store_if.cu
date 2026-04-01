@@ -86,7 +86,12 @@ __global__ void predicated_async_load_kernel(const float* __restrict__ src,
 
     async_load_if(g_src, pred, smem_buf, u_gmem, u_smem);
 
+#if defined(__gfx1250__)
+    s_wait_loadcnt(number<0>{});
+    s_wait_asynccnt(number<0>{});
+#else
     s_waitcnt_vmcnt(number<0>{});
+#endif
     __builtin_amdgcn_s_barrier();
 
     dst[gid] = smem_buf[tid];

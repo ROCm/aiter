@@ -185,6 +185,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         cxxflags += [
             "-DUSE_ROCM",
             "-DENABLE_FP8",
+            "-DENABLE_CK=1",
             "-O3" if not AITER_DEBUG else "-O0",
             "-std=c++20",
             "-DLEGACY_HIPBLAS_DIRECT",

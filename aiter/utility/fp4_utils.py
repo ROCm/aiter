@@ -468,83 +468,156 @@ def _moe_mxfp4_sort_kernel(
     sorted_ids_ptr,
     num_valid_ids_ptr,
     blockscale_e8m0_sorted_ptr,
-    stride_blockscale_e8m0_m: tl.constexpr,
-    stride_blockscale_e8m0_n: tl.constexpr,
-    stride_o3: tl.constexpr,
-    stride_o2: tl.constexpr,
-    stride_o1: tl.constexpr,
-    stride_o0: tl.constexpr,
-    token_num: tl.constexpr,
-    M_i: tl.constexpr,
-    N_i: tl.constexpr,
+    stride_blockscale_e8m0_m: tl.int64,
+    stride_blockscale_e8m0_n: tl.int64,
+    stride_o3: tl.int64,
+    stride_o2: tl.int64,
+    stride_o1: tl.int64,
+    stride_o0: tl.int64,
+    token_num,
+    N_i,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     TOPK: tl.constexpr,
 ):
+    """2D-grid kernel: one program per (M-tile, N-tile). Best for small token counts
+    where GPU needs many lightweight programs for parallelism."""
     pid_m = tl.program_id(0) * 2
     pid_n = tl.program_id(1) * 2
     num_valid_ids = tl.load(num_valid_ids_ptr)
     if pid_m * BLOCK_SIZE_M >= num_valid_ids:
         return
-    stride_blockscale_e8m0_m = tl.cast(stride_blockscale_e8m0_m, tl.int64)
-    stride_blockscale_e8m0_n = tl.cast(stride_blockscale_e8m0_n, tl.int64)
-    stride_o0 = tl.cast(stride_o0, tl.int64)
-    stride_o1 = tl.cast(stride_o1, tl.int64)
-    stride_o2 = tl.cast(stride_o2, tl.int64)
-    stride_o3 = tl.cast(stride_o3, tl.int64)
 
     out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
-    for i in range(0, 4):
-        m = i % 2 * BLOCK_SIZE_M
-        n = i // 2 * BLOCK_SIZE_N
+    for m_idx in range(2):
+        m = m_idx * BLOCK_SIZE_M
         sorted_ids_offs_m = pid_m * BLOCK_SIZE_M + m + tl.arange(0, BLOCK_SIZE_M)
-        sorted_ids_offs = sorted_ids_offs_m
         sorted_ids_mask = sorted_ids_offs_m < num_valid_ids
-        sorted_ids = tl.load(
-            sorted_ids_ptr + sorted_ids_offs, mask=sorted_ids_mask, other=token_num
+        raw_ids = tl.load(
+            sorted_ids_ptr + sorted_ids_offs_m, mask=sorted_ids_mask, other=token_num
         )
-        topk_ids = sorted_ids >> 24
-        sorted_ids = sorted_ids & 0xFFFFFF
-
-        # Sort the blockscale tensor based on the sorted ids
+        token_ids = raw_ids & 0xFFFFFF
         if TOPK == 1:
-            blockscale_e8m0_offs_m = sorted_ids
+            blockscale_e8m0_offs_m = token_ids
         else:
-            blockscale_e8m0_offs_m = sorted_ids * TOPK + topk_ids
-        blockscale_e8m0_offs_n = pid_n * BLOCK_SIZE_N + n + tl.arange(0, BLOCK_SIZE_N)
-        blockscale_e8m0_offs = (
-            blockscale_e8m0_offs_m[:, None] * stride_blockscale_e8m0_m
-            + blockscale_e8m0_offs_n[None, :] * stride_blockscale_e8m0_n
-        )
-        blockscale_e8m0_mask = (sorted_ids < token_num)[:, None] & (
-            blockscale_e8m0_offs_n < N_i
-        )[None, :]
-        blockscale_e8m0_sub = tl.load(
-            blockscale_e8m0_ptr + blockscale_e8m0_offs,
-            mask=blockscale_e8m0_mask,
-        ).to(tl.uint8, bitcast=True)
-        out = out | (blockscale_e8m0_sub.to(tl.uint32) << (i * 8))
+            blockscale_e8m0_offs_m = token_ids * TOPK + (raw_ids >> 24)
+        row_addrs = blockscale_e8m0_offs_m[:, None] * stride_blockscale_e8m0_m
+        row_mask = (token_ids < token_num)[:, None]
 
-    # Store the result
-    # 16x4 uint32 -> 32x2 uint8
+        for n_idx in range(2):
+            i = m_idx + n_idx * 2
+            col_offs = (
+                pid_n * BLOCK_SIZE_N + n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            )
+            gather_offs = row_addrs + col_offs[None, :] * stride_blockscale_e8m0_n
+            col_mask = (col_offs < N_i)[None, :]
+            sub = tl.load(
+                blockscale_e8m0_ptr + gather_offs,
+                mask=row_mask & col_mask,
+            ).to(tl.uint8, bitcast=True)
+            out = out | (sub.to(tl.uint32) << (i * 8))
+
     offs_0 = tl.arange(0, BLOCK_SIZE_M)
     offs_1 = tl.arange(0, BLOCK_SIZE_N)
-    offs_2 = pid_n // 2
-    offs_3 = pid_m // 2
     offs = (
         offs_0[:, None] * stride_o0
-        + offs_1[None, :] * stride_o1  # * BLOCK_SIZE_M
-        + offs_2 * stride_o2  # * BLOCK_SIZE_M * BLOCK_SIZE_N
-        + offs_3 * stride_o3  # * BLOCK_SIZE_M * BLOCK_SIZE_N * N_i // BLOCK_SIZE_N
+        + offs_1[None, :] * stride_o1
+        + pid_n // 2 * stride_o2
+        + pid_m // 2 * stride_o3
     )
-    # blockscale_e8m0_sorted_mask = (blockscale_e8m0_sorted_offs_m < M_o)[:, None] & (
-    #     blockscale_e8m0_sorted_offs_n < N_o
-    # )[None, :]
-    tl.store(
-        blockscale_e8m0_sorted_ptr + offs,
-        out,
-        # mask=blockscale_e8m0_sorted_mask,
+    tl.store(blockscale_e8m0_sorted_ptr + offs, out)
+
+
+@triton.jit
+def _moe_mxfp4_sort_kernel_fused_n(
+    blockscale_e8m0_ptr,
+    sorted_ids_ptr,
+    num_valid_ids_ptr,
+    blockscale_e8m0_sorted_ptr,
+    stride_blockscale_e8m0_m: tl.int64,
+    stride_blockscale_e8m0_n: tl.int64,
+    stride_o3: tl.int64,
+    stride_o2: tl.int64,
+    stride_o1: tl.int64,
+    stride_o0: tl.int64,
+    token_num,
+    N_i,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    TOPK: tl.constexpr,
+    N_TILES: tl.constexpr,
+):
+    """1D-grid kernel: one program handles ALL N-tiles for an M-tile group.
+    Loads sorted_ids once and reuses row addresses across all N-tiles.
+    Best for large token counts where gather bandwidth dominates."""
+    pid_m = tl.program_id(0) * 2
+    num_valid_ids = tl.load(num_valid_ids_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
+        return
+
+    # Pre-load sorted_ids for both m sub-blocks once.
+    offs_m0 = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    raw_0 = tl.load(
+        sorted_ids_ptr + offs_m0, mask=offs_m0 < num_valid_ids, other=token_num
     )
+    tid_0 = raw_0 & 0xFFFFFF
+    if TOPK == 1:
+        ridx_0 = tid_0
+    else:
+        ridx_0 = tid_0 * TOPK + (raw_0 >> 24)
+    raddr_0 = ridx_0[:, None] * stride_blockscale_e8m0_m
+    rmask_0 = (tid_0 < token_num)[:, None]
+
+    offs_m1 = offs_m0 + BLOCK_SIZE_M
+    raw_1 = tl.load(
+        sorted_ids_ptr + offs_m1, mask=offs_m1 < num_valid_ids, other=token_num
+    )
+    tid_1 = raw_1 & 0xFFFFFF
+    if TOPK == 1:
+        ridx_1 = tid_1
+    else:
+        ridx_1 = tid_1 * TOPK + (raw_1 >> 24)
+    raddr_1 = ridx_1[:, None] * stride_blockscale_e8m0_m
+    rmask_1 = (tid_1 < token_num)[:, None]
+
+    offs_row = tl.arange(0, BLOCK_SIZE_M)
+    offs_col = tl.arange(0, BLOCK_SIZE_N)
+    store_base = pid_m // 2 * stride_o3
+
+    for n_tile in range(N_TILES):
+        pid_n = n_tile * 2
+        out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
+
+        for m_idx in range(2):
+            if m_idx == 0:
+                cur_raddr = raddr_0
+                cur_rmask = rmask_0
+            else:
+                cur_raddr = raddr_1
+                cur_rmask = rmask_1
+
+            for n_idx in range(2):
+                i = m_idx + n_idx * 2
+                col_offs = (
+                    pid_n * BLOCK_SIZE_N
+                    + n_idx * BLOCK_SIZE_N
+                    + tl.arange(0, BLOCK_SIZE_N)
+                )
+                gather_offs = cur_raddr + col_offs[None, :] * stride_blockscale_e8m0_n
+                col_mask = (col_offs < N_i)[None, :]
+                sub = tl.load(
+                    blockscale_e8m0_ptr + gather_offs,
+                    mask=cur_rmask & col_mask,
+                ).to(tl.uint8, bitcast=True)
+                out = out | (sub.to(tl.uint32) << (i * 8))
+
+        store_offs = (
+            offs_row[:, None] * stride_o0
+            + offs_col[None, :] * stride_o1
+            + n_tile * stride_o2
+            + store_base
+        )
+        tl.store(blockscale_e8m0_sorted_ptr + store_offs, out)
 
 
 def moe_mxfp4_sort(
@@ -589,21 +662,36 @@ def moe_mxfp4_sort(
         device=blockscale_e8m0.device,
     )  # .fill_(0)
 
-    grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
-    _moe_mxfp4_sort_kernel[grid](
+    # Dispatch threshold: for small token counts the 2D-grid kernel has better
+    # parallelism; for large token counts the fused-N kernel wins by reusing
+    # sorted_ids row addresses across all N tiles.
+    _FUSED_N_THRESHOLD = 2048
+
+    common_args = (
         blockscale_e8m0.view(torch.uint8),
         sorted_ids,
         num_valid_ids,
         blockscale_e8m0_sorted,
         *blockscale_e8m0.stride(),
         *blockscale_e8m0_sorted.stride(),
+    )
+    common_kwargs = dict(
         token_num=token_num,
-        M_i=M_i,
         N_i=N_i,
         BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
         BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
         TOPK=topk,
     )
+
+    if token_num > _FUSED_N_THRESHOLD:
+        N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
+        grid = (triton.cdiv(M_o, BLOCK_SIZE_M),)
+        _moe_mxfp4_sort_kernel_fused_n[grid](
+            *common_args, **common_kwargs, N_TILES=N_TILES
+        )
+    else:
+        grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
+        _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
 
     # Reshape the output to the final shape
     return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)

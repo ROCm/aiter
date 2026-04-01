@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
+from ..jit.core import compile_ops
 from ..ops.enum import QuantType, ActivationType
+from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
 
 defaultDtypes = {
@@ -29,20 +31,57 @@ u32 = torch.uint32
 i32 = torch.int32
 i16 = torch.int16
 i8 = torch.int8
+u8 = torch.uint8
+i64 = torch.int64
+u64 = torch.uint64
 
-d_dtypes = {
-    "fp8": fp8,
-    "fp8_e8m0": fp8_e8m0,
-    "fp16": fp16,
-    "bf16": bf16,
-    "fp32": fp32,
-    "i4x2": i4x2,
-    "fp4x2": fp4x2,
-    "u32": u32,
-    "i32": i32,
-    "i16": i16,
-    "i8": i8,
-}
+d_dtypes = {name: globals()[name] for name in aiter_dtypes}
+
+globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items()})
+_torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
+
+
+@compile_ops("module_aiter_tensor", "make_aiter_tensor")
+def _make_aiter_tensor(data_ptr, numel, ndim, shape, strides, dtype, device_id): ...
+
+
+def torch_to_aiter_pybind(tensor: torch.Tensor):
+    """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
+
+    Unlike torch_to_aiter() which returns a ctypes aiter_tensor_t struct,
+    this function constructs a *pybind11* aiter_tensor_t via
+    module_aiter_tensor.  The two types are not interchangeable.
+    """
+    return _make_aiter_tensor(
+        tensor.data_ptr(),
+        tensor.numel(),
+        tensor.ndim,
+        list(tensor.shape),
+        list(tensor.stride()),
+        _torch_to_aiter_dtype[tensor.dtype],
+        tensor.device.index or 0,
+    )
+
+
+def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
+    """This is for ctypes binding.
+    torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
+    assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
+    assert (
+        tensor.ndim <= 8
+    ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
+    assert tensor.dtype in _torch_to_aiter_dtype, f"Unsupported dtype: {tensor.dtype}"
+
+    at = aiter_tensor_t()
+    at.ptr = tensor.data_ptr()
+    at.numel_ = tensor.numel()
+    at.ndim = tensor.ndim
+    for i in range(tensor.ndim):
+        at.shape[i] = tensor.shape[i]
+        at.strides[i] = tensor.stride(i)
+    at.dtype_ = _torch_to_aiter_dtype[tensor.dtype]
+    at.device_id = tensor.device.index or 0
+    return at
 
 
 def str2bool(v):

@@ -83,8 +83,15 @@ def biased_grouped_topk(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
     token_num = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 212:
+    # moe_fused_gate requires num_experts to be a power of 2.
+    # For models with non-power-of-2 expert counts (e.g. Kimi-K2.5 with 384
+    # experts), always use biased_grouped_topk_hip which has no such constraint.
+    num_experts_is_power_of_2 = (
+        num_experts > 0 and (num_experts & (num_experts - 1)) == 0
+    )
+    if token_num <= cu_num * 212 or not num_experts_is_power_of_2:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -209,7 +216,7 @@ def top_k_per_row_prefill(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -234,7 +241,7 @@ def top_k_per_row_decode(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
     next_n: int,

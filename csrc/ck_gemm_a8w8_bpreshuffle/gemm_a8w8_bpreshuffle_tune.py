@@ -17,7 +17,10 @@ from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/")
-from gemm_a8w8_bpreshuffle_cktile_common import kernels_list as kernels_list_cktile
+from gemm_a8w8_bpreshuffle_cktile_common import (
+    kernels_list as kernels_list_cktile,
+    BLOCK_PER_CU_MAX,
+)
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -151,6 +154,14 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             help="choose libtype to be tuned, support ['all', 'asm', 'ck', 'cktile']",
         )
 
+        self.parser.add_argument(
+            "--blockPerCu",
+            nargs="+",
+            type=int,
+            default=list(range(1, BLOCK_PER_CU_MAX + 1)),
+            help="List of BlockPerCu values to tune (CKTile only)",
+        )
+
     def calculate(self, results, bpes=(1, 1, 2)):
         ## bpes = (inbpe, w_bpe, outbpe)
         return super().calculate(results, bpes=bpes)
@@ -252,12 +263,15 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 f"Warning: q_dtype_w only support {dtypes.fp8}, actual q_dtype_w is {q_dtype_w}!"
             )
             return []
-        kernels_num = len(kernels_list_cktile)
+        filtered_cktile = {
+            k: v
+            for k, v in kernels_list_cktile.items()
+            if v.BlockPerCu in args.blockPerCu
+        }
         gemm_a8w8_idx = [0, 1, 2, 3, 4]  # input index in generate_data
         ref_data_idx = [0, 5, 2, 3, 6]
         tasks_ck = []
-        for i in range(kernels_num):
-            kernel = kernels_list_cktile[i]
+        for i, kernel in filtered_cktile.items():
             maxsplitK = (
                 aiter.compute_gemm_SplitK(
                     M,

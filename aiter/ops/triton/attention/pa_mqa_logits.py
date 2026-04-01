@@ -50,6 +50,7 @@ if triton_version >= Version("3.5.0"):
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
     )
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
     from aiter.ops.triton.gluon.pa_mqa_logits import (
         _gluon_deepgemm_fp8_paged_mqa_logits,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
@@ -253,6 +254,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
 ):
     gfx_version = get_gfx()
     assert gfx_version == "gfx942" or gfx_version == "gfx950"
+    cdna_version = get_cdna_version()
     target = GPUTarget("hip", gfx_version, 64)
 
     gfx_fp8_pointer = "*fp8e4b8" if gfx_version == "gfx942" else "*fp8e4nv"
@@ -290,6 +292,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["ChunkK"] = "constexpr"
     fn_signature["KVBlockSize"] = "constexpr"
     fn_signature["HiddenDim"] = "constexpr"
+    fn_signature["CDNA_VERSION"] = "constexpr"
 
     options = {
         "num_warps": 4,
@@ -332,6 +335,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "ChunkK": ChunkK,
             "KVBlockSize": KVBlockSize,
             "HiddenDim": HiddenDim,
+            "CDNA_VERSION": cdna_version,
         },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
@@ -469,6 +473,7 @@ def deepgemm_fp8_paged_mqa_logits(
             VarCtxOpt=VarCtxOpt,
         )
         if triton_version >= Version("3.5.0"):
+            cdna_version = get_cdna_version()
             kernel[grid](
                 batch_size,
                 next_n,
@@ -495,6 +500,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 ChunkK,
                 KVBlockSize,
                 hidden_dim,
+                cdna_version,
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(

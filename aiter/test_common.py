@@ -80,6 +80,7 @@ def perftest(
                     end_event.record()
                     end_event.synchronize()
                     latencies.append(start_event.elapsed_time(end_event))
+                    torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
 

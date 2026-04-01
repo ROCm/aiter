@@ -5,7 +5,11 @@ import importlib.util
 import sys
 from types import SimpleNamespace
 
-from . import quant
+# Try to import quant module
+try:
+    from . import quant
+except (ImportError, AttributeError):
+    quant = None
 
 # Try to import comms module (requires iris)
 try:
@@ -27,7 +31,9 @@ except ImportError:
     IRIS_COMM_AVAILABLE = False
     comms = None
 
-__all__ = ["quant"]
+__all__ = []
+if quant is not None:
+    __all__.append("quant")
 
 if _COMMS_AVAILABLE:
     __all__.extend(

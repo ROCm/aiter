@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -30,8 +32,10 @@ except ImportError:
 
 # for some newer triton>=3.5 version, a 3D instr_shape is required.
 try:
+    _cdna_version = get_cdna_version()
+    _version = _cdna_version if _cdna_version > 0 else 3
     _: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4,
+        version=_version,
         instr_shape=[16, 16],
         transposed=False,
         warps_per_cta=[1, 1],
@@ -73,6 +77,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 1,
+    CDNA_VERSION: gl.constexpr = 3,
 ):
     pid = tl.program_id(0)
     num_block_q_head = tl.cdiv(heads_num, ChunkQ)
@@ -123,7 +128,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     )
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4,
+        version=CDNA_VERSION,
         instr_shape=[16, 16],
         transposed=False,
         warps_per_cta=[1, NumWarps],
@@ -328,6 +333,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
+    CDNA_VERSION: gl.constexpr = 3,
 ):
     # ===---------------------------------------------------
     # Gluon Layout
@@ -350,7 +356,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
 
     if _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4,
+            version=CDNA_VERSION,
             instr_shape=[16, 16],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -358,7 +364,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         )
     else:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4,
+            version=CDNA_VERSION,
             instr_shape=[16, 16, 32],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -1122,6 +1128,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
     ChunkK: tl.constexpr,
     HiddenDim: tl.constexpr,
     KVBlockSize: tl.constexpr = 16,
+    CDNA_VERSION: gl.constexpr = 3,
 ):
     # ===---------------------------------------------------
     # Gluon Layout
@@ -1144,7 +1151,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
 
     if _Use_2d_instr_shape_mfma_layout:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4,
+            version=CDNA_VERSION,
             instr_shape=[16, 16],
             transposed=False,
             warps_per_cta=[1, NumWarps],
@@ -1152,7 +1159,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         )
     else:
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-            version=4,
+            version=CDNA_VERSION,
             instr_shape=[16, 16, 32],
             transposed=False,
             warps_per_cta=[1, NumWarps],

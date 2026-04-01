@@ -180,6 +180,8 @@ def get_torch_quant(qType):
         QuantType.per_Token: pertoken_quant,
         QuantType.per_1x32: per_1x32_f4_quant,
         QuantType.per_1x128: per_block_quant_wrapper((1, 128))(pertoken_quant),
+        QuantType.per_256x128: per_block_quant_wrapper((256, 128))(pertoken_quant),
+        QuantType.per_1024x128: per_block_quant_wrapper((1024, 128))(pertoken_quant),
     }
 
     def raise_NotImplementedError(*a, **k):
@@ -415,21 +417,35 @@ def moe_smooth_per_token_scaled_quant(
     local_expert_hash: Optional[torch.Tensor] = None,
     shuffle_scale: bool = False,
     transpose_out: bool = False,
+    is_balanced: bool = False,
 ) -> None:
     cu_num = get_cu_num()
     is_moe_stage1 = input.numel() != out.numel()
-    token_num = input.shape[0]
-    if is_moe_stage1 and local_expert_hash is not None and token_num < cu_num * 8:
-        moe_smooth_per_token_scaled_quant_v1(
-            out,
-            input,
-            scales,
-            smooth_scale,
-            topk_ids,
-            shuffle_scale,
-            local_expert_hash,
-            transpose_out,
-        )
+    M = input.shape[0]
+    if is_moe_stage1 and local_expert_hash is not None and M < cu_num * 8:
+        if is_balanced:
+            moe_smooth_per_token_scaled_quant_v1(
+                out,
+                input,
+                scales,
+                smooth_scale,
+                topk_ids,
+                shuffle_scale,
+                local_expert_hash,
+                transpose_out,
+            )
+        else:
+            topk = topk_ids.shape[1]
+            model_dim = input.shape[-1]
+            smooth_per_token_scaled_quant(
+                out.view(topk, M, model_dim).transpose(0, 1),
+                input.view(M, 1, model_dim).expand(-1, topk, -1),
+                scales,
+                smooth_scale,
+                topk_ids,
+                smooth_scale_map_hash=local_expert_hash,
+                enable_ps=True,
+            )
     else:
         moe_smooth_per_token_scaled_quant_v2(
             out,

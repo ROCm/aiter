@@ -4,35 +4,14 @@
 import torch
 from torch import Tensor
 from typing import Optional
-from aiter import logger
-from ..jit.core import (
-    compile_ops,
-    AITER_ROOT_DIR,
-)
-from ..jit.utils.chip_info import get_cu_num
-from ..jit.utils.chip_info import get_gfx
+from ..jit.core import compile_ops
 import functools
-import pandas as pd
-from ..ops.gemm_op_common import get_padded_m
-
-
-def gen_gemm_a16w16_asm_fake_tensors(
-    A: Tensor,
-    B: Tensor,
-    out: Tensor,
-    semaphore: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
-    bpreshuffle: bool = False,
-) -> Tensor:
-    return out
 
 
 @compile_ops(
     "module_gemm_a16w16_asm",
     fc_name="gemm_a16w16_asm",
-    gen_fake=gen_gemm_a16w16_asm_fake_tensors,
+    ffi_type="ctypes",
 )
 def _gemm_a16w16_asm(
     A: Tensor,
@@ -43,7 +22,7 @@ def _gemm_a16w16_asm(
     splitK: Optional[int] = None,
     kernelName: Optional[str] = None,
     bpreshuffle: bool = False,
-) -> Tensor: ...
+) -> None: ...
 
 
 @functools.lru_cache(maxsize=1)
@@ -65,4 +44,5 @@ def gemm_a16w16_asm(
     else:
         sema = torch.empty((0,), dtype=torch.uint32, device=out.device)
 
-    return _gemm_a16w16_asm(A, B, out, sema, bias, splitK, kernelName, bpreshuffle)
+    _gemm_a16w16_asm(A, B, out, sema, bias, splitK, kernelName, bpreshuffle)
+    return out

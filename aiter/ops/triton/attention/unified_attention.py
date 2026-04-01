@@ -10,6 +10,8 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+
 
 def select_2d_config(
     block_size,
@@ -21,35 +23,44 @@ def select_2d_config(
     num_queries_per_kv,
     num_2d_prgms,
 ):
+    arch = get_arch()
+
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    TILE_SIZE = 64
-    # in case head_size is large
-    max_num_stages_2d = 4
-    if head_size > 128:
-        max_num_stages_2d = 2
-    if all_decode == False:
-        num_stages_2d = 1
-        num_warps = 2
-    else:
-        num_stages_2d = 3
-        num_warps = 2
-        TILE_SIZE = block_size
 
+    TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
+    waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
+
+    max_num_stages_2d = 2 if head_size > 128 else 4
+
+    # base prefill, for short cases
+    if not all_decode:
+        num_stages_2d, num_warps = 1, 2
+    # pure decode config
+    else:
+        # to not have masking when loading KV
+        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        if arch.is_rdna:
+            num_stages_2d, num_warps = 1, 4
+        else:
+            num_stages_2d, num_warps = 3, 2
+
+    # large prefill config
     if max_seqlen_q >= 256:
-        BLOCK_M = 128
-        num_stages_2d = 1
-        num_warps = 4
+        BLOCK_M = 64 if arch.is_rdna else 128
+        num_stages_2d, num_warps = 1, 4
+
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
+
     return {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
         "TILE_SIZE": TILE_SIZE,
         "num_warps": num_warps,
         "num_stages": num_stages_2d,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
     }
 
 
@@ -58,8 +69,8 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = block_size
-    MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
@@ -124,7 +135,6 @@ def unified_attention(
     sinks=None,
 ):
     assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -198,9 +208,10 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            out_scale=1 / output_scale if output_scale is not None else 1.0,
+            q_descale_ptr=q_descale,
+            k_descale_ptr=k_descale,
+            v_descale_ptr=v_descale,
+            out_scale_ptr=output_scale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
@@ -228,7 +239,6 @@ def unified_attention(
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
-            USE_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
             **config,
         )
@@ -279,8 +289,9 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
+            q_descale_ptr=q_descale,
+            k_descale_ptr=k_descale,
+            v_descale_ptr=v_descale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
@@ -319,7 +330,7 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
-            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+            out_scale_ptr=output_scale,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
@@ -327,6 +338,5 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            USE_FP8=output_scale is not None,
             **reduce_config,
         )

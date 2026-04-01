@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 import sys
 import os
 import argparse
@@ -30,12 +30,16 @@ def cmdGenFunc_mha_fwd(ck_exclude: bool):
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}",
         ]
     blob_gen_cmd.extend(FWD_CODEGEN_CMD)
-    flag_use_v3 = "-DFAV3_ON=1" if ck_exclude else "-DFAV3_ON=1 -DFAV2_ON=1"
+    flag_use_v3 = (
+        "-DFAV3_ON=1 -DENABLE_CK=0" if ck_exclude else "-DFAV3_ON=1 -DFAV2_ON=1"
+    )
     return {
         "srcs": srcs,
         "md_name": "libmha_fwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": [flag_use_v3],
+        "torch_exclude": True,
+        "is_python_module": False,
     }
 
 
@@ -55,11 +59,13 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}",
         ]
     blob_gen_cmd.extend(BWD_CODEGEN_CMD)
-    flags_extra_cc = ["-DONLY_FAV3"] if ck_exclude else []
+    flags_extra_cc = ["-DONLY_FAV3", "-DENABLE_CK=0"] if ck_exclude else []
     return {
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": flags_extra_cc,
+        "torch_exclude": True,
+        "is_python_module": False,
     }
 
 
