@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 from packaging import version
 from packaging.version import Version
 import importlib
@@ -75,6 +75,14 @@ NONE_WRAPPED_OP = [
     "qr_destroy",
     "qr_open_handles",
     "qr_get_handle",
+    # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
+    "all_reduce",
+    "reduce_scatter",
+    "all_gather_reg",
+    "all_gather_unreg",
+    "fused_allreduce_rmsnorm",
+    "fused_allreduce_rmsnorm_quant",
+    "_make_aiter_tensor",
 ]
 
 
