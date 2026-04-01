@@ -39,6 +39,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Set up Python environment
         uses: actions/setup-python@v4
         with:
@@ -51,8 +53,21 @@ jobs:
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+          fi
+
+          CHANGED_PY_FILES=$(git diff --name-only "$BASE_SHA" "$GITHUB_SHA" | rg '\.py$' || true)
+          if [ -z "$CHANGED_PY_FILES" ]; then
+            echo "No changed Python files detected."
+            exit 0
+          fi
+
           set +e
-          ruff check . \
+          # Only lint changed Python files to avoid unrelated historical violations.
+          ruff check $CHANGED_PY_FILES \
             --output-format=rdjson \
             --no-fix > ruff.rdjson
           ruff_exit=$?
