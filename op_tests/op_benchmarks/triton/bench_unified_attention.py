@@ -6,12 +6,6 @@ import itertools
 import torch
 import triton
 
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-    get_caller_name_no_ext,
-)
-from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.attention import unified_attention as ua_mod
 
@@ -19,6 +13,12 @@ from aiter.ops.triton.gluon.unified_attention_2d import (
     unified_attention as gluon_unified_attention_2d,
 )
 
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    print_vgpr,
+    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.attention.test_unified_attention import ref_paged_attn
 
 def default_benchmark_configs():
     CONFIGS = [
