@@ -103,7 +103,9 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
     return inputs
 
 
-def _mask_array_to_tensor(mask_arr: List, device: torch.device) -> Tuple[torch.Tensor, int, int, int]:
+def _mask_array_to_tensor(
+    mask_arr: List, device: torch.device
+) -> Tuple[torch.Tensor, int, int, int]:
     """Convert a mask array (2D or 3D list) to tensor and infer BATCH, num_q_blocks, num_kv_blocks."""
     if not mask_arr:
         raise ValueError("mask array is empty")
@@ -163,17 +165,25 @@ def load_block_mask_from_json(
                 raise ValueError("Each element in 'masks' must have a 'mask' key")
             mask_t, batch, nqb, nkb = _mask_array_to_tensor(item["mask"], device)
             if "num_q_blocks" in item and item["num_q_blocks"] != nqb:
-                raise ValueError(f"num_q_blocks mismatch: inferred {nqb}, got {item['num_q_blocks']}")
+                raise ValueError(
+                    f"num_q_blocks mismatch: inferred {nqb}, got {item['num_q_blocks']}"
+                )
             if "num_kv_blocks" in item and item["num_kv_blocks"] != nkb:
-                raise ValueError(f"num_kv_blocks mismatch: inferred {nkb}, got {item['num_kv_blocks']}")
+                raise ValueError(
+                    f"num_kv_blocks mismatch: inferred {nkb}, got {item['num_kv_blocks']}"
+                )
             out.append((mask_t, batch, nqb, nkb))
         return out
     if "mask" in data:
         mask_t, batch, nqb, nkb = _mask_array_to_tensor(data["mask"], device)
         if "num_q_blocks" in data and data["num_q_blocks"] != nqb:
-            raise ValueError(f"num_q_blocks mismatch: inferred {nqb}, got {data['num_q_blocks']}")
+            raise ValueError(
+                f"num_q_blocks mismatch: inferred {nqb}, got {data['num_q_blocks']}"
+            )
         if "num_kv_blocks" in data and data["num_kv_blocks"] != nkb:
-            raise ValueError(f"num_kv_blocks mismatch: inferred {nkb}, got {data['num_kv_blocks']}")
+            raise ValueError(
+                f"num_kv_blocks mismatch: inferred {nkb}, got {data['num_kv_blocks']}"
+            )
         return (mask_t, batch, nqb, nkb)
     return None
 
@@ -190,7 +200,9 @@ def make_block_attn_mask(
 
     Returns None if neither block_sparsity nor block_mask_file is set, or if file contains "masks" list (use list flow instead).
     """
-    if not getattr(args, "block_sparsity", None) and not getattr(args, "block_mask_file", None):
+    if not getattr(args, "block_sparsity", None) and not getattr(
+        args, "block_mask_file", None
+    ):
         return None
     if getattr(args, "block_mask_file", None):
         loaded = load_block_mask_from_json(args.block_mask_file, device)
@@ -220,7 +232,10 @@ def make_block_attn_mask(
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
     num_kv_blocks = (N_CTX_K + BLOCK_N - 1) // BLOCK_N
-    return (torch.rand(BATCH, args.hq, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity).to(torch.bool)
+    return (
+        torch.rand(BATCH, args.hq, num_q_blocks, num_kv_blocks, device=device)
+        > args.block_sparsity
+    ).to(torch.bool)
 
 
 def sparse_flops_from_lut(
@@ -902,7 +917,13 @@ def run_benchmark_captured(args):
             else None
         )
         return bench_kernel(
-            q, k, v, args, provider, block_lut=block_lut, block_attn_mask=block_attn_mask
+            q,
+            k,
+            v,
+            args,
+            provider,
+            block_lut=block_lut,
+            block_attn_mask=block_attn_mask,
         )
 
     args.layout = "bhsd"  # captured inputs are in BHSD format
@@ -959,7 +980,13 @@ def run_benchmark(args):
             else None
         )
         return bench_kernel(
-            q, k, v, args, provider, block_lut=block_lut, block_attn_mask=block_attn_mask
+            q,
+            k,
+            v,
+            args,
+            provider,
+            block_lut=block_lut,
+            block_attn_mask=block_attn_mask,
         )
 
     bench_mha.run(save_path="." if args.o else None, print_data=True)
@@ -997,7 +1024,8 @@ def run_benchmark_block_sparse_repetitions(args):
 
     # JIT warmup: compile kernel before timed runs so reported ms is not inflated.
     _warmup_mask = (
-        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
+        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+        > args.block_sparsity
     ).to(torch.bool)
     _warmup_lut = block_attn_mask_to_ragged_lut(_warmup_mask)
     bench_kernel(
@@ -1010,11 +1038,18 @@ def run_benchmark_block_sparse_repetitions(args):
     effective_tflops_list = []
     for _ in range(n_rep):
         block_attn_mask = (
-            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
+            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+            > args.block_sparsity
         ).to(torch.bool)
         block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
         ms = bench_kernel(
-            q, k, v, args, "time(ms)", block_lut=block_lut, block_attn_mask=block_attn_mask
+            q,
+            k,
+            v,
+            args,
+            "time(ms)",
+            block_lut=block_lut,
+            block_attn_mask=block_attn_mask,
         )
         latencies_ms.append(ms)
         ops_per_sec = total_flops / (ms * 1e-3)
@@ -1149,9 +1184,11 @@ def run_benchmark_masks_list(
         assert not causal
         mask_tensor, BATCH, num_q_blocks, num_kv_blocks = masks[MASK_IDX]
         if mask_tensor.dim() == 3:
-            mask_tensor = mask_tensor.unsqueeze(1).expand(
-                BATCH, HQ, num_q_blocks, num_kv_blocks
-            ).clone()
+            mask_tensor = (
+                mask_tensor.unsqueeze(1)
+                .expand(BATCH, HQ, num_q_blocks, num_kv_blocks)
+                .clone()
+            )
         N_CTX_Q = num_q_blocks * BLOCK_M
         N_CTX_K = num_kv_blocks * BLOCK_N
 
@@ -1359,9 +1396,9 @@ def main():
                     "block_mask_file is empty or has no 'mask' / 'masks' key"
                 )
             if isinstance(loaded_masks, list):
-                assert args.hq and args.d, (
-                    "For --block_mask_file with list of masks provide -hq and -d"
-                )
+                assert (
+                    args.hq and args.d
+                ), "For --block_mask_file with list of masks provide -hq and -d"
                 run_benchmark_masks_list(args, loaded_masks)
                 return 0
 

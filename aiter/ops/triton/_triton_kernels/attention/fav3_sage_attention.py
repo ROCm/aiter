@@ -291,7 +291,9 @@ def _sage_fwd_blocksparse_nomask(
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
         if USE_BIAS:
-            q_shifted = tl.where(m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None])
+            q_shifted = tl.where(
+                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+            )
         else:
             q_shifted = qk_scaled - m_ij[:, None]
 
@@ -438,7 +440,9 @@ def _sage_fwd_blocksparse_mask(
             bias_ptrs = bias_base_ptrs + start_n * stride_bn
             bias = tl.load(bias_ptrs, mask=qk_mask, other=0.0)
             qk_scaled += bias
-        qk_scaled = tl.where(qk_mask, qk_scaled, float("-inf"))  # mask padding before softmax
+        qk_scaled = tl.where(
+            qk_mask, qk_scaled, float("-inf")
+        )  # mask padding before softmax
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
         q_shifted = tl.where(
             m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
@@ -1341,7 +1345,9 @@ def sage_fwd(
     #          PROGRAM EARLY EXIT (All K Blocks Skipped)
     # ============================================================
     if not USE_BLOCK_SPARSE:
-        total_visible_blocks = n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
+        total_visible_blocks = (
+            n_front_masked_blocks + n_full_blocks + n_back_masked_blocks
+        )
     # Early exit: no K blocks to process
     if USE_BLOCK_SPARSE:
         _no_blocks = not has_any_range
@@ -1765,9 +1771,7 @@ def sage_fwd(
 
     acc = acc * l_recip * v_descale
     z = 0.0
-    acc = tl.where(
-        invalid_mask[:, None], z.to(acc.type.element_ty), acc
-    )
+    acc = tl.where(invalid_mask[:, None], z.to(acc.type.element_ty), acc)
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
@@ -1782,16 +1786,12 @@ def sage_fwd(
             mi_base2 = m_i
             # For invalid rows, log(l_i) would be -inf, but we want LSE to be -inf
             log_l_i = tl.where(invalid_mask, 0.0, tl.math.log2(l_i_safe))
-            softmax_lse = tl.where(
-                invalid_mask, float("-inf"), mi_base2 + log_l_i
-            )
+            softmax_lse = tl.where(invalid_mask, float("-inf"), mi_base2 + log_l_i)
             # convert back to natural units
             softmax_lse *= LN2
         else:
             log_l_i = tl.where(invalid_mask, 0.0, tl.math.log(l_i_safe))
-            softmax_lse = tl.where(
-                invalid_mask, float("-inf"), m_i + log_l_i
-            )
+            softmax_lse = tl.where(invalid_mask, float("-inf"), m_i + log_l_i)
 
     # handle masking edge cases
     if USE_SLIDING_WINDOW:

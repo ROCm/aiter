@@ -55,14 +55,12 @@ def block_attn_mask_to_ragged_lut(
 
     counts = block_attn_mask.to(torch.int32).sum(dim=-1)
     lut_count = counts.reshape(-1)
-    lut_start = (torch.cumsum(lut_count, dim=0) - lut_count)
+    lut_start = torch.cumsum(lut_count, dim=0) - lut_count
 
     # NOTE: Overallocating the LUT is a waste of memory, but the
     # alternative lut_count.sum(), will cause graph break with torch compile.
     max_count = batch * num_heads * num_q_blocks * num_kv_blocks
-    kv_block_indices = torch.empty(
-        max_count, dtype=torch.int32, device=device
-    )
+    kv_block_indices = torch.empty(max_count, dtype=torch.int32, device=device)
     block_attn_mask_to_lut_kernel(
         block_attn_mask,
         lut_start,

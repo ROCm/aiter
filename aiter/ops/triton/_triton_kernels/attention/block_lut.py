@@ -49,9 +49,7 @@ def _block_attn_mask_to_lut_kernel(
         in_bounds = kb_offs < num_kv_blocks
 
         # Row offset for (b, h, qb): mask[b, h, qb, start_kb : start_kb+BLOCK_KB]
-        row_base = (
-            b * stride_mask_b + h * stride_mask_h + qb * stride_mask_qb
-        )
+        row_base = b * stride_mask_b + h * stride_mask_h + qb * stride_mask_qb
         mask_ptrs = mask_ptr + row_base + kb_offs * stride_mask_kb
         # Load mask chunk; bool loads as uint8/int8, non-zero = True
         mask_chunk = tl.load(mask_ptrs, mask=in_bounds, other=0)

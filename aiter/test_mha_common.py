@@ -399,17 +399,25 @@ def block_attn_mask_to_token_mask(
     """
     nd = block_attn_mask.dim()
     assert nd in (3, 4), "block_attn_mask must be 3D or 4D"
-    q_block_idx = torch.arange(seqlen_q, device=device).div(
-        BLOCK_M, rounding_mode="floor"
-    ).clamp(max=block_attn_mask.shape[nd - 2] - 1)
-    k_block_idx = torch.arange(seqlen_k, device=device).div(
-        BLOCK_N, rounding_mode="floor"
-    ).clamp(max=block_attn_mask.shape[nd - 1] - 1)
+    q_block_idx = (
+        torch.arange(seqlen_q, device=device)
+        .div(BLOCK_M, rounding_mode="floor")
+        .clamp(max=block_attn_mask.shape[nd - 2] - 1)
+    )
+    k_block_idx = (
+        torch.arange(seqlen_k, device=device)
+        .div(BLOCK_N, rounding_mode="floor")
+        .clamp(max=block_attn_mask.shape[nd - 1] - 1)
+    )
     if nd == 3:
-        attn_mask = block_attn_mask[:, q_block_idx, :][:, :, k_block_idx]  # (B, seqlen_q, seqlen_k)
+        attn_mask = block_attn_mask[:, q_block_idx, :][
+            :, :, k_block_idx
+        ]  # (B, seqlen_q, seqlen_k)
         return attn_mask
     # 4D: (B, H, num_q_blocks, num_kv_blocks)
-    attn_mask = block_attn_mask[:, :, q_block_idx, :][:, :, :, k_block_idx]  # (B, H, seqlen_q, seqlen_k)
+    attn_mask = block_attn_mask[:, :, q_block_idx, :][
+        :, :, :, k_block_idx
+    ]  # (B, H, seqlen_q, seqlen_k)
     return attn_mask
 
 
@@ -467,11 +475,11 @@ def attention_ref_block_sparse(
         scores = scores + attn_bias
     lse = torch.logsumexp(scores, dim=-1).to(v.dtype)
     attention = torch.softmax(scores, dim=-1).to(v.dtype)
-    all_masked = token_mask.all(dim=-1)  # (batch, seqlen_q) or (batch, num_heads, seqlen_q)
+    all_masked = token_mask.all(
+        dim=-1
+    )  # (batch, seqlen_q) or (batch, num_heads, seqlen_q)
     if block_attn_mask.dim() == 3:
-        attention = attention.masked_fill(
-            rearrange(all_masked, "b t -> b 1 t 1"), 0.0
-        )
+        attention = attention.masked_fill(rearrange(all_masked, "b t -> b 1 t 1"), 0.0)
     else:
         attention = attention.masked_fill_(all_masked.unsqueeze(-1), 0.0)
     if query_padding_mask is not None:

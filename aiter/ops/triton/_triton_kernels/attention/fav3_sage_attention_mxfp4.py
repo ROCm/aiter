@@ -358,6 +358,7 @@ def _sage_fwd_mask_mxfp4(
 
     return acc, l_i, m_i
 
+
 @triton.jit
 def _sage_fwd_blocksparse_nomask_mxfp4(
     acc,
@@ -460,6 +461,7 @@ def _sage_fwd_blocksparse_nomask_mxfp4(
         acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
+
 
 @triton.jit
 def _sage_fwd_blocksparse_mask_mxfp4(
@@ -570,6 +572,7 @@ def _sage_fwd_blocksparse_mask_mxfp4(
         acc += tl.dot(p.to(v.type.element_ty), v, out_dtype=tl.float32)
 
     return acc, l_i, m_i
+
 
 @triton.jit
 def sage_fwd_mxfp4(
@@ -867,7 +870,7 @@ def sage_fwd_mxfp4(
             stride_ksn,
             kv_block_indices,
             lut_start_val,
-            n_blocks-1,
+            n_blocks - 1,
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
@@ -907,7 +910,7 @@ def sage_fwd_mxfp4(
             kv_block_indices,
             lut_start_val + (n_blocks - 1),
             1,
-            False, # IS_CAUSAL is not supported for block sparse
+            False,  # IS_CAUSAL is not supported for block sparse
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,

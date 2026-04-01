@@ -167,7 +167,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
 
         if return_lse:
             return out, softmax_lse
-        
+
         return out
 
     @staticmethod

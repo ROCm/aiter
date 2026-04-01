@@ -37,8 +37,14 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
     check_attention_outputs,
     input_helper,
 )
-from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func, sparse_flops_from_lut
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import print_vgpr, get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.bench_fav3_sage import (
+    fav2_forward_func,
+    sparse_flops_from_lut,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    print_vgpr,
+    get_caller_name_no_ext,
+)
 
 # Configuration
 logging.getLogger().setLevel(logging.INFO)
@@ -162,7 +168,9 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
         ref_name = getattr(args, "ref", None) or "torch"
         if block_attn_mask is not None:
             if ref_name != "torch":
-                raise ValueError(f"Reference kernel {ref_name} not supported for block sparsity")
+                raise ValueError(
+                    f"Reference kernel {ref_name} not supported for block sparsity"
+                )
 
             q_bshd, k_bshd, v_bshd = layout_preprocess(
                 q, k, v, layout=args.layout, target_layout="bshd"
@@ -188,14 +196,23 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
 
             if ref_name == "fav2":
                 ref_out = fav2_forward_func(
-                    q_ref, k_ref, v_ref,
-                    dropout_p=0.0, softmax_scale=sm_scale,
-                    causal=False, return_lse=False, return_attn_probs=False,
+                    q_ref,
+                    k_ref,
+                    v_ref,
+                    dropout_p=0.0,
+                    softmax_scale=sm_scale,
+                    causal=False,
+                    return_lse=False,
+                    return_attn_probs=False,
                 )()
             else:
                 ref_out = attention_ref(
-                    q_ref, k_ref, v_ref,
-                    dropout_p=0.0, dropout_mask=None, causal=False,
+                    q_ref,
+                    k_ref,
+                    v_ref,
+                    dropout_p=0.0,
+                    dropout_mask=None,
+                    causal=False,
                 )
 
             reference_primary = primary_output(ref_out)
@@ -205,7 +222,9 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
 
     if block_lut is not None:
-        sparse_flops, _ = sparse_flops_from_lut(block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V)
+        sparse_flops, _ = sparse_flops_from_lut(
+            block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V
+        )
     else:
         sparse_flops = 0
 
@@ -230,6 +249,7 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
     elif "GB/s" in provider:
         return mem / ms * 1e-6
     return ms
+
 
 def create_benchmark_configs(args):
     dtype = arg_to_torch_dtype[args.dtype]
@@ -284,13 +304,20 @@ def create_benchmark_configs(args):
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_vals,
-            styles=[("red", "-"), ("green", "-"), ("yellow", "-"), ("blue", "-"), ("cyan", "-")],
+            styles=[
+                ("red", "-"),
+                ("green", "-"),
+                ("yellow", "-"),
+                ("blue", "-"),
+                ("cyan", "-"),
+            ],
             ylabel=unit,
             plot_name=plot_name,
             args=extra_args,
         )
     )
     return configs
+
 
 def run_benchmark(args):
     torch.manual_seed(20)
@@ -329,7 +356,15 @@ def run_benchmark(args):
             ).to(torch.bool)
             block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
 
-        return bench_kernel(q, k, v, args, provider, block_lut=block_lut, block_attn_mask=block_attn_mask)
+        return bench_kernel(
+            q,
+            k,
+            v,
+            args,
+            provider,
+            block_lut=block_lut,
+            block_attn_mask=block_attn_mask,
+        )
 
     bench_mha.run(save_path="." if getattr(args, "o", False) else None, print_data=True)
 
@@ -363,7 +398,8 @@ def run_benchmark_block_sparse_repetitions(args):
 
     # JIT warmup: compile kernel before timed runs so reported ms is not inflated.
     _warmup_mask = (
-        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
+        torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+        > args.block_sparsity
     ).to(torch.bool)
     _warmup_lut = block_attn_mask_to_ragged_lut(_warmup_mask)
     bench_kernel(
@@ -376,13 +412,22 @@ def run_benchmark_block_sparse_repetitions(args):
     effective_tflops_list = []
     for _ in range(n_rep):
         block_attn_mask = (
-            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device) > args.block_sparsity
+            torch.rand(BATCH, HQ, num_q_blocks, num_kv_blocks, device=device)
+            > args.block_sparsity
         ).to(torch.bool)
         block_lut = block_attn_mask_to_ragged_lut(block_attn_mask)
         ms = bench_kernel(
-            q, k, v, args, "time(ms)", block_lut=block_lut, block_attn_mask=block_attn_mask
+            q,
+            k,
+            v,
+            args,
+            "time(ms)",
+            block_lut=block_lut,
+            block_attn_mask=block_attn_mask,
         )
-        sparse_flops, total_flops = sparse_flops_from_lut(block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V)
+        sparse_flops, total_flops = sparse_flops_from_lut(
+            block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V
+        )
         latencies_ms.append(ms)
         ops_per_sec = total_flops / (ms * 1e-3)
         tflops = ops_per_sec / 1e12
@@ -429,22 +474,58 @@ def run_benchmark_block_sparse_repetitions(args):
         with open(csv_path, "a", newline="") as f:
             writer = csv.writer(f)
             row = [
-                BATCH, HQ, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
-                args.block_sparsity, n_rep,
-                median_tflops, q1_tflops, q3_tflops, p10_tflops, p90_tflops,
-                median_latency_ms, q1_latency_ms, q3_latency_ms, p10_latency_ms, p90_latency_ms,
-                median_effective_tflops, q1_effective_tflops, q3_effective_tflops,
-                p10_effective_tflops, p90_effective_tflops,
+                BATCH,
+                HQ,
+                N_CTX_Q,
+                N_CTX_K,
+                D_HEAD,
+                D_HEAD_V,
+                args.block_sparsity,
+                n_rep,
+                median_tflops,
+                q1_tflops,
+                q3_tflops,
+                p10_tflops,
+                p90_tflops,
+                median_latency_ms,
+                q1_latency_ms,
+                q3_latency_ms,
+                p10_latency_ms,
+                p90_latency_ms,
+                median_effective_tflops,
+                q1_effective_tflops,
+                q3_effective_tflops,
+                p10_effective_tflops,
+                p90_effective_tflops,
             ]
             if not file_exists:
-                writer.writerow([
-                    "BATCH", "HQ", "N_CTX_Q", "N_CTX_K", "D_HEAD", "D_HEAD_V",
-                    "block_sparsity", "n_repetitions",
-                    "median_TFLOPS", "q1_TFLOPS", "q3_TFLOPS", "p10_TFLOPS", "p90_TFLOPS",
-                    "median_latency_ms", "q1_latency_ms", "q3_latency_ms", "p10_latency_ms", "p90_latency_ms",
-                    "median_effective_TFLOPS", "q1_effective_TFLOPS", "q3_effective_TFLOPS",
-                    "p10_effective_TFLOPS", "p90_effective_TFLOPS",
-                ])
+                writer.writerow(
+                    [
+                        "BATCH",
+                        "HQ",
+                        "N_CTX_Q",
+                        "N_CTX_K",
+                        "D_HEAD",
+                        "D_HEAD_V",
+                        "block_sparsity",
+                        "n_repetitions",
+                        "median_TFLOPS",
+                        "q1_TFLOPS",
+                        "q3_TFLOPS",
+                        "p10_TFLOPS",
+                        "p90_TFLOPS",
+                        "median_latency_ms",
+                        "q1_latency_ms",
+                        "q3_latency_ms",
+                        "p10_latency_ms",
+                        "p90_latency_ms",
+                        "median_effective_TFLOPS",
+                        "q1_effective_TFLOPS",
+                        "q3_effective_TFLOPS",
+                        "p10_effective_TFLOPS",
+                        "p90_effective_TFLOPS",
+                    ]
+                )
             writer.writerow(row)
         logger.info(f"Wrote CSV row to {csv_path}")
 
