@@ -557,6 +557,79 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 check_boundary=check_boundary,
             )
 
+    # ---- Inline-asm prefetch: fully opaque to LLVM waitcnt analysis ----
+    def _prefetch_k_tile_asm(p_lds_kv_warp_i32, row_i32, col_base_i32, block_idx_const):
+        """Prefetch one KV block via inline asm buffer_load_dword lds.
+
+        Uses inline asm for BOTH the normal load AND the OOB zero-write
+        so LLVM sees no LDS operations and won't insert spurious
+        s_waitcnt vmcnt(0) before subsequent ds_read ops.
+
+        Per-lane OOB check (row_i32 == -1): scf.IfOp for branching,
+        but both branches use inline asm for LDS operations so LLVM
+        can't see them.
+        """
+        lds_warp_offset = block_idx_const * KV_BLOCK_BYTES
+        lds_base_i32 = _std_arith.AddIOp(
+            p_lds_kv_warp_i32,
+            _raw(
+                arith.constant(
+                    lds_warp_offset - block_idx_const * KV_NUM_COLS, type=T.i32
+                )
+            ),
+        ).result
+
+        neg_one = _raw(arith.constant(-1, type=T.i32))
+        is_oob = _std_arith.CmpIOp(CmpIPredicate.eq, _raw(row_i32), neg_one).result
+
+        if_op = scf.IfOp(is_oob, [], has_else=True)
+        with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+            # OOB: write zero to LDS via inline asm ds_write_b32
+            lane_offset = _std_arith.MulIOp(
+                _raw(lane_idx_i32),
+                _raw(arith.constant(4, type=T.i32)),
+            ).result
+            lds_zero_addr = _std_arith.AddIOp(
+                lds_base_i32,
+                _std_arith.AddIOp(
+                    _raw(arith.constant(block_idx_const * KV_NUM_COLS, type=T.i32)),
+                    lane_offset,
+                ).result,
+            ).result
+            llvm.InlineAsmOp(
+                res=None,
+                operands_=[lds_zero_addr, _raw(arith.constant(0, type=T.i32))],
+                asm_string="ds_write_b32 $0, $1",
+                constraints="v,v",
+                has_side_effects=True,
+                is_align_stack=False,
+            )
+            scf.YieldOp([])
+        with ir.InsertionPoint(if_op.regions[1].blocks[0]):
+            # Normal: inline asm buffer_load_dword lds
+            voff = _std_arith.AddIOp(
+                _std_arith.MulIOp(
+                    _raw(row_i32),
+                    _raw(arith.constant(QK_HEAD_DIM, type=T.i32)),
+                ).result,
+                _raw(col_base_i32),
+            ).result
+            col_off_imm = block_idx_const * KV_NUM_COLS
+            asm_str = (
+                "s_mov_b32 m0, $0\n"
+                "s_nop 0\n"
+                f"buffer_load_dword $1, $2, 0 offen offset:{col_off_imm} lds"
+            )
+            llvm.InlineAsmOp(
+                res=None,
+                operands_=[lds_base_i32, voff, _raw(kv_rsrc)],
+                asm_string=asm_str,
+                constraints="s,v,s",
+                has_side_effects=True,
+                is_align_stack=False,
+            )
+            scf.YieldOp([])
+
     # ---- Helper: load K sub-tile from LDS (16x32 for MFMA) ----
     def _load_k_from_lds(p_lds_kv_base_idx, row_offset, col_offset):
         """Read 16x32 K sub-tile from LDS -> i64 for MFMA.
@@ -1198,6 +1271,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             )
 
     # ---- Helper: process one KV tile (GEMM1 + softmax + V + GEMM2) ----
+    # Interleaves async prefetch of the NEXT tile's KV data
+    # into the GEMM1 NoPE loop (1 block per iteration, 9 total).
     def _process_tile(
         p_lds_kv_base,
         kv_tile_start_i32,
@@ -1209,11 +1284,28 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         oaccu_in,
         is_first_iter,
         check_boundary,
+        p_lds_kv_next_warp_i32=None,
+        row_kv_ld_next=None,
+        kv_ld_col_base_i32_arg=None,
     ):
         """Process one KV tile: QK GEMM -> softmax -> V transpose -> PV GEMM.
 
-        Returns (row_max, row_sum_e, oaccu) as updated values.
+        When p_lds_kv_next_warp_i32 is provided, interleaves prefetch
+        of the next tile's KV data during GEMM1 NoPE loop.
+
+        Returns (row_max, row_sum_e, oaccu).
         """
+        do_prefetch = p_lds_kv_next_warp_i32 is not None
+
+        # ---- Prefetch block 0 of next tile (inline asm, opaque to LLVM) ----
+        if do_prefetch:
+            _prefetch_k_tile_asm(
+                p_lds_kv_next_warp_i32,
+                row_kv_ld_next,
+                kv_ld_col_base_i32_arg,
+                0,
+            )
+
         # ---- GEMM1: QK attention scores ----
         p_comp = [_raw(c_zero_v4f32), _raw(c_zero_v4f32)]
 
@@ -1225,6 +1317,15 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             k0_hi = _load_k_from_lds(p_lds_kv_base, 16, tile_0 * BLOCK_K)
             k1_lo = _load_k_from_lds(p_lds_kv_base, 0, tile_1 * BLOCK_K)
             k1_hi = _load_k_from_lds(p_lds_kv_base, 16, tile_1 * BLOCK_K)
+
+            # Prefetch block nope_pair+1 of next tile (inline asm)
+            if do_prefetch:
+                _prefetch_k_tile_asm(
+                    p_lds_kv_next_warp_i32,
+                    row_kv_ld_next,
+                    kv_ld_col_base_i32_arg,
+                    nope_pair + 1,
+                )
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
@@ -1400,21 +1501,12 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         num_tiles = arith.divui(arith.addi(kv_len, c_block_n_m1), c_block_n)
         num_tiles_idx = arith.index_cast(T.index, num_tiles)
 
-        # ---- Tile loop ----
-        # We use Python range with compile-time max and break early via
-        # scf.IfOp to avoid complex SSA state passing through scf.ForOp.
-        # The tile loop processes tiles [0, num_tiles).
-        # For each tile:
-        #   1. Resolve KV page indices
-        #   2. Load KV tile to LDS (p_lds_kv_0 region, no double-buffering for now)
-        #   3. Barrier
-        #   4. Process tile (GEMM1 + softmax + V + GEMM2)
-        #
-        # First tile: is_first_iter=True, always check boundary
-        # Last tile: always check boundary
-        # Middle tiles: no boundary check
+        # ---- Double-buffered tile loop ----
+        # Buffer 0: first tile loaded synchronously
+        # Prefetch of next tile interleaved in _process_tile during GEMM1
+        # Subsequent tiles alternate buffers via tile_idx parity.
 
-        # --- First tile ---
+        # --- First tile: load all 9 blocks to KV_0 synchronously ---
         row_kv_ld_first = _get_kv_ld_row(kv_start, kv_end, True)
         _async_load_kv_all(
             p_lds_kv_0_warp_i32,
@@ -1426,6 +1518,15 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         _barrier(vmcnt=0, lgkmcnt=0)
         rocdl.sched_barrier(0)
 
+        # Resolve row for tile 1 prefetch (raw, may be -1 for OOB)
+        kv_start_plus_bn = _std_arith.AddIOp(
+            _raw(kv_start),
+            _raw(arith.constant(BLOCK_N, type=T.i32)),
+        ).result
+        row_kv_ld_tile1 = _get_kv_ld_row(kv_start_plus_bn, _raw(kv_end), True)
+
+        # Process first tile; interleave prefetch of tile 1 to KV_1
+        # _prefetch_k_tile_asm handles OOB (row==-1) by writing zeros.
         row_max, row_sum_e, oaccu = _process_tile(
             p_lds_kv_0_base,
             kv_start,
@@ -1437,20 +1538,22 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             oaccu,
             is_first_iter=True,
             check_boundary=True,
+            p_lds_kv_next_warp_i32=p_lds_kv_1_warp_i32,
+            row_kv_ld_next=row_kv_ld_tile1,
+            kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
         )
 
-        # --- Middle + last tiles (if any) ---
-        # Use scf.ForOp with tile index [1, num_tiles)
-        # Carried values: row_max, row_sum_e, oaccu[0..31]
+        # --- Remaining tiles [1, num_tiles) via scf.ForOp ---
+        # Carried state: row_max, row_sum_e, oaccu[0..31]
         c_one_idx = arith.index(1)
         init_args = [row_max, row_sum_e] + oaccu
-        result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
+        init_args = [_raw(v) if not isinstance(v, ir.Value) else v for v in init_args]
 
         for_op = scf.ForOp(
             _raw(c_one_idx),
             _raw(num_tiles_idx),
             _raw(c_one_idx),
-            [_raw(v) if not isinstance(v, ir.Value) else v for v in init_args],
+            init_args,
         )
         with ir.InsertionPoint(for_op.body):
             tile_iv = for_op.induction_variable  # index type
@@ -1467,32 +1570,48 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 for_op.inner_iter_args[2 + i] for i in range(NUM_PV_ITERS * 2)
             ]
 
-            # Determine if this is the last tile (needs boundary check)
-            is_last_tile_i32 = _std_arith.AddIOp(
+            # Buffer parity: tile 0 used KV_0 and prefetched to KV_1.
+            #   tile 1 (odd):  curr=KV_1, next=KV_0
+            #   tile 2 (even): curr=KV_0, next=KV_1
+            tile_parity = _std_arith.AndIOp(
                 tile_iv_i32,
                 _raw(arith.constant(1, type=T.i32)),
             ).result
-            last_cond = _std_arith.CmpIOp(
-                CmpIPredicate.sge,
-                is_last_tile_i32,
-                _raw(num_tiles),
+            is_odd = _std_arith.CmpIOp(
+                CmpIPredicate.ne,
+                tile_parity,
+                _raw(arith.constant(0, type=T.i32)),
+            ).result
+            curr_base_idx = _std_arith.SelectOp(
+                is_odd,
+                _raw(p_lds_kv_1_base),
+                _raw(p_lds_kv_0_base),
+            ).result
+            curr_warp = _std_arith.SelectOp(
+                is_odd,
+                p_lds_kv_1_warp_i32,
+                p_lds_kv_0_warp_i32,
+            ).result
+            next_warp = _std_arith.SelectOp(
+                is_odd,
+                p_lds_kv_0_warp_i32,
+                p_lds_kv_1_warp_i32,
             ).result
 
-            # Load KV tile (with boundary check on last tile)
-            # For simplicity, always check boundary -- slightly slower but correct
-            row_kv_ld_tile = _get_kv_ld_row(kv_tile_start_i32, _raw(kv_end), True)
-            _async_load_kv_all(
-                p_lds_kv_0_warp_i32,
-                row_kv_ld_tile,
-                kv_ld_col_base_i32,
-                check_boundary=True,
-            )
-
+            # Wait for previous prefetch, then process curr buffer
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
 
+            # Resolve row for next tile prefetch (fresh, may be -1 for OOB).
+            # _prefetch_k_tile_asm handles OOB by writing zeros to LDS.
+            kv_tile_next_start = _std_arith.AddIOp(
+                kv_tile_start_i32,
+                _raw(arith.constant(BLOCK_N, type=T.i32)),
+            ).result
+            row_kv_ld_next = _get_kv_ld_row(kv_tile_next_start, _raw(kv_end), True)
+
             rm_new, rse_new, oaccu_new = _process_tile(
-                p_lds_kv_0_base,
+                curr_base_idx,
                 kv_tile_start_i32,
                 _raw(kv_end),
                 q_nope_packs,
@@ -1502,6 +1621,9 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 oaccu_carried,
                 is_first_iter=False,
                 check_boundary=True,
+                p_lds_kv_next_warp_i32=next_warp,
+                row_kv_ld_next=row_kv_ld_next,
+                kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
             )
 
             yield_vals = [rm_new, rse_new] + oaccu_new
