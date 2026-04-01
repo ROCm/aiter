@@ -59,15 +59,15 @@ jobs:
             BASE_SHA="${{ github.event.before }}"
           fi
 
-          CHANGED_PY_FILES=$(git diff --name-only "$BASE_SHA" "$GITHUB_SHA" | rg '\.py$' || true)
-          if [ -z "$CHANGED_PY_FILES" ]; then
+          mapfile -t CHANGED_PY_FILES < <(git diff --name-only "$BASE_SHA" "$GITHUB_SHA" -- '*.py')
+          if [ "${#CHANGED_PY_FILES[@]}" -eq 0 ]; then
             echo "No changed Python files detected."
             exit 0
           fi
 
           set +e
           # Only lint changed Python files to avoid unrelated historical violations.
-          ruff check $CHANGED_PY_FILES \
+          ruff check "${CHANGED_PY_FILES[@]}" \
             --output-format=rdjson \
             --no-fix > ruff.rdjson
           ruff_exit=$?
