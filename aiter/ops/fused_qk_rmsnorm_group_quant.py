@@ -12,7 +12,7 @@ from ..utility import dtypes
 @compile_ops(
     "module_fused_qk_rmsnorm_group_quant", fc_name="fused_qk_rmsnorm_group_quant"
 )
-def _fused_qk_rmsnorm_group_quant_hip_kernel(
+def _fused_qk_rmsnorm_group_quant_kernel(
     q_out_quantized: Tensor,
     q_out_scale: Tensor,
     q: Tensor,
@@ -30,7 +30,7 @@ def _fused_qk_rmsnorm_group_quant_hip_kernel(
 ) -> None: ...
 
 
-def fused_qk_rmsnorm_group_quant_hip(
+def fused_qk_rmsnorm_group_quant(
     q_out_quantized: Tensor,
     q_out_scale: Tensor,
     q: Tensor,
@@ -48,15 +48,27 @@ def fused_qk_rmsnorm_group_quant_hip(
 ) -> None:
     if q_out_quantized.dtype not in (dtypes.fp8, dtypes.fp4x2):
         raise ValueError(
-            "fused_qk_rmsnorm_group_quant_hip currently supports fp8/fp4x2 output quant only; "
+            "fused_qk_rmsnorm_group_quant currently supports fp8/fp4x2 output quant only; "
             f"got {q_out_quantized.dtype}"
         )
-    if q_out_quantized.dtype == dtypes.fp4x2 and transpose_scale:
-        raise ValueError(
-            "fused_qk_rmsnorm_group_quant_hip fp4x2 currently does not support transpose_scale=True"
-        )
+    if q_out_quantized.dtype == dtypes.fp4x2:
+        if transpose_scale:
+            raise ValueError(
+                "fused_qk_rmsnorm_group_quant fp4x2 currently does not support transpose_scale=True"
+            )
+        n1 = q.size(1)
+        if n1 % 2 != 0:
+            raise ValueError(
+                f"q.size(1) must be even for fp4x2 packed output, got {n1}"
+            )
+        expected_packed = n1 // 2
+        if q_out_quantized.size(1) != expected_packed:
+            raise ValueError(
+                f"fp4x2 q_out_quantized.size(1) should be {expected_packed} "
+                f"(n1//2 packed), got {q_out_quantized.size(1)}"
+            )
 
-    _fused_qk_rmsnorm_group_quant_hip_kernel(
+    _fused_qk_rmsnorm_group_quant_kernel(
         q_out_quantized,
         q_out_scale,
         q,

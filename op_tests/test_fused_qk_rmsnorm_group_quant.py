@@ -97,7 +97,6 @@ def _upcast_group_fp4x2(
             f"fp4x2 packed columns insufficient: got {x_q_u8.shape[1]}, need {packed_cols}"
         )
     if x_q_u8.shape[1] != packed_cols:
-        # HIP fp4x2 API may expose logical-width tensors; only the packed prefix is valid.
         x_q_u8 = x_q_u8[:, :packed_cols]
     q_f32 = fp4_utils.mxfp4_to_f32(x_q_u8).view(m, n // group_size, group_size)
     s_f32 = fp4_utils.e8m0_to_f32(x_s).float().view(m, -1, 1)
@@ -269,8 +268,7 @@ def run_hip(
         x1_q = torch.empty((m, n1), dtype=dtypes.fp8, device=x1.device)
         x1_s = torch.empty((m, n1 // group_size), dtype=torch.float32, device=x1.device)
     elif quant_out_dtype == dtypes.fp4x2:
-        # Current HIP API expects logical shape [M, N1] for fp4x2 output tensors.
-        x1_q = torch.empty((m, n1), dtype=dtypes.fp4x2, device=x1.device)
+        x1_q = torch.empty((m, n1 // 2), dtype=dtypes.fp4x2, device=x1.device)
         x1_s = torch.empty((m, n1 // group_size), dtype=torch.uint8, device=x1.device)
     else:
         raise ValueError(f"Unsupported quant_out_dtype={quant_out_dtype}")
@@ -278,7 +276,7 @@ def run_hip(
     x2_out = torch.empty_like(x2) if x2 is not None else None
     res_out = torch.empty_like(x1) if res1 is not None else None
 
-    aiter.fused_qk_rmsnorm_group_quant_hip(
+    aiter.fused_qk_rmsnorm_group_quant(
         x1_q,
         x1_s,
         x1,
@@ -298,7 +296,7 @@ def run_hip(
 
 
 @benchmark()
-def test_fused_qk_rmsnorm_group_quant_hip(
+def test_fused_qk_rmsnorm_group_quant(
     dtype: torch.dtype,
     token: int,
     num_head1: int,
@@ -911,7 +909,7 @@ if __name__ == "__main__":
                     for num_head1 in l_num_head1:
                         for num_head2 in l_num_head2:
                             for add_residual in l_residual:
-                                row = test_fused_qk_rmsnorm_group_quant_hip(
+                                row = test_fused_qk_rmsnorm_group_quant(
                                     dtype=dtype,
                                     token=token,
                                     num_head1=num_head1,
@@ -928,6 +926,6 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     focus_df = _focus_summary_df(df)
     aiter.logger.info(
-        "fused_qk_rmsnorm_group_quant_hip summary (time/err/bw, markdown):\n%s",
+        "fused_qk_rmsnorm_group_quant summary (time/err/bw, markdown):\n%s",
         focus_df.to_markdown(index=False),
     )

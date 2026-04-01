@@ -31,8 +31,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     const DTYPE_I* __restrict__ q_residual,
     const DTYPE_I* __restrict__ q_weight,
     const DTYPE_I* __restrict__ k_weight,
-    double q_epsilon,
-    double k_epsilon,
+    float q_epsilon,
+    float k_epsilon,
     int m,
     int q_n,
     int k_n,
@@ -57,8 +57,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     const auto* res1 = q_residual;
     const auto* w1 = q_weight;
     const auto* w2 = k_weight;
-    const double eps1 = q_epsilon;
-    const double eps2 = k_epsilon;
+    const float eps1 = q_epsilon;
+    const float eps2 = k_epsilon;
     const int n1 = q_n;
     const int n2 = k_n;
     const int inp1_stride = q_stride;
@@ -195,7 +195,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     }
     auto sum_f = [](float a, float b) { return a + b; };
     rcp[0] = block_reduce<float, decltype(sum_f), BlockSize, true>(square_sum, sum_f);
-    const double epsilon = is_x1 ? eps1 : eps2;
+    const float epsilon = is_x1 ? eps1 : eps2;
     rcp[0] = rsqrtf(rcp[0] / n + epsilon);
     rcp[1] = rcp[0];
 
@@ -305,7 +305,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
         }
         float& inv_scale = quant_scale;
 
-        int oob_o = (n1 + ooba_o - 1) / ooba_o * ooba_o;
+        int oob_n1 = std::is_same_v<DTYPE_O, opus::fp4_t> ? n1 / 2 : n1;
+        int oob_o = (oob_n1 + ooba_o - 1) / ooba_o * ooba_o;
         auto out_q_ptr = out1_q + idx * static_cast<int64_t>(out1_q_stride);
         auto out_q_buffer = opus::make_gmem<DTYPE_O_STORE>(
             reinterpret_cast<DTYPE_O_STORE*>(out_q_ptr), oob_o * sizeof(DTYPE_O_STORE));
@@ -529,7 +530,7 @@ void fused_qk_rmsnorm_group_quant(
     auto& out1_scale = q_out_scale;
     auto& inp1 = q;
     auto& inp1_weight = q_weight;
-    const double inp1_epsilon = q_epsilon;
+    const float inp1_epsilon = static_cast<float>(q_epsilon);
     const auto& out1_unquantized_opt = q_out_unquantized_opt;
     const auto& out2_opt = k_out_opt;
     const auto& out_res1_opt = q_res_out_opt;
@@ -540,8 +541,10 @@ void fused_qk_rmsnorm_group_quant(
 
     TORCH_CHECK(inp1.is_cuda(), __func__, " inp1 must be on CUDA/HIP device");
     TORCH_CHECK(inp1.dim() == 2, __func__, " inp1 must be a 2D tensor");
+    TORCH_CHECK(inp1.is_contiguous(), __func__, " inp1 must be contiguous");
     TORCH_CHECK(inp1_weight.is_cuda(), __func__, " inp1_weight must be on CUDA/HIP device");
     TORCH_CHECK(inp1_weight.dim() == 1, __func__, " inp1_weight must be a 1D tensor");
+    TORCH_CHECK(inp1_weight.is_contiguous(), __func__, " inp1_weight must be contiguous");
     TORCH_CHECK(inp1.scalar_type() == torch::kHalf || inp1.scalar_type() == torch::kBFloat16,
                 __func__,
                 " inp1 only supports fp16/bf16, got: ",
@@ -562,26 +565,13 @@ void fused_qk_rmsnorm_group_quant(
 
     TORCH_CHECK(out1_quantized.is_cuda(), __func__, " out1_quantized must be on CUDA/HIP device");
     TORCH_CHECK(out1_quantized.dim() == 2, __func__, " out1_quantized must be a 2D tensor");
+    TORCH_CHECK(out1_quantized.is_contiguous(), __func__, " out1_quantized must be contiguous");
     TORCH_CHECK(out1_scale.is_cuda(), __func__, " out1_scale must be on CUDA/HIP device");
     TORCH_CHECK(out1_scale.dim() == 2, __func__, " out1_scale must be a 2D tensor");
+    TORCH_CHECK(out1_scale.is_contiguous(), __func__, " out1_scale must be contiguous");
 
     const int m = inp1.size(0);
     const int n1 = inp1.size(1);
-    TORCH_CHECK(out1_quantized.size(0) == m && out1_quantized.size(1) == n1,
-                __func__,
-                " out1_quantized shape mismatch, expected [",
-                m,
-                ", ",
-                n1,
-                "]");
-    TORCH_CHECK(out1_scale.size(0) == m && out1_scale.size(1) == (n1 / group_size),
-                __func__,
-                " out1_scale shape mismatch, expected [",
-                m,
-                ", ",
-                (n1 / group_size),
-                "]");
-
     bool quant_is_fp8 = (out1_quantized.scalar_type() == torch_fp8) ||
                         (out1_quantized.scalar_type() == at::ScalarType::Float8_e4m3fn) ||
                         (out1_quantized.scalar_type() == at::ScalarType::Float8_e4m3fnuz);
@@ -593,6 +583,38 @@ void fused_qk_rmsnorm_group_quant(
                 __func__,
                 " out1_quantized dtype only supports fp8/fp4x2, got: ",
                 out1_quantized.scalar_type());
+
+    if(quant_is_fp4)
+    {
+        TORCH_CHECK(n1 % 2 == 0,
+                    __func__,
+                    " inp1.size(1) must be even for fp4x2 packed output, got ",
+                    n1);
+        TORCH_CHECK(out1_quantized.size(0) == m && out1_quantized.size(1) == (n1 / 2),
+                    __func__,
+                    " out1_quantized shape mismatch for fp4x2, expected [",
+                    m,
+                    ", ",
+                    (n1 / 2),
+                    "]");
+    }
+    else
+    {
+        TORCH_CHECK(out1_quantized.size(0) == m && out1_quantized.size(1) == n1,
+                    __func__,
+                    " out1_quantized shape mismatch, expected [",
+                    m,
+                    ", ",
+                    n1,
+                    "]");
+    }
+    TORCH_CHECK(out1_scale.size(0) == m && out1_scale.size(1) == (n1 / group_size),
+                __func__,
+                " out1_scale shape mismatch, expected [",
+                m,
+                ", ",
+                (n1 / group_size),
+                "]");
     if(quant_is_fp8)
     {
         TORCH_CHECK(out1_scale.scalar_type() == torch::kFloat32,
@@ -619,6 +641,7 @@ void fused_qk_rmsnorm_group_quant(
     {
         TORCH_CHECK(out1_unquantized.is_cuda(), __func__, " out1_unquantized must be on CUDA/HIP device");
         TORCH_CHECK(out1_unquantized.dim() == 2, __func__, " out1_unquantized must be a 2D tensor");
+        TORCH_CHECK(out1_unquantized.is_contiguous(), __func__, " out1_unquantized must be contiguous");
         TORCH_CHECK(out1_unquantized.scalar_type() == inp1.scalar_type(),
                     __func__,
                     " out1_unquantized dtype mismatch with inp1");
@@ -644,6 +667,7 @@ void fused_qk_rmsnorm_group_quant(
         out_res1 = out_res1_opt.value();
         TORCH_CHECK(residual.is_cuda(), __func__, " res1 must be on CUDA/HIP device");
         TORCH_CHECK(residual.dim() == 2, __func__, " res1 must be a 2D tensor");
+        TORCH_CHECK(residual.is_contiguous(), __func__, " res1 must be contiguous");
         TORCH_CHECK(residual.scalar_type() == inp1.scalar_type(),
                     __func__,
                     " res1 dtype mismatch with inp1");
@@ -652,6 +676,7 @@ void fused_qk_rmsnorm_group_quant(
                     " res1 shape mismatch with inp1");
         TORCH_CHECK(out_res1.is_cuda(), __func__, " out_res1 must be on CUDA/HIP device");
         TORCH_CHECK(out_res1.dim() == 2, __func__, " out_res1 must be a 2D tensor");
+        TORCH_CHECK(out_res1.is_contiguous(), __func__, " out_res1 must be contiguous");
         TORCH_CHECK(out_res1.scalar_type() == inp1.scalar_type(),
                     __func__,
                     " out_res1 dtype mismatch with inp1");
@@ -669,7 +694,7 @@ void fused_qk_rmsnorm_group_quant(
     int inp2_stride = 0;
     int out2_stride = 0;
     int n2 = 0;
-    double x2_epsilon = inp2_epsilon.value_or(inp1_epsilon);
+    float x2_epsilon = static_cast<float>(inp2_epsilon.value_or(inp1_epsilon));
 
     if(has_second_input)
     {
@@ -684,12 +709,14 @@ void fused_qk_rmsnorm_group_quant(
         out2 = out2_opt.value();
         TORCH_CHECK(x2.is_cuda(), __func__, " inp2 must be on CUDA/HIP device");
         TORCH_CHECK(x2.dim() == 2, __func__, " inp2 must be a 2D tensor");
+        TORCH_CHECK(x2.is_contiguous(), __func__, " inp2 must be contiguous");
         TORCH_CHECK(x2.scalar_type() == inp1.scalar_type(),
                     __func__,
                     " inp2 and inp1 must have the same dtype");
         TORCH_CHECK(x2.size(0) == m, __func__, " inp2 and inp1 must have the same leading dim");
         TORCH_CHECK(x2_weight.is_cuda(), __func__, " inp2_weight must be on CUDA/HIP device");
         TORCH_CHECK(x2_weight.dim() == 1, __func__, " inp2_weight must be a 1D tensor");
+        TORCH_CHECK(x2_weight.is_contiguous(), __func__, " inp2_weight must be contiguous");
         TORCH_CHECK(x2_weight.scalar_type() == inp1.scalar_type(),
                     __func__,
                     " inp2_weight dtype mismatch with inp1");
@@ -701,6 +728,7 @@ void fused_qk_rmsnorm_group_quant(
                     x2_weight.numel());
         TORCH_CHECK(out2.is_cuda(), __func__, " out2 must be on CUDA/HIP device");
         TORCH_CHECK(out2.dim() == 2, __func__, " out2 must be a 2D tensor");
+        TORCH_CHECK(out2.is_contiguous(), __func__, " out2 must be contiguous");
         TORCH_CHECK(out2.scalar_type() == inp1.scalar_type(),
                     __func__,
                     " out2 dtype mismatch with inp1");
