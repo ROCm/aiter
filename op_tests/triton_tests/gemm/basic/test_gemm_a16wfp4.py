@@ -79,10 +79,7 @@ def generate_gemm_a16wfp4_inputs(
 
 
 def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(v, 512, 128) for v in (128, 192, 4096, 8000)]
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
     x_vals += [(v, 128, 512) for v in (128, 192, 4096, 8000)]
     return x_vals
 

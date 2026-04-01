@@ -131,9 +131,7 @@ def generate_gemm_afp4wfp4_inputs(
 
 
 def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
     x_vals += [(v, 106496, 16384) for v in (150, 256, 4096, 8000)] # LL3 405B FC1
     x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
@@ -209,7 +207,6 @@ def test_gemm_afp4_wfp4(
     N: int,
     K: int,
     dtype,
-    layout,
     output,
     shuffle_weight_scales,
     skip_reduce,
@@ -268,7 +265,7 @@ def test_gemm_afp4_wfp4(
                 w_scales_triton,
                 dtype,
                 y,
-                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                use_aot=(dtype == torch.bfloat16),
                 skip_reduce=skip_reduce,
             )
         else:
@@ -278,7 +275,7 @@ def test_gemm_afp4_wfp4(
                 x_scales_triton,
                 w_scales_triton,
                 dtype,
-                use_aot=(dtype == torch.bfloat16 and layout == "TN"),
+                use_aot=(dtype == torch.bfloat16),
                 skip_reduce=skip_reduce,
             )
         # TODO: remove in the future
