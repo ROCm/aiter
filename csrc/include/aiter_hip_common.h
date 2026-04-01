@@ -256,6 +256,8 @@ struct WarpSizeValue
     }
 };
 
+// WARNING: Do not use WARP_SIZE as const/constexpr in host code;
+// it will take the host-pass fallback path and cause a compile error.
 inline constexpr WarpSizeValue WARP_SIZE{};
 
 static int get_pci_chip_id()

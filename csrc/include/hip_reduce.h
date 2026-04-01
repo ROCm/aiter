@@ -54,7 +54,7 @@ __device__ constexpr T cross_wave_reduce(T local, F reduce_op, T* smem)
 //     return v_local;
 // }
 
-template <typename T, int thread_num, int warp_size = 64>
+template <typename T, int thread_num, int warp_size = WARP_SIZE>
 __device__ inline T thread_broadcast(T val, int idx)
 {
     constexpr int words_no = (sizeof(T) + sizeof(int) - 1) / sizeof(int);
@@ -99,7 +99,7 @@ __device__ inline std::
 
 // copied from
 // https://github.com/ROCm/rocPRIM/blob/3b6802d397c4e5266bb6ba7ea8c924d239288608/rocprim/include/rocprim/warp/detail/warp_reduce_dpp.hpp
-template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
+template <typename T, typename F, int WarpSize = WARP_SIZE, bool threadBroadcast = true>
 __device__ constexpr T wave_reduce(T local, F reduce_op)
 {
     if constexpr(WarpSize > 1)
@@ -154,7 +154,7 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
     return local;
 }
 
-template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
+template <typename T, typename F, int WarpSize = WARP_SIZE, bool threadBroadcast = true>
 __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
 {
     if(thread_num == 1)
