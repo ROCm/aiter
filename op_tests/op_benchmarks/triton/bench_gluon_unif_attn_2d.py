@@ -260,11 +260,13 @@ def create_configs():
         "num_kv_blocks",
     ]
     x_vals = []
-    for q_heads in [64, 8]:
-        for seq_l in [1024, 2048, 4096, 8192]:
-            x_vals.append(
-                [q_heads, q_heads // 8, 64, seq_l, seq_l, 1, 0, 64, 0, 0, 0, 1, 1]
-            )
+    use_tdm = int(IS_DEVICE_ARCH_GFX12)
+    for bs in [1,]:
+        for q_heads in [64,8]:
+            for seq_l in [1024, 2048, 4096, 8192]:
+                x_vals.append(
+                    [q_heads, q_heads // 8, 64, seq_l, seq_l, bs, 0, 64, 0, 0, 0, use_tdm, 1]
+                )
     sub_config = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals,
@@ -337,7 +339,7 @@ def run_benchmark(configs):
         output_scale = None
         soft_cap = None
         new_kv_layout = num_kv_blocks > 1
-        waves_per_eu = 4
+        waves_per_eu = 4 if head_size < 128 else 2
         num_warps = 4
         block_m = 128
         if output_scale is not None:

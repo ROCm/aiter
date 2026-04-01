@@ -1108,7 +1108,8 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=True)
+        assert_trivial: gl.constexpr = True if self.cfg.ARCH_NAME == "gfx1250" else False
+        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=assert_trivial)
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(p, v, acc)
         else:
