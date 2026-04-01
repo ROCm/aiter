@@ -567,8 +567,22 @@ def nextPow2(n):
     return 1 << (n - 1).bit_length()
 
 def get_padded_M(M):
-    padded_m = nextPow2(M)
-    return padded_m
+     padded_m = M
+     if M >= 1 and M <= 16:
+         padded_m = nextPow2(padded_m)
+     elif M < 32:
+         padded_m = 32
+     elif M > 512 and M <= 768:
+         padded_m = 768
+     elif M <= 16384:
+         padded_m = nextPow2(padded_m)
+     else:
+         padded_m = 16384
+     return padded_m
+
+#def get_padded_M(M):
+#    padded_m = nextPow2(M)
+#    return padded_m
 
 @dataclass
 class MOEMetadata:
@@ -668,7 +682,7 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     def use_cfg():
-        return False
+        return True
         problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
         bypass_type = (
             ActivationType.Silu,
