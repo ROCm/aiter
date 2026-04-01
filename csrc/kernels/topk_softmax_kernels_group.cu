@@ -101,7 +101,7 @@ using topk_score_t = kvpair_t<int, float>;
 // mask    : [1, 1, 0, 0, 1] (of above condition per lane)
 // position: [0, 2, x, x, 1] => this is cumsum-1
 //
-template <typename T, int lanegroup_size_ = 64>
+template <typename T, int lanegroup_size_ = WARP_SIZE>
 __device__ constexpr int
 cumsum_topk_with_pivot(const T& v, const T& pivot, opus::number<lanegroup_size_> = {})
 {
@@ -119,7 +119,7 @@ cumsum_topk_with_pivot(const T& v, const T& pivot, opus::number<lanegroup_size_>
 }
 
 // make sure local_max is local_value, local_max_2 is -INF
-template <typename T, int wave_size_ = 64>
+template <typename T, int wave_size_ = WARP_SIZE>
 __device__ constexpr void
 wave_reduce_max2(T& local_max, T& local_max_2, opus::number<wave_size_> = {})
 {
@@ -159,7 +159,7 @@ wave_reduce_max2(T& local_max, T& local_max_2, opus::number<wave_size_> = {})
     }
 }
 
-template <typename T, typename I, int wave_size_ = 64>
+template <typename T, typename I, int wave_size_ = WARP_SIZE>
 __device__ constexpr void wave_reduce_argmax2(
     T& local_max, I& idx, T& local_max_2, I& idx_2, opus::number<wave_size_> = {})
 {
@@ -205,11 +205,11 @@ __device__ constexpr void wave_reduce_argmax2(
 __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 {
     using kvp = hipcub::KeyValuePair<int, float>;
-    hipcub::ArgMax arg_max;
     kvp thread_kvp;
     thread_kvp.key       = idx;
     thread_kvp.value     = val_o;
-    const kvp result_kvp = wave_reduce<kvp, decltype(arg_max), WARP_SIZE, true>(thread_kvp, arg_max);
+    auto arg_max = [](kvp a, kvp b) { return a.value > b.value ? a : b; };
+    const kvp result_kvp = wave_reduce<kvp, decltype(arg_max), WARP_SIZE, false>(thread_kvp, arg_max);
     val_o = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, result_kvp.value), WARP_SIZE - 1));
     idx = __builtin_bit_cast(int, __builtin_amdgcn_readlane(result_kvp.key, WARP_SIZE - 1));
     // static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
@@ -394,7 +394,6 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     }
     else
     {
-        __shared__ float sdata;
         float max_val = -INFINITY;
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
@@ -407,22 +406,8 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             }
         }
         __syncthreads();
-#pragma unroll
-        for(int i = 0; i < 6; i++)
-        {
-            int offset    = 1 << i;
-            float tmp_val = __shfl_down(max_val, offset);
-            if(tmp_val > max_val)
-            {
-                max_val = tmp_val;
-            }
-        }
-        if(threadIdx.x == 0)
-        {
-            sdata = max_val;
-        }
-        __syncthreads();
-        max_val          = sdata;
+        auto max_reduce = [](float a, float b) { return a > b ? a : b; };
+        max_val = wave_reduce<float, decltype(max_reduce), WARP_SIZE, true>(max_val, max_reduce);
         float thread_sum = 0.0;
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
@@ -430,7 +415,8 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             thread_sum += scores[e];
         }
         __syncthreads();
-        thread_sum = wave_reduce(thread_sum, [](float a, float b) { return a + b; });
+        auto sum_reduce = [](float a, float b) { return a + b; };
+        thread_sum = wave_reduce<float, decltype(sum_reduce), WARP_SIZE, true>(thread_sum, sum_reduce);
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
             scores[e] /= thread_sum;
@@ -1250,10 +1236,10 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
-                        (topk_grp == 4) && (isBiased == true);
+                        (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64);
 
     dim3 grid(num_tokens);
-    dim3 block(64);
+    dim3 block(get_warp_size_func());
     size_t shared_mem_size = (num_experts * sizeof(float) + num_expert_group * sizeof(float));
     shared_mem_size += !use_opt_sort
                            ? 0
@@ -1295,7 +1281,7 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
     bool use_opt_sort = false;
 
     dim3 grid(num_tokens);
-    dim3 block(64);
+    dim3 block(get_warp_size_func());
     size_t shared_mem_size = (num_experts * sizeof(float) + (num_expert_group + 1) * sizeof(float) +
                               topk * sizeof(int) + topk * sizeof(float) + 255) &
                              ~255;
