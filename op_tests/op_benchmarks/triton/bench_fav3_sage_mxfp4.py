@@ -37,7 +37,7 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
     check_attention_outputs,
     input_helper,
 )
-from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func
+from op_tests.op_benchmarks.triton.bench_fav3_sage import fav2_forward_func, sparse_flops_from_lut
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import print_vgpr, get_caller_name_no_ext
 
 # Configuration
@@ -205,12 +205,9 @@ def bench_kernel(q, k, v, args, provider, block_lut=None, block_attn_mask=None):
     total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
 
     if block_lut is not None:
-        _, _, lut_count_metric = block_lut
-        cfg = get_sage_fwd_configs_mxfp4()
-        num_sparse_pairs = lut_count_metric.sum().item()
-        sparse_flops = 2.0 * num_sparse_pairs * cfg["BLOCK_M"] * cfg["BLOCK_N"] * (D_HEAD + D_HEAD_V)
+        sparse_flops, _ = sparse_flops_from_lut(block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V)
     else:
-        sparse_flops = total_flops
+        sparse_flops = 0
 
     q_element_size = q.element_size()
     k_element_size = k.element_size()
@@ -359,7 +356,6 @@ def run_benchmark_block_sparse_repetitions(args):
     v.requires_grad = False
     q, k, v = layout_preprocess(q, k, v, layout="bhsd", target_layout=layout)
 
-    total_flops = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
     config = get_sage_fwd_configs_mxfp4()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
     num_q_blocks = (N_CTX_Q + BLOCK_M - 1) // BLOCK_M
@@ -386,13 +382,11 @@ def run_benchmark_block_sparse_repetitions(args):
         ms = bench_kernel(
             q, k, v, args, "time(ms)", block_lut=block_lut, block_attn_mask=block_attn_mask
         )
+        sparse_flops, total_flops = sparse_flops_from_lut(block_lut, BATCH, N_CTX_Q, N_CTX_K, HQ, D_HEAD, D_HEAD_V)
         latencies_ms.append(ms)
         ops_per_sec = total_flops / (ms * 1e-3)
         tflops = ops_per_sec / 1e12
         throughputs_tflops.append(tflops)
-        _, _, lut_count_t = block_lut
-        num_sparse_pairs = lut_count_t.sum().item()
-        sparse_flops = 2.0 * num_sparse_pairs * BLOCK_M * BLOCK_N * (D_HEAD + D_HEAD_V)
         effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
         effective_tflops_list.append(effective_tflops)
 

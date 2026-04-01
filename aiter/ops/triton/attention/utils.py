@@ -14,6 +14,7 @@ def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
     num_heads: Optional[int] = None,
     return_none_if_dense: bool = False,
+    BLOCK_KB: int = 128,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Convert a dense block attention mask to a ragged look-up table of KV block
@@ -56,6 +57,8 @@ def block_attn_mask_to_ragged_lut(
     lut_count = counts.reshape(-1)
     lut_start = (torch.cumsum(lut_count, dim=0) - lut_count)
 
+    # NOTE: Overallocating the LUT is a waste of memory, but the
+    # alternative lut_count.sum(), will cause graph break with torch compile.
     max_count = batch * num_heads * num_q_blocks * num_kv_blocks
     kv_block_indices = torch.empty(
         max_count, dtype=torch.int32, device=device
@@ -65,7 +68,7 @@ def block_attn_mask_to_ragged_lut(
         lut_start,
         lut_count,
         kv_block_indices,
-        BLOCK_KB=128,
+        BLOCK_KB=BLOCK_KB,
     )
 
     return kv_block_indices, lut_start, lut_count

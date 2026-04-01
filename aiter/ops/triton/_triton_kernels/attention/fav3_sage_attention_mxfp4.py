@@ -907,7 +907,7 @@ def sage_fwd_mxfp4(
             kv_block_indices,
             lut_start_val + (n_blocks - 1),
             1,
-            IS_CAUSAL,
+            False, # IS_CAUSAL is not supported for block sparse
             BLOCK_M,
             BLOCK_N,
             PRE_LOAD_V,
