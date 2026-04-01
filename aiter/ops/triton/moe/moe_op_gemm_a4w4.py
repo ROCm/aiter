@@ -173,26 +173,33 @@ def reduce_grouped(
     BLOCK_N = 512
     num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
 
-    _reduce_grouped[(num_blocks, num_groups)](
-        x,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),  #
-        out,
-        out.stride(0),
-        out.stride(1),  #
-        indx,  #
-        x.shape[0],
-        x.shape[-1],  #
-        apply_swiglu,
-        alpha,
-        limit,
-        reduction_n,
-        BLOCK_N=BLOCK_N,
-        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        K=K,  #
-        num_warps=2,  #
-    )
+    MAX_GROUPS = 65535
+    start = 0
+    while start < num_groups:
+        end = min(start + MAX_GROUPS, num_groups)
+        current_groups = end - start
+
+        _reduce_grouped[(num_blocks, current_groups)](
+            x,
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),  #
+            out,
+            out.stride(0),
+            out.stride(1),  #
+            indx,  #
+            x.shape[0],
+            x.shape[-1],  #
+            apply_swiglu,
+            alpha,
+            limit,
+            reduction_n,
+            BLOCK_N=BLOCK_N,
+            EVEN_N=(x.shape[-1] % BLOCK_N == 0),
+            K=K,  #
+            num_warps=2,  #
+        )
+        start = end
     return out
 
 
