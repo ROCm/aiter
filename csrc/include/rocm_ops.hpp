@@ -195,6 +195,17 @@ namespace py = pybind11;
           py::arg("x_scale") = std::nullopt, \
           py::arg("w_scale") = std::nullopt);
 
+#define OPUS_GEMM_PYBIND                          \
+    m.def("opus_gemm",                            \
+          &opus_gemm,                             \
+          "opus_gemm",                            \
+          py::arg("XQ"),                          \
+          py::arg("WQ"),                          \
+          py::arg("Y"),                           \
+          py::arg("group_layout") = std::nullopt, \
+          py::arg("x_scale") = std::nullopt,      \
+          py::arg("w_scale") = std::nullopt);
+
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
