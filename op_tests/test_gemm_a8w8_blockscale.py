@@ -19,9 +19,10 @@ from einops import rearrange
 from einops import repeat as eirp
 
 block_shape = (128, 128)
+TEST_NUM_ITERS = 100
 
 
-@perftest(num_iters=5)
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
@@ -46,12 +47,12 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-@perftest()
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
-@perftest()
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
         x, weightshuffle, x_scale, w_scale, dtype
@@ -98,7 +99,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     return ret
 
 
-@perftest(num_iters=5)
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape
@@ -118,7 +119,7 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-@perftest()
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     m, k = x.shape
     n, _ = weight.shape
@@ -229,17 +230,52 @@ parser.add_argument(
         or --ck_preshuffle False
     """,
 )
+parser.add_argument(
+    "--csv",
+    type=str,
+    default=None,
+    help="""CSV file containing M, N, K columns (one shape per row).
+    e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "-o",
+    "--output",
+    type=str,
+    default=None,
+    help="""Directory to save results CSV.
+    e.g.: -o results/""",
+)
+parser.add_argument(
+    "--suffix",
+    type=str,
+    default="results",
+    help="""Suffix for output CSV filename.
+    e.g.: --suffix branch""",
+)
 
 args = parser.parse_args()
 
+l_preshuffle = args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
+
 df = []
-for dtype in args.dtype:
-    # deepseek-r1
-    for m in args.m:
-        for n, k in args.nk:
-            for ck_p in args.ck_preshuffle:
-                ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+if args.csv is not None:
+    if not os.path.exists(args.csv):
+        raise FileNotFoundError(f"CSV file not found: {args.csv}")
+    shapes_df = pd.read_csv(args.csv)
+    print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
+    for dtype in args.dtype:
+        for preshuffle in l_preshuffle:
+            for _, row in shapes_df.iterrows():
+                ret = test_gemm(dtype, int(row["M"]), int(row["N"]), int(row["K"]), ck_preshuffle=preshuffle)
                 df.append(ret)
+else:
+    for dtype in args.dtype:
+        for m in args.m:
+            for n, k in args.nk:
+                for ck_p in l_preshuffle:
+                    ret = test_gemm(dtype, m, n, k, ck_preshuffle=ck_p)
+                    df.append(ret)
+
 df = pd.DataFrame(df)
 
 # Configure pandas to show all columns without truncation
@@ -256,3 +292,13 @@ print("=" * 150)
 
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)
+
+if args.output:
+    os.makedirs(args.output, exist_ok=True)
+    if args.csv:
+        csv_filename = os.path.basename(args.csv).replace(".csv", f"_{args.suffix}.csv")
+    else:
+        csv_filename = f"gemm_a8w8_blockscale_{args.suffix}.csv"
+    out_path = os.path.join(args.output, csv_filename)
+    df.to_csv(out_path, index=False)
+    print(f"Saved results to: {out_path}")

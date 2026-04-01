@@ -340,6 +340,7 @@ def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk, pad_a=128
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a8w8 summary (markdown):\n%s", df_md)
+    return df
 
 
 def test_skinny_gemm_a8w8_pertoken_quant():
@@ -476,7 +477,47 @@ parser.add_argument(
     e.g. -mnk 1280,8192,1024""",
 )
 
+parser.add_argument(
+    "--csv",
+    type=str,
+    default=None,
+    help="""CSV file containing M, N, K columns (one shape per row).
+    e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "-o",
+    "--output",
+    type=str,
+    default=None,
+    help="""Directory to save results CSV.
+    e.g.: -o results/""",
+)
+parser.add_argument(
+    "--suffix",
+    type=str,
+    default="results",
+    help="""Suffix for output CSV filename.
+    e.g.: --suffix branch""",
+)
+
 args = parser.parse_args()
 
-test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk, args.pad_a)
+if args.csv is not None:
+    if not os.path.exists(args.csv):
+        raise FileNotFoundError(f"CSV file not found: {args.csv}")
+    shapes_df = pd.read_csv(args.csv)
+    print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
+    args.mnk = list(zip(shapes_df["M"].tolist(), shapes_df["N"].tolist(), shapes_df["K"].tolist()))
+
+df = test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk, args.pad_a)
 test_skinny_gemm_a8w8_pertoken_quant()
+
+if args.output and df is not None:
+    os.makedirs(args.output, exist_ok=True)
+    if args.csv:
+        csv_filename = os.path.basename(args.csv).replace(".csv", f"_{args.suffix}.csv")
+    else:
+        csv_filename = f"gemm_a8w8_{args.suffix}.csv"
+    out_path = os.path.join(args.output, csv_filename)
+    df.to_csv(out_path, index=False)
+    print(f"Saved results to: {out_path}")
