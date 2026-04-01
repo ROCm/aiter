@@ -88,15 +88,11 @@ void unified_attention_fwd(
     args.query_start_len_ptr = query_start_len.data_ptr<int32_t>();
     args.num_seqs            = num_seqs;
 
-    // Compute max_seqlen_q from query_start_len to detect mixed batches
-    {
-        auto cu = query_start_len.cpu();
-        auto cu_ptr = cu.data_ptr<int32_t>();
-        ck_tile::index_t max_q = 0;
-        for (ck_tile::index_t i = 0; i < num_seqs; i++)
-            max_q = std::max(max_q, cu_ptr[i + 1] - cu_ptr[i]);
-        args.max_seqlen_q = max_q;
-    }
+    // Graph-capture-safe max_seqlen_q estimation (no GPU→CPU copy).
+    // Pure decode: num_tokens == num_seqs → every seq has exactly 1 token.
+    // Otherwise: use num_tokens as conservative upper bound (forces medium tier
+    // which handles any seqlen_q correctly via 1D grid with Q tile iteration).
+    args.max_seqlen_q = (num_tokens == num_seqs) ? 1 : num_tokens;
 
     auto [launched, elapsed] = ck_tile::unified_attention(args, {stream});
     TORCH_CHECK(launched,
