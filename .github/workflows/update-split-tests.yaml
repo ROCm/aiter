@@ -1,0 +1,82 @@
+name: Update Split Tests
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      runs_count:
+        description: "How many completed runs to sample from main"
+        required: false
+        default: "10"
+      aggregate:
+        description: "Aggregation mode for per-file duration"
+        required: false
+        default: "median"
+        type: choice
+        options:
+          - median
+          - mean
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      RUNS_COUNT: ${{ github.event.inputs.runs_count || '10' }}
+      AGGREGATE: ${{ github.event.inputs.aggregate || 'median' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Update FILE_TIMES from recent runs
+        id: update_times
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/update_split_test_times.py \
+            --repo "${REPO}" \
+            --runs-count "${RUNS_COUNT}" \
+            --aggregate "${AGGREGATE}" \
+            --summary-path split-tests-update-summary.md
+
+      - name: Dry run rebalance check (aiter)
+        run: bash .github/scripts/split_tests.sh --shards 5 --test-type aiter --dry-run
+
+      - name: Dry run rebalance check (triton)
+        run: bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run
+
+      - name: Prepare PR body
+        if: steps.update_times.outputs.changed == 'true'
+        run: |
+          {
+            echo "## Summary"
+            cat split-tests-update-summary.md
+            echo ""
+            echo "## Test plan"
+            echo "- [x] bash .github/scripts/split_tests.sh --shards 5 --test-type aiter --dry-run"
+            echo "- [x] bash .github/scripts/split_tests.sh --shards 8 --test-type triton --dry-run"
+          } > pr-body.md
+
+      - name: Create Pull Request
+        if: steps.update_times.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          branch: ci/update-split-tests-file-times
+          title: "CI: auto-update split test FILE_TIMES"
+          assignees: gyohuangxin
+          body-path: pr-body.md
+          commit-message: "CI: auto-update split test FILE_TIMES"
+          delete-branch: true

@@ -921,6 +921,14 @@ def get_mla_metadata_info_v1(
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
 
+    use_qseqlen_fold = (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and num_head_qo > 16
+        and max_seqlen_qo * (num_head_qo // 16) == 4
+    )
+
     max_qo_tiles_per_batch = (
         int(math.ceil(max_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16
@@ -930,6 +938,7 @@ def get_mla_metadata_info_v1(
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
         )
+        or use_qseqlen_fold
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size

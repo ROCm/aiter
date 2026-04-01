@@ -11,6 +11,18 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_aiter_tensor": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/aiter_tensor_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_activation": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/activation_pybind.cu'",
@@ -197,7 +209,6 @@
     },
     "module_gemm_common": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_common_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'"
         ],
         "flags_extra_cc": [],
@@ -825,11 +836,11 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_rope_general_fwd": {
+    "module_rope_1c_uncached_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/rope_general_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_uncached_fwd_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/rope/general_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_uncached_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -838,11 +849,11 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_rope_general_bwd": {
+    "module_rope_2c_uncached_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/rope_general_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_uncached_fwd_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/rope/general_bwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_uncached_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -851,11 +862,180 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_rope_pos_fwd": {
+    "module_rope_1c_cached_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/rope_pos_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_cached_fwd_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/rope/pos_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_cached_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_thd_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_thd_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_thd_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_2d_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_2d_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_2d_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_uncached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_uncached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_uncached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_uncached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_uncached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_uncached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_cached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_cached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_cached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_thd_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_thd_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_thd_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_2d_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_2d_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_2d_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_cached_positions_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_1c_cached_positions_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_positions_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_positions_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_2c_cached_positions_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_positions_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_cached_positions_offsets_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_1c_cached_positions_offsets_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_positions_offsets_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_positions_offsets_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_2c_cached_positions_offsets_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -880,6 +1060,7 @@
     "module_fused_qk_norm_rope_cache_quant_shuffle": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_qk_norm_rope_cache_quant_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_qk_norm.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
             "f'{AITER_CSRC_DIR}/kernels/fused_qk_norm_rope_cache_quant.cu'"
         ],
@@ -889,7 +1070,8 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'"
+            "f'{AITER_CSRC_DIR}/include/ck_tile'",
+            "f'{AITER_CSRC_DIR}/include/opus'"
         ],
         "verbose": "False",
         "blob_gen_cmd": "''"
@@ -1293,8 +1475,11 @@
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/fused_split_gdr_update.cu'"
         ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_cc": [
+        ],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
