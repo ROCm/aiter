@@ -25,7 +25,7 @@ class TunerCommon:
         "batch": 100,
         "profile_file": "",  # for all results
         "timeout": None,  # 100s timeout for per test
-        "warmup": 5,  # 5 warmup iters for profiling
+        "warmup": 50,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
     }
     dtype2bpe_dict = {
@@ -66,7 +66,7 @@ class TunerCommon:
         self.remain_untuned = pd.DataFrame(columns=self.keys)
         self.sort_keys = key
         self.start_time = 0
-        self.num_warmup = 10
+        self.num_warmup = 50
         self.num_iters = 101
 
     def get_arg_defaults(self):
