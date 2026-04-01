@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -64,30 +65,6 @@ def matmul_launch_metadata(grid, kernel, args):
     ret["bytes"] = int(n_x_bytes + n_y_bytes + n_w_bytes)
 
     return ret
-
-
-@triton.jit
-def clip(x, limit, clip_lower: tl.constexpr):
-    res = tl.minimum(x, limit)
-    if clip_lower:
-        res = tl.maximum(-limit, res)
-    return res
-
-
-@triton.jit
-def _swiglu(input, alpha, limit, ADD_RESIDUAL: tl.constexpr):
-    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
-    gelu = gelu.to(tl.float32)
-    if limit is not None:
-        gelu = clip(gelu, limit, clip_lower=False)
-    linear = linear.to(tl.float32)
-    if limit is not None:
-        linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + tl.exp2(-1.44269504089 * alpha * gelu))
-    if ADD_RESIDUAL:
-        return tl.fma(s, linear, s)  # s * (linear + 1)
-    else:
-        return s * linear
 
 
 @triton.jit
