@@ -347,7 +347,8 @@ def run_silu_mul_benchmark(args):
         # Rough op count: SiLU + mul per output element
         flops = float(n_rows * d * 8)
 
-        fn = lambda: fused_silu_mul_last_dim(x, out)
+        def fn():
+            return fused_silu_mul_last_dim(x, out)
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         bandwidth = (mem_read + mem_write) / (ms * 1e-3) * 1e-9
