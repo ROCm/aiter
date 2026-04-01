@@ -229,6 +229,21 @@ def bench_triton(s, warmup, iters, force_2d, inp, use_graph):
         if saved_ua: ua_mod._try_ck_unified_attention = saved_ua
 
 
+def bench_auto(s, warmup, iters, inp, use_graph):
+    """Benchmark the production unified_attention dispatcher (with selector)."""
+    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
+    out = torch.empty_like(q)
+    kw = dict(q=q, k=k, v=v, out=out, cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=s.max_seqlen_q, seqused_k=seq_lens_k,
+        max_seqlen_k=s.max_seqlen_k, softmax_scale=scale,
+        causal=True, window_size=s.window_size, block_table=block_tables,
+        softcap=s.softcap, q_descale=None, k_descale=None, v_descale=None,
+        alibi_slopes=None, output_scale=None, qq_bias=None, sinks=None)
+    def fn():
+        ua_mod.unified_attention(**kw)
+    return _timed(fn, warmup, iters, use_graph)
+
+
 def phase_label(s):
     return "decode" if s.max_seqlen_q == 1 else "prefill"
 
