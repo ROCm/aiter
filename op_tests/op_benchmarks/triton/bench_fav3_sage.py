@@ -30,10 +30,10 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 
 from aiter.ops.triton.attention.fav3_sage import (
-    block_attn_mask_to_ragged_lut,
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
 CAUSAL = False
@@ -1144,7 +1144,7 @@ def run_benchmark_masks_list(
         HQ,
         HK,
         provider,
-        device="cuda",
+        device=device,
     ):
         assert not causal
         mask_tensor, BATCH, num_q_blocks, num_kv_blocks = masks[MASK_IDX]

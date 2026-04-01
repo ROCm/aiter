@@ -16,7 +16,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_func,
 )
 
-from aiter.ops.triton.attention.fav3_sage import (
+from aiter.ops.triton.attention.utils import (
     block_attn_mask_to_ragged_lut,
 )
 

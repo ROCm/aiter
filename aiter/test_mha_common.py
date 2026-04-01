@@ -406,7 +406,6 @@ def block_attn_mask_to_token_mask(
         BLOCK_N, rounding_mode="floor"
     ).clamp(max=block_attn_mask.shape[nd - 1] - 1)
     if nd == 3:
-        num_q_blocks, num_kv_blocks = block_attn_mask.shape[1], block_attn_mask.shape[2]
         attn_mask = block_attn_mask[:, q_block_idx, :][:, :, k_block_idx]  # (B, seqlen_q, seqlen_k)
         return attn_mask
     # 4D: (B, H, num_q_blocks, num_kv_blocks)
@@ -447,7 +446,6 @@ def attention_ref_block_sparse(
     # Check that the number of keys matches the number of values.
     assert seqlen_k == v.shape[1]
 
-    batch_size = q.shape[0]
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]

@@ -1335,7 +1335,6 @@ def sage_fwd(
             BLOCK_M,
             BLOCK_N,
         )
-        total_k_blocks = tl.cdiv(seqlen_k, BLOCK_N)
         has_any_range = True  # unused in this branch
 
     # ============================================================
