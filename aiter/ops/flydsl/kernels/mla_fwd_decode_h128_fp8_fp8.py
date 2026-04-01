@@ -854,11 +854,12 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
         q_regs = []  # Will hold 18 v2i64 = 16 nope + 2 rope
 
-        # voffset is constant across all 9 passes -- column chunk goes into ioffset.
-        # v_offset_i32 is in fp8 elements (= bytes); buffer_load auto-scales by
-        # element_bytes (i32 = 4), so divide by 4.
+        # Fold s_offset and per-pass ioffset into voffset so that soffset=0.
+        # LLVM ISel only extracts immediate offsets when soffset is literal 0.
+        # v_offset_i32 is in bytes; buffer_load auto-scales by element_bytes
+        # (i32 = 4), so divide by 4.  s_offset_i32 is also in bytes.
         voff_dw = _std_arith.DivSIOp(
-            _raw(v_offset_i32),
+            _std_arith.AddIOp(_raw(v_offset_i32), s_offset_i32).result,
             _raw(arith.constant(4, type=T.i32)),
         ).result
 
@@ -869,13 +870,15 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         lds_rd_addr = p_lds_q_warp + lds_ld_offset
 
         def _q_buf_load(pass_idx):
+            voff_pass = _std_arith.AddIOp(
+                voff_dw,
+                _raw(arith.constant(pass_idx * Q_ELEM_PER_ROW // 4, type=T.i32)),
+            ).result
             return buffer_ops.buffer_load(
                 query_rsrc,
-                voff_dw,
+                voff_pass,
                 vec_width=4,
                 dtype=T.i32,
-                soffset=s_offset_i32,
-                ioffset=pass_idx * Q_ELEM_PER_ROW,
             )
 
         def _shuffle_q_through_lds(q_vram_data):
