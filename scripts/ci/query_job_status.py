@@ -120,7 +120,9 @@ def list_recent_runs(
                 stop = True
                 continue
             workflow_path = run.get("path", "")
-            workflow_file = workflow_file_from_path(workflow_path) if workflow_path else ""
+            workflow_file = (
+                workflow_file_from_path(workflow_path) if workflow_path else ""
+            )
             if workflow_file in workflow_set:
                 run["workflow_file"] = workflow_file
                 yield run
