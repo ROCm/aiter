@@ -61,6 +61,30 @@
       "num_expert": 256,
       "top_k": 4
     }
+  },
+  "glm47fp8": {
+    "tp4": {
+      "hidden_size": 5120,
+      "intermediate_size": 768,
+      "num_attention_heads": 96,
+      "num_key_value_heads": 8,
+      "vocab_size": 151552,
+      "num_expert": 160,
+      "top_k": 8,
+      "silu_mul_benchmark_M": [4, 8193, 7238]
+    }
+  },
+  "kimik25": {
+    "tp4": {
+      "hidden_size": 7168,
+      "intermediate_size": 1024,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 64,
+      "vocab_size": 163840,
+      "num_expert": 384,
+      "top_k": 8,
+      "silu_mul_benchmark_M": [4, 8193, 7238]
+    }
   }
 }
     
