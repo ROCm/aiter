@@ -12,7 +12,7 @@ from flydsl.expr import buffer_ops, range_constexpr, vector
 
 
 def _to_raw(v):
-    """Convert ArithValue / Numeric (Int32, Boolean, ...) to raw ir.Value."""
+    """Convert ArithValue / Numeric (Int32, Boolean, …) to raw ir.Value."""
     if isinstance(v, ir.Value):
         return v
     if hasattr(v, "ir_value"):

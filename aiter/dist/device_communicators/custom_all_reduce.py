@@ -56,7 +56,7 @@ def _current_stream_ptr() -> int:
 class IPCBuffer:
     """A single IPC-accessible device buffer.
 
-    Pure data container -- owns a pre-allocated GPU allocation with a fixed
+    Pure data container — owns a pre-allocated GPU allocation with a fixed
     device address.  All IPC handle / broadcast / registration logic lives
     in IPCBufferPool.
 
@@ -153,7 +153,7 @@ class IPCBufferPool:
         assert isinstance(s, dist.TCPStore), (
             f"IPC metadata exchange requires a pure-TCP KV store "
             f"(torch.distributed.TCPStore), got {type(s).__name__}. "
-            f"This ensures the exchange is backend-free -- no RCCL, "
+            f"This ensures the exchange is backend-free — no RCCL, "
             f"gloo, or MPI collective is involved."
         )
 

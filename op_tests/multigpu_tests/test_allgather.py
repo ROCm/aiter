@@ -233,9 +233,9 @@ l_shape = [
     (1345,),
     (128, 7168),
     # exceeds max_size/world_size but satisfies all other custom ag
-    # conditions (contiguous, 16-byte aligned) -- should fallback to RCCL
+    # conditions (contiguous, 16-byte aligned) — should fallback to RCCL
     # threshold: 64 MB (2 GPU) / 32 MB (4 GPU) / 16 MB (8 GPU)
-    # this shape = 4097*8192*2 bytes ? 64.015 MB, exceeds even the 2-GPU threshold
+    # this shape = 4097*8192*2 bytes ≈ 64.015 MB, exceeds even the 2-GPU threshold
     (4097, 8192),
 ]
 
