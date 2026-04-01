@@ -35,5 +35,23 @@ mha_varlen_fwd(at::Tensor& q,                                 // [total_q, hq, d
                std::optional<const at::Tensor> cu_seqlens_q_padded = std::nullopt,
                std::optional<const at::Tensor> cu_seqlens_k_padded = std::nullopt,
                std::optional<const at::Tensor> sink_ptr = std::nullopt);
+void mha_varlen_fwd_pagedkv(
+    at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& cu_seqlens_q,
+    std::optional<const at::Tensor>& cu_seqlens_k,
+    int max_seqlen_q,
+    int max_seqlen_k,
+    float softmax_scale,
+    float logits_soft_cap,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    int sink_size,
+    at::Tensor& out,
+    std::optional<const at::Tensor>& block_table_,
+    std::optional<const at::Tensor>& alibi_slopes_,
+    std::optional<const at::Tensor>& sink_ptr_);
 } // namespace torch_itfs
 } // namespace aiter

@@ -175,6 +175,35 @@ def bench_ck_sk(s, warmup, iters, inp, use_graph):
     return _timed(fn, warmup, iters, use_graph)
 
 
+def _get_pagedkv_fn():
+    """Lazily find the mha_varlen_fwd_pagedkv function from the loaded JIT module."""
+    import importlib, sys
+    for name, mod in sys.modules.items():
+        if 'aiter.jit.mha_varlen_fwd' in name and hasattr(mod, 'mha_varlen_fwd_pagedkv'):
+            return mod.mha_varlen_fwd_pagedkv
+    return None
+
+def bench_ck_pk(s, warmup, iters, inp, use_graph):
+    """CK FmhaFwdPagedKV: non-split, paged KV, single kernel."""
+    pk_fn = _get_pagedkv_fn()
+    if pk_fn is None:
+        raise RuntimeError("mha_varlen_fwd_pagedkv not available (trigger mha_varlen_fwd first)")
+    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
+    out = torch.empty_like(q)
+    cu_k = torch.nn.functional.pad(seq_lens_k.cumsum(0, dtype=torch.int32), (1, 0))
+    window_left = s.window_size[0] if s.window_size[0] >= 0 else -1
+    window_right = s.window_size[1] if s.window_size[1] >= 0 else 0
+
+    def fn():
+        pk_fn(q, k, v, cu_seqlens_q, cu_k,
+              s.max_seqlen_q, s.max_seqlen_k,
+              scale, s.softcap, True,
+              window_left, window_right, 0,
+              out, block_tables)
+
+    return _timed(fn, warmup, iters, use_graph)
+
+
 def bench_triton(s, warmup, iters, force_2d, inp, use_graph):
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = inp
     out = torch.empty_like(q)
@@ -240,13 +269,13 @@ def main() -> int:
 
     hdr = (f"{'#':>4s} {'phase':>8s} {'seqs':>5s} {'q_tok':>6s} {'max_q':>6s} "
            f"{'max_k':>6s} {'heads':>5s} {'hdim':>4s} {'win':>7s} {'cnt':>4s} "
-           f"{'CK-UA':>8s} {'CK-SK':>8s} {'T-2D':>8s} {'T-3D':>8s} {'best':>6s}")
+           f"{'CK-UA':>8s} {'CK-PK':>8s} {'CK-SK':>8s} {'T-2D':>8s} {'T-3D':>8s} {'best':>6s}")
     print(hdr)
     print("-" * len(hdr))
 
     csv_rows = []
     use_g = not args.no_graph
-    BACKENDS = ["ck_ua", "ck_sk", "t_2d", "t_3d"]
+    BACKENDS = ["ck_ua", "ck_pk", "ck_sk", "t_2d", "t_3d"]
 
     for i, (s, count) in enumerate(ok):
         phase = phase_label(s)
@@ -271,6 +300,7 @@ def main() -> int:
             backends = [
                 ("ck_ua", lambda: bench_ck_ua(s, args.warmup, args.iters, inp, use_g)),
                 ("ck_sk", lambda: bench_ck_sk(s, args.warmup, args.iters, inp, use_g)),
+                ("ck_pk", lambda: bench_ck_pk(s, args.warmup, args.iters, inp, use_g)),
                 ("t_2d",  lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g)),
                 ("t_3d",  lambda: bench_triton(s, args.warmup, args.iters, False, inp, use_g)),
             ]
@@ -287,13 +317,14 @@ def main() -> int:
         vals = {k: f"{results[k]:8.4f}" if results.get(k) is not None else "     err" for k in BACKENDS}
         valid = {k: v for k, v in results.items() if v is not None}
         best = min(valid, key=valid.get) if valid else ""
-        print(f"{prefix} {vals['ck_ua']:>8s} {vals['ck_sk']:>8s} "
+        print(f"{prefix} {vals['ck_ua']:>8s} {vals['ck_pk']:>8s} {vals['ck_sk']:>8s} "
               f"{vals['t_2d']:>8s} {vals['t_3d']:>8s} {best:>6s}")
 
         csv_rows.append([i, phase, s.num_seqs, s.total_q_tokens, s.max_seqlen_q,
             s.max_seqlen_k, s.num_query_heads, s.num_kv_heads, s.head_size,
             s.block_size, win_str, count,
             f"{results.get('ck_ua','')}" if results.get('ck_ua') is not None else "",
+            f"{results.get('ck_pk','')}" if results.get('ck_pk') is not None else "",
             f"{results.get('ck_sk','')}" if results.get('ck_sk') is not None else "",
             f"{results.get('t_2d','')}" if results.get('t_2d') is not None else "",
             f"{results.get('t_3d','')}" if results.get('t_3d') is not None else "",
@@ -308,7 +339,8 @@ def main() -> int:
             wins[b] += 1
             benchmarked += 1
 
-    LABELS = {"ck_ua": "CK Unified Attn", "ck_sk": "CK FMHA SplitKV",
+    LABELS = {"ck_ua": "CK Unified Attn", "ck_pk": "CK FMHA PagedKV",
+              "ck_sk": "CK FMHA SplitKV",
               "t_2d": "Triton 2D", "t_3d": "Triton 3D"}
     print(f"Summary: {benchmarked} shapes benchmarked")
     for k in BACKENDS:
@@ -322,7 +354,8 @@ def main() -> int:
             w.writerow(["idx", "phase", "num_seqs", "total_q_tokens", "max_seqlen_q",
                          "max_seqlen_k", "num_q_heads", "num_kv_heads", "head_size",
                          "block_size", "window_size", "trace_count",
-                         "ck_ua_ms", "ck_splitkv_ms", "triton_2d_ms", "triton_3d_ms", "best"])
+                         "ck_ua_ms", "ck_pagedkv_ms", "ck_splitkv_ms",
+                         "triton_2d_ms", "triton_3d_ms", "best"])
             w.writerows(csv_rows)
         print(f"\nCSV: {args.out_csv}")
 

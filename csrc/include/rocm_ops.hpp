@@ -1040,7 +1040,26 @@ namespace py = pybind11;
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt, \
-          py::arg("sink_ptr")            = std::nullopt);
+          py::arg("sink_ptr")            = std::nullopt); \
+    m.def("mha_varlen_fwd_pagedkv",                      \
+          &aiter::torch_itfs::mha_varlen_fwd_pagedkv,    \
+          py::arg("q"),                                   \
+          py::arg("k"),                                   \
+          py::arg("v"),                                   \
+          py::arg("cu_seqlens_q"),                        \
+          py::arg("cu_seqlens_k"),                        \
+          py::arg("max_seqlen_q"),                        \
+          py::arg("max_seqlen_k"),                        \
+          py::arg("softmax_scale"),                       \
+          py::arg("logits_soft_cap"),                     \
+          py::arg("is_causal"),                           \
+          py::arg("window_size_left"),                    \
+          py::arg("window_size_right"),                   \
+          py::arg("sink_size"),                           \
+          py::arg("out"),                                 \
+          py::arg("block_table"),                         \
+          py::arg("alibi_slopes") = std::nullopt,         \
+          py::arg("sink_ptr")     = std::nullopt);
 
 #define MHA_BATCH_PREFILL_PYBIND                       \
     m.def("mha_batch_prefill",                         \
