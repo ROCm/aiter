@@ -143,7 +143,12 @@ __global__ void add_rmsnorm_quant_kernel(
             vec2_f* thread_data_float2 = reinterpret_cast<vec2_f*>(&thread_data_float);
             for(int i = 0; i < thread_data_size / 2; i++)
             {
-                asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
+                #if defined(__gfx11__) || defined(__gfx12__)
+                    thread_data_float[2*i] *= rcp[0];
+                    thread_data_float[2*i+1] *= rcp[1];
+                #else
+                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(rcp));
+                    #endif
             }
             
             float* thread_data_weight2 = reinterpret_cast<float*>(&thread_data_weight);
@@ -170,7 +175,12 @@ __global__ void add_rmsnorm_quant_kernel(
                 //         : "v"(thread_data_weight2[i])
                 //     );
                 // }
-                asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+                #if defined(__gfx11__) || defined(__gfx12__)
+                    thread_data_float[2*i] *= rcp[0];
+                    thread_data_float[2*i+1] *= rcp[1];
+                #else
+                    asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(thread_data_float2[i]) : "v"(thread_data_float2[i]), "v"(thread_data_weight_float2));
+                #endif
             }
 
             if constexpr(FUSE_QUANT)

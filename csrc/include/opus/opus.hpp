@@ -1405,7 +1405,7 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
 //
 OPUS_H_D constexpr index_t get_warp_size()
 {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx12__)
     return 32;
 #elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
     return 64;
@@ -2078,8 +2078,8 @@ using mfma_scale_f32_16x16x128_fp4_fp4  = mfma_f32_16x16x128_fp4_fp4;
 #endif // __GFX9__ (mfma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// wmma (gfx1250 / RDNA4, wave32)
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+// wmma (gfx1250 / gfx12 / RDNA4, wave32)
+#if defined(__gfx1250__) || defined(__gfx12__) || !defined(__HIP_DEVICE_COMPILE__)
 // f16/bf16/f32 builtins: (neg_a, A, neg_b, B, matrix_fmts, C, clamp, neg_c)
 #define DISPATCH_WMMA_(ta_, tb_, tc_, wm_, wn_, wk_, inst_) \
  (std::is_same_v<dtype_a, ta_> && std::is_same_v<dtype_b, tb_> && std::is_same_v<dtype_c, tc_> && \
@@ -2130,6 +2130,12 @@ struct wmma {
     // Format code for scaled WMMA (f8f6f4); -1 for types that don't support scaling
     static constexpr int fmt_a = std::is_same_v<dtype_a, fp8_t> ? 0 : std::is_same_v<dtype_a, bf8_t> ? 1 : std::is_same_v<dtype_a, fp4_t> ? 4 : -1;
     static constexpr int fmt_b = std::is_same_v<dtype_b, fp8_t> ? 0 : std::is_same_v<dtype_b, bf8_t> ? 1 : std::is_same_v<dtype_b, fp4_t> ? 4 : -1;
+#if defined(__gfx12__)
+    static_assert(
+        wave_m == 16 && wave_n == 16 && wave_k == 16,
+        "gfx12 WMMA in OPUS only supports 16x16x16 shapes; use SWMMAC or a gfx1250 path for wider K"
+    );
+#endif
 
     // Regular (non-scaled) dispatch
     template<typename VA, typename VB, typename VC>
@@ -2164,6 +2170,17 @@ struct wmma {
         else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_fp8_bf8)
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_fp8)
         else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp16_t, 16, 16, 128, __builtin_amdgcn_wmma_f16_16x16x128_bf8_bf8)
+#elif defined(__gfx12__)
+        // RDNA4 gfx12 WMMA: 16x16x16 for the common floating-point cases.
+        else if constexpr DISPATCH_WMMA_(fp16_t, fp16_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_(fp16_t, fp16_t, fp16_t, 16, 16, 16, __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_(bf16_t, bf16_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_(bf16_t, bf16_t, bf16_t, 16, 16, 16, __builtin_amdgcn_wmma_bf16_16x16x16_bf16_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_8BIT_(u8_t, u8_t, i32_t, 16, 16, 16, __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, fp8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_8BIT_(fp8_t, bf8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_fp8_bf8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, fp8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_fp8_w32_gfx12)
+        else if constexpr DISPATCH_WMMA_8BIT_(bf8_t, bf8_t, fp32_t, 16, 16, 16, __builtin_amdgcn_wmma_f32_16x16x16_bf8_bf8_w32_gfx12)
 #endif
         __builtin_unreachable();
     }
@@ -2260,14 +2277,13 @@ struct wmma {
 #undef DISPATCH_WMMA_BF16F32_
 #undef DISPATCH_WMMA_8BIT_
 
-// f16/bf16 16x16x32
+// gfx1250: wide-k WMMA and scaled WMMA
+#if defined(__gfx1250__)
 using wmma_f32_16x16x32_f16   = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 32>;
 using wmma_f16_16x16x32_f16   = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 32>;
 using wmma_f32_16x16x32_bf16  = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 32>;
 using wmma_bf16_16x16x32_bf16 = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 32>;
-// f32 16x16x4
 using wmma_f32_16x16x4_f32    = wmma<fp32_t, fp32_t, fp32_t, 16, 16,  4>;
-// fp8/bf8 16x16x64
 using wmma_f32_16x16x64_fp8_fp8  = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 64>;
 using wmma_f32_16x16x64_fp8_bf8  = wmma<fp8_t, bf8_t, fp32_t, 16, 16, 64>;
 using wmma_f32_16x16x64_bf8_fp8  = wmma<bf8_t, fp8_t, fp32_t, 16, 16, 64>;
@@ -2276,7 +2292,6 @@ using wmma_f16_16x16x64_fp8_fp8  = wmma<fp8_t, fp8_t, fp16_t, 16, 16, 64>;
 using wmma_f16_16x16x64_fp8_bf8  = wmma<fp8_t, bf8_t, fp16_t, 16, 16, 64>;
 using wmma_f16_16x16x64_bf8_fp8  = wmma<bf8_t, fp8_t, fp16_t, 16, 16, 64>;
 using wmma_f16_16x16x64_bf8_bf8  = wmma<bf8_t, bf8_t, fp16_t, 16, 16, 64>;
-// fp8/bf8 16x16x128
 using wmma_f32_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 128>;
 using wmma_f32_16x16x128_fp8_bf8 = wmma<fp8_t, bf8_t, fp32_t, 16, 16, 128>;
 using wmma_f32_16x16x128_bf8_fp8 = wmma<bf8_t, fp8_t, fp32_t, 16, 16, 128>;
@@ -2285,12 +2300,21 @@ using wmma_f16_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp16_t, 16, 16, 128>;
 using wmma_f16_16x16x128_fp8_bf8 = wmma<fp8_t, bf8_t, fp16_t, 16, 16, 128>;
 using wmma_f16_16x16x128_bf8_fp8 = wmma<bf8_t, fp8_t, fp16_t, 16, 16, 128>;
 using wmma_f16_16x16x128_bf8_bf8 = wmma<bf8_t, bf8_t, fp16_t, 16, 16, 128>;
-// Scaled WMMA (f8f6f4 unified instruction, supports fp8/bf8/fp4 via format code)
 using wmma_scale_f32_16x16x128_fp8_fp8 = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 128>;
 using wmma_scale_f32_16x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 16, 16, 128>;
-// Scaled WMMA (dedicated fp4 32x16x128 instruction)
 using wmma_scale_f32_32x16x128_fp4_fp4 = wmma<fp4_t, fp4_t, fp32_t, 32, 16, 128>;
-#endif // __gfx1250__ (wmma)
+#elif defined(__gfx12__)
+using wmma_f32_16x16x16_f16_gfx12     = wmma<fp16_t, fp16_t, fp32_t, 16, 16, 16>;
+using wmma_f16_16x16x16_f16_gfx12     = wmma<fp16_t, fp16_t, fp16_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf16_gfx12    = wmma<bf16_t, bf16_t, fp32_t, 16, 16, 16>;
+using wmma_bf16_16x16x16_bf16_gfx12   = wmma<bf16_t, bf16_t, bf16_t, 16, 16, 16>;
+using wmma_i32_16x16x16_iu8_gfx12     = wmma<u8_t, u8_t, i32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_fp8_fp8_gfx12 = wmma<fp8_t, fp8_t, fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_fp8_bf8_gfx12 = wmma<fp8_t, bf8_t, fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf8_fp8_gfx12 = wmma<bf8_t, fp8_t, fp32_t, 16, 16, 16>;
+using wmma_f32_16x16x16_bf8_bf8_gfx12 = wmma<bf8_t, bf8_t, fp32_t, 16, 16, 16>;
+#endif
+#endif // __gfx1250__ || __gfx12__ (wmma)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // adaptor
@@ -2499,11 +2523,11 @@ template<typename d_a, typename d_b, typename d_c, typename WaveMNK /*seq<m, n, 
 OPUS_D decltype(auto) make_mfma(WaveMNK&&, A&& = {}, number<warp_size_> = {}) { return A{}(mfma<d_a, d_b, d_c, get<0>(WaveMNK{}), get<1>(WaveMNK{}), get<2>(WaveMNK{}), warp_size_>{}); }
 #endif // __GFX9__
 
-// wmma_adaptor: same layout encoding as mfma_adaptor but for wave32 WMMA (gfx1250)
+// wmma_adaptor: same layout encoding as mfma_adaptor but for wave32 WMMA (gfx1250/gfx12)
 // A:[(grpm_a<p>), (rept_a<y>, grpk_a<p>, pack_a<y>)], MxK
 // B:[(grpn_b<p>), (rept_b<y>, grpk_b<p>, pack_b<y>)], NxK
 // C:[(grpm_c<p>, rept_c<y>, pack_c<y>), (grpn_c<p>)], MxN
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1250__) || defined(__gfx12__) || !defined(__HIP_DEVICE_COMPILE__)
 namespace impl {
 template<typename WMMA>
 struct wmma_adaptor : public remove_cvref_t<WMMA> {
@@ -2731,14 +2755,14 @@ OPUS_D decltype(auto) make_tiled_mma(MMA&& mma, ES, TS, A&& = {}) {
 }
 
 template<typename d_a, typename d_b, typename d_c, typename ES /* expand-m/n/k */, typename TS /* tile-m/n/k */, typename WS /* wave-m/n/k*/,
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx12__)
          typename WA = wmma_adaptor,
 #else
          typename WA = mfma_adaptor,
 #endif
          typename TA = tiled_mma_adaptor, index_t warp_size = get_warp_size()>
 OPUS_D decltype(auto) make_tiled_mma(ES, TS, WS, WA&& = {}, TA&& = {}) {
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx12__)
     return TA{}(make_wmma<d_a, d_b, d_c>(WS{}, WA{}, number<warp_size>{}),
 #else
     return TA{}(make_mfma<d_a, d_b, d_c>(WS{}, WA{}, number<warp_size>{}),
