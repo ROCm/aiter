@@ -106,6 +106,17 @@ def get_GEMM_A16W16_config(
             None,
         )
         if config is not None:
+            if config["libtype"] == "flydsl":
+                if is_flydsl_available():
+                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                        config["kernelName"]
+                    )
+                    if flydsl_config is None:
+                        config = None
+                else:
+                    config = None
+            if config is None:
+                continue
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
                 logger.info(
@@ -248,29 +259,23 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
-    use_flydsl = (
-        config is not None and config["libtype"] == "flydsl" and is_flydsl_available()
-    )
-    if use_flydsl:
+    if config is not None and config["libtype"] == "flydsl":
         flydsl_config = (
             aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
                 config["kernelName"]
             )
         )
-        if flydsl_config is not None:
-            return flydsl_gemm(
-                inp_view,
-                B,
-                bias,
-                otype,
-                scale_a,
-                scale_b,
-                scale_c,
-                config=flydsl_config,
-            )
-        else:
-            # clean up the config to avoid using the invalid config
-            config = None
+        return flydsl_gemm(
+            inp_view,
+            B,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            config=flydsl_config,
+        )
+
     if config is not None and config["libtype"] == "asm":
         kernelName = config["kernelName"]
         splitK = config["splitK"]

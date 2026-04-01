@@ -85,9 +85,14 @@ def compile_hgemm_kernel(
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     LDG_A_X_THREADS = BLOCK_K // LDG_VEC_SIZE
     LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
+    C_TILE_VECS = BLOCK_M * LDG_C_X_THREADS
     LDG_REG_A_COUNT = BLOCK_MK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
     LDG_REG_B_COUNT = BLOCK_NK_SIZE // LDG_VEC_SIZE // BLOCK_THREADS
-    LDG_REG_C_COUNT = BLOCK_M * BLOCK_N // LDG_VEC_SIZE // BLOCK_THREADS
+    # Split-K stores C through LDS in LDG_VEC_SIZE-wide vectors. When BLOCK_M is
+    # not a multiple of the per-iteration row coverage, floor division drops the
+    # tail rows entirely (for example tile_m=48 only covers rows 0..31). Use
+    # ceil-div here and guard tail accesses explicitly in the C load/store paths.
+    LDG_REG_C_COUNT = (C_TILE_VECS + BLOCK_THREADS - 1) // BLOCK_THREADS
     assert (LDG_REG_A_COUNT >= 1) and (LDG_REG_B_COUNT >= 1)
     if IS_SPLIT_K:
         assert LDG_REG_C_COUNT >= 1
@@ -199,17 +204,29 @@ def compile_hgemm_kernel(
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
-                    row_idx = m_offset + fx.Index(m_local_idx)
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, row_idx, fx.Index(m)
+                    cond_in_tile = arith.cmpi(
+                        arith.CmpIPredicate.ult,
+                        fx.Index(m_local_idx),
+                        fx.Index(BLOCK_M),
                     )
-                    cond_boundary_if = scf.IfOp(
-                        cond_boundary, results_=[], has_else=False
+                    cond_in_tile_if = scf.IfOp(
+                        cond_in_tile, results_=[], has_else=False
                     )
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        C_.vec_store(
-                            (row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE
+                    with ir.InsertionPoint(cond_in_tile_if.then_block):
+                        row_idx = m_offset + fx.Index(m_local_idx)
+                        cond_boundary = arith.cmpi(
+                            arith.CmpIPredicate.ult, row_idx, fx.Index(m)
                         )
+                        cond_boundary_if = scf.IfOp(
+                            cond_boundary, results_=[], has_else=False
+                        )
+                        with ir.InsertionPoint(cond_boundary_if.then_block):
+                            C_.vec_store(
+                                (row_idx, n_offset + n_local_idx),
+                                zero_vec,
+                                LDG_VEC_SIZE,
+                            )
+                            scf.YieldOp([])
                         scf.YieldOp([])
                 scf.YieldOp([])
             rocdl.sched_barrier(0)
@@ -663,76 +680,101 @@ def compile_hgemm_kernel(
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                     n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                    m_global_idx = m_offset + m_local_idx
-                    n_global_idx = n_offset + n_local_idx
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                    cond_in_tile = arith.cmpi(
+                        arith.CmpIPredicate.ult, m_local_idx, fx.Index(BLOCK_M)
                     )
-                    cond_boundary_if = scf.IfOp(
-                        cond_boundary, results_=[], has_else=False
+                    cond_in_tile_if = scf.IfOp(
+                        cond_in_tile, results_=[], has_else=False
                     )
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                        linear_bytes_offset = (
-                            C_.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
+                    with ir.InsertionPoint(cond_in_tile_if.then_block):
+                        m_global_idx = m_offset + m_local_idx
+                        n_global_idx = n_offset + n_local_idx
+                        cond_boundary = arith.cmpi(
+                            arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                         )
-                        # split to vec2s
-                        vec2_ty = T.vec(2, dtype_)
-                        for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
-                            e0 = vector.extract(
-                                pk_val,
-                                static_position=[vec_idx * 2],
-                                dynamic_position=[],
+                        cond_boundary_if = scf.IfOp(
+                            cond_boundary, results_=[], has_else=False
+                        )
+                        with ir.InsertionPoint(cond_boundary_if.then_block):
+                            pk_val = cs_.vec_load(
+                                (m_local_idx, n_local_idx), LDG_VEC_SIZE
                             )
-                            e1 = vector.extract(
-                                pk_val,
-                                static_position=[vec_idx * 2 + 1],
-                                dynamic_position=[],
+                            linear_bytes_offset = (
+                                C_.linear_offset((m_global_idx, n_global_idx))
+                                * DTYPE_BYTES
                             )
-                            pair = vector.from_elements(vec2_ty, [e0, e1])
-                            pair_byte_offset = arith.index_cast(
-                                T.i64,
-                                linear_bytes_offset
-                                + fx.Index(vec_idx * 2 * DTYPE_BYTES),
-                            )
-                            pair_addr_i64 = llvm.AddOp(
-                                out_base_int,
-                                pair_byte_offset,
-                                llvm.IntegerOverflowFlags(0),
-                            ).result
-                            pair_ptr = llvm.IntToPtrOp(_ptr_type, pair_addr_i64).result
-                            pair_ptr_v = (
-                                pair_ptr._value
-                                if hasattr(pair_ptr, "_value")
-                                else pair_ptr
-                            )
-                            pair_v = pair._value if hasattr(pair, "_value") else pair
-                            llvm.AtomicRMWOp(
-                                llvm.AtomicBinOp.fadd,
-                                pair_ptr_v,
-                                pair_v,
-                                llvm.AtomicOrdering.monotonic,
-                                syncscope="agent",
-                                alignment=4,
-                            )
+                            # split to vec2s
+                            vec2_ty = T.vec(2, dtype_)
+                            for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
+                                e0 = vector.extract(
+                                    pk_val,
+                                    static_position=[vec_idx * 2],
+                                    dynamic_position=[],
+                                )
+                                e1 = vector.extract(
+                                    pk_val,
+                                    static_position=[vec_idx * 2 + 1],
+                                    dynamic_position=[],
+                                )
+                                pair = vector.from_elements(vec2_ty, [e0, e1])
+                                pair_byte_offset = arith.index_cast(
+                                    T.i64,
+                                    linear_bytes_offset
+                                    + fx.Index(vec_idx * 2 * DTYPE_BYTES),
+                                )
+                                pair_addr_i64 = llvm.AddOp(
+                                    out_base_int,
+                                    pair_byte_offset,
+                                    llvm.IntegerOverflowFlags(0),
+                                ).result
+                                pair_ptr = llvm.IntToPtrOp(
+                                    _ptr_type, pair_addr_i64
+                                ).result
+                                pair_ptr_v = (
+                                    pair_ptr._value
+                                    if hasattr(pair_ptr, "_value")
+                                    else pair_ptr
+                                )
+                                pair_v = (
+                                    pair._value if hasattr(pair, "_value") else pair
+                                )
+                                llvm.AtomicRMWOp(
+                                    llvm.AtomicBinOp.fadd,
+                                    pair_ptr_v,
+                                    pair_v,
+                                    llvm.AtomicOrdering.monotonic,
+                                    syncscope="agent",
+                                    alignment=4,
+                                )
+                            scf.YieldOp([])
                         scf.YieldOp([])
             else:
                 for i in range_constexpr(LDG_REG_C_COUNT):
                     global_tid = BLOCK_THREADS * i + tid
                     m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
                     n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                    m_global_idx = m_offset + m_local_idx
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
+                    cond_in_tile = arith.cmpi(
+                        arith.CmpIPredicate.ult, m_local_idx, fx.Index(BLOCK_M)
                     )
-                    cond_boundary_if = scf.IfOp(
-                        cond_boundary, results_=[], has_else=False
+                    cond_in_tile_if = scf.IfOp(
+                        cond_in_tile, results_=[], has_else=False
                     )
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                        C_.vec_store(
-                            (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
+                    with ir.InsertionPoint(cond_in_tile_if.then_block):
+                        m_global_idx = m_offset + m_local_idx
+                        cond_boundary = arith.cmpi(
+                            arith.CmpIPredicate.ult, m_global_idx, fx.Index(m)
                         )
+                        cond_boundary_if = scf.IfOp(
+                            cond_boundary, results_=[], has_else=False
+                        )
+                        with ir.InsertionPoint(cond_boundary_if.then_block):
+                            vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                            C_.vec_store(
+                                (m_global_idx, n_offset + n_local_idx),
+                                vec,
+                                LDG_VEC_SIZE,
+                            )
+                            scf.YieldOp([])
                         scf.YieldOp([])
         return
 
