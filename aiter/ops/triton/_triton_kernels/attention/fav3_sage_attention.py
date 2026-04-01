@@ -440,13 +440,9 @@ def _sage_fwd_blocksparse_mask(
             qk_scaled += bias
         qk_scaled = tl.where(qk_mask, qk_scaled, float("-inf"))  # mask padding before softmax
         m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
-        if USE_BIAS:
-            q_shifted = tl.where(
-                m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
-            )
-        else:
-            q_shifted = qk_scaled - m_ij[:, None]
-
+        q_shifted = tl.where(
+            m_ij[:, None] == float("-inf"), float("-inf"), qk_scaled - m_ij[:, None]
+        )
         if USE_EXP2:
             p = tl.math.exp2(q_shifted)
         else:
@@ -485,10 +481,7 @@ def _sage_fwd_blocksparse_mask(
                 kv_offs_n[None, :] < seqlen_k
             )
             tl.store(sd_mask_ptrs, p, mask=sd_store_mask)
-        if USE_BIAS:
-            m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
-        else:
-            m_diff = m_i - m_ij
+        m_diff = tl.where(m_ij == float("-inf"), float("-inf"), m_i - m_ij)
         if USE_EXP2:
             alpha = tl.math.exp2(m_diff)
         else:
