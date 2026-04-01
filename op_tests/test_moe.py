@@ -510,6 +510,9 @@ for test in args.test:
                         #   quant='fp8quant', use_g1u1=True)
 
     elif test == "g1u0_int8smoothquant":
+        if get_gfx() != "gfx942":
+            print(f"skip {test} on {get_gfx()}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:
@@ -566,6 +569,9 @@ for test in args.test:
                             activation=args.activation,
                         )
     elif test == "g1u1_int4":
+        if get_gfx() != "gfx942":
+            print(f"skip {test} on {get_gfx()}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:
