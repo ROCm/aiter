@@ -6,11 +6,74 @@ import glob
 import os
 import sys
 from collections import defaultdict
+from io import StringIO
 
 import numpy as np
 import pandas as pd
 
 pd.set_option("future.no_silent_downcasting", True)
+
+
+def _strip_line_end_comments(line: str) -> str:
+    """Remove the first //, #, or ; (only if preceded by whitespace) outside quotes to EOL."""
+    i = 0
+    n = len(line)
+    in_quotes = False
+    while i < n:
+        c = line[i]
+        if c == '"':
+            if in_quotes and i + 1 < n and line[i + 1] == '"':
+                i += 2
+                continue
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        if not in_quotes:
+            if c == "/" and i + 1 < n and line[i + 1] == "/":
+                if i > 0 and line[i - 1] == ":":
+                    i += 2
+                    continue
+                return line[:i].rstrip()
+            if c == "#":
+                return line[:i].rstrip()
+            if c == ";" and i > 0 and line[i - 1] in " \t":
+                return line[:i].rstrip()
+        i += 1
+    return line
+
+
+def _strip_csv_comments(content: str) -> str:
+    """Strip block comments /* ... */ and line comments (//, #, ;) from CSV text."""
+    out = content
+    while True:
+        start = out.find("/*")
+        if start == -1:
+            break
+        end = out.find("*/", start + 2)
+        if end == -1:
+            out = out[:start]
+            break
+        out = out[:start] + out[end + 2 :]
+    lines = []
+    for line in out.splitlines(keepends=True):
+        if line.endswith("\r\n"):
+            body, sep = line[:-2], "\r\n"
+        elif line.endswith("\n"):
+            body, sep = line[:-1], "\n"
+        else:
+            body, sep = line, ""
+        if body.lstrip().startswith(("//", "#", ";")):
+            continue
+        lines.append(_strip_line_end_comments(body) + sep)
+    return "".join(lines)
+
+
+def read_csv_strip_comments(path: str, **kwargs):
+    """Read a CSV file with comment preprocessing."""
+    with open(path, encoding="utf-8-sig") as f:
+        raw = f.read()
+    return pd.read_csv(StringIO(_strip_csv_comments(raw)), **kwargs)
+
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.basename(this_dir)
@@ -66,7 +129,7 @@ if __name__ == "__main__":
         for file_info in file_info_list:
             single_file = file_info["file_path"]
             arch = file_info["arch"]
-            df = pd.read_csv(single_file)
+            df = read_csv_strip_comments(single_file)
             # check headers
             headers_list = df.columns.tolist()
             required_columns = {"knl_name", "co_name"}
