@@ -111,67 +111,17 @@ def use_2d_kernel(
     )
 
 
-def _try_ck_splitkv_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
-                               seqused_k, softmax_scale, window_size,
-                               block_table, softcap, alibi_slopes, sinks):
-    """Route low-batch decode to CK FMHA split-KV for KV-parallel scheduling."""
-    if max_seqlen_q != 1:
-        return False
-    if window_size != (-1, -1):
-        return False
-    if softcap != 0:
-        return False
-    if alibi_slopes is not None or sinks is not None:
-        return False
-
-    num_kv_heads = k.shape[2]
-    num_seqs = len(seqused_k)
-    num_2d_prgms = num_kv_heads * num_seqs
-    if num_2d_prgms >= 256 * 4:
-        return False
-
-    block_size = k.shape[1]
-    if block_size < 64 or (block_size & (block_size - 1)) != 0:
-        return False
-
-    try:
-        from aiter.ops.mha import mha_varlen_fwd
-        max_seqlen_k = int(seqused_k.max().item())
-        cu_k = torch.nn.functional.pad(seqused_k.cumsum(0, dtype=torch.int32), (1, 0))
-
-        mha_varlen_fwd(
-            q=q, k=k, v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            min_seqlen_q=max_seqlen_q,
-            dropout_p=0.0,
-            softmax_scale=softmax_scale,
-            logits_soft_cap=0.0,
-            zero_tensors=False,
-            is_causal=True,
-            window_size_left=-1,
-            window_size_right=0,
-            sink_size=0,
-            return_softmax_lse=True,
-            return_dropout_randval=False,
-            out=out,
-            block_table=block_table,
-        )
-        return True
-    except Exception:
-        return False
-
-
 def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
                                seqused_k, softmax_scale, window_size,
                                block_table, softcap, alibi_slopes, sinks):
-    """Route decode to CK unified attention when CK is faster than Triton.
+    """Route decode to CK unified attention when it's faster than Triton.
 
-    CK 2D wins in a medium-batch sweet spot where there are enough workgroups
-    for full GPU occupancy but not so many that per-workgroup overhead dominates.
-    Empirically: 1024 <= num_kv_heads * num_seqs <= 2048.
+    CK unified attention (42_unified_attention) is a single-kernel paged-KV
+    attention that wins over Triton at medium-to-high batch decode:
+      - num_seqs >= 32 (enough workgroups for GPU occupancy)
+      - hdim=64 GQA-8 or hdim=128 MHA (compiled instances)
+      - No sliding window (CK-UA doesn't support window_size yet)
+      - No softcap, alibi, or sinks
     """
     if max_seqlen_q != 1:
         return False
@@ -197,12 +147,15 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
 
     num_seqs = len(seqused_k)
     num_2d_prgms = num_kv_heads * num_seqs
-    if num_2d_prgms < 1024 or num_2d_prgms > 2048:
-        return False
+    # TODO: CK-UA wins on some high-batch shapes but not consistently enough
+    # to enable by default. Re-enable when CK-UA performance improves or
+    # when a per-shape lookup table is available. Current data:
+    #   AmirFix JSONL: CK-UA wins 57/96 shapes at 257-1024 seqs
+    #   Original JSONL: CK-UA loses to Triton 2D at all batch sizes
+    return False
 
     try:
         from aiter.ops.unified_attention import unified_attention_fwd
-        import math
         scale_s = softmax_scale if softmax_scale else 1.0 / math.sqrt(head_size)
         unified_attention_fwd(
             out, q, k, v, block_table, seqused_k, cu_seqlens_q,
@@ -238,11 +191,6 @@ def unified_attention(
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
-
-    if _try_ck_splitkv_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
-                                  seqused_k, softmax_scale, window_size,
-                                  block_table, softcap, alibi_slopes, sinks):
-        return
 
     if _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
                                   seqused_k, softmax_scale, window_size,

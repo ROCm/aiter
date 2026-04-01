@@ -91,6 +91,17 @@ def compatible(s: Shape) -> tuple[bool, str]:
     return True, "ok"
 
 
+def estimate_mem_gb(s: Shape) -> float:
+    """Estimate GPU memory needed for this shape's tensors."""
+    blk = s.block_size
+    elem = 2  # bf16
+    needed_blocks = max((s.max_seqlen_k + blk - 1) // blk, 1)
+    num_phys = max(needed_blocks * max(s.num_seqs, 1) * 2, 64)
+    kv_bytes = num_phys * blk * s.num_kv_heads * s.head_size * elem * 2
+    q_bytes = s.total_q_tokens * s.num_query_heads * s.head_size * elem
+    return (kv_bytes + q_bytes) / (1024**3)
+
+
 def make_tensors(s: Shape, device: str = "cuda"):
     dtype = DTYPE_MAP[s.q_dtype]
     blk = s.block_size
@@ -183,6 +194,26 @@ def bench_ck_fmha(s: Shape, warmup: int, iters: int, created_input=None, use_gra
     return _timed(fn, warmup, iters, use_graph)
 
 
+def bench_auto(s: Shape, warmup: int, iters: int, created_input=None, use_graph: bool = True) -> float:
+    """Benchmark the production unified_attention path with smart selector."""
+    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
+    out = torch.empty_like(q)
+
+    kw = dict(
+        q=q, k=k, v=v, out=out, cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=s.max_seqlen_q, seqused_k=seq_lens_k,
+        max_seqlen_k=s.max_seqlen_k, softmax_scale=scale,
+        causal=True, window_size=s.window_size, block_table=block_tables,
+        softcap=s.softcap, q_descale=None, k_descale=None, v_descale=None,
+        alibi_slopes=None, output_scale=None, qq_bias=None, sinks=None,
+    )
+
+    def fn():
+        ua_mod.unified_attention(**kw)
+
+    return _timed(fn, warmup, iters, use_graph)
+
+
 def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None, created_input=None, use_graph: bool = True) -> float:
     """Benchmark Triton unified attention (2D or 3D)."""
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
@@ -238,6 +269,8 @@ def main() -> int:
     ap.add_argument("--no-graph", action="store_true",
                     help="Skip CUDA graph capture")
     ap.add_argument("--out-csv", type=Path, default=None)
+    ap.add_argument("--decode-only", action="store_true",
+                    help="Only benchmark decode shapes (max_seqlen_q == 1)")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -245,6 +278,8 @@ def main() -> int:
         return 2
 
     shapes = load_and_dedup(args.jsonl, args.max_shapes)
+    if args.decode_only:
+        shapes = [(s, c) for s, c in shapes if s.max_seqlen_q == 1]
     if not shapes:
         print("No shapes found in JSONL.")
         return 1
@@ -264,7 +299,7 @@ def main() -> int:
 
     hdr = (f"{'#':>4s} {'phase':>8s} {'seqs':>5s} {'q_tok':>6s} {'max_q':>6s} "
            f"{'max_k':>6s} {'heads':>5s} {'hdim':>4s} {'win':>7s} {'cnt':>4s} "
-           f"{'CK-UA':>8s} {'CK-SK':>8s} {'T-2D':>8s} {'T-3D':>8s} "
+           f"{'AUTO':>8s} {'CK-UA':>8s} {'CK-SK':>8s} {'T-2D':>8s} {'T-3D':>8s} "
            f"{'best':>6s}")
     print(hdr)
     print("-" * len(hdr))
@@ -280,15 +315,30 @@ def main() -> int:
                   f"{s.num_query_heads:3d}/{s.num_kv_heads:<2d} {s.head_size:4d} "
                   f"{win_str:>7s} {count:4d}")
 
-        inp = make_tensors(s)
+        try:
+            inp = make_tensors(s)
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"{prefix} SKIP (OOM on tensor alloc)")
+            continue
         results = {}
 
-        for name, fn in [
-            ("ck_ua",  lambda: bench_ck_ua(s, args.warmup, args.iters, inp, use_g)),
-            ("ck_sk",  lambda: bench_ck_fmha(s, args.warmup, args.iters, inp, use_g)),
-            ("t_2d",   lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g)),
-            ("t_3d",   lambda: bench_triton(s, args.warmup, args.iters, False, inp, use_g)),
-        ]:
+        mem_gb = estimate_mem_gb(s)
+        if mem_gb > 128:
+            backends = [
+                ("auto",   lambda: bench_auto(s, args.warmup, args.iters, inp, use_g)),
+                ("t_2d",   lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g)),
+            ]
+        else:
+            backends = [
+                ("auto",   lambda: bench_auto(s, args.warmup, args.iters, inp, use_g)),
+                ("ck_ua",  lambda: bench_ck_ua(s, args.warmup, args.iters, inp, use_g)),
+                ("ck_sk",  lambda: bench_ck_fmha(s, args.warmup, args.iters, inp, use_g)),
+                ("t_2d",   lambda: bench_triton(s, args.warmup, args.iters, True, inp, use_g)),
+                ("t_3d",   lambda: bench_triton(s, args.warmup, args.iters, False, inp, use_g)),
+            ]
+
+        for name, fn in backends:
             try:
                 results[name] = fn()
             except Exception as e:
@@ -302,8 +352,9 @@ def main() -> int:
         valid = {k: v for k, v in results.items() if v is not None}
         best = min(valid, key=valid.get) if valid else ""
 
-        print(f"{prefix} {vals['ck_ua']:>8s} {vals['ck_sk']:>8s} "
-              f"{vals['t_2d']:>8s} {vals['t_3d']:>8s} {best:>6s}")
+        auto_s = vals.get('auto', '        ')
+        print(f"{prefix} {auto_s:>8s} {vals.get('ck_ua','        '):>8s} {vals.get('ck_sk','        '):>8s} "
+              f"{vals.get('t_2d','        '):>8s} {vals.get('t_3d','        '):>8s} {best:>6s}")
 
         csv_rows.append([
             i, phase, s.num_seqs, s.total_q_tokens, s.max_seqlen_q,
@@ -318,7 +369,7 @@ def main() -> int:
 
     # Summary
     print()
-    wins = {"ck_ua": 0, "ck_sk": 0, "t_2d": 0, "t_3d": 0}
+    wins = {"auto": 0, "ck_ua": 0, "ck_sk": 0, "t_2d": 0, "t_3d": 0}
     total = 0
     for row in csv_rows:
         b = row[-1]
@@ -326,12 +377,34 @@ def main() -> int:
             wins[b] += 1
             total += 1
     print(f"Summary: {total} shapes benchmarked")
-    for k in ["ck_ua", "ck_sk", "t_2d", "t_3d"]:
-        label = {"ck_ua": "CK Unified Attn",
+    for k in ["auto", "ck_ua", "ck_sk", "t_2d", "t_3d"]:
+        label = {"auto": "Auto (selector)",
+                 "ck_ua": "CK Unified Attn",
                  "ck_sk": "CK FMHA SplitKV",
                  "t_2d": "Triton 2D", "t_3d": "Triton 3D"}[k]
         pct = 100 * wins[k] / total if total else 0
         print(f"  {label:>20s}: {wins[k]:4d} wins ({pct:.1f}%)")
+
+    auto_vs_best = []
+    for row in csv_rows:
+        r = {k: v for k, v in zip(["auto","ck_ua","ck_sk","t_2d","t_3d"],
+             [row[12] if len(row)>12 else "", row[13] if len(row)>13 else "",
+              row[14] if len(row)>14 else "", row[15] if len(row)>15 else "",
+              row[16] if len(row)>16 else ""])}
+        try:
+            auto_t = float(r["auto"]) if r["auto"] else None
+            others = [float(v) for v in [r["ck_ua"],r["ck_sk"],r["t_2d"],r["t_3d"]] if v]
+            if auto_t and others:
+                best_t = min(others)
+                auto_vs_best.append(auto_t / best_t)
+        except: pass
+    if auto_vs_best:
+        geo_mean = math.exp(sum(math.log(x) for x in auto_vs_best) / len(auto_vs_best))
+        worse = sum(1 for x in auto_vs_best if x > 1.05)
+        better = sum(1 for x in auto_vs_best if x < 0.95)
+        print(f"\n  Auto vs oracle best: geomean={geo_mean:.3f}x, "
+              f"within 5%={len(auto_vs_best)-worse-better}, "
+              f"auto slower={worse}, auto faster={better}")
 
     if args.out_csv:
         args.out_csv.parent.mkdir(parents=True, exist_ok=True)
