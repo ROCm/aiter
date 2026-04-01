@@ -28,23 +28,40 @@ from .parallel_state import get_tp_group, get_pp_group, get_dp_group, get_ep_gro
 
 
 def tensor_model_parallel_all_reduce(
-    input_: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
+    input_: torch.Tensor,
+    use_new: bool = True,
+    open_fp8_quant: bool = False,
+    prefill_support: bool = False,
 ) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_, use_new, open_fp8_quant)
+    return get_tp_group().all_reduce(input_, use_new, open_fp8_quant, prefill_support)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
-    input_: torch.Tensor, residual_inp_: torch.Tensor, weight_: torch.Tensor, eps: float
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+    return get_tp_group().fused_allreduce_rmsnorm(
+        input_, residual_inp_, weight_, eps, prefill_support
+    )
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-    input_: torch.Tensor, residual_inp_: torch.Tensor, weight_: torch.Tensor, eps: float
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return get_tp_group().fused_allreduce_rmsnorm_quant(
-        input_, residual_inp_, weight_, eps
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
     )
 
 
@@ -53,13 +70,17 @@ def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tenso
 
 
 def tensor_model_parallel_reduce_scatter(
-    input_: torch.Tensor, use_custom: bool = True, dim: int = 0
+    input_: torch.Tensor,
+    use_custom: bool = True,
+    dim: int = 0,
 ) -> torch.Tensor:
     return get_tp_group().reduce_scatter_tensor(input_, use_custom, dim)
 
 
 def tensor_model_parallel_all_gather(
-    input_: torch.Tensor, use_custom: bool = False, dim: int = -1
+    input_: torch.Tensor,
+    use_custom: bool = False,
+    dim: int = -1,
 ) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""
     return get_tp_group().all_gather(input_, use_custom, dim)
