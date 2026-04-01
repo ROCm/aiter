@@ -219,18 +219,12 @@ def make_workloads(
     Each entry is (batch, sq, sk, causal, functions).
     """
     prefill_seqlens = [256, 1024, num_tokens]
-    prefill = [
-        (num_tokens // sq, sq, sq, True, PREFILL_FNS)
-        for sq in prefill_seqlens
-    ]
+    prefill = [(num_tokens // sq, sq, sq, True, PREFILL_FNS) for sq in prefill_seqlens]
     # Cross-attention (non-causal, sq != sk)
     prefill.append((num_tokens // 1024, 1024, 4096, False, PREFILL_FNS))
 
     decode_batch = min(num_tokens, max_num_seqs)
-    decode = [
-        (decode_batch, 1, sk, True, DECODE_FNS)
-        for sk in [1024, 4096, 8192]
-    ]
+    decode = [(decode_batch, 1, sk, True, DECODE_FNS) for sk in [1024, 4096, 8192]]
 
     return prefill, decode
 
@@ -259,15 +253,23 @@ def model_benchmark_configs(
         if args.sq:
             b = args.b if args.b else 1
             causal = args.causal if args.causal is not None else True
-            workloads = [(b, args.sq, args.sk if args.sk else args.sq, causal, functions)]
+            workloads = [
+                (b, args.sq, args.sk if args.sk else args.sq, causal, functions)
+            ]
         else:
             # Realistic serving on MI350 node: 8192 token budget per step, 64 concurrent decodes
             prefill, decode = make_workloads(num_tokens=8192, max_num_seqs=64)
             workloads = prefill + decode
             if args.b:
-                workloads = [(args.b, sq, sk, c, fns) for (_, sq, sk, c, fns) in workloads]
+                workloads = [
+                    (args.b, sq, sk, c, fns) for (_, sq, sk, c, fns) in workloads
+                ]
             if args.causal is not None:
-                workloads = [(b, sq, sk, c, fns) for (b, sq, sk, c, fns) in workloads if c == args.causal]
+                workloads = [
+                    (b, sq, sk, c, fns)
+                    for (b, sq, sk, c, fns) in workloads
+                    if c == args.causal
+                ]
 
         for (b, sq, sk, causal, workload_fns), d in itertools.product(
             workloads, dtypes
@@ -371,11 +373,23 @@ class _CsvWriter:
         if not run.save_path:
             return
         import os
+
         os.makedirs(run.save_path, exist_ok=True)
         self._path = os.path.join(run.save_path, f"{run.plot_name}.csv")
         header = [
-            "model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K",
-            "D_HEAD", "D_HEAD_V", "causal", "function", "dtype", "impl", "fused",
+            "model",
+            "BATCH",
+            "HQ",
+            "HK",
+            "N_CTX_Q",
+            "N_CTX_K",
+            "D_HEAD",
+            "D_HEAD_V",
+            "causal",
+            "function",
+            "dtype",
+            "impl",
+            "fused",
             run.unit,
         ]
         with open(self._path, "w") as f:
@@ -411,7 +425,10 @@ def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     kept = []
     for c in configs:
         if c.estimated_memory > limit:
-            print(f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM", flush=True)
+            print(
+                f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
+                flush=True,
+            )
         else:
             kept.append(c)
     return kept
@@ -460,9 +477,25 @@ def run_benchmark(run: BenchRun):
         )
         try:
             value = _run_single_benchmark(
-                model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
-                causal, function, dtype, impl, fused, torch_dtype, unit,
-                dropout, sm_scale, device, run,
+                model,
+                BATCH,
+                HQ,
+                HK,
+                N_CTX_Q,
+                N_CTX_K,
+                D_HEAD,
+                D_HEAD_V,
+                causal,
+                function,
+                dtype,
+                impl,
+                fused,
+                torch_dtype,
+                unit,
+                dropout,
+                sm_scale,
+                device,
+                run,
             )
         except Exception as e:
             print(f"  [SKIP] {e}", flush=True)
@@ -473,9 +506,25 @@ def run_benchmark(run: BenchRun):
         return value if value is not None else 0
 
     def _run_single_benchmark(
-        model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
-        causal, function, dtype, impl, fused, torch_dtype, unit,
-        dropout, sm_scale, device, run,
+        model,
+        BATCH,
+        HQ,
+        HK,
+        N_CTX_Q,
+        N_CTX_K,
+        D_HEAD,
+        D_HEAD_V,
+        causal,
+        function,
+        dtype,
+        impl,
+        fused,
+        torch_dtype,
+        unit,
+        dropout,
+        sm_scale,
+        device,
+        run,
     ):
         assert dropout <= 0.0, "Dropout not supported in this benchmark."
         is_bwd = function.startswith("bwd")
@@ -534,9 +583,7 @@ def run_benchmark(run: BenchRun):
             cache_seqlens = torch.full(
                 (BATCH,), N_CTX_K, dtype=torch.int32, device=device
             )
-            total_flops += (
-                2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-            )
+            total_flops += 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
 
             fn_kwargs = dict(
                 sm_scale=sm_scale,
