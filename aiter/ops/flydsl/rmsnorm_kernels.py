@@ -15,7 +15,9 @@ def _to_flydsl_dtype(dtype: torch.dtype) -> str:
 @functools.cache
 def _get_rmsnorm_launch(M: int, N: int, dtype_str: str):
     from kernels.rmsnorm_kernel import build_rmsnorm_module
+
     return build_rmsnorm_module(M, N, dtype_str)
+
 
 @torch._dynamo.disable
 def flydsl_rmsnorm(x, gamma, eps):
@@ -42,5 +44,3 @@ def flydsl_rmsnorm(x, gamma, eps):
     launch_fn(x_2d, gamma, out, M, stream=stream)
 
     return out.reshape(orig_shape)
-
-
