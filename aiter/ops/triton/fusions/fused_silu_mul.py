@@ -81,7 +81,11 @@ def fused_silu_mul_last_dim(
     leading = x.shape[:-1]
     n_rows = x.numel() // (2 * d)
     if n_rows == 0:
-        return torch.empty(*leading, d, dtype=x.dtype, device=x.device) if out is None else out
+        return (
+            torch.empty(*leading, d, dtype=x.dtype, device=x.device)
+            if out is None
+            else out
+        )
 
     _LOGGER.info(
         f"FUSED_SILU_MUL_LAST_DIM: x={tuple(x.shape)} last_half={d} rows={n_rows}"

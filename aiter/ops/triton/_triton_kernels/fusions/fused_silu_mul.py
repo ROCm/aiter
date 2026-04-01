@@ -36,12 +36,14 @@ def fused_silu_mul_kernel(
     row_out = row_idx * row_stride_out
 
     first_half_ptrs = inp_ptr + row_in[:, None] + col_idx[None, :] * col_stride_in
-    second_half_ptrs = inp_ptr + row_in[:, None] + (n_cols + col_idx)[None, :] * col_stride_in
+    second_half_ptrs = (
+        inp_ptr + row_in[:, None] + (n_cols + col_idx)[None, :] * col_stride_in
+    )
     out_ptrs = out_ptr + row_out[:, None] + col_idx[None, :] * col_stride_out
 
     mask = (row_idx < n_rows)[:, None] & (col_idx < n_cols)[None, :]
     a = tl.load(first_half_ptrs, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(second_half_ptrs, mask=mask, other=0.0).to(tl.float32)
-    silu_a = _silu_exp2(a)
+    silu_a = _silu_exp2(a).to(inp_ptr.dtype.element_ty)
+    b = tl.load(second_half_ptrs, mask=mask, other=0.0)
     o = (silu_a * b).to(out_ptr.dtype.element_ty)
     tl.store(out_ptrs, o, mask=mask)

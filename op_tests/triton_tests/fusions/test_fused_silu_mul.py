@@ -66,10 +66,14 @@ def test_fused_silu_mul_requires_even_last_dim():
     [
         # Decode M=4 → rows M * top_k
         pytest.param(4 * _GLM47_TOP_K, _GLM47_TP4_LAST, id="glm47_tp4_decode4"),
-        pytest.param(4 * _KIMI_K25_TOP_K, _KIMI_K25_TP4_LAST, id="kimi_k25_tp4_decode4"),
+        pytest.param(
+            4 * _KIMI_K25_TOP_K, _KIMI_K25_TP4_LAST, id="kimi_k25_tp4_decode4"
+        ),
         # Medium prefill / batched decode
         pytest.param(256 * _GLM47_TOP_K, _GLM47_TP4_LAST, id="glm47_tp4_rows256x8"),
-        pytest.param(256 * _KIMI_K25_TOP_K, _KIMI_K25_TP4_LAST, id="kimi_k25_tp4_rows256x8"),
+        pytest.param(
+            256 * _KIMI_K25_TOP_K, _KIMI_K25_TP4_LAST, id="kimi_k25_tp4_rows256x8"
+        ),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

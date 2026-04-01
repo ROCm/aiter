@@ -53,9 +53,7 @@ def silu_mul_benchmark_configs(args):
     no_bench_stage2 = args.no_bench_stage2
     if args.silu_mul_M_list:
         default_ms = [
-            int(x.strip())
-            for x in args.silu_mul_M_list.split(",")
-            if x.strip()
+            int(x.strip()) for x in args.silu_mul_M_list.split(",") if x.strip()
         ]
     elif args.M:
         default_ms = [args.M]
