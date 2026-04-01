@@ -89,7 +89,9 @@ def _check_result(
     pct_close = close_mask.float().mean().item() * 100.0
     passed = pct_close >= pass_pct
 
-    print(f"  max_delta={max_delta:.6f}, {pct_close:.2f}% close (atol={atol}, rtol={rtol})")
+    print(
+        f"  max_delta={max_delta:.6f}, {pct_close:.2f}% close (atol={atol}, rtol={rtol})"
+    )
     print(f"  ref  sample:  {ref_f.reshape(-1)[:8]}")
     print(f"  test sample: {test_f.reshape(-1)[:8]}")
     print(f"  --> {'PASS' if passed else 'FAIL'}")
