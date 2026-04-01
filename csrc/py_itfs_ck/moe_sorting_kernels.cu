@@ -24,8 +24,6 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
     TORCH_CHECK(topk_weights.scalar_type() == at::ScalarType::Float,
                 "topk_weights must be FP32 (float32)");
 
-    auto dtype = topk_ids.dtype();
-
     auto dtype_str = torchDTypeToStr(topk_ids.dtype());
     int num_tokens = topk_ids.size(0);
     int topk       = topk_ids.size(1);
@@ -33,13 +31,16 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     int workspace_size = moe_sorting_get_workspace_size(num_tokens, num_experts, topk, dispatch_policy);
-    torch::Tensor ws;
+    // Keep workspace tensor alive across kernel launch. The previous block-scoped
+    // allocation released `ws` before `moe_sorting(...)` was invoked.
+    torch::Tensor ws_holder;
     void* ws_ptr = nullptr;
     if(workspace_size > 0)
     {
-        ws     = torch::empty({workspace_size},
-                               torch::TensorOptions().dtype(dtype).device(device_of(topk_ids)));
-        ws_ptr = ws.data_ptr();
+        ws_holder = torch::empty(
+            {workspace_size},
+            torch::TensorOptions().dtype(torch::kUInt8).device(device_of(topk_ids)));
+        ws_ptr = ws_holder.data_ptr();
     }
 
     moe_sorting(
