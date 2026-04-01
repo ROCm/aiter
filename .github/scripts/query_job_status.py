@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import time
 from collections import defaultdict
@@ -37,6 +38,16 @@ def parse_args():
         "--summary",
         action="store_true",
         help="Print markdown table summary.",
+    )
+    parser.add_argument(
+        "--snapshot-in",
+        default="",
+        help="Optional path to pre-fetched snapshot JSON.",
+    )
+    parser.add_argument(
+        "--snapshot-out",
+        default="",
+        help="Optional path to write fetched snapshot JSON.",
     )
     return parser.parse_args()
 
@@ -148,6 +159,45 @@ def list_jobs_for_run(owner: str, repo: str, run_id: int, token: str):
         page += 1
 
 
+def job_name_matches(filter_name: str, actual_name: str):
+    if not filter_name:
+        return True
+    if actual_name == filter_name:
+        return True
+    # Handle matrix-expanded names like "Foo (bar=1)".
+    if actual_name.startswith(f"{filter_name} ("):
+        return True
+    if actual_name.startswith(f"{filter_name} / "):
+        return True
+    return False
+
+
+def row_to_dict(row: list[str]):
+    return {
+        "workflow": row[0],
+        "job": row[1],
+        "runner": row[2],
+        "runner_group": row[3],
+        "status": row[4],
+        "conclusion": row[5],
+        "branch": row[6],
+        "run_url": row[7],
+    }
+
+
+def row_from_dict(data: dict):
+    return [
+        data.get("workflow", "-"),
+        data.get("job", "-"),
+        data.get("runner", "-"),
+        data.get("runner_group", "-"),
+        data.get("status", "-"),
+        data.get("conclusion", "-"),
+        data.get("branch", "-"),
+        data.get("run_url", "-"),
+    ]
+
+
 def main():
     args = parse_args()
     token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
@@ -165,44 +215,63 @@ def main():
     rate_limited = False
     rate_limit_reset_epoch = None
 
-    try:
-        runs = list_recent_runs(owner, repo, workflows, token, lookback)
-        for run in runs:
-            run_id = run["id"]
-            run_url = run["html_url"]
-            branch = run.get("head_branch") or "-"
-            workflow = run.get("workflow_file", "-")
-            for job in list_jobs_for_run(owner, repo, run_id, token):
-                if args.job and job["name"] != args.job:
-                    continue
+    all_rows = []
+    if args.snapshot_in:
+        snapshot_payload = json.loads(Path(args.snapshot_in).read_text(encoding="utf-8"))
+        all_rows = [row_from_dict(item) for item in snapshot_payload.get("rows", [])]
+    else:
+        try:
+            runs = list_recent_runs(owner, repo, workflows, token, lookback)
+            for run in runs:
+                run_id = run["id"]
+                run_url = run["html_url"]
+                branch = run.get("head_branch") or "-"
+                workflow = run.get("workflow_file", "-")
+                for job in list_jobs_for_run(owner, repo, run_id, token):
+                    runner_name = job.get("runner_name") or "-"
+                    runner_group = job.get("runner_group_name") or "-"
+                    status = job.get("status") or "-"
+                    conclusion = job.get("conclusion") or "-"
 
-                runner_name = job.get("runner_name") or "-"
-                runner_group = job.get("runner_group_name") or "-"
-                status = job.get("status") or "-"
-                conclusion = job.get("conclusion") or "-"
+                    all_rows.append(
+                        [
+                            workflow,
+                            job["name"],
+                            runner_name,
+                            runner_group,
+                            status,
+                            conclusion,
+                            branch,
+                            run_url,
+                        ]
+                    )
+        except RateLimitExceededError as exc:
+            rate_limited = True
+            rate_limit_reset_epoch = exc.reset_epoch
+            print("[warn] GitHub API rate limit exceeded during report generation.")
+        except requests.HTTPError as exc:
+            print(f"[warn] Failed to query workflow runs: {exc}")
 
-                job_rows.append(
-                    [
-                        workflow,
-                        job["name"],
-                        runner_name,
-                        runner_group,
-                        status,
-                        conclusion,
-                        branch,
-                        run_url,
-                    ]
-                )
+    if args.snapshot_out:
+        snapshot_payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "rows": [row_to_dict(row) for row in all_rows],
+        }
+        Path(args.snapshot_out).write_text(
+            json.dumps(snapshot_payload, ensure_ascii=False), encoding="utf-8"
+        )
 
-                key = (workflow, runner_name, runner_group)
-                runner_stats[key]["total"] += 1
-                runner_stats[key][conclusion] += 1
-    except RateLimitExceededError as exc:
-        rate_limited = True
-        rate_limit_reset_epoch = exc.reset_epoch
-        print("[warn] GitHub API rate limit exceeded during report generation.")
-    except requests.HTTPError as exc:
-        print(f"[warn] Failed to query workflow runs: {exc}")
+    workflow_set = set(workflows)
+    for row in all_rows:
+        if row[0] not in workflow_set:
+            continue
+        if not job_name_matches(args.job, row[1]):
+            continue
+
+        job_rows.append(row)
+        key = (row[0], row[2], row[3])
+        runner_stats[key]["total"] += 1
+        runner_stats[key][row[5]] += 1
 
     if not job_rows:
         print("No matching job records in the selected time window.")
