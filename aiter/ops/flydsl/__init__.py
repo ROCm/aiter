@@ -39,7 +39,10 @@ if is_flydsl_available():
         flydsl_moe_stage2,
     )
 
+    from .gemm_kernels import flydsl_hgemm
+
     __all__ += [
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_hgemm",
     ]
