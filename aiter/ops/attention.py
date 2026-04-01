@@ -916,7 +916,11 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 16 == 0
+    effective_num_head = num_head_qo
+    if num_head_qo < 16 and num_head_qo > 0 and 16 % num_head_qo == 0:
+        effective_num_head = 16
+    assert effective_num_head % 16 == 0
+
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
@@ -930,16 +934,16 @@ def get_mla_metadata_info_v1(
     )
 
     max_qo_tiles_per_batch = (
-        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
-        if num_head_qo == 16
+        int(math.ceil(max_seqlen_qo * effective_num_head / 128))
+        if effective_num_head == 16
         or (
             get_gfx() == "gfx942"
-            and num_head_qo == 128
+            and effective_num_head == 128
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
         )
         or use_qseqlen_fold
-        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
+        else int(math.ceil(max_seqlen_qo * effective_num_head / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch

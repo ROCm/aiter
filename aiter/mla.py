@@ -118,6 +118,8 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_block_n_fp8 = {
+        4: 128,
+        8: 128,
         16: 128,
         32: 128,
         48: 64,
@@ -187,6 +189,18 @@ def mla_decode_fwd(
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
+
+    _head_pad_factor = 1
+    _o_unpadded = None
+    if nhead < 16 and nhead > 0 and 16 % nhead == 0:
+        _head_pad_factor = 16 // nhead
+        q = q.repeat_interleave(_head_pad_factor, dim=1)
+        _o_unpadded = o
+        nhead = 16
+        ori_nhead = 16
+        o = torch.empty(
+            total_s, nhead, v_head_dim, dtype=_o_unpadded.dtype, device=device
+        )
 
     persistent_mode = work_meta_data is not None
 
@@ -266,6 +280,8 @@ def mla_decode_fwd(
                 and nhead in [32, 64]
             )
         ):
+            if _o_unpadded is not None:
+                _o_unpadded.copy_(o[:, ::_head_pad_factor, :])
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
@@ -466,6 +482,11 @@ def mla_decode_fwd(
                     .reshape(ori_total_s, ori_nhead)
                     .contiguous()
                 )
+
+    if _o_unpadded is not None:
+        _o_unpadded.copy_(o[:, ::_head_pad_factor, :])
+        if final_lse is not None:
+            final_lse = final_lse[:, ::_head_pad_factor]
 
     return logits, final_lse
 

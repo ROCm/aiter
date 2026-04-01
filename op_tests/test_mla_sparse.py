@@ -16,8 +16,8 @@ torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
-# qdtype bf16, kdtype bf16: nhead16
-# qdtype fp8, kdtype fp8: nhead16, nhead128
+# qdtype bf16, kdtype bf16: nhead4, nhead8, nhead16
+# qdtype fp8, kdtype fp8: nhead4, nhead8, nhead16, nhead128
 # qdtype fp8, kdtype bf16: nhead16
 
 
@@ -722,7 +722,7 @@ parser.add_argument(
     "--nhead",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[(16, 2), (48, 1), (128, 2)],
+    default=[(4, 1), (8, 1), (16, 2), (48, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )

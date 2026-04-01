@@ -466,7 +466,14 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                                   kv_is_fp8 && (num_heads > 16) &&
                                   (uni_seqlen_qo * (num_heads / 16) == 4);
 
-    if((natively_supported == false) && (num_heads % 16 == 0))
+    const bool pad_to_qh16 = (!natively_supported) && (num_heads < 16) &&
+                              (num_heads > 0) && (16 % num_heads == 0);
+
+    if(pad_to_qh16)
+    {
+        num_heads = 16;
+    }
+    else if((natively_supported == false) && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
