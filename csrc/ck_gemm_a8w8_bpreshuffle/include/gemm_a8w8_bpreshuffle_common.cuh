@@ -165,7 +165,8 @@ __forceinline__ torch::Tensor gemm_a8w8_bpreshuffle_impl(
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y)
+    torch::Tensor &Y,
+    int KBatch = 1)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);
@@ -198,7 +199,7 @@ __forceinline__ torch::Tensor gemm_a8w8_bpreshuffle_impl(
                                              StrideB,
                                              std::array<ck::index_t, NumDTensor>{I0, I0},
                                              StrideE,
-                                             1,
+                                             KBatch,
                                              a_element_op,
                                              b_element_op,
                                              cde_element_op);
