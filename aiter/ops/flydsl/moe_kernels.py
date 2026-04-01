@@ -9,6 +9,7 @@ import re
 from typing import Dict, Optional
 from aiter.utility import dtypes
 
+import flydsl.compiler as flyc
 import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
@@ -281,139 +282,171 @@ def compile_flydsl_moe_stage2(
         )
 
 
-# Private: compiled kernel closures
+# Private helpers
 
 
-@functools.cache
-def _get_compiled_stage1(
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    doweight: bool,
-    a_dtype: str,
-    b_dtype: str,
-    out_dtype: str,
-    act: str,
-    persist_m: int = 1,
-    fuse_fp4_quant: bool = False,
-    fuse_sort_scale: bool = False,
-    use_async_copy: bool = False,
-    k_batch: int = 1,
-    waves_per_eu: int = 3,
-    b_nt: int = 0,
-    gate_only: bool = False,
-):
-    """Compile and cache stage1 kernel, return a tensor_api closure."""
-    exe = compile_flydsl_moe_stage1(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage1=doweight,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        act=act,
-        persist_m=persist_m,
-        fuse_fp4_quant=fuse_fp4_quant,
-        fuse_sort_scale=fuse_sort_scale,
-        use_async_copy=use_async_copy,
-        k_batch=k_batch,
-        waves_per_eu=waves_per_eu,
-        b_nt=b_nt,
-        gate_only=gate_only,
+_DLPACK_SAFE = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+
+
+def _view_safe(t: torch.Tensor) -> torch.Tensor:
+    """View as uint8 if dtype is not dlpack-safe, otherwise return as-is."""
+    return (
+        t.view(torch.uint8)
+        if t is not None and t.numel() > 0 and t.dtype not in _DLPACK_SAFE
+        else t
     )
-    is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
-    _k_in = model_dim
 
-    def tensor_api(
-        out: torch.Tensor,
-        a: torch.Tensor,
-        w: torch.Tensor,
-        a_scale: torch.Tensor,
-        w_scale: torch.Tensor,
-        sorted_ids: torch.Tensor,
-        sorted_expert_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_valid_ids: torch.Tensor,
-        token_num: int,
-        size_expert_ids_in: int,
-        out_scale_sorted: Optional[torch.Tensor] = None,
-    ) -> None:
-        if gate_only:
-            _gx = _n_in // tile_n
-        else:
-            _gx = _n_in // 2 // tile_n
-        _gy = (size_expert_ids_in + persist_m - 1) // persist_m
-        _total_wg = _gx * _gy * k_batch
 
-        if is_fp4:
-            _dlpack_safe = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-            empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            empty_scale = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream()
-            _out = out.view(torch.uint8) if out.dtype not in _dlpack_safe else out
-            _a = a.view(torch.uint8) if a.dtype not in _dlpack_safe else a
-            _w = w.view(torch.uint8) if w.dtype not in _dlpack_safe else w
-            _as = (
-                a_scale.view(torch.uint8)
-                if a_scale is not None
-                and a_scale.numel() > 0
-                and a_scale.dtype not in _dlpack_safe
-                else a_scale
-            )
-            _ws = (
-                w_scale.view(torch.uint8)
-                if w_scale is not None
-                and w_scale.numel() > 0
-                and w_scale.dtype not in _dlpack_safe
-                else w_scale
-            )
-            _oss = out_scale_sorted if out_scale_sorted is not None else empty_scale
-            exe(
-                _out,
-                _a,
-                _w,
-                _as,
-                _ws,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                empty_bias,
-                _oss,
-                token_num,
-                _n_in,
-                _k_in,
-                size_expert_ids_in,
-                stream,
-            )
-        else:
-            exe(
-                out,
-                a,
-                w,
-                a_scale,
-                w_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                token_num,
-                _n_in,
-                _k_in,
-                size_expert_ids_in,
-            )
+def _s1_args_fp4(
+    out,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    out_scale_sorted,
+    token_num,
+    n_in,
+    k_in,
+    size_expert_ids_in,
+    dev,
+):
+    empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
+    return (
+        _view_safe(out),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        empty_f32,
+        out_scale_sorted,
+        token_num,
+        n_in,
+        k_in,
+        size_expert_ids_in,
+        torch.cuda.current_stream(),
+    )
 
-    return tensor_api
+
+def _s1_args_std(
+    out,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    token_num,
+    n_in,
+    k_in,
+    size_expert_ids_in,
+):
+    return (
+        out,
+        a,
+        w,
+        a_scale,
+        w_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        token_num,
+        n_in,
+        k_in,
+        size_expert_ids_in,
+        torch.cuda.current_stream(),
+    )
+
+
+def _s2_args_fp4(
+    target,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    token_num,
+    n_in,
+    k_in,
+    blocks,
+    dev,
+):
+    empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
+    return (
+        _view_safe(target),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        empty_f32,
+        token_num,
+        n_in,
+        k_in,
+        blocks,
+        torch.cuda.current_stream(),
+    )
+
+
+def _s2_args_std(
+    target,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    token_num,
+    n_in,
+    k_in,
+    blocks,
+):
+    return (
+        target,
+        a,
+        w,
+        a_scale,
+        w_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        token_num,
+        n_in,
+        k_in,
+        blocks,
+        torch.cuda.current_stream(),
+    )
+
+
+def _run_compiled(exe, args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_aiter_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._aiter_cf = cf
+    else:
+        cf(*args)
 
 
 @functools.cache
@@ -422,131 +455,6 @@ def _get_compiled_silu_fq(inter_dim: int, topk: int):
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
     return build_silu_and_mul_fq_module(inter_dim, topk)
-
-
-@functools.cache
-def _get_compiled_stage2(
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    doweight: bool,
-    a_dtype: str,
-    b_dtype: str,
-    out_dtype: str,
-    accumulate: bool = True,
-    persist_m: int = 1,
-    sort_block_m: int = 0,
-):
-    """Compile and cache stage2 kernel, return a tensor_api closure."""
-    exe = compile_flydsl_moe_stage2(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage2=doweight,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        accumulate=accumulate,
-        persist_m=persist_m,
-        sort_block_m=sort_block_m,
-    )
-    is_fp4 = b_dtype == "fp4"
-    _n_in = model_dim
-    _k_in = inter_dim
-
-    _topk = topk
-
-    def tensor_api(
-        out: torch.Tensor,
-        a: torch.Tensor,
-        w: torch.Tensor,
-        a_scale: torch.Tensor,
-        w_scale: torch.Tensor,
-        sorted_ids: torch.Tensor,
-        sorted_expert_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_valid_ids: torch.Tensor,
-        token_num: int,
-        blocks: int,
-    ) -> None:
-        if accumulate:
-            target = out
-        else:
-            target = torch.empty(
-                (token_num * topk * model_dim,),
-                device=out.device,
-                dtype=out.dtype,
-            )
-
-        if is_fp4:
-            _dlpack_safe = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-            empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream()
-            _target = (
-                target.view(torch.uint8) if target.dtype not in _dlpack_safe else target
-            )
-            _a = a.view(torch.uint8) if a.dtype not in _dlpack_safe else a
-            _w = w.view(torch.uint8) if w.dtype not in _dlpack_safe else w
-            _as = (
-                a_scale.view(torch.uint8)
-                if a_scale is not None
-                and a_scale.numel() > 0
-                and a_scale.dtype not in _dlpack_safe
-                else a_scale
-            )
-            _ws = (
-                w_scale.view(torch.uint8)
-                if w_scale is not None
-                and w_scale.numel() > 0
-                and w_scale.dtype not in _dlpack_safe
-                else w_scale
-            )
-            exe(
-                _target,
-                _a,
-                _w,
-                _as,
-                _ws,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                empty_bias,
-                token_num,
-                _n_in,
-                _k_in,
-                blocks,
-                stream,
-            )
-        else:
-            exe(
-                target,
-                a,
-                w,
-                a_scale,
-                w_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                token_num,
-                _n_in,
-                _k_in,
-                blocks,
-            )
-
-        if not accumulate:
-            torch.sum(target.view(token_num, _topk, model_dim), dim=1, out=out)
-
-    return tensor_api
 
 
 # Public API
@@ -679,7 +587,47 @@ def flydsl_moe_stage1(
     _gemm_fq = fuse_fp4_quant and not _is_splitk
     _gemm_fss = fuse_sort_scale and not _is_splitk
 
-    tensor_api = _get_compiled_stage1(
+    _kernel_out = tmp_out if _is_splitk else out
+    is_fp4 = b_dtype == "fp4"
+    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    _k_in = model_dim
+
+    if is_fp4:
+        args = _s1_args_fp4(
+            _kernel_out.view(-1),
+            a.view(-1),
+            w1.view(-1),
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            out_scale_sorted_flat.view(-1),
+            token_num,
+            _n_in,
+            _k_in,
+            _grid_y,
+            dev,
+        )
+    else:
+        args = _s1_args_std(
+            _kernel_out.view(-1),
+            a.view(-1),
+            w1.view(-1),
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            _grid_y,
+        )
+
+    exe = compile_flydsl_moe_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -687,7 +635,7 @@ def flydsl_moe_stage1(
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
-        doweight=(sorted_weights is not None),
+        doweight_stage1=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
@@ -701,34 +649,23 @@ def flydsl_moe_stage1(
         b_nt=b_nt,
         gate_only=gate_only,
     )
-
-    _kernel_out = tmp_out if _is_splitk else out
-    tensor_api(
-        _kernel_out.view(-1),
-        a.view(-1),
-        w1.view(-1),
-        flat_a_scale,
-        flat_w_scale,
-        sorted_token_ids,
-        sorted_expert_ids,
-        sw,
-        num_valid_ids,
-        token_num,
-        _grid_y,
-        out_scale_sorted=out_scale_sorted_flat.view(-1),
-    )
+    _run_compiled(exe, args)
 
     if _splitk_fq:
         _silu_fq = _get_compiled_silu_fq(inter_dim, topk)
         num_sorted_rows = sorted_token_ids.shape[0]
-        _silu_fq(
-            tmp_out.view(-1, inter_dim * 2),
-            out.view(-1).view(torch.uint8),
-            out_scale_sorted_flat,
-            sorted_token_ids,
-            num_valid_ids,
-            token_num,
-            num_sorted_rows,
+        _run_compiled(
+            _silu_fq,
+            (
+                tmp_out.view(-1, inter_dim * 2),
+                out.view(-1).view(torch.uint8),
+                out_scale_sorted_flat,
+                sorted_token_ids,
+                num_valid_ids,
+                token_num,
+                num_sorted_rows,
+                torch.cuda.current_stream(),
+            ),
         )
     elif _is_splitk:
         from aiter.ops.activation import silu_and_mul
@@ -823,7 +760,53 @@ def flydsl_moe_stage2(
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
-    tensor_api = _get_compiled_stage2(
+    is_fp4 = b_dtype == "fp4"
+    _n_in = model_dim
+    _k_in = inter_dim
+
+    target = out
+    if not accumulate:
+        target = torch.empty(
+            (token_num * topk * model_dim,),
+            device=out.device,
+            dtype=out.dtype,
+        )
+
+    if is_fp4:
+        args = _s2_args_fp4(
+            target,
+            inter_states,
+            w2,
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            m_blocks,
+            dev,
+        )
+    else:
+        args = _s2_args_std(
+            target,
+            inter_states,
+            w2,
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            m_blocks,
+        )
+
+    exe = compile_flydsl_moe_stage2(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -831,7 +814,7 @@ def flydsl_moe_stage2(
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
-        doweight=(sorted_weights is not None),
+        doweight_stage2=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
@@ -839,18 +822,9 @@ def flydsl_moe_stage2(
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
     )
-    tensor_api(
-        out,
-        inter_states,
-        w2,
-        flat_a_scale,
-        flat_w_scale,
-        sorted_token_ids,
-        sorted_expert_ids,
-        sw,
-        num_valid_ids,
-        token_num,
-        m_blocks,
-    )
+    _run_compiled(exe, args)
+
+    if not accumulate:
+        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
     return out

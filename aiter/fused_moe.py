@@ -1002,6 +1002,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
+                split_k=max(ksplit, 1),
             ),
             functools.partial(
                 cktile_moe_stage2,
