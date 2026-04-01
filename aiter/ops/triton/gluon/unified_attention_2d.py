@@ -10,6 +10,9 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 float8_info = torch.finfo(e4m3_dtype)
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
+# Check if gfx1250 (MI350X) TDM support is available in this Triton version
+HAS_GFX1250_TDM = hasattr(gl.amd, "gfx1250")
+
 
 @aggregate
 class AsyncKVLoaderConfig:
@@ -1108,7 +1111,8 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=True)
+        # Layout conversion is trivial on gfx1250 but may require data movement on gfx950
+        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=(self.cfg.ARCH_NAME == "gfx1250"))
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(p, v, acc)
         else:
@@ -1541,6 +1545,19 @@ def unified_attention(
         output_scale: Output scale
         sinks: Sinks tensor [num_query_heads,]
     """
+    ARCH_NAME = arch_info.get_arch()
+    
+    # Check TDM availability for gfx1250
+    if use_tdm and not HAS_GFX1250_TDM:
+        if ARCH_NAME == "gfx1250":
+            raise RuntimeError(
+                "TDM (Tensor DMA) requested but gl.amd.gfx1250 module is not available. "
+                "Please upgrade Triton to a version with gfx1250 support, or set use_tdm=False."
+            )
+        else:
+            # Silently disable TDM for non-gfx1250 architectures
+            use_tdm = False
+    
     NUM_SEQS = len(seqused_k)
     NUM_Q_HEADS = q.shape[1]
     HEAD_SIZE = q.shape[2]
@@ -1584,7 +1601,6 @@ def unified_attention(
         num_kv_blocks & (num_kv_blocks - 1) == 0
     ), "num_kv_blocks must be a power of 2"
     TILE_SIZE = num_kv_blocks * BLOCK_SIZE
-    ARCH_NAME = arch_info.get_arch()
     NUM_WARPS = num_warps
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1

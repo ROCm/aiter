@@ -6,8 +6,6 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention, _try_ck_unified_attention
-from aiter.ops.unified_attention import unified_attention_fwd as ck_unified_attention
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
@@ -198,8 +196,11 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    line_vals = [f"fwd(Gluon_2D)"]  # TODO: get this to work and add with others
-    line_vals = [f"fwd(Triton_2D)", f"fwd(Triton_3D)", f"fwd(CK)"]
+    line_vals = ["fwd(Triton_2D)", "fwd(Triton_3D)", "fwd(Gluon_2D)"]
+    line_styles = [("red", "-"), ("green", "-"), ("blue", "-")]
+    if args.use_ck:
+        line_vals.append("fwd(CK)")
+        line_styles.append(("yellow", "-"))
 
     configs.append(
         triton.testing.Benchmark(
@@ -208,7 +209,7 @@ def create_benchmark_configs(custom, args):
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_vals,
-            styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
+            styles=line_styles,
             ylabel=unit,
             plot_name=plot_name,
             args=extra_args,
@@ -428,7 +429,13 @@ def run_benchmark(custom, args):
                 sinks=sinks,
             )
 
-        ms = triton.testing.do_bench_cudagraph(fn)
+        try:
+            ms = triton.testing.do_bench_cudagraph(fn)
+        except RuntimeError as e:
+            if "CK JIT build failed" in str(e):
+                print(f"[WARN] {e}")
+                return float("nan")
+            raise
 
         run_correctness = args.test
         if run_correctness:

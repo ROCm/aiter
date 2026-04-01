@@ -20,6 +20,13 @@ from aiter.ops.triton.gluon.unified_attention_2d import (
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 
+# Check if gfx1250 TDM support is available in Triton
+try:
+    import triton.experimental.gluon.language as gl
+    HAS_GFX1250_TDM = hasattr(gl.amd, "gfx1250")
+except (ImportError, AttributeError):
+    HAS_GFX1250_TDM = False
+
 
 def shuffle_kv_cache(
     key_cache: torch.Tensor,
@@ -259,19 +266,38 @@ def create_configs():
         "use_tdm",
         "num_kv_blocks",
     ]
+    # TDM requires gfx1250 hardware AND Triton gfx1250 module support
+    use_tdm_val = 1 if (HAS_GFX1250_TDM and IS_DEVICE_ARCH_GFX12) else 0
+    if IS_DEVICE_ARCH_GFX12 and not HAS_GFX1250_TDM:
+        print(f"Warning: Running on {DEVICE_ARCH} but TDM module not available in Triton. Using use_tdm=0.")
+    elif not IS_DEVICE_ARCH_GFX12:
+        print(f"Info: Running on {DEVICE_ARCH} (TDM only available on gfx1250). Using use_tdm=0.")
+
     x_vals = []
     for q_heads in [64, 8]:
         for seq_l in [1024, 2048, 4096, 8192]:
-            x_vals.append(
-                [q_heads, q_heads // 8, 64, seq_l, seq_l, 1, 0, 64, 0, 0, 0, 0, 1]
-            )
+            x_vals.append([
+                q_heads,            # num_heads_q:       64 (e.g. Llama-70B) or 8 (e.g. Llama-8B)
+                q_heads // 8,       # num_heads_k:       GQA ratio of 8 (8 KV heads or 1 KV head)
+                64,                 # head_size:         64-dim heads
+                seq_l,              # seq_q_l:           query length = context length (prefill)
+                seq_l,              # seq_kv_l:          KV length matches query length
+                1,                  # bs:                single-sequence batch
+                0,                  # window_size:       full attention (no sliding window)
+                64,                 # block_size:        64 tokens per KV cache page
+                0,                  # shuffled_kv_cache: standard layout
+                0,                  # q_fp8:             BF16 queries
+                0,                  # kv_fp8:            BF16 KV cache
+                use_tdm_val,        # use_tdm:           auto-detected based on hardware
+                1,                  # num_kv_blocks:     1 block per tile (no gather)
+            ])
     sub_config = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals,
         line_arg="provider",
         line_vals=["Gluon"],
         line_names=["Gluon"],
-        ylabel="TFLOPS",
+        ylabel="ms",
         plot_name="Unified Attention",
         args={},
     )
@@ -349,6 +375,8 @@ def run_benchmark(configs):
         if v_descale is not None:
             v_descale = v_descale.cuda()
         if new_kv_layout:
+            # Permute from [num_blocks, block_size, num_kv_heads, head_size]
+            #           to [num_blocks, num_kv_heads, block_size, head_size]
             maybe_quantized_key_cache = maybe_quantized_key_cache.permute(0, 2, 1, 3)
             maybe_quantized_value_cache = maybe_quantized_value_cache.permute(
                 0, 2, 1, 3
@@ -400,7 +428,8 @@ def run_benchmark(configs):
             window_size,
             ms * 1000.0,
         )
-        return perf(ms), perf(max_ms), perf(min_ms)
+        return ms, max_ms, min_ms
+        # return perf(ms), perf(max_ms), perf(min_ms)
 
     benchmark.run(print_data=True)
 
