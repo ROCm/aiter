@@ -2,15 +2,10 @@
 # SPDX-License-Identifier: MIT
 
 """
-Benchmark CK unified attention (via AITER JIT) vs Triton unified attention (2D & 3D)
-on realistic shapes replayed from a JSONL trace file.
+Benchmark CK FMHA split-KV (via mha_varlen_fwd with block_table) vs Triton
+unified attention (2D & 3D) on realistic shapes replayed from a JSONL trace.
 
-Deduplicates shapes, runs all three backends, writes CSV + prints summary.
-
-CK compile-time constraints:
-  - head_size=128 NumQPerKV=1, or head_size=64 NumQPerKV=8
-  - page block size >= 32 (kPageBlockSize = 32)
-  - mask: no-mask or causal (no sliding window)
+Deduplicates shapes, runs both backends, writes CSV + prints summary.
 """
 
 from __future__ import annotations
@@ -22,12 +17,10 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any  # noqa: F401
 
 import torch
 
 from aiter.ops.mha import mha_varlen_fwd
-from aiter.ops.unified_attention import unified_attention_fwd
 from aiter.ops.triton.attention import unified_attention as ua_mod
 
 
@@ -86,52 +79,19 @@ def load_and_dedup(path: Path, max_shapes: int) -> list[tuple[Shape, int]]:
     return result
 
 
-def ck_compatible(s: Shape) -> tuple[bool, str]:
-    """Check if shape is compatible with compiled CK instances."""
-    if s.head_size == 128:
-        nqpkv = s.num_query_heads // s.num_kv_heads
-        if nqpkv != 1:
-            return False, f"d128 requires MHA (nqpkv=1), got {nqpkv}"
-    elif s.head_size == 64:
-        nqpkv = s.num_query_heads // s.num_kv_heads
-        if nqpkv != 8:
-            return False, f"d64 requires GQA-8 (nqpkv=8), got {nqpkv}"
-    else:
-        return False, f"unsupported head_size={s.head_size}"
-
-    if s.block_size < 32:
-        return False, f"block_size={s.block_size} < 32 (CK minimum)"
-
-    if s.window_size != (-1, -1):
-        return False, f"sliding window {s.window_size} not supported"
-
-    if s.q_dtype not in DTYPE_MAP:
-        return False, f"unsupported dtype {s.q_dtype}"
-
-    return True, "ok"
-
-
 def ck_fmha_compatible(s: Shape) -> tuple[bool, str]:
     """Check if shape is compatible with CK FMHA split-KV (via mha_varlen_fwd)."""
     if s.q_dtype not in DTYPE_MAP:
         return False, f"unsupported dtype {s.q_dtype}"
     if s.block_size < 16 or (s.block_size & (s.block_size - 1)) != 0:
         return False, f"block_size={s.block_size} must be power-of-2 >= 16"
-    if s.max_seqlen_q != 1:
-        return False, "CK FMHA split-KV benchmark targets decode only"
     return True, "ok"
 
 
-def _ck_block_size(s: Shape) -> int:
-    """CK block size: use native block_size if supported, else round up to minimum."""
-    min_blk = 32
-    return max(s.block_size, min_blk)
-
-
-def make_tensors(s: Shape, device: str = "cuda", block_size_override: int | None = None):
+def make_tensors(s: Shape, device: str = "cuda"):
     """Build tensors for a given shape."""
     dtype = DTYPE_MAP[s.q_dtype]
-    blk = block_size_override or s.block_size
+    blk = s.block_size
 
     q = torch.randn(s.total_q_tokens, s.num_query_heads, s.head_size,
                      dtype=dtype, device=device)
@@ -165,38 +125,7 @@ def _synth_q_lens(total: int, num_seqs: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(num_seqs)]
 
 
-def bench_ck(s: Shape, warmup: int, iters: int, created_input=None) -> float:
-    blk = _ck_block_size(s)
-    q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
-    out = torch.empty_like(q)
-    mask_type = 2  # causal
-
-    for _ in range(warmup):
-        unified_attention_fwd(
-            out, q, k, v, block_tables, seq_lens_k, cu_seqlens_q,
-            mask_type=mask_type,
-            scale_s=scale, scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
-        )
-    torch.cuda.synchronize()
-
-    # Capture CUDA graph
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        unified_attention_fwd(
-            out, q, k, v, block_tables, seq_lens_k, cu_seqlens_q,
-            mask_type=mask_type,
-            scale_s=scale, scale=1.0, scale_k=1.0, scale_v=1.0, scale_out=1.0,
-        )
-    
-    # Profile graph execution
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        graph.replay()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t0) * 1e3 / iters, out
-
-
-def bench_ck_fmha(s: Shape, warmup: int, iters: int, created_input=None) -> tuple[float, torch.Tensor]:
+def bench_ck_fmha(s: Shape, warmup: int, iters: int, created_input=None, use_graph: bool = True) -> tuple[float, torch.Tensor]:
     """Benchmark CK FMHA split-KV via mha_varlen_fwd with paged KV cache."""
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
     out = torch.empty_like(q)
@@ -205,7 +134,7 @@ def bench_ck_fmha(s: Shape, warmup: int, iters: int, created_input=None) -> tupl
         seq_lens_k.cumsum(0, dtype=torch.int32), (1, 0))
 
     window_left = s.window_size[0] if s.window_size[0] >= 0 else -1
-    window_right = s.window_size[1] if s.window_size[1] >= 0 else -1
+    window_right = s.window_size[1] if s.window_size[1] >= 0 else 0
 
     kw = dict(
         q=q, k=k, v=v,
@@ -232,22 +161,26 @@ def bench_ck_fmha(s: Shape, warmup: int, iters: int, created_input=None) -> tupl
         mha_varlen_fwd(**kw)
     torch.cuda.synchronize()
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        mha_varlen_fwd(**kw)
-
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        graph.replay()
+    if use_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            mha_varlen_fwd(**kw)
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            graph.replay()
+    else:
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            mha_varlen_fwd(**kw)
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) * 1e3 / iters, out
 
 
-def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None, created_input=None) -> float:
+def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None, created_input=None, use_graph: bool = True) -> tuple[float, torch.Tensor]:
+    """Benchmark Triton unified attention (2D or 3D)."""
     q, k, v, cu_seqlens_q, seq_lens_k, block_tables, scale = created_input
     out = torch.empty_like(q)
 
-    # Disable CK selectors to measure pure Triton performance
     saved_splitkv = getattr(ua_mod, '_try_ck_splitkv_attention', None)
     saved_ua = getattr(ua_mod, '_try_ck_unified_attention', None)
     if saved_splitkv:
@@ -271,7 +204,7 @@ def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None
         sinks=None,
     )
 
-    saved = ua_mod.use_2d_kernel
+    saved_use2d = ua_mod.use_2d_kernel
     if force_2d is not None:
         ua_mod.use_2d_kernel = (lambda *a, **kw: True) if force_2d else (lambda *a, **kw: False)
 
@@ -280,19 +213,21 @@ def bench_triton(s: Shape, warmup: int, iters: int, force_2d: bool | None = None
             ua_mod.unified_attention(**kw)
         torch.cuda.synchronize()
 
-        # Capture CUDA graph
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            ua_mod.unified_attention(**kw)
-        
-        # Profile graph execution
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            graph.replay()
+        if use_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                ua_mod.unified_attention(**kw)
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                graph.replay()
+        else:
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                ua_mod.unified_attention(**kw)
         torch.cuda.synchronize()
         return (time.perf_counter() - t0) * 1e3 / iters, out
     finally:
-        ua_mod.use_2d_kernel = saved
+        ua_mod.use_2d_kernel = saved_use2d
         if saved_splitkv:
             ua_mod._try_ck_splitkv_attention = saved_splitkv
         if saved_ua:
@@ -310,7 +245,7 @@ def main() -> int:
     torch.manual_seed(42)
 
     ap = argparse.ArgumentParser(
-        description="Benchmark CK FMHA split-KV / CK unified attention vs Triton 2D/3D from JSONL trace."
+        description="Benchmark CK FMHA split-KV vs Triton 2D/3D from JSONL trace."
     )
     ap.add_argument("--jsonl", type=Path, required=True)
     ap.add_argument("--max-shapes", type=int, default=0, help="0 = all unique shapes")
@@ -318,6 +253,8 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--out-csv", type=Path, default=None,
                     help="Write per-shape CSV results")
+    ap.add_argument("--no-graph", action="store_true",
+                    help="Skip CUDA graph capture (use direct kernel calls)")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -337,21 +274,18 @@ def main() -> int:
     fmha_skip = [(s, c, ck_fmha_compatible(s)[1]) for s, c in shapes if not ck_fmha_compatible(s)[0]]
 
     print(f"CK FMHA compatible: {len(fmha_ok)} shapes ({sum(c for _, c in fmha_ok)} calls)")
-    print(f"CK FMHA skipped:    {len(fmha_skip)} shapes ({sum(c for _, c, _ in fmha_skip)} calls)")
     if fmha_skip:
+        print(f"CK FMHA skipped:    {len(fmha_skip)} shapes ({sum(c for _, c, _ in fmha_skip)} calls)")
         reasons: dict[str, int] = {}
         for _, cnt, reason in fmha_skip:
             reasons[reason] = reasons.get(reason, 0) + cnt
         for reason, cnt in sorted(reasons.items(), key=lambda x: -x[1]):
             print(f"  skip reason: {reason}  ({cnt} calls)")
-
-    ck_ua_count = sum(1 for s, _ in fmha_ok if ck_compatible(s)[0])
-    print(f"  of which CK unified-attn also compatible: {ck_ua_count} shapes")
     print()
 
     hdr = (f"{'#':>4s} {'phase':>8s} {'seqs':>5s} {'q_tok':>6s} {'max_q':>6s} "
            f"{'max_k':>6s} {'heads':>5s} {'hdim':>4s} {'win':>7s} {'cnt':>4s} "
-           f"{'FMHA ms':>8s} {'CK-UA ms':>8s} {'T-2D ms':>8s} {'T-3D ms':>8s} "
+           f"{'FMHA ms':>8s} {'T-2D ms':>8s} {'T-3D ms':>8s} "
            f"{'best':>6s} {'ratio':>7s}")
     print(hdr)
     print("-" * len(hdr))
@@ -370,11 +304,12 @@ def main() -> int:
         created_input = make_tensors(s)
 
         # -- CK FMHA split-KV --
-        fmha_ms_str = ""
         fmha_ms = None
+        fmha_ms_str = ""
         try:
-            fmha_ms, out_fmha = bench_ck_fmha(s, warmup=args.warmup, iters=args.iters,
-                                               created_input=created_input)
+            fmha_ms, _ = bench_ck_fmha(s, warmup=args.warmup, iters=args.iters,
+                                        created_input=created_input,
+                                        use_graph=not args.no_graph)
             fmha_ms_str = f"{fmha_ms:8.4f}"
         except Exception as e:
             fmha_ms_str = "err"
@@ -384,33 +319,19 @@ def main() -> int:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-        # -- CK unified attention (only if compatible) --
-        ck_ua_ms_str = ""
-        ck_ua_ms = None
-        if ck_compatible(s)[0]:
-            blk = _ck_block_size(s)
-            ua_input = make_tensors(s, block_size_override=blk)
-            try:
-                ck_ua_ms, _ = bench_ck(s, warmup=args.warmup, iters=args.iters,
-                                       created_input=ua_input)
-                ck_ua_ms_str = f"{ck_ua_ms:8.4f}"
-            except Exception as e:
-                ck_ua_ms_str = "err"
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-
         # -- Triton 2D & 3D --
-        t2d_str = ""
-        t3d_str = ""
         t2d = t3d = None
+        t2d_str = t3d_str = ""
         try:
             t2d, _ = bench_triton(s, warmup=args.warmup, iters=args.iters,
-                                  force_2d=True, created_input=created_input)
+                                  force_2d=True, created_input=created_input,
+                                  use_graph=not args.no_graph)
             t2d_str = f"{t2d:8.4f}"
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
             t3d, _ = bench_triton(s, warmup=args.warmup, iters=args.iters,
-                                  force_2d=False, created_input=created_input)
+                                  force_2d=False, created_input=created_input,
+                                  use_graph=not args.no_graph)
             t3d_str = f"{t3d:8.4f}"
         except Exception as e:
             if not t2d_str:
@@ -422,7 +343,7 @@ def main() -> int:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-        # -- Compare FMHA vs best Triton --
+        # -- Compare --
         best_label = ""
         ratio_str = ""
         if fmha_ms is not None and t2d is not None and t3d is not None:
@@ -435,7 +356,7 @@ def main() -> int:
             else:
                 stats["triton_wins"] += 1
 
-        print(f"{prefix} {fmha_ms_str:>8s} {ck_ua_ms_str:>8s} "
+        print(f"{prefix} {fmha_ms_str:>8s} "
               f"{t2d_str:>8s} {t3d_str:>8s} {best_label:>6s} {ratio_str:>7s}")
 
         csv_rows.append([
@@ -443,7 +364,6 @@ def main() -> int:
             s.max_seqlen_k, s.num_query_heads, s.num_kv_heads,
             s.head_size, s.block_size, win_str, count,
             f"{fmha_ms:.6f}" if fmha_ms is not None else "",
-            f"{ck_ua_ms:.6f}" if ck_ua_ms is not None else "",
             f"{t2d:.6f}" if t2d is not None else "",
             f"{t3d:.6f}" if t3d is not None else "",
             best_label, ratio_str,
@@ -464,7 +384,7 @@ def main() -> int:
             w.writerow(["idx", "phase", "num_seqs", "total_q_tokens", "max_seqlen_q",
                          "max_seqlen_k", "num_q_heads", "num_kv_heads", "head_size",
                          "block_size", "window_size", "trace_count",
-                         "ck_fmha_ms", "ck_unified_ms", "triton_2d_ms", "triton_3d_ms",
+                         "ck_fmha_ms", "triton_2d_ms", "triton_3d_ms",
                          "triton_best", "fmha_vs_best"])
             w.writerows(csv_rows)
         print(f"\nCSV written to: {args.out_csv}")

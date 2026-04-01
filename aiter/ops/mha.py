@@ -344,8 +344,9 @@ def cmdGenFunc_mha_varlen_fwd(
         blob_gen_cmd = variants[0]["blob_gen_cmd"]
     else:
         md_name = "mha_varlen_fwd"
-        filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
-        filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
+        hdim = q.size(2)
+        filter_fwd_splitkv1 = f"*_d{hdim}"
+        filter_fwd_splitkv2 = f"*_d{hdim}"
         if q.dtype == dtypes.fp16:
             md_name += "_fp16"
             filter_fwd_splitkv1 += "_fp16*"
@@ -374,23 +375,28 @@ def cmdGenFunc_mha_varlen_fwd(
             filter_fwd_splitkv2 += "_nmask*"
         else:
             md_name += "_mask"
-            filter_fwd_splitkv2 += "_m*"
         if return_softmax_lse:
             md_name += "_lse"
-            filter_fwd_splitkv1 += "_lse*"
             filter_fwd_splitkv2 += "_lse*"
         else:
             md_name += "_nlse"
-            filter_fwd_splitkv1 += "_nlse*"
             filter_fwd_splitkv2 += "_nlse*"
         md_name += "_pagedkv"
         filter_fwd_splitkv2 += "_pagedkv*"
+        if sink_size > 0:
+            md_name += "_sink"
+            filter_fwd_splitkv2 += "_sink*"
+        else:
+            md_name += "_nsink"
+            filter_fwd_splitkv2 += "_nsink*"
         filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" "'),
+            f"--receipt 200 --mask generic "
+            f"--filter *_d{hdim}* --output_dir {{}}",
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --output_dir {{}}".format()
+            f"--receipt 200 --mask generic "
+            f"--filter {filter_fwd_splitkv} --output_dir {{}}"
         ]
     return {
         "md_name": md_name,

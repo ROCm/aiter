@@ -303,9 +303,6 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.seqlen_k_ptr,
                        a.cu_seqlen_q_ptr,
                        a.cu_seqlen_k_ptr,
-                       a.block_scale_seqstart_q_ptr,
-                       a.block_scale_seqstart_k_ptr,
-                       nullptr, // seqstart_v_scale_ptr
                        a.sink_ptr,
                        a.seqlen_q,
                        a.seqlen_k,
@@ -315,8 +312,6 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.hdim_v,
                        a.nhead_q,
                        a.nhead_k,
-                       0, // num_head_q_total
-                       0, // head_start
                        a.scale_s,
                        a.logits_soft_cap,
                        a.stride_q,
@@ -325,9 +320,6 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.stride_bias,
                        a.stride_randval,
                        a.stride_o,
-                       0, // stride_q_descale
-                       0, // stride_k_descale
-                       0, // stride_v_descale
                        a.nhead_stride_q,
                        a.nhead_stride_k,
                        a.nhead_stride_v,
@@ -335,9 +327,6 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.nhead_stride_randval,
                        a.nhead_stride_lse,
                        a.nhead_stride_o,
-                       a.nhead_stride_q_descale,
-                       a.nhead_stride_k_descale,
-                       a.nhead_stride_v_descale,
                        a.batch_stride_q,
                        a.batch_stride_k,
                        a.batch_stride_v,
@@ -345,9 +334,6 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.batch_stride_randval,
                        a.batch_stride_lse,
                        a.batch_stride_o,
-                       a.batch_stride_q_descale,
-                       a.batch_stride_k_descale,
-                       a.batch_stride_v_descale,
                        a.window_size_left,
                        a.window_size_right,
                        a.sink_size,
@@ -355,9 +341,7 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
                        a.min_seqlen_q,
                        a.p_drop,
                        a.s_randval,
-                       a.drop_seed_offset,
-                       a.block_scale_size_q,
-                       a.block_scale_size_kv};
+                       a.drop_seed_offset};
 
     return fmha_fwd(traits, args, s);
 }
