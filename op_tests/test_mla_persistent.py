@@ -403,36 +403,10 @@ def torch_mla_extend_split_kv(
     elif nheads in range(32, 128 + 1, 16):
         # we use nhead=16 to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-        fold_factor = nheads // 16
-        use_qseqlen_fold = (
-            get_gfx() == "gfx950"
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q * fold_factor == 4
-        )
-        total_s = total_q * fold_factor
-        ori_nheads = nheads
+        q_ratio = nheads // 16
+        total_s = total_q * q_ratio
         nheads = 16
-        if use_qseqlen_fold:
-            max_seqlen_q = max_seqlen_q * fold_factor
-            q_ratio = 1
-            q = q.view(total_s, nheads, -1)
-        elif max_seqlen_q == 1:
-            q_ratio = fold_factor
-            q = q.view(total_s, nheads, -1)
-        else:
-            q_ratio = fold_factor
-            q = (
-                q.reshape(
-                    total_q // max_seqlen_q,
-                    max_seqlen_q,
-                    ori_nheads // nheads,
-                    nheads,
-                    -1,
-                )
-                .permute(0, 2, 1, 3, 4)
-                .reshape(total_s, nheads, -1)
-            )
+        q = q.view(total_s, nheads, -1)
         final_out = final_out.view(total_s, nheads, -1)
         final_lse = final_lse.view(total_s, nheads)
         io_transformed = True
@@ -727,33 +701,11 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        if max_seqlen_q == 1:
-            split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
-            split_lse = split_lse.reshape(total_q, nhead)
-        else:
-            split_out = (
-                split_out.reshape(
-                    total_q // max_seqlen_q,
-                    nhead // 16,
-                    max_seqlen_q,
-                    16,
-                    -1,
-                )
-                .permute(0, 2, 1, 3, 4)
-                .reshape(total_q, nhead, kv_lora_rank)
-                .contiguous()
-            )
-            split_lse = (
-                split_lse.reshape(
-                    total_q // max_seqlen_q,
-                    nhead // 16,
-                    max_seqlen_q,
-                    16,
-                )
-                .permute(0, 2, 1, 3)
-                .reshape(total_q, nhead)
-                .contiguous()
-            )
+        # import pdb; pdb.set_trace()
+        # partial_out = partial_out.reshape(-1, nhead, kv_lora_rank)
+        # partial_lse = partial_lse.reshape(-1, nhead)
+        split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
+        split_lse = split_lse.reshape(total_q, nhead)
 
     return partial_out, partial_lse, split_out, split_lse
 
@@ -1287,7 +1239,7 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
-            return_lse=False,
+            return_lse=True,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -1590,7 +1542,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
+    default=[(4, 1), (16, 1), (16, 2), (16, 4), (48, 1), (128, 2)],
     help="""Number of heads.
     e.g.: -n 16,1""",
 )

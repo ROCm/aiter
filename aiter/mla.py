@@ -5,6 +5,7 @@
 
 import functools
 from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -43,6 +44,7 @@ def _fwd_kernel_stage2_asm(
     cur_split_end = tl.load(num_kv_splits_indptr + cur_batch + 1)
     num_max_kv_splits = tl.load(num_kv_splits_indptr + BATCH_NUM)
     cur_kv_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
+
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
 
@@ -118,6 +120,8 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_block_n_fp8 = {
+        4: 128,
+        8: 128,
         16: 128,
         32: 128,
         48: 64,
@@ -133,11 +137,6 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         num_kv_splits = min(
             num_kv_splits, int(total_kv / bs + min_block_n - 1) // min_block_n
         )
-        if num_kv_splits > 1:
-            num_kv_splits = min(
-                num_kv_splits,
-                (abs(total_kv / bs - max_seqlen_q) // min_block_n + 1),
-            )
 
     num_kv_splits_indptr = torch.arange(
         0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
@@ -188,10 +187,24 @@ def mla_decode_fwd(
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
 
+    # Handle nhead < 16 by padding to 16 via repeat_interleave so that models
+    # with small head counts (e.g. Kimi-Linear-48B-A3B with TP=8, nhead=4)
+    # can reuse the nhead=16 ASM kernel transparently.
+    _head_pad_factor = 1
+    _o_unpadded = None
+    if nhead < 16 and nhead > 0 and 16 % nhead == 0:
+        _head_pad_factor = 16 // nhead
+        q = q.repeat_interleave(_head_pad_factor, dim=1)
+        _o_unpadded = o
+        nhead = 16
+        ori_nhead = 16
+        o = torch.empty(
+            total_s, nhead, v_head_dim, dtype=_o_unpadded.dtype, device=device
+        )
+
     persistent_mode = work_meta_data is not None
 
     io_transformed = False
-    qseqlen_folded = False
 
     if not persistent_mode:
         if num_kv_splits is None or num_kv_splits_indptr is None:
@@ -200,13 +213,6 @@ def mla_decode_fwd(
             )
 
         mgc = 64 if max_seqlen_q == 1 and nhead == 16 else 16
-        mgc = (
-            32
-            if (
-                nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
-            )
-            else mgc
-        )
 
         MAYBE_FINAL_OUT = True
 
@@ -266,6 +272,8 @@ def mla_decode_fwd(
                 and nhead in [32, 64]
             )
         ):
+            if _o_unpadded is not None:
+                _o_unpadded.copy_(o[:, ::_head_pad_factor, :])
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
@@ -318,22 +326,9 @@ def mla_decode_fwd(
         elif nhead in range(32, 128 + 1, 16) and persistent_mode:
             # we use nhead=16 to simulate such cases by customized metadata
             # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-            fold_factor = ori_nhead // 16
-            use_qseqlen_fold = (
-                get_gfx() == "gfx950"
-                and q.dtype == dtypes.fp8
-                and kv_buffer.dtype == dtypes.fp8
-                and max_seqlen_q * fold_factor == 4
-            )
-
-            total_s = ori_total_s * fold_factor
+            total_s = ori_total_s * (ori_nhead // 16)
             nhead = 16
-
-            if use_qseqlen_fold:
-                max_seqlen_q = max_seqlen_q * fold_factor
-                q = q.view(total_s, nhead, -1)
-                qseqlen_folded = True
-            elif max_seqlen_q == 1:
+            if max_seqlen_q == 1:
                 q = q.view(total_s, nhead, -1)
             else:
                 q = (
@@ -433,7 +428,7 @@ def mla_decode_fwd(
         if return_logits:
             logits = logits.view(-1, 1, ori_nhead, v_head_dim)
 
-        if max_seqlen_q == 1 or qseqlen_folded:
+        if max_seqlen_q == 1:
             q = q.view(ori_total_s, ori_nhead, -1)
             o = o.view(ori_total_s, ori_nhead, -1)
             if final_lse is not None:
@@ -466,6 +461,11 @@ def mla_decode_fwd(
                     .reshape(ori_total_s, ori_nhead)
                     .contiguous()
                 )
+
+    if _o_unpadded is not None:
+        _o_unpadded.copy_(o[:, ::_head_pad_factor, :])
+        if final_lse is not None:
+            final_lse = final_lse[:, ::_head_pad_factor]
 
     return logits, final_lse
 
