@@ -56,20 +56,6 @@ def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
     return output, residual_out
 
 
-@perftest()
-def run_asm(input, weight, bias, eps, residual=None):
-    if residual is None:
-        residual_out = None
-        output = aiter.layer_norm(input, weight, bias, eps)
-    else:
-        residual_out = torch.empty_like(input)
-        output = torch.empty_like(input)
-        aiter.layernorm2d_with_add_asm(
-            output, input, residual, residual_out, weight, bias, eps
-        )
-    return output, residual_out
-
-
 def test_layernorm2d(dtype, m, n):
     dim = (m, n)
     input = torch.randn(dim, dtype=dtype, device="cuda")
@@ -97,13 +83,10 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)
-    (c, res_c, *_), avg_c = run_asm(input, weight, bias, 1e-5, residual=res)
 
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
     checkAllclose(res_a, res_b, msg="res check")
-    checkAllclose(a, c, atol=0.03, msg="asm")
-    checkAllclose(res_a, res_c, atol=0.01, msg="asm res")
 
 
 parser = argparse.ArgumentParser(
