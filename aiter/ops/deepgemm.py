@@ -3,16 +3,8 @@
 """
 DeepGEMM front-end (CK backend).
 
-Hosts the CK-backed `deepgemm_ck` binding plus a thin `deepgemm()`
-wrapper. Opus entries have been extracted under `aiter.ops.opus.*`;
-see `aiter.ops.opus.gemm_a16w16_opus` for BF16 matmul and
-`aiter.ops.opus.opus_gemm_a16w16_tune` for id-based kernel selection.
-
-`opus_gemm_a16w16_tune` is kept here as a deprecation shim for one
-release to ease migration from the old aggregate entry.
-"""
-
-import warnings
+import os
+from torch import Tensor
 from typing import Optional
 
 import torch
@@ -33,6 +25,17 @@ def deepgemm_ck(
 ) -> Tensor: ...
 
 
+@compile_ops("module_deepgemm_opus", fc_name="opus_gemm")
+def deepgemm_opus(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    group_layout: Optional[Tensor] = None,
+    x_scale: Optional[Tensor] = None,
+    w_scale: Optional[Tensor] = None,
+) -> Tensor: ...
+
+
 def deepgemm(
     XQ: Tensor,
     WQ: Tensor,
@@ -41,6 +44,9 @@ def deepgemm(
     x_scale: Optional[Tensor] = None,
     w_scale: Optional[Tensor] = None,
 ):
+    backend = os.environ.get("AITER_DEEPGEMM_BACKEND", "ck")
+    if backend == "opus":
+        return deepgemm_opus(XQ, WQ, Y, group_layout, x_scale, w_scale)
     return deepgemm_ck(XQ, WQ, Y, group_layout, x_scale, w_scale)
 
 
