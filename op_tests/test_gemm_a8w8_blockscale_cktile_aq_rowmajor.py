@@ -17,6 +17,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from aiter.jit.utils.chip_info import get_gfx
+
+if get_gfx() != "gfx950":
+    print(
+        f"Skipping test_gemm_a8w8_blockscale_cktile_aq_rowmajor.py: "
+        f"AQRowMajor only supported on gfx950, detected {get_gfx()}"
+    )
+    sys.exit(0)
+
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
