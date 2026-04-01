@@ -354,6 +354,116 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     return args;
 }
 
+fmha_fwd_pagedkv_args get_ck_fmha_varlen_fwd_pagedkv_args(bool has_lse,
+                                                          const mask_info &mask,
+                                                          const int b,
+                                                          const int max_seqlen_q,
+                                                          const int h,
+                                                          const int h_k,
+                                                          const int d,
+                                                          const int d_v,
+                                                          const int page_block_size,
+                                                          float softmax_scale,
+                                                          float logits_soft_cap,
+                                                          const at::Tensor q,
+                                                          const at::Tensor k,
+                                                          const at::Tensor v,
+                                                          const at::Tensor cu_seqlens_q,
+                                                          std::optional<const at::Tensor> &cu_seqlens_k,
+                                                          std::optional<const at::Tensor> &seqlens_k,
+                                                          std::optional<const at::Tensor> &block_table_,
+                                                          std::optional<const at::Tensor> &bias_,
+                                                          std::optional<const at::Tensor> &alibi_slopes_,
+                                                          at::Tensor out,
+                                                          at::Tensor lse,
+                                                          std::optional<const at::Tensor> &sink_ptr_)
+{
+    fmha_fwd_pagedkv_args args;
+    args.q_ptr = q.data_ptr();
+    args.k_ptr = k.data_ptr();
+    args.v_ptr = v.data_ptr();
+    args.bias_ptr = nullptr;
+    args.lse_ptr = nullptr;
+    args.o_ptr = out.data_ptr();
+
+    if (block_table_.has_value())
+    {
+        auto block_table = block_table_.value();
+        args.block_table_ptr = block_table.data_ptr();
+        args.batch_stride_block_table = block_table.stride(0);
+        args.page_block_size = page_block_size;
+    }
+    else
+    {
+        args.block_table_ptr = nullptr;
+        args.batch_stride_block_table = 0;
+        args.page_block_size = 0;
+    }
+
+    args.is_gappy = false;
+    args.cache_batch_idx = nullptr;
+
+    args.seqstart_q_ptr = cu_seqlens_q.data_ptr();
+    args.seqstart_k_ptr = cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr;
+    args.seqlen_k_ptr = seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr;
+    args.sink_ptr = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
+
+    args.batch = b;
+    args.max_seqlen_q = max_seqlen_q;
+    args.hdim_q = d;
+    args.hdim_v = d_v;
+    args.nhead_q = h;
+    args.nhead_k = h_k;
+
+    args.scale_s = softmax_scale;
+    args.scale_p = 1;
+    args.scale_o = 1;
+    args.logits_soft_cap = logits_soft_cap;
+
+    args.batch_stride_q = 0;
+    args.stride_q = q.stride(0);
+    args.nhead_stride_q = q.stride(1);
+
+    args.batch_stride_k = k.stride(0);
+    args.stride_k = k.stride(1);
+    args.nhead_stride_k = k.stride(2);
+
+    args.batch_stride_v = v.stride(0);
+    args.stride_v = v.stride(1);
+    args.nhead_stride_v = v.stride(2);
+
+    args.batch_stride_o = 0;
+    args.stride_o = out.stride(0);
+    args.nhead_stride_o = out.stride(1);
+
+    args.batch_stride_bias = 0;
+    args.stride_bias = 0;
+    args.nhead_stride_bias = 0;
+
+    args.batch_stride_lse = 0;
+    args.nhead_stride_lse = 0;
+
+    if (has_lse) {
+        args.lse_ptr = lse.data_ptr();
+        args.nhead_stride_lse = lse.stride(0);
+    }
+
+    TORCH_CHECK(!bias_.has_value(), "Paged attention does not support bias");
+    if (alibi_slopes_.has_value()) {
+        auto alibi_slopes = alibi_slopes_.value();
+        args.bias_ptr = alibi_slopes.data_ptr();
+        args.stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
+    }
+
+    args.window_size_left = mask.left;
+    args.window_size_right = mask.right;
+    args.sink_size = mask.sink;
+    args.mask_type = static_cast<ck_tile::index_t>(mask.type);
+    args.min_seqlen_q = 0;
+
+    return args;
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 mha_varlen_fwd(
     at::Tensor& q,                                 // [total_q, hq, d]
@@ -582,51 +692,44 @@ mha_varlen_fwd(
 
         if (paged_KV)
         {
-            int num_splits = 0;
-            num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
-            TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
-            TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
+            // Try non-split paged-KV path first (single kernel, no combine pass)
+            // pagedkv_prefill kernel does not support LSE output
+            auto pk_args =
+                get_ck_fmha_varlen_fwd_pagedkv_args(
+                    false, mask, batch_size, max_seqlen_q,
+                    num_heads, num_heads_k, head_size_q, head_size_v,
+                    page_block_size, softmax_scale, logits_soft_cap,
+                    q, k, v, cu_seqlens_q, cu_seqlens_k, seqlens_k,
+                    block_table_, bias_, alibi_slopes_,
+                    out, softmax_lse, sink_ptr);
+            float t_pk = aiter::mha_fwd_pagedkv(pk_args, stream_config,
+                                                 dtype_str, true,
+                                                 mask.type, bias_type,
+                                                 false, has_sink);
+            if (t_pk < 0) {
+                // Fallback to split-KV path
+                int num_splits = 0;
+                num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
+                TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
+                TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
 
-            auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
-            auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
+                auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
+                auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
 
-            auto args =
-                get_ck_fmha_varlen_fwd_splitkv_args(
-                    has_lse,
-                    mask,
-                    batch_size,
-                    max_seqlen_q,
-                    num_heads,
-                    num_heads_k,
-                    head_size_q,
-                    head_size_v,
-                    page_block_size,
-                    num_splits,
-                    softmax_scale,
-                    logits_soft_cap,
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    seqlens_k,
-                    block_table_,
-                    bias_,
-                    alibi_slopes_,
-                    out,
-                    softmax_lse,
-                    softmax_lse_accum,
-                    out_accum,
-                    sink_ptr);
-            float t = aiter::mha_fwd_splitkv(args,
-                                             stream_config,
-                                             dtype_str,
-                                             true, //is_group_mode
-                                             mask.type,
-                                             bias_type,
-                                             has_lse,
-                                             has_sink);
-            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
+                auto args =
+                    get_ck_fmha_varlen_fwd_splitkv_args(
+                        has_lse, mask, batch_size, max_seqlen_q,
+                        num_heads, num_heads_k, head_size_q, head_size_v,
+                        page_block_size, num_splits, softmax_scale, logits_soft_cap,
+                        q, k, v, cu_seqlens_q, cu_seqlens_k, seqlens_k,
+                        block_table_, bias_, alibi_slopes_,
+                        out, softmax_lse, softmax_lse_accum, out_accum, sink_ptr);
+                float t = aiter::mha_fwd_splitkv(args, stream_config,
+                                                 dtype_str, true,
+                                                 mask.type, bias_type,
+                                                 has_lse, has_sink);
+                TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
+            }
         }
         else
         {

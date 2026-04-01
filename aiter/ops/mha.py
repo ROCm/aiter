@@ -396,7 +396,10 @@ def cmdGenFunc_mha_varlen_fwd(
             f"--filter *_d{hdim}* --output_dir {{}}",
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
             f"--receipt 200 --mask generic "
-            f"--filter {filter_fwd_splitkv} --output_dir {{}}"
+            f"--filter {filter_fwd_splitkv} --output_dir {{}}",
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d pagedkv_prefill "
+            f"--receipt 200 --mask generic "
+            f"--filter *_d{hdim}* --output_dir {{}}"
         ]
     return {
         "md_name": md_name,

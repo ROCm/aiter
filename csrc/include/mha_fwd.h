@@ -244,12 +244,51 @@ struct mha_fwd_args
     ck_tile::index_t block_scale_size_kv;
 };
 
+struct mha_fwd_pagedkv_traits : public fmha_fwd_pagedkv_traits
+{
+    mha_fwd_pagedkv_traits(int head_size_q,
+                           int head_size_v,
+                           std::string dtype,
+                           bool is_group_mode,
+                           bool has_logits_soft_cap,
+                           mask_enum mask_type,
+                           bias_enum bias_type,
+                           bool has_lse,
+                           bool has_sink)
+        : fmha_fwd_pagedkv_traits{head_size_q,
+                                  head_size_v,
+                                  dtype,
+                                  is_group_mode,
+                                  true, // is_v_rowmajor
+                                  has_logits_soft_cap,
+                                  mask_type,
+                                  bias_type,
+                                  has_lse,
+                                  true,  // use_pagedkv
+                                  false, // do_fp8_static_quant
+                                  false, // skip_min_seqlen_q
+                                  has_sink}
+    {
+    }
+};
+
 #if ENABLE_CK
 using mha_fwd_splitkv_args   = fmha_fwd_splitkv_args;
+using mha_fwd_pagedkv_args   = fmha_fwd_pagedkv_args;
 using mha_batch_prefill_args = fmha_batch_prefill_args;
 
 __attribute__((visibility("default"))) float
 mha_fwd_splitkv(mha_fwd_splitkv_args args,
+                const ck_tile::stream_config& stream_config,
+                std::string q_dtype_str,
+                bool is_group_mode,
+                mask_enum mask_type,
+                bias_enum bias_type,
+                bool has_lse,
+                bool has_sink = false);
+
+__attribute__((visibility("default"))) float
+mha_fwd_pagedkv(mha_fwd_pagedkv_args args,
                 const ck_tile::stream_config& stream_config,
                 std::string q_dtype_str,
                 bool is_group_mode,
