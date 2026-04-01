@@ -73,6 +73,7 @@ class TDMSubtileKVLoader:
     kv_head_idx: gl.tensor
     stride_k_cache_2: gl.tensor
     stride_v_cache_2: gl.tensor
+    num_blocks: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -86,6 +87,7 @@ class TDMSubtileKVLoader:
         kv_head_idx,
         stride_k_cache_2,
         stride_v_cache_2,
+        num_blocks,
     ):
         self.kv_cfg = kv_cfg
         self.k_shared = k_shared
@@ -96,6 +98,7 @@ class TDMSubtileKVLoader:
         self.kv_head_idx = kv_head_idx
         self.stride_k_cache_2 = stride_k_cache_2
         self.stride_v_cache_2 = stride_v_cache_2
+        self.num_blocks = num_blocks
 
     @gluon.jit
     def initialize(
@@ -155,6 +158,7 @@ class TDMSubtileKVLoader:
             kv_head_idx,
             stride_k_cache_2,
             stride_v_cache_2,
+            num_blocks,
         )
 
     @gluon.jit
@@ -205,7 +209,7 @@ class TDMSubtileKVLoader:
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             return i
         else:
-            return gl.load(self.block_tables_ptr_shifted + i)
+            return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.num_blocks, other=0)
 
 
 
