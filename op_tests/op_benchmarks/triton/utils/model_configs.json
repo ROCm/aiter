@@ -47,10 +47,20 @@
       "num_expert": 8,
       "top_k": 2
     }
-
   },
   "deepseek": {
     "V3": {
+      "hidden_size": 7168,
+      "intermediate_size": 18432,
+      "num_attention_heads": 128,
+      "num_key_value_heads": 128,
+      "vocab_size": 129280,
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "num_expert": 256,
+      "top_k": 4
+    },
+    "R1": {
       "hidden_size": 7168,
       "intermediate_size": 18432,
       "num_attention_heads": 128,
@@ -110,6 +120,13 @@
       "num_attention_heads": 32,
       "num_key_value_heads": 8,
       "vocab_size": 32000
+    },
+    "Small_4_119B": {
+      "hidden_size": 12288,
+      "intermediate_size": 28672,
+      "num_attention_heads": 96,
+      "num_key_value_heads": 8,
+      "vocab_size": 32768
     }
   },
   "qwen3": {
@@ -122,6 +139,39 @@
       "num_expert": 128,
       "top_k": 8,
       "n_routed_experts": 128
+    },
+    "30B_A3B": {
+      "hidden_size": 2048,
+      "intermediate_size": 6144,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 4,
+      "vocab_size": 151936,
+      "num_expert": 128,
+      "top_k": 8,
+      "n_routed_experts": 128,
+      "moe_layer_freq": 1
+    },
+    "Coder_480B": {
+      "hidden_size": 6144,
+      "intermediate_size": 8192,
+      "num_attention_heads": 96,
+      "num_key_value_heads": 8,
+      "vocab_size": 151936,
+      "num_expert": 160,
+      "top_k": 8,
+      "n_routed_experts": 160,
+      "moe_layer_freq": 1
+    },
+    "Next_80B_A3B": {
+      "hidden_size": 2048,
+      "intermediate_size": 5120,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 2,
+      "vocab_size": 151936,
+      "num_expert": 512,
+      "top_k": 10,
+      "n_routed_experts": 512,
+      "moe_layer_freq": 1
     }
   },
   "qwen3.5": {
@@ -134,6 +184,42 @@
       "num_expert": 512,
       "top_k": 10,
       "n_routed_experts": 512
+    },
+    "9B": {
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 4,
+      "vocab_size": 248320
+    },
+    "27B": {
+      "hidden_size": 5120,
+      "intermediate_size": 17408,
+      "num_attention_heads": 24,
+      "num_key_value_heads": 4,
+      "vocab_size": 248320
+    },
+    "35B_A3B": {
+      "hidden_size": 2048,
+      "intermediate_size": 5120,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 2,
+      "vocab_size": 248320,
+      "num_expert": 256,
+      "top_k": 8,
+      "n_routed_experts": 256,
+      "moe_layer_freq": 1
+    },
+    "122B_A10B": {
+      "hidden_size": 6144,
+      "intermediate_size": 12288,
+      "num_attention_heads": 48,
+      "num_key_value_heads": 4,
+      "vocab_size": 152064,
+      "num_expert": 128,
+      "top_k": 10,
+      "n_routed_experts": 128,
+      "moe_layer_freq": 1
     }
   },
   "bert": {
@@ -200,7 +286,7 @@
       "vocab_size": 32064
     }
   },
-  "commandr": {
+  "command_r": {
     "Plus": {
       "num_attention_heads": 96,
       "num_key_value_heads": 96,
@@ -217,8 +303,170 @@
       "num_expert": 128,
       "top_k": 4
     }
+  },
+  "arcee": {
+    "Trinity_Large": {
+      "hidden_size": 8192,
+      "intermediate_size": 28672,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 8,
+      "vocab_size": 256000,
+      "num_expert": 256,
+      "top_k": 4,
+      "n_routed_experts": 256,
+      "moe_layer_freq": 1
+    }
+  },
+  "glm": {
+    "5": {
+      "hidden_size": 8192,
+      "intermediate_size": 28672,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 8,
+      "vocab_size": 151552
+    }
+  },
+  "mimo": {
+    "V2_Flash": {
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "vocab_size": 151680
+    }
+  },
+  "lfm": {
+    "2_24B_A2B": {
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "vocab_size": 65536,
+      "num_expert": 64,
+      "top_k": 4,
+      "n_routed_experts": 64,
+      "moe_layer_freq": 1
+    }
+  },
+  "minimax": {
+    "M2.5": {
+      "hidden_size": 3072,
+      "intermediate_size": 1536,
+      "num_attention_heads": 48,
+      "num_key_value_heads": 8,
+      "vocab_size": 200064,
+      "num_expert": 256,
+      "top_k": 8,
+      "n_routed_experts": 256,
+      "moe_layer_freq": 1
+    }
+  },
+  "nemotron": {
+    "3_Super_120B": {
+      "hidden_size": 12288,
+      "intermediate_size": 28672,
+      "num_attention_heads": 96,
+      "num_key_value_heads": 8,
+      "vocab_size": 131072
+    }
+  },
+  "cogvideox": {
+    "5B": {
+      "hidden_size": 3072,
+      "intermediate_size": 12288,
+      "num_attention_heads": 24,
+      "num_key_value_heads": 24,
+      "vocab_size": 49408
+    }
+  },
+  "flux": {
+    "1_dev": {
+      "hidden_size": 3072,
+      "intermediate_size": 12288,
+      "num_attention_heads": 24,
+      "num_key_value_heads": 24,
+      "vocab_size": 0
+    }
+  },
+  "hunyuan": {
+    "Video": {
+      "hidden_size": 4096,
+      "intermediate_size": 16384,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 32,
+      "vocab_size": 128256
+    }
+  },
+  "pixart": {
+    "Sigma": {
+      "hidden_size": 1152,
+      "intermediate_size": 4608,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 16,
+      "vocab_size": 0
+    }
+  },
+  "sdxl": {
+    "base": {
+      "hidden_size": 2048,
+      "intermediate_size": 8192,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 16,
+      "vocab_size": 0
+    }
+  },
+  "sd3": {
+    "5_Large": {
+      "hidden_size": 2432,
+      "intermediate_size": 9728,
+      "num_attention_heads": 19,
+      "num_key_value_heads": 19,
+      "vocab_size": 0
+    }
+  },
+  "sana": {
+    "1.6B": {
+      "hidden_size": 2240,
+      "intermediate_size": 8960,
+      "num_attention_heads": 20,
+      "num_key_value_heads": 20,
+      "vocab_size": 0
+    }
+  },
+  "step": {
+    "3.5_Flash": {
+      "hidden_size": 7168,
+      "intermediate_size": 18432,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 8,
+      "vocab_size": 102400
+    }
+  },
+  "vae": {
+    "generic": {
+      "hidden_size": 512,
+      "intermediate_size": 2048,
+      "num_attention_heads": 8,
+      "num_key_value_heads": 8,
+      "vocab_size": 0
+    }
+  },
+  "wan": {
+    "2.1_14B": {
+      "hidden_size": 5120,
+      "intermediate_size": 20480,
+      "num_attention_heads": 40,
+      "num_key_value_heads": 40,
+      "vocab_size": 151552
+    }
+  },
+  "whisper": {
+    "large_v3": {
+      "hidden_size": 1280,
+      "intermediate_size": 5120,
+      "num_attention_heads": 20,
+      "num_key_value_heads": 20,
+      "vocab_size": 51866
+    }
   }
 }
-    
-    
-  
