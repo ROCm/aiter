@@ -32,7 +32,9 @@ x, w, _, y = generate_gemm_a16w16_gated_inputs(
 for config in config_list:
     if config is not None:
         config = config.copy()
-        config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+        # Gated kernel doesn't support split-K, remove those keys
+        config.pop("NUM_KSPLIT", None)
+        config.pop("SPLITK_BLOCK_SIZE", None)
 
     def fn():
         ############################################################
