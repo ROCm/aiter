@@ -1,0 +1,10 @@
+{
+    "any": {
+        "BLOCK_M": 32,
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "NUM_BUFFERS": 5,
+        "num_warps": 2,
+        "L2_PREFETCH_DISTANCE": 0
+    }
+}
