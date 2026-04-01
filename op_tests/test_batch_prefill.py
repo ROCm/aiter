@@ -808,8 +808,12 @@ def test_batch_prefill_page_size_1_linear_sglang(
         )
 
         # Causal + kv_len < qo_len: rows with few valid K positions amplify
-        # FP8 quantization error (not averaged over many attention targets)
+        # FP8 quantization error (not averaged over many attention targets).
+        # Larger head_dim accumulates more rounding error in dot products
+        # (CK's own FP8BF16 atol is 0.18 for reference).
         fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+        if head_dim > 128:
+            fp8_threshold = max(fp8_threshold, 0.06)
         verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
         rtol, atol = get_tolerances(dtype, is_fp8=True)
         torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
@@ -883,7 +887,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
 )
 @pytest.mark.parametrize("page_size", [16, 1024])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (16, 1)])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -1095,8 +1099,12 @@ def test_batch_prefill(
         )
 
         # Causal + kv_len < qo_len: rows with few valid K positions amplify
-        # FP8 quantization error (not averaged over many attention targets)
+        # FP8 quantization error (not averaged over many attention targets).
+        # Larger head_dim accumulates more rounding error in dot products
+        # (CK's own FP8BF16 atol is 0.18 for reference).
         fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+        if head_dim > 128:
+            fp8_threshold = max(fp8_threshold, 0.06)
         verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
         rtol, atol = get_tolerances(dtype, is_fp8=False)
         torch.testing.assert_close(out_ref, o_ref, rtol=rtol, atol=atol)
@@ -1318,7 +1326,7 @@ def vectorize_kv_cache(
     ],
 )
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (16, 1)])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 def test_batch_prefill_linear_vs_vectorized(
@@ -2214,6 +2222,16 @@ parser.add_argument(
     e.g.: --quant_method pertensor kv_blockscale""",
 )
 parser.add_argument(
+    "--head_dim",
+    type=int,
+    const=None,
+    choices=[128, 256],
+    default=[128, 256],
+    nargs="*",
+    help="""head dimension.
+    e.g.: --head_dim 128 256""",
+)
+parser.add_argument(
     "--profile",
     action="store_true",
     help="Enable profiling mode",
@@ -2243,6 +2261,7 @@ if __name__ == "__main__":
         quant_method,
         contiguous_kv,
         return_lse,
+        head_dim,
     ) in itertools.product(
         args.pagesize,
         args.causal,
@@ -2254,6 +2273,7 @@ if __name__ == "__main__":
         args.quant_method,
         [True, False],  # contiguous_kv
         args.return_lse,
+        args.head_dim,
     ):
         # Validate quant_method and input_dtype combinations:
         # - fp16/bf16 must use quant_method="none"
@@ -2278,7 +2298,7 @@ if __name__ == "__main__":
                 page_size=page_size,
                 num_qo_heads=args.headq,
                 num_kv_heads=args.headk,
-                head_dim=128,
+                head_dim=head_dim,
                 causal=causal,
                 logits_soft_cap=logits_soft_cap,
                 dtype=dtype,
@@ -2297,7 +2317,7 @@ if __name__ == "__main__":
                 page_size=page_size,
                 num_qo_heads=args.headq,
                 num_kv_heads=args.headk,
-                head_dim=128,
+                head_dim=head_dim,
                 causal=causal,
                 logits_soft_cap=logits_soft_cap,
                 dtype=dtype,
@@ -2319,7 +2339,7 @@ if __name__ == "__main__":
             "page_sz": page_size,
             "h_q": args.headq,
             "h_kv": args.headk,
-            "hdim": 128,
+            "hdim": head_dim,
             "input_dtype": input_dtype,
             "quant_method": quant_method if input_dtype == "fp8" else "-",
             "kv_layout": kv_layout,

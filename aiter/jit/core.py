@@ -527,7 +527,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_enum"]
+rebuilded_list = ["module_aiter_enum", "module_aiter_tensor"]
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -1448,11 +1448,23 @@ def compile_ops(
                             doc_str = re.sub(
                                 f" (module_)?aiter.*{el} ", f" {el} ", doc_str
                             )
+                        doc_str = re.sub(
+                            r"(?:[\w.]+\.)?aiter_tensor_t",
+                            "aiter_tensor_t",
+                            doc_str,
+                        )
+                        try:
+                            aiter_tensor_t = get_module(
+                                "module_aiter_tensor"
+                            ).aiter_tensor_t
+                        except Exception:
+                            aiter_tensor_t = object
                         namespace = {
                             "List": List,
                             "Optional": Optional,
                             "torch": torch,
                             "typing": typing,
+                            "aiter_tensor_t": aiter_tensor_t,
                         }
 
                         exec(
