@@ -114,4 +114,11 @@ def str2Dtype(v):
 
 def str2ActivationType(s):
     """Convert string to ActivationType."""
-    return getattr(ActivationType, s.capitalize())
+    mapping = {
+        "no": ActivationType.No,
+        "silu": ActivationType.Silu,
+        "gelu": ActivationType.Gelu,
+        "swiglu": ActivationType.Swiglu,
+        "swiglustep": ActivationType.SwigluStep,
+    }
+    return mapping[s.lower()]

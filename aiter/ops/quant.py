@@ -400,6 +400,7 @@ def get_torch_act(aType):
         ActivationType.No: lambda *a, **k: a[0],
         ActivationType.Silu: F.silu,
         ActivationType.Gelu: F.gelu,
+        ActivationType.SwigluStep: F.silu,
     }
     return tmp.get(aType, NotImplementedError)
 

@@ -20,6 +20,7 @@ PYBIND11_MODULE(module_aiter_enum, m)
         .value("Silu", ActivationType::Silu)
         .value("Gelu", ActivationType::Gelu)
         .value("Swiglu", ActivationType::Swiglu)
+        .value("SwigluStep", ActivationType::SwigluStep)
         .export_values();
     pybind11::implicitly_convertible<int, QuantType>();
     pybind11::implicitly_convertible<int, ActivationType>();
