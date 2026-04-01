@@ -49,37 +49,37 @@ struct kvpair_t
 using topk_score_t = kvpair_t<int, float>;
 } // namespace impl
 
-template <typename T, typename F, int wave_size_ = 64>
-__device__ constexpr T wave_reduce(T local, F reduce_f, opus::number<wave_size_> = {})
-{
-    constexpr int reduce_stage = []() {
-        if constexpr(wave_size_ == 2)
-            return 1;
-        else if constexpr(wave_size_ == 4)
-            return 2;
-        else if constexpr(wave_size_ == 8)
-            return 3;
-        else if constexpr(wave_size_ == 16)
-            return 4;
-        else if constexpr(wave_size_ == 32)
-            return 5;
-        else if constexpr(wave_size_ == 64)
-            return 6;
-        else
-            return 0;
-    }();
-    T v_local = local;
-#pragma unroll
-    for(int i_stage = 0; i_stage < reduce_stage; i_stage++)
-    {
-        int src_lane = __lane_id() ^ (1 << i_stage);
-        int32_t v_remote_tmp =
-            __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
-        T v_remote = __builtin_bit_cast(T, v_remote_tmp);
-        v_local    = reduce_f(v_local, v_remote);
-    }
-    return v_local;
-}
+// template <typename T, typename F, int wave_size_ = 64>
+// __device__ constexpr T wave_reduce(T local, F reduce_f, opus::number<wave_size_> = {})
+// {
+//     constexpr int reduce_stage = []() {
+//         if constexpr(wave_size_ == 2)
+//             return 1;
+//         else if constexpr(wave_size_ == 4)
+//             return 2;
+//         else if constexpr(wave_size_ == 8)
+//             return 3;
+//         else if constexpr(wave_size_ == 16)
+//             return 4;
+//         else if constexpr(wave_size_ == 32)
+//             return 5;
+//         else if constexpr(wave_size_ == 64)
+//             return 6;
+//         else
+//             return 0;
+//     }();
+//     T v_local = local;
+// #pragma unroll
+//     for(int i_stage = 0; i_stage < reduce_stage; i_stage++)
+//     {
+//         int src_lane = __lane_id() ^ (1 << i_stage);
+//         int32_t v_remote_tmp =
+//             __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
+//         T v_remote = __builtin_bit_cast(T, v_remote_tmp);
+//         v_local    = reduce_f(v_local, v_remote);
+//     }
+//     return v_local;
+// }
 
 // every thread hold one value, with pivot (topk value)
 // need to find the first topk value that is >= pivot
@@ -204,47 +204,55 @@ __device__ constexpr void wave_reduce_argmax2(
 
 __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 {
-    static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
-    constexpr int lane_steps  = 6;
-    constexpr int row_mask    = 0xf;
-    constexpr int bank_mask   = 0xf;
-    constexpr bool bound_ctrl = true;
-    float val                 = val_o;
+    using kvp = hipcub::KeyValuePair<int, float>;
+    hipcub::ArgMax arg_max;
+    kvp thread_kvp;
+    thread_kvp.key       = idx;
+    thread_kvp.value     = val_o;
+    const kvp result_kvp = wave_reduce<kvp, decltype(arg_max), WARP_SIZE, true>(thread_kvp, arg_max);
+    val_o = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, result_kvp.value), WARP_SIZE - 1));
+    idx = __builtin_bit_cast(int, __builtin_amdgcn_readlane(result_kvp.key, WARP_SIZE - 1));
+    // static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
+    // constexpr int lane_steps  = 6;
+    // constexpr int row_mask    = 0xf;
+    // constexpr int bank_mask   = 0xf;
+    // constexpr bool bound_ctrl = true;
+    // float val                 = val_o;
 
-    constexpr auto get_dpp_i = [&](auto i_step) {
-        if constexpr(i_step.value == 0)
-            return 0xb1; // quad_perm:[1,0,3,2]
-        if constexpr(i_step.value == 1)
-            return 0x4e; // quad_perm:[2,3,0,1]
-        if constexpr(i_step.value == 2)
-            return 0x114; // row_shr:4
-        if constexpr(i_step.value == 3)
-            return 0x118; // row_shr:8
-        if constexpr(i_step.value == 4)
-            return 0x142; // row_bcast:15
-        if constexpr(i_step.value == 5)
-            return 0x143; // row_bcast:31
-        else
-            return 0xffff; // return a value to let compile crash
-    };
-    opus::static_for<lane_steps>([&](auto i_step) {
-        constexpr int dpp_i = get_dpp_i(i_step);
+    // constexpr auto get_dpp_i = [&](auto i_step) {
+    //     if constexpr(i_step.value == 0)
+    //         return 0xb1; // quad_perm:[1,0,3,2]
+    //     if constexpr(i_step.value == 1)
+    //         return 0x4e; // quad_perm:[2,3,0,1]
+    //     if constexpr(i_step.value == 2)
+    //         return 0x114; // row_shr:4
+    //     if constexpr(i_step.value == 3)
+    //         return 0x118; // row_shr:8
+    //     if constexpr(i_step.value == 4)
+    //         return 0x142; // row_bcast:15
+    //     if constexpr(i_step.value == 5)
+    //         return 0x143; // row_bcast:31
+    //     else
+    //         return 0xffff; // return a value to let compile crash
+    // };
+    // opus::static_for<lane_steps>([&](auto i_step) {
+    //     constexpr int dpp_i = get_dpp_i(i_step);
 
-        float remote_val = __builtin_bit_cast(
-            float,
-            __builtin_amdgcn_mov_dpp(
-                __builtin_bit_cast(int, val), dpp_i, row_mask, bank_mask, bound_ctrl));
-        int remote_idx = __builtin_bit_cast(
-            int,
-            __builtin_amdgcn_mov_dpp(
-                __builtin_bit_cast(int, idx), dpp_i, row_mask, bank_mask, bound_ctrl));
+    //     float remote_val = __builtin_bit_cast(
+    //         float,
+    //         __builtin_amdgcn_mov_dpp(
+    //             __builtin_bit_cast(int, val), dpp_i, row_mask, bank_mask, bound_ctrl));
+    //     int remote_idx = __builtin_bit_cast(
+    //         int,
+    //         __builtin_amdgcn_mov_dpp(
+    //             __builtin_bit_cast(int, idx), dpp_i, row_mask, bank_mask, bound_ctrl));
 
-        idx = val > remote_val ? idx : remote_idx;
-        val = val > remote_val ? val : remote_val;
-    });
-    val_o = __builtin_bit_cast(
-        float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), WARP_SIZE - 1));
-    idx = __builtin_amdgcn_readlane(idx, WARP_SIZE - 1);
+    //     idx = val > remote_val ? idx : remote_idx;
+    //     val = val > remote_val ? val : remote_val;
+    // });
+    // val_o = __builtin_bit_cast(
+    //     float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), WARP_SIZE - 1));
+    // idx = __builtin_amdgcn_readlane(idx, WARP_SIZE - 1);
 
     // val = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), 63));
     // if (val==val_o)

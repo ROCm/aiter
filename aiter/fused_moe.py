@@ -1879,7 +1879,8 @@ def fused_topk(
     )
 
     if (
-        (expert, topk)
+        get_gfx() in ["gfx942", "gfx950"]
+        and (expert, topk)
         in [
             (128, 4),
             (128, 6),
