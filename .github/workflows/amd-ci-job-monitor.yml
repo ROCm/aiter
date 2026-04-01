@@ -6,8 +6,8 @@ on:
   pull_request:
     paths:
       - ".github/workflows/amd-ci-job-monitor.yml"
-      - "scripts/ci/list_jobs.py"
-      - "scripts/ci/query_job_status.py"
+      - ".github/scripts/list_jobs.py"
+      - ".github/scripts/query_job_status.py"
   workflow_dispatch:
     inputs:
       hours:
@@ -54,7 +54,7 @@ jobs:
       - name: Parse workflow files
         id: parse
         run: |
-          python scripts/ci/list_jobs.py \
+          python .github/scripts/list_jobs.py \
             --workflow-dir ".github/workflows" \
             --workflows "${{ inputs.workflows }}" \
             --exclude-workflows "amd-ci-job-monitor.yml" \
@@ -101,7 +101,7 @@ jobs:
 
       - name: Generate custom report
         run: |
-          python scripts/ci/query_job_status.py \
+          python .github/scripts/query_job_status.py \
             --repo "${{ github.repository }}" \
             --workflows "${{ inputs.workflows }}" \
             --job "${{ inputs.job_filter }}" \
@@ -133,7 +133,7 @@ jobs:
 
       - name: Generate report
         run: |
-          python scripts/ci/query_job_status.py \
+          python .github/scripts/query_job_status.py \
             --repo "${{ github.repository }}" \
             --workflows "${{ matrix.workflow }}" \
             --job "${{ matrix.job_name }}" \
@@ -162,7 +162,7 @@ jobs:
       - name: Generate runner fleet report
         run: |
           HOURS="${{ github.event_name == 'pull_request' && '1' || (inputs.hours || '24') }}"
-          python scripts/ci/query_job_status.py \
+          python .github/scripts/query_job_status.py \
             --repo "${{ github.repository }}" \
             --workflows "${{ needs.parse-workflows.outputs.workflow_list }}" \
             --hours "${HOURS}" \
