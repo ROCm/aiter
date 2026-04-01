@@ -386,6 +386,7 @@ def torch_mla_extend_split_kv(
     final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
 
     io_transformed = False
+    use_qseqlen_fold = False
     q_ratio = 1
     if (
         nheads == 16
@@ -403,16 +404,21 @@ def torch_mla_extend_split_kv(
     elif nheads in range(32, 128 + 1, 16):
         # we use nhead=16 to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-        fold_factor = nheads // 16
+        ori_nheads = nheads
         use_qseqlen_fold = (
             get_gfx() == "gfx950"
             and is_fp8_q
             and is_fp8_kvc
-            and max_seqlen_q * fold_factor == 4
-        )
+            and (max_seqlen_q * (nheads // 16)) == 4 or max_seqlen_q * (nheads // 32) == 4)
+
+        if use_qseqlen_fold and (max_seqlen_q * (nheads // 32) == 4):
+            fold_factor = nheads // 32
+            nheads = 32
+        else:
+            fold_factor = nheads // 16
+            nheads = 16
+
         total_s = total_q * fold_factor
-        ori_nheads = nheads
-        nheads = 16
         if use_qseqlen_fold:
             max_seqlen_q = max_seqlen_q * fold_factor
             q_ratio = 1
@@ -519,7 +525,7 @@ def torch_mla_extend_split_kv(
         partial_lse,
     )
 
-    return partial_o, partial_lse, final_out, final_lse, io_transformed
+    return partial_o, partial_lse, final_out, final_lse, io_transformed, use_qseqlen_fold
 
 
 def torch_mla_reduce_v1(
@@ -693,7 +699,7 @@ def torch_mla_split_kv_and_reduce(
     kv_scale=None,
 ):
     total_q, nhead, _ = q.shape
-    partial_out, partial_lse, split_out, split_lse, io_transformed = (
+    partial_out, partial_lse, split_out, split_lse, io_transformed, use_qseqlen_fold = (
         torch_mla_extend_split_kv(
             q,
             kv_cache,
@@ -727,7 +733,7 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        if max_seqlen_q == 1:
+        if max_seqlen_q == 1 or use_qseqlen_fold:
             split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
             split_lse = split_lse.reshape(total_q, nhead)
         else:
