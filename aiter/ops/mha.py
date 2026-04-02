@@ -1257,6 +1257,7 @@ def _flash_attn_forward(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     batch_size, seqlen_q, nhead_q, hdim_q = q.shape
@@ -1317,7 +1318,7 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
-        out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
+        out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
             v,
@@ -1329,7 +1330,7 @@ def _flash_attn_forward(
             return_lse,
             return_softmax,
             how_v3_bf16_cvt,
-            None,
+            out,
             bias,
             alibi_slopes,
             q_descale,
@@ -1338,7 +1339,7 @@ def _flash_attn_forward(
             None,
         )
     else:
-        out, softmax_lse, S_dmask, rng_state = mha_fwd(
+        out_, softmax_lse, S_dmask, rng_state = mha_fwd(
             q,
             k,
             v,
@@ -1352,7 +1353,7 @@ def _flash_attn_forward(
             return_softmax,
             cu_seqlens_q,
             cu_seqlens_kv,
-            None,
+            out,
             bias,
             alibi_slopes,
             q_descale,
@@ -1362,7 +1363,7 @@ def _flash_attn_forward(
             None,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
-    return out, softmax_lse, S_dmask, rng_state
+    return out_, softmax_lse, S_dmask, rng_state
 
 
 # @torch_compile_guard(mutates_args=[])
