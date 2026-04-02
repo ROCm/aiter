@@ -6,7 +6,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     shuffle_scales,
     un_shuffle_scales,
 )
-from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+from aiter.ops.triton.activation import act_mul, act_mul_and_mxfp4_quant
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 DEBUG_MODE = False
@@ -140,3 +140,39 @@ def test_act_mul_and_mxfp4_quant(
 
     torch.testing.assert_close(triton_out, torch_out)
     torch.testing.assert_close(triton_scale, torch_scale)
+
+
+def torch_act_mul_ref(x: torch.Tensor, activation: str) -> torch.Tensor:
+    d = x.shape[-1] // 2
+    a, b = x[:, :d], x[:, d:]
+    if activation == "silu":
+        y = F.silu(a) * b
+    elif activation == "gelu":
+        y = F.gelu(a) * b
+    else:
+        y = F.gelu(a, approximate="tanh") * b
+    return y.to(x.dtype)
+
+
+@pytest.mark.parametrize(
+    "M, N_half",
+    [
+        (4, 64),
+        (31, 128),
+        (128, 256),
+        (1, 7),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
+@pytest.mark.parametrize("use_out", [False, True])
+def test_act_mul_no_quant(M, N_half, dtype, activation, use_out):
+    N = 2 * N_half
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
+    ref = torch_act_mul_ref(x, activation)
+    if use_out:
+        out = torch.empty_like(ref)
+        act_mul(x, activation, out=out)
+    else:
+        out = act_mul(x, activation)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
