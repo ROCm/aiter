@@ -148,7 +148,6 @@ def get_fewer_x_vals():
     [
         (in_dtype, out_dtype, *shape)
         for in_dtype in ["fp8e4m3", "fp8e5m2"]
-        for out_dtype in ["bf16"]
         for shape in get_x_vals()
     ],
 )
@@ -160,7 +159,7 @@ def get_fewer_x_vals():
         "gluon_shuffle",
     ],
 )
-def test_gemm_fp8(in_dtype, out_dtype, m, n, k, impl: str):
+def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 
     torch.cuda.empty_cache()
 
@@ -175,7 +174,7 @@ def test_gemm_fp8(in_dtype, out_dtype, m, n, k, impl: str):
         )
 
     in_dtype = str_to_torch_dtype[in_dtype]
-    out_dtype = str_to_torch_dtype[out_dtype]
+    out_dtype = str_to_torch_dtype["bf16"]
     x, weight, weight_triton, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
         M=m,
         N=n,
@@ -205,7 +204,6 @@ def test_gemm_fp8(in_dtype, out_dtype, m, n, k, impl: str):
     "in_dtype, out_dtype, m, n, k, layout, output",
     [
         (in_dtype, out_dtype, *shape, layout, output)
-        for in_dtype in ["int8"]
         for out_dtype in ["fp16", "fp32", "int32"]
         for shape in get_fewer_x_vals()
         for layout in ["TN", "TT", "NN", "NT"]
@@ -220,7 +218,7 @@ def test_gemm_fp8(in_dtype, out_dtype, m, n, k, impl: str):
         "gluon_shuffle",
     ],
 )
-def test_gemm_int8(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
+def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
 
     torch.cuda.empty_cache()
 
@@ -234,7 +232,7 @@ def test_gemm_int8(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
 
-    in_dtype = str_to_torch_dtype[in_dtype]
+    in_dtype = str_to_torch_dtype["int8"]
     out_dtype = str_to_torch_dtype[out_dtype]
     x, weight, weight_triton, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
         M=m,
