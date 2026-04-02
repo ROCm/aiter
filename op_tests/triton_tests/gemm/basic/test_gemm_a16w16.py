@@ -80,6 +80,9 @@ def get_fewer_x_vals():
     return x_vals
 
 
+# A smaller set of shapes that tests fused activations, different dtypes
+# and output tensor arg. We don't want the larger set above to test
+# all these combinations.
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -130,21 +133,20 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout):
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
+def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, output=output)
 
     torch_out = F.linear(x, w, bias=None)
 
     # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
     if output:
         y = y.to(torch.float32).zero_()
-        triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(dtype)
+        triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(torch.bfloat16)
     else:
-        triton_out = gemm_a16w16_atomic(x, w, dtype=torch.float32).to(dtype)
+        triton_out = gemm_a16w16_atomic(x, w, dtype=torch.float32).to(torch.bfloat16)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 

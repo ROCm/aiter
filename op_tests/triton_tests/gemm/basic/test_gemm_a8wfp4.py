@@ -340,13 +340,13 @@ e5m2_type, e4m3_type = types.get_fp8_dtypes()
 #     (1,1280,8192)
 # ])
 @pytest.mark.parametrize("a_dtype", [e4m3_type])  # [e4m3_type, e5m2_type, torch.int8]
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "layout", ["TN"]
 )  # NOTE: Kernel will occasionally crash for layouts other than TN.
 def test_gemm_a8wfp4(
-    M: int, N: int, K: int, a_dtype, out_dtype, layout: str, CLEAR_GPUS=True
+    M: int, N: int, K: int, a_dtype, layout: str, CLEAR_GPUS=True
 ):
+    out_dtype = torch.bfloat16
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     torch.manual_seed(42)  # for reproducibility

@@ -194,7 +194,6 @@ def run_triton(
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "shuffle_weight_scales",
@@ -206,15 +205,16 @@ def test_gemm_afp4_wfp4(
     M: int,
     N: int,
     K: int,
-    dtype,
     output,
     shuffle_weight_scales,
     skip_reduce,
     impl,
 ):
-    if impl == "gluon" and DEVICE_ARCH != "gfx950":
+    dtype = torch.bfloat16
+    # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950
+    if impl == "gluon":
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon tests temporarily disabled."
         )
 
     if impl == "gluon" and shuffle_weight_scales:

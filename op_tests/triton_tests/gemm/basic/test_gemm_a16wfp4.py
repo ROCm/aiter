@@ -130,7 +130,6 @@ def run_torch(x, w, w_scales, dtype):
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "atomic_add, shuffle, skip_reduce",
@@ -145,7 +144,6 @@ def test_gemm_a16wfp4(
     M: int,
     N: int,
     K: int,
-    dtype,
     output: bool,
     atomic_add: bool,
     shuffle: bool,
@@ -160,6 +158,7 @@ def test_gemm_a16wfp4(
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
 
+    dtype = torch.bfloat16
     x, w, w_triton, _, w_scales, w_scales_triton, y = generate_gemm_a16wfp4_inputs(
         M,
         N,
