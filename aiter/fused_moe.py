@@ -1370,6 +1370,18 @@ def torch_moe_act(act_input, torch_act, inter_dim, activation=ActivationType.No)
         return torch_act(gate) * up
 
 
+def apply_act_and_mul(out, act_input, activation=ActivationType.No):
+    if activation == ActivationType.Silu:
+        aiter.silu_and_mul(out, act_input)
+    elif activation == ActivationType.Gelu:
+        aiter.gelu_and_mul(out, act_input)
+    else:
+        inter_dim = act_input.shape[-1] // 2
+        torch_act = aiter.get_torch_act(activation)
+        out.copy_(torch_moe_act(act_input, torch_act, inter_dim, activation).to(out.dtype))
+    return out
+
+
 def asm_stage1(
     input,
     w1,
@@ -1427,10 +1439,7 @@ def asm_stage1(
         sorted_weights=sorted_weights,
     )
     if ksplit > 0:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
-        else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+        apply_act_and_mul(out, tmp_out.view(dtypes.fp32), activation)
     return out
 
 
@@ -1754,10 +1763,7 @@ def ck_moe_stage1(
         out.dtype,
     )
     if is_splitk:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
-        else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+        apply_act_and_mul(out, tmp_out.view(dtypes.fp32), activation)
     return out
 
 
@@ -1822,10 +1828,7 @@ def cktile_moe_stage1(
     )
 
     if split_k > 1:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
-        else:
-            aiter.gelu_and_mul(out, tmp_out)
+        apply_act_and_mul(out, tmp_out, activation)
     return out
 
 
