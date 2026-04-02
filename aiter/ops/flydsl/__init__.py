@@ -41,8 +41,15 @@ if is_flydsl_available():
 
     from .gemm_kernels import flydsl_hgemm
 
+    from .grouped_gemm_kernels import (
+        flydsl_grouped_gemm_contiguous,
+        flydsl_grouped_gemm_masked,
+    )
+
     __all__ += [
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",
+        "flydsl_grouped_gemm_contiguous",
+        "flydsl_grouped_gemm_masked",
     ]

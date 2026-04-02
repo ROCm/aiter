@@ -1,0 +1,69 @@
+{
+  "name": "aiter ROCm Dev",
+  "build": {
+    "context": "..",
+    "dockerfile": "Dockerfile",
+    "args": {
+      "PYTORCH_ROCM_ARCH": "gfx942"
+    },
+    "options": [
+      "--network=host"
+    ]
+  },
+  "remoteUser": "root",
+  "mounts": [
+    // 1. Mount Zsh Config
+    "source=${localEnv:HOME}/.zshrc,target=/root/.zshrc,type=bind,consistency=cached",
+    // 2. Mount Git Config
+    "source=${localEnv:HOME}/.gitconfig,target=/root/.gitconfig_host,type=bind,consistency=cached",
+    // 3. Mount Shell History
+    "source=${localEnv:HOME}/shell-history,target=/root/shell-history,type=bind,consistency=cached"
+  ],
+  "runArgs": [
+    "--device=/dev/kfd",
+    "--device=/dev/dri",
+    "--group-add=video",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt",
+    "seccomp=unconfined",
+    "--network=host"
+  ],
+  "containerEnv": {
+    "HISTFILE": "/root/shell-history/.zsh_history",
+    "ROCM_VERSION": "70200",
+    "HIPBLAS_V2": "1",
+    "BUILD_ROCM_VERSION": "7.2",
+    "MAX_JOBS": "64",
+    "NODE_TLS_REJECT_UNAUTHORIZED": "0"
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/aiter,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace/aiter",
+
+  // [UPDATED] Post Create Command
+  // 1. Copy gitconfig
+  // 2. Trust repo
+  // 3. [NEW] Link the VS Code config from the sidecar mount (Restores your settings)
+  // 4. [NEW] Install requirements (Replaces Dockerfile step 5)
+  "postCreateCommand": "cp /root/.gitconfig_host /root/.gitconfig",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "github.copilot",
+        "github.copilot-chat",
+        "sysoev.vscode-open-in-github",
+        "ryu1kn.partial-diff",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy",
+        "ms-python.vscode-python-envs",
+        "GitHub.copilot",
+        "ms-vscode.cpptools-extension-pack",
+        "ms-vscode.cmake-tools",
+        "ms-vscode.cpptools-themes",
+        "benjamin-simmonds.pythoncpp-debug"
+      ]
+    }
+  }
+}
