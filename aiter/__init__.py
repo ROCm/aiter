@@ -3,6 +3,7 @@
 
 import torch
 import os
+import sys
 import logging
 
 logger = logging.getLogger("aiter")
@@ -57,44 +58,55 @@ def getLogger():
 
 logger = getLogger()
 
-from .jit import core as core  # noqa: E402
-from .utility import dtypes as dtypes  # noqa: E402
-from .ops.enum import *  # noqa: F403,E402
-from .ops.norm import *  # noqa: F403,E402
-from .ops.quant import *  # noqa: F403,E402
-from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
-from .ops.gemm_op_a16w16 import *  # noqa: F403,E402
-from .ops.gemm_op_a4w4 import *  # noqa: F403,E402
-from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
-from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
-from .ops.deepgemm import *  # noqa: F403,E402
-from .ops.aiter_operator import *  # noqa: F403,E402
-from .ops.activation import *  # noqa: F403,E402
-from .ops.attention import *  # noqa: F403,E402
-from .ops.custom import *  # noqa: F403,E402
-from .ops.custom_all_reduce import *  # noqa: F403,E402
-from .ops.quick_all_reduce import *  # noqa: F403,E402
-from .ops.moe_op import *  # noqa: F403,E402
-from .ops.moe_sorting import *  # noqa: F403,E402
-from .ops.moe_sorting_opus import *  # noqa: F403,E402
-from .ops.pos_encoding import *  # noqa: F403,E402
-from .ops.cache import *  # noqa: F403,E402
-from .ops.rmsnorm import *  # noqa: F403,E402
-from .ops.communication import *  # noqa: F403,E402
-from .ops.rope import *  # noqa: F403,E402
-from .ops.topk import *  # noqa: F403,E402
-from .ops.topk_plain import topk_plain  # noqa: F403,F401,E402
-from .ops.mha import *  # noqa: F403,E402
-from .ops.gradlib import *  # noqa: F403,E402
-from .ops.trans_ragged_layout import *  # noqa: F403,E402
-from .ops.sample import *  # noqa: F403,E402
-from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
-from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
-from .ops.groupnorm import *  # noqa: F403,E402
-from .ops.mhc import *  # noqa: F403,E402
-from .ops.causal_conv1d import *  # noqa: F403,E402
-from .ops.fused_split_gdr_update import *  # noqa: F403,E402
-from . import mla  # noqa: F403,F401,E402
+
+if sys.platform == "win32":
+    logger.info("Windows: CK and HIP ops are not available. Triton ops only.")
+else:
+    try:
+        from .jit import core as core  # noqa: E402
+        from .utility import dtypes as dtypes  # noqa: E402
+        from .ops.enum import *  # noqa: F403,E402
+        from .ops.norm import *  # noqa: F403,E402
+        from .ops.quant import *  # noqa: F403,E402
+        from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
+        from .ops.gemm_op_a16w16 import *  # noqa: F403,E402
+        from .ops.gemm_op_a4w4 import *  # noqa: F403,E402
+        from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
+        from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
+        from .ops.deepgemm import *  # noqa: F403,E402
+        from .ops.aiter_operator import *  # noqa: F403,E402
+        from .ops.activation import *  # noqa: F403,E402
+        from .ops.attention import *  # noqa: F403,E402
+        from .ops.custom import *  # noqa: F403,E402
+        from .ops.custom_all_reduce import *  # noqa: F403,E402
+        from .ops.quick_all_reduce import *  # noqa: F403,E402
+        from .ops.moe_op import *  # noqa: F403,E402
+        from .ops.moe_sorting import *  # noqa: F403,E402
+        from .ops.moe_sorting_opus import *  # noqa: F403,E402
+        from .ops.pos_encoding import *  # noqa: F403,E402
+        from .ops.cache import *  # noqa: F403,E402
+        from .ops.rmsnorm import *  # noqa: F403,E402
+        from .ops.communication import *  # noqa: F403,E402
+        from .ops.rope import *  # noqa: F403,E402
+        from .ops.topk import *  # noqa: F403,E402
+        from .ops.topk_plain import topk_plain  # noqa: F403,F401,E402
+        from .ops.mha import *  # noqa: F403,E402
+        from .ops.gradlib import *  # noqa: F403,E402
+        from .ops.trans_ragged_layout import *  # noqa: F403,E402
+        from .ops.sample import *  # noqa: F403,E402
+        from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
+        from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
+        from .ops.groupnorm import *  # noqa: F403,E402
+        from .ops.mhc import *  # noqa: F403,E402
+        from .ops.causal_conv1d import *  # noqa: F403,E402
+        from .ops.fused_split_gdr_update import *  # noqa: F403,E402
+        from . import mla  # noqa: F403,F401,E402
+    except (ImportError, RuntimeError, OSError) as e:
+        logger.warning(
+            "ROCm/HIP JIT runtime not available: %s. "
+            "CK and HIP ops are disabled. Triton ops remain available.",
+            e,
+        )
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:
@@ -106,6 +118,6 @@ try:
         reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
         IRIS_COMM_AVAILABLE,  # noqa: F401
     )
-except ImportError:
-    # Iris not available, skip import
+except (ImportError, AttributeError):
+    # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False

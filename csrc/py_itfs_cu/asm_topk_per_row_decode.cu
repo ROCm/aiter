@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include "py_itfs_common.h"
 
@@ -13,11 +13,11 @@ struct __attribute__((packed)) TopKDecodeKernelArgs
     int32_t next_n;
 };
 
-extern "C" __attribute__((visibility("default"))) void top_k_per_row_decode_fast(
-    AiterTensor* logits,
+AITER_C_ITFS void top_k_per_row_decode_fast(
+    aiter_tensor_t* logits,
     int64_t next_n,
-    AiterTensor* seqLens,
-    AiterTensor* indices,
+    aiter_tensor_t* seqLens,
+    aiter_tensor_t* indices,
     int64_t numRows,
     int64_t stride0,
     int64_t stride1,

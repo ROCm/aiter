@@ -61,6 +61,8 @@ def init_dist_env(
         )
         ca_comm.signal = signal
         ca_comm.register_input_buffer(signal)
+        # buffer: expose the pool's input buffer tensor for ASM-path functions
+        ca_comm.buffer = ca_comm._pool["input"].tensor
     logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
 

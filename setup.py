@@ -13,6 +13,10 @@ PACKAGE_NAME = "amd-aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    ENABLE_CK = False
+    PREBUILD_KERNELS = False
 
 
 def getMaxJobs():
@@ -63,7 +67,10 @@ def prepare_packaging():
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
-    shutil.copytree("hsa", "aiter_meta/hsa")
+    if not IS_WINDOWS:
+        shutil.copytree("hsa", "aiter_meta/hsa")
+    else:
+        os.makedirs("aiter_meta/hsa", exist_ok=True)
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
     open("aiter_meta/__init__.py", "w").close()
@@ -98,7 +105,7 @@ def _is_metadata_only():
 
 
 # Defer heavy imports until build time
-if not _is_metadata_only():
+if not _is_metadata_only() and not IS_WINDOWS:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
@@ -149,7 +156,7 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
                 "module_fmha_v3_fwd",
@@ -157,24 +164,16 @@ def get_exclude_ops():
             ]:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
-            # Exclude _bwd, _tune, and specific module
-            if (
-                "_bwd" in module
-                or "_tune" in module
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            # Exclude _bwd and _tune
+            if "_bwd" in module or "_tune" in module:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 3:
-            # Keep only module_fmha_v3* and module_aiter_enum
-            if not (
-                module.startswith("module_fmha_v3")
-                or module == "module_aiter_enum"
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            # Keep only module_fmha_v3*
+            if not module.startswith("module_fmha_v3"):
                 exclude_ops.append(module)
         else:
-            # Default behavior: exclude tunes and specific mi350 module
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            # Default behavior: exclude tunes
+            if "_tune" in module:
                 exclude_ops.append(module)
 
     return exclude_ops
@@ -306,6 +305,19 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
+if IS_WINDOWS:
+    install_requires = ["einops", "packaging", "psutil"]
+else:
+    install_requires = [
+        "pybind11>=3.0.1",
+        "ninja",
+        "pandas",
+        "einops",
+        "psutil",
+        "packaging",
+        "flydsl==0.1.1.dev409",
+    ]
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -321,15 +333,7 @@ setup(
     ],
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=[
-        "pybind11>=3.0.1",
-        "ninja",
-        "pandas",
-        "einops",
-        "psutil",
-        "packaging",
-        "flydsl==0.1.1",
-    ],
+    install_requires=install_requires,
     extras_require={
         # Triton-based communication using Iris
         # Note: Iris is not available on PyPI and must be installed separately

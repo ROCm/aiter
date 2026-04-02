@@ -92,8 +92,8 @@ pip install -e .
 AITER uses `pre-commit` to maintain code quality. Install it before making changes:
 
 ```bash
-pip install black==25.1.0 ruff==0.11.11
-apt install clang-format  # For C++/HIP code formatting
+pip install black==26.3.0 ruff==0.15.7
+apt install clang-format-18
 
 # Install pre-commit hooks
 bash ./.githooks/install
@@ -117,7 +117,7 @@ black aiter/ op_tests/
 ruff check aiter/ op_tests/
 
 # C++/HIP formatting
-find csrc/ -name "*.cu" -o -name "*.h" -o -name "*.cpp" | xargs clang-format -i
+find csrc/ -name "*.cu" -o -name "*.h" -o -name "*.cpp" | xargs clang-format-18 -i
 ```
 
 ### Code Style Guidelines

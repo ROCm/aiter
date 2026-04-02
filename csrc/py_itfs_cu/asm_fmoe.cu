@@ -95,19 +95,19 @@ class FMoeKernel
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
-    void launch_kernel(AiterTensor* out,               // [token_cnt, dim]
-                       AiterTensor* input,             // [token_cnt, dim] M,K
-                       AiterTensor* w1,                // [expert, inter_dim, dim] N,K
-                       AiterTensor* w2,                // [expert, dim, inter_dim]
-                       AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-                       AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-                       AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-                       AiterTensor* num_valid_ids,     // [1]
+    void launch_kernel(aiter_tensor_t* out,               // [token_cnt, dim]
+                       aiter_tensor_t* input,             // [token_cnt, dim] M,K
+                       aiter_tensor_t* w1,                // [expert, inter_dim, dim] N,K
+                       aiter_tensor_t* w2,                // [expert, dim, inter_dim]
+                       aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+                       aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+                       aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+                       aiter_tensor_t* num_valid_ids,     // [1]
                        uint32_t topk,                  //
-                       AiterTensor* input_dqn     = nullptr,
-                       AiterTensor* w1_dqn        = nullptr,
-                       AiterTensor* w2_dqn        = nullptr,
-                       AiterTensor* w2_smooth_qnt = nullptr,
+                       aiter_tensor_t* input_dqn     = nullptr,
+                       aiter_tensor_t* w1_dqn        = nullptr,
+                       aiter_tensor_t* w2_dqn        = nullptr,
+                       aiter_tensor_t* w2_smooth_qnt = nullptr,
                        hipStream_t stream         = nullptr)
     {
         int token_cnt       = out->size(0);
@@ -333,15 +333,15 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& ava
     return selectedTile;
 };
 
-extern "C" __attribute__((visibility("default"))) void fmoe(
-    AiterTensor* out,               // [token_cnt, dim]
-    AiterTensor* input,             // [token_cnt, dim] M,K
-    AiterTensor* gate,              // [expert, inter_dim, dim] N,K
-    AiterTensor* down,              // [expert, dim, inter_dim]
-    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor* num_valid_ids,     // [1]
+AITER_C_ITFS void fmoe(
+    aiter_tensor_t* out,               // [token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim] M,K
+    aiter_tensor_t* gate,              // [expert, inter_dim, dim] N,K
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t* num_valid_ids,     // [1]
     int topk,
     hipStream_t stream)
 {
@@ -376,20 +376,20 @@ extern "C" __attribute__((visibility("default"))) void fmoe(
                                   stream);
 }
 
-extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0(
-    AiterTensor* out,               // [token_cnt, dim]
-    AiterTensor* input,             // [token_cnt, dim] M,K
-    AiterTensor* gate,              // [expert, inter_dim, dim] N,K
-    AiterTensor* down,              // [expert, dim, inter_dim]
-    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor* num_valid_ids,     // [1]
+AITER_C_ITFS void fmoe_int8_g1u0(
+    aiter_tensor_t* out,               // [token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim] M,K
+    aiter_tensor_t* gate,              // [expert, inter_dim, dim] N,K
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t* num_valid_ids,     // [1]
     int topk,                       //
-    AiterTensor* input_scale,       // [token_cnt, 1]
-    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
-    AiterTensor* fc2_scale,         // [expert, 1, dim]
-    AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+    aiter_tensor_t* input_scale,       // [token_cnt, 1]
+    aiter_tensor_t* fc1_scale,         // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
+    aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     hipStream_t stream)
 {
@@ -499,21 +499,21 @@ extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0(
                                   stream);
 }
 
-extern "C" __attribute__((visibility("default"))) void fmoe_g1u1(
-    AiterTensor* out,               // [token_cnt, dim]
-    AiterTensor* input,             // [token_cnt, dim] M,K
-    AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
-    AiterTensor* down,              // [expert, dim, inter_dim]
-    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor* num_valid_ids,     // [1]
+AITER_C_ITFS void fmoe_g1u1(
+    aiter_tensor_t* out,               // [token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim] M,K
+    aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t* num_valid_ids,     // [1]
     int topk,                       //
-    AiterTensor* input_scale,       // [token_cnt, 1]
-    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
-    AiterTensor* fc2_scale,         // [expert, 1, dim]
+    aiter_tensor_t* input_scale,       // [token_cnt, 1]
+    aiter_tensor_t* fc1_scale,         // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
     const char* kernel_name,
-    AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     hipStream_t stream)
 {
@@ -636,21 +636,21 @@ extern "C" __attribute__((visibility("default"))) void fmoe_g1u1(
                                   stream);
 }
 
-extern "C" __attribute__((visibility("default"))) void fmoe_g1u1_tkw1(
-    AiterTensor* out,               // [token_cnt, dim]
-    AiterTensor* input,             // [token_cnt, dim] M,K
-    AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
-    AiterTensor* down,              // [expert, dim, inter_dim]
-    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor* num_valid_ids,     // [1]
+AITER_C_ITFS void fmoe_g1u1_tkw1(
+    aiter_tensor_t* out,               // [token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim] M,K
+    aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t* num_valid_ids,     // [1]
     int topk,                       //
-    AiterTensor* input_scale,       // [token_cnt, 1]
-    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
-    AiterTensor* fc2_scale,         // [expert, 1, dim]
+    aiter_tensor_t* input_scale,       // [token_cnt, 1]
+    aiter_tensor_t* fc1_scale,         // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
     const char* kernel_name,
-    AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     hipStream_t stream)
 {
@@ -703,20 +703,20 @@ extern "C" __attribute__((visibility("default"))) void fmoe_g1u1_tkw1(
                                   stream);
 }
 
-extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0_a16(
-    AiterTensor* out,               // [token_cnt, dim]
-    AiterTensor* input,             // [token_cnt, dim] M,K
-    AiterTensor* gate,              // [expert, inter_dim, dim] N,K
-    AiterTensor* down,              // [expert, dim, inter_dim]
-    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor* num_valid_ids,     // [1]
+AITER_C_ITFS void fmoe_int8_g1u0_a16(
+    aiter_tensor_t* out,               // [token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim] M,K
+    aiter_tensor_t* gate,              // [expert, inter_dim, dim] N,K
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t* num_valid_ids,     // [1]
     int topk,                       //
-    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
-    AiterTensor* fc2_scale,         // [expert, 1, dim]
-    AiterTensor* fc1_smooth_scale,  // [expert, 1, dim]
-    AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+    aiter_tensor_t* fc1_scale,         // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
+    aiter_tensor_t* fc1_smooth_scale,  // [expert, 1, dim]
+    aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     hipStream_t stream)
 {
@@ -761,20 +761,20 @@ extern "C" __attribute__((visibility("default"))) void fmoe_int8_g1u0_a16(
                                         stream);
 }
 
-extern "C" __attribute__((visibility("default"))) void fmoe_g1u1_a16(
-    AiterTensor* out,               // [token_cnt, dim]
-    AiterTensor* input,             // [token_cnt, dim] M,K
-    AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
-    AiterTensor* down,              // [expert, dim, inter_dim]
-    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor* num_valid_ids,     // [1]
+AITER_C_ITFS void fmoe_g1u1_a16(
+    aiter_tensor_t* out,               // [token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim] M,K
+    aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t* num_valid_ids,     // [1]
     int topk,                       //
-    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
-    AiterTensor* fc2_scale,         // [expert, 1, dim]
-    AiterTensor* fc1_smooth_scale,  // [expert, 1, dim]
-    AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+    aiter_tensor_t* fc1_scale,         // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
+    aiter_tensor_t* fc1_smooth_scale,  // [expert, 1, dim]
+    aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     hipStream_t stream)
 {
@@ -834,23 +834,23 @@ extern "C" __attribute__((visibility("default"))) void fmoe_g1u1_a16(
                                         stream);
 }
 
-extern "C" __attribute__((visibility("default"))) void fmoe_fp8_blockscale_g1u1(
-    AiterTensor* out,               // [token_cnt, dim]
-    AiterTensor* input,             // [token_cnt, dim] M,K
-    AiterTensor* gate,              // [expert, inter_dim*2, dim] N,K
-    AiterTensor* down,              // [expert, dim, inter_dim]
-    AiterTensor* sorted_token_ids,  // [max_num_tokens_padded]
-    AiterTensor* sorted_weights,    // [max_num_tokens_padded]
-    AiterTensor* sorted_expert_ids, // [max_num_m_blocks]
-    AiterTensor* num_valid_ids,     // [1]
+AITER_C_ITFS void fmoe_fp8_blockscale_g1u1(
+    aiter_tensor_t* out,               // [token_cnt, dim]
+    aiter_tensor_t* input,             // [token_cnt, dim] M,K
+    aiter_tensor_t* gate,              // [expert, inter_dim*2, dim] N,K
+    aiter_tensor_t* down,              // [expert, dim, inter_dim]
+    aiter_tensor_t* sorted_token_ids,  // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_weights,    // [max_num_tokens_padded]
+    aiter_tensor_t* sorted_expert_ids, // [max_num_m_blocks]
+    aiter_tensor_t* num_valid_ids,     // [1]
     int topk,                       //
-    AiterTensor* input_scale,       // [expert, 1, dim]
-    AiterTensor* fc1_scale,         // [expert, 1, inter_dim]
-    AiterTensor* fc2_scale,         // [expert, 1, dim]
+    aiter_tensor_t* input_scale,       // [expert, 1, dim]
+    aiter_tensor_t* fc1_scale,         // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_scale,         // [expert, 1, dim]
     const char* kernel_name,
     int fc_scale_blkn,
     int fc_scale_blkk,
-    AiterTensor* fc2_smooth_scale,  // [expert, 1, inter_dim]
+    aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     int block_size_M,
     hipStream_t stream)

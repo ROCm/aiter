@@ -15,6 +15,7 @@ op_tests/opus/
 │   ├── test_mfma_f32.cu         # MFMA fp32 kernels
 │   ├── test_mfma_f8.cu          # MFMA fp8/bf8 kernels
 │   ├── test_mxfp.cu             # MXFP8/MXFP4 kernels (gfx950 only)
+│   ├── test_wmma_scale.cu       # WMMA scaled f8f6f4/f4 kernels (gfx1250 only)
 │   ├── test_vector_add.cu       # Vector addition kernel
 │   ├── test_async_load.cu       # Async global->LDS->global copy kernel
 │   ├── test_dtype_convert.cu    # FP32<->BF16/FP16/FP8/FP4 round-trip kernels
@@ -23,7 +24,7 @@ op_tests/opus/
 │   ├── test_finfo.cu            # opus::finfo kernel
 │   ├── test_mdiv.cu             # opus::magic_div kernel
 │   ├── test_workgroup_barrier.cu# Workgroup barrier kernel
-│   ├── setup.py                 # Parallel hipcc build: 12 .cu -> .o -> .so
+│   ├── setup.py                 # Parallel hipcc build: 16 .cu -> .o -> .so
 │   └── test_opus_device.py      # Python test runner (builds .so, runs all tests)
 ├── run_tests.sh                 # Runs host test + device tests
 └── README.md
@@ -89,41 +90,49 @@ The device test build applies several techniques from the OPUS best-practices gu
 
 ### Current time breakdown (`time ./run_tests.sh`)
 
-```
-real    0m6.9s      (wall clock)
-user    0m18.4s     (CPU time, summed across parallel hipcc jobs)
-sys     0m2.1s
+Measured on MI355 (gfx950) with ROCm 7.1.1:
 
-Phase                             Time
+```
+real    0m4.1s      (wall clock)
+user    0m12.9s     (CPU time, summed across parallel hipcc jobs)
+sys     0m2.3s
+
+Phase                              Time
 ────────────────────────────────  ──────
 Host build (hipcc test_opus_basic)  1,400 ms
 Host run (13 unit tests)               12 ms
-Device .so build (11 .cu, parallel) 1,740 ms
-  compile (11 parallel jobs)          1,710 ms
-  link (.o -> .so)                       30 ms
-Device tests (torch import + GPU)   3,900 ms
-  torch import                        1,600 ms
-  kernel execution (50+ tests)        2,300 ms
+Device .so build (16 .cu, parallel)   921 ms
+  compile (16 parallel jobs)           887 ms
+  link (.o -> .so)                      34 ms
+Device tests (torch import + GPU)   1,800 ms
+  torch import + .so build              ~800 ms
+  kernel execution (60+ tests)        ~1,000 ms
 ────────────────────────────────  ──────
-Total wall clock                    ~6.9 s
+Total wall clock                    ~4.1 s
 ```
 
-### Per-file device compile times
+On MI308 (gfx942) with ROCm 6.3: compile 1,694ms, total ~6.6s.
+
+### Per-file device compile times (MI355 / gfx950, 16 parallel jobs)
 
 ```
-test_finfo.cu              127 ms
-test_async_load.cu         130 ms
-test_numeric_limits.cu     143 ms
-test_vector_add.cu         147 ms
-test_workgroup_barrier.cu  147 ms
-test_mdiv.cu               167 ms
-test_load_store_if.cu      216 ms
-test_mxfp.cu               224 ms
-test_dtype_convert.cu      292 ms
-test_mfma_f32.cu           769 ms
-test_mfma_f16.cu           863 ms
-test_mfma_f8.cu            884 ms  <-- critical path
-link                        25 ms
+test_finfo.cu              128 ms
+test_async_load.cu         128 ms
+test_vector_add.cu         131 ms
+test_numeric_limits.cu     139 ms
+test_workgroup_barrier.cu  149 ms
+test_wmma_f16.cu           162 ms
+test_wmma_f32.cu           163 ms
+test_mdiv.cu               165 ms
+test_wmma_scale.cu         172 ms
+test_wmma_f8.cu            173 ms
+test_load_store_if.cu      224 ms
+test_mxfp.cu               226 ms
+test_dtype_convert.cu      287 ms
+test_mfma_f32.cu           763 ms
+test_mfma_f8.cu            852 ms
+test_mfma_f16.cu           875 ms  <-- critical path
+link                        34 ms
 ```
 
 ## How to add a new device test
@@ -236,9 +245,16 @@ In `device/test_opus_device.py`:
 | `test_numeric_limits` | all types | `opus::numeric_limits<T>` for fp32/fp16/bf16/fp8/bf8/i32/i16/i8/u8 | all |
 | `test_finfo` | all float types | `opus::finfo<T>` (eps/max/min/tiny/bits) for fp32/fp16/bf16/fp8/bf8/fp4/e8m0 | all |
 | `test_mdiv` | 11 divisors | `opus::magic_div` integer division by magic multiply | all |
+| `test_wmma_scale` | 16x16x128 fp8 BX32/BX16 | `wmma<fp8_t,...,16,16,128>` scaled overload, per-lane E8M0 scale | gfx1250 |
+| `test_wmma_scale` | 16x16x128 fp4 BX32/BX16 | `wmma<fp4_t,...,16,16,128>` scaled overload via f8f6f4 (fmt=4) | gfx1250 |
+| `test_wmma_scale` | 32x16x128 fp4 BX32/BX16 | `wmma<fp4_t,...,32,16,128>` scaled overload (dedicated f4 inst) | gfx1250 |
+| `test_wmma_scale` | tiled 16x16x128 fp8 1x1 | `make_tiled_mma` + `wmma_adaptor_swap_ab`, scaled, 1 wave | gfx1250 |
+| `test_wmma_scale` | tiled 16x16x128 fp8 2x2 | `make_tiled_mma`, 4 waves (32x32 block), scaled | gfx1250 |
+| `test_wmma_scale` | tiled 16x16x128 fp8 4x1 | `make_tiled_mma`, 4 waves (64x16 block), scaled | gfx1250 |
+| `test_wmma_scale` | per-lane scale fp8 | Random E8M0 per m-row/n-col, bitwise exact | gfx1250 |
 | `test_workgroup_barrier` | cumulative + streamk | `opus::workgroup_barrier` cross-workgroup synchronization | all |
 
-Total: **50+ test calls** (14 MFMA + 4 MXFP + 1 vector_add + 1 async_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
+Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 vector_add + 1 async_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
 
 ## Notes
 
@@ -254,4 +270,5 @@ Total: **50+ test calls** (14 MFMA + 4 MXFP + 1 vector_add + 1 async_load + 11 d
 - FP8 = `float8_e4m3fnuz` (gfx942) / `float8_e4m3fn` (gfx950), BF8 = `float8_e5m2fnuz` (gfx942) / `float8_e5m2` (gfx950).
 - FP4 = E2M1 (4-bit: 1 sign, 2 exponent, 1 mantissa). Representable values: +/-{0, 0.5, 1, 1.5, 2, 3, 4, 6}. gfx950 only.
 - **MXFP** (unified into `struct mfma`, scaled `operator()` overload): gfx950-only `__builtin_amdgcn_mfma_scale_f32_{32x32x64,16x16x128}_f8f6f4` intrinsics. Support MXFP8 (fp8*fp8) and MXFP4 (fp4*fp4) with E8M0 block exponent scaling. Tests use `scale=127` (2^0=1.0, no scaling) and verify `C = A @ B` (standard matmul, **not** swap_ab). The data layout follows the CDNA4 Matrix Core specification.
+- **WMMA Scale** (unified into `struct wmma`, BX32/BX16 scaled `operator()` overloads): gfx1250-only scaled WMMA intrinsics. Supports 16x16x128 f8f6f4 (fp8 via fmt=0, fp4 via fmt=4) and 32x16x128 dedicated f4. Scale is per-lane E8M0 exponent (`scale_sel=0` reads from lanes 0-15, `=1` from lanes 16-31). Tests verify both `scale=127` (no scaling) and random per-lane scales in [122..133], plus multi-wave tiled_mma configurations (1x1, 2x2, 4x1).
 - `test_opus_device.py` does a fresh build on every run (cleans previous `.so`) to ensure changes are picked up.

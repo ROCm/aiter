@@ -192,11 +192,11 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
     return result.first->second.get();
 }
 
-extern "C" __attribute__((visibility("default"))) void gemm_a16w16_asm(AiterTensor* A,
-                     AiterTensor* B,
-                     AiterTensor* out,
-                     AiterTensor* semaphore,
-                     AiterTensor* bias,
+AITER_C_ITFS void gemm_a16w16_asm(aiter_tensor_t* A,
+                     aiter_tensor_t* B,
+                     aiter_tensor_t* out,
+                     aiter_tensor_t* semaphore,
+                     aiter_tensor_t* bias,
                      int          splitK,
                      const char*  kernelName,
                      int          bpreshuffle,
