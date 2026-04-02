@@ -232,6 +232,7 @@ def _moe_gemm_a8w4(
     EVEN_K: gl.constexpr,
     MASK_K_LIMIT: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
+    num_warps: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
 ):
 
@@ -292,7 +293,7 @@ def _moe_gemm_a8w4(
         X += start_m * stride_x_m
     else:
         IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-            1, gl.BlockedLayout([BLOCK_M, 1], [1, 32], [1, 4], [1, 0])
+            1, gl.BlockedLayout([BLOCK_M, 1], [1, 32], [1, num_warps], [1, 0])
         )
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
         GatherIndx += start_m
@@ -324,9 +325,14 @@ def _moe_gemm_a8w4(
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_K, 16]], [BLOCK_M, BLOCK_K], [1, 0]
     )
-    SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
-    )
+    if BLOCK_K <= 256:
+        SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
+        )
+    else:
+        SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[PACKED_BLOCK_K_W, 16]], [BLOCK_N, PACKED_BLOCK_K_W], [1, 0]
+        )
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
     )
@@ -516,6 +522,7 @@ def _moe_gemm_a8w4(
         w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 
         acc = gl.amd.gfx1250.wmma_scaled(x, 0, "e4m3", w, w_scales, "e2m1", acc)
+        read_idx += 1
 
     # scalar fp8 scale
     if X_static_scale is not None:
@@ -532,6 +539,7 @@ def _moe_gemm_a8w4(
     if B is not None:
         BPtrs = B + expt_id * stride_b_e
         bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
+        # Reg bank conflict here
         acc = acc + bias[None, :]
     if APPLY_SWIGLU:
         out = _swiglu(acc, alpha, limit)
