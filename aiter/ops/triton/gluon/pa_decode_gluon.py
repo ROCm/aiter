@@ -21,21 +21,30 @@ except ImportError:
     gluon = triton
     gl = tl
     GLUON_JIT_KERNEL_ENABLED = False
+
 try:
-    sched_barrier = gl.amd.sched_barrier
-    sched_group_barrier = gl.amd.sched_group_barrier
-    iglp_opt = gl.amd.iglp_opt
-    set_prio = gl.amd.set_prio
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_barrier as _amd_iglp_sched_barrier,
+        sched_group_barrier as _amd_iglp_sched_group_barrier,
+        set_prio as _amd_set_prio,
+    )
 except ImportError:
-    sched_barrier = lambda *args, **kwargs: args[0]
-    sched_group_barrier = lambda *args, **kwargs: args[0]
-    iglp_opt = lambda *args, **kwargs: args[0]
-    set_prio = lambda *args, **kwargs: args[0]
+    # ignore iglp hint
+    @gluon.jit
+    def _amd_iglp_sched_barrier(tensor, inst_mask):
+        pass
 
+    @gluon.jit
+    def _amd_iglp_sched_group_barrier(tensor,inst_mask, cnt, _):
+        pass
 
-DS_READ: gl.constexpr = gl.constexpr(0x100)
-BUFFER_LOAD: gl.constexpr = gl.constexpr(0x002)
-MFMA: gl.constexpr = gl.constexpr(0x008)
+    @gluon.jit
+    def _amd_set_prio(value, prio):
+        pass
+
+@gluon.jit
+def _fused_max_combine(a1, a2, b1, b2):
+    return tl.maximum(a1, b1), tl.maximum(a2, b2)
 
 
 @lru_cache(maxsize=1)
@@ -1050,6 +1059,13 @@ def paged_attention_decode_sliding_window_head_1(
     if KV_QUANT_MODE >= 0:
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
+    
+    DS_WRITE: gl.constexpr = 0x200
+    DS_READ: gl.constexpr = 0x100
+    VMEM_LOAD: gl.constexpr = 0x020
+    MFMA: gl.constexpr = 0x008
+    VALU: gl.constexpr = 0x002
+    
     sequence_idx = gl.program_id(0)
     mtp_idx = gl.program_id(1)
     split_idx = gl.program_id(2)
@@ -1616,6 +1632,7 @@ def paged_attention_decode_sliding_window_head_1(
             layout=qk_mfma_layout,
         )
         # Load key quantization scales if needed (overlaps with key tensor load)
+        key_tensor = _amd_iglp_sched_barrier(key_tensor, 0x0)
         if KV_QUANT_MODE == 1:
             # Per-token quantization - prepare offsets while key loads
             if MAX_NUM_KV_BLOCKS_PER_COMPUTE == 1:
@@ -1713,6 +1730,21 @@ def paged_attention_decode_sliding_window_head_1(
         attention_scores = gl.reshape(
             attention_scores, [QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE]
         )
+        if KV_QUANT_MODE == 1:
+            value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 1, 0)
+            value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+            value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 1, 0)
+            value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+
+        value_tensor = _amd_iglp_sched_barrier(value_tensor, 0x0)
         qk_column_offsets = (
             kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + qk_column_indices
         )
@@ -1813,6 +1845,7 @@ def paged_attention_decode_sliding_window_head_1(
                 mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
             )
 
+        kv_block_numbers2 = _amd_iglp_sched_barrier(kv_block_numbers2, 0x0)
         boundary_mask = qk_row_mask[:, None] & causal_mask
 
         attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
@@ -1833,10 +1866,13 @@ def paged_attention_decode_sliding_window_head_1(
             value_scale_value = gl.where(
                 valid_token_mask, value_scale_value, float(0.0)
             )
-            # Fused reduction: compute both max operations together to share barrier
-            # This allows the compiler to merge the cross-wave synchronization
-            current_max_logits = gl.max(attention_scores, axis=1)
-            value_scale_max = gl.max(value_scale_value, axis=0)
+            value_scale_broadcast = tl.broadcast_to(value_scale_value[None, :], attention_scores.shape)
+            current_max_logits, value_scale_max_2d = gl.reduce(
+                (attention_scores, value_scale_broadcast), axis=1, combine_fn=_fused_max_combine
+                )
+            # All rows are identical (broadcast from 1D); collapse to scalar.
+            # This is a cheap intra-wave reduction, no extra cross-wave barrier.
+            value_scale_max = gl.max(value_scale_max_2d, axis=0)
         else:
             # Update running maximum for numerical stability
             current_max_logits = gl.max(attention_scores, axis=1)
@@ -1882,7 +1918,6 @@ def paged_attention_decode_sliding_window_head_1(
                 # This reduces ~12 instructions to ~3-4 instructions with acceptable precision loss
                 # The relative error is < 2^-22 which is sufficient for FP8 quantization scaling
                 inv_value_scale_max = hip_libdevice.fast_dividef(1.0, value_scale_max + 1e-8)
-                # Fuse FP8_MAX_VALUE into the scale factor to reduce one multiplication
                 fp8_inv_scale = float(FP8_MAX_VALUE) * inv_value_scale_max
                 value_scale_value = value_scale_value * fp8_inv_scale
                 attention_probs = value_scale_value[None, :] * attention_probs
@@ -1914,11 +1949,21 @@ def paged_attention_decode_sliding_window_head_1(
             layout=pv_mfma_layout,
         )
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
+        key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
         key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
 
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
         if KV_QUANT_MODE >= 0:
             attention_accumulator += probability_scale * attention_output
         else:
