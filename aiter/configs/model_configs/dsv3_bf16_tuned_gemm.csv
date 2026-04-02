@@ -30,7 +30,6 @@ cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,ke
 256,48,7168,2048,False,torch.bfloat16,torch.bfloat16,False,False,asm,3,2,13.0225,_ZN5aiter39bf16gemm_fp32bf16_tn_48x64_splitk_cleanE,0.0034,108.22,2322.51
 256,48,16160,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,65.2215,auto,0.0,170.5,3586.38
 256,64,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,asm,5,16,7.9784,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.0302,29.44,579.1
-256,64,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,asm,5,6,15.3187,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.018,126.5,2054.06
 256,64,3072,1536,False,torch.bfloat16,torch.bfloat16,False,False,asm,7,4,9.2849,_ZN5aiter39bf16gemm_fp32bf16_tn_80x64_splitk_cleanE,0.0078,65.05,1079.93
 256,64,7168,2048,False,torch.bfloat16,torch.bfloat16,False,False,asm,5,2,13.5831,_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE,0.0034,138.34,2248.37
 256,64,16160,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,65.4327,auto,0.0,226.6,3586.22
@@ -40,7 +39,6 @@ cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,ke
 256,80,7168,2048,False,torch.bfloat16,torch.bfloat16,False,False,asm,7,2,14.0021,_ZN5aiter39bf16gemm_fp32bf16_tn_80x64_splitk_cleanE,0.0034,167.75,2202.15
 256,80,16160,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,84.1977,auto,0.0,220.12,2795.83
 256,96,256,7168,False,torch.bfloat16,torch.bfloat16,False,False,asm,8,16,8.6162,_ZN5aiter39bf16gemm_fp32bf16_tn_96x64_splitk_cleanE,0.0321,40.89,591.38
-256,96,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,asm,8,6,16.4247,_ZN5aiter39bf16gemm_fp32bf16_tn_96x64_splitk_cleanE,0.018,176.97,1951.9
 256,96,3072,1536,False,torch.bfloat16,torch.bfloat16,False,False,asm,8,4,9.668,_ZN5aiter39bf16gemm_fp32bf16_tn_96x64_splitk_cleanE,0.0076,93.71,1067.64
 256,96,7168,2048,False,torch.bfloat16,torch.bfloat16,False,False,asm,8,2,14.2839,_ZN5aiter39bf16gemm_fp32bf16_tn_96x64_splitk_cleanE,0.0034,197.33,2179.35
 256,96,16160,7168,False,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,86.0249,auto,0.0,258.53,2745.12

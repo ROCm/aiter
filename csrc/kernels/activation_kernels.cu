@@ -10,7 +10,6 @@
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
-#include "hip_compat.h"
 #include "py_itfs_common.h"
 #include <hip/hip_bf16.h>
 
