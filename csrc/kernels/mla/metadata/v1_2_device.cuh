@@ -178,7 +178,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                     1;
                             }
                         }
-                        batch_tail = ck_tile::max(batch_tail, 0);
+                        batch_tail       = ck_tile::max(batch_tail, 0);
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end - batch_tail);
@@ -320,7 +320,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                  1;
                                 }
                             }
-                            batch_tail = ck_tile::max(batch_tail, 0);
+                            batch_tail       = ck_tile::max(batch_tail, 0);
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
@@ -456,16 +456,29 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
-    const bool natively_supported = (num_heads == 16) ||
-                                    ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 &&
-                                     kv_is_fp8 && (max_seqlen_qo == 4)) ||
-                                    ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
+    const bool natively_supported =
+        (num_heads == 16) ||
+        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
+         (max_seqlen_qo == 4)) ||
+        ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
+
+    const bool use_qseqlen_fold = !natively_supported && (arch_id == "gfx950") && q_is_fp8 &&
+                                  kv_is_fp8 && (num_heads > 16) &&
+                                  (uni_seqlen_qo * (num_heads / 16) == 4);
 
     if((natively_supported == false) && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
-        num_batches *= qk_batch_ratio;
+        if(use_qseqlen_fold)
+        {
+            uni_seqlen_qo *= qk_batch_ratio;
+            qk_batch_ratio = 1;
+        }
+        else
+        {
+            num_batches *= qk_batch_ratio;
+        }
     }
 
     TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
