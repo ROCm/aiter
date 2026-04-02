@@ -144,9 +144,9 @@ def get_fewer_x_vals():
 
 
 @pytest.mark.parametrize(
-    "in_dtype, out_dtype, m, n, k",
+    "in_dtype, m, n, k",
     [
-        (in_dtype, out_dtype, *shape)
+        (in_dtype, *shape)
         for in_dtype in ["fp8e4m3", "fp8e5m2"]
         for shape in get_x_vals()
     ],
@@ -201,9 +201,9 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 
 
 @pytest.mark.parametrize(
-    "in_dtype, out_dtype, m, n, k, layout, output",
+    "out_dtype, m, n, k, layout, output",
     [
-        (in_dtype, out_dtype, *shape, layout, output)
+        (out_dtype, *shape, layout, output)
         for out_dtype in ["fp16", "fp32", "int32"]
         for shape in get_fewer_x_vals()
         for layout in ["TN", "TT", "NN", "NT"]
@@ -221,6 +221,8 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
 
     torch.cuda.empty_cache()
+
+    in_dtype = "int8"
 
     if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
         pytest.skip(
