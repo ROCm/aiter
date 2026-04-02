@@ -363,12 +363,12 @@ void all_reduce(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
-    bool is_broadcast_reg_outptr = (reg_out_ptr == 0);
+    bool use_reg_out = (reg_out_ptr != 0);
 
     if(reg_inp_ptr == 0 && reg_out_ptr == 0)
     {
         _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
-                    use_new, open_fp8_quant, is_broadcast_reg_outptr);
+                    use_new, open_fp8_quant, false);
         return;
     }
 
@@ -381,7 +381,7 @@ void all_reduce(fptr_t _fa,
         actual_inp = (void*)reg_inp_ptr;
     }
 
-    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
+    if(use_reg_out)
     {
         if(data_bytes > reg_out_bytes)
             throw std::runtime_error("registered output buffer is too small to contain the output");
@@ -389,9 +389,9 @@ void all_reduce(fptr_t _fa,
     }
 
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
-                use_new, open_fp8_quant, is_broadcast_reg_outptr);
+                use_new, open_fp8_quant, use_reg_out);
 
-    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
+    if(use_reg_out)
     {
         HIP_CALL(hipMemcpyAsync(out.data_ptr(), (void*)reg_out_ptr, data_bytes,
                                 hipMemcpyDeviceToDevice, stream));
