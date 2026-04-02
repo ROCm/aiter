@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
+import math
 import os
 
 
@@ -76,6 +77,100 @@ def _ki(tile_m, tile_n, tile_k, lds_stage,
     )
 
 
+def _smem_align(ptr: int, align: int = 16) -> int:
+    if ptr % align == 0:
+        return ptr
+    return (ptr + align - 1) // align * align
+
+
+def _smem_finalize_size(used_ptr: int) -> int:
+    """Match FlyDSL SmemAllocator.finalize: align ptr to 128, min 128."""
+    total = _smem_align(used_ptr, 128)
+    if total == 0:
+        return 128
+    return total
+
+
+def preshuffle_gemm_estimated_lds_bytes(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    *,
+    in_dtype: str = "fp8",
+    out_dtype: str = "bf16",
+    lds_stage: int = 2,
+    use_cshuffle_epilog: int = 0,
+) -> int:
+    """Estimated total LDS (bytes) for preshuffle_gemm: sum of two smem globals.
+
+    Mirrors ``preshuffle_gemm.py`` ping/pong allocation; used to skip tune
+    instances that exceed AMDGPU per-kernel LDS limits (e.g. 64 KiB on gfx942).
+    """
+    is_fp4 = in_dtype == "fp4"
+    elem_bytes = 1 if in_dtype in ("fp8", "int8", "int4", "fp4") else 2
+    a_elem_vec_pack = 2 if is_fp4 else 1
+    tile_k_bytes = int(tile_k) * elem_bytes
+    lds_tile_bytes = int(tile_m) * tile_k_bytes // a_elem_vec_pack
+    # Epilogue staging in LDS is fp16/bf16-sized (2 bytes per element).
+    lds_out_bytes = (
+        2 * int(tile_m) * int(tile_n) if int(use_cshuffle_epilog) else 0
+    )
+
+    ptr_pong = 0
+    ptr_ping = 0
+    if int(lds_stage) == 2:
+        buffer_size_bytes = max(lds_tile_bytes, lds_out_bytes // 2)
+        buffer_size_elems = (
+            buffer_size_bytes if elem_bytes == 1 else buffer_size_bytes // 2
+        )
+        bsz = buffer_size_elems * elem_bytes
+        ptr_pong = _smem_align(ptr_pong) + bsz
+        ptr_ping = _smem_align(ptr_ping) + bsz
+    else:
+        lds_total_bytes = max(lds_tile_bytes, lds_out_bytes)
+        lds_total_elems = (
+            lds_total_bytes if elem_bytes == 1 else lds_total_bytes // 2
+        )
+        ptr_pong = _smem_align(ptr_pong) + lds_total_elems * elem_bytes
+
+    return _smem_finalize_size(ptr_pong) + _smem_finalize_size(ptr_ping)
+
+
+def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
+    """LDS estimate using dtypes from a tune ``kernelInstance``."""
+    return preshuffle_gemm_estimated_lds_bytes(
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        in_dtype=ki.q_dtype_a,
+        out_dtype=ki.dtype,
+        lds_stage=ki.lds_stage,
+        use_cshuffle_epilog=ki.use_cshuffle_epilog,
+    )
+
+
+# Per-kernel LDS cap for tune filtering (must match LLVM AMDGPU
+# getAddressableLocalMemorySize for the compile target).
+# When arch cannot be parsed (no GPU, bad string), stay conservative for CDNA.
+_FALLBACK_MAX_LDS_BYTES = 65536
+
+
+def addressable_lds_bytes_for_gfx(gfx: str) -> int:
+    g = (gfx or "").strip().lower().split(":")[0]
+    if not g.startswith("gfx"):
+        return _FALLBACK_MAX_LDS_BYTES
+    if g.startswith("gfx950"):
+        return 163840
+    if g.startswith("gfx7") or g.startswith("gfx8"):
+        return 32768
+    return 65536
+
+
+def max_lds_bytes_for_tune() -> int:
+    """Addressable LDS limit for current target (from ``get_gfx()``)."""
+    return addressable_lds_bytes_for_gfx(get_gfx())
+
+
 # fmt: off
 # ---------------------------------------------------------------------------
 # Base tile configurations: (tile_m, tile_n, tile_k)
@@ -145,8 +240,36 @@ _CSHUFFLE_VALS   = (0, 1)
 _ASYNC_COPY_VALS = (0, 1)
 _WAVES_PER_EU    = (0, 1, 2, 3, 4)
 
+_WAVES_PER_WG = 4  # typical wavefronts per workgroup in FlyDSL preshuffle GEMM
 
-def _build_kernels_list(tiles_lds2, tiles_lds1):
+
+def _vgpr_per_simd(gfx: str) -> int:
+    """VGPRs per SIMD unit for the given GPU architecture."""
+    g = (gfx or "").strip().lower()
+    if g.startswith("gfx9"):
+        return 512
+    return 512
+
+
+def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
+    """Estimate max achievable waves_per_eu from C-accumulator VGPR pressure.
+
+    Each workgroup has _WAVES_PER_WG waves sharing the output tile.
+    Per-wave VGPR ≈ (accum share) * 1.5 (pipeline overhead for A/B buffers).
+    Returns the max waves_per_eu that the register file can support.
+    """
+    mfma_m = 16 if tile_m < 32 else 32
+    mfma_n = 16 if tile_n < 32 else 32
+    vgpr_per_mfma = 16 if (mfma_m >= 32 and mfma_n >= 32) else 4
+    blocks_m = math.ceil(tile_m / mfma_m)
+    blocks_n = math.ceil(tile_n / mfma_n)
+    c_vgprs_total = blocks_m * blocks_n * vgpr_per_mfma
+    c_per_wave = c_vgprs_total / _WAVES_PER_WG
+    est_per_wave = c_per_wave * 1.5
+    return int(total_vgpr / max(est_per_wave, 1))
+
+
+def _build_kernels_list(tiles_lds2, tiles_lds1, total_vgpr=512):
     tiles_by_lds = {2: tiles_lds2, 1: tiles_lds1}
     kl = {}
     idx = 0
@@ -155,15 +278,19 @@ def _build_kernels_list(tiles_lds2, tiles_lds1):
             for acp in _ASYNC_COPY_VALS:
                 for lds in _LDS_STAGES:
                     for tm, tn, tk in tiles_by_lds[lds]:
+                        if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
+                            continue
                         kl[idx] = _ki(tm, tn, tk, lds, csh, acp, wpe)
                         idx += 1
     return kl
 
 
 kernels_list_942 = _build_kernels_list(
-    _base_tiles_lds2_common + _base_tiles_lds2_942_extra, _base_tiles_lds1)
+    _base_tiles_lds2_common + _base_tiles_lds2_942_extra, _base_tiles_lds1,
+    total_vgpr=_vgpr_per_simd("gfx942"))
 kernels_list_950 = _build_kernels_list(
-    _base_tiles_lds2_common + _base_tiles_lds2_950_extra, _base_tiles_lds1)
+    _base_tiles_lds2_common + _base_tiles_lds2_950_extra, _base_tiles_lds1,
+    total_vgpr=_vgpr_per_simd("gfx950"))
 # fmt: on
 
 default_kernels_dict_942 = {

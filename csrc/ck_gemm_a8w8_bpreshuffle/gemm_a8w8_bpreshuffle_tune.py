@@ -23,17 +23,38 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
 )
 
 try:
-    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import kernels_list as kernels_list_flydsl
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        kernel_instance_estimated_lds_bytes,
+        kernels_list as kernels_list_flydsl,
+        max_lds_bytes_for_tune,
+    )
 except ImportError:
     print(
         "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled"
     )
     kernels_list_flydsl = {}
 
+    def kernel_instance_estimated_lds_bytes(_ki):
+        return 0
+
+    def max_lds_bytes_for_tune():
+        return 1 << 30
+
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 if is_flydsl_available():
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+
+def _get_padded_m(M: int) -> int:
+    if M <= 256:
+        return (M + 15) // 16 * 16
+    elif M <= 1024:
+        return (M + 31) // 32 * 32
+    elif M <= 4096:
+        return (M + 63) // 64 * 64
+    else:
+        return (M + 127) // 128 * 128
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -422,14 +443,27 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         gemm_flydsl_data_idx = [0, 1, 2, 3, 4]
         ref_data_idx = [0, 5, 2, 3, 6]
         tasks = []
+        lds_limit = max_lds_bytes_for_tune()
+        padded_m = _get_padded_m(M)
+        min_ctas = max(4, min(16, N // 64))
         for i in sorted(kernels_list_flydsl.keys()):
             ki = kernels_list_flydsl[i]
+            if kernel_instance_estimated_lds_bytes(ki) > lds_limit:
+                continue
             if N % ki.tile_n != 0 or K % ki.tile_k != 0:
                 continue
-            if M < 16:
-                if ki.tile_m != 16:
-                    continue
-            elif M % ki.tile_m != 0:
+            if padded_m % ki.tile_m != 0:
+                continue
+            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+            if num_ctas < min_ctas:
+                continue
+            if ki.tile_m == 16 and ki.tile_n == 512:
+                continue
+            if M >= 8192 and ki.tile_m < 64:
+                continue
+            if M >= 4096 and ki.tile_m < 32:
+                continue
+            if M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128:
                 continue
             kernel_name = ki.name
             info = (info_keys, i, 0, kernel_name, "flydsl")
