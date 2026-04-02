@@ -577,17 +577,6 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
-    "module_asm_layernorm": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_layernorm.cu'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "blob_gen_cmd": "''"
-    },
     "module_pos_encoding": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/pos_encoding_pybind.cu'",

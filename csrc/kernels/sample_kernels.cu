@@ -504,7 +504,7 @@ void greedy_sample(torch::Tensor& out, torch::Tensor& input)
 
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "greedy_sample", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
-        greedy_sample_kernel<input_dtype, block_size, warpSize, 16><<<grid, block>>>(
+        greedy_sample_kernel<input_dtype, block_size, warpSize, 16><<<grid, block, 0, stream>>>(
             reinterpret_cast<input_dtype*>(input.data_ptr()), out.data_ptr<int>(), N, stride_M);
     });
 }
@@ -539,7 +539,7 @@ void random_sample_outer_exponential(torch::Tensor& out,
                                                warpSize,
                                                unroll_factor,
                                                true>
-            <<<grid, block>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
+            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
                               exponentials.data_ptr<float>(),
                               temperatures.data_ptr<float>(),
                               out.data_ptr<int>(),
@@ -576,7 +576,7 @@ void mixed_sample_outer_exponential(torch::Tensor& out,
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "mix_sample_outer_exponential", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
         mix_sample_outer_exponential_kernel<input_dtype, block_size, warpSize, unroll_factor, true>
-            <<<grid, block>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
+            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
                               exponentials.data_ptr<float>(),
                               temperatures.data_ptr<float>(),
                               out.data_ptr<int>(),
@@ -645,7 +645,7 @@ void random_sample(torch::Tensor& out,
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "random_sample", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
         random_sample_kernel<input_dtype, block_size, warpSize, unroll_factor, false>
-            <<<grid, block>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
+            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
                               temperatures.data_ptr<float>(),
                               out.data_ptr<int>(),
                               lambd,
@@ -706,7 +706,7 @@ void mixed_sample(torch::Tensor& out,
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "mixed_sample", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
         mix_sample_kernel<input_dtype, block_size, warpSize, unroll_factor, false>
-            <<<grid, block>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
+            <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
                               temperatures.data_ptr<float>(),
                               out.data_ptr<int>(),
                               lambd,
@@ -807,7 +807,7 @@ void exponential(torch::Tensor& out,
     VLLM_DISPATCH_FLOATING_TYPES(out.scalar_type(), "exponential_kernel", [&] {
         using out_dtype = typename t2opus<scalar_t>::type;
         exponential_kernel<out_dtype, block_size, warpSize, unroll_factor>
-            <<<grid, block>>>(reinterpret_cast<out_dtype*>(out.data_ptr()),
+            <<<grid, block, 0, stream>>>(reinterpret_cast<out_dtype*>(out.data_ptr()),
                               lambd,
                               N,
                               stride_M,

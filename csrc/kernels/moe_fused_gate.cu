@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
 #include <ATen/hip/HIPContext.h>

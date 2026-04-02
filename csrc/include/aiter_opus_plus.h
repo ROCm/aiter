@@ -32,10 +32,10 @@ template <typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 {
     fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
-#if defined(__gfx950__)
-    constexpr float hi = 448.0f, lo = -448.0f;
-#else
+#if defined(__gfx942__)
     constexpr float hi = 240.0f, lo = -240.0f;
+#else
+    constexpr float hi = 448.0f, lo = -448.0f;
 #endif
     float a = tmp[0], b = tmp[1];
     int w;

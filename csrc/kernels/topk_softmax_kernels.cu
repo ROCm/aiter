@@ -19,7 +19,7 @@
  * limitations under the License.
  */
 #include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
 #include "py_itfs_common.h"
@@ -35,6 +35,12 @@
 
 namespace vllm {
 namespace moe {
+
+#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+static constexpr int kLaunchBoundsWarpSize = 64;
+#else
+static constexpr int kLaunchBoundsWarpSize = 32;
+#endif
 
 // Enum for shared expert scoring functions
 enum class SharedExpertScoringFunc
@@ -222,7 +228,7 @@ template <typename DTYPE,
           bool need_renorm,
           int NUM_SHARED_EXPERTS = 0,
           SharedExpertScoringFunc SCORING_FUNC = SharedExpertScoringFunc::NONE>
-__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
+__launch_bounds__(WARPS_PER_CTA * kLaunchBoundsWarpSize) __global__
     void topkGatingSoftmax(const DTYPE* input,
                            const bool* finished,
                            float* output,
@@ -745,7 +751,7 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            x += VLLM_LDG(&input[token_idx * TOPK * d + k * d + idx]);
+            x += *(&input[token_idx * TOPK * d + k * d + idx]);
         }
         out[token_idx * d + idx] = x;
     }

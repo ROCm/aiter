@@ -13,6 +13,7 @@
 #include "dispatch_utils.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
+#include "aiter_hip_common.h"
 #include "warp_sort.h"
 #include "aiter_opus_plus.h"
 #include <ATen/hip/HIPContext.h>
@@ -35,7 +36,6 @@
 #define C_LOG2E 1.44269504088896340736 // log2(e)
 #endif
 
-#define WARP_SIZE 64
 namespace aiter {
 namespace impl {
 // use this type for argsort
