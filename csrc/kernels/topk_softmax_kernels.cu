@@ -36,12 +36,6 @@
 namespace vllm {
 namespace moe {
 
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
-static constexpr int kLaunchBoundsWarpSize = 64;
-#else
-static constexpr int kLaunchBoundsWarpSize = 32;
-#endif
-
 // Enum for shared expert scoring functions
 enum class SharedExpertScoringFunc
 {
@@ -228,7 +222,7 @@ template <typename DTYPE,
           bool need_renorm,
           int NUM_SHARED_EXPERTS = 0,
           SharedExpertScoringFunc SCORING_FUNC = SharedExpertScoringFunc::NONE>
-__launch_bounds__(WARPS_PER_CTA * kLaunchBoundsWarpSize) __global__
+__launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     void topkGatingSoftmax(const DTYPE* input,
                            const bool* finished,
                            float* output,
