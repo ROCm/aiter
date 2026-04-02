@@ -306,6 +306,29 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 seqstart_q_ptr = cu_seqlens_q.data_ptr();
             }
 
+            void* sink_data_ptr   = nullptr;
+            void* d_sink_data_ptr = nullptr;
+            if (sink_.has_value() && sink_.value().defined()) {
+                const auto& sink = sink_.value();
+                CHECK_DEVICE(sink);
+                TORCH_CHECK(sink.dtype() == torch::kFloat32, "sink must be float32");
+                TORCH_CHECK(sink.is_contiguous(), "sink must be contiguous");
+                TORCH_CHECK(sink.dim() == 2 && sink.size(0) == batch_size && sink.size(1) == num_heads,
+                            "sink must have shape [batch_size, num_heads]");
+                sink_data_ptr = sink.data_ptr();
+            }
+            if (d_sink_.has_value() && d_sink_.value().defined()) {
+                TORCH_CHECK(sink_data_ptr != nullptr,
+                            "d_sink requires sink to also be provided");
+                const auto& d_sink = d_sink_.value();
+                CHECK_DEVICE(d_sink);
+                TORCH_CHECK(d_sink.dtype() == torch::kFloat32, "d_sink must be float32");
+                TORCH_CHECK(d_sink.is_contiguous(), "d_sink must be contiguous");
+                TORCH_CHECK(d_sink.dim() == 1 && d_sink.size(0) == num_heads,
+                            "d_sink must have shape [num_heads]");
+                d_sink_data_ptr = d_sink.data_ptr();
+            }
+
             return mha_bwd_args{false, // use_v3
                                 false, // is_v3_atomic_fp32
                                 false, // how_v3_bf16_cvt
@@ -336,8 +359,8 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
                                 dq_accum.data_ptr(), // dq_acc
-                                (sink_.has_value()   && sink_.value().defined())   ? sink_.value().data_ptr()   : nullptr, // sink_ptr [b, hq]
-                                (d_sink_.has_value() && d_sink_.value().defined()) ? d_sink_.value().data_ptr() : nullptr, // d_sink_ptr [hq]
+                                sink_data_ptr,   // sink_ptr [b, hq]
+                                d_sink_data_ptr, // d_sink_ptr [hq]
                                 seqstart_q_ptr, // seqstart_q_ptr (physical cumulative)
                                 seqstart_k_ptr, // seqstart_k_ptr (physical cumulative)
                                 nullptr, // seqlen_q_ptr (per-sequence logical)

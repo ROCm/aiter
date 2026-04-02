@@ -1573,7 +1573,8 @@ def _flash_attn_backward_fake(
     rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> torch.Tensor:
     batch_size = q.size(0)
     seqlen_q = q.size(1)
@@ -1612,7 +1613,8 @@ def _flash_attn_backward(
     rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> torch.Tensor:
     # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
@@ -1729,7 +1731,8 @@ def _flash_attn_backward(
             alibi_slopes,
             rng_state,
             None,
-            sink_ptr,
+            sink,
+            d_sink,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
@@ -1788,7 +1791,7 @@ class FlashAttnFunc(torch.autograd.Function):
             how_v3_bf16_cvt=how_v3_bf16_cvt,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
-            sink_ptr=sink_ptr,
+            sink_ptr=sink_ptr,  # fwd kernel still uses sink_ptr naming
         )
         if is_grad:
             assert return_lse
@@ -1846,7 +1849,8 @@ class FlashAttnFunc(torch.autograd.Function):
             rng_state,
             ctx.is_v3_atomic_fp32,
             ctx.how_v3_bf16_cvt,
-            sink_ptr=None,
+            sink=None,
+            d_sink=None,
         )
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
@@ -1869,7 +1873,8 @@ class FlashAttnFunc(torch.autograd.Function):
         # 15 how_v3_bf16_cvt
         # 16 cu_seqlens_q
         # 17 cu_seqlens_kv
-        # Need to return exactly 17 gradient entries.
+        # 18 sink_ptr
+        # Need to return exactly 18 gradient entries.
         return (
             dq,  # q
             dk,  # k
@@ -2176,7 +2181,8 @@ def _flash_attn_varlen_backward(
     zero_tensors: bool = False,
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
+    sink: Optional[Tensor] = None,
+    d_sink: Optional[Tensor] = None,
 ) -> torch.Tensor:
 
     _, nhead_q, hdim_q = q.shape
@@ -2338,7 +2344,8 @@ def _flash_attn_varlen_backward(
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
-            sink_ptr=sink_ptr,
+            sink=sink,
+            d_sink=d_sink,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
@@ -2493,7 +2500,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
             cu_seqlens_q_padded=ctx.cu_seqlens_q_padded,
             cu_seqlens_k_padded=ctx.cu_seqlens_k_padded,
-            sink_ptr=None,
+            sink=None,
+            d_sink=None,
         )
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
