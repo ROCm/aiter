@@ -8,7 +8,7 @@ import os
 import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.test_common import checkAllclose, perftest, benchmark, run_perftest
 from aiter import hipb_mm, hipb_create_extension
 from aiter.jit.utils.chip_info import get_gfx, get_cu_num
 import pandas as pd
@@ -19,6 +19,33 @@ from functools import lru_cache
 # pd.set_option('display.max_columns', 100)
 # pd.set_option('display.width', 1000)
 TEST_NUM_ITERS = 100
+
+
+def _default_mnk_from_bpreshuffle_untuned_csv():
+    """(M, N, K) tuples from aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv."""
+    csv_path = os.path.normpath(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "aiter",
+            "configs",
+            "a8w8_bpreshuffle_untuned_gemm.csv",
+        )
+    )
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"Default MNK CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    for col in ("M", "N", "K"):
+        if col not in df.columns:
+            raise ValueError(
+                f"{csv_path} must contain M, N, K; got columns {list(df.columns)}"
+            )
+    return [
+        tuple(int(df.loc[i, c]) for c in ("M", "N", "K")) for i in range(len(df))
+    ]
+
+
+_DEFAULT_MNK = _default_mnk_from_bpreshuffle_untuned_csv()
 
 
 _TUNED_SHAPES_CACHE = None
@@ -91,7 +118,36 @@ def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
+    return aiter.gemm_a8w8_ASM(
+        x, weightshuffle, x_scale, w_scale, bias, dtype=dtype
+    )
+
+
+def run_gemm_asm_splitk(
+    x,
+    weightshuffle,
+    x_scale,
+    w_scale,
+    bias=None,
+    dtype=dtypes.bf16,
+    splitK=1,
+):
+    out = torch.empty(x.shape[0], weightshuffle.shape[0], dtype=dtype, device=x.device)
+    bias_f32 = (
+        bias.to(dtypes.fp32)
+        if bias is not None and bias.dtype != dtypes.fp32
+        else bias
+    )
+    return aiter.gemm_a8w8_asm(
+        x,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        "",
+        bias_f32,
+        splitK=splitK,
+    )
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -338,6 +394,143 @@ def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk, pad_a=128
     aiter.logger.info("gemm_a8w8 summary (markdown):\n%s", df_md)
 
 
+def _format_exc_short(exc: BaseException, limit: int = 160) -> str:
+    """One-line-ish message for markdown tables (avoid huge C++ stacks in repr)."""
+    s = str(exc).strip().split("\n", 1)[0]
+    if len(s) > limit:
+        return s[: limit - 3] + "..."
+    return s
+
+
+def test_gemm_splitk_sweep(
+    l_dtype,
+    l_quantDtype,
+    l_mnk,
+    pad_a=128,
+    splitk_min=1,
+    splitk_max=12,
+    sweep_ck=False,
+):
+    """Sweep splitK on low-level ASM vs torch ref.
+
+    gemm_a8w8_ASM reads tuned CSV only (not sweepable). gemm_a8w8_CK often rejects
+    explicit splitK for rowwise GEMM (RuntimeError: This GEMM is not supported),
+    so CK sweep is opt-in via sweep_ck.
+    """
+    if not sweep_ck:
+        aiter.logger.info(
+            "splitK sweep: ASM only (CK rowwise rarely supports arbitrary splitK). "
+            "Pass --splitk_sweep_ck to also try gemm_a8w8_CK(..., splitK=sk)."
+        )
+    rows = []
+    for dtype in l_dtype:
+        for quantDtype in l_quantDtype:
+            for m, n, k in l_mnk:
+                x = torch.randn((m, k), dtype=dtype, device="cuda")
+                weight = torch.randn((n, k), dtype=dtype, device="cuda")
+                x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
+                weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
+                weightshuffle = shuffle_weight(weight, layout=(16, 16))
+                pad_k = max(pad_a, 0)
+                if pad_k > 0:
+                    x_full = torch.empty_strided(
+                        (m, k + pad_k),
+                        (k + pad_k, 1),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                    x_full[:, :k] = x
+                    x_asm = x_full[:, :k]
+                else:
+                    x_asm = x
+                if quantDtype == dtypes.fp8:
+                    bias = None
+                else:
+                    bias = torch.rand([1, n], dtype=dtype, device="cuda") * 10
+
+                a, _ = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+
+                run_asm = (
+                    dtype == dtypes.bf16
+                    and quantDtype == dtypes.i8
+                    and bias is not None
+                    and get_gfx() == "gfx942"
+                )
+
+                for sk in range(splitk_min, splitk_max + 1):
+                    row = {
+                        "dtype": str(dtype),
+                        "m": m,
+                        "n": n,
+                        "k": k,
+                        "quantDtype": str(quantDtype),
+                        "splitK": sk,
+                        "ck us": None,
+                        "ck err": None,
+                        "ck note": "",
+                        "asm us": None,
+                        "asm err": None,
+                        "asm note": "",
+                    }
+                    if sweep_ck:
+                        try:
+                            def _run_ck():
+                                return aiter.gemm_a8w8_CK(
+                                    x,
+                                    weight,
+                                    x_scale,
+                                    w_scale,
+                                    bias,
+                                    dtype,
+                                    splitK=sk,
+                                )
+
+                            b, ck_avg = run_perftest(_run_ck, num_iters=TEST_NUM_ITERS)
+                            row["ck us"] = round(float(ck_avg), 4)
+                            row["ck err"] = checkAllclose(
+                                a,
+                                b,
+                                msg=f"splitK={sk} ck: ",
+                                rtol=1e-2,
+                                atol=1e-2,
+                                printLog=False,
+                            )
+                        except Exception as e:
+                            row["ck note"] = _format_exc_short(e)
+
+                    if run_asm:
+                        bias_f32 = bias.to(dtypes.fp32)
+                        try:
+                            d, asm_avg = run_perftest(
+                                run_gemm_asm_splitk,
+                                x_asm,
+                                weightshuffle,
+                                x_scale,
+                                w_scale,
+                                bias_f32,
+                                dtype,
+                                sk,
+                                num_iters=TEST_NUM_ITERS,
+                            )
+                            row["asm us"] = round(float(asm_avg), 4)
+                            row["asm err"] = checkAllclose(
+                                a,
+                                d,
+                                msg=f"splitK={sk} asm: ",
+                                rtol=1e-2,
+                                atol=1e-2,
+                                printLog=False,
+                            )
+                        except Exception as e:
+                            row["asm note"] = _format_exc_short(e)
+
+                    rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("gemm_a8w8 splitK sweep (markdown):\n%s", df_md)
+
+
 def test_skinny_gemm_a8w8_pertoken_quant():
     # seed = 8779
     # torch.manual_seed(seed)
@@ -427,52 +620,54 @@ parser.add_argument(
     help="Pad A on K dimension, stride_a = K + pad_a.",
 )
 parser.add_argument(
+    "--splitk_sweep",
+    action="store_true",
+    help="Sweep splitK from splitk_min to splitk_max: ASM via gemm_a8w8_asm(..., splitK=sk) vs "
+    "torch (matches bpreshuffle ASM tuning). CK optional via --splitk_sweep_ck (rowwise CK "
+    "often errors on arbitrary splitK). Skips the default gemm table and skinny_gemm.",
+)
+parser.add_argument(
+    "--splitk_sweep_ck",
+    action="store_true",
+    help="With --splitk_sweep, also try gemm_a8w8_CK(..., splitK=sk) each step (may fail with "
+    "'This GEMM is not supported' for many shapes).",
+)
+parser.add_argument(
+    "--splitk_min",
+    type=int,
+    default=1,
+    help="Inclusive lower bound for --splitk_sweep (default 1).",
+)
+parser.add_argument(
+    "--splitk_max",
+    type=int,
+    default=12,
+    help="Inclusive upper bound for --splitk_sweep (default 12).",
+)
+parser.add_argument(
     "-mnk",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[
-        # qkv_proj
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        # attn_out
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-        # hipmm preshuffle
-        (16, 7424, 8192),
-        (32, 7424, 8192),
-        (48, 7424, 8192),
-        (64, 7424, 8192),
-        (4096, 7424, 8192),
-        (5120, 7424, 8192),
-        (8192, 7424, 8192),
-    ],
-    help="""Shape of mnk.
-    e.g. -mnk 1280,8192,1024""",
+    default=_DEFAULT_MNK,
+    help="Shape list (m,n,k) per row. Default: M,N,K from "
+    "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv. e.g. -mnk 1280,8192,1024",
 )
 
 args = parser.parse_args()
 
-test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk, args.pad_a)
-test_skinny_gemm_a8w8_pertoken_quant()
+if args.splitk_min < 1 or args.splitk_max < args.splitk_min:
+    parser.error("--splitk_min/--splitk_max must satisfy 1 <= splitk_min <= splitk_max")
+
+if args.splitk_sweep:
+    test_gemm_splitk_sweep(
+        args.dtype,
+        args.quantDtype,
+        args.mnk,
+        pad_a=args.pad_a,
+        splitk_min=args.splitk_min,
+        splitk_max=args.splitk_max,
+        sweep_ck=args.splitk_sweep_ck,
+    )
+else:
+    test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk, args.pad_a)
+    test_skinny_gemm_a8w8_pertoken_quant()

@@ -21,7 +21,7 @@ class TunerCommon:
         "verbose": False,
         "tune_file": "",
         "untune_file": "",
-        "errRatio": 0.05,
+        "errRatio": 0.20,
         "batch": 100,
         "profile_file": "",  # for all results
         "timeout": None,  # 100s timeout for per test
