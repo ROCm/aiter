@@ -331,9 +331,6 @@ def test_biased_grouped_topk(
         scale_factor,
     )
 
-    w_sglang = _[0]
-    id_sglang = _[1]
-
     id_sglang, _sglang = torch.sort(id_sglang)
     w_sglang = w_sglang.gather(1, _sglang)
     ret["us_sglang"] = us_sglang
