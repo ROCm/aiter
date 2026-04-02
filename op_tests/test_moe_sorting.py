@@ -154,23 +154,26 @@ def test_moe_sorting(
         atol=0,
         msg="num_tokens_post_padded",
     )
-    mask = sorted_ids_a != (topk << 24 | topk_ids.shape[0])
     num_tokens_post_pad = num_tokens_post_padded_a[0].item()
     checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
         sorted_ids_b[:num_tokens_post_pad],
         msg="sorted_ids",
     )
+    mask = sorted_ids_a[:num_tokens_post_pad] != (topk << 24 | topk_ids.shape[0])
     checkAllclose(
-        sorted_weights_a[mask],
-        sorted_weights_b[mask],
+        sorted_weights_a[:num_tokens_post_pad][mask],
+        sorted_weights_b[:num_tokens_post_pad][mask],
         msg="sorted_weights",
     )
 
-    expert_mask = sorted_expert_ids_a != -1
+    num_expert_blocks = (num_tokens_post_pad + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M
+    valid_eids_a = sorted_expert_ids_a[:num_expert_blocks]
+    valid_eids_b = sorted_expert_ids_b[:num_expert_blocks]
+    eid_mask = valid_eids_a != -1
     checkAllclose(
-        sorted_expert_ids_a[expert_mask],
-        sorted_expert_ids_b[expert_mask],
+        valid_eids_a[eid_mask],
+        valid_eids_b[eid_mask],
         msg="sorted_expert_ids",
     )
     return {"us": avg_b}

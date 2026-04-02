@@ -41,7 +41,7 @@ def _moe_sorting_impl(
     device = topk_ids.device
     M, topk = topk_ids.shape
     if expert_mask is not None:
-        key = expert_mask.data_ptr()
+        key = (expert_mask.data_ptr(), expert_mask.numel())
         if key not in _local_expert_count_cache:
             _local_expert_count_cache[key] = int((expert_mask >= 0).sum().item())
         n_experts = _local_expert_count_cache[key]
