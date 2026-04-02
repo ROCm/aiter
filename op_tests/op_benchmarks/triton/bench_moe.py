@@ -306,7 +306,8 @@ def run_act_mul_benchmark(args):
         mem_write = n_rows * d * elem
         flops = float(n_rows * d * 8)
 
-        fn = lambda: act_mul(x, activation, out=out)
+        def fn():
+            return act_mul(x, activation, out=out)
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
         bandwidth = (mem_read + mem_write) / (ms * 1e-3) * 1e-9
