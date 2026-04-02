@@ -359,7 +359,9 @@ def mp_tuner(
         gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
         return pool, gpu_map
 
-    def fill_active_tasks(pool, gpu_map, pending_task_indices, active_tasks, task_start_times):
+    def fill_active_tasks(
+        pool, gpu_map, pending_task_indices, active_tasks, task_start_times
+    ):
         """
         Submit only up to `parallel_num` in-flight tasks.
 
@@ -380,7 +382,9 @@ def mp_tuner(
     task_start_times = {}
     check_interval = 10  # Check every 10 seconds for responsive polling
 
-    fill_active_tasks(pool, gpu_map, pending_task_indices, active_tasks, task_start_times)
+    fill_active_tasks(
+        pool, gpu_map, pending_task_indices, active_tasks, task_start_times
+    )
 
     timeout_msg = (
         f"timeout={timeout}s each" if timeout is not None else "no timeout limit"
@@ -536,7 +540,9 @@ def mp_tuner(
             )
             continue
 
-        fill_active_tasks(pool, gpu_map, pending_task_indices, active_tasks, task_start_times)
+        fill_active_tasks(
+            pool, gpu_map, pending_task_indices, active_tasks, task_start_times
+        )
 
         # Small sleep to avoid busy waiting
         if active_tasks:

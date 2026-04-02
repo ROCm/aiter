@@ -40,9 +40,7 @@ def _default_mnk_from_bpreshuffle_untuned_csv():
             raise ValueError(
                 f"{csv_path} must contain M, N, K; got columns {list(df.columns)}"
             )
-    return [
-        tuple(int(df.loc[i, c]) for c in ("M", "N", "K")) for i in range(len(df))
-    ]
+    return [tuple(int(df.loc[i, c]) for c in ("M", "N", "K")) for i in range(len(df))]
 
 
 _DEFAULT_MNK = _default_mnk_from_bpreshuffle_untuned_csv()
@@ -118,9 +116,8 @@ def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_ASM(
-        x, weightshuffle, x_scale, w_scale, bias, dtype=dtype
-    )
+    # return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
+    return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias, dtype=dtype)
 
 
 def run_gemm_asm_splitk(
@@ -134,9 +131,7 @@ def run_gemm_asm_splitk(
 ):
     out = torch.empty(x.shape[0], weightshuffle.shape[0], dtype=dtype, device=x.device)
     bias_f32 = (
-        bias.to(dtypes.fp32)
-        if bias is not None and bias.dtype != dtypes.fp32
-        else bias
+        bias.to(dtypes.fp32) if bias is not None and bias.dtype != dtypes.fp32 else bias
     )
     return aiter.gemm_a8w8_asm(
         x,
@@ -220,9 +215,6 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128):
 
     avg_d = None
     err_d = None
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
     if (
         dtype == dtypes.bf16
         and quantDtype == dtypes.i8
@@ -474,6 +466,7 @@ def test_gemm_splitk_sweep(
                     }
                     if sweep_ck:
                         try:
+
                             def _run_ck():
                                 return aiter.gemm_a8w8_CK(
                                     x,
@@ -669,5 +662,7 @@ if args.splitk_sweep:
         sweep_ck=args.splitk_sweep_ck,
     )
 else:
-    test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk, args.pad_a)
+    test_normal_gemm_a8w8_pertoken_quant(
+        args.dtype, args.quantDtype, args.mnk, args.pad_a
+    )
     test_skinny_gemm_a8w8_pertoken_quant()
