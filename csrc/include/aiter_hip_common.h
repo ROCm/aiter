@@ -242,6 +242,40 @@ static uint32_t get_num_cu_func()
     return num_cu;
 }
 
+static uint32_t get_warp_size_func()
+{
+    static const uint32_t warp_size = []() {
+        hipDevice_t dev;
+        hipDeviceProp_t dev_prop;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+        return static_cast<uint32_t>(dev_prop.warpSize);
+    }();
+    return warp_size;
+}
+
+struct WarpSizeValue
+{
+    __host__ __device__ constexpr operator int() const
+    {
+#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__GFX9__)
+        return 64;
+#else
+        return 32;
+#endif
+#else
+        if(__builtin_is_constant_evaluated())
+        {
+            return 64; // host pass fallback
+        }
+        return static_cast<int>(get_warp_size_func());
+#endif
+    }
+};
+
+inline constexpr WarpSizeValue WARP_SIZE{};
+
 static int get_pci_chip_id()
 {
     static const int chip_id = []() {

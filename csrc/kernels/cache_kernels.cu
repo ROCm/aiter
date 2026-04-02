@@ -6,7 +6,7 @@
 #include <torch/all.h>
 
 #include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 
@@ -1305,16 +1305,16 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
       // GPT-NeoX style rotary embedding.
       x_index = rot_offset;
       y_index = embed_dim + rot_offset;
-      cos = VLLM_LDG(cos_ptr + x_index);
-      sin = VLLM_LDG(sin_ptr + x_index);
+      cos = *(cos_ptr + x_index);
+      sin = *(sin_ptr + x_index);
     }
     else
     {
       // GPT-J style rotary embedding.
       x_index = 2 * rot_offset;
       y_index = 2 * rot_offset + 1;
-      cos = VLLM_LDG(cos_ptr + x_index / 2);
-      sin = VLLM_LDG(sin_ptr + x_index / 2);
+      cos = *(cos_ptr + x_index / 2);
+      sin = *(sin_ptr + x_index / 2);
     }
 
     const scalar_t x = arr_in[x_index];
@@ -1474,16 +1474,16 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
       // GPT-NeoX style rotary embedding.
       x_index = threadIdx.x;
       y_index = embed_dim + threadIdx.x;
-      cos = cos_ptr[x_index];//VLLM_LDG(cos_ptr + x_index);
-      sin = sin_ptr[x_index];//VLLM_LDG(sin_ptr + x_index);
+      cos = cos_ptr[x_index];//*(cos_ptr + x_index);
+      sin = sin_ptr[x_index];//*(sin_ptr + x_index);
     }
     else
     {
       // GPT-J style rotary embedding.
       x_index = 2 * threadIdx.x;
       y_index = 2 * threadIdx.x + 1;
-      cos = cos_ptr[x_index/2];//VLLM_LDG(cos_ptr + x_index / 2);
-      sin = sin_ptr[x_index/2];//VLLM_LDG(sin_ptr + x_index / 2);
+      cos = cos_ptr[x_index/2];//*(cos_ptr + x_index / 2);
+      sin = sin_ptr[x_index/2];//*(sin_ptr + x_index / 2);
     }
     const int64_t token_head_in = token_idx * q_pe_stride_0 + head_idx * q_pe_stride_1;
     const int rot_offset = threadIdx.x;
@@ -1758,16 +1758,16 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
             // GPT-NeoX style rotary embedding.
             x_index = rot_offset;
             y_index = embed_dim + rot_offset;
-            cos = VLLM_LDG(cos_ptr + x_index);
-            sin = VLLM_LDG(sin_ptr + x_index);
+            cos = *(cos_ptr + x_index);
+            sin = *(sin_ptr + x_index);
           }
           else
           {
             // GPT-J style rotary embedding.
             x_index = 2 * rot_offset;
             y_index = 2 * rot_offset + 1;
-            cos = VLLM_LDG(cos_ptr + x_index / 2);
-            sin = VLLM_LDG(sin_ptr + x_index / 2);
+            cos = *(cos_ptr + x_index / 2);
+            sin = *(sin_ptr + x_index / 2);
           }
 
           const int r_head_idx = q_vec_idx / 32;//embed_dim;
@@ -2110,13 +2110,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;  // *2
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // K RoPE: load, compute, store
@@ -2166,13 +2166,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // Q RoPE: load, compute, store
@@ -2416,13 +2416,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // K RoPE
@@ -2472,13 +2472,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // Q RoPE

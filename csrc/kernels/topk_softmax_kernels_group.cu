@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 /*
  * @Script: topk_softmax_kernels_group.cu
  * @Author: valarLip
@@ -13,6 +13,7 @@
 #include "dispatch_utils.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
+#include "aiter_hip_common.h"
 #include "warp_sort.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
@@ -34,7 +35,6 @@
 #define C_LOG2E 1.44269504088896340736 // log2(e)
 #endif
 
-#define WARP_SIZE 64
 namespace aiter {
 namespace impl {
 // use this type for argsort
