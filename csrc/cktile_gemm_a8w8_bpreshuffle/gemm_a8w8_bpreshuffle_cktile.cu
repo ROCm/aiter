@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_bpreshuffle_cktile_common.cuh"
 #include "gemm_a8w8_bpreshuffle_cktile_lookup.h"
@@ -8,7 +8,7 @@
 #include <cmath>
 
 using RowwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash
@@ -100,22 +100,25 @@ torch::Tensor gemm_a8w8_bpreshuffle_cktile(torch::Tensor& XQ,
                                            torch::Tensor& WQ,
                                            torch::Tensor& x_scale,
                                            torch::Tensor& w_scale,
-                                           torch::Tensor& Y)
+                                           torch::Tensor& Y,
+                                           int splitK)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
+    TORCH_CHECK(splitK >= 0, "splitK must be non-negative!");
 
-    int M = XQ.size(0);
-    int N = WQ.size(0);
-    int K = XQ.size(1);
+    int M      = XQ.size(0);
+    int N      = WQ.size(0);
+    int K      = XQ.size(1);
+    int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        rowwise_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        rowwise_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        rowwise_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+        rowwise_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {

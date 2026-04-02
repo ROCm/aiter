@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_bpreshuffle_common.cuh"
 #include "gemm_a8w8_bpreshuffle_lookup.h"
@@ -8,7 +8,7 @@
 #include <string>
 
 using BlockwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -72,7 +72,8 @@ torch::Tensor gemm_a8w8_bpreshuffle_tune(torch::Tensor& XQ,
     int M      = XQ.size(0);
     int N      = WQ.size(0);
     int K      = XQ.size(1);
-    int KBatch = std::pow(2, splitK);
+    TORCH_CHECK(splitK >= 0, "splitK must be non-negative!");
+    int KBatch = 1 << splitK;
 
     //if(Y.dtype() == at::ScalarType::Half)
     //{
@@ -80,7 +81,7 @@ torch::Tensor gemm_a8w8_bpreshuffle_tune(torch::Tensor& XQ,
     //}
     if (Y.dtype() == at::ScalarType::BFloat16)
     {
-        blockwise_dispatch<F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+        blockwise_dispatch<F32, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     } else
     {
         TORCH_CHECK(false, "Unsupported scales/output dtype!");
