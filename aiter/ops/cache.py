@@ -137,11 +137,11 @@ def fused_qk_rope_concat_and_cache_mla(
 
 
 @compile_ops("module_cache")
-def fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+def fused_qk_norm_rope_group_quant_cache_mla(
     q_nope: Tensor,  # [num_tokens, num_heads, qk_lora_rank]
-    q_pe: Tensor,  # [num_tokens, num_heads, pe_dim]
+    q_pe: Tensor,  # [num_tokens, num_heads, pe_dim], input and output
     kv_c: Tensor,  # [num_tokens, k_num_heads, kv_lora_rank]
-    k_pe: Tensor,  # [num_tokens, k_num_heads, pe_dim]
+    k_pe: Tensor,  # [num_tokens, k_num_heads, pe_dim], input and output
     k_weight: Tensor,  # [kv_lora_rank] RMSNorm weights for K
     q_weight: Optional[
         Tensor

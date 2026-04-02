@@ -692,7 +692,7 @@ def run_aiter_fused_norm_rope_group_quant(
     is_neox,
     is_nope_first,
 ):
-    aiter.fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+    aiter.fused_qk_norm_rope_group_quant_cache_mla(
         q_nope,
         q_pe,
         kv_c,
@@ -715,7 +715,7 @@ def run_aiter_fused_norm_rope_group_quant(
 
 
 @benchmark()
-def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+def test_fused_qk_norm_rope_group_quant_cache_mla(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     num_tokens: int,
@@ -806,7 +806,7 @@ def test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
     )
     # Correctness run: clone k_pe so in-place RoPE doesn't corrupt the original
     k_pe_out = k_pe.clone()
-    aiter.fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+    aiter.fused_qk_norm_rope_group_quant_cache_mla(
         q_nope,
         q_pe,
         kv_c,
@@ -1120,7 +1120,7 @@ def run_aiter_fused_norm_rope_qk_group_quant(
     is_neox,
     is_nope_first,
 ):
-    aiter.fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+    aiter.fused_qk_norm_rope_group_quant_cache_mla(
         q_nope,
         q_pe,
         kv_c,
@@ -1226,7 +1226,7 @@ def test_fused_qk_norm_rope_qk_group_quant_concat_and_cache_mla(
     # Correctness run
     k_pe_out = k_pe.clone()
     q_pe_kernel = q_pe.clone()  # clone q_pe for kernel (inplace RoPE)
-    aiter.fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+    aiter.fused_qk_norm_rope_group_quant_cache_mla(
         q_nope,
         q_pe_kernel,
         kv_c,
@@ -1593,7 +1593,7 @@ if "fused_norm_group_quant" in args.case:
                         for q_dtype in args.q_dtype:
                             if q_dtype == "fp8" and kv_cache_dtype != "fp8":
                                 continue
-                            ret = test_fused_qk_norm_rope_group_quant_concat_and_cache_mla(
+                            ret = test_fused_qk_norm_rope_group_quant_cache_mla(
                                 kv_lora_rank=448,
                                 qk_rope_head_dim=args.qk_rope_head_dim,
                                 num_tokens=num_token,
@@ -1612,7 +1612,7 @@ if "fused_norm_group_quant" in args.case:
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info(
-        "fused_qk_norm_rope_group_quant_concat_and_cache_mla summary (markdown):\n%s",
+        "fused_qk_norm_rope_group_quant_cache_mla summary (markdown):\n%s",
         df_md,
     )
 

@@ -220,6 +220,53 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     return data;
 }
 
+#define _ASM_DPP_MAX_F32(v, dpp_mod)                                                        \
+    do                                                                                      \
+    {                                                                                       \
+        float _r;                                                                           \
+        asm volatile("v_max_f32 %0, %1, %1 " dpp_mod " bound_ctrl:1" : "=&v"(_r) : "v"(v)); \
+        v = _r;                                                                             \
+    } while(0)
+
+template <int thread_num, bool threadBroadcast = true>
+__device__ __forceinline__ float multithread_reduce_max_dpp(float v)
+{
+    static_assert(thread_num >= 1 && thread_num <= 64 && (thread_num & (thread_num - 1)) == 0,
+                  "thread_num must be power-of-2 in [1,64]");
+
+    if constexpr(thread_num <= 1)
+        return v;
+
+    _ASM_DPP_MAX_F32(v, "quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf");
+    if constexpr(thread_num == 2)
+        return v;
+
+    _ASM_DPP_MAX_F32(v, "quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf");
+    if constexpr(thread_num == 4)
+        return v;
+
+    _ASM_DPP_MAX_F32(v, "row_half_mirror row_mask:0xf bank_mask:0xf");
+    if constexpr(thread_num == 8)
+        return v;
+
+    _ASM_DPP_MAX_F32(v, "row_mirror row_mask:0xf bank_mask:0xf");
+    if constexpr(thread_num == 16)
+        return v;
+
+    _ASM_DPP_MAX_F32(v, "row_bcast:15 row_mask:0xa bank_mask:0xf");
+    if constexpr(thread_num == 32)
+    {
+        if constexpr(threadBroadcast)
+            v = rocprim::warp_shuffle(v, thread_num - 1, thread_num);
+        return v;
+    }
+
+    _ASM_DPP_MAX_F32(v, "row_bcast:31 row_mask:0xf bank_mask:0xf");
+    if constexpr(threadBroadcast)
+        v = rocprim::warp_shuffle(v, thread_num - 1, thread_num);
+    return v;
+}
+
 template <typename T, typename F, int BlockSize, bool waveBroadcast = true>
 __device__ constexpr T block_reduce(T local, F reduce_op)
 {
