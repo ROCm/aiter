@@ -33,7 +33,6 @@ def all_reduce(
     reg_inp_bytes: int,
     reg_out_ptr: int,
     reg_out_bytes: int,
-    stream: int,
 ) -> None: ...
 
 
@@ -44,7 +43,6 @@ def reduce_scatter(
     out,  # aiter_tensor_t
     reg_ptr: int,
     reg_bytes: int,
-    stream: int,
 ) -> None: ...
 
 
@@ -54,7 +52,6 @@ def all_gather_reg(
     inp,  # aiter_tensor_t
     out,  # aiter_tensor_t
     dim: int,
-    stream: int,
 ) -> None: ...
 
 
@@ -66,7 +63,6 @@ def all_gather_unreg(
     out,  # aiter_tensor_t
     reg_bytes: int,
     dim: int,
-    stream: int,
 ) -> None: ...
 
 
@@ -82,7 +78,6 @@ def fused_allreduce_rmsnorm(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
-    stream: int,
 ) -> None: ...
 
 
@@ -99,7 +94,6 @@ def fused_allreduce_rmsnorm_quant(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
-    stream: int,
 ) -> None: ...
 
 
@@ -244,7 +238,7 @@ def register_graph_buffers(
 
 
 @compile_ops("module_custom_all_reduce")
-def allocate_meta_buffer(size: int, stream: int) -> int: ...
+def allocate_meta_buffer(size: int) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")

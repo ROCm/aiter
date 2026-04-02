@@ -77,7 +77,7 @@ class IPCBuffer:
         self._uncached = uncached
         if uncached:
             self._buffer = None
-            self._raw_ptr = ops.allocate_meta_buffer(size, _current_stream_ptr())
+            self._raw_ptr = ops.allocate_meta_buffer(size)
         else:
             self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
             self._raw_ptr = self._buffer.data_ptr()
@@ -486,7 +486,6 @@ class CustomAllreduce:
         if out is None:
             out = torch.empty_like(inp)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
         reg_out = 0 if registered_output else self._pool["output"].data_ptr
@@ -501,7 +500,6 @@ class CustomAllreduce:
             reg_inp_bytes,
             reg_out,
             reg_out_bytes,
-            stream,
         )
         return out
 
@@ -545,7 +543,6 @@ class CustomAllreduce:
         registered: bool = False,
     ):
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
@@ -554,7 +551,6 @@ class CustomAllreduce:
             _torch_to_aiter(out),
             reg,
             reg_bytes,
-            stream,
         )
 
     def custom_reduce_scatter(
@@ -588,13 +584,11 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         ops.all_gather_reg(
             self._ptr,
             _torch_to_aiter(inp),
             _torch_to_aiter(out),
             dim,
-            stream,
         )
         return out
 
@@ -608,7 +602,6 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         ops.all_gather_unreg(
             self._ptr,
             _torch_to_aiter(inp),
@@ -616,7 +609,6 @@ class CustomAllreduce:
             _torch_to_aiter(out),
             self._pool["input"].max_size,
             dim,
-            stream,
         )
         return out
 
@@ -648,7 +640,6 @@ class CustomAllreduce:
     ):
         if res_out is None:
             res_out = torch.empty_like(inp)
-        stream = _current_stream_ptr()
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
@@ -666,7 +657,6 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
-                stream,
             )
             return out, res_out
         else:
@@ -689,7 +679,6 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
-                stream,
             )
             return out, res_out, scale_out
 
