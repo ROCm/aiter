@@ -283,7 +283,8 @@ template torch::Tensor
                 "(acc_data_type)": dtype_dict[self.acc_dtype],
                 "(c_data_type)": dtype_dict[self.c_dtype],
                 "(activation)": self.activation,
-                "(has_bias)": "true" if self.activation == 2 else "false",
+                # Both swiglu (2) and swiglu_step (3) need gate-up structure
+                "(has_bias)": "true" if self.activation in [2, 3] else "false",
                 "(split_k)": "true" if self.is_split_k else "false",
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
@@ -548,7 +549,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu", "swiglu"],
+        choices=["silu", "gelu", "swiglu", "swiglu_step"],
         help="select activation",
     )
 
@@ -619,7 +620,7 @@ if __name__ == "__main__":
     quant_type = "1x32"
 
     acc_type = "float"
-    act_types = ["silu", "swiglu"]
+    act_types = ["silu", "swiglu", "swiglu_step"]
     c_dtypes = ["bf16"]
     is_split_k_l = [True, False]
 
@@ -650,7 +651,8 @@ if __name__ == "__main__":
     for a_type, c_dtype, act_type, is_split_k in itertools.product(
         a_types, c_dtypes, act_types, is_split_k_l
     ):
-        has_bias = True if act_type == "swiglu" else False
+        # Both swiglu and swiglu_step need gate-up structure
+        has_bias = True if act_type in ["swiglu", "swiglu_step"] else False
 
         # a8w8 do not support
         if a_type in ["fp8", "bf8"] and is_split_k:

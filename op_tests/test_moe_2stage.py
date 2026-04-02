@@ -4,7 +4,7 @@
 import torch
 import itertools
 import aiter
-from aiter import dtypes
+from aiter import dtypes, logger
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.int4_utils import *
 from aiter.utility import fp4_utils
@@ -353,8 +353,11 @@ parser.add_argument(
     nargs="*",
     default=[aiter.ActivationType.Silu],
     help="""Select activation type. Default: [Silu].
-    e.g.: -a gelu        # [Gelu]
-          -a silu gelu    # [Silu, Gelu]""",
+    e.g.: -a gelu                     # [Gelu]
+          -a silu gelu                # [Silu, Gelu]
+          -a swiglu                   # [Swiglu]
+          -a swiglu_step              # [Swiglu_STEP]
+          -a silu swiglu swiglu_step  # [Silu, Swiglu, Swiglu_STEP]""",
 )
 
 parser.add_argument(
@@ -422,50 +425,68 @@ for (
         aiter.QuantType.per_1x32,
         dtypes.bf16,
         dtypes.fp4x2,
-    ):
-        for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-            for m in args.tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
+    ):  # a16w4: now supports custom activation functions
+        for act_type in args.act:
+            if act_type not in [
+                aiter.ActivationType.Swiglu,
+                aiter.ActivationType.Swiglu_STEP,
+            ]:
+                logger.warning(
+                    f"Activation type {act_type} is not supported for a16w4 (per_1x32 bf16+fp4x2), skipping..."
                 )
-                df.append(ret)
+                continue
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+                for m in args.tokenNum:
+                    ret = test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        act_type,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                    )
+                    df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.fp8,
         dtypes.fp4x2,
-    ):
-        for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-            for m in args.tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
+    ):  # a8w4: now supports custom activation functions (gfx950 only)
+        for act_type in args.act:
+            if act_type not in [
+                aiter.ActivationType.Swiglu,
+                aiter.ActivationType.Swiglu_STEP,
+            ]:
+                logger.warning(
+                    f"Activation type {act_type} is not supported for a8w4 (per_1x32 fp8+fp4x2), skipping..."
                 )
-                df.append(ret)
+                continue
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
+                for m in args.tokenNum:
+                    ret = test_fmoe(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        args.expert,
+                        args.topk,
+                        act_type,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        use_g1u1=True,
+                        doweight_stage1=doweight_stage1,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                    )
+                    df.append(ret)
     elif (quant_type, aq_dtype, wq_dtype) == (
         aiter.QuantType.per_1x32,
         dtypes.fp4x2,

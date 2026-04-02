@@ -137,5 +137,21 @@ def str2Dtype(v):
 
 
 def str2ActivationType(s):
-    """Convert string to ActivationType."""
+    """Convert string to ActivationType.
+
+    Supports:
+    - 'silu', 'gelu', 'swiglu' -> capitalize directly
+    - 'swiglu_step', 'swiglustep' -> Swiglu_STEP
+    """
+    # Special case for swiglu_step -> Swiglu_STEP
+    if s.lower() in ("swiglu_step", "swiglustep"):
+        return ActivationType.Swiglu_STEP
+
+    # Case-insensitive lookup
+    s_lower = s.lower()
+    for name in dir(ActivationType):
+        if not name.startswith("_") and name.lower() == s_lower:
+            return getattr(ActivationType, name)
+
+    # Fallback to capitalize for backward compatibility
     return getattr(ActivationType, s.capitalize())

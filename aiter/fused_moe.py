@@ -266,7 +266,7 @@ def fused_moe_(
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = 512
     if quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu:
+        if activation in [ActivationType.Swiglu, ActivationType.Swiglu_STEP]:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             elif M >= bf16_fp8_bound:
@@ -985,7 +985,7 @@ def get_2stage_cfgs(
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        and activation in [ActivationType.Swiglu, ActivationType.Swiglu_STEP]
     ):
         return MOEMetadata(
             functools.partial(
@@ -1158,7 +1158,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
+            and activation in [ActivationType.Swiglu, ActivationType.Swiglu_STEP]
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -1169,7 +1169,8 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
+        and activation
+        in [aiter.ActivationType.Swiglu, aiter.ActivationType.Swiglu_STEP]
     ):
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
@@ -1245,7 +1246,7 @@ def fused_moe_2stages(
         and metadata.has_bias
         and dtype in [dtypes.bf16, dtypes.fp16]
         and quant_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        and activation in [ActivationType.Swiglu, ActivationType.Swiglu_STEP]
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
@@ -1272,7 +1273,7 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
+            and activation in [ActivationType.Swiglu, ActivationType.Swiglu_STEP]
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -1282,7 +1283,8 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
+        and activation
+        in [aiter.ActivationType.Swiglu, aiter.ActivationType.Swiglu_STEP]
     ):
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
@@ -1499,6 +1501,18 @@ def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
     return out_glu * (x_linear + 1)
 
 
+def swiglu_step(
+    x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0, out_limit: float = 15.0
+):
+    # Apply Silu to gate: gate = gate * sigmoid(gate)
+    gate_silu = x_glu * torch.sigmoid(x_glu) 
+	# Clamp gate_silu and x_linear
+    gate_silu = gate_silu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+	# Return silu(gate) * up
+    return gate_silu * x_linear
+
+
 def torch_moe_stage1(
     hidden_states,
     w1,  # E, inter_dim*2, model_dim
@@ -1592,11 +1606,14 @@ def torch_moe_stage1(
                 out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
     use_swiglu = activation == aiter.ActivationType.Swiglu
+    use_swiglu_step = activation == aiter.ActivationType.Swiglu_STEP
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
         if use_swiglu:
             out = swiglu(gate, up)
+        elif use_swiglu_step:
+            out = swiglu_step(gate, up)
         else:
             out = torch_act(gate) * up
     else:

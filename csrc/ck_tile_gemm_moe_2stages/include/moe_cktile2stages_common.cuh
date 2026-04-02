@@ -232,9 +232,12 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                 ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
-        // TODO: support more act type.
-        using FusedAct =
-            std::conditional_t<ActivationOp == 2, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
+        // TODO: support more act type. Activation mapping: 0=Silu(MoeSilu), 2=Swiglu, 3=Swiglu_STEP
+        using FusedAct = std::conditional_t<ActivationOp == 2,
+                                            ck_tile::moe::Swiglu,
+                                            std::conditional_t<ActivationOp == 3,
+                                                               ck_tile::moe::Swiglu_STEP,
+                                                               ck_tile::moe::MoeSilu>>;
 
         using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
                                                 CodegenFlatmmPipeline,

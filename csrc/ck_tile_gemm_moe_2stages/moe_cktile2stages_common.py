@@ -22,6 +22,7 @@ act_dict = {
     "silu": 0,
     # "gelu": 1,
     "swiglu": 2,
+    "swiglu_step": 3,
 }
 
 

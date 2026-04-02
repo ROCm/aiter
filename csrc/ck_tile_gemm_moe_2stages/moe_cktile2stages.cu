@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages_common.cuh"
+#include "moe_cktile2stages_heuristic_dispatch_common.h"
 #include "moe_cktile2stages_lookup.h"
 #include "moe_cktile2stages_manifest_common.h"
 #include "moe_cktile2stages_name_dispatch.h"
 #include "py_itfs_common.h"
-#include "moe_cktile2stages_heuristic_dispatch_common.h"
 #include <cmath>
 
 template <typename ADataType,
@@ -101,6 +101,52 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                                                       true>::dispatch(M, N, K, block_m);
             }
         }
+        else if(activation == 3 && has_bias)
+        {
+            if(stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      true,
+                                                      true>::dispatch(M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      true,
+                                                      true>::dispatch(M, N, K, block_m);
+            }
+        }
+        else if(activation == 3 && !has_bias)
+        {
+            if(stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      true>::dispatch(M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      true>::dispatch(M, N, K, block_m);
+            }
+        }
         else if(activation == 0 && has_bias)
         {
             if(stage == 1)
@@ -192,6 +238,52 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                                                       AccDataType,
                                                       CDataType,
                                                       2,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+        }
+        else if(activation == 3 && has_bias)
+        {
+            if(stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      true,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      true,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+        }
+        else if(activation == 3 && !has_bias)
+        {
+            if(stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
+                                                      false,
+                                                      false>::dispatch(M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType,
+                                                      BDataType,
+                                                      AccDataType,
+                                                      CDataType,
+                                                      3,
                                                       false,
                                                       false>::dispatch(M, N, K, block_m);
             }

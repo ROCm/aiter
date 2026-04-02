@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include <pybind11/pybind11.h>
 #include "aiter_enum.h"
+#include <pybind11/pybind11.h>
 
 PYBIND11_MODULE(module_aiter_enum, m)
 {
@@ -20,6 +20,7 @@ PYBIND11_MODULE(module_aiter_enum, m)
         .value("Silu", ActivationType::Silu)
         .value("Gelu", ActivationType::Gelu)
         .value("Swiglu", ActivationType::Swiglu)
+        .value("Swiglu_STEP", ActivationType::Swiglu_STEP)
         .export_values();
     pybind11::implicitly_convertible<int, QuantType>();
     pybind11::implicitly_convertible<int, ActivationType>();
