@@ -155,7 +155,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
 // D=A*B*alpha+beta*C
 AITER_CTYPES_ERROR_DEF
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     gemm_a4w4_asm,
     (
     aiter_tensor_t* A,       // A:[M, K/2] f4x2
@@ -291,5 +291,4 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                              1,   // bdy
                              1,   // bdz
                              stream});
-    return 0;
 }

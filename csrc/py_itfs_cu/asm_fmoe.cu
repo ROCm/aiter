@@ -336,7 +336,7 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& ava
 
 AITER_CTYPES_ERROR_DECL;
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe,
     (
     aiter_tensor_t* out,               // [token_cnt, dim]
@@ -380,10 +380,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                                   nullptr,
                                   nullptr,
                                   stream);
-    return 0;
 }
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_int8_g1u0,
     (
     aiter_tensor_t* out,               // [token_cnt, dim]
@@ -507,10 +506,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
-    return 0;
 }
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_g1u1,
     (
     aiter_tensor_t* out,               // [token_cnt, dim]
@@ -648,10 +646,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
-    return 0;
 }
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_g1u1_tkw1,
     (
     aiter_tensor_t* out,               // [token_cnt, dim]
@@ -719,10 +716,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream);
-    return 0;
 }
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_int8_g1u0_a16,
     (
     aiter_tensor_t* out,               // [token_cnt, dim]
@@ -781,10 +777,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                                         fc2_scale,
                                         fc2_smooth_scale,
                                         stream);
-    return 0;
 }
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_g1u1_a16,
     (
     aiter_tensor_t* out,               // [token_cnt, dim]
@@ -858,10 +853,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                                         fc2_scale,
                                         fc2_smooth_scale,
                                         stream);
-    return 0;
 }
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     fmoe_fp8_blockscale_g1u1,
     (
     aiter_tensor_t* out,               // [token_cnt, dim]
@@ -925,5 +919,4 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
     }
     else
         AITER_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
-    return 0;
 }

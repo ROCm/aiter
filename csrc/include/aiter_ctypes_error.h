@@ -21,13 +21,22 @@
 //   #include "aiter_ctypes_error.h"
 //   AITER_CTYPES_ERROR_DEF
 //
-//   AITER_CTYPES_DEFINE_ENTRYPOINT(
+//   // Preferred form for kernels with no meaningful return value:
+//   AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 //       my_kernel,
 //       (int a, float b),
 //       (a, b))
 //   {
 //       AITER_CHECK(a > 0, "a must be positive, got ", a);
-//       return 0;
+//   }
+//
+//   // Use the non-VOID form only when returning a meaningful int:
+//   AITER_CTYPES_DEFINE_ENTRYPOINT(
+//       getPaddedM,
+//       (int M),
+//       (M))
+//   {
+//       return (M + 255) & ~255;
 //   }
 //
 // Python side (aiter/jit/core.py _ctypes_call) is already generic:
@@ -49,30 +58,22 @@
 //   - extern "C" aiter_clear_last_error
 // ---------------------------------------------------------------------------
 #define AITER_CTYPES_ERROR_DEF                                                    \
-    thread_local std::string g_aiter_last_error;                                \
-                                                                                \
-    AITER_C_ITFS int aiter_ctypes_abi_version()                                   \
-    {                                                                           \
-        return 2;                                                               \
-    }                                                                           \
-                                                                                \
-    AITER_C_ITFS const char *aiter_get_last_error()                             \
-    {                                                                           \
-        return g_aiter_last_error.empty() ? nullptr                             \
-                                          : g_aiter_last_error.c_str();         \
-    }                                                                           \
-                                                                                \
-    AITER_C_ITFS void aiter_clear_last_error()                                  \
-    {                                                                           \
-        g_aiter_last_error.clear();                                             \
-    }
+    thread_local std::string g_aiter_last_error;                                  \
+                                                                                  \
+    AITER_C_ITFS int aiter_ctypes_abi_version() { return 2; }                     \
+                                                                                  \
+    AITER_C_ITFS const char* aiter_get_last_error()                               \
+    {                                                                             \
+        return g_aiter_last_error.empty() ? nullptr : g_aiter_last_error.c_str(); \
+    }                                                                             \
+                                                                                  \
+    AITER_C_ITFS void aiter_clear_last_error() { g_aiter_last_error.clear(); }
 
 // ---------------------------------------------------------------------------
 // AITER_CTYPES_ERROR_DECL -- use in additional translation units within the
 // same .so when AITER_CTYPES_ERROR_DEF is defined elsewhere.
 // ---------------------------------------------------------------------------
-#define AITER_CTYPES_ERROR_DECL                                                   \
-    extern thread_local std::string g_aiter_last_error
+#define AITER_CTYPES_ERROR_DECL extern thread_local std::string g_aiter_last_error
 
 // ---------------------------------------------------------------------------
 // aiter_safe_call -- wraps a callable (typically a lambda) with try/catch.
@@ -83,12 +84,17 @@ template <typename Func>
 inline int aiter_safe_call(std::string& tls_error, Func&& fn)
 {
     tls_error.clear();
-    try {
+    try
+    {
         return fn();
-    } catch (const std::exception& e) {
+    }
+    catch(const std::exception& e)
+    {
         tls_error = e.what();
         return -1;
-    } catch (...) {
+    }
+    catch(...)
+    {
         tls_error = "unknown C++ exception";
         return -1;
     }
@@ -96,19 +102,40 @@ inline int aiter_safe_call(std::string& tls_error, Func&& fn)
 
 // ---------------------------------------------------------------------------
 // AITER_CTYPES_DEFINE_ENTRYPOINT - define one C-ABI entrypoint with hidden
-// try/catch bridging:
+// try/catch bridging.  The _impl body returns int (0 = success).
 //   - static int <func>_impl DECL_ARGS  (user writes body here)
 //   - AITER_C_ITFS int <func> DECL_ARGS (generated wrapper)
+//
+// Use this when the function needs to return a meaningful int value to Python
+// (e.g. getPaddedM).  For pure-void kernels prefer _VOID below.
 //
 // Example:
 //   AITER_CTYPES_DEFINE_ENTRYPOINT(foo, (int x), (x)) { ...; return 0; }
 // ---------------------------------------------------------------------------
-#define AITER_CTYPES_DEFINE_ENTRYPOINT(func, DECL_ARGS, CALL_ARGS)                \
-    static int func##_impl DECL_ARGS;                                            \
-    AITER_C_ITFS int func DECL_ARGS                                              \
-    {                                                                            \
-        return aiter_safe_call(g_aiter_last_error, [&]() -> int {               \
-            return func##_impl CALL_ARGS;                                        \
-        });                                                                      \
-    }                                                                            \
+#define AITER_CTYPES_DEFINE_ENTRYPOINT(func, DECL_ARGS, CALL_ARGS)              \
+    static int func##_impl DECL_ARGS;                                           \
+    AITER_C_ITFS int func DECL_ARGS                                             \
+    {                                                                           \
+        return aiter_safe_call(g_aiter_last_error,                              \
+                               [&]() -> int { return func##_impl CALL_ARGS; }); \
+    }                                                                           \
     static int func##_impl DECL_ARGS
+
+// ---------------------------------------------------------------------------
+// AITER_CTYPES_DEFINE_ENTRYPOINT_VOID - same as above but the _impl body is
+// void; the macro supplies `return 0` automatically.  This is the preferred
+// form for kernel wrappers that have no meaningful return value.
+//
+// Example:
+//   AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(bar, (int x), (x)) { ... }
+// ---------------------------------------------------------------------------
+#define AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(func, DECL_ARGS, CALL_ARGS) \
+    static void func##_impl DECL_ARGS;                                  \
+    AITER_C_ITFS int func DECL_ARGS                                     \
+    {                                                                   \
+        return aiter_safe_call(g_aiter_last_error, [&]() -> int {       \
+            func##_impl CALL_ARGS;                                      \
+            return 0;                                                   \
+        });                                                             \
+    }                                                                   \
+    static void func##_impl DECL_ARGS

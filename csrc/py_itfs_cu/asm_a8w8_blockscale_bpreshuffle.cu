@@ -255,7 +255,7 @@ static void print_debug_info(const KernelArgs& args, const std::string& selected
 
 AITER_CTYPES_ERROR_DEF
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     gemm_a8w8_blockscale_bpreshuffle_asm,
     (
     aiter_tensor_t* A,
@@ -345,6 +345,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
     if (DebugPrint) {
         print_debug_info(args, selectedKernelName, selectedsplitK, gdx, gdy, gdz, stream, bias);
     }
+<<<<<<< HEAD
     impl_ptr->launch_kernel({&args, &arg_size, gdx / blockSizeX, gdy, gdz, blockSizeX, 1, 1, stream});
     return 0;
+=======
+    impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
+>>>>>>> d70ea2319 (add _VOID marco to define function without return value)
 }

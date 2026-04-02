@@ -1142,46 +1142,33 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args.get("third_party", []),
             )
         lib = ctypes.CDLL(so_path)
-        ctypes_status_mode = False
-        ctypes_abi_version = 1
-        err_getter = None
-        err_clear = None
-        try:
-            abi_ver_getter = getattr(lib, "aiter_ctypes_abi_version")
-            abi_ver_getter.argtypes = []
-            abi_ver_getter.restype = ctypes.c_int
-            ctypes_abi_version = abi_ver_getter()
-            ctypes_status_mode = ctypes_abi_version >= 2
-        except AttributeError:
-            ctypes_abi_version = 1
-            ctypes_status_mode = False
         c_func = getattr(lib, fc_name)
-        c_func.restype = ctypes.c_int if ctypes_status_mode else None
-        try:
-            err_getter = getattr(lib, "aiter_get_last_error")
-            err_getter.argtypes = []
-            err_getter.restype = ctypes.c_char_p
-        except AttributeError:
-            err_getter = None
-        try:
-            err_clear = getattr(lib, "aiter_clear_last_error")
-            err_clear.argtypes = []
-            err_clear.restype = None
-        except AttributeError:
-            err_clear = None
+
+        def _opt_sym(name, argtypes=(), restype=None):
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.argtypes = list(argtypes)
+                fn.restype = restype
+            return fn
+
+        abi_fn = _opt_sym("aiter_ctypes_abi_version", restype=ctypes.c_int)
+        ctypes_abi_version = abi_fn() if abi_fn else 1
+        ctypes_status_mode = ctypes_abi_version >= 2
+        err_getter = _opt_sym("aiter_get_last_error", restype=ctypes.c_char_p)
+        err_clear = _opt_sym("aiter_clear_last_error")
 
         hints = typing.get_type_hints(func)
+        ret_hint = hints.get("return")
+        ctypes_data_return = ctypes_status_mode and ret_hint is int
 
-        # In ctypes status mode, C API return value is always int status.
-        # Keep restype as c_int regardless of Python annotation (often -> None).
-        if not ctypes_status_mode:
-            ret_hint = hints.get("return")
-            if ret_hint is int:
-                c_func.restype = ctypes.c_int
-            elif ret_hint is float:
-                c_func.restype = ctypes.c_float
-            else:
-                c_func.restype = None
+        if ctypes_status_mode:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is int:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is float:
+            c_func.restype = ctypes.c_float
+        else:
+            c_func.restype = None
 
         argtypes = []
         has_tensor = False
@@ -1218,7 +1205,7 @@ def _ctypes_call(func, fc_name, md_name):
         _cache["err_getter"] = err_getter
         _cache["err_clear"] = err_clear
         _cache["ctypes_status_mode"] = ctypes_status_mode
-        _cache["ctypes_abi_version"] = ctypes_abi_version
+        _cache["ctypes_data_return"] = ctypes_data_return
         _cache["has_tensor"] = has_tensor
 
     def _check_args_before_convert(bound_args, hints):
@@ -1283,6 +1270,7 @@ def _ctypes_call(func, fc_name, md_name):
         err_getter = _cache.get("err_getter")
         err_clear = _cache.get("err_clear")
         ctypes_status_mode = _cache.get("ctypes_status_mode", False)
+        ctypes_data_return = _cache.get("ctypes_data_return", False)
 
         if AITER_LOG_MORE == 2:
             from ..test_common import log_args
@@ -1342,24 +1330,22 @@ def _ctypes_call(func, fc_name, md_name):
         if err_clear is not None:
             err_clear()
         ret = c_func(*c_args)
-        if ctypes_status_mode and ret != 0:
-            msg = f"ctypes status={ret}"
-            if err_getter is not None:
-                err = err_getter()
-                if err:
-                    msg = err.decode(errors="replace")
+
+        err_msg = None
+        if ctypes_status_mode and not ctypes_data_return and ret != 0:
+            err_msg = f"ctypes status={ret}"
+        if err_getter is not None:
+            raw = err_getter()
+            if raw:
+                err_msg = raw.decode(errors="replace")
+        if err_msg is not None:
             if err_clear is not None:
                 err_clear()
-            raise RuntimeError(f"{fc_name} failed: {msg}")
-        elif not ctypes_status_mode and err_getter is not None:
-            err = err_getter()
-            if err:
-                msg = err.decode(errors="replace")
-                if err_clear is not None:
-                    err_clear()
-                raise RuntimeError(f"{fc_name} failed: {msg}")
+            raise RuntimeError(f"{fc_name} failed: {err_msg}")
+
+        if ctypes_data_return:
+            return ret
         if ctypes_status_mode:
-            # C-ABI status mode: return code is internal status only.
             return None
         return ret
 

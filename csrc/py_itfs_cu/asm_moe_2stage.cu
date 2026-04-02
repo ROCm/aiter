@@ -147,7 +147,7 @@ static std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *
     return selected;
 }
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     moe_stage1_g1u1,
     (aiter_tensor_t *input,             // [token_cnt, model_dim] M,K
      aiter_tensor_t *w1,                // [expert, inter_dim*2, model_dim] N,K
@@ -278,5 +278,4 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
                              1,   // bdy
                              1,   // bdz
                              stream});
-    return 0;
 }

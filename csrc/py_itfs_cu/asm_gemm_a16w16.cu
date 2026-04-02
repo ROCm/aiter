@@ -195,7 +195,7 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
 
 AITER_CTYPES_ERROR_DEF
 
-AITER_CTYPES_DEFINE_ENTRYPOINT(
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     gemm_a16w16_asm,
     (aiter_tensor_t* A,
                      aiter_tensor_t* B,
@@ -268,5 +268,4 @@ AITER_CTYPES_DEFINE_ENTRYPOINT(
 
     size_t arg_size = sizeof(args);
     impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
-    return 0;
 }
