@@ -345,10 +345,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if (DebugPrint) {
         print_debug_info(args, selectedKernelName, selectedsplitK, gdx, gdy, gdz, stream, bias);
     }
-<<<<<<< HEAD
     impl_ptr->launch_kernel({&args, &arg_size, gdx / blockSizeX, gdy, gdz, blockSizeX, 1, 1, stream});
-    return 0;
-=======
-    impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
->>>>>>> d70ea2319 (add _VOID marco to define function without return value)
+
 }

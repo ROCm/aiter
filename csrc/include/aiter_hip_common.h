@@ -21,27 +21,13 @@
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
 
-enum class GPUArch
-{
-    gfx942,
-    gfx950
-};
-
-#define CHECK_COND(x)                                                                             \
-    do                                                                                            \
-    {                                                                                             \
-        if(!(x))                                                                                  \
-        {                                                                                         \
-            std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
-            std::terminate();                                                                     \
-        }                                                                                         \
-    } while(0)
-
-namespace aiter_detail {
+namespace detail {
 template <typename... Args>
-inline void check_print(std::ostream& os, Args&&... args)
+[[noreturn, noinline]] inline void aiter_check_fatal(const char* file, size_t line, Args&&... args)
 {
-    (os << ... << std::forward<Args>(args));
+    std::cerr << "[AITER] " << file << ":" << line << " ";
+    (std::cerr << ... << std::forward<Args>(args)) << std::endl;
+    std::abort();
 }
 
 template <typename... Args>
@@ -129,8 +115,8 @@ inline void load_asm_kernel(const char* name,
 #if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
         std::string fname = "hsa/" + arch_name + "/" + hsaco;
         auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
-        CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
-        CHECK_COND(hasco_obj->second.data() != nullptr);
+        AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
+        AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
         AITER_LOG_INFO("hipModuleLoad: " << fname << " GetFunction: " << name);
         HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
 #endif
