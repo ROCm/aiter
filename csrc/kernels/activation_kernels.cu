@@ -8,20 +8,16 @@
 #include <cmath>
 
 #include "aiter_hip_common.h"
-#include "ck_tile/core.hpp"
-#include "ck_tile/ops/elementwise/unary_element_wise_operation.hpp"
+#include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
 #include "hip_compat.h"
 #include "py_itfs_common.h"
-#include "vec_convert.h"
 #include <hip/hip_bf16.h>
 
-using fp8_type = ck_tile::fp8_t;
+using fp8_type = opus::fp8_t;
 
 static constexpr int32_t max_vec_size = 8;
 static constexpr int32_t max_wave_num = 8;
-
-// Type trait for computation type (all compute in native type)
 
 namespace aiter {
 
@@ -33,31 +29,28 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
                                    const int d)
 {
-    // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
+    // Buffer vector addressing constraint: float supports VEC_SIZE <= 16
     static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
                   "float type only supports VEC_SIZE up to 16");
 
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
-    using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
-    using vec_o                     = ck_tile::vec_t<DTYPE_O, VEC_SIZE_I>;
+    using vec_i                     = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
+    using vec_o                     = opus::vector_t<DTYPE_O, VEC_SIZE_I>;
+    static constexpr int32_t load_chunk_bytes =
+        sizeof(DTYPE_I) * VEC_SIZE_I % 16 == 0 ? 16 : (sizeof(DTYPE_I) * VEC_SIZE_I % 8 == 0 ? 8 : 4);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
-    auto buffer_x = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_x, oob_i);
-    auto buffer_y = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_y, oob_i);
-    buffer_x.init_raw();
-    buffer_y.init_raw();
+    auto buffer_x = opus::make_gmem<DTYPE_I>(ptr_x, oob_i * sizeof(DTYPE_I));
+    auto buffer_y = opus::make_gmem<DTYPE_I>(ptr_y, oob_i * sizeof(DTYPE_I));
 
     // Output buffer view (independent type from input)
     DTYPE_O* __restrict__ out_base  = out + token_idx * d;
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int32_t oob_o             = (d + ooba_o - 1) / ooba_o * ooba_o;
-    auto buffer_out =
-        ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(out_base, oob_o);
-    buffer_out.init_raw();
-
-    constexpr int32_t allowed_max = std::is_same<DTYPE_O, double>::value ? 8 : 16;
+    auto buffer_out = opus::make_gmem<DTYPE_O>(out_base, oob_o * sizeof(DTYPE_O));
+    constexpr int32_t allowed_max = std::is_same_v<DTYPE_O, double> ? 8 : 16;
 
     auto store_vec_segmented = [&](int64_t base_idx, const vec_o& v) __device__ {
         int64_t off = base_idx;
@@ -67,57 +60,57 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
         {
             if(allowed_max >= 16 && rem >= 16)
             {
-                using vec16 = ck_tile::vec_t<DTYPE_O, 16>;
+                using vec16 = opus::vector_t<DTYPE_O, 16>;
                 vec16 t{};
 #pragma unroll
                 for(int i = 0; i < 16; ++i)
                     t[i] = v[pos + i];
-                buffer_out.template set<vec16>(off, 0, true, t);
+                buffer_out.template store<16>(t, off);
                 off += 16;
                 pos += 16;
                 rem -= 16;
             }
             else if(rem >= 8)
             {
-                using vec8 = ck_tile::vec_t<DTYPE_O, 8>;
+                using vec8 = opus::vector_t<DTYPE_O, 8>;
                 vec8 t{};
 #pragma unroll
                 for(int i = 0; i < 8; ++i)
                     t[i] = v[pos + i];
-                buffer_out.template set<vec8>(off, 0, true, t);
+                buffer_out.template store<8>(t, off);
                 off += 8;
                 pos += 8;
                 rem -= 8;
             }
             else if(rem >= 4)
             {
-                using vec4 = ck_tile::vec_t<DTYPE_O, 4>;
+                using vec4 = opus::vector_t<DTYPE_O, 4>;
                 vec4 t{};
 #pragma unroll
                 for(int i = 0; i < 4; ++i)
                     t[i] = v[pos + i];
-                buffer_out.template set<vec4>(off, 0, true, t);
+                buffer_out.template store<4>(t, off);
                 off += 4;
                 pos += 4;
                 rem -= 4;
             }
             else if(rem >= 2)
             {
-                using vec2 = ck_tile::vec_t<DTYPE_O, 2>;
+                using vec2 = opus::vector_t<DTYPE_O, 2>;
                 vec2 t{};
                 t[0] = v[pos + 0];
                 t[1] = v[pos + 1];
-                buffer_out.template set<vec2>(off, 0, true, t);
+                buffer_out.template store<2>(t, off);
                 off += 2;
                 pos += 2;
                 rem -= 2;
             }
             else
             {
-                using vec1 = ck_tile::vec_t<DTYPE_O, 1>;
+                using vec1 = opus::vector_t<DTYPE_O, 1>;
                 vec1 t{};
                 t[0] = v[pos];
-                buffer_out.template set<vec1>(off, 0, true, t);
+                buffer_out.template store<1>(t, off);
                 off += 1;
                 pos += 1;
                 rem -= 1;
@@ -127,8 +120,18 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
-        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+        vec_i x{};
+        vec_i y{};
+        if constexpr((VEC_SIZE_I * sizeof(DTYPE_I)) % 4 == 0)
+        {
+            x = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes>(buffer_x, idx);
+            y = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes>(buffer_y, idx);
+        }
+        else
+        {
+            x = buffer_x.template load<VEC_SIZE_I>(idx);
+            y = buffer_y.template load<VEC_SIZE_I>(idx);
+        }
 
         vec_o r{};
 
@@ -138,29 +141,29 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
             // Call ACT_FN with appropriate type conversion
             DTYPE_I x_val0 = x[j];
             float ax0      = ACT_FN(x_val0);
-            float y0       = ck_tile::type_convert<float>(y[j]);
+            float y0       = opus::cast<float>(y[j]);
             if(j + 1 < VEC_SIZE_I)
             {
                 DTYPE_I x_val1      = x[j + 1];
                 float ax1           = ACT_FN(x_val1);
-                float y1            = ck_tile::type_convert<float>(y[j + 1]);
-                ck_tile::fp32x2_t a = {ax0, ax1};
-                ck_tile::fp32x2_t b = {y0, y1};
-                ck_tile::fp32x2_t c;
+                float y1            = opus::cast<float>(y[j + 1]);
+                opus::fp32x2_t a    = {ax0, ax1};
+                opus::fp32x2_t b    = {y0, y1};
+                opus::fp32x2_t c;
                 asm volatile("v_pk_mul_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
-                r[j]     = ck_tile::type_convert<DTYPE_O>(c.x);
-                r[j + 1] = ck_tile::type_convert<DTYPE_O>(c.y);
+                r[j]     = opus::cast<DTYPE_O>(c.x);
+                r[j + 1] = opus::cast<DTYPE_O>(c.y);
             }
             else
             {
-                r[j] = ck_tile::type_convert<DTYPE_O>(ax0 * y0);
+                r[j] = opus::cast<DTYPE_O>(ax0 * y0);
             }
         }
 
         if constexpr(VEC_SIZE_I == 1 || VEC_SIZE_I == 2 || VEC_SIZE_I == 4 || VEC_SIZE_I == 8 ||
                      VEC_SIZE_I == 16)
         {
-            buffer_out.template set<vec_o>(idx, 0, true, r);
+            buffer_out.template store<VEC_SIZE_I>(r, idx);
         }
         else
         {
@@ -177,26 +180,36 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                                           const int d,
                                           const float scale)
 {
-    // CK Tile buffer addressing constraint: float supports VEC_SIZE <= 16
+    // Buffer vector addressing constraint: float supports VEC_SIZE <= 16
     static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
                   "float type only supports VEC_SIZE up to 16");
 
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
-    using vec_i                     = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
+    using vec_i                     = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
+    static constexpr int32_t load_chunk_bytes =
+        sizeof(DTYPE_I) * VEC_SIZE_I % 16 == 0 ? 16 : (sizeof(DTYPE_I) * VEC_SIZE_I % 8 == 0 ? 8 : 4);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (d + ooba_i - 1) / ooba_i * ooba_i;
 
-    auto buffer_x = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_x, oob_i);
-    auto buffer_y = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_y, oob_i);
-    buffer_x.init_raw();
-    buffer_y.init_raw();
+    auto buffer_x = opus::make_gmem<DTYPE_I>(ptr_x, oob_i * sizeof(DTYPE_I));
+    auto buffer_y = opus::make_gmem<DTYPE_I>(ptr_y, oob_i * sizeof(DTYPE_I));
 
     for(int64_t idx = threadIdx.x * VEC_SIZE_I; idx < d; idx += blockDim.x * VEC_SIZE_I)
     {
-        vec_i x = buffer_x.template get<vec_i>(idx, 0, true);
-        vec_i y = buffer_y.template get<vec_i>(idx, 0, true);
+        vec_i x{};
+        vec_i y{};
+        if constexpr((VEC_SIZE_I * sizeof(DTYPE_I)) % 4 == 0)
+        {
+            x = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes>(buffer_x, idx);
+            y = load_vector_nbytes<DTYPE_I, VEC_SIZE_I, load_chunk_bytes>(buffer_y, idx);
+        }
+        else
+        {
+            x = buffer_x.template load<VEC_SIZE_I>(idx);
+            y = buffer_y.template load<VEC_SIZE_I>(idx);
+        }
 
         for(size_t j = 0; j < VEC_SIZE_I; j += 2)
         {
@@ -206,8 +219,8 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                 DTYPE_I x_val1 = x[j + 1];
                 float act_x0   = ACT_FN(x_val0);
                 float act_x1   = ACT_FN(x_val1);
-                float y0       = ck_tile::type_convert<float>(y[j]);
-                float y1       = ck_tile::type_convert<float>(y[j + 1]);
+                float y0       = opus::cast<float>(y[j]);
+                float y1       = opus::cast<float>(y[j + 1]);
 
                 float2 act_vals   = {act_x0, act_x1};
                 float2 y_vals     = {y0, y1};
@@ -219,14 +232,14 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                              : "=v"(result)
                              : "v"(act_vals), "v"(y_vals), "v"(scale_vals));
 
-                out[token_idx * d + idx + j]     = ck_tile::type_convert<DTYPE_O>(result.x);
-                out[token_idx * d + idx + j + 1] = ck_tile::type_convert<DTYPE_O>(result.y);
+                out[token_idx * d + idx + j]     = opus::cast<DTYPE_O>(result.x);
+                out[token_idx * d + idx + j + 1] = opus::cast<DTYPE_O>(result.y);
             }
             else
             {
                 DTYPE_I x_val = x[j];
-                float r       = ACT_FN(x_val) * ck_tile::type_convert<float>(y[j]) * scale;
-                out[token_idx * d + idx + j] = ck_tile::type_convert<DTYPE_O>(r);
+                float r       = ACT_FN(x_val) * opus::cast<float>(y[j]) * scale;
+                out[token_idx * d + idx + j] = opus::cast<DTYPE_O>(r);
             }
         }
     }
@@ -236,9 +249,9 @@ template <typename T>
 __device__ __forceinline__ float silu_kernel(const T& x)
 {
     // x * sigmoid(x)
-    constexpr auto one = ck_tile::type_convert<float>(1);
-    float x_           = ck_tile::type_convert<float>(x);
-    float y            = x_ * __builtin_amdgcn_rcpf(one + ck_tile::exp(-x_));
+    constexpr float one = 1.0f;
+    float x_            = opus::cast<float>(x);
+    float y             = x_ * __builtin_amdgcn_rcpf(one + __ocml_exp_f32(-x_));
     return y;
 }
 
@@ -248,7 +261,7 @@ __device__ __forceinline__ float gelu_kernel(const T& x)
     // Equivalent to PyTorch GELU with 'none' approximation.
     // Refer to:
     // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
-    const float f         = ck_tile::type_convert<float>(x);
+    const float f         = opus::cast<float>(x);
     constexpr float ALPHA = M_SQRT1_2;
     return f * 0.5f * (1.0f + ::erf(f * ALPHA));
 }
@@ -259,7 +272,7 @@ __device__ __forceinline__ float gelu_tanh_kernel(const T& x)
     // Equivalent to PyTorch GELU with 'tanh' approximation.
     // Refer to:
     // https://github.com/pytorch/pytorch/blob/8ac9b20d4b090c213799e81acf48a55ea8d437d6/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L25-L30
-    const float f         = ck_tile::type_convert<float>(x);
+    const float f         = opus::cast<float>(x);
     constexpr float BETA  = M_SQRT2 * M_2_SQRTPI * 0.5f;
     constexpr float KAPPA = 0.044715;
     float x_cube          = f * f * f;
@@ -290,7 +303,7 @@ static constexpr int nextPow2(unsigned int num)
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input)); \
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-// Helper macro for fp32 vec_size dispatch (CK Tile only supports VEC_SIZE <= 16 for fp32)
+// Helper macro for fp32 vec_size dispatch (VEC_SIZE <= 16 for fp32 path)
 #define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...)              \
     case VS:                                                                   \
         aiter::KERNEL_NAME<input_dtype, output_dtype, KERNEL<input_dtype>, VS> \
@@ -325,7 +338,7 @@ static constexpr int nextPow2(unsigned int num)
     }                                                                               \
     else if(out.scalar_type() == at::ScalarType::Char)                              \
     {                                                                               \
-        using output_dtype = ck_tile::int8_t;                                       \
+        using output_dtype = opus::i8_t;                                            \
         auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
         DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
     }                                                                               \
@@ -341,23 +354,23 @@ static constexpr int nextPow2(unsigned int num)
     if(input.scalar_type() == at::ScalarType::Float)                                             \
     {                                                                                            \
         /* fp32 input: dispatch based on output type */                                          \
-        using input_dtype = ck_tile::fp32_t;                                                     \
+        using input_dtype = opus::fp32_t;                                                        \
         auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                    \
         if(out.scalar_type() == at::ScalarType::BFloat16)                                        \
         {                                                                                        \
-            using output_dtype = ck_tile::bf16_t;                                                \
+            using output_dtype = opus::bf16_t;                                                   \
             auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
             DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
         }                                                                                        \
         else if(out.scalar_type() == at::ScalarType::Half)                                       \
         {                                                                                        \
-            using output_dtype = ck_tile::fp16_t;                                                \
+            using output_dtype = opus::fp16_t;                                                   \
             auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
             DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
         }                                                                                        \
         else if(out.scalar_type() == at::ScalarType::Float)                                      \
         {                                                                                        \
-            using output_dtype = ck_tile::fp32_t;                                                \
+            using output_dtype = opus::fp32_t;                                                   \
             auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
             DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
         }                                                                                        \
@@ -372,7 +385,7 @@ static constexpr int nextPow2(unsigned int num)
         TORCH_CHECK(input.scalar_type() == out.scalar_type(),                                    \
                     "For bf16/fp16 input, output type must match input type");                   \
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {         \
-            using input_dtype  = typename t2ck<scalar_t>::type;                                  \
+            using input_dtype  = typename aiter::t2opus<scalar_t>::type;                         \
             using output_dtype = input_dtype;                                                    \
             AITER_DISPATCH_CASE_VEC_SIZE(                                                        \
                 vec_size,                                                                        \
@@ -390,7 +403,7 @@ static constexpr int nextPow2(unsigned int num)
     if(input.scalar_type() == at::ScalarType::Float)                                            \
     {                                                                                           \
         /* fp32 input: dispatch based on output type (fp8/bf16/fp16/fp32) */                    \
-        using input_dtype = ck_tile::fp32_t;                                                    \
+        using input_dtype = opus::fp32_t;                                                       \
         auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                   \
         float inv_scale   = 1.0f / (*scale.data_ptr<float>());                                  \
         DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                                  \
@@ -399,7 +412,7 @@ static constexpr int nextPow2(unsigned int num)
     {                                                                                           \
         /* bf16/fp16 input: dispatch based on output type (fp8/bf16/fp16/fp32) */               \
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \
-            using input_dtype = typename t2ck<scalar_t>::type;                                  \
+            using input_dtype = typename aiter::t2opus<scalar_t>::type;                         \
             auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());               \
             float inv_scale   = 1.0f / (*scale.data_ptr<float>());                              \
             DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                              \
@@ -467,7 +480,7 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
                                              const DTYPE_I* __restrict__ input,
                                              const int64_t numel)
 {
-    using vec_i = ck_tile::vec_t<DTYPE_I, VEC_SIZE_I>;
+    using vec_i = opus::vector_t<DTYPE_I, VEC_SIZE_I>;
     const int64_t stride = gridDim.x * blockDim.x * VEC_SIZE_I * 2;
 
     for(int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE_I * 2;
@@ -488,10 +501,10 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
         // Process both vectors with inline GELU (compiler can interleave instructions)
         #pragma unroll
         for(size_t j = 0; j < VEC_SIZE_I; j++) {
-            x0_ptr[j] = ck_tile::type_convert<DTYPE_I>(ACT_FN(x0_ptr[j]));
+            x0_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x0_ptr[j]));
 
             if (has_second) {
-                x1_ptr[j] = ck_tile::type_convert<DTYPE_I>(ACT_FN(x1_ptr[j]));
+                x1_ptr[j] = opus::cast<DTYPE_I>(ACT_FN(x1_ptr[j]));
             }
         }
 
@@ -522,7 +535,7 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));              \
     const hipStream_t stream = at::hip::getCurrentHIPStream();                                     \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "activation_kernel_vec", [&] {     \
-        using input_dtype = typename t2ck<scalar_t>::type;                                         \
+        using input_dtype = typename aiter::t2opus<scalar_t>::type;                              \
         AITER_DISPATCH_CASE_VEC_SIZE(                                                              \
             vec_size,                                                                              \
             aiter::activation_kernel_vec<input_dtype, KERNEL<input_dtype>, VEC_SIZE>        \
@@ -537,7 +550,7 @@ namespace aiter {
 template <typename T>
 __device__ __forceinline__ float gelu_fast_kernel(const T& x)
 {
-    const float f = ck_tile::type_convert<float>(x);
+    const float f = opus::cast<float>(x);
     const float f_sq = f * f;
     const float inner = fmaf(0.035677408f, f_sq * f, 0.79788456f * f);
     const float t = fast_tanh(inner);
