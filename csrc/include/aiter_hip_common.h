@@ -21,34 +21,27 @@
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
 
-namespace detail {
-template <typename... Args>
-[[noreturn, noinline]] inline void aiter_check_fatal(const char* file, size_t line, Args&&... args)
-{
-    std::cerr << "[AITER] " << file << ":" << line << " ";
-    (std::cerr << ... << std::forward<Args>(args)) << std::endl;
-    std::abort();
-}
+namespace aiter_detail {
 
 template <typename... Args>
 [[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
 {
     std::ostringstream oss;
     oss << "[AITER] " << file << ":" << line << " ";
-    check_print(oss, std::forward<Args>(args)...);
+    (oss << ... << std::forward<Args>(args));
     std::string msg = oss.str();
     std::cerr << msg << std::endl;
     throw std::runtime_error(msg);
 }
 } // namespace aiter_detail
 
-#define AITER_CHECK(x, ...)                                                                        \
-    do                                                                                             \
-    {                                                                                              \
-        if(!(x))                                                                                   \
-        {                                                                                          \
-            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__);                              \
-        }                                                                                          \
+#define AITER_CHECK(x, ...)                                            \
+    do                                                                 \
+    {                                                                  \
+        if(!(x))                                                       \
+        {                                                              \
+            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__); \
+        }                                                              \
     } while(0)
 
 #define HIP_CALL(call)                                                          \
@@ -57,12 +50,8 @@ template <typename... Args>
         hipError_t err = call;                                                  \
         if(err != hipSuccess)                                                   \
         {                                                                       \
-            std::ostringstream _hip_oss;                                         \
-            _hip_oss << "[AITER] " << __FILE__ << ":" << __LINE__               \
-                     << " " #call " failed: " << hipGetErrorString(err);        \
-            std::string _hip_msg = _hip_oss.str();                              \
-            std::cerr << _hip_msg << std::endl;                                 \
-            throw std::runtime_error(_hip_msg);                                 \
+            aiter_detail::check_fail(                                           \
+                __FILE__, __LINE__, #call " failed: ", hipGetErrorString(err)); \
         }                                                                       \
     } while(0)
 
