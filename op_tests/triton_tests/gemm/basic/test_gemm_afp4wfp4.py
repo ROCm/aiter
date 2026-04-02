@@ -132,7 +132,7 @@ def generate_gemm_afp4wfp4_inputs(
 
 def get_x_vals():
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(v, 106496, 16384) for v in (150, 256, 4096, 8000)] # LL3 405B FC1
+    x_vals += [(v, 106496, 16384) for v in (150, 256, 4096, 8000)]  # LL3 405B FC1
     x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
@@ -213,9 +213,7 @@ def test_gemm_afp4_wfp4(
     dtype = torch.bfloat16
     # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950
     if impl == "gluon":
-        pytest.skip(
-            "Gluon tests temporarily disabled."
-        )
+        pytest.skip("Gluon tests temporarily disabled.")
 
     if impl == "gluon" and shuffle_weight_scales:
         pytest.skip("Gluon kernel does not have a preshuffled implementation.")

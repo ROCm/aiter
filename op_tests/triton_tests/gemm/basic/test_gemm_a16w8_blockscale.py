@@ -51,10 +51,10 @@ def get_x_vals():
     x_vals = [(1, 1, 1)]  # minimal case
     x_vals += [(3, 5, 2)]  # irregular shape
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)] # DSR1 router GEMM
+    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)] # LL3 405B FC1
+    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
     return x_vals
 
 

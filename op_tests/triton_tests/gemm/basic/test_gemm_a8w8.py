@@ -53,8 +53,10 @@ def get_x_vals():
     x_vals = [(1, 1, 1)]  # minimal case
     x_vals += [(3, 5, 2)]  # irregular shape
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(v, 106496, 16384) for v in (190, 256, 4096)] # LL3 405B FC1
-    x_vals += [(v, 10240, 8192) for v in (256, 4096, 8000)]  # LL3 70B QKV input projection
+    x_vals += [(v, 106496, 16384) for v in (190, 256, 4096)]  # LL3 405B FC1
+    x_vals += [
+        (v, 10240, 8192) for v in (256, 4096, 8000)
+    ]  # LL3 70B QKV input projection
     return x_vals
 
 

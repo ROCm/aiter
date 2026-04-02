@@ -28,7 +28,7 @@ def get_x_vals():
     x_vals = [(1, 1, 1)]  # minimal case
     x_vals += [(3, 5, 2)]  # irregular shape
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)] # LL3 405B FC1
+    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
     # GPT-OSS-120B attention projections
     x_vals += [(v, 5120, 2880) for v in (128, 192, 4096, 8000)]  # QKV input projection
     x_vals += [(v, 2880, 4096) for v in (128, 192, 4096, 8000)]  # output projection

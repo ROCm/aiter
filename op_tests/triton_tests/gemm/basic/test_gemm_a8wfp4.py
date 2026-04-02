@@ -221,12 +221,12 @@ def quantize_to_fp4(w_fp32):
 
 def get_x_vals():
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)] # DSR1 router GEMM
+    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
     # GPT-OSS-120B attention projections
     x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
     x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
     x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
-    x_vals += [(v, 57344, 8192) for v in (128, 2048)] # LL3 405B FC1 (reduced)
+    x_vals += [(v, 57344, 8192) for v in (128, 2048)]  # LL3 405B FC1 (reduced)
     return x_vals
 
 
@@ -343,9 +343,7 @@ e5m2_type, e4m3_type = types.get_fp8_dtypes()
 @pytest.mark.parametrize(
     "layout", ["TN"]
 )  # NOTE: Kernel will occasionally crash for layouts other than TN.
-def test_gemm_a8wfp4(
-    M: int, N: int, K: int, a_dtype, layout: str, CLEAR_GPUS=True
-):
+def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, layout: str, CLEAR_GPUS=True):
     out_dtype = torch.bfloat16
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
