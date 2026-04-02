@@ -1219,6 +1219,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_mha_prefill_splitk_stage1_opus": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mha_prefill_splitk_stage1_opus_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mha/prefill_splitk_stage1_opus_skeleton.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_reduce_pybind.cu'",

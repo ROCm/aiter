@@ -943,6 +943,23 @@ def get_mha_prefill_splitk_metadata_v1(
 ) -> None: ...
 
 
+@compile_ops("module_mha_prefill_splitk_stage1_opus")
+def mha_prefill_splitk_stage1_opus(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    page_size: int,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    softmax_scale: float,
+    split_o: torch.Tensor,
+    split_lse: torch.Tensor,
+    debug_qk_scores: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 @compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_prefill_ps_asm_fwd(
     Q: torch.Tensor,
