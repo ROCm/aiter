@@ -1503,13 +1503,6 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
 
-                if develop and _md_name != "module_aiter_core":
-                    import torch
-
-                    stream = torch.cuda.current_stream()
-                    get_module("module_aiter_core")._set_current_hip_stream(
-                        stream.cuda_stream
-                    )
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
