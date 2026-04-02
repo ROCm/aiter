@@ -22,7 +22,7 @@ def init_custom_ar(
 ) -> int: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_reduce(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -36,7 +36,7 @@ def all_reduce(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -46,7 +46,7 @@ def reduce_scatter(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_reg(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -55,7 +55,7 @@ def all_gather_reg(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_unreg(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -66,7 +66,7 @@ def all_gather_unreg(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -81,7 +81,7 @@ def fused_allreduce_rmsnorm(
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm_quant(
     _fa: int,
     inp,  # aiter_tensor_t

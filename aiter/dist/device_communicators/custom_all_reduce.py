@@ -49,10 +49,6 @@ def is_weak_contiguous(inp: torch.Tensor):
 _torch_to_aiter = torch_to_aiter_pybind
 
 
-def _current_stream_ptr() -> int:
-    return torch.cuda.current_stream().cuda_stream
-
-
 class IPCBuffer:
     """A single IPC-accessible device buffer.
 
