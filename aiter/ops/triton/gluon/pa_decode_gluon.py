@@ -47,6 +47,11 @@ except ImportError:
     def _amd_iglp_opt(tensor, value=0):
         return tensor
 
+@gluon.jit
+def _fused_max_combine(a1, a2, b1, b2):
+    return tl.maximum(a1, b1), tl.maximum(a2, b2)
+
+
 @lru_cache(maxsize=1)
 def get_cdna_version():
     """Get CDNA version lazily to avoid CUDA initialization during import."""
@@ -1064,7 +1069,7 @@ def paged_attention_decode_sliding_window_head_1(
     DS_READ: gl.constexpr = 0x100
     VMEM_LOAD: gl.constexpr = 0x020
     MFMA: gl.constexpr = 0x008
-    # VALU: gl.constexpr = 0x002
+    VALU: gl.constexpr = 0x002
 
     sequence_idx = gl.program_id(0)
     mtp_idx = gl.program_id(1)
@@ -1116,9 +1121,9 @@ def paged_attention_decode_sliding_window_head_1(
         SHARED_LAYOUT_WIDTH, 1, 8, order=[1, 0]
     )
     shared_value_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(
-        2, 1, 4, order=[0]
+        1, 1, 8, order=[0]
     )
-    shared_key_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(2, 1, 4, order=[0])
+    shared_key_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 8, order=[0])
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
     if ONE_QUERY_GROUP_SIZE_POW2 <= 16:
         Q_WARPS_PER_CTA_DIM1: gl.constexpr = ONE_QUERY_GROUP_SIZE_POW2 // 4
@@ -1173,6 +1178,14 @@ def paged_attention_decode_sliding_window_head_1(
     qk_linear_layout: gl.constexpr = define_layout(
         QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE, QUERY_SEQ_LEN_POW2
     )
+
+    kv_scale_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1],
+            threads_per_warp=[64],
+            warps_per_cta=[4],
+            order=[0],
+        )
+    kv_scale_indices = gl.arange(0, CONTEXT_PARTITION_SIZE, layout=kv_scale_layout)
 
     context_length = gl.load(context_lengths_ptr + sequence_idx)
     # Value cache layout configuration based on transpose flag
@@ -1281,29 +1294,28 @@ def paged_attention_decode_sliding_window_head_1(
         0, KV_16B_ELEMENT_COUNT, layout=contiguous_kv_elements_layout
     )
 
+    max_logits_base_offsets = gl.arange(
+        0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
+
     if QUERY_SEQ_LEN_POW2 == 1:
-        query_row_mask = query_group_size_offsets < query_group_size
+        query_row_mask_1d = query_group_size_offsets < query_group_size
     else:
-        qk_row_offsets = gl.arange(
-            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
-        )
         query_row_mask_3d = (
             mtp_idx * QUERY_SEQ_LEN_POW2 + mtp_query_len_offsets[:, None, None]
             < query_seq_len
         ) & (mtp_query_group_size_offsets[None, :, None] < query_group_size)
         query_row_mask_1d = gl.reshape(query_row_mask_3d, [QUERY_GROUP_SIZE_POW2])
 
+    output_group_offsets = gl.arange(
+        0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, pv_mfma_layout)
+    )
+
     if QUERY_SEQ_LEN_POW2 == 1:
-        output_group_offsets = gl.arange(
-            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, pv_mfma_layout)
-        )
         output_group_offsets = mtp_idx * query_group_size + output_group_offsets
     else:
-        output_group_offsets_mtp = gl.arange(
-            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, pv_mfma_layout)
-        )
-        output_query_len_idx = output_group_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
-        output_group_idx_in_len = output_group_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
+        output_query_len_idx = output_group_offsets // ONE_QUERY_GROUP_SIZE_POW2
+        output_group_idx_in_len = output_group_offsets % ONE_QUERY_GROUP_SIZE_POW2
         output_group_offsets = (
             mtp_idx * QUERY_SEQ_LEN_POW2 + output_query_len_idx
         ) * query_group_size + output_group_idx_in_len
@@ -1339,7 +1351,7 @@ def paged_attention_decode_sliding_window_head_1(
             head_size_offsets[None, :] < head_size
         )
         query_tensor = gl.amd.cdna3.buffer_load(
-            ptr=query_ptr, offsets=query_offsets, mask=query_mask
+            ptr=query_ptr, offsets=query_offsets, mask=query_mask, cache=".cg"
         )
     else:
         mtp_query_offsets = (
@@ -1373,9 +1385,7 @@ def paged_attention_decode_sliding_window_head_1(
         )
         sequence_start_idx = page_size * sequence_split_idx
 
-        sequence_end_idx = gl.minimum(
-            context_length, page_size * (sequence_split_idx + 1)
-        )
+        sequence_end_idx = gl.minimum(context_length, page_size + sequence_start_idx)
         sequence_partition_start_idx = (
             sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
         )
@@ -1385,28 +1395,21 @@ def paged_attention_decode_sliding_window_head_1(
     block_indices = gl.arange(0, MAX_NUM_KV_BLOCKS_PER_COMPUTE, layout=block_id_layout)
     max_num_kv_blocks = gl.cdiv(context_length, KV_COMPUTE_BLOCK_SIZE)
     kv_block_start_idx = sequence_partition_start_idx * MAX_NUM_KV_BLOCKS_PER_COMPUTE
-    kv_block_numbers = gl.amd.cdna3.buffer_load(
-        ptr=block_tables_ptr
-        + sequence_idx * stride_block_table_seq
-        + kv_block_start_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-        offsets=block_indices,
-        mask=block_indices < (max_num_kv_blocks - kv_block_start_idx),
-    )
+    if kv_block_start_idx < max_num_kv_blocks:
+            kv_block_numbers = gl.load(
+                block_tables_ptr
+                + sequence_idx * stride_block_table_seq
+                + kv_block_start_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK
+            )
+    else:
+        kv_block_numbers = 0
     if QUERY_SEQ_LEN_POW2 == 1:
-        max_logits_base_offsets = gl.arange(
-            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
-        )
         max_logits_group_idx_in_len = max_logits_base_offsets
         max_logits_base_offsets = mtp_idx * query_group_size + max_logits_base_offsets
     else:
-        max_logits_base_offsets_mtp = gl.arange(
-            0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
-        )
-        max_logits_query_len_idx = (
-            max_logits_base_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
-        )
+        max_logits_query_len_idx = max_logits_base_offsets // ONE_QUERY_GROUP_SIZE_POW2
         max_logits_group_idx_in_len = (
-            max_logits_base_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
+            max_logits_base_offsets % ONE_QUERY_GROUP_SIZE_POW2
         )
         max_logits_base_offsets = (
             mtp_idx * QUERY_SEQ_LEN_POW2 + max_logits_query_len_idx
@@ -1440,14 +1443,9 @@ def paged_attention_decode_sliding_window_head_1(
             + split_idx * stride_max_logits_part
             + max_logits_base_offsets
         )
-    if QUERY_SEQ_LEN_POW2 == 1:
-        qk_row_mask = gl.convert_layout(
-            query_row_mask, layout=gl.SliceLayout(1, qk_linear_layout)
-        )
-    else:
-        qk_row_mask = gl.convert_layout(
-            query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
-        )
+    qk_row_mask = gl.convert_layout(
+        query_row_mask_1d, layout=gl.SliceLayout(1, qk_linear_layout)
+    )
     pv_row_mask = gl.convert_layout(
         qk_row_mask, layout=gl.SliceLayout(1, pv_mfma_layout)
     )
@@ -1491,6 +1489,9 @@ def paged_attention_decode_sliding_window_head_1(
         COMPUTE_TYPE,
         [QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE],
         shared_probs_layout,
+    )
+    qk_column_indices = gl.arange(
+        0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
     )
 
     value_scale_shared = gl.allocate_shared_memory(
@@ -1562,26 +1563,15 @@ def paged_attention_decode_sliding_window_head_1(
     ) * CONTEXT_PARTITION_SIZE
     kv_block_numbers = kv_block_numbers.to(gl.int64)
     key_block_offsets = (
-        kv_block_numbers[:, None, None, None] * stride_key_block
+        kv_block_numbers * stride_key_block
         + head_size_split_offsets[None, :, None, None] * stride_key_head_split
         # Use runtime stride for KV block element (may be padded for large blocks).
         + (page_offset + block_element_offsets)[None, None, :, None]
         * stride_key_block_elem
         + contiguous_kv_element_offsets[None, None, None, :]
     )
-    if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
-        kv_token_global = (
-            kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
-        )
-        kv_in_window_mask = kv_token_global >= sequence_start_idx
 
-        key_tensor = gl.load(
-            key_cache_ptr + key_block_offsets,
-            mask=kv_in_window_mask[None, None, :, None],
-            other=0.0,
-        )
-    else:
-        key_tensor = gl.load(key_cache_ptr + key_block_offsets)
+    key_tensor = gl.load(key_cache_ptr + key_block_offsets)
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
         sequence_partition_start_idx,
@@ -1601,40 +1591,15 @@ def paged_attention_decode_sliding_window_head_1(
         # Load key quantization scales if needed (overlaps with key tensor load)
 
         # Per-token quantization - prepare offsets while key loads
-        key_scale_offsets = (
-            kv_block_numbers[:, None, None, None] * kv_scale_stride_0
-            + (page_offset + block_element_offsets)[None, None, :, None]
+        key_scale_offsets = kv_block_numbers * kv_scale_stride_0 + (
+            page_offset + kv_scale_indices
         )
         # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
-        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
-            kv_token_global = (
-                kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
-            )
-            kv_in_window_mask = kv_token_global >= sequence_start_idx
-
-            key_scale_value_blocked = gl.load(
-                key_scale + key_scale_offsets,
-                mask=kv_in_window_mask[None, None, :, None],
-                other=0.0,
-            )
-            value_scale_value_blocked = gl.load(
-                value_scale + key_scale_offsets,
-                mask=kv_in_window_mask[None, None, :, None],
-                other=0.0,
-            )
-        else:
-            key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
-            value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
-
-        # Convert to required distributed layout for computation
-        key_scale_value_blocked = gl.reshape(
-            key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-        )
+        key_scale_offsets = _amd_iglp_sched_barrier(key_scale_offsets, 0x0)
+        key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
+        
         key_scale_shared.store(key_scale_value_blocked)
-
-        value_scale_value_blocked = gl.reshape(
-            value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
-        )
+        value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
         value_scale_shared.store(value_scale_value_blocked)
 
         # Reshape key tensor for matrix multiplication
@@ -1648,15 +1613,9 @@ def paged_attention_decode_sliding_window_head_1(
         key_converted = gl.convert_layout(key_converted, layout=qk_rhs_operand_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
         # Load values from transposed cache layout
-        kv_block_numbers_reshaped = gl.convert_layout(
-            kv_block_numbers,
-            layout=gl.SliceLayout(
-                1, gl.SliceLayout(2, gl.SliceLayout(3, blocked_value_layout))
-            ),
-        )
-
+        kv_block_numbers_reshaped = kv_block_numbers
         value_block_offsets = (
-            kv_block_numbers_reshaped[:, None, None, None] * stride_value_block
+            kv_block_numbers_reshaped * stride_value_block
             + (page_offset // KV_16B_ELEMENT_COUNT + value_dim1_offsets)[
                 None, :, None, None
             ]
@@ -1664,36 +1623,43 @@ def paged_attention_decode_sliding_window_head_1(
             + value_dim2_offsets[None, None, :, None] * KV_16B_ELEMENT_COUNT
             + value_dim3_offsets[None, None, None, :]
         )
-        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
-            value_token_global = (
-                kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE
-                + value_dim1_offsets[None, :, None, None] * KV_16B_ELEMENT_COUNT
-                + value_dim3_offsets[None, None, None, :]
-            )
-            value_in_window_mask = value_token_global >= sequence_start_idx
-
-            value_tensor = gl.load(
-                value_cache_ptr + value_block_offsets,
-            )
-            value_tensor = gl.where(value_in_window_mask, value_tensor, 0.0)
-        else:
-            value_tensor = gl.load(value_cache_ptr + value_block_offsets)
+        value_tensor = gl.load(value_cache_ptr + value_block_offsets)
 
         # Permute and reshape for matrix multiplication
         value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
 
+        value_tensor = gl.reshape(
+            value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
+        )
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
         )
-        value_tensor = gl.reshape(
-            value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
-        )
 
+        # value_tensor = _amd_set_prio(value_tensor, 1)
         attention_scores = gl.reshape(
             attention_scores, [QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE]
         )
 
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 1, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 1, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, VMEM_LOAD, 2, 0)
+        value_tensor = _amd_iglp_sched_group_barrier(value_tensor, MFMA, 2, 0)
+        # value_tensor = _amd_set_prio(value_tensor, 0)
+        
+        value_tensor = _amd_iglp_sched_barrier(value_tensor, 0x0)
+
+        qk_column_offsets = (
+            kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + qk_column_indices
+        )
         # Apply quantization scaling to attention scores
         key_scale_value = key_scale_shared.load(
             gl.SliceLayout(0, qk_linear_layout)
@@ -1705,78 +1671,26 @@ def paged_attention_decode_sliding_window_head_1(
             qk_scale_value = softmax_scale * key_scale_value
 
         # ==================== ATTENTION MASKING ====================
-        qk_column_offsets = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE + gl.arange(
-            0, CONTEXT_PARTITION_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
-        )
-        if QUERY_SEQ_LEN_POW2 == 1:
-            if IS_CAUSAL:
-                sequence_position_extension = query_seq_len - 1 - mtp_idx
-                causal_mask = (
-                    sequence_position_extension + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
-                if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension + qk_column_offsets[None, :]
-                        >= sequence_start_idx + query_seq_len
-                    )
-                else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension + qk_column_offsets[None, :]
-                        >= sequence_start_idx
-                    )
-            else:
-                causal_mask = qk_column_offsets[None, :] < sequence_end_idx
-                if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
-                        qk_column_offsets[None, :] >= sequence_start_idx + mtp_idx + 1
-                    )
-                else:
-                    causal_mask = causal_mask & (
-                        qk_column_offsets[None, :] >= sequence_start_idx
-                    )
-        else:
-            query_token_idx = (
-                mtp_idx * QUERY_SEQ_LEN_POW2
-                + qk_row_offsets // ONE_QUERY_GROUP_SIZE_POW2
-            )
-            if IS_CAUSAL:
-                sequence_position_extension = query_seq_len - 1 - query_token_idx
-                causal_mask = (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
-                if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension[:, None]
-                        + qk_column_offsets[None, :]
-                        >= sequence_start_idx + query_seq_len
-                    )
-                else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension[:, None]
-                        + qk_column_offsets[None, :]
-                        >= sequence_start_idx
-                    )
-            else:
-                causal_mask = qk_column_offsets[None, :] < sequence_end_idx
-                if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
-                        qk_column_offsets[None, :]
-                        >= sequence_start_idx + query_token_idx[:, None] + 1
-                    )
-                else:
-                    causal_mask = causal_mask & (
-                        qk_column_offsets[None, :] >= sequence_start_idx
-                    )
 
-        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
-            ptr=block_tables_ptr
-            + sequence_idx * stride_block_table_seq
-            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-            offsets=block_indices,
-            mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
-        )
+        causal_mask = qk_column_offsets[None, :] < sequence_end_idx
+        if SLIDING_WINDOW > 0:
+            causal_mask = causal_mask & (
+                qk_column_offsets[None, :] >= sequence_start_idx + mtp_idx + 1
+            )
+        else:
+            causal_mask = causal_mask & (
+                qk_column_offsets[None, :] >= sequence_start_idx
+            )
+
+        if kv_block_start_idx2 < max_num_kv_blocks:
+                kv_block_numbers2 = gl.load(
+                    block_tables_ptr
+                    + sequence_idx * stride_block_table_seq
+                    + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK
+                )
+        else:
+            kv_block_numbers2 = 0
+        kv_block_numbers2 = _amd_iglp_sched_barrier(kv_block_numbers2, 0x0)
         boundary_mask = qk_row_mask[:, None] & causal_mask
 
         attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
@@ -1797,12 +1711,21 @@ def paged_attention_decode_sliding_window_head_1(
         value_scale_value = gl.where(
             valid_token_mask, value_scale_value, float(0.0)
         )
-        # Fused reduction: compute both max operations together to share barrier
-        # This allows the compiler to merge the cross-wave synchronization
-        current_max_logits = gl.max(attention_scores, axis=1)
-        value_scale_max = gl.max(value_scale_value, axis=0)
+
+        # Fused reduction: broadcast value_scale to 2D and reduce both in a single
+        # cross-wave reduce op, sharing one s_barrier instead of two.
+        value_scale_broadcast = tl.broadcast_to(
+            value_scale_value[None, :], attention_scores.shape
+        )
+        current_max_logits, value_scale_max_2d = gl.reduce(
+            (attention_scores, value_scale_broadcast), axis=1, combine_fn=_fused_max_combine
+        )
+        # All rows are identical (broadcast from 1D); collapse to scalar.
+        # This is a cheap intra-wave reduction, no extra cross-wave barrier.
+        value_scale_max = gl.max(value_scale_max_2d, axis=0)
 
         new_max_logits = gl.maximum(max_logits, current_max_logits)
+        # new_max_logits = _amd_iglp_sched_barrier(new_max_logits, 0x0)
 
         accumulator_scale = tl.math.exp2((max_logits - new_max_logits) * LOG2_E)
         # Compute attention probabilities
@@ -1811,15 +1734,22 @@ def paged_attention_decode_sliding_window_head_1(
         )
 
         exp_sums = accumulator_scale * exp_sums + gl.sum(attention_probs, axis=1)
+        # exp_sums = _amd_set_prio(exp_sums, 0)
         kv_block_numbers2 = kv_block_numbers2.to(gl.int64)
         key_block_offsets2 = (
-            kv_block_numbers2[:, None, None, None] * stride_key_block
+            kv_block_numbers2 * stride_key_block
             + head_size_split_offsets[None, :, None, None] * stride_key_head_split
             # Use runtime stride for KV block element (may be padded for large blocks).
             + (page_offset + block_element_offsets)[None, None, :, None]
             * stride_key_block_elem
             + contiguous_kv_element_offsets[None, None, None, :]
         )
+        # value_scale_max = _amd_iglp_sched_group_barrier(value_scale_max, DS_WRITE, 1, 0)
+        # value_scale_max = _amd_iglp_sched_group_barrier(value_scale_max, VALU, 4, 0)
+        # value_scale_max = _amd_iglp_sched_group_barrier(value_scale_max, DS_WRITE, 1, 0)
+        # value_scale_max = _amd_iglp_sched_group_barrier(value_scale_max, VALU, 4, 0)
+        # value_scale_max = _amd_iglp_sched_group_barrier(value_scale_max, DS_READ, 2, 0)
+        # value_scale_max = _amd_iglp_sched_barrier(value_scale_max, 0)
 
         # ==================== VALUE ACCUMULATION ====================
         # Handle value quantization scaling for FP8
@@ -1859,23 +1789,21 @@ def paged_attention_decode_sliding_window_head_1(
             layout=pv_mfma_layout,
         )
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
-        if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
-            kv_token_global2 = (
-                kv_block_start_idx2 * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
-            )
-            kv_in_window_mask2 = kv_token_global2 >= sequence_start_idx
-
-            key_tensor2 = gl.load(
-                key_cache_ptr + key_block_offsets2,
-                mask=kv_in_window_mask2[None, None, :, None],
-                other=0.0,
-            )
-        else:
-            key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
+        key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
+        key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2)
 
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
 
         attention_accumulator += probability_scale * attention_output
         max_logits = new_max_logits

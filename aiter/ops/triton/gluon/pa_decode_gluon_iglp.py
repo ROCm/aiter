@@ -32,16 +32,16 @@ try:
 except ImportError:
     # ignore iglp hint
     @gluon.jit
-    def _amd_iglp_sched_barrier(inst_mask):
-        pass
+    def _amd_iglp_sched_barrier(tensor, inst_mask=0):
+        return tensor
 
     @gluon.jit
-    def _amd_iglp_sched_group_barrier(inst_mask, cnt, _):
-        pass
+    def _amd_iglp_sched_group_barrier(tensor, inst_mask=0, cnt=1, sync_id=0):
+        return tensor
 
     @gluon.jit
-    def _amd_set_prio(value, prio):
-        pass
+    def _amd_set_prio(tensor, value):
+        return tensor
 
     @gluon.jit
     def _amd_iglp_opt(tensor, value=0):
@@ -1065,6 +1065,8 @@ def paged_attention_decode_sliding_window_head_1(
     VMEM_LOAD: gl.constexpr = 0x020
     MFMA: gl.constexpr = 0x008
     # VALU: gl.constexpr = 0x002
+    QK_IGLP_SYNC_ID: gl.constexpr = 0
+    PV_PREFETCH_IGLP_SYNC_ID: gl.constexpr = 1
 
     sequence_idx = gl.program_id(0)
     mtp_idx = gl.program_id(1)
@@ -1598,6 +1600,15 @@ def paged_attention_decode_sliding_window_head_1(
             dtype=gl.float32,
             layout=qk_mfma_layout,
         )
+        # Start the next block-table VMEM as early as possible so it can overlap
+        # with the current round of QK work instead of stalling near softmax.
+        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
+            ptr=block_tables_ptr
+            + sequence_idx * stride_block_table_seq
+            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
+            offsets=block_indices,
+            mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
+        )
         # Load key quantization scales if needed (overlaps with key tensor load)
 
         # Per-token quantization - prepare offsets while key loads
@@ -1647,6 +1658,9 @@ def paged_attention_decode_sliding_window_head_1(
         # Convert key layout for MFMA (query_converted and qk_accumulator already prepared above)
         key_converted = gl.convert_layout(key_converted, layout=qk_rhs_operand_layout)
         key_converted = key_converted.to(COMPUTE_TYPE)
+        # Start a dedicated scheduling window so the value-cache VMEM loads can
+        # be interleaved with the current QK MFMA wave.
+        key_converted = _amd_iglp_sched_barrier(key_converted, 0x0)
         # Load values from transposed cache layout
         kv_block_numbers_reshaped = gl.convert_layout(
             kv_block_numbers,
@@ -1686,6 +1700,31 @@ def paged_attention_decode_sliding_window_head_1(
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
         )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, VMEM_LOAD, 2, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, MFMA, 2, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, VMEM_LOAD, 2, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, MFMA, 2, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, VMEM_LOAD, 2, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, MFMA, 2, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, VMEM_LOAD, 2, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_group_barrier(
+            attention_scores, MFMA, 1, QK_IGLP_SYNC_ID
+        )
+        attention_scores = _amd_iglp_sched_barrier(attention_scores, 0x0)
         value_tensor = gl.reshape(
             value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
         )
@@ -1770,13 +1809,6 @@ def paged_attention_decode_sliding_window_head_1(
                         qk_column_offsets[None, :] >= sequence_start_idx
                     )
 
-        kv_block_numbers2 = gl.amd.cdna3.buffer_load(
-            ptr=block_tables_ptr
-            + sequence_idx * stride_block_table_seq
-            + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
-            offsets=block_indices,
-            mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
-        )
         boundary_mask = qk_row_mask[:, None] & causal_mask
 
         attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
@@ -1859,6 +1891,9 @@ def paged_attention_decode_sliding_window_head_1(
             layout=pv_mfma_layout,
         )
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
+        # Open a second scheduling window so the next-block key prefetch can be
+        # woven through the current PV MFMA issue stream.
+        probs_converted = _amd_iglp_sched_barrier(probs_converted, 0x0)
         if KV_BLOCK_SIZE > CONTEXT_PARTITION_SIZE and SLIDING_WINDOW > 0:
             kv_token_global2 = (
                 kv_block_start_idx2 * KV_COMPUTE_BLOCK_SIZE + block_element_offsets
@@ -1876,6 +1911,31 @@ def paged_attention_decode_sliding_window_head_1(
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, VMEM_LOAD, 2, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, MFMA, 4, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, VMEM_LOAD, 2, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, MFMA, 4, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, VMEM_LOAD, 2, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, MFMA, 4, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, VMEM_LOAD, 2, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_group_barrier(
+            attention_output, MFMA, 4, PV_PREFETCH_IGLP_SYNC_ID
+        )
+        attention_output = _amd_iglp_sched_barrier(attention_output, 0x0)
 
         attention_accumulator += probability_scale * attention_output
         max_logits = new_max_logits
