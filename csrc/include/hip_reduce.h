@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include <rocprim/rocprim.hpp>
 
 template <typename T, typename F>
@@ -78,6 +78,25 @@ __device__ inline T thread_broadcast(T val, int idx)
     return __builtin_bit_cast(T, a);
 }
 
+template <typename T>
+__device__ inline std::
+    enable_if_t<std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(int) == 0), T>
+    warp_permlanex16(const T& input)
+{
+    constexpr int words = sizeof(T) / sizeof(int);
+    struct V
+    {
+        int w[words];
+    };
+    auto a = __builtin_bit_cast(V, input);
+#pragma unroll
+    for(int i = 0; i < words; i++)
+    {
+        a.w[i] = __builtin_amdgcn_permlanex16(a.w[i], a.w[i], 0x76543210u, 0xfedcba98u, true, true);
+    }
+    return __builtin_bit_cast(T, a);
+}
+
 // copied from
 // https://github.com/ROCm/rocPRIM/blob/3b6802d397c4e5266bb6ba7ea8c924d239288608/rocprim/include/rocprim/warp/detail/warp_reduce_dpp.hpp
 template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
@@ -97,38 +116,41 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
 
     if constexpr(WarpSize > 4)
     {
-        // row_ror:4
-        // Use rotation instead of shift to avoid leaving invalid values in the destination
-        // registers (asume warp size of at least hardware warp-size)
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(local), local);
+        // row_half_mirror
+        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(local), local);
     }
 
     if constexpr(WarpSize > 8)
     {
-        // row_ror:8
-        // Use rotation instead of shift to avoid leaving invalid values in the destination
-        // registers (asume warp size of at least hardware warp-size)
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(local), local);
+        // row_mirror
+        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(local), local);
     }
 
     if constexpr(WarpSize > 16)
     {
+#if defined(__GFX9__)
         // row_bcast:15
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(local), local);
+#else
+        // local = reduce_op(rocprim::detail::warp_swizzle<T, 0x401F>(local), local);
+        local = reduce_op(warp_permlanex16(local), local);
+#endif
     }
 
+#if defined(__GFX9__)
     if constexpr(WarpSize > 32)
     {
         // row_bcast:31
         local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x143>(local), local);
     }
 
-    if constexpr(threadBroadcast && WarpSize > 4)
+    if constexpr(threadBroadcast && WarpSize > 16)
     {
         // Read the result from the last lane of the logical warp
         local = rocprim::warp_shuffle(local, WarpSize - 1, WarpSize);
         // local = thread_broadcast<T, WarpSize, WarpSize>(local, WarpSize - 1);
     }
+#endif
     return local;
 }
 
@@ -165,15 +187,21 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(data), data);
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
+        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(data), data);
+#if defined(__GFX9__)
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142, 0xa>(data), data);
         if constexpr(threadBroadcast)
         {
             data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
             // data = thread_broadcast<T, 32, WarpSize>(data, thread_num - 1);
         }
+#else
+        // data = reduce_op(rocprim::detail::warp_swizzle<T, 0x401F>(data), data);
+        data = reduce_op(warp_permlanex16(data), data);
+#endif
     }
+#if defined(__GFX9__)
     else if(thread_num == 64)
     {
         data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
@@ -188,7 +216,7 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
             // data = thread_broadcast<T, 64, WarpSize>(data, thread_num - 1);
         }
     }
-
+#endif
     return data;
 }
 
@@ -196,38 +224,45 @@ template <typename T, typename F, int BlockSize, bool waveBroadcast = true>
 __device__ constexpr T block_reduce(T local, F reduce_op)
 {
     // static_assert(BlockSize <= 256, "BlockSize > 256 is not supported");
-    static constexpr int waves = BlockSize / WARP_SIZE;
-    const int wave_size        = WARP_SIZE;
-    int wave_id                = threadIdx.x / wave_size;
-    int lane_id                = threadIdx.x % wave_size;
-    __shared__ float smem[waves];
-
-    local = wave_reduce<T, F, WARP_SIZE, false>(local, reduce_op);
-
-    if(lane_id == wave_size - 1)
+    static constexpr int waves     = BlockSize / WARP_SIZE;
+    static constexpr int wave_size = WARP_SIZE;
+    if constexpr(BlockSize == wave_size)
     {
-        smem[wave_id] = local;
-    }
-    __syncthreads();
-
-    if constexpr(WARP_SIZE % waves == 0)
-    {
-        local = smem[lane_id % waves];
-        local = wave_reduce<T, F, waves, waveBroadcast>(local, reduce_op);
+        local = wave_reduce<T, F, WARP_SIZE, waveBroadcast>(local, reduce_op);
     }
     else
     {
-        if(lane_id < waves)
+        int wave_id = threadIdx.x / wave_size;
+        int lane_id = threadIdx.x % wave_size;
+        __shared__ float smem[waves];
+
+        local = wave_reduce<T, F, WARP_SIZE, false>(local, reduce_op);
+
+        if(lane_id == wave_size - 1)
         {
-            local = smem[lane_id];
+            smem[wave_id] = local;
         }
+        __syncthreads();
 
-        local = wave_reduce<T, F, waves, false>(local, reduce_op);
-
-        if constexpr(waveBroadcast)
+        if constexpr(WARP_SIZE % waves == 0)
         {
-            // Read the result from the last lane of the logical warp
-            local = rocprim::warp_shuffle(local, waves - 1, wave_size);
+            local = smem[lane_id % waves];
+            local = wave_reduce<T, F, waves, waveBroadcast>(local, reduce_op);
+        }
+        else
+        {
+            if(lane_id < waves)
+            {
+                local = smem[lane_id];
+            }
+
+            local = wave_reduce<T, F, waves, false>(local, reduce_op);
+
+            if constexpr(waveBroadcast)
+            {
+                // Read the result from the last lane of the logical warp
+                local = rocprim::warp_shuffle(local, waves - 1, wave_size);
+            }
         }
     }
 
