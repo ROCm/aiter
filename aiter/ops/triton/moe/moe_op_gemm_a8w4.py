@@ -120,7 +120,8 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
     split_k = 1
-    block_k = 256
+    block_k = 512
+    num_buffers = 2
 
     if block_m == 16:
         block_n = 128
@@ -134,7 +135,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
             block_n = 256
             num_warps = 4
         else:
-            block_n = 512
+            block_n = 256
             num_warps = 4
 
     else:
@@ -151,6 +152,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
+        "num_buffers": num_buffers,
     }
     return ret
 
@@ -330,7 +332,7 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
+            NUM_BUFFERS=config["num_buffers"] if config["num_buffers"] is not None else config["num_stages"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             EVEN_K=K % config["block_k"] == 0,
             MASK_K_LIMIT=K % config["block_k"],
@@ -492,3 +494,177 @@ def moe_gemm_torch(
         out[i, :] = y[src_idx[i], :].float().sum(0)
 
     return out
+
+
+# -----------------------------------------------------------------------------
+# Main Function for Testing
+# -----------------------------------------------------------------------------
+
+
+def main():
+    import argparse
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.quant_moe import (
+        downcast_to_static_fp8,
+        downcast_to_mxfp,
+        upcast_from_mxfp,
+    )
+
+    parser = argparse.ArgumentParser(description="Run MoE GEMM A8W4 test")
+    parser.add_argument("--M", type=int, default=32)
+    # parser.add_argument("--N", type=int, default=1024)
+    # parser.add_argument("--K", type=int, default=1024)
+    # parser.add_argument("--N", type=int, default=5760)
+    # parser.add_argument("--K", type=int, default=2880)
+    parser.add_argument("--N", type=int, default=6144)
+    parser.add_argument("--K", type=int, default=3072)
+    parser.add_argument("--E", type=int, default=1, help="Total experts")
+    parser.add_argument("--n_expts_act", type=int, default=1, help="Active experts per token")
+    parser.add_argument(
+        "--do_gather", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--do_scatter", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--has_y_gammas", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--apply_swiglu", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--fused_quant", action=argparse.BooleanOptionalAction, default=False
+    )
+    parser.add_argument(
+        "--hbm_swizzling", action=argparse.BooleanOptionalAction, default=False,
+        help="Enable HBM scale swizzling (default: False).",
+    )
+    parser.add_argument("--device", type=str, default="cuda")
+    args = parser.parse_args()
+
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA/HIP device is not available")
+
+    arch = get_arch()
+    assert arch in ("gfx950", "gfx1250"), (
+        f"a8w4 kernel requires gfx950 or gfx1250, got {arch}"
+    )
+
+    if args.hbm_swizzling:
+        if arch == "gfx950" and (args.N % 32 != 0 or args.K % (32 * 8) != 0):
+            raise ValueError(
+                f"Shape {args.M}x{args.N}x{args.K} not supported for scale swizzling on gfx950"
+            )
+        if arch == "gfx1250" and (args.N % 128 != 0 or args.K % (32 * 4) != 0):
+            raise ValueError(
+                f"Shape {args.M}x{args.N}x{args.K} not supported for scale swizzling on gfx1250"
+            )
+
+    print("Testing MoE GEMM A8W4 kernel")
+    print(
+        f"  M={args.M}, K={args.K}, N={args.N}, E={args.E}, "
+        f"n_expts_act={args.n_expts_act}"
+    )
+    print(
+        f"  Flags: gather={args.do_gather}, scatter={args.do_scatter}, "
+        f"swiglu={args.apply_swiglu}, fused_quant={args.fused_quant}, "
+        f"gammas={args.has_y_gammas}, hbm_swizzling={args.hbm_swizzling}"
+    )
+    print(f"  Device: {device}, Architecture: {arch}")
+
+    logits = torch.randn((args.M, args.E), dtype=torch.float16, device=device)
+    routing_data, gather_idx, scatter_idx = routing(logits, args.n_expts_act)
+
+    config = get_kernel_config_gluon(args.M, args.N, args.K, routing_data)
+    print(
+        f"  Config: block_m={config['block_m']}, block_n={config['block_n']}, "
+        f"block_k={config['block_k']}, num_warps={config['num_warps']}, "
+        f"num_buffers={config['num_buffers']}"
+    )
+    routing_data.gate_scal = None
+    gather_idx = gather_idx if args.do_gather else None
+    scatter_idx = scatter_idx if args.do_scatter else None
+
+    in_m = args.M * (args.n_expts_act if gather_idx is None else 1)
+
+    x_bf16 = torch.randn((in_m, args.K), dtype=torch.bfloat16, device=device) / 10
+    w_bf16 = torch.randn((args.E, args.K, args.N), dtype=torch.bfloat16, device=device) / 10
+    bias = torch.randn((args.E, args.N), dtype=torch.float32, device=device)
+    gammas = (
+        2 ** torch.randint(
+            -5, 0, (args.M * args.n_expts_act,), device=device, dtype=torch.float32
+        )
+        if args.has_y_gammas
+        else None
+    )
+
+    w_tri, w_scale_tri = downcast_to_mxfp(w_bf16, torch.uint8, axis=1)
+    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
+
+    swizzle_mx_scale = None
+    if args.hbm_swizzling:
+        if arch == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+        else:
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
+
+    x_mx_scales = None
+    x_static_scale = x_bf16.abs().max().float() / 448.0
+    x_tri = downcast_to_static_fp8(x_bf16, x_static_scale)
+    x_ref = x_bf16.clone()
+
+    ref_y = moe_gemm_torch(
+        x_ref, w_ref, bias.clone(), routing_data, gather_idx, scatter_idx,
+        gammas, args.apply_swiglu,
+    )
+
+    quant_static_scale = None
+    out_dtype = torch.bfloat16
+    if args.fused_quant:
+        quant_static_scale = ref_y.abs().max().float() / 448.0
+        out_dtype = torch.float8_e4m3fn
+
+    tri_y = moe_gemm_a8w4(
+        x_tri,
+        w_tri,
+        x_mx_scales,
+        w_scale_tri,
+        x_static_scale,
+        quant_static_scale,
+        bias,
+        routing_data,
+        gather_idx,
+        scatter_idx,
+        gammas,
+        swizzle_mx_scale,
+        out_dtype,
+        args.apply_swiglu,
+    )
+    if args.fused_quant:
+        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
+
+    ref_f = ref_y.to(torch.float32).detach()
+    tri_f = tri_y.to(torch.float32).detach()
+    eps = 1.0e-30
+    multiplier = 1.0 / (torch.max(torch.abs(ref_f)) + eps)
+    refn = ref_f * multiplier
+    trin = tri_f * multiplier
+    ref_rms = torch.sqrt(torch.square(refn).mean()) + eps
+    rel_err = torch.abs(refn - trin) / torch.maximum(ref_rms, torch.abs(refn))
+    max_err = torch.max(rel_err).item()
+    rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
+
+    maxtol, rmstol = 4e-1, 4e-2
+    print(f"maximum relative error = {max_err} (threshold = {maxtol})")
+    print(f"RMS relative error = {rms_err} (threshold = {rmstol})")
+    if max_err > maxtol or rms_err > rmstol:
+        raise AssertionError("Wrapper test failed against reference")
+    print("Test completed successfully")
+    return 0
+
+
+if __name__ == "__main__":
+    main()
