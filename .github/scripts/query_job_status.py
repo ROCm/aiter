@@ -347,13 +347,31 @@ def runner_label_sort_key(label: str):
     return (gpu, count, lowered)
 
 
+def get_concurrency_labels(row: dict[str, Any]):
+    labels = row.get("labels", []) or []
+    selected: list[str] = []
+
+    for label in labels:
+        lowered = label.lower()
+        if lowered in GENERIC_LABELS or lowered.startswith("ubuntu-"):
+            continue
+        if lowered == "build-only-aiter" or "mi35x" in lowered:
+            selected.append(label)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for label in selected:
+        if label not in seen:
+            deduped.append(label)
+            seen.add(label)
+    return deduped
+
+
 def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
     stats_by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in job_rows:
-        label = get_runner_label(row)
-        if label in ("unknown", "ubuntu-latest"):
-            continue
-        stats_by_label[label].append(row)
+        for label in get_concurrency_labels(row):
+            stats_by_label[label].append(row)
 
     results = {}
     for label in sorted(stats_by_label, key=runner_label_sort_key):
@@ -674,7 +692,10 @@ def main():
                 )
             )
         else:
-            print("No self-hosted runner jobs found in the selected time window.")
+            print(
+                "No matching `build-only-aiter` or `mi35x` runner labels found "
+                "in the selected time window."
+            )
     else:
         print("### Job Status Report")
         print(
