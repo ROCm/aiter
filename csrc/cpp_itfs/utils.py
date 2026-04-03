@@ -39,9 +39,13 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
+_ROCM_HOME = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH") or "/opt/rocm"
 DEFAULT_GPU_ARCH = (
     subprocess.run(
-        "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
+        f"{_ROCM_HOME}/llvm/bin/amdgpu-arch",
+        shell=True,
+        capture_output=True,
+        text=True,
     )
     .stdout.strip()
     .split("\n")[0]
