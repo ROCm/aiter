@@ -95,9 +95,9 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
 
     #pragma unroll
     for (int i = 0; i < THREAD_DATA_SIZE; i++) {
-        x_vals[i] = ck_tile::type_convert<float>(x_ptr[elem_id + i]);
-        z_vals[i] = ck_tile::type_convert<float>(z_ptr[elem_id + i]);
-        weight_vals[i] = ck_tile::type_convert<float>(weight[elem_id + i]);
+        x_vals[i] = opus::cast<float>(x_ptr[elem_id + i]);
+        z_vals[i] = opus::cast<float>(z_ptr[elem_id + i]);
+        weight_vals[i] = opus::cast<float>(weight[elem_id + i]);
     }
 
     // Step 1: Compute variance for standard RMSNorm (sum of squares of x)
@@ -155,14 +155,14 @@ __global__ void gated_rmsnorm_fp8_group_quant_kernel(
 
     // Step 6: Quantize and store
     const int out_base = token_id * (num_heads * head_dim) + head_id * head_dim;
-    using DTYPE_O_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
+    using DTYPE_O_STORE = typename opus::vector_traits<DTYPE_O>::dtype;
     DTYPE_O_STORE* out_ptr = reinterpret_cast<DTYPE_O_STORE*>(out + out_base);
 
     #pragma unroll
     for (int i = 0; i < THREAD_DATA_SIZE; i++) {
         float clamped = fminf(fmaxf(gated_vals[i] * quant_scale_inv, -FP8_MAX), FP8_MAX);
-        DTYPE_O quantized = ck_tile::type_convert<DTYPE_O>(clamped);
-        out_ptr[elem_id + i] = ck_tile::type_convert<DTYPE_O_STORE>(quantized);
+        DTYPE_O quantized = opus::cast<DTYPE_O>(clamped);
+        out_ptr[elem_id + i] = quantized;
     }
 
     // Step 7: Thread 0 of each group stores scale
@@ -285,11 +285,11 @@ void gated_rmsnorm_fp8_group_quant(
     // Dispatch based on input/output types
     if (x.scalar_type() == at::ScalarType::BFloat16 &&
         (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
-        gated_rmsnorm_fp8_group_quant_launcher<ck_tile::bf16_t, ck_tile::fp8_t>(
+        gated_rmsnorm_fp8_group_quant_launcher<opus::bf16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon, group_size, transpose_scale);
     } else if (x.scalar_type() == at::ScalarType::Half &&
                (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
-        gated_rmsnorm_fp8_group_quant_launcher<ck_tile::fp16_t, ck_tile::fp8_t>(
+        gated_rmsnorm_fp8_group_quant_launcher<opus::fp16_t, opus::fp8_t>(
             out, scale, x, z, weight, epsilon, group_size, transpose_scale);
     } else {
         TORCH_CHECK(false, "Unsupported dtype combination. Input: ", x.scalar_type(),
