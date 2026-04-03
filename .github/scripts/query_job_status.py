@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument(
         "--runner-report",
         action="store_true",
-        help="Print runner utilization and queue-time summary.",
+        help="Print runner concurrency summary by runner label.",
     )
     parser.add_argument(
         "--summary",
@@ -347,6 +347,80 @@ def runner_label_sort_key(label: str):
     return (gpu, count, lowered)
 
 
+def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
+    stats_by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in job_rows:
+        label = get_runner_label(row)
+        if label in ("unknown", "ubuntu-latest"):
+            continue
+        stats_by_label[label].append(row)
+
+    results = {}
+    for label in sorted(stats_by_label, key=runner_label_sort_key):
+        label_rows = stats_by_label[label]
+        events: list[tuple[datetime, int]] = []
+        queue_times: list[float] = []
+        durations: list[float] = []
+
+        for row in label_rows:
+            created = parse_time(row.get("created_at", ""))
+            started = parse_time(row.get("started_at", ""))
+            completed = parse_time(row.get("completed_at", ""))
+
+            if started and completed and completed >= started:
+                events.append((started, +1))
+                events.append((completed, -1))
+                durations.append((completed - started).total_seconds())
+            elif started:
+                events.append((started, +1))
+                events.append((report_time, -1))
+                durations.append((report_time - started).total_seconds())
+
+            if created and started:
+                queue_seconds = (started - created).total_seconds()
+                if queue_seconds >= 0:
+                    queue_times.append(queue_seconds)
+
+        if not events:
+            results[label] = {
+                "peak": 0,
+                "avg_concurrent": 0.0,
+                "total_jobs": len(label_rows),
+                "avg_queue_seconds": average(queue_times) or 0.0,
+                "avg_duration_seconds": average(durations) or 0.0,
+            }
+            continue
+
+        events.sort(key=lambda item: (item[0], item[1]))
+        concurrent = 0
+        peak = 0
+        time_weighted_sum = 0.0
+        total_time = 0.0
+        previous_time = events[0][0]
+
+        for timestamp, delta in events:
+            if concurrent > 0:
+                elapsed = (timestamp - previous_time).total_seconds()
+                if elapsed > 0:
+                    time_weighted_sum += concurrent * elapsed
+                    total_time += elapsed
+            concurrent += delta
+            peak = max(peak, concurrent)
+            previous_time = timestamp
+
+        results[label] = {
+            "peak": peak,
+            "avg_concurrent": (
+                round(time_weighted_sum / total_time, 1) if total_time > 0 else 0.0
+            ),
+            "total_jobs": len(label_rows),
+            "avg_queue_seconds": average(queue_times) or 0.0,
+            "avg_duration_seconds": average(durations) or 0.0,
+        }
+
+    return results
+
+
 def build_queue_distribution(queue_times: list[float]):
     if not queue_times:
         return []
@@ -570,47 +644,37 @@ def main():
     tablefmt = "github" if args.summary else "grid"
 
     if args.runner_report:
-        summary_rows, distribution_sections = build_runner_report_rows(
-            job_rows, report_time
-        )
-        print("### Runner Label Queue Summary")
-        print(
-            tabulate(
-                summary_rows,
-                headers=[
-                    "runner_label",
-                    "total",
-                    "running",
-                    "queued",
-                    "waiting",
-                    "success",
-                    "failure",
-                    "cancelled",
-                    "avg_queue",
-                    "p50_queue",
-                    "p90_queue",
-                    "p99_queue",
-                    "avg_duration",
-                ],
-                tablefmt=tablefmt,
-            )
-        )
-        non_empty_distributions = [
-            (label, rows) for label, rows in distribution_sections if rows
-        ]
-        if non_empty_distributions:
-            print("")
-            print("### Queue Time Distribution by Runner Label")
-            for label, rows in non_empty_distributions:
-                print("")
-                print(f"#### {label}")
-                print(
-                    tabulate(
-                        rows,
-                        headers=["queue_range", "count", "percentage"],
-                        tablefmt=tablefmt,
-                    )
+        concurrency = analyze_concurrency(job_rows, report_time)
+        print("## Concurrency by Runner Label")
+        if concurrency:
+            print(
+                tabulate(
+                    [
+                        [
+                            label,
+                            values["peak"],
+                            values["avg_concurrent"],
+                            values["total_jobs"],
+                            format_duration_seconds(values["avg_queue_seconds"]),
+                            format_duration_seconds(values["avg_duration_seconds"]),
+                        ]
+                        for label, values in sorted(
+                            concurrency.items(), key=lambda item: -item[1]["peak"]
+                        )
+                    ],
+                    headers=[
+                        "runner_label",
+                        "peak_concurrent",
+                        "avg_concurrent",
+                        "total_jobs",
+                        "avg_queue",
+                        "avg_duration",
+                    ],
+                    tablefmt=tablefmt,
                 )
+            )
+        else:
+            print("No self-hosted runner jobs found in the selected time window.")
     else:
         print("### Job Status Report")
         print(
