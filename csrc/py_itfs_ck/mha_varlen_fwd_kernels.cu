@@ -530,6 +530,7 @@ mha_varlen_fwd(
 
     // Otherwise the kernel will be launched from cuda:0 device
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
@@ -571,12 +572,11 @@ mha_varlen_fwd(
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
         hipLaunchKernelGGL(
-            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
+            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
 
     if (max_seqlen_k > 0) {
-        auto stream = at::hip::getCurrentHIPStream();
         ck_tile::stream_config stream_config{stream};
 
         if (paged_KV)

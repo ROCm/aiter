@@ -123,7 +123,7 @@
     "M_LEQ_8192": {
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 32,
-        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 4,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,
@@ -134,7 +134,7 @@
     "any": {
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 32,
-        "BLOCK_SIZE_K": 256,
+        "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 4,
         "waves_per_eu": 1,
         "matrix_instr_nonkdim": 16,

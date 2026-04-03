@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include <cfloat>
 #include <hip/hip_bf16.h>
 
@@ -23,8 +23,7 @@
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
-
+#define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
 using floatx4   = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using float16x4 = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
@@ -262,7 +261,6 @@ __device__ __forceinline__ _B16x4 addx4(const _B16x4& inp1, const _B16x4& inp2)
     }
 }
 
-
 __device__ __forceinline__ floatx4 to_float_fp8x4(const _B8x4& inp)
 {
 #if defined(__gfx90a__)
@@ -342,43 +340,43 @@ template <typename scalar_t,
           bool ALIBI_ENABLED,
           int GQA_RATIO,
           typename AttentionVariant>
-__device__ void _paged_attention_kernel(
-    const int* block_table_seq,
-    const int64_t query_loc,
-    int context_len,
-    const int partition_start_token_idx,
-    const scalar_t* q,
-    const cache_t* k_cache,
-    const cache_t* v_cache,
-    const float scale,
-    const float* __restrict__ alibi_slopes,    // [num_heads]
-    const int q_stride,
-    const int kv_block_stride,
-    const int kv_head_stride,
-    const int kv_seq_stride,
-    float* __restrict__ exp_sums,   // [num_seqs, num_heads, max_num_partitions]
-    float* __restrict__ max_logits, // [num_seqs, num_heads,
-                                    // max_num_partitions]
-    scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
-                                    // head_size]
-    float logits_soft_cap,
-    float logits_soft_cap_rcp,
-    const float* k_scale_ptr,
-    const float* v_scale_ptr,
-    const AttentionVariant* variant)
+__device__ void
+_paged_attention_kernel(const int* block_table_seq,
+                        const int64_t query_loc,
+                        int context_len,
+                        const int partition_start_token_idx,
+                        const scalar_t* q,
+                        const cache_t* k_cache,
+                        const cache_t* v_cache,
+                        const float scale,
+                        const float* __restrict__ alibi_slopes, // [num_heads]
+                        const int q_stride,
+                        const int kv_block_stride,
+                        const int kv_head_stride,
+                        const int kv_seq_stride,
+                        float* __restrict__ exp_sums,   // [num_seqs, num_heads, max_num_partitions]
+                        float* __restrict__ max_logits, // [num_seqs, num_heads,
+                                                        // max_num_partitions]
+                        scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
+                                                        // head_size]
+                        float logits_soft_cap,
+                        float logits_soft_cap_rcp,
+                        const float* k_scale_ptr,
+                        const float* v_scale_ptr,
+                        const AttentionVariant* variant)
 {
-    const int seq_idx       = blockIdx.x;
-    const int partition_idx = blockIdx.y;
+    const int seq_idx        = blockIdx.x;
+    const int partition_idx  = blockIdx.y;
     constexpr int T_PAR_SIZE = 256;
-    constexpr int NWARPS = NUM_THREADS / WARP_SIZE;
-    const int warpid     = threadIdx.x / WARP_SIZE;
-    const int laneid     = threadIdx.x % WARP_SIZE;
-    const int lane4id    = laneid % 4;
-    const int lane16id   = laneid % 16;
-    const int rowid      = laneid / 16;
+    constexpr int NWARPS     = NUM_THREADS / WARP_SIZE;
+    const int warpid         = threadIdx.x / WARP_SIZE;
+    const int laneid         = threadIdx.x % WARP_SIZE;
+    const int lane4id        = laneid % 4;
+    const int lane16id       = laneid % 16;
+    const int rowid          = laneid / 16;
 
     const int max_num_partitions = gridDim.y;
-    constexpr int GQA_RATIO4 = DIVIDE_ROUND_UP(GQA_RATIO, 4);
+    constexpr int GQA_RATIO4     = DIVIDE_ROUND_UP(GQA_RATIO, 4);
 
     __shared__ float shared_qk_max[NWARPS][16 + 1];
     __shared__ float shared_exp_sum[NWARPS][16 + 1];
@@ -454,7 +452,7 @@ __device__ void _paged_attention_kernel(
     const int local_qhead_idx  = 4 * warpid + rowid;
     const int global_qhead_idx = wg_start_head_idx + local_qhead_idx;
 
-    const scalar_t* q_ptr      = q + query_loc * q_stride + global_qhead_idx * HEAD_SIZE;
+    const scalar_t* q_ptr = q + query_loc * q_stride + global_qhead_idx * HEAD_SIZE;
 
     const int qhead_element = lane16id * CONTIGUOUS_SCALAR_ELEMS_16B;
     if((local_qhead_idx < GQA_RATIO) && (qhead_element < HEAD_SIZE))
@@ -622,10 +620,10 @@ __device__ void _paged_attention_kernel(
                 for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                 {
 #if defined(__gfx950__)
-                    dout[token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                        Klocal[token_depth][qkhe_depth],
-                        Qlocal[qkhe_depth][qkratio],
-                        dout[token_depth]);
+                    dout[token_depth] =
+                        gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(Klocal[token_depth][qkhe_depth],
+                                                                  Qlocal[qkhe_depth][qkratio],
+                                                                  dout[token_depth]);
 #else
                     for(int i = 0; i < 2; i++)
                     {
@@ -647,9 +645,7 @@ __device__ void _paged_attention_kernel(
                     _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
 #if defined(__gfx950__)
                     dout[token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                        Klocaltmp,
-                        Qlocal[qkhe_depth][qkratio],
-                        dout[token_depth]);
+                        Klocaltmp, Qlocal[qkhe_depth][qkratio], dout[token_depth]);
 #else
                     for(int i = 0; i < 2; i++)
                     {
@@ -688,10 +684,10 @@ __device__ void _paged_attention_kernel(
         {
             dout[token_depth][i] =
                 variant->LogitsTransform(variant_params,
-                                        dout[token_depth][i],
-                                        /*batch_idx=*/blockIdx.x,
-                                        /*qo_head_idx=*/wg_start_head_idx + lane16id,
-                                        /*kv_head_idx=*/blockIdx.z);
+                                         dout[token_depth][i],
+                                         /*batch_idx=*/blockIdx.x,
+                                         /*qo_head_idx=*/wg_start_head_idx + lane16id,
+                                         /*kv_head_idx=*/blockIdx.z);
         }
     }
 
@@ -842,22 +838,20 @@ __device__ void _paged_attention_kernel(
                             *reinterpret_cast<const _B16x8*>(elems);
                     }
 #if defined(__gfx950__)
-		    assert(ELEMS8_ELEMS4_RATIO == 2);
+                    assert(ELEMS8_ELEMS4_RATIO == 2);
                     _B16x8 tmp_in;
                     for(int i = 0; i < 2; i++)
                     {
                         const int offset = rowid * VTLANELOOP * ELEMS8_ELEMS4_RATIO +
-                            vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
+                                           vfetch_depth * ELEMS8_ELEMS4_RATIO + i;
                         const int offset1 = offset % ROWS_PER_WARP;
                         const int offset2 = offset / ROWS_PER_WARP;
-                        tmp_in.xy[i] = shared_logits[vtoken_depth][offset2][lane16id][offset1];
+                        tmp_in.xy[i]      = shared_logits[vtoken_depth][offset2][lane16id][offset1];
                     }
                     // output format is 16 qheads across 16 lanes, 16 head elems spread
                     // across 4 rows
                     tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                        Vlocal[vtoken_depth][vhe_depth][vfetch_depth],
-                        tmp_in,
-                        tmp_out);
+                        Vlocal[vtoken_depth][vhe_depth][vfetch_depth], tmp_in, tmp_out);
 #else
                     for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                     {
@@ -896,14 +890,12 @@ __device__ void _paged_attention_kernel(
                                                j * ELEMS8_ELEMS4_RATIO + i;
                             const int offset1 = offset % ROWS_PER_WARP;
                             const int offset2 = offset / ROWS_PER_WARP;
-			    tmp_in.xy[i] = shared_logits[vtoken_depth][offset2][lane16id][offset1];
+                            tmp_in.xy[i] = shared_logits[vtoken_depth][offset2][lane16id][offset1];
                         }
                         // output format is 16 qheads across 16 lanes, 16 head elems
                         // spread across 4 rows
-                        tmp_out = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
-                            Vlocaltmp,
-                            tmp_in,
-                            tmp_out);
+                        tmp_out =
+                            gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(Vlocaltmp, tmp_in, tmp_out);
 #else
                         for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                         {
@@ -991,16 +983,16 @@ template <typename scalar_t,
 __device__ void _paged_attention_ll4mi_reduce_kernel(
     const int64_t query_loc,
     int context_len,
-    OUTT* __restrict__ out,                    // [num_seqs, num_heads, head_size]
-    const float* __restrict__ exp_sums,        // [num_seqs, num_heads,
-                                               // max_num_partitions]
-    const float* __restrict__ max_logits,      // [num_seqs, num_heads,
-                                               // max_num_partitions]
-    const scalar_t* __restrict__ tmp_out,      // [num_seqs, num_heads,
-                                               // max_num_partitions, head_size]
+    OUTT* __restrict__ out,               // [num_seqs, num_heads, head_size]
+    const float* __restrict__ exp_sums,   // [num_seqs, num_heads,
+                                          // max_num_partitions]
+    const float* __restrict__ max_logits, // [num_seqs, num_heads,
+                                          // max_num_partitions]
+    const scalar_t* __restrict__ tmp_out, // [num_seqs, num_heads,
+                                          // max_num_partitions, head_size]
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr
-){
+    const float* __restrict__ fp8_out_scale_ptr)
+{
     const int num_heads = gridDim.x;
     const int head_idx  = blockIdx.x;
     const int seq_idx   = blockIdx.y;
