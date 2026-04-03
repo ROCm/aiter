@@ -54,10 +54,6 @@ def run_torch(
     return q, k, v
 
 
-# @pytest.mark.parametrize("B", [32])
-# @pytest.mark.parametrize("QH_PER_KH", [8])
-# @pytest.mark.parametrize("KH", [8])
-# @pytest.mark.parametrize("D", [64])
 @pytest.mark.parametrize("B", [1, 4, 8, 16])
 @pytest.mark.parametrize("QH_PER_KH", [1, 2, 4, 8])
 @pytest.mark.parametrize("KH", [1, 4])

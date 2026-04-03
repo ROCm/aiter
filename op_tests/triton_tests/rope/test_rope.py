@@ -358,9 +358,7 @@ def test_rope_sbhd_bwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize(
-    "B, T", [(1, 1), (2, 32), (57, 1024)]
-)
+@pytest.mark.parametrize("B, T", [(1, 1), (2, 32), (57, 1024)])
 @pytest.mark.parametrize("H", [8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2.
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
@@ -447,9 +445,7 @@ def test_rope_thd_fwd(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize(
-    "B, T", [(1, 1), (2, 32), (57, 1024)]
-)
+@pytest.mark.parametrize("B, T", [(1, 1), (2, 32), (57, 1024)])
 @pytest.mark.parametrize("H", [8])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2.
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
@@ -664,6 +660,7 @@ def test_rope_cached_fwd(
         print(f"triton_out={triton_out}")
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
 
 @pytest.mark.parametrize("B", [1, 32])
 @pytest.mark.parametrize("S", [1, 1024])
