@@ -1654,10 +1654,6 @@ def compile_moe_gemm2(
                 else arith.constant_vector(0.0, vec4_f32)
             )
 
-            # A2 layout (flatten token-slot -> M; use i32 for fly.make_shape).
-            topk_idx = arith.index(topk)
-            m_in = tokens_in * topk_idx
-
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = arith.index(experts * model_dim)
             kpack_bytes = 8 if (is_int4 or is_int4_bf16) else 16
