@@ -267,6 +267,8 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     bpreshuffle: Optional[bool] = True,
     zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
+    if bias is None and zero_bias_buf is None:
+        zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
     _gemm_a8w8_blockscale_bpreshuffle_asm(
         A,
         B,
