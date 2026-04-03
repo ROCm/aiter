@@ -16,7 +16,6 @@
  */
 #include "custom_all_reduce.cuh"
 #include "aiter_tensor.h"
-#include "aiter_stream.h"
 #include <cstring>
 
 using fp8_type = opus::fp8_t;
@@ -35,7 +34,8 @@ fptr_t init_custom_ar(int64_t meta_ptr,
                       const std::vector<int64_t>& ipc_handle_ptrs,
                       const std::vector<int64_t>& offsets,
                       int64_t rank,
-                      bool fully_connected)
+                      bool fully_connected,
+                      hipStream_t stream)
 {
     int world_size = offsets.size();
     if(world_size > 8)
@@ -321,9 +321,8 @@ void register_graph_buffers(fptr_t _fa,
 
 #ifdef USE_ROCM
 
-int64_t allocate_meta_buffer(int64_t size)
+int64_t allocate_meta_buffer(int64_t size, hipStream_t stream)
 {
-    auto stream = aiter::getCurrentHIPStream();
     void* buffer;
     hipStreamCaptureMode mode = hipStreamCaptureModeRelaxed;
     HIP_CALL(hipThreadExchangeStreamCaptureMode(&mode));
@@ -353,9 +352,9 @@ void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& out,
                 bool use_new, bool open_fp8_quant,
                 int64_t reg_inp_ptr, int64_t reg_inp_bytes,
-                int64_t reg_out_ptr, int64_t reg_out_bytes)
+                int64_t reg_out_ptr, int64_t reg_out_bytes,
+                hipStream_t stream)
 {
-    auto stream    = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
@@ -401,9 +400,9 @@ void all_reduce(fptr_t _fa,
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t reg_ptr, int64_t reg_bytes)
+                    int64_t reg_ptr, int64_t reg_bytes,
+                    hipStream_t stream)
 {
-    auto stream    = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t inp_numel  = inp.numel();
     int64_t data_bytes = inp_numel * inp.element_size();
@@ -425,9 +424,9 @@ void reduce_scatter(fptr_t _fa,
 void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t dim)
+                    int64_t dim,
+                    hipStream_t stream)
 {
-    auto stream = aiter::getCurrentHIPStream();
     int64_t last_dim_size = inp.size(-1);
     _all_gather(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
                 last_dim_size, dim, stream);
@@ -438,9 +437,9 @@ void all_gather_unreg(fptr_t _fa,
                       int64_t reg_buffer,
                       const aiter_tensor_t& out,
                       int64_t reg_bytes,
-                      int64_t dim)
+                      int64_t dim,
+                      hipStream_t stream)
 {
-    auto stream    = aiter::getCurrentHIPStream();
     int64_t data_bytes = inp.numel() * inp.element_size();
     int64_t last_dim_size = inp.size(-1);
 
@@ -460,9 +459,9 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& w,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
-                             bool use_1stage)
+                             bool use_1stage,
+                             hipStream_t stream)
 {
-    auto stream    = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
@@ -498,9 +497,9 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& w,
                                    double eps,
                                    int64_t reg_ptr, int64_t reg_bytes,
-                                   bool use_1stage)
+                                   bool use_1stage,
+                                   hipStream_t stream)
 {
-    auto stream    = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
