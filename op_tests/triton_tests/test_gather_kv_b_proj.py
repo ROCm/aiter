@@ -294,7 +294,7 @@ def test_gather_kv_b_proj(
     ],
 )
 def test_gather_kv_b_proj_per_row_scale(
-    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length
+    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length, perf=False
 ):
     """kv_proj_scale [weight_n]: one BF16/FP32 scale per output row (e.g. F8_E4M3 + per-row)."""
     torch.manual_seed(0)
@@ -395,6 +395,34 @@ def test_gather_kv_b_proj_per_row_scale(
     checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
     checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
 
+    if perf:
+        _, elapsed_us = run_perftest(
+            gather_kv_b_proj,
+            k_buffer,
+            k_scale,
+            kv_indptr,
+            kv_indices,
+            kv_prefix_sum_context_lens,
+            kv_proj_weight,
+            kv_proj_scale,
+            k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+            v_prefix.view(-1, tp_k_head_num, qk_nope_head_dim),
+            weight_preshuffle=weight_preshuffle,
+        )
+        total_float_operations = (
+            2
+            * context_lens.float().sum().item()
+            * (2 * tp_k_head_num * qk_nope_head_dim)
+            * kv_c_dim
+        )
+        tflops = total_float_operations / elapsed_us * 1e-6
+
+        print(">>> Performance gather_kv_b_proj_per_row_scale:")
+        print(
+            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
+            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -434,11 +462,21 @@ if __name__ == "__main__":
     assert (
         args.ktype == "fp8" or args.ktype == "bf16"
     ), "Only fp8 and bfloat16 are supported"
+    k_buffer_type = dtypes.fp8 if args.ktype == "fp8" else torch.bfloat16
+
+    test_gather_kv_b_proj_per_row_scale(
+        args.batch,
+        args.blocksize,
+        args.num_tp,
+        k_buffer_type,
+        args.kv_length,
+        perf=True,
+    )
     test_gather_kv_b_proj(
         args.batch,
         args.blocksize,
         args.num_tp,
-        torch.float8_e4m3fnuz if args.ktype == "fp8" else torch.bfloat16,
+        k_buffer_type,
         args.kv_length,
         perf=True,
     )
