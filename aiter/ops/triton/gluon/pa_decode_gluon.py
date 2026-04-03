@@ -3407,7 +3407,7 @@ def pa_decode_gluon(
             equivalent_query_group_size,
             head_size,
             device=query.device,
-            dtype=query.dtype,
+            dtype=output.dtype,
         )
     kv_block_size = key_cache.shape[-2]
 
@@ -3484,7 +3484,7 @@ def pa_decode_gluon(
             equivalent_query_group_size,
             head_size,
             device=query.device,
-            dtype=query.dtype,
+            dtype=output.dtype,
         )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
