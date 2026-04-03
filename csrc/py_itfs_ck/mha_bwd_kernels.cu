@@ -133,18 +133,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias;
     bool has_dbias = dbias_.has_value();
     auto opts = q.options();
-    const fmha_bwd_traits traits{
-        head_size_q,
-        head_size_v,
-        q_dtype_str,
-        false, // is_group_mode
-        mask.type,
-        bias_type,
-        has_dbias,
-        p_dropout > 0,
-        false, // is_store_randval
-        deterministic,
-    };
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
     auto stream = at::hip::getCurrentHIPStream();

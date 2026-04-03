@@ -150,18 +150,6 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
     bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
     auto opts = q.options();
-    const fmha_bwd_traits traits{
-        head_size_q,
-        head_size_v,
-        q_dtype_str,
-        true, // is_group_mode
-        mask.type,
-        bias_type,
-        false, // has_dbias
-        p_dropout > 0,
-        false, // is_store_randval
-        deterministic,
-    };
     // nsplits: deterministic mode splits dK into ceil(max_seqlen_k/16) pieces for atomic-free accumulation.
     constexpr ck_tile::index_t kN0 = 16;
     const ck_tile::index_t nsplits = deterministic

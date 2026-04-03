@@ -134,8 +134,15 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     return asm_ret;
 #else // !ONLY_FAV3
     const fmha_bwd_traits traits{
+        a.seqlen_q,
+        a.seqlen_k,
+        a.batch,
+        a.max_seqlen_q,
+        a.max_seqlen_k,
         a.hdim_q,
         a.hdim_v,
+        a.nhead_q,
+        a.nhead_k,
         a.data_type,
         a.is_group_mode,
         static_cast<mask_enum>(a.mask_type),
@@ -203,7 +210,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* nhead_stride_randval*/ a.nhead_stride_randval,
         /* nhead_stride_do    */ a.nhead_stride_do,
         /* nhead_stride_lsed  */ a.nhead_stride_lsed,
-        /* nhead_stride_dq_acc*/ static_cast<ck_tile::index_t>(a.nhead_stride_dq_acc),
+        /* nhead_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.nhead_stride_dq_acc),
         /* nhead_stride_dq    */ a.nhead_stride_dq,
         /* nhead_stride_dk    */ a.nhead_stride_dk,
         /* nhead_stride_dv    */ a.nhead_stride_dv,
@@ -217,7 +224,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* batch_stride_randval*/ a.batch_stride_randval,
         /* batch_stride_do    */ a.batch_stride_do,
         /* batch_stride_lsed  */ a.batch_stride_lsed,
-        /* batch_stride_dq_acc*/ static_cast<ck_tile::index_t>(a.batch_stride_dq_acc),
+        /* batch_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.batch_stride_dq_acc),
         /* batch_stride_dq    */ a.batch_stride_dq,
         /* batch_stride_dk    */ a.batch_stride_dk,
         /* batch_stride_dv    */ a.batch_stride_dv,

@@ -1873,7 +1873,9 @@ class FlashAttnFunc(torch.autograd.Function):
         # 15 how_v3_bf16_cvt
         # 16 cu_seqlens_q
         # 17 cu_seqlens_kv
-        # 18 sink_ptr
+        # 18 sink_ptr (fwd-only sink scores; not differentiable via autograd.
+        #              bwd sink gradient d_sink is computed inside mha_bwd kernel,
+        #              not returned here as a positional gradient.)
         # Need to return exactly 18 gradient entries.
         return (
             dq,  # q
@@ -1893,7 +1895,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # how_v3_bf16_cvt
             None,  # cu_seqlens_q
             None,  # cu_seqlens_kv
-            None,  # sink_ptr
+            None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
         )
 
 
@@ -2522,7 +2524,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # out,
         # is_grad_enabled,
         # cu_seqlens_q_padded, cu_seqlens_k_padded,
-        # is_v3_atomic_fp32, how_v3_bf16_cvt
+        # is_v3_atomic_fp32, how_v3_bf16_cvt,
+        # sink_ptr (fwd-only sink scores; not differentiable via autograd.
+        #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
+        #           not returned here as a positional gradient.)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
         return (
             dq,  # q
@@ -2550,7 +2555,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # cu_seqlens_k_padded
             None,  # is_v3_atomic_fp32
             None,  # how_v3_bf16_cvt
-            None,  # sink_ptr
+            None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
         )
 
 
