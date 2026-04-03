@@ -500,7 +500,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     }
 }
 
-namespace detail {
+namespace topk_detail {
 // Constructs some constants needed to partition the work across threads at compile time.
 template <typename DTYPE, int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants
@@ -514,7 +514,7 @@ struct TopkConstants
     static constexpr int VPT             = VECs_PER_THREAD * ELTS_PER_LDG;
     static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
 };
-} // namespace detail
+} // namespace topk_detail
 
 template <typename DTYPE,
           int EXPERTS,
@@ -539,7 +539,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
     static constexpr std::size_t MAX_BYTES_PER_LDG = EXPERTS < 512 ? 32 : 64;
 
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(DTYPE) * EXPERTS);
-    using Constants                    = detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
+    using Constants                    = topk_detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
     AITER_CHECK(EXPERTS / (Constants::ELTS_PER_LDG * WARP_SIZE) <= 1, "EXPERTS:", EXPERTS, " not supported");
     static constexpr int VPT           = Constants::VPT;
     int ROWS_PER_WARP   = get_warp_size_func() / Constants::THREADS_PER_ROW;
