@@ -60,15 +60,18 @@ template <typename... Args>
         }                                                              \
     } while(0)
 
-#define HIP_CALL(call)                                                          \
-    do                                                                          \
-    {                                                                           \
-        hipError_t err = call;                                                  \
-        if(err != hipSuccess) [[unlikely]]                                      \
-        {                                                                       \
-            aiter_detail::aiter_check_fatal(                                    \
-                __FILE__, __LINE__, #call " failed: ", hipGetErrorString(err)); \
-        }                                                                       \
+#define HIP_CALL(call)                                                            \
+    do                                                                            \
+    {                                                                             \
+        hipError_t err = call;                                                    \
+        if(err != hipSuccess) [[unlikely]]                                        \
+        {                                                                         \
+            aiter_detail::aiter_check_fatal(__FILE__,                             \
+                                      __LINE__,                                   \
+                                      "fail to call " #call " ---> [HIP error](", \
+                                      hipGetErrorString(err),                     \
+                                      ')');                                       \
+        }                                                                         \
     } while(0)
 
 struct p3
