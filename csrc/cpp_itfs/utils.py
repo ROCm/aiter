@@ -39,10 +39,14 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
+
+
 def _find_rocm_home():
     # 1. Env var override (highest priority, escape hatch for users)
+    # If explicitly set, always respect it — fail loudly if wrong, don't silently
+    # fall back to a different install (TheRock principle).
     rocm = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
-    if rocm and os.path.isdir(rocm):
+    if rocm:
         return rocm
     # 2. hipconfig --rocmpath (tool-based discovery, TheRock recommended)
     hipconfig = shutil.which("hipconfig")
