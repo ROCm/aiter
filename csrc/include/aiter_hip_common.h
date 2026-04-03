@@ -13,15 +13,19 @@
 #include "ck_tile/core.hpp"
 #endif
 #include <cstdint>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
 
 namespace aiter_detail {
+
+inline thread_local bool g_aiter_can_throw = false;
 
 template <typename... Args>
 [[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
@@ -31,14 +35,18 @@ template <typename... Args>
     (oss << ... << std::forward<Args>(args));
     std::string msg = oss.str();
     std::cerr << msg << std::endl;
-    throw std::runtime_error(msg);
+    if(g_aiter_can_throw)
+    {
+        throw std::runtime_error(std::move(msg));
+    }
+    std::abort();
 }
 } // namespace aiter_detail
 
 #define AITER_CHECK(x, ...)                                            \
     do                                                                 \
     {                                                                  \
-        if(!(x))                                                       \
+        if(!(x)) [[unlikely]]                                          \
         {                                                              \
             aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__); \
         }                                                              \
@@ -48,7 +56,7 @@ template <typename... Args>
     do                                                                          \
     {                                                                           \
         hipError_t err = call;                                                  \
-        if(err != hipSuccess)                                                   \
+        if(err != hipSuccess) [[unlikely]]                                      \
         {                                                                       \
             aiter_detail::check_fail(                                           \
                 __FILE__, __LINE__, #call " failed: ", hipGetErrorString(err)); \

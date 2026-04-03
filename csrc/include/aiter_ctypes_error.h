@@ -46,6 +46,7 @@
 #pragma once
 #include <string>
 #include <utility>
+#include <hip/hip_runtime_api.h>
 
 // ---------------------------------------------------------------------------
 // AITER_CTYPES_ERROR_DEF -- place once at file scope in ONE translation unit
@@ -83,18 +84,26 @@
 template <typename Func>
 inline int aiter_safe_call(std::string& tls_error, Func&& fn)
 {
+    const bool prev_can_throw = aiter_detail::g_aiter_can_throw;
+    aiter_detail::g_aiter_can_throw = true;
     tls_error.clear();
     try
     {
-        return fn();
+        int ret = fn();
+        aiter_detail::g_aiter_can_throw = prev_can_throw;
+        return ret;
     }
     catch(const std::exception& e)
     {
+        aiter_detail::g_aiter_can_throw = prev_can_throw;
+        (void)hipGetLastError();
         tls_error = e.what();
         return -1;
     }
     catch(...)
     {
+        aiter_detail::g_aiter_can_throw = prev_can_throw;
+        (void)hipGetLastError();
         tls_error = "unknown C++ exception";
         return -1;
     }
