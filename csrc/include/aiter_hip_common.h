@@ -28,6 +28,14 @@ namespace aiter_detail {
 inline thread_local bool g_aiter_can_throw = false;
 
 template <typename... Args>
+[[noreturn, noinline]] inline void aiter_check_fatal(const char* file, size_t line, Args&&... args)
+{
+    std::cerr << "[AITER] " << file << ":" << line << " ";
+    (std::cerr << ... << std::forward<Args>(args)) << std::endl;
+    std::abort();
+}
+
+template <typename... Args>
 [[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
 {
     std::ostringstream oss;
@@ -58,7 +66,7 @@ template <typename... Args>
         hipError_t err = call;                                                  \
         if(err != hipSuccess) [[unlikely]]                                      \
         {                                                                       \
-            aiter_detail::check_fail(                                           \
+            aiter_detail::aiter_check_fatal(                                    \
                 __FILE__, __LINE__, #call " failed: ", hipGetErrorString(err)); \
         }                                                                       \
     } while(0)
