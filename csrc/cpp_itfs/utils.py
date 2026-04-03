@@ -39,7 +39,38 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
-_ROCM_HOME = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH") or "/opt/rocm"
+def _find_rocm_home():
+    # 1. Env var override (highest priority, escape hatch for users)
+    rocm = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
+    if rocm and os.path.isdir(rocm):
+        return rocm
+    # 2. hipconfig --rocmpath (tool-based discovery, TheRock recommended)
+    hipconfig = shutil.which("hipconfig")
+    if hipconfig:
+        try:
+            result = subprocess.run(
+                [hipconfig, "--rocmpath"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and os.path.isdir(result.stdout.strip()):
+                return result.stdout.strip()
+        except Exception:
+            pass
+    # 3. rocm-sdk path --root (TheRock Python package)
+    rocm_sdk = shutil.which("rocm-sdk")
+    if rocm_sdk:
+        try:
+            result = subprocess.run(
+                [rocm_sdk, "path", "--root"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and os.path.isdir(result.stdout.strip()):
+                return result.stdout.strip()
+        except Exception:
+            pass
+    # 4. Fallback
+    return "/opt/rocm"
+
+
+_ROCM_HOME = _find_rocm_home()
 DEFAULT_GPU_ARCH = (
     subprocess.run(
         f"{_ROCM_HOME}/llvm/bin/amdgpu-arch",
