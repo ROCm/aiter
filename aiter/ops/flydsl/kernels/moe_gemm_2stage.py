@@ -117,7 +117,6 @@ def compile_moe_gemm1(
 
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
-    _state = {}  # legacy; kept until stage2/reduction are migrated
 
     if in_dtype not in (
         "fp8",
@@ -181,14 +180,6 @@ def compile_moe_gemm1(
                 "BF16 K16 MFMA op not found: expected `rocdl.mfma_f32_16x16x16bf16_1k` "
                 "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)."
             )
-
-    ir.ShapedType.get_dynamic_size()
-    # W is packed int4 for W4A8: 2 values per byte.
-    (
-        (experts * (2 * inter_dim) * model_dim) // 2
-        if (is_int4 or is_int4_bf16)
-        else (experts * (2 * inter_dim) * model_dim)
-    )
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
@@ -331,9 +322,6 @@ def compile_moe_gemm1(
                 else arith.constant_vector(0.0, vec4_f32)
             )
 
-            # Layouts (use i32 values; fly.make_shape requires i32/i64, not index)
-            fx.make_layout((tokens_i32_v, k_i32_v), stride=(k_i32_v, 1))
-
             # B preshuffle layout: match GEMM test helper exactly.
             c_n_total = arith.index(experts * (2 * inter_dim))
             # For packed int4 (W4A8/W4A16), kpack_bytes=8.
@@ -347,7 +335,6 @@ def compile_moe_gemm1(
                 elem_bytes=w_elem_bytes,
             )
             layout_b = b_layout.layout_b
-            (k_in * arith.index(int(elem_bytes))) // arith.index(64)
 
             shape_lds = fx.make_shape(tile_m, tile_k)
             stride_lds = fx.make_stride(lds_stride, 1)
@@ -492,7 +479,6 @@ def compile_moe_gemm1(
 
                 c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
                 c_k_div4_i32 = arith.index_cast(i32, c_k_div4)
-                fx.make_layout((tokens_i32_v, c_k_div4_i32), stride=(c_k_div4_i32, 1))
                 tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
                 layout_x_tile_div4 = fx.make_layout(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
@@ -549,8 +535,6 @@ def compile_moe_gemm1(
                         t_safe = arith.select(t_valid_i32, t_idx, arith.index(0))
                         x_row_base_div4.append(t_safe * c_k_div4)
 
-                T.vec(1, i32)
-                T.vec(2, i32)
                 vec4_i32 = T.vec(4, i32)
                 vec4_x = T.vec(4, x_elem)
 
@@ -635,7 +619,6 @@ def compile_moe_gemm1(
                 n_blk_up = []
                 col_g_list = []
                 inter_idx = arith.index(inter_dim)
-                c_n_total // arith.index(16)
                 c_n0_static = experts * (2 * inter_dim) // 16
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
                 for ni in range_constexpr(num_acc_n):
@@ -1119,7 +1102,6 @@ def compile_moe_gemm1(
                 for ni in range_constexpr(num_acc_n):
                     col_i32_list.append(arith.index_cast(i32, col_g_list[ni]))
 
-                lane_div_16 * arith.index(4)
                 inter_i32_local = inter_i32_v
 
                 # Uses EVec=4 (buffer store "x4" of fp16 elements).
@@ -1306,7 +1288,6 @@ def compile_moe_gemm1(
                             )
                         )
                     sx = sx0
-                    arith.constant(0.0, type=out_mlir())
 
                     # out linear index base = ((t*topk + s)*inter_dim) (invariant across ni)
                     idx0 = (t2 * topk_i32_v + s2) * inter_i32_local
@@ -1462,7 +1443,6 @@ def compile_moe_gemm2(
     """
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
-    _state = {}
 
     if in_dtype not in (
         "fp8",
@@ -1518,14 +1498,6 @@ def compile_moe_gemm2(
                 "BF16 K16 MFMA op not found: expected `rocdl.mfma_f32_16x16x16bf16_1k` "
                 "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)."
             )
-
-    ir.ShapedType.get_dynamic_size()
-    # W is packed int4 for W4A8/W4A16: 2 values per byte.
-    (
-        (experts * model_dim * inter_dim) // 2
-        if (is_int4 or is_int4_bf16)
-        else (experts * model_dim * inter_dim)
-    )
 
     total_threads = 256
     tile_k_bytes = int(tile_k) * int(elem_bytes)
@@ -1650,8 +1622,6 @@ def compile_moe_gemm2(
             size_expert_ids_in = arith.index_cast(
                 T.index, i32_size_expert_ids_in.ir_value()
             )
-            # i32 versions for layout construction (fly.make_shape requires i32/i64)
-            i32_tokens_in.ir_value()
             k_i32_v = i32_k_in.ir_value()
             x_elem = (
                 T.bf16
@@ -1674,8 +1644,6 @@ def compile_moe_gemm2(
             i64 = T.i64
             vec4_f32 = T.vec(4, f32)
             vec4_i32 = T.vec(4, i32)
-            T.vec(1, f16)
-            T.vec(2, f16)
             vec4_f16 = T.vec(4, f16)
             vec4_i16 = T.vec(4, T.i16)  # For bf16 MFMA (expects v4i16 bit-pattern)
             vec16_elems = 16 if elem_bytes == 1 else 8
@@ -1695,7 +1663,6 @@ def compile_moe_gemm2(
             topk_idx = arith.index(topk)
             m_in = tokens_in * topk_idx
             m_i32_v = arith.index_cast(i32, m_in)
-            fx.make_layout((m_i32_v, k_i32_v), stride=(k_i32_v, 1))
 
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = arith.index(experts * model_dim)
@@ -1709,7 +1676,6 @@ def compile_moe_gemm2(
                 elem_bytes=w_elem_bytes,
             )
             layout_b = b_layout.layout_b
-            (k_in * arith.index(int(elem_bytes))) // arith.index(64)
 
             shape_lds = fx.make_shape(tile_m, tile_k)
             stride_lds = fx.make_stride(lds_stride, 1)
@@ -1726,7 +1692,6 @@ def compile_moe_gemm2(
             k_blocks16 = arith.index(tile_k_bytes // 16)
             layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
-            fx.make_layout((tile_m, tile_k), stride=(tile_k, 1))
 
             base_ptr = allocator.get_base()
             lds_x_ptr = SmemPtr(
@@ -1859,7 +1824,6 @@ def compile_moe_gemm2(
 
                 c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
                 c_k_div4_i32 = arith.index_cast(i32, c_k_div4)
-                fx.make_layout((m_i32_v, c_k_div4_i32), stride=(c_k_div4_i32, 1))
                 tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
                 layout_x_tile_div4 = fx.make_layout(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
@@ -1986,7 +1950,6 @@ def compile_moe_gemm2(
                 n_intra_list = []
                 n_blk_list = []
                 col_g_list = []
-                c_n_total // arith.index(16)
                 c_n0_static = experts * model_dim // 16
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
                 for ni in range_constexpr(num_acc_n):
@@ -2843,9 +2806,6 @@ def compile_moe_reduction(
     When use_mask=True, only sums slots where valid_mask[t,k]=1.
     Used in conjunction with compile_moe_gemm2(accumulate=False) to avoid atomic contention.
     """
-    get_hip_arch()
-    ir.ShapedType.get_dynamic_size()
-
     # Kernel Config
     BLOCK_SIZE = 256
     VEC_WIDTH = 8
@@ -2926,8 +2886,6 @@ def compile_moe_reduction(
                 )
                 _if_col = scf.IfOp(col_ok)
                 with _if_then(_if_col):
-                    [arith.constant(0.0, type=compute_type()) for _ in range(VEC_WIDTH)]
-
                     # Fast path: full vector in-bounds -> vector load/store.
                     end_ok = arith.cmpi(
                         arith.CmpIPredicate.ule,
