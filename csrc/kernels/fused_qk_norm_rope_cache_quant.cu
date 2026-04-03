@@ -35,6 +35,10 @@
  
  namespace {
  using mrope_utils::vec_t;
+
+ // Minimum absmax used when computing FP8 KV scales to avoid division by zero when
+ // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
+ static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
  
  template <typename Func, typename T>
  __inline__ __device__ T warpReduceSum(Func func, T val)
@@ -270,7 +274,8 @@
          float k_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
-             k_scale_val = warp_max / dtype_max;
+             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+             k_scale_val                 = warp_max_safe / dtype_max;
              int64_t scale_offset =
                  block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
              k_scale[scale_offset] = k_scale_val;
@@ -298,7 +303,8 @@
          float v_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
-             v_scale_val = warp_max / dtype_max;
+             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+             v_scale_val                 = warp_max_safe / dtype_max;
              int64_t scale_offset =
                  block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
              v_scale[scale_offset] = v_scale_val;
@@ -637,8 +643,9 @@
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            k_scale_val = block_max / dtype_max;
-            inv_scale_val = dtype_max / block_max;
+            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            k_scale_val                  = block_max_safe / dtype_max;
+            inv_scale_val                = dtype_max / block_max_safe;
             int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
@@ -675,7 +682,7 @@
                 else
                 {
                     k_scale_val   = k_scale_global;
-                    inv_scale_val = 1.0f / k_scale_global;
+                    inv_scale_val = 1.0f / fmaxf(k_scale_global, kFp8KvQuantAbsmaxFloorF32);
                 }
             }
             else
@@ -715,8 +722,9 @@
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            v_scale_val = block_max / dtype_max;
-            inv_scale_val = dtype_max / block_max;
+            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            v_scale_val                  = block_max_safe / dtype_max;
+            inv_scale_val                = dtype_max / block_max_safe;
             int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
@@ -776,7 +784,7 @@
                 else
                 {
                     v_scale_val   = v_scale_global;
-                    inv_scale_val = 1.0f / v_scale_global;
+                    inv_scale_val = 1.0f / fmaxf(v_scale_global, kFp8KvQuantAbsmaxFloorF32);
                 }
             }
             else
