@@ -236,6 +236,25 @@ def row_from_dict(data: Any):
     }
 
 
+def parse_row_created_at(row: dict[str, Any]):
+    created_at = row.get("created_at")
+    if not created_at:
+        return None
+    if isinstance(created_at, datetime):
+        return (
+            created_at
+            if created_at.tzinfo is not None
+            else created_at.replace(tzinfo=timezone.utc)
+        )
+    if not isinstance(created_at, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 def calculate_duration(started_at: str, completed_at: str):
     started = parse_time(started_at)
     completed = parse_time(completed_at)
@@ -285,8 +304,14 @@ def percentile(values: list[float], percent: int):
     if not values:
         return None
     ordered = sorted(values)
-    index = min(int(len(ordered) * percent / 100), len(ordered) - 1)
-    return ordered[index]
+    clamped_percent = max(0, min(percent, 100))
+    position = (len(ordered) - 1) * clamped_percent / 100
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    fraction = position - lower_index
+    return ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
 
 
 def format_duration_seconds(seconds: float | None):
@@ -456,6 +481,19 @@ def main():
     all_rows: list[dict[str, Any]] = []
     if args.snapshot_in:
         snapshot_payload = json.loads(Path(args.snapshot_in).read_text(encoding="utf-8"))
+        snapshot_generated_at = snapshot_payload.get("generated_at")
+        if isinstance(snapshot_generated_at, str):
+            try:
+                parsed_report_time = datetime.fromisoformat(
+                    snapshot_generated_at.replace("Z", "+00:00")
+                )
+                report_time = (
+                    parsed_report_time
+                    if parsed_report_time.tzinfo is not None
+                    else parsed_report_time.replace(tzinfo=timezone.utc)
+                )
+            except ValueError:
+                pass
         all_rows = [row_from_dict(item) for item in snapshot_payload.get("rows", [])]
     else:
         try:
@@ -492,7 +530,7 @@ def main():
 
     if args.snapshot_out:
         snapshot_payload = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": report_time.isoformat(),
             "rows": [row_to_dict(row) for row in all_rows],
         }
         Path(args.snapshot_out).write_text(
@@ -505,6 +543,8 @@ def main():
         for row in all_rows
         if row.get("workflow") in workflow_set
         and job_name_matches(args.job, row.get("job", ""))
+        and (created_at := parse_row_created_at(row)) is not None
+        and created_at >= lookback
     ]
 
     if not job_rows:

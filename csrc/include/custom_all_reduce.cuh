@@ -1563,6 +1563,15 @@ __global__ void __launch_bounds__(1024, 1)
             }
         }
 
+        // Round allreduce result to bf16 and back to f32 before adding residual,
+        // matching the numerical behavior of the unfused (allreduce -> bf16 -> add residual) path.
+        // Without this, the extra f32 mantissa bits cause 1-ULP divergence that compounds across layers.
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] = upcast_s(downcast_s<T>(acc[v]));
+        }
+
         P res = *reinterpret_cast<P*>(residual_inp + idx);
 
 #pragma unroll

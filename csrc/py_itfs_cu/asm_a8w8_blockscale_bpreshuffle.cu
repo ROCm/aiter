@@ -4,6 +4,7 @@
 #include "asm_fp8gemm_blockscale_configs.hpp"
 #include <cmath>
 #include <memory>
+#include <optional>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
@@ -71,9 +72,15 @@ static void validate_inputs(aiter_tensor_t* A, aiter_tensor_t* B, aiter_tensor_t
 }
 
 // Heuristic kernel selection
-std::tuple<std::string, int> get_heuristic_fp8_kernel(int M, int N, int K, std::string arch_id,
-                                                      int splitK, int bpreshuffle,
-                                                      CFG* cfgs) {
+std::tuple<std::string, int> get_heuristic_fp8_kernel(
+    int M,
+    int N,
+    int K,
+    std::string arch_id,
+    std::optional<int> k_split,
+    std::optional<bool> bpreshuffle,
+    CFG* cfgs) {
+    k_split = k_split.value_or(0) ?: 1;
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
@@ -84,8 +91,8 @@ std::tuple<std::string, int> get_heuristic_fp8_kernel(int M, int N, int K, std::
     uint32_t round = 0xffffffff;
     float compute2mem_effi = 1.0;
 
-    int splitK_en = (splitK >= 0 && splitK != 1) ? 1 : 0;
-    int bpreshuffle_en = (bpreshuffle == 0) ? 0 : 1;
+    int splitK_en = 1;
+    int bpreshuffle_en = (bpreshuffle.has_value() && !bpreshuffle.value()) ? 0 : 1;
     std::string selectedKernelName = "";
     int selectedsplitK = 1;
 
@@ -93,11 +100,16 @@ std::tuple<std::string, int> get_heuristic_fp8_kernel(int M, int N, int K, std::
         if (el.first.find(arch_id) != 0) continue;
 
         const auto& cfg = el.second;
-        if (cfg.bpreshuffle == bpreshuffle_en && ((cfg.splitK >= splitK_en) || (splitK < 0))) {
+        if (cfg.bpreshuffle == bpreshuffle_en &&
+            ((cfg.splitK >= splitK_en) || !k_split.has_value())) {
             if ((N % cfg.tile_n) == 0) {
-                std::vector<int> splitK_list = (splitK >= 0) 
-                    ? std::vector<int>{splitK}
-                    : (cfg.splitK ? std::vector<int>{2, 4, 8} : std::vector<int>{1});
+                std::vector<int> splitK_list =
+                    (k_split.has_value())
+                        ? std::vector<int>{k_split.value()}
+                        : (cfg.splitK
+                               ? std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8,
+                                                  9, 10, 11, 12, 13, 14, 15, 16}
+                               : std::vector<int>{1});
 
                 for (auto& split_k : splitK_list) {
                     int tg_num_M = (M + cfg.tile_m - 1) / cfg.tile_m;
@@ -128,23 +140,31 @@ std::tuple<std::string, int> get_heuristic_fp8_kernel(int M, int N, int K, std::
 }
 
 struct KernelSelector {
-    using DictKey = std::tuple<int, int, int, int, int>;
+    using DictKey = std::tuple<int, int, int, std::optional<int>, std::optional<bool>>;
     struct SimpleHash {
         size_t operator()(const DictKey& key) const {
             const auto& [m, n, k, split_k, shuffle] = key;
+            int split_key = split_k.has_value() ? split_k.value() : -1;
+            bool shuffle_key = shuffle.has_value() ? shuffle.value() : false;
             return std::hash<int>()(m) ^ std::hash<int>()(n) ^ std::hash<int>()(k) ^
-                   std::hash<int>()(split_k) ^ std::hash<int>()(shuffle);
+                   std::hash<int>()(split_key) ^ std::hash<bool>()(shuffle_key);
         }
     };
 
     static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash> heuristic_cache;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> kernel_cache;
 
-    static std::tuple<std::string, int> select_kernel(int M, int N, int K, const std::string& arch_id,
-                                                     int splitK, int bpreshuffle,
-                                                     const char* kernelName, CFG* config_map) {
+    static std::tuple<std::string, int> select_kernel(
+        int M,
+        int N,
+        int K,
+        const std::string& arch_id,
+        std::optional<int> splitK,
+        std::optional<bool> bpreshuffle,
+        const char* kernelName,
+        CFG* config_map) {
         if (kernelName && kernelName[0] != 0) {
-            return std::make_tuple(arch_id + kernelName, (splitK >= 0) ? splitK : 1);
+            return std::make_tuple(arch_id + kernelName, splitK.value_or(0) ?: 1);
         }
 
         DictKey key(M, N, K, splitK, bpreshuffle);
@@ -171,9 +191,20 @@ std::unordered_map<KernelSelector::DictKey, std::tuple<std::string, int>, Kernel
     KernelSelector::heuristic_cache;
 std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> KernelSelector::kernel_cache;
 
-static KernelArgs setup_kernel_args(aiter_tensor_t* A, aiter_tensor_t* B, aiter_tensor_t* out,
-                                   aiter_tensor_t* A_scale, aiter_tensor_t* B_scale,
-                                   void* bias_ptr, int selectedsplitK) {
+static KernelArgs setup_kernel_args(
+    aiter_tensor_t* A,
+    aiter_tensor_t* B,
+    aiter_tensor_t* out,
+    aiter_tensor_t* A_scale,
+    aiter_tensor_t* B_scale,
+    void* bias_ptr,
+    int Mdim,
+    int Ndim,
+    int Kdim,
+    int stride_a,
+    int stride_b,
+    int stride_c,
+    int selectedsplitK) {
     constexpr int block_shape_m = 1, block_shape_k = 128, block_shape_n = 128;
     KernelArgs args;
     args.ptr_A = A->ptr;
@@ -182,16 +213,16 @@ static KernelArgs setup_kernel_args(aiter_tensor_t* A, aiter_tensor_t* B, aiter_
     args.ptr_a_scale = A_scale->ptr;
     args.ptr_b_scale = B_scale->ptr;
     args.ptr_bias = bias_ptr;
-    args.m = A->size(0);
-    args.n = B->size(0);
-    args.k = A->size(1);
-    args.lda = A->size(1);
-    args.ldb = A->size(1);
-    args.ldc = B->size(0) * 2;  // BF16 is 2 bytes
+    args.m = Mdim;
+    args.n = Ndim;
+    args.k = Kdim;
+    args.lda = stride_a;
+    args.ldb = stride_b;
+    args.ldc = stride_c;
     args.ks = selectedsplitK;
-    args.scale_m = (A->size(0) + block_shape_m - 1) / block_shape_m;
-    args.scale_n = (B->size(0) + block_shape_n - 1) / block_shape_n;
-    args.scale_k = (A->size(1) + block_shape_k - 1) / block_shape_k;
+    args.scale_m = (Mdim + block_shape_m - 1) / block_shape_m;
+    args.scale_n = (Ndim + block_shape_n - 1) / block_shape_n;
+    args.scale_k = (Kdim + block_shape_k - 1) / block_shape_k;
 
     return args;
 }
@@ -235,17 +266,25 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
     hipStream_t  stream)
 {
     validate_inputs(A, B, out, A_scale, B_scale);
+    int Mdim = A->size(0);
+    int Ndim = out->size(1);
+    int Kdim = A->size(1);
+    int stride_a = static_cast<int>(A->stride(0));
+    int stride_b = static_cast<int>(B->stride(0));
+    int stride_c = static_cast<int>(out->stride(0)) * sizeof(uint16_t);
+    std::optional<int> opt_splitK = (splitK >= 0) ? std::optional<int>(splitK) : std::nullopt;
+    std::optional<bool> opt_bpreshuffle =
+        bpreshuffle ? std::optional<bool>(true) : std::optional<bool>(false);
     std::string arch_id = get_gpu_arch();
     CFG* config_map = get_cfg(A->dtype(), out->dtype());
 
     AITER_CHECK(!config_map->empty(), __func__, " no kernel support a8w8 blockscale for GPU arch: ", arch_id);
 
     auto [selectedKernelName, selectedsplitK] = KernelSelector::select_kernel(
-        A->size(0), B->size(0), A->size(1), arch_id, splitK, bpreshuffle, kernelName, config_map);
+        Mdim, Ndim, Kdim, arch_id, opt_splitK, opt_bpreshuffle, kernelName, config_map);
 
     // Use provided bias or the zero_bias_buf passed by caller
     void* bias_ptr = bias ? bias->ptr : (zero_bias_buf ? zero_bias_buf->ptr : nullptr);
-
     const HipDeviceGuard device_guard(A->device_id);
 
     auto it = config_map->find(selectedKernelName);
@@ -254,29 +293,51 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
     const auto& cfg = it->second;
     constexpr int TileK = 128;
 
-    if (cfg.splitK == 1 && selectedsplitK > 1) {
-        int k_per_split = (A->size(1) + selectedsplitK - 1) / selectedsplitK;
+    if (cfg.splitK == 1 && selectedsplitK > 0) {
+        int k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
         int k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
-        int actual_ksplit = (A->size(1) + k_per_split_aligned - 1) / k_per_split_aligned;
+        int actual_ksplit = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
         if (actual_ksplit != selectedsplitK) {
+            printf("warning: change splitK form %d to %d to make sure every block deals with "
+                   "128x k\n",
+                   selectedsplitK,
+                   actual_ksplit);
             selectedsplitK = actual_ksplit;
         }
-        AITER_CHECK(A->size(1) % k_per_split_aligned == 0 ||
-                   (A->size(1) / k_per_split_aligned) == (selectedsplitK - 1),
+        k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
+        k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
+        AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
+                   (Kdim / k_per_split_aligned) == (selectedsplitK - 1),
                    __func__, " Kdim alignment check failed for splitK!");
-        hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream);
+        if (selectedsplitK > 1) {
+            HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
+        }
     }
 
     AiterAsmKernel* impl_ptr = KernelSelector::get_kernel(cfg.knl_name, cfg.co_name);
-    KernelArgs args = setup_kernel_args(A, B, out, A_scale, B_scale, bias_ptr, selectedsplitK);
+    KernelArgs args = setup_kernel_args(
+        A,
+        B,
+        out,
+        A_scale,
+        B_scale,
+        bias_ptr,
+        Mdim,
+        Ndim,
+        Kdim,
+        stride_a,
+        stride_b,
+        stride_c,
+        selectedsplitK);
     size_t arg_size = sizeof(args);
 
-    int gdx = (B->size(0) + cfg.tile_n - 1) / cfg.tile_n;
-    int gdy = (A->size(0) + cfg.tile_m - 1) / cfg.tile_m;
+    constexpr int blockSizeX = 256;
+    int gdx = (Ndim / cfg.tile_n) * blockSizeX;
+    int gdy = (Mdim % cfg.tile_m == 0) ? Mdim / cfg.tile_m : Mdim / cfg.tile_m + 1;
     int gdz = 1;
     gdx = gdx * selectedsplitK;
     if (DebugPrint) {
         print_debug_info(args, selectedKernelName, selectedsplitK, gdx, gdy, gdz, stream, bias);
     }
-    impl_ptr->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
+    impl_ptr->launch_kernel({&args, &arg_size, gdx / blockSizeX, gdy, gdz, blockSizeX, 1, 1, stream});
 }

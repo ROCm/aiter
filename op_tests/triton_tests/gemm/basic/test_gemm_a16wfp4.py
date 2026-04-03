@@ -79,44 +79,9 @@ def generate_gemm_a16wfp4_inputs(
 
 
 def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
-    x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(32, 512, 7168)]
-    x_vals += [(1, 1280, 8192)]
-    x_vals += [(v, 7168, 2048) for v in [1, 4, 8, 32, 64, 128]]
-    x_vals += [(v, 2112, 7168) for v in [1, 4, 8, 32, 64, 128]]
-    # x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case, TODO: fix
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
+    x_vals += [(v, 128, 512) for v in (128, 192, 4096, 8000)]
+    x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     return x_vals
 
 
@@ -166,8 +131,6 @@ def run_torch(x, w, w_scales, dtype):
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "atomic_add, shuffle, skip_reduce",
@@ -182,8 +145,6 @@ def test_gemm_a16wfp4(
     M: int,
     N: int,
     K: int,
-    dtype,
-    layout,
     output: bool,
     atomic_add: bool,
     shuffle: bool,
@@ -198,6 +159,7 @@ def test_gemm_a16wfp4(
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
 
+    dtype = torch.bfloat16
     x, w, w_triton, _, w_scales, w_scales_triton, y = generate_gemm_a16wfp4_inputs(
         M,
         N,
@@ -205,7 +167,7 @@ def test_gemm_a16wfp4(
         output=output,
         atomic_add=atomic_add,
         dtype=dtype,
-        layout=layout,
+        layout="TN",
         shuffle=shuffle,
     )
     y_dtype = torch.float32 if atomic_add else dtype

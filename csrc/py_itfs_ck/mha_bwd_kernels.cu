@@ -36,7 +36,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::hip::getCurrentHIPStream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -153,6 +152,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     };
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    auto stream = at::hip::getCurrentHIPStream();
 
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     const fmha_bwd_launcher launcher(traits);
@@ -196,7 +196,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
         hipLaunchKernelGGL(
-            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
+            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream,
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
     }
 
