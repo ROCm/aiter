@@ -57,7 +57,7 @@ def _triton_gather_kv_b_proj(
     kv_indices,  # [total_kv]
     kv_prefix_sum_context_lens,  # [batch_size + 1]
     kv_proj_weight,  # [tp_k_head_num * 2 * qk_nope_head_dim, kv_c_dim]
-    kv_proj_scale,  # [tp_k_head_num * 2 * qk_nope_head_dim // 128, kv_c_dim // 128]
+    kv_proj_scale,  # block: [n//128, k//128]; per-row: [tp_heads * 2 * qk_nope_head_dim]
     k_prefix,  # [total_kv, tp_k_head_num * qk_nope_head_dim + kv_pe_dim]
     v_prefix,  # [total_kv, tp_k_head_num * qk_nope_head_dim]
     KBlockSize: tl.constexpr,
@@ -67,6 +67,7 @@ def _triton_gather_kv_b_proj(
     KV_PeDim: tl.constexpr,
     ChunkK: tl.constexpr,
     WEIGHT_PRESHUFFLE: tl.constexpr = False,
+    PER_ROW_SCALE: tl.constexpr = False,
 ):
     stride_k_buffer: tl.constexpr = KBlockSize * (KV_CDim + KV_PeDim)
     stride_k_prefix: tl.constexpr = TpNumHeads * (QkNopeHeadDim + KV_PeDim)
@@ -102,22 +103,31 @@ def _triton_gather_kv_b_proj(
     else:
         k_scalar_scale = tl.load(k_scale)
 
-    k_nope_scale_base_offset = (
-        kv_proj_scale
-        + pid_head
-        * 2
-        * QkNopeHeadDim
-        * KV_CDim
-        // ScaleKGranularity
-        // ScaleNGranularity
-        + tl.arange(0, QkNopeHeadDim // ScaleNGranularity)
-        * (KV_CDim // ScaleKGranularity)
-    )
-
     offs_n = tl.arange(0, QkNopeHeadDim)
     offs_k = tl.arange(0, ScaleKGranularity)
     k_head_base = kv_proj_weight + pid_head * 2 * QkNopeHeadDim * KV_CDim
     v_head_base = k_head_base + QkNopeHeadDim * KV_CDim
+
+    if PER_ROW_SCALE:
+        k_row0 = pid_head * 2 * QkNopeHeadDim
+        k_nope_scale_vec = tl.load(
+            kv_proj_scale + k_row0 + offs_n
+        ).to(tl.float32)
+        v_nope_scale_vec = tl.load(
+            kv_proj_scale + k_row0 + QkNopeHeadDim + offs_n
+        ).to(tl.float32)
+    else:
+        k_nope_scale_base_offset = (
+            kv_proj_scale
+            + pid_head
+            * 2
+            * QkNopeHeadDim
+            * KV_CDim
+            // ScaleKGranularity
+            // ScaleNGranularity
+            + tl.arange(0, QkNopeHeadDim // ScaleNGranularity)
+            * (KV_CDim // ScaleKGranularity)
+        )
 
     if WEIGHT_PRESHUFFLE:
         k_nope_weight_0 = _load_unshuffle_segment(
@@ -175,31 +185,32 @@ def _triton_gather_kv_b_proj(
             k_nope_weight_base_offset + QkNopeHeadDim * KV_CDim + 3 * ScaleKGranularity
         ).to(k_type)
 
-    k_nope_scale_0 = tl.load(k_nope_scale_base_offset + 0)
-    k_nope_scale_1 = tl.load(k_nope_scale_base_offset + 1)
-    k_nope_scale_2 = tl.load(k_nope_scale_base_offset + 2)
-    k_nope_scale_3 = tl.load(k_nope_scale_base_offset + 3)
+    if not PER_ROW_SCALE:
+        k_nope_scale_0 = tl.load(k_nope_scale_base_offset + 0)
+        k_nope_scale_1 = tl.load(k_nope_scale_base_offset + 1)
+        k_nope_scale_2 = tl.load(k_nope_scale_base_offset + 2)
+        k_nope_scale_3 = tl.load(k_nope_scale_base_offset + 3)
 
-    v_nope_scale_0 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 0
-    )
-    v_nope_scale_1 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 1
-    )
-    v_nope_scale_2 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 2
-    )
-    v_nope_scale_3 = tl.load(
-        k_nope_scale_base_offset
-        + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
-        + 3
-    )
+        v_nope_scale_0 = tl.load(
+            k_nope_scale_base_offset
+            + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+            + 0
+        )
+        v_nope_scale_1 = tl.load(
+            k_nope_scale_base_offset
+            + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+            + 1
+        )
+        v_nope_scale_2 = tl.load(
+            k_nope_scale_base_offset
+            + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+            + 2
+        )
+        v_nope_scale_3 = tl.load(
+            k_nope_scale_base_offset
+            + QkNopeHeadDim * KV_CDim // ScaleNGranularity // ScaleKGranularity
+            + 3
+        )
 
     for chunk_id in range(total_kv_chunk):
         kv_block_idx = tl.load(
@@ -231,14 +242,40 @@ def _triton_gather_kv_b_proj(
             + tl.arange(0, KV_PeDim)[None, :],
         )
 
-        accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0
-        accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0
-        accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1
-        accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1
-        accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2
-        accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2
-        accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3
-        accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3
+        if PER_ROW_SCALE:
+            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[
+                None, :
+            ]
+            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_vec[
+                None, :
+            ]
+            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_vec[
+                None, :
+            ]
+            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_vec[
+                None, :
+            ]
+            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_vec[
+                None, :
+            ]
+            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_vec[
+                None, :
+            ]
+            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_vec[
+                None, :
+            ]
+            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[
+                None, :
+            ]
+        else:
+            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0
+            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0
+            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_1
+            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_1
+            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_2
+            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_2
+            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_3
+            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_3
 
         accum_k *= k_scalar_scale
         accum_v *= k_scalar_scale

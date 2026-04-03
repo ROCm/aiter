@@ -19,7 +19,7 @@ def ref_gather_kv_b_proj(
     kv_indices: torch.Tensor,  # len(kv_indices) = kv_indptr[-1]
     kv_prefix_sum_context_lens: torch.Tensor,  # [batch_size + 1]
     kv_proj_weight: torch.Tensor,  # [2 * 128 // TP * 128, 512]
-    kv_proj_scale: torch.Tensor,  # [2 * 128 // TP, 4], blockscale=128 x 128
+    kv_proj_scale: torch.Tensor,  # [weight_n] per-row or [N//128, K//128] block
 ):
     batch_size = kv_indptr.shape[0] - 1
 
@@ -28,13 +28,16 @@ def ref_gather_kv_b_proj(
 
     num_block, block_size, hidden_dim = k_buffer.shape
     weight_n, weight_k = kv_proj_weight.shape
-
-    scale_granularity_n = weight_n // kv_proj_scale.shape[0]
-    scale_granularity_k = weight_k // kv_proj_scale.shape[1]
+    per_row_scale = kv_proj_scale.dim() == 1
 
     assert hidden_dim == kv_c_dim + kv_pe_dim
     assert weight_k == kv_c_dim
-    assert scale_granularity_k == 128
+    if per_row_scale:
+        assert kv_proj_scale.numel() == weight_n
+    else:
+        scale_granularity_n = weight_n // kv_proj_scale.shape[0]
+        scale_granularity_k = weight_k // kv_proj_scale.shape[1]
+        assert scale_granularity_k == 128
 
     num_tp = 2 * 128 * 128 // weight_n
     tp_k_head_num = 128 // num_tp
@@ -58,7 +61,8 @@ def ref_gather_kv_b_proj(
     k_prefix_tp = k_prefix.view(total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim)
     v_prefix_tp = v_prefix.view(total_kv, tp_k_head_num, qk_nope_head_dim)
 
-    kv_proj_scale_repeat = kv_proj_scale.repeat_interleave(scale_granularity_n, dim=0)
+    if not per_row_scale:
+        kv_proj_scale_repeat = kv_proj_scale.repeat_interleave(scale_granularity_n, dim=0)
 
     kv_indptr_list = kv_indptr.tolist()
     for b in range(batch_size):
@@ -86,23 +90,28 @@ def ref_gather_kv_b_proj(
             -1, kv_c_dim
         )[: context_end - context_start, :]
 
-        kv_proj = torch.zeros(
-            (context_end - context_start, weight_n),
-            device=k_buffer.device,
-            dtype=torch.float32,
-        )
-        for i in range(weight_k // scale_granularity_k):
-            kv_proj_tmp = (
-                k_data[:, i * scale_granularity_k : (i + 1) * scale_granularity_k].to(
-                    torch.float32
-                )
-                @ kv_proj_weight[
-                    :, i * scale_granularity_k : (i + 1) * scale_granularity_k
-                ]
-                .to(torch.float32)
-                .T
-            )  # [batch_kv, 2 * 128 // TP * 128]
-            kv_proj += kv_proj_tmp * kv_proj_scale_repeat[:, i].unsqueeze(0)
+        if per_row_scale:
+            kv_proj = (k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T) * (
+                kv_proj_scale.to(torch.float32).unsqueeze(0)
+            )
+        else:
+            kv_proj = torch.zeros(
+                (context_end - context_start, weight_n),
+                device=k_buffer.device,
+                dtype=torch.float32,
+            )
+            for i in range(weight_k // scale_granularity_k):
+                kv_proj_tmp = (
+                    k_data[:, i * scale_granularity_k : (i + 1) * scale_granularity_k].to(
+                        torch.float32
+                    )
+                    @ kv_proj_weight[
+                        :, i * scale_granularity_k : (i + 1) * scale_granularity_k
+                    ]
+                    .to(torch.float32)
+                    .T
+                )  # [batch_kv, 2 * 128 // TP * 128]
+                kv_proj += kv_proj_tmp * kv_proj_scale_repeat[:, i].unsqueeze(0)
 
         kv_proj_tp = kv_proj.view(
             context_end - context_start, tp_k_head_num, qk_nope_head_dim * 2
@@ -272,6 +281,117 @@ def test_gather_kv_b_proj(
             f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
             f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
         )
+
+
+@pytest.mark.parametrize(
+    "batch_size, block_size, num_tp, k_buffer_type, avg_kv_length",
+    [
+        (4, 1, 4, dtypes.fp8, 512),
+        (8, 16, 4, dtypes.fp8, 1024),
+        (8, 16, 4, torch.bfloat16, 1024),
+    ],
+)
+def test_gather_kv_b_proj_per_row_scale(
+    batch_size, block_size, num_tp, k_buffer_type, avg_kv_length
+):
+    """kv_proj_scale [weight_n]: one BF16/FP32 scale per output row (e.g. F8_E4M3 + per-row)."""
+    torch.manual_seed(0)
+    random.seed(0)
+    kv_c_dim = 512
+    kv_pe_dim = 64
+    qk_nope_head_dim = 128
+    tp_k_head_num = 128 // num_tp
+    num_block = 2 * avg_kv_length // block_size
+    weight_preshuffle = True
+    device = "cuda"
+    weight_dtype = dtypes.fp8
+    weight_n = 2 * 128 // num_tp * qk_nope_head_dim
+
+    k_buffer = torch.randn(
+        (num_block, block_size, kv_c_dim + kv_pe_dim),
+        device=device,
+        dtype=torch.float32,
+    ).to(k_buffer_type)
+    k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
+
+    var_ratio = 0.2
+    context_lens = (
+        torch.randint(
+            int((1 - var_ratio) * avg_kv_length),
+            int(((1 + var_ratio)) * avg_kv_length) + 1,
+            (batch_size,),
+        )
+        .cuda()
+        .to(torch.int32)
+    )
+    context_blocks = torch.div(
+        context_lens + block_size - 1, block_size, rounding_mode="trunc"
+    )
+
+    kv_indptr = torch.zeros((batch_size + 1,), device="cuda", dtype=torch.int32)
+    kv_indptr[1:] = torch.cumsum(context_blocks, dim=0)
+
+    kv_prefix_sum_context_lens = torch.zeros(
+        (batch_size + 1,), device="cuda", dtype=torch.int32
+    )
+    kv_prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
+
+    kv_indices = torch.zeros(kv_indptr[-1], device="cuda", dtype=torch.int32)
+    for b in range(batch_size):
+        ctx_len = int(context_blocks[b].item())
+        kv_indices[kv_indptr[b] : kv_indptr[b + 1]] = torch.randperm(
+            num_block, device="cuda"
+        )[:ctx_len]
+
+    kv_proj_weight = torch.randn(
+        (weight_n, kv_c_dim),
+        device=device,
+        dtype=torch.float32,
+    ).to(weight_dtype)
+    kv_proj_scale = torch.randn((weight_n,), device=device, dtype=torch.bfloat16).abs()
+
+    k_ref, v_ref = ref_gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        kv_proj_scale,
+    )
+
+    k_prefix = torch.zeros(
+        (
+            kv_prefix_sum_context_lens[-1].item(),
+            tp_k_head_num * (qk_nope_head_dim + kv_pe_dim),
+        ),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_prefix = torch.zeros(
+        (kv_prefix_sum_context_lens[-1].item(), tp_k_head_num * qk_nope_head_dim),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    if weight_preshuffle:
+        kv_proj_weight = shuffle_weight(kv_proj_weight)
+
+    gather_kv_b_proj(
+        k_buffer,
+        k_scale,
+        kv_indptr,
+        kv_indices,
+        kv_prefix_sum_context_lens,
+        kv_proj_weight,
+        kv_proj_scale,
+        k_prefix.view(-1, tp_k_head_num, qk_nope_head_dim + kv_pe_dim),
+        v_prefix.view(-1, tp_k_head_num, qk_nope_head_dim),
+        weight_preshuffle=weight_preshuffle,
+    )
+
+    checkAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2)
+    checkAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
