@@ -62,7 +62,9 @@ def ref_gather_kv_b_proj(
     v_prefix_tp = v_prefix.view(total_kv, tp_k_head_num, qk_nope_head_dim)
 
     if not per_row_scale:
-        kv_proj_scale_repeat = kv_proj_scale.repeat_interleave(scale_granularity_n, dim=0)
+        kv_proj_scale_repeat = kv_proj_scale.repeat_interleave(
+            scale_granularity_n, dim=0
+        )
 
     kv_indptr_list = kv_indptr.tolist()
     for b in range(batch_size):
@@ -91,9 +93,9 @@ def ref_gather_kv_b_proj(
         )[: context_end - context_start, :]
 
         if per_row_scale:
-            kv_proj = (k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T) * (
-                kv_proj_scale.to(torch.float32).unsqueeze(0)
-            )
+            kv_proj = (
+                k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T
+            ) * (kv_proj_scale.to(torch.float32).unsqueeze(0))
         else:
             kv_proj = torch.zeros(
                 (context_end - context_start, weight_n),
@@ -102,9 +104,9 @@ def ref_gather_kv_b_proj(
             )
             for i in range(weight_k // scale_granularity_k):
                 kv_proj_tmp = (
-                    k_data[:, i * scale_granularity_k : (i + 1) * scale_granularity_k].to(
-                        torch.float32
-                    )
+                    k_data[
+                        :, i * scale_granularity_k : (i + 1) * scale_granularity_k
+                    ].to(torch.float32)
                     @ kv_proj_weight[
                         :, i * scale_granularity_k : (i + 1) * scale_granularity_k
                     ]

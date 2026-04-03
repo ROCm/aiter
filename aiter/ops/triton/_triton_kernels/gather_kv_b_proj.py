@@ -110,12 +110,10 @@ def _triton_gather_kv_b_proj(
 
     if PER_ROW_SCALE:
         k_row0 = pid_head * 2 * QkNopeHeadDim
-        k_nope_scale_vec = tl.load(
-            kv_proj_scale + k_row0 + offs_n
-        ).to(tl.float32)
-        v_nope_scale_vec = tl.load(
-            kv_proj_scale + k_row0 + QkNopeHeadDim + offs_n
-        ).to(tl.float32)
+        k_nope_scale_vec = tl.load(kv_proj_scale + k_row0 + offs_n).to(tl.float32)
+        v_nope_scale_vec = tl.load(kv_proj_scale + k_row0 + QkNopeHeadDim + offs_n).to(
+            tl.float32
+        )
     else:
         k_nope_scale_base_offset = (
             kv_proj_scale
@@ -243,30 +241,30 @@ def _triton_gather_kv_b_proj(
         )
 
         if PER_ROW_SCALE:
-            accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[
-                None, :
-            ]
-            accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_vec[
-                None, :
-            ]
-            accum_k += tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_vec[
-                None, :
-            ]
-            accum_v += tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_vec[
-                None, :
-            ]
-            accum_k += tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_vec[
-                None, :
-            ]
-            accum_v += tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_vec[
-                None, :
-            ]
-            accum_k += tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_vec[
-                None, :
-            ]
-            accum_v += tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[
-                None, :
-            ]
+            accum_k += (
+                tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_vec[None, :]
+            )
+            accum_k += (
+                tl.dot(kv_c_data_1, k_nope_weight_1.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_1, v_nope_weight_1.T) * v_nope_scale_vec[None, :]
+            )
+            accum_k += (
+                tl.dot(kv_c_data_2, k_nope_weight_2.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_2, v_nope_weight_2.T) * v_nope_scale_vec[None, :]
+            )
+            accum_k += (
+                tl.dot(kv_c_data_3, k_nope_weight_3.T) * k_nope_scale_vec[None, :]
+            )
+            accum_v += (
+                tl.dot(kv_c_data_3, v_nope_weight_3.T) * v_nope_scale_vec[None, :]
+            )
         else:
             accum_k += tl.dot(kv_c_data_0, k_nope_weight_0.T) * k_nope_scale_0
             accum_v += tl.dot(kv_c_data_0, v_nope_weight_0.T) * v_nope_scale_0
