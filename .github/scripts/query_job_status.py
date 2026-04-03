@@ -311,7 +311,9 @@ def percentile(values: list[float], percent: int):
     if lower_index == upper_index:
         return ordered[lower_index]
     fraction = position - lower_index
-    return ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
+    return (
+        ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
+    )
 
 
 def format_duration_seconds(seconds: float | None):
@@ -434,14 +436,18 @@ def build_runner_report_rows(job_rows: list[dict[str, Any]], report_time: dateti
                 format_duration_seconds(average(stat["duration_samples"])),
             ]
         )
-        distribution_sections.append((label, build_queue_distribution(stat["queue_samples"])))
+        distribution_sections.append(
+            (label, build_queue_distribution(stat["queue_samples"]))
+        )
 
     return summary_rows, distribution_sections
 
 
 def build_job_report_rows(job_rows: list[dict[str, Any]], report_time: datetime):
     rows = []
-    for row in sorted(job_rows, key=lambda item: item.get("created_at", ""), reverse=True):
+    for row in sorted(
+        job_rows, key=lambda item: item.get("created_at", ""), reverse=True
+    ):
         rows.append(
             [
                 row.get("workflow", "-"),
@@ -454,7 +460,9 @@ def build_job_report_rows(job_rows: list[dict[str, Any]], report_time: datetime)
                 format_time(row.get("created_at", "")),
                 format_time(row.get("started_at", "")),
                 calculate_queue_time(row, report_time),
-                calculate_duration(row.get("started_at", ""), row.get("completed_at", "")),
+                calculate_duration(
+                    row.get("started_at", ""), row.get("completed_at", "")
+                ),
                 row.get("branch", "-"),
                 row.get("html_url") or row.get("run_url", "-"),
             ]
@@ -480,7 +488,9 @@ def main():
 
     all_rows: list[dict[str, Any]] = []
     if args.snapshot_in:
-        snapshot_payload = json.loads(Path(args.snapshot_in).read_text(encoding="utf-8"))
+        snapshot_payload = json.loads(
+            Path(args.snapshot_in).read_text(encoding="utf-8")
+        )
         snapshot_generated_at = snapshot_payload.get("generated_at")
         if isinstance(snapshot_generated_at, str):
             try:
@@ -560,7 +570,9 @@ def main():
     tablefmt = "github" if args.summary else "grid"
 
     if args.runner_report:
-        summary_rows, distribution_sections = build_runner_report_rows(job_rows, report_time)
+        summary_rows, distribution_sections = build_runner_report_rows(
+            job_rows, report_time
+        )
         print("### Runner Label Queue Summary")
         print(
             tabulate(
