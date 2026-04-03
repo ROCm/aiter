@@ -576,13 +576,14 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
         out = out_padded[..., :head_size_og]
 
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
+        # Varlen softmax_lse is stored THD-flat (total_q, nheads); flash_attn API uses
+        # (nheads, total_q). Match FlashAttnVarlenFunc: return_attn_probs -> (out, lse, S_dmask).
+        lse_for_api = softmax_lse.transpose(0, 1).contiguous()
         if return_softmax:
-            result.append(S_dmask)
-
-        return result[0] if len(result) == 1 else tuple(result)
+            return (out, lse_for_api, S_dmask)
+        if return_lse:
+            return (out, lse_for_api)
+        return out
 
     @staticmethod
     def backward(ctx, do, *args):
