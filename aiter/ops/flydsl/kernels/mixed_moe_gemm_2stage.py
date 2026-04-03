@@ -720,7 +720,6 @@ def compile_mixed_moe_gemm1(
                 if not gate_only:
                     up_n_intra_list = []
                     up_n_blk_list = []
-                col_g_list = []
                 c_n0_static = experts * (2 * inter_dim) // 16
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
                 inter_idx = arith.constant(inter_dim, index=True)
@@ -728,8 +727,6 @@ def compile_mixed_moe_gemm1(
                 for i in range_constexpr(num_acc_n):
                     offset = i * 16
                     c_offset = arith.constant(offset, index=True)
-                    col_g = by_n + n_tile_base + c_offset + lane_mod_16
-                    col_g_list.append(col_g)
 
                     global_n = by_n + n_tile_base + c_offset + lane_mod_16
                     # Gate: rows [expert_off, expert_off + inter_dim)
@@ -2585,7 +2582,6 @@ def compile_mixed_moe_gemm2(
             )
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
             # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
-            f16 = T.f16
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
@@ -2606,9 +2602,6 @@ def compile_mixed_moe_gemm2(
             # A2 layout (flatten token-slot -> M; use i32 for fly.make_shape).
             topk_idx = arith.constant(topk, index=True)
             m_in = tokens_in * topk_idx
-            # fly.make_shape requires i32/i64, not index
-            m_i32_v = arith.index_cast(T.i32, m_in)
-            k_i32_v = i32_k_in.ir_value()
 
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = arith.constant(experts * model_dim, index=True)
@@ -2917,7 +2910,6 @@ def compile_mixed_moe_gemm2(
                     * arith.constant(int(a_elem_bytes), index=True),
                     4,
                 )
-                c_k_div4_i32 = arith.index_cast(T.i32, c_k_div4)
                 tile_k_dwords = (int(tile_k) * int(a_elem_bytes)) // (
                     4 * int(a_elem_vec_pack)
                 )
@@ -3055,13 +3047,8 @@ def compile_mixed_moe_gemm2(
                     _n_scale_shift_i32 = None
                 n_intra_list = [None] * num_acc_n
                 n_blk_list = [None] * num_acc_n
-                col_g_list = [None] * num_acc_n
                 for i in range_constexpr(num_acc_n):
                     offset = i * 16
-                    col_g = by_n + n_tile_base
-                    col_g = _div_pow2(col_g, 2) + offset
-                    col_g = col_g + lane_mod_16
-                    col_g_list[i] = col_g
                     c_offset = arith.constant(offset, index=True)
                     global_n = by_n + n_tile_base + c_offset + lane_mod_16
                     n_blk_list[i] = _div_pow2(global_n, 16)
@@ -3766,11 +3753,10 @@ def compile_mixed_moe_gemm2(
                 # ---------------- Epilogue: LDS CShuffle + atomic half2 (x2) ----------------
                 # Reuse the shared helper so GEMM / MoE kernels share the exact same CShuffle skeleton.
 
-                sw_pf = None
                 tw_pf = None
                 bias_pf = None
                 if epilogue_pf is not None:
-                    sw_pf, tw_pf, bias_pf = epilogue_pf
+                    _, tw_pf, bias_pf = epilogue_pf
 
                 mask24_i32 = arith.constant(0xFFFFFF)
                 topk_i32_v = topk_i32
@@ -3828,7 +3814,6 @@ def compile_mixed_moe_gemm2(
                     ts_ok = arith.andi(t_ok, s_ok)
                     t2_safe = arith.select(ts_ok, t2, arith.constant(0))
                     s2_safe = arith.select(ts_ok, s2, arith.constant(0))
-                    t2_safe * topk_i32_v + s2_safe
 
                     if doweight_stage2:
                         tw_idx = (mi * 4) + ii

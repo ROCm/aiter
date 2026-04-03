@@ -268,9 +268,6 @@ def compile_moe_gemm1(
             size_expert_ids_in = arith.index_cast(
                 T.index, i32_size_expert_ids_in.ir_value()
             )
-            # i32 versions for layout construction (fly.make_shape requires i32/i64)
-            tokens_i32_v = i32_tokens_in.ir_value()
-            k_i32_v = i32_k_in.ir_value()
             x_elem = (
                 T.bf16
                 if is_bf16
@@ -478,7 +475,6 @@ def compile_moe_gemm1(
                 chunk_i32 = x_load_bytes // 4  # dwords per chunk (1/2/4)
 
                 c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
-                c_k_div4_i32 = arith.index_cast(i32, c_k_div4)
                 tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
                 layout_x_tile_div4 = fx.make_layout(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
@@ -1622,7 +1618,6 @@ def compile_moe_gemm2(
             size_expert_ids_in = arith.index_cast(
                 T.index, i32_size_expert_ids_in.ir_value()
             )
-            k_i32_v = i32_k_in.ir_value()
             x_elem = (
                 T.bf16
                 if is_bf16
@@ -1662,7 +1657,6 @@ def compile_moe_gemm2(
             # A2 layout (flatten token-slot -> M; use i32 for fly.make_shape).
             topk_idx = arith.index(topk)
             m_in = tokens_in * topk_idx
-            m_i32_v = arith.index_cast(i32, m_in)
 
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = arith.index(experts * model_dim)
@@ -1823,7 +1817,6 @@ def compile_moe_gemm2(
                 vec4_i32 = T.vec(4, i32)
 
                 c_k_div4 = (k_in * arith.index(int(elem_bytes))) // arith.index(4)
-                c_k_div4_i32 = arith.index_cast(i32, c_k_div4)
                 tile_k_dwords = (int(tile_k) * int(elem_bytes)) // 4
                 layout_x_tile_div4 = fx.make_layout(
                     (tile_m, tile_k_dwords), stride=(tile_k_dwords, 1)
