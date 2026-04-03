@@ -430,115 +430,118 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         __syncthreads();
     }
 
-    if constexpr(isBiased)
+    if constexpr(NUM_GRP > 1)
     {
-        constexpr int lane_steps = [&]() {
-            if constexpr(THREAD_PER_GRP == 8)
-                return 3;
-            if constexpr(THREAD_PER_GRP == 4)
-                return 2;
-            if constexpr(THREAD_PER_GRP == 2)
-                return 1;
-            else
-                return 0;
-        }();
-        const int lane_id = threadIdx.x % THREAD_PER_GRP;
-        for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
+        if constexpr(isBiased)
         {
-            float max1 = -INFINITY, max2 = -INFINITY;
-            const int start = g * experts_per_group;
-            const int end   = experts_per_group / vec_size;
-            f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
-
-            for(int e = lane_id; e < end; e += THREAD_PER_GRP)
+            constexpr int lane_steps = [&]() {
+                if constexpr(THREAD_PER_GRP == 8)
+                    return 3;
+                if constexpr(THREAD_PER_GRP == 4)
+                    return 2;
+                if constexpr(THREAD_PER_GRP == 2)
+                    return 1;
+                else
+                    return 0;
+            }();
+            const int lane_id = threadIdx.x % THREAD_PER_GRP;
+            for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
             {
-                auto s_vec = sc[e];
-                for(int j = 0; j < vec_size; j++)
+                float max1 = -INFINITY, max2 = -INFINITY;
+                const int start = g * experts_per_group;
+                const int end   = experts_per_group / vec_size;
+                f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
+
+                for(int e = lane_id; e < end; e += THREAD_PER_GRP)
                 {
-                    auto s_tmp = s_vec[j];
-                    max2       = dev_max_(s_tmp, max2);
-                    max2       = s_tmp > max1 ? max1 : max2;
-                    max1       = dev_max_(s_tmp, max1);
+                    auto s_vec = sc[e];
+                    for(int j = 0; j < vec_size; j++)
+                    {
+                        auto s_tmp = s_vec[j];
+                        max2       = dev_max_(s_tmp, max2);
+                        max2       = s_tmp > max1 ? max1 : max2;
+                        max1       = dev_max_(s_tmp, max1);
+                    }
                 }
-            }
 
+                {
+                    constexpr int row_mask    = 0xf;
+                    constexpr int bank_mask   = 0xf;
+                    constexpr bool bound_ctrl = true; // ! out-of-bound is zero !
+
+                    constexpr auto get_dpp_i = [&](auto i_step) {
+                        if constexpr(i_step.value == 0)
+                            return 0xb1; // quad_perm:[1,0,3,2]
+                        if constexpr(i_step.value == 1)
+                            return 0x4e; // quad_perm:[2,3,0,1]
+                        if constexpr(i_step.value == 2)
+                            return 0x141; // row_half_mirror
+                        else
+                            return 0xffff; // return a value to let compile crash
+                    };
+                    opus::static_for<lane_steps>([&](auto i_step) {
+                        constexpr int dpp_i = get_dpp_i(i_step);
+                        float remote_max_1  = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(
+                                __builtin_bit_cast(int, max1), dpp_i, row_mask, bank_mask, bound_ctrl));
+                        float remote_max_2 = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(
+                                __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
+
+                        max2 = dev_max_(remote_max_1, max2);
+                        max2 = remote_max_1 > max1 ? max1 : max2;
+                        max1 = dev_max_(remote_max_1, max1);
+                        max2 = dev_max_(max2, remote_max_2);
+                    });
+                }
+                if(lane_id == 0)
+                    group_scores[g] = max1 + max2;
+            }
+            __syncthreads();
+        }
+        else
+        {
+    #pragma unroll
+            for(int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
             {
-                constexpr int row_mask    = 0xf;
-                constexpr int bank_mask   = 0xf;
-                constexpr bool bound_ctrl = true; // ! out-of-bound is zero !
-
-                constexpr auto get_dpp_i = [&](auto i_step) {
-                    if constexpr(i_step.value == 0)
-                        return 0xb1; // quad_perm:[1,0,3,2]
-                    if constexpr(i_step.value == 1)
-                        return 0x4e; // quad_perm:[2,3,0,1]
-                    if constexpr(i_step.value == 2)
-                        return 0x141; // row_half_mirror
-                    else
-                        return 0xffff; // return a value to let compile crash
-                };
-                opus::static_for<lane_steps>([&](auto i_step) {
-                    constexpr int dpp_i = get_dpp_i(i_step);
-                    float remote_max_1  = __builtin_bit_cast(
-                        float,
-                        __builtin_amdgcn_mov_dpp(
-                            __builtin_bit_cast(int, max1), dpp_i, row_mask, bank_mask, bound_ctrl));
-                    float remote_max_2 = __builtin_bit_cast(
-                        float,
-                        __builtin_amdgcn_mov_dpp(
-                            __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
-
-                    max2 = dev_max_(remote_max_1, max2);
-                    max2 = remote_max_1 > max1 ? max1 : max2;
-                    max1 = dev_max_(remote_max_1, max1);
-                    max2 = dev_max_(max2, remote_max_2);
-                });
+                float max1      = -INFINITY;
+                const int start = g * experts_per_group;
+                const int end   = start + experts_per_group;
+                for(int e = start; e < end; ++e)
+                {
+                    max1 = scores[e] > max1 ? scores[e] : max1;
+                }
+                group_scores[g] = max1;
             }
-            if(lane_id == 0)
-                group_scores[g] = max1 + max2;
+            __syncthreads();
+        }
+    
+        for(int k = 0; k < topk_group; k++)
+        {
+            float max_val = -INFINITY;
+            int max_idx   = NUM_GRP;
+    #pragma unroll
+            for(int g = 0; g < NUM_GRP; g++)
+            {
+                auto gs_tmp = group_scores[g];
+                max_idx     = gs_tmp > max_val ? g : max_idx;
+                max_val     = gs_tmp > max_val ? gs_tmp : max_val;
+            }
+            group_scores[max_idx] = -INFINITY;
+        }
+
+        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        {
+            int group_idx = e * vec_size / experts_per_group;
+            if(group_scores[group_idx] != -INFINITY)
+            {
+                scores_vec[e] = -INFINITY;
+            }
         }
         __syncthreads();
     }
-    else
-    {
-#pragma unroll
-        for(int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
-        {
-            float max1      = -INFINITY;
-            const int start = g * experts_per_group;
-            const int end   = start + experts_per_group;
-            for(int e = start; e < end; ++e)
-            {
-                max1 = scores[e] > max1 ? scores[e] : max1;
-            }
-            group_scores[g] = max1;
-        }
-        __syncthreads();
-    }
-
-    for(int k = 0; k < topk_group; k++)
-    {
-        float max_val = -INFINITY;
-        int max_idx   = NUM_GRP;
-#pragma unroll
-        for(int g = 0; g < NUM_GRP; g++)
-        {
-            auto gs_tmp = group_scores[g];
-            max_idx     = gs_tmp > max_val ? g : max_idx;
-            max_val     = gs_tmp > max_val ? gs_tmp : max_val;
-        }
-        group_scores[max_idx] = -INFINITY;
-    }
-
-    for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
-    {
-        int group_idx = e * vec_size / experts_per_group;
-        if(group_scores[group_idx] != -INFINITY)
-        {
-            scores_vec[e] = -INFINITY;
-        }
-    }
-    __syncthreads();
 
     // using kvp = hipcub::KeyValuePair<int, float>;
     // using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
@@ -1234,10 +1237,11 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
     int num_experts     = gating_output.size(1);
     int topk            = topk_ids.size(1);
     size_t stride_tk    = topk_ids.stride(0);
-    TORCH_CHECK(stride_tk == topk_weights.stride(0),
-                "topk_ids.stride(0) == topk_weights.stride(0)");
-    TORCH_CHECK(gating_output.dtype() == correction_bias.dtype(),
-                "gating_output.dtype() == correction_bias.dtype()");
+    TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
+                "topk_grp must be in [1, num_expert_group], but got topk_grp=",
+                topk_grp,
+                ", num_expert_group=",
+                num_expert_group);
 
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
@@ -1280,8 +1284,11 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
     int topk             = topk_ids.size(1);
     size_t stride_tk     = topk_ids.stride(0);
     auto correction_bias = topk_ids;
-    TORCH_CHECK(stride_tk == topk_weights.stride(0),
-                "topk_ids.stride(0) == topk_weights.stride(0)");
+    TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
+                "topk_grp must be in [1, num_expert_group], but got topk_grp=",
+                topk_grp,
+                ", num_expert_group=",
+                num_expert_group);
 
     // TODO: expand usage in the future
     bool use_opt_sort = false;
