@@ -28,9 +28,6 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
                                    const int d)
 {
-    // Buffer vector addressing constraint: float supports VEC_SIZE <= 16
-    static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
-                  "float type only supports VEC_SIZE up to 16");
 
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
@@ -105,9 +102,6 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                                           const int d,
                                           const float scale)
 {
-    // Buffer vector addressing constraint: float supports VEC_SIZE <= 16
-    static_assert(!(std::is_same_v<DTYPE_I, float> && VEC_SIZE_I > 16),
-                  "float type only supports VEC_SIZE up to 16");
 
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
@@ -212,15 +206,16 @@ static constexpr int nextPow2(unsigned int num)
 
 // Common kernel launch parameters computation
 #define COMPUTE_ACTIVATION_KERNEL_PARAMS                                              \
+    int warp_size       = static_cast<int>(WARP_SIZE);                                \
     int d              = input.size(-1) / 2;                                          \
     int64_t num_tokens = input.numel() / input.size(-1);                              \
-    int vec_size       = nextPow2(d / 64);                                            \
+    int vec_size       = nextPow2(d / warp_size);                                     \
     vec_size           = vec_size < 2 ? 2 : vec_size;                                 \
     vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;           \
-    int num_wave       = nextPow2(d / 64 / vec_size);                                 \
+    int num_wave       = nextPow2(d / warp_size / vec_size);                          \
     num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;           \
     dim3 grid(num_tokens);                                                            \
-    dim3 block(num_wave * 64);                                                        \
+    dim3 block(num_wave * warp_size);                                                 \
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input)); \
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
@@ -440,8 +435,8 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
 } // namespace aiter
 
 #define LAUNCH_ACTIVATION_KERNEL_VEC(KERNEL)                                                \
-    int64_t numel      = input.numel();                                                            \
-    const int warp_size = static_cast<int>(WARP_SIZE);                                             \
+    int64_t numel      = input.numel();                                                          \
+    int warp_size = static_cast<int>(WARP_SIZE);                                                 \
     int vec_size       = nextPow2(static_cast<unsigned int>(numel / warp_size));                  \
     vec_size           = vec_size > max_vec_size ? max_vec_size : vec_size;                        \
     vec_size           = vec_size < 1 ? 1 : vec_size;                                              \
