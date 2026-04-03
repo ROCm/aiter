@@ -28,7 +28,6 @@ __global__ void act_and_mul_kernel(DTYPE_O* __restrict__ out,         // [..., d
                                    const DTYPE_I* __restrict__ input, // [..., 2, d]
                                    const int d)
 {
-
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
@@ -102,7 +101,6 @@ __global__ void scaled_act_and_mul_kernel(DTYPE_O* __restrict__ out,         // 
                                           const int d,
                                           const float scale)
 {
-
     const int64_t token_idx         = blockIdx.x;
     auto const* ptr_x               = (input + token_idx * 2 * d);
     auto const* ptr_y               = (input + token_idx * 2 * d + d);
