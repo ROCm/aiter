@@ -858,8 +858,23 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    is_mxfp4 = (
+        q_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+    )
+    looks_like_fused_shared_experts = is_mxfp4 and topk > 8
+
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
+        if cfg is None and looks_like_fused_shared_experts:
+            logger.warning(
+                "[fused_moe] missing tuned cfg for possible shared-expert MXFP4 "
+                "shape %s. This can bypass flydsl stage2 and fall back to CK "
+                "heuristics. Consider retuning and setting AITER_CONFIG_FMOE to "
+                "a config that includes this key.",
+                keys,
+            )
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
