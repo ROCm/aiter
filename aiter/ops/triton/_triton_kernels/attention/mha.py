@@ -532,7 +532,8 @@ def _attn_fwd(
                     + cu_seqlens_q_start * stride_lse_m
                     + offs_m * stride_lse_m
                 )
-                lse_mask = offs_m < SEQLEN_Q
+                # Use per-sequence seqlen_q; SEQLEN_Q is max over batch and can mis-index VARLEN.
+                lse_mask = offs_m < seqlen_q
                 lse = tl.full([BLOCK_M], value=0.0, dtype=tl.float32)
                 tl.store(softmax_lse_ptr + offs_lse, lse, mask=lse_mask)
                 # TODO: Should dropout and return encoded softmax be handled here too?
