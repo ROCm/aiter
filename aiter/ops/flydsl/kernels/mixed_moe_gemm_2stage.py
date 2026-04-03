@@ -79,6 +79,7 @@ def compile_mixed_moe_gemm1(
     enable_bias: bool = False,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
+    g1u0: bool = False,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -219,8 +220,9 @@ def compile_mixed_moe_gemm1(
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
-    module_name = (
-        f"mfma_moe1_a{a_dtype}_w{b_dtype}_{epilog_tag}_abi35_ckstage1".replace("-", "_")
+    g1u_tag = "g1u0" if g1u0 else "g1u1"
+    module_name = f"mfma_moe1_{g1u_tag}_a{a_dtype}_w{b_dtype}_{epilog_tag}_abi35_ckstage1".replace(
+        "-", "_"
     )
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse the same LDS bytes for both:
@@ -302,6 +304,18 @@ def compile_mixed_moe_gemm1(
                 sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
                 return x * sig
 
+            def gelu(x):
+                # e^(x*(c1*x*x+c2))
+                t = (
+                    (x * x * (-0.07135400176048279) - 1.595770001411438)
+                    * x
+                    * (1.4426950408889634)
+                )
+                emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                den = 1.0 + emu
+                sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
+                return x * sig
+
             _arith_min = getattr(arith, "minimum", None) or getattr(arith, "minimumf")
             _arith_max = getattr(arith, "maximum", None) or getattr(arith, "maximumf")
 
@@ -335,7 +349,10 @@ def compile_mixed_moe_gemm1(
             _layout_x = fx.make_layout((tokens_i32_v, k_i32_v), stride=(k_i32_v, 1))
 
             # B preshuffle layout: match GEMM test helper exactly.
-            c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
+            # For g1u0, stage1 W1 rows are [experts * inter_dim].
+            # For g1u1, stage1 W1 rows are [experts * (2 * inter_dim)].
+            _w_rows_per_expert = inter_dim if g1u0 else (2 * inter_dim)
+            c_n_total = arith.constant(experts * _w_rows_per_expert, index=True)
             kpack_bytes = 8 if is_int4 else 16
             b_layout = make_preshuffle_b_layout(
                 arith,
@@ -434,7 +451,7 @@ def compile_mixed_moe_gemm1(
                 x_rsrc = buffer_ops.create_buffer_resource(
                     arg_x, max_size=False, num_records_bytes=x_nbytes
                 )
-                _w_n = arith.constant(experts * (2 * inter_dim), index=True)
+                _w_n = arith.constant(experts * _w_rows_per_expert, index=True)
                 _w_nbytes = (
                     _w_n
                     * (k_in / arith.constant(int(a_elem_vec_pack), index=True))
@@ -473,10 +490,10 @@ def compile_mixed_moe_gemm1(
                 if is_f16_b:
                     sw_rsrc = None
                 else:
-                    # W1 microscale: [experts * 2 * inter_dim, K/32] e8m0 bytes.
+                    # W1 microscale: [experts * rows_per_expert, K/32] e8m0 bytes.
                     _c32_w = arith.constant(32, index=True)
                     _kblk_w = k_in / _c32_w
-                    _mn_w = arith.constant(experts * (2 * inter_dim), index=True)
+                    _mn_w = arith.constant(experts * _w_rows_per_expert, index=True)
                     sw_nbytes = _mn_w * _kblk_w
                     sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes)
                     sw_rsrc = buffer_ops.create_buffer_resource(
@@ -521,7 +538,7 @@ def compile_mixed_moe_gemm1(
                 _ifexpert_of = scf.IfOp(exp_valid)
                 with _if_then(_ifexpert_of):
                     expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
-                    inter2_idx = arith.constant(2 * inter_dim, index=True)
+                    inter2_idx = arith.constant(_w_rows_per_expert, index=True)
                     expert_off_idx = expert_idx * inter2_idx  # index
 
                     bx_m = bx * arith.constant(tile_m, index=True)
@@ -673,7 +690,7 @@ def compile_mixed_moe_gemm1(
                     out_block_base = by_n
                     out_wave_base = n_tile_base
                     # layout for (row -> (blk,intra)) where intra is 0..15
-                    c_n0_static = experts * (2 * inter_dim) // 16
+                    c_n0_static = (experts * _w_rows_per_expert) // 16
                     layout_n_blk_intra = fx.make_layout(
                         (c_n0_static, 16), stride=(16, 1)
                     )
@@ -694,10 +711,11 @@ def compile_mixed_moe_gemm1(
                         gate_n_blk_list.append(layout_get(gate_coord_n, 0))
                         gate_n_intra_list.append(layout_get(gate_coord_n, 1))
 
-                        up_row_w = gate_row_w + inter_idx
-                        up_coord_n = idx2crd(up_row_w, layout_n_blk_intra)
-                        up_n_blk_list.append(layout_get(up_coord_n, 0))
-                        up_n_intra_list.append(layout_get(up_coord_n, 1))
+                        if not g1u0:
+                            up_row_w = gate_row_w + inter_idx
+                            up_coord_n = idx2crd(up_row_w, layout_n_blk_intra)
+                            up_n_blk_list.append(layout_get(up_coord_n, 0))
+                            up_n_intra_list.append(layout_get(up_coord_n, 1))
 
                     # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
                     def load_b_packs_k64(base_k, ku: int, n_blk, n_intra):
@@ -740,12 +758,12 @@ def compile_mixed_moe_gemm1(
 
                     def load_b_tile(base_k):
                         gate_b_tile = []
-                        up_b_tile = []
+                        up_b_tile = [] if not g1u0 else None
                         for ku in range_constexpr(k_unroll):
                             gate_packs0 = []
                             gate_packs1 = []
-                            up_packs0 = []
-                            up_packs1 = []
+                            up_packs0 = [] if not g1u0 else None
+                            up_packs1 = [] if not g1u0 else None
                             for ni in range_constexpr(num_acc_n):
                                 gate_b0, gate_b1 = load_b_packs_k64(
                                     base_k,
@@ -753,18 +771,20 @@ def compile_mixed_moe_gemm1(
                                     gate_n_blk_list[ni],
                                     gate_n_intra_list[ni],
                                 )
-                                up_b0, up_b1 = load_b_packs_k64(
-                                    base_k,
-                                    ku,
-                                    up_n_blk_list[ni],
-                                    up_n_intra_list[ni],
-                                )
                                 gate_packs0.append(gate_b0)
                                 gate_packs1.append(gate_b1)
-                                up_packs0.append(up_b0)
-                                up_packs1.append(up_b1)
+                                if not g1u0:
+                                    up_b0, up_b1 = load_b_packs_k64(
+                                        base_k,
+                                        ku,
+                                        up_n_blk_list[ni],
+                                        up_n_intra_list[ni],
+                                    )
+                                    up_packs0.append(up_b0)
+                                    up_packs1.append(up_b1)
                             gate_b_tile.append((gate_packs0, gate_packs1))
-                            up_b_tile.append((up_packs0, up_packs1))
+                            if not g1u0:
+                                up_b_tile.append((up_packs0, up_packs1))
                         return gate_b_tile, up_b_tile
 
                     def load_scale(arg_scale, rsrc, scale_info, ku, mni):
@@ -798,7 +818,7 @@ def compile_mixed_moe_gemm1(
 
                     def load_b_scale_tile(base_k):
                         gate_b_scale_tile = []
-                        up_b_scale_tile = []
+                        up_b_scale_tile = [] if not g1u0 else None
                         for ku in range_constexpr(k_unroll_packed):
                             for ni in range_constexpr(num_acc_n_packed):
                                 col_offset = ni * 16 * pack_N
@@ -812,9 +832,6 @@ def compile_mixed_moe_gemm1(
                                 gate_mni = (
                                     expert_off_idx + col_base
                                 ) // arith.constant(32, index=True)
-                                up_mni = (
-                                    expert_off_idx + inter_idx + col_base
-                                ) // arith.constant(32, index=True)
                                 gate_scale_i32 = load_scale_masked(
                                     arg_scale_w,
                                     sw_rsrc,
@@ -823,16 +840,20 @@ def compile_mixed_moe_gemm1(
                                     gate_mni,
                                     col_valid,
                                 )
-                                up_scale_i32 = load_scale_masked(
-                                    arg_scale_w,
-                                    sw_rsrc,
-                                    layout_b_scale,
-                                    ku + base_k,
-                                    up_mni,
-                                    col_valid,
-                                )
                                 gate_b_scale_tile.append(gate_scale_i32)
-                                up_b_scale_tile.append(up_scale_i32)
+                                if not g1u0:
+                                    up_mni = (
+                                        expert_off_idx + inter_idx + col_base
+                                    ) // arith.constant(32, index=True)
+                                    up_scale_i32 = load_scale_masked(
+                                        arg_scale_w,
+                                        sw_rsrc,
+                                        layout_b_scale,
+                                        ku + base_k,
+                                        up_mni,
+                                        col_valid,
+                                    )
+                                    up_b_scale_tile.append(up_scale_i32)
                         return gate_b_scale_tile, up_b_scale_tile
 
                     def load_a_scale_tile(base_k):
@@ -854,7 +875,7 @@ def compile_mixed_moe_gemm1(
                         return [load_a_scale_tile(base_k), gate_bs, up_bs]
 
                     acc_gate = [acc_init] * (num_acc_n * m_repeat)
-                    acc_up = [acc_init] * (num_acc_n * m_repeat)
+                    acc_up = None if g1u0 else ([acc_init] * (num_acc_n * m_repeat))
 
                     # ---- Pipeline helpers: store X tile to LDS with ping-pong base ----
                     def store_x_tile_to_lds(vec_x_in_parts, lds_base):
@@ -915,7 +936,7 @@ def compile_mixed_moe_gemm1(
                         prefetch_epilogue: bool = False,
                     ):
                         gate_list = list(acc_gate_in)
-                        up_list = list(acc_up_in)
+                        up_list = None if g1u0 else list(acc_up_in)
 
                         # Re-sync all threads before consuming the current LDS tile.
                         gpu.barrier()
@@ -926,22 +947,23 @@ def compile_mixed_moe_gemm1(
                             expert_off_idx + by_n + n_tile_base
 
                             gate_bias = []
-                            up_bias = []
+                            up_bias = [] if not g1u0 else None
                             for ni in range_constexpr(num_acc_n):
                                 global_n = by_n + n_tile_base + ni * 16 + lane_mod_16
                                 gate_offset = expert_off_idx + global_n
-                                up_offset = expert_off_idx + global_n + inter_dim
                                 gate_bias.append(
                                     buffer_ops.buffer_load(
                                         bias_rsrc, gate_offset, vec_width=1, dtype=f32
                                     )
                                 )
-                                up_bias.append(
-                                    buffer_ops.buffer_load(
-                                        bias_rsrc, up_offset, vec_width=1, dtype=f32
+                                if not g1u0:
+                                    up_offset = expert_off_idx + global_n + inter_dim
+                                    up_bias.append(
+                                        buffer_ops.buffer_load(
+                                            bias_rsrc, up_offset, vec_width=1, dtype=f32
+                                        )
                                     )
-                                )
-                            epilogue_pf = (gate_bias, up_bias)
+                            epilogue_pf = gate_bias if g1u0 else (gate_bias, up_bias)
 
                         if (int(tile_k) % 128) != 0:
                             raise ValueError(
@@ -975,18 +997,11 @@ def compile_mixed_moe_gemm1(
                                         static_position=[0],
                                         dynamic_position=[],
                                     )
-                                    up_bs_i32 = up_b_scale[
-                                        ku128 * num_acc_n_packed + ni
-                                    ]
-                                    up_bs_val = vector.extract(
-                                        up_bs_i32,
-                                        static_position=[0],
-                                        dynamic_position=[],
-                                    )
                                     for ikxdl in range_constexpr(pack_K):
                                         k_idx = ku128 * pack_K + ikxdl
                                         gate_bp0, gate_bp1 = gate_b_tile_in[k_idx]
-                                        up_bp0, up_bp1 = up_b_tile_in[k_idx]
+                                        if not g1u0:
+                                            up_bp0, up_bp1 = up_b_tile_in[k_idx]
                                         col_base = (
                                             col_offset_base
                                             + (k_idx * 128) // a_elem_vec_pack
@@ -1036,12 +1051,6 @@ def compile_mixed_moe_gemm1(
                                                     gb0, gb1, c0_i64, c0_i64
                                                 )
 
-                                                ub0 = up_bp0[ni_idx]
-                                                ub1 = up_bp1[ni_idx]
-                                                ub128 = pack_i64x4_to_i32x8(
-                                                    ub0, ub1, c0_i64, c0_i64
-                                                )
-
                                                 rocdl.sched_barrier(0)
                                                 gate_list[acc_idx] = (
                                                     rocdl.mfma_scale_f32_16x16x128_f8f6f4(
@@ -1059,23 +1068,37 @@ def compile_mixed_moe_gemm1(
                                                         ],
                                                     )
                                                 )
-                                                rocdl.sched_barrier(0)
-                                                up_list[acc_idx] = (
-                                                    rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                                                        mfma_res_ty,
-                                                        [
-                                                            a128,
-                                                            ub128,
-                                                            up_list[acc_idx],
-                                                            cbsz,
-                                                            blgp,
-                                                            ikxdl * pack_M + imxdl,
-                                                            a_scale_val,
-                                                            ikxdl * pack_N + inxdl,
-                                                            up_bs_val,
-                                                        ],
+                                                if not g1u0:
+                                                    ub0 = up_bp0[ni_idx]
+                                                    ub1 = up_bp1[ni_idx]
+                                                    ub128 = pack_i64x4_to_i32x8(
+                                                        ub0, ub1, c0_i64, c0_i64
                                                     )
-                                                )
+                                                    up_bs_i32 = up_b_scale[
+                                                        ku128 * num_acc_n_packed + ni
+                                                    ]
+                                                    up_bs_val = vector.extract(
+                                                        up_bs_i32,
+                                                        static_position=[0],
+                                                        dynamic_position=[],
+                                                    )
+                                                    rocdl.sched_barrier(0)
+                                                    up_list[acc_idx] = (
+                                                        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                                            mfma_res_ty,
+                                                            [
+                                                                a128,
+                                                                ub128,
+                                                                up_list[acc_idx],
+                                                                cbsz,
+                                                                blgp,
+                                                                ikxdl * pack_M + imxdl,
+                                                                a_scale_val,
+                                                                ikxdl * pack_N + inxdl,
+                                                                up_bs_val,
+                                                            ],
+                                                        )
+                                                    )
                         return gate_list, up_list, epilogue_pf
 
                     # ---------------- 2-stage pipeline (ping-pong LDS + B tile prefetch) ----------------
@@ -1087,7 +1110,7 @@ def compile_mixed_moe_gemm1(
                     rocdl.sched_barrier(0)
 
                     def hot_loop_scheduler():
-                        mfma_group = num_acc_n * 2
+                        mfma_group = num_acc_n if g1u0 else (num_acc_n * 2)
                         # K64 micro-step: 2x K32 MFMA per gemm.
                         mfma_total = (k_unroll * 2) * m_repeat * mfma_group
                         mfma_per_iter = 2 * mfma_group
@@ -1335,21 +1358,31 @@ def compile_mixed_moe_gemm1(
                                     static_position=[ii],
                                     dynamic_position=[],
                                 )
-                                vu = vector.extract(
-                                    acc_up[acc_idx],
-                                    static_position=[ii],
-                                    dynamic_position=[],
-                                )
-
-                                if enable_bias:
-                                    gate_bias_list, up_bias_list = epilogue_pf
-                                    vg = vg + gate_bias_list[ni]
-                                    vu = vu + up_bias_list[ni]
-
-                                if act == "swiglu":
-                                    y = swiglu(vg, vu)
+                                if g1u0:
+                                    if enable_bias:
+                                        gate_bias_list = epilogue_pf
+                                        vg = vg + gate_bias_list[ni]
+                                    if act == "gelu":
+                                        y = gelu(vg)
+                                    else:
+                                        y = silu(vg)
                                 else:
-                                    y = silu(vg) * vu
+                                    vu = vector.extract(
+                                        acc_up[acc_idx],
+                                        static_position=[ii],
+                                        dynamic_position=[],
+                                    )
+                                    if enable_bias:
+                                        gate_bias_list, up_bias_list = epilogue_pf
+                                        vg = vg + gate_bias_list[ni]
+                                        vu = vu + up_bias_list[ni]
+
+                                    if act == "swiglu":
+                                        y = swiglu(vg, vu)
+                                    elif act == "gelu":
+                                        y = gelu(vg) * vu
+                                    else:
+                                        y = silu(vg) * vu
 
                                 if doweight_stage1:
                                     y = y * tw
@@ -1496,20 +1529,31 @@ def compile_mixed_moe_gemm1(
                                     static_position=[ii],
                                     dynamic_position=[],
                                 )
-                                vu = vector.extract(
-                                    acc_up[acc_idx],
-                                    static_position=[ii],
-                                    dynamic_position=[],
-                                )
-                                if enable_bias:
-                                    gate_bias_list, up_bias_list = epilogue_pf
-                                    vg = vg + gate_bias_list[ni]
-                                    vu = vu + up_bias_list[ni]
-
-                                if act == "swiglu":
-                                    y = swiglu(vg, vu)
+                                if g1u0:
+                                    if enable_bias:
+                                        gate_bias_list = epilogue_pf
+                                        vg = vg + gate_bias_list[ni]
+                                    if act == "gelu":
+                                        y = gelu(vg)
+                                    else:
+                                        y = silu(vg)
                                 else:
-                                    y = silu(vg) * vu
+                                    vu = vector.extract(
+                                        acc_up[acc_idx],
+                                        static_position=[ii],
+                                        dynamic_position=[],
+                                    )
+                                    if enable_bias:
+                                        gate_bias_list, up_bias_list = epilogue_pf
+                                        vg = vg + gate_bias_list[ni]
+                                        vu = vu + up_bias_list[ni]
+
+                                    if act == "swiglu":
+                                        y = swiglu(vg, vu)
+                                    elif act == "gelu":
+                                        y = gelu(vg) * vu
+                                    else:
+                                        y = silu(vg) * vu
 
                                 if doweight_stage1:
                                     y = y * tw
@@ -1531,6 +1575,7 @@ def compile_mixed_moe_gemm1(
     # -- Host launcher (flyc.jit + .launch) --------------------------------
     _cache_tag = (
         module_name,
+        g1u_tag,
         a_dtype,
         b_dtype,
         out_dtype,

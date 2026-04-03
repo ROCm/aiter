@@ -410,7 +410,13 @@ class TunerCommon:
         logger.info("Failed shapes:")
         print(self.failed, flush=True)
 
-        tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
+        # tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
+        tunedf_subset = tunedf[self.untunedf.columns]
+        for col in tunedf_subset.columns:
+            try:
+                tunedf_subset[col] = tunedf_subset[col].astype(self.untunedf[col].dtype)
+            except (ValueError, TypeError):
+                pass
         mask = self.untunedf.apply(tuple, axis=1).isin(
             tunedf_subset.apply(tuple, axis=1)
         )

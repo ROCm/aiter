@@ -39,9 +39,9 @@ def get_flydsl_stage1_kernels(
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [256] if is_fp4 else [128]
-    tile_ks = [256] if is_fp4 else [128]
-    tile_ms = [16, 32, 64]
+    tile_ns = [256, 512] if is_fp4 else [128]
+    tile_ks = [256, 512] if is_fp4 else [128]
+    tile_ms = [16, 32, 64, 128, 256]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -66,9 +66,9 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [256] if is_fp4 else [128]
-    tile_ms = [32, 64, 128]
+    tile_ns = [128, 256, 512] if is_fp4 else [128]
+    tile_ks = [256, 512] if is_fp4 else [128]
+    tile_ms = [32, 64, 128, 256]
     modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
@@ -117,6 +117,7 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
+    g1u0: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -135,6 +136,7 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
+            g1u0=g1u0,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -220,6 +222,7 @@ def _get_compiled_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str,
+    g1u0: bool = False,
 ):
     """Compile and cache stage1 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage1(
@@ -235,9 +238,17 @@ def _get_compiled_stage1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
+        g1u0=g1u0,
     )
     is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    # _n_in is used by kernel launch to compute gx.
+    # Keep historical behavior:
+    # - g1u0=False (gated): fp4 path uses 2*inter_dim, non-fp4 uses inter_dim
+    # - g1u0=True  (non-gated): always inter_dim
+    if g1u0:
+        _n_in = inter_dim
+    else:
+        _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim
 
     def tensor_api(
@@ -475,17 +486,19 @@ def flydsl_moe_stage1(
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
+    g1u0: bool = False,
 ) -> torch.Tensor:
-    """Fused gate+up GEMM (MOE stage1).
+    """Fused gate+up/gate GEMM (MOE stage1).
 
-    a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
+    a: (token_num, model_dim),
+    w1: (E, 2*inter_dim, model_dim) pre-shuffled for G1U1, or (E, inter_dim, model_dim) for G1U0.
     For fp4 stage1, `w1`/`w1_scale` must use the same CK preshuffle layout as `shuffle_weight(..., (16, 16))`
     and `e8m0_shuffle(...)`.
     Returns (token_num, topk, inter_dim).
     """
     token_num = a.shape[0]
     E = w1.shape[0]
-    inter_dim = w1.shape[1] // 2
+    inter_dim = w1.shape[1] if g1u0 else (w1.shape[1] // 2)
     model_dim = a.shape[1]
 
     if a_dtype == "fp4":
@@ -524,6 +537,7 @@ def flydsl_moe_stage1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
+        g1u0=g1u0,
     )
     tensor_api(
         out.view(-1),
