@@ -20,16 +20,16 @@ def model_benchmark_shapes(args):
     )
     if args.model is None:
         return [
-            ("llama3-8B",   1,     4096),
-            ("llama3-8B",   4096,  4096),
-            ("llama3-70B",  1,     8192),
-            ("llama3-70B",  128,   8192),
-            ("llama3-70B",  4096,  8192),
-            ("llama3-405B", 1,     16384),
-            ("llama3-405B", 128,   16384),
-            ("llama3-405B", 4096,  16384),
+            ("llama3-8B", 128, 4096),
+            ("llama3-8B", 4096, 4096),
+            ("llama3-70B", 32, 8192),
+            ("llama3-70B", 128, 8192),
+            ("llama3-70B", 4096, 8192),
+            ("llama3-405B", 32, 16384),
+            ("llama3-405B", 128, 16384),
+            ("llama3-405B", 4096, 16384),
         ]
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    M_list = [args.M] if args.model == "all" else [2**i for i in range(1, 15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
@@ -41,7 +41,6 @@ def model_benchmark_shapes(args):
 
 def get_x_vals():
     x_vals = [
-        (1, 1280),
         (32, 1280),
         (64, 1280),
         (128, 1280),
