@@ -284,11 +284,11 @@ void gated_rmsnorm_fp8_group_quant(
 
     // Dispatch based on input/output types
     if (x.scalar_type() == at::ScalarType::BFloat16 &&
-        out.scalar_type() == at::ScalarType::Float8_e4m3fnuz) {
+        (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
         gated_rmsnorm_fp8_group_quant_launcher<ck_tile::bf16_t, ck_tile::fp8_t>(
             out, scale, x, z, weight, epsilon, group_size, transpose_scale);
     } else if (x.scalar_type() == at::ScalarType::Half &&
-               out.scalar_type() == at::ScalarType::Float8_e4m3fnuz) {
+               (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz || out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
         gated_rmsnorm_fp8_group_quant_launcher<ck_tile::fp16_t, ck_tile::fp8_t>(
             out, scale, x, z, weight, epsilon, group_size, transpose_scale);
     } else {

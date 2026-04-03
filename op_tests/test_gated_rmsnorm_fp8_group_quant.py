@@ -14,7 +14,6 @@ Constraint: ONLY supports head_dim=128 and group_size=128
 import pandas as pd
 import torch
 import aiter
-from aiter.ops.quant import per_group_quant_hip
 from aiter.test_common import checkAllclose, perftest
 import argparse
 
@@ -33,6 +32,48 @@ def rms_norm_forward(x: torch.Tensor, weight: torch.Tensor, eps: float):
     return weight * x_normed
 
 
+def normalize_scales_layout(
+    scales: torch.Tensor,
+    num_tokens: int,
+    num_heads: int,
+    transpose_scale: bool,
+) -> torch.Tensor:
+    """Convert the physical scale buffer layout into logical [token, head]."""
+    if not transpose_scale:
+        return scales
+    return scales.reshape(-1).view(num_heads, num_tokens).transpose(0, 1).contiguous()
+
+
+def gated_rmsnorm_fp8_group_quant_reference_impl(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    quant_dtype,
+):
+    """Reference that matches the fused HIP kernel math and quantization path."""
+    if quant_dtype == torch.float8_e4m3fnuz:
+        fp8_max = 240.0
+    elif quant_dtype == torch.float8_e4m3fn:
+        fp8_max = 448.0
+    else:
+        raise ValueError(f"Unsupported FP8 dtype for this test: {quant_dtype}")
+
+    variance = x.float().pow(2).mean(-1, keepdim=True)
+    inv_std = torch.rsqrt(variance + eps)
+    normed = x.float() * inv_std
+    normed = normed * weight.float().view(1, 1, -1)
+
+    gated = normed * silu(z.float())
+    scales = gated.abs().amax(dim=-1) / fp8_max
+    scales = torch.maximum(scales, torch.full_like(scales, 1e-10))
+
+    out_quant = torch.clamp(gated / scales.unsqueeze(-1), -fp8_max, fp8_max).to(
+        quant_dtype
+    )
+    return out_quant.reshape(x.shape[0], -1), scales
+
+
 @perftest()
 def test_gated_rmsnorm_fp8_group_quant_reference(
     x: torch.Tensor,
@@ -43,29 +84,9 @@ def test_gated_rmsnorm_fp8_group_quant_reference(
     quant_dtype,
     transpose_scale: bool = False,
 ):
-    """Reference implementation using PyTorch + per_group_quant_hip."""
-    num_tokens, num_heads, head_dim = x.shape
-
-    # Step 1: RMSNorm (per-head)
-    x_normed = rms_norm_forward(x, weight, eps)
-
-    # Step 2: Gating with SiLU
-    silu_z = silu(z)
-    out = x_normed * silu_z
-
-    # Step 3: Flatten to [num_tokens, num_heads*head_dim]
-    out_flat = out.reshape(num_tokens, -1)
-
-    # Step 4: Group quantization using AITER's HIP reference on flattened tensor
-    out_quant, scales = per_group_quant_hip(
-        out_flat,
-        scale=None,
-        quant_dtype=quant_dtype,
-        group_size=group_size,
-        transpose_scale=transpose_scale,
-    )
-
-    return out_quant, scales
+    """Reference implementation that matches the fused kernel numerics."""
+    del group_size, transpose_scale
+    return gated_rmsnorm_fp8_group_quant_reference_impl(x, z, weight, eps, quant_dtype)
 
 
 @perftest()
@@ -97,7 +118,9 @@ def test_gated_rmsnorm_fp8_group_quant_hip(
         out_quant, scales, x, z, weight, eps, group_size, transpose_scale
     )
 
-    return out_quant, scales
+    return out_quant, normalize_scales_layout(
+        scales, num_tokens, num_heads, transpose_scale
+    )
 
 
 def calculate_bandwidth(num_tokens, num_heads, head_dim, time_us):
@@ -198,11 +221,12 @@ def test_gated_rmsnorm_fp8_group_quant(
     # Dequantized comparison
     print("\nDequantized comparison:")
 
-    # For reference: scales are [num_tokens, num_groups]
-    ref_dequant = ref_quant.float()
-
-    # For HIP: scales are same shape
-    hip_dequant = hip_quant.float()
+    ref_dequant = (
+        ref_quant.float().view(ref_quant.shape[0], -1, 128) * ref_scales[:, :, None]
+    )
+    hip_dequant = (
+        hip_quant.float().view(ref_quant.shape[0], -1, 128) * hip_scales[:, :, None]
+    )
 
     checkAllclose(
         ref_dequant, hip_dequant, rtol=1e-2, atol=1e-2, msg="Dequantized values"
