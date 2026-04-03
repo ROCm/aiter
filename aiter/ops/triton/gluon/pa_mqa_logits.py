@@ -127,12 +127,20 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         order=[1, 0],
     )
 
-    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=CDNA_VERSION,
-        instr_shape=[16, 16],
-        transposed=False,
-        warps_per_cta=[1, NumWarps],
-    )
+    if _Use_2d_instr_shape_mfma_layout:
+        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=CDNA_VERSION,
+            instr_shape=[16, 16],
+            transposed=False,
+            warps_per_cta=[1, NumWarps],
+        )
+    else:
+        mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+            version=CDNA_VERSION,
+            instr_shape=[16, 16, 32],
+            transposed=False,
+            warps_per_cta=[1, NumWarps],
+        )
     mfma_layout_a: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
     )
