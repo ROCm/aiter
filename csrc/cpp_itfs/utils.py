@@ -42,13 +42,20 @@ if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
 
 
 def _find_rocm_home():
-    # 1. Env var override (highest priority, escape hatch for users)
-    # If explicitly set, always respect it — fail loudly if wrong, don't silently
-    # fall back to a different install (TheRock principle).
+    # 1. Env var override (optional, not required — escape hatch for users)
     rocm = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm:
         return rocm
-    # 2. hipconfig --rocmpath (tool-based discovery, TheRock recommended)
+    # 2. rocm_sdk Python package (TheRock, no subprocess needed)
+    try:
+        from rocm_sdk._devel import get_devel_root
+
+        root = str(get_devel_root())
+        if os.path.isdir(root):
+            return root
+    except Exception:
+        pass
+    # 3. hipconfig --rocmpath (tool-based discovery)
     hipconfig = shutil.which("hipconfig")
     if hipconfig:
         try:
@@ -59,7 +66,7 @@ def _find_rocm_home():
                 return result.stdout.strip()
         except Exception:
             pass
-    # 3. rocm-sdk path --root (TheRock Python package)
+    # 4. rocm-sdk CLI fallback (TheRock, when Python import unavailable)
     rocm_sdk = shutil.which("rocm-sdk")
     if rocm_sdk:
         try:
@@ -70,15 +77,14 @@ def _find_rocm_home():
                 return result.stdout.strip()
         except Exception:
             pass
-    # 4. Fallback
+    # 5. Fallback
     return "/opt/rocm"
 
 
 _ROCM_HOME = _find_rocm_home()
 DEFAULT_GPU_ARCH = (
     subprocess.run(
-        f"{_ROCM_HOME}/llvm/bin/amdgpu-arch",
-        shell=True,
+        [os.path.join(_ROCM_HOME, "llvm", "bin", "amdgpu-arch")],
         capture_output=True,
         text=True,
     )
@@ -152,7 +158,7 @@ def mp_lock(
 def get_hip_version():
     hipconfig_home = shutil.which("hipconfig")
     version = subprocess.run(
-        f"{hipconfig_home} --version", shell=True, capture_output=True, text=True
+        [hipconfig_home, "--version"], capture_output=True, text=True
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 

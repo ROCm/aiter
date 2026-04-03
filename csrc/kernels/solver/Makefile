@@ -2,7 +2,7 @@
 
 # Compiler and flags
 CXX = hipcc
-ROCM_HOME ?= /opt/rocm
+ROCM_HOME ?= $(if $(ROCM_PATH),$(ROCM_PATH),/opt/rocm)
 ROCBLAS_DIR ?= $(ROCM_HOME)
 ROCSOLVER_DIR ?= $(ROCM_HOME)
 
