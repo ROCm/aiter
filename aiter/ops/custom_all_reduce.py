@@ -31,8 +31,6 @@ def all_reduce(
     open_fp8_quant: bool,
     reg_inp_ptr: int,
     reg_inp_bytes: int,
-    reg_out_ptr: int,
-    reg_out_bytes: int,
     stream: int,
 ) -> None: ...
 
