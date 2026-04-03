@@ -187,7 +187,7 @@ jobs:
             --summary
 
   runner-fleet-report:
-    name: Runner Fleet Report
+    name: Runner Fleet Queue Report
     needs: [parse-workflows, fetch-actions-snapshot]
     if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '') && needs.parse-workflows.outputs.workflow_list != '' }}
     runs-on: ubuntu-latest
@@ -209,7 +209,7 @@ jobs:
           name: actions-job-snapshot
           path: .
 
-      - name: Generate runner fleet report
+      - name: Generate runner fleet queue report
         run: |
           python .github/scripts/query_job_status.py \
             --repo "${{ github.repository }}" \
@@ -219,7 +219,7 @@ jobs:
             --summary | tee runner-fleet-report.md
 
           {
-            echo "## Runner Fleet Summary"
+            echo "## Runner Fleet Queue Summary"
             echo ""
             cat runner-fleet-report.md
           } >> "$GITHUB_STEP_SUMMARY"
