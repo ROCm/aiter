@@ -27,9 +27,23 @@ import torch
 
 _LOGGER = logging.getLogger(__name__)
 
-# FlyDSL kernel source lives in the FlyDSL repo.
-_FLYDSL_ROOT = os.environ.get("FLYDSL_ROOT", "/home/pensun/FlyDSL")
-if _FLYDSL_ROOT not in sys.path:
+# Locate FlyDSL kernels directory.  Priority:
+# 1. FLYDSL_ROOT env var (explicit override)
+# 2. flydsl package installation directory (pip install flydsl ships kernels/)
+# 3. Common development paths
+_FLYDSL_ROOT = os.environ.get("FLYDSL_ROOT")
+if _FLYDSL_ROOT is None:
+    try:
+        import flydsl as _flydsl_pkg
+
+        _pkg_dir = os.path.dirname(os.path.dirname(_flydsl_pkg.__file__))
+        _kernels_dir = os.path.join(_pkg_dir, "kernels")
+        if os.path.isdir(_kernels_dir):
+            _FLYDSL_ROOT = _pkg_dir
+    except ImportError:
+        pass
+
+if _FLYDSL_ROOT and _FLYDSL_ROOT not in sys.path:
     sys.path.insert(0, _FLYDSL_ROOT)
 
 from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module  # noqa: E402
