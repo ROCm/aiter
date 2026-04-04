@@ -179,8 +179,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         self.parser.add_argument(
             "--libtype",
             type=str,
-            default="both",
-            choices=["ck", "cktile", "asm", "both", "all"],
+            default="all",
+            choices=["ck", "cktile", "asm", "all", "both"],
             required=False,
             help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, both or all (covers all supported backends across standard/preshuffleB modes)",
         )
@@ -480,7 +480,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             total_kernel_nums = 0
             info_keys = (cu_num, M, N, K)
             lib = args.libtype
-            if lib == "ck":
+            if lib in ("ck", "both", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_tune_task(
                         info_keys,
@@ -491,7 +491,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         num_iters,
                     )
                 )
-            elif lib == "cktile":
+            if lib in ("cktile", "both", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_cktile_tune_task(
                         info_keys,
@@ -503,7 +503,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         num_iters,
                     )
                 )
-            elif lib == "asm":
+            if lib in ("asm", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_asm_tune_task(
                         info_keys,
@@ -514,61 +514,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         num_iters,
                     )
                 )
-            elif lib == "both":
-                task.extend(
-                    self.get_gemm_a8w8_blockscale_tune_task(
-                        info_keys,
-                        useSplitK,
-                        seed,
-                        isPreshuffleB,
-                        num_warmup,
-                        num_iters,
-                    )
-                )
-                task.extend(
-                    self.get_gemm_a8w8_blockscale_cktile_tune_task(
-                        info_keys,
-                        useSplitK,
-                        seed,
-                        isPreshuffleB,
-                        block_per_cu,
-                        num_warmup,
-                        num_iters,
-                    )
-                )
-            elif lib == "all":
-                for preshuffleB in [True, False]:
-                    task.extend(
-                        self.get_gemm_a8w8_blockscale_tune_task(
-                            info_keys,
-                            useSplitK,
-                            seed,
-                            preshuffleB,
-                            num_warmup,
-                            num_iters,
-                        )
-                    )
-                    task.extend(
-                        self.get_gemm_a8w8_blockscale_cktile_tune_task(
-                            info_keys,
-                            useSplitK,
-                            seed,
-                            preshuffleB,
-                            block_per_cu,
-                            num_warmup,
-                            num_iters,
-                        )
-                    )
-                    task.extend(
-                        self.get_gemm_a8w8_blockscale_asm_tune_task(
-                            info_keys,
-                            useSplitK,
-                            seed,
-                            preshuffleB,
-                            num_warmup,
-                            num_iters,
-                        )
-                    )
             total_kernel_nums = len(task)
 
             tasks_data.append((total_kernel_nums, ()))
