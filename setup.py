@@ -12,7 +12,9 @@ from setuptools.command.build_ext import build_ext
 this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_FIND_LINKS = "https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl/"
+FLYDSL_FIND_LINKS = (
+    "https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl/"
+)
 FLYDSL_VERSION = "flydsl==0.1.1+20260401.5ac412e"
 
 if not sys.platform == "win32":
@@ -20,8 +22,15 @@ if not sys.platform == "win32":
         import flydsl  # noqa: F401
     except ImportError:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install",
-             "--find-links", FLYDSL_FIND_LINKS, FLYDSL_VERSION]
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--find-links",
+                FLYDSL_FIND_LINKS,
+                FLYDSL_VERSION,
+            ]
         )
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
