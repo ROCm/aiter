@@ -10,6 +10,7 @@ from aiter.test_common import (
     perftest,
 )
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 import pandas as pd
 import argparse
 
@@ -112,6 +113,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
         if tag == "asm" and not (
             (E, topk) in [(128, 4), (128, 6), (128, 8), (256, 6), (256, 8), (384, 8)]
             and dtype in [dtypes.bf16, dtypes.fp32]
+            and get_gfx() in ["gfx942", "gfx950"]
         ):
             continue
         gating_output = gating_output.contiguous() if tag == "asm" else gating_output

@@ -426,8 +426,6 @@ template <typename T,
           int VPT,
           int NUM_EXPERTS,
           int THREADS_PER_ROW,
-          int ROWS_PER_WARP,
-          int ROWS_PER_CTA,
           int WARPS_PER_CTA>
 __global__ void moe_fused_gate_kernel(void* input,
                                       void* bias,
@@ -440,6 +438,9 @@ __global__ void moe_fused_gate_kernel(void* input,
                                       double routed_scaling_factor,
                                       int32_t out_stride)
 {
+    constexpr int EXPERT_GROUP = THREADS_PER_ROW;
+    constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;
+    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;
     KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA>
         params;
     moe_fused_gate_impl<T>(input,
@@ -461,15 +462,10 @@ __global__ void moe_fused_gate_kernel(void* input,
     {                                                                                         \
         constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                       \
         /* If EXPERT_GROUP > WARP_SIZE, fall back to 1 row per warp */                        \
-        constexpr int ROWS_PER_WARP =                                                         \
-            ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;                 \
-        constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                           \
         moe_fused_gate_kernel<T,                                                              \
                               VPT,                                                            \
                               (EXPERTS),                                                      \
                               (EXPERT_GROUP),                                                 \
-                              ROWS_PER_WARP,                                                  \
-                              ROWS_PER_CTA,                                                   \
                               WARPS_PER_CTA>                                                  \
             <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),            \
                                                                  bias.data_ptr(),             \
