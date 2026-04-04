@@ -8,7 +8,7 @@ requires = [
     "psutil",
     "ninja",
     "pandas",
-    "flydsl @ git+https://github.com/ROCm/FlyDSL.git@main"
+    "flydsl==0.1.1+20260401.5ac412e"
 ]
 
 [tool.setuptools_scm]

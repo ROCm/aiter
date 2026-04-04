@@ -46,7 +46,16 @@ if _FLYDSL_ROOT is None:
 if _FLYDSL_ROOT and _FLYDSL_ROOT not in sys.path:
     sys.path.insert(0, _FLYDSL_ROOT)
 
-from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module  # noqa: E402
+try:
+    from kernels.fused_rope_cache_kernel import (  # noqa: E402
+        build_fused_rope_cache_module,
+    )
+except ImportError as e:
+    raise ImportError(
+        "FlyDSL RoPE kernel source not found. Set FLYDSL_ROOT env var "
+        "to the FlyDSL repo root containing kernels/fused_rope_cache_kernel.py, "
+        "or install FlyDSL with: pip install flydsl"
+    ) from e
 
 
 @functools.lru_cache(maxsize=64)

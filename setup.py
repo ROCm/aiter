@@ -15,7 +15,7 @@ PACKAGE_NAME = "amd-aiter"
 FLYDSL_FIND_LINKS = (
     "https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl/"
 )
-FLYDSL_VERSION = "flydsl @ git+https://github.com/ROCm/FlyDSL.git@main"
+FLYDSL_VERSION = "flydsl==0.1.1+20260401.5ac412e"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -59,7 +59,8 @@ if not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
 
-        pkg_version("flydsl")  # Check if installed at all
+        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+            raise ImportError("version mismatch")
     except Exception:
         subprocess.check_call(
             [

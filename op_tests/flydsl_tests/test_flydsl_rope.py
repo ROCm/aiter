@@ -30,13 +30,20 @@ except ImportError:
     HAS_FLYDSL = False
 
 if HAS_FLYDSL:
-    import sys
+    try:
+        from aiter.ops.flydsl.rope_kernels import (  # noqa: F401
+            flydsl_fused_qk_rope_reshape_and_cache,
+        )
 
-    # FlyDSL kernels are in the FlyDSL repo, not in aiter
-    flydsl_root = os.environ.get("FLYDSL_ROOT", "/home/pensun/FlyDSL")
-    if flydsl_root not in sys.path:
-        sys.path.insert(0, flydsl_root)
-    from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
+        # Also import build function for direct kernel tests
+        import sys
+
+        flydsl_root = os.environ.get("FLYDSL_ROOT", "")
+        if flydsl_root and flydsl_root not in sys.path:
+            sys.path.insert(0, flydsl_root)
+        from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
+    except ImportError:
+        HAS_FLYDSL = False
 
 # ── AITER Triton availability ──
 try:
@@ -107,7 +114,7 @@ def pytorch_rope_ref(q, k, cos_2d, sin_2d, positions, D):
     q1, q2 = q[..., :half], q[..., half:]
     k1, k2 = k[..., :half], k[..., half:]
     q_out = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
-    k_out = torch.cat([k1 * cos - k2 * sin, k2 * cos + q1 * sin], dim=-1)
+    k_out = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
     return q_out, k_out
 
 
