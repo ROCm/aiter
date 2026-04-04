@@ -127,7 +127,7 @@ def get_GEMM_A16W16_config(
     if config is None:
         default_config = {}
         if bpreshuffle:
-            default_config["bpreshuflle"] = True
+            default_config["bpreshuffle"] = True
             if get_gfx() == "gfx942":
                 default_config["libtype"] = "hipblaslt"
                 default_config["solidx"] = -1

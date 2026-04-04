@@ -17,21 +17,6 @@ FLYDSL_FIND_LINKS = (
 )
 FLYDSL_VERSION = "flydsl==0.1.1+20260401.5ac412e"
 
-if not sys.platform == "win32":
-    try:
-        import flydsl  # noqa: F401
-    except ImportError:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--find-links",
-                FLYDSL_FIND_LINKS,
-                FLYDSL_VERSION,
-            ]
-        )
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
@@ -68,6 +53,26 @@ def is_develop_mode():
         elif "editable" in arg:
             return True
     return False
+
+
+if not IS_WINDOWS and is_develop_mode():
+    try:
+        from importlib.metadata import version as pkg_version
+
+        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+            raise ImportError("version mismatch")
+    except Exception:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--find-links",
+                FLYDSL_FIND_LINKS,
+                FLYDSL_VERSION,
+            ]
+        )
 
 
 def write_install_mode():
