@@ -595,6 +595,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    dv_buf.GetDeviceBuffer(),
                                    dbias_buf.GetDeviceBuffer(),
                                    dq_acc_buf.GetDeviceBuffer(),
+                                   nullptr, // sink_ptr
+                                   nullptr, // d_sink_ptr
                                    seqstart_q.GetDeviceBuffer(),
                                    seqstart_k.GetDeviceBuffer(),
                                    nullptr,

@@ -22,9 +22,7 @@
             "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -150,10 +148,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'",
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -435,8 +430,7 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -444,6 +438,16 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
+        "verbose": "False"
+    },
+    "module_moe_topksoftmax_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
@@ -600,6 +604,21 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/rmsnorm_quant_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/rmsnorm_quant_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_fused_qk_rmsnorm_group_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/fused_qk_rmsnorm_group_quant.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/fused_qk_rmsnorm_group_quant_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -790,9 +809,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -1427,10 +1444,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'",
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },

@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
-from aiter import dtypes, get_gfx
+from aiter import dtypes
 import argparse
 
 
