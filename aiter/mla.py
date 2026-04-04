@@ -282,6 +282,10 @@ def mla_decode_fwd(
         ):
             if _o_unpadded is not None:
                 _o_unpadded.copy_(o[:, ::_head_pad_factor, :])
+                return (
+                    logits.view(total_s, nhead, v_head_dim)[:, ::_head_pad_factor, :],
+                    attn_lse[:, :, ::_head_pad_factor, :],
+                )
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
@@ -494,6 +498,7 @@ def mla_decode_fwd(
         _o_unpadded.copy_(o[:, ::_head_pad_factor, :])
         if final_lse is not None:
             final_lse = final_lse[:, ::_head_pad_factor]
+        logits = logits[:, :, ::_head_pad_factor, :]
 
     return logits, final_lse
 
