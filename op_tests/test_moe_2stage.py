@@ -372,7 +372,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=8,
+    default=257,
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -381,7 +381,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=2,
+    default=9,
     help="""Number of top experts.
     e.g.: -k 2""",
 )
