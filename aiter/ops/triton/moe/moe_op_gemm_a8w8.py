@@ -7,8 +7,8 @@ import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
-    _reduce_grouped,
 )
+from aiter.ops.triton.moe.reduce import reduce_grouped
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -119,82 +119,6 @@ def swizzle_scales(data):
     E = block_shape[0]
     data = data.reshape(E, N // 32, SCALE_K * 32)
     return data.transpose(-1, -2)
-
-
-def reduce_grouped(
-    x: torch.Tensor,
-    indx: torch.Tensor,
-    out: torch.Tensor,
-    apply_swiglu=False,
-    alpha=1.0,
-    limit=1.0,
-    reduction_n=1,
-    out_dtype: bool = None,
-    add_residual: bool = True,
-):
-    """
-    In-place grouped row reduction.
-
-    Arguments
-    - x: Tensor[AnyFloat] of shape [(num_groups * K), N]
-    - indx: Tensor[Int] of shape [num_groups, K]
-
-    Description
-    For each group g in [0, num_groups), this routine sums the K rows of `x`
-    specified by `indx[g, :]` and overwrites the row corresponding to the first
-    valid (non-negative) index with the per-group sum. Accumulation is performed
-    in float32 for numerical stability, and the result is written back in the
-    dtype of `x`.
-
-    Behavior and edge cases
-    - Invalid (-1) entries are skipped during accumulation and do not generate
-      memory traffic. If a group has no valid entries, nothing is written for
-      that group.
-    - Reduction is performed tile-by-tile along the N dimension within a single
-      kernel launch (persistent along N) to minimize launch overhead.
-
-    Performance notes
-    - Memory traffic per group is approximately (valid_rows_read + 1) * N * sizeof(x),
-      plus index reads. With no invalid entries, this becomes (K + 1) reads/writes
-      of length N per group.
-
-    Returns
-    - The input tensor `x` (modified in place).
-    """
-    if indx is None and x.shape[0] == 1:
-        return x.squeeze(0)
-    if indx is not None:
-        num_groups = indx.shape[0]
-    else:
-        num_groups = x.shape[-2]
-    K = 1 if indx is None else indx.shape[1]
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    assert x.shape[-1] % reduction_n == 0
-    BLOCK_N = 512
-    num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
-
-    _reduce_grouped[(num_blocks, num_groups)](
-        x,
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),  #
-        out,
-        out.stride(0),
-        out.stride(1),  #
-        indx,  #
-        x.shape[0],
-        x.shape[-1],  #
-        apply_swiglu,
-        alpha,
-        limit,
-        reduction_n,
-        BLOCK_N=BLOCK_N,
-        EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        K=K,  #
-        ADD_RESIDUAL=add_residual,
-        num_warps=2,  #
-    )
-    return out
 
 
 # -----------------------------------------------------------------------------
