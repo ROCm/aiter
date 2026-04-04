@@ -919,7 +919,7 @@ def get_mla_metadata_info_v1(
     effective_num_head = num_head_qo
     if num_head_qo < 16 and num_head_qo > 0 and 16 % num_head_qo == 0:
         effective_num_head = 16
-    assert effective_num_head % 16 == 0
+    assert effective_num_head % 8 == 0
 
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)

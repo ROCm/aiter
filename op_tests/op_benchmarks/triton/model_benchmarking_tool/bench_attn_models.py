@@ -164,6 +164,8 @@ class Model:
     dqk: int
     dv: int
     use_mla: bool = False
+    use_sink: bool = False
+    sliding_window_left: int = 0
 
     def __post_init__(self) -> None:
         assert self.name, "Model name must be non-empty."
@@ -177,6 +179,12 @@ class Model:
         assert (
             self.dqk >= self.dv
         ), f"Invalid head dimensions: dqk ({self.dqk}) < dv ({self.dv}). Expected dqk >= dv."
+        assert (
+            self.sliding_window_left >= 0
+        ), "Sliding window size must be non-negative."
+        assert not (
+            self.use_mla and (self.use_sink or self.sliding_window_left > 0)
+        ), "MLA models don't support sink or sliding window annotations."
 
     def kernel_backend_str(self) -> str:
         return "mla" if self.use_mla else "mha"
@@ -277,6 +285,8 @@ class TpModel:
             dqk=original_model.dqk,
             dv=original_model.dv,
             use_mla=original_model.use_mla,
+            use_sink=original_model.use_sink,
+            sliding_window_left=original_model.sliding_window_left,
         )
 
 
@@ -356,6 +366,10 @@ class BenchArgs:
         }
 
         args_list: list[str] = [kv for k, v in args_dict.items() for kv in (k, v)]
+        if m.use_sink:
+            args_list.append("-sink")
+        if m.sliding_window_left > 0:
+            args_list.extend(("--window-size-left", str(m.sliding_window_left)))
         if self.kernel == "bwdf":
             args_list.append("-fused_bwd")
         args_str: str = " ".join(args_list)
@@ -392,6 +406,8 @@ class BenchArgs:
             "hkv": str(m.hkv),
             "dqk": str(m.dqk),
             "dv": str(m.dv),
+            "sink": str(m.use_sink),
+            "sliding_window_left": str(m.sliding_window_left),
             "tp": str(self.tp_model.tp),
             "b": str(self.b),
             "s": str(self.s),
@@ -411,6 +427,8 @@ class BenchArgs:
             "hkv",
             "dqk",
             "dv",
+            "sink",
+            "sliding_window_left",
             "tp",
             "b",
             "s",
@@ -429,6 +447,8 @@ class BenchArgs:
             m.hkv,
             m.dqk,
             m.dv,
+            m.use_sink,
+            m.sliding_window_left,
             self.tp_model.tp,
             self.b,
             self.s,
@@ -468,19 +488,20 @@ def get_mha_bench_result(
     l2: list[str]
     l0, l1, l2 = out_lines
     # Check stdout line #1 (benchmark name):
-    if l0 != ["bench_mha:"]:
+    if not (len(l0) == 1 and l0[0].startswith("bench_mha") and l0[0].endswith(":")):
         logging.error("Benchmark name doesn't match: %s", l0)
         return None
     # Check stdout line #2 (table header):
     kernel_header: str = {"fwd": "fwd", "bwdo": "bwd", "bwdf": "fused-bwd"}[args.kernel]
-    if l1 != [
-        "BATCH",
-        "HQ",
-        "HK",
-        "N_CTX_Q",
-        "N_CTX_K",
-        f"BF16-{kernel_header}({metric.user_unit})",
-    ]:
+    expected_metric_header = f"BF16-{kernel_header}({metric.user_unit})"
+    if not (
+        l1[:5] == ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
+        and l1[5:]
+        in (
+            [expected_metric_header],
+            [expected_metric_header, f"({metric.user_unit})"],
+        )
+    ):
         logging.error("Table header doesn't match: %s", l1)
         return None
     # Check stdout line #3 (table data):
@@ -720,6 +741,10 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                 hkv_raw: object = entry_raw.get("hkv")
                 dqk_raw: object = entry_raw.get("dqk")
                 dv_raw: object = entry_raw.get("dv")
+                use_sink_raw: object = entry_raw.get("sink", False)
+                sliding_window_left_raw: object = entry_raw.get(
+                    "sliding_window_left", 0
+                )
 
                 # In Python, bool is a subclass of int, so True/False pass `isinstance(..., int)`.
                 # We want to reject Booleans as valid values, so we explicitly check for bool.
@@ -759,6 +784,26 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                         "dv",
                     )
                     continue
+                if not isinstance(use_sink_raw, bool):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be a boolean.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "sink",
+                    )
+                    continue
+                if not isinstance(sliding_window_left_raw, int) or isinstance(
+                    sliding_window_left_raw, bool
+                ):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "sliding_window_left",
+                    )
+                    continue
 
                 try:
                     model = Model(
@@ -768,6 +813,8 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                         dqk=dqk_raw,
                         dv=dv_raw,
                         use_mla=use_mla,
+                        use_sink=use_sink_raw,
+                        sliding_window_left=sliding_window_left_raw,
                     )
                 except Exception as e:
                     logging.error(
@@ -829,13 +876,15 @@ def list_models() -> None:
     logging.info("Available models:")
     for model in get_models():
         logging.info(
-            "%s kernel_backend=%s hq=%d hkv=%d dqk=%d dv=%d",
+            "%s kernel_backend=%s hq=%d hkv=%d dqk=%d dv=%d sink=%s sliding_window_left=%d",
             model.name,
             model.kernel_backend_str(),
             model.hq,
             model.hkv,
             model.dqk,
             model.dv,
+            model.use_sink,
+            model.sliding_window_left,
         )
 
 
@@ -878,16 +927,29 @@ def get_bench_args(
     if tp_models is None:
         tp_models = get_tp_models()
     # MHA kernel backend:
-    bench_args: list[BenchArgs] = [
-        BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s)
-        for kernel, layout, tp_model, b, s in product(
-            kernels,
-            layouts,
-            (tp_model for tp_model in tp_models if not tp_model.model.use_mla),
-            batch_range.to_range(),
-            seq_range.to_range(),
+    bench_args: list[BenchArgs] = []
+    skipped_model_kernels: set[tuple[str, str]] = set()
+    for kernel, layout, tp_model, b, s in product(
+        kernels,
+        layouts,
+        (tp_model for tp_model in tp_models if not tp_model.model.use_mla),
+        batch_range.to_range(),
+        seq_range.to_range(),
+    ):
+        model = tp_model.model
+        if kernel == "bwdf" and (model.use_sink or model.sliding_window_left > 0):
+            skipped_key = (model.name, kernel)
+            if skipped_key not in skipped_model_kernels:
+                logging.info(
+                    "Skipping %s for model '%s': fused backward doesn't support sink or sliding window attention.",
+                    kernel,
+                    model.name,
+                )
+                skipped_model_kernels.add(skipped_key)
+            continue
+        bench_args.append(
+            BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s)
         )
-    ]
     # MLA kernel backend:
     # Only forward kernel, layout option doesn't make sense.
     if "fwd" in kernels:

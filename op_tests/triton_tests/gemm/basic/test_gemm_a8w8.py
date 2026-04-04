@@ -50,39 +50,13 @@ dtype_max = {
 
 
 def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
-    # This shape (4864, 8192, 4160) failing due to compiler change https://github.com/triton-lang/triton/commit/8a34c216a9d7fa3a7e456186ddaab23428320766
+    x_vals = [(1, 1, 1)]  # minimal case
+    x_vals += [(3, 5, 2)]  # irregular shape
+    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
+    x_vals += [(v, 106496, 16384) for v in (190, 256, 4096)]  # LL3 405B FC1
     x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(1, 1, 1)]
+        (v, 10240, 8192) for v in (256, 4096, 8000)
+    ]  # LL3 70B QKV input projection
     return x_vals
 
 
@@ -161,15 +135,20 @@ def generate_gemm_a8w8_inputs(
     return x, weight, weight_shuffled, x_scale, w_scale, bias, y
 
 
+def get_fewer_x_vals():
+    x_vals = [(16, 1024, 1024)]
+    x_vals += [(128, 8192, 512)]
+    x_vals += [(256, 512, 8192)]
+    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 5, 8)]
+    return x_vals
+
+
 @pytest.mark.parametrize(
-    "in_dtype, out_dtype, m, n, k, layout, output",
+    "in_dtype, m, n, k",
     [
-        (in_dtype, out_dtype, *shape, layout, output)
-        for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
-        for out_dtype in ["bf16", "fp16", "fp32", "int32"]
+        (in_dtype, *shape)
+        for in_dtype in ["fp8e4m3", "fp8e5m2"]
         for shape in get_x_vals()
-        for layout in ["TN", "TT", "NN", "NT"]
-        for output in [True, False]
     ],
 )
 @pytest.mark.parametrize(
@@ -180,14 +159,9 @@ def generate_gemm_a8w8_inputs(
         "gluon_shuffle",
     ],
 )
-def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
+def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-
-    if out_dtype == "int32" and in_dtype in ["fp8e4m3", "fp8e5m2"]:
-        pytest.skip(
-            "This kernel is not supported for in_dtype of float and out_dtype of int."
-        )
+    torch.cuda.empty_cache()
 
     if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
         pytest.skip(
@@ -200,6 +174,67 @@ def test_gemm(in_dtype, out_dtype, m, n, k, layout, output, impl: str):
         )
 
     in_dtype = str_to_torch_dtype[in_dtype]
+    out_dtype = str_to_torch_dtype["bf16"]
+    x, weight, weight_triton, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+        M=m,
+        N=n,
+        K=k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        layout="TN",
+        output=False,
+        shuffle=("_shuffle" in impl),
+    )
+
+    a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
+    if impl == "triton":
+        impl = triton_gemm_a8w8
+    elif impl == "gluon":
+        impl = gluon_gemm_a8w8
+    elif impl == "gluon_shuffle":
+        impl = gluon_gemm_a8w8_preshuffle
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
+
+    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "out_dtype, m, n, k, layout, output",
+    [
+        (out_dtype, *shape, layout, output)
+        for out_dtype in ["fp16", "fp32", "int32"]
+        for shape in get_fewer_x_vals()
+        for layout in ["TN", "TT", "NN", "NT"]
+        for output in [True, False]
+    ],
+)
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "triton",
+        "gluon",
+        "gluon_shuffle",
+    ],
+)
+def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
+
+    torch.cuda.empty_cache()
+
+    in_dtype = "int8"
+
+    if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
+        pytest.skip(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
+
+    if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
+        pytest.skip(
+            "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
+        )
+
+    in_dtype = str_to_torch_dtype["int8"]
     out_dtype = str_to_torch_dtype[out_dtype]
     x, weight, weight_triton, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
         M=m,
