@@ -83,8 +83,9 @@ def biased_grouped_topk(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
     token_num = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 212:
+    if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
