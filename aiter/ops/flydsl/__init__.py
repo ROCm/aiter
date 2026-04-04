@@ -41,8 +41,11 @@ if is_flydsl_available():
 
     from .gemm_kernels import flydsl_hgemm
 
+    from .rope_kernels import flydsl_fused_qk_rope_reshape_and_cache
+
     __all__ += [
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",
+        "flydsl_fused_qk_rope_reshape_and_cache",
     ]
