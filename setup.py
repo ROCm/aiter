@@ -15,7 +15,7 @@ PACKAGE_NAME = "amd-aiter"
 FLYDSL_FIND_LINKS = (
     "https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl/"
 )
-FLYDSL_VERSION = "flydsl==0.1.1+20260401.5ac412e"
+FLYDSL_VERSION = "flydsl==0.1.1.dev442"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
