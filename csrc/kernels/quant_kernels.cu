@@ -1797,9 +1797,10 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
 {
     int cols = input.size(-1);
     int token_num = input.numel() / (cols * topk);
+    int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
     
     const int num_cu = get_num_cu_func();
-    int sub_block_m = (token_num * topk) > (num_cu * 8) ? 2 : 8;
+    int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 8;
     TORCH_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
     int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
     const bool persistent_mode = false;
