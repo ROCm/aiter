@@ -389,9 +389,7 @@ namespace py = pybind11;
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_inp_ptr"),                                                              \
           py::arg("reg_inp_bytes"),                                                            \
-          py::arg("reg_out_ptr"),                                                              \
-          py::arg("reg_out_bytes"),                                                             \
-          py::arg("stream"));                                                               \
+          py::arg("stream"));                                                                  \
     m.def("reduce_scatter",                                                                    \
           &aiter::reduce_scatter,                                                              \
           py::arg("_fa"),                                                                      \

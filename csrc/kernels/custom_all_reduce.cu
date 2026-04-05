@@ -354,8 +354,7 @@ void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& out,
                 bool use_new, bool open_fp8_quant,
                 int64_t reg_inp_ptr, int64_t reg_inp_bytes,
-                int64_t reg_out_ptr, int64_t reg_out_bytes,
-                intptr_t stream_ptr)
+                int64_t stream_ptr)
 {
     hipStream_t stream = reinterpret_cast<hipStream_t>(stream_ptr);
     auto dtype     = inp.dtype();
@@ -365,14 +364,11 @@ void all_reduce(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
-    bool use_reg_out = (reg_out_ptr != 0);
-
-    if(reg_inp_ptr == 0 && reg_out_ptr == 0)
-    {
-        _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
-                    use_new, open_fp8_quant, false);
-        return;
-    }
+    // reg_inp_ptr == 0 means the input tensor itself is IPC-registered
+    // (graph mode), so the write-mode kernel can directly write to peer
+    // GPUs via IPC-registered output buffers.  In eager mode (reg_inp_ptr
+    // != 0) the output is not IPC-registered, kernel uses temp-buffer path.
+    bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
     if(reg_inp_ptr != 0)
     {
@@ -383,21 +379,8 @@ void all_reduce(fptr_t _fa,
         actual_inp = (void*)reg_inp_ptr;
     }
 
-    if(use_reg_out)
-    {
-        if(data_bytes > reg_out_bytes)
-            throw std::runtime_error("registered output buffer is too small to contain the output");
-        actual_out = (void*)reg_out_ptr;
-    }
-
     _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
-                use_new, open_fp8_quant, use_reg_out);
-
-    if(use_reg_out)
-    {
-        HIP_CALL(hipMemcpyAsync(out.data_ptr(), (void*)reg_out_ptr, data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
-    }
+                use_new, open_fp8_quant, is_broadcast_reg_outptr);
 }
 
 void reduce_scatter(fptr_t _fa,
