@@ -66,4 +66,13 @@ void moe_smooth_per_token_scaled_quant_v2(torch::Tensor& out,         // [..., d
                                           int block_m,
                                           bool shuffle_scale = false,
                                           bool transpose_out = false);
+
+void fused_dynamic_mxfp4_quant_moe_sort_hip(torch::Tensor& out,         // [token_num * topk, d / 2]
+                                            torch::Tensor& scales,      // swizzled e8m0 bytes
+                                            torch::Tensor const& input, // [token_num * topk, d]
+                                            torch::Tensor const& sorted_ids,
+                                            torch::Tensor const& num_valid_ids,
+                                            int topk,
+                                            int block_m,
+                                            int group_size = 32);
 } // namespace aiter

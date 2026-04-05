@@ -1614,4 +1614,212 @@ void moe_smooth_per_token_scaled_quant_v2(
 }
 
 
+template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
+__global__ void mxfp4_quant_moe_sort_kernel(
+    DTYPE_O* __restrict__ out,
+    uint8_t* __restrict__ scale,
+    DTYPE_I const* __restrict__ input,
+    int32_t const* __restrict__ sorted_ids,
+    int32_t const* __restrict__ num_valid_ids,
+    const int32_t num_tokens,
+    const int32_t cols,
+    const int32_t group_size,
+    const int32_t block_m,
+    const int32_t sub_block_m,
+    const int32_t num_blocks,
+    const int32_t num_tg,
+    const int32_t topk,
+    const int32_t input_stride)
+{
+    int num_thread_per_group = group_size / thread_data_size;
+    int num_valid_ids_value  = num_valid_ids[0];
+    int block_idx            = blockIdx.x;
+    int lane_idx             = threadIdx.x % WARP_SIZE;
+    const int scale_k        = threadIdx.x / num_thread_per_group;
+    static constexpr int32_t vec_size_i =
+        thread_data_size == 0 ? 16 / sizeof(DTYPE_I) : thread_data_size;
+    static constexpr int32_t load_chunk_bytes =
+        (sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16
+                                                : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
+    using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
+    using vec_f = opus::vector_t<float, vec_size_i>;
+    const float inverted_DTYPE_MAX =
+        std::is_same_v<DTYPE_O, opus::fp4_t>
+            ? 0.25
+            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+    const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
+    const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
+
+    auto fp4_scale = [](float tmp) {
+        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
+        uint32_t exponent = (u32 >> 23) & 0b11111111;
+        if(exponent == 0b11111111)
+        {
+            return __builtin_bit_cast(float, exponent << 23);
+        }
+        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
+            exponent += 1;
+        return __builtin_bit_cast(float, exponent << 23);
+    };
+    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
+        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
+               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
+    };
+
+    for(; block_idx < num_blocks; block_idx += num_tg)
+    {
+        int sorted_ids_offset = block_idx * sub_block_m;
+        if(sorted_ids_offset >= num_valid_ids_value)
+        {
+            return;
+        }
+        int token_id_info_list;
+        if (lane_idx < sub_block_m)
+        {
+            token_id_info_list = sorted_ids[sorted_ids_offset + lane_idx];
+        }
+        int token_id_list = token_id_info_list & 0xFFFFFF;
+        int topk_id_list  = token_id_info_list >> 24;
+        for(int i = 0; i < sub_block_m; i++)
+        {
+            int token_idx = __builtin_amdgcn_readlane(token_id_list, i);
+            int topk_id   = __builtin_amdgcn_readlane(topk_id_list, i);
+            if(token_idx >= num_tokens)
+            {
+                break;
+            }
+
+            int64_t input_offset;
+            if (topk == 1)
+            {
+                input_offset = (int64_t)(token_idx) * input_stride;
+            }
+            else
+            {
+                input_offset = (int64_t)(token_idx * topk + topk_id) * input_stride;
+            }
+            auto buffer_input =
+                opus::make_gmem<DTYPE_I>(input + input_offset, cols * sizeof(DTYPE_I));
+            vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(
+                buffer_input, threadIdx.x * vec_size_i);
+            vec_f vec_input_f;
+            float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
+            float absMax       = 1e-10f;
+            #pragma unroll
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                vec_input_f[j] = static_cast<float>(vec_input[j]);
+                absMax         = max(absMax, abs(vec_input_f[j]));
+            }
+            absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+
+            float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
+                                  ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                                  : absMax * inverted_DTYPE_MAX;
+
+            const int sorted_row = sorted_ids_offset + i;
+            if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
+            {
+                uint8_t bs_e8m0 = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
+                int addr        = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k);
+                scale[addr]     = bs_e8m0;
+            }
+
+            if(topk_id < topk)
+            {
+                int64_t out_offset = (int64_t)(token_idx * topk + topk_id) * cols;
+                scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(
+                    out, input_f_ptr, &row_scale, cols, out_offset);
+            }
+        }
+    }
+}
+
+
+#define MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                    \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "mxfp4_quant_moe_sort_kernel", [&] { \
+        AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
+        using input_dtype = typename t2opus<scalar_t>::type;                                   \
+        int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE;                                         \
+        int num_tg = persistent_mode ? num_cu * warps_per_cu : num_blocks;                     \
+        dim3 const grid(num_tg);                                                               \
+        mxfp4_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>             \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                           \
+                reinterpret_cast<DTYPE_O*>(output.data_ptr()),                                  \
+                reinterpret_cast<uint8_t*>(scale.data_ptr()),                                   \
+                reinterpret_cast<input_dtype const*>(input.data_ptr()),                         \
+                sorted_ids.data_ptr<int32_t>(),                                                 \
+                num_valid_ids.data_ptr<int32_t>(),                                              \
+                token_num,                                                                      \
+                cols,                                                                           \
+                group_size,                                                                     \
+                block_m,                                                                        \
+                sub_block_m,                                                                     \
+                num_blocks,                                                                     \
+                num_tg,                                                                         \
+                topk,                                                                           \
+                input_stride);                                                                  \
+    });
+
+
+#define MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(DTYPE_O, cols_)                                   \
+    if(cols_ <= 4 * BlockSize)                                                                 \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 2)                           \
+    }                                                                                          \
+    else if(cols_ <= 8 * BlockSize)                                                            \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize)                               \
+    }                                                                                          \
+    else if(cols_ <= 16 * BlockSize)                                                           \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 16, BlockSize)                              \
+    }                                                                                          \
+    else if(cols_ <= 16 * BlockSize * 2)                                                       \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 32, BlockSize)                              \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize)  \
+    }
+
+void fused_dynamic_mxfp4_quant_moe_sort_hip(
+    torch::Tensor& output,
+    torch::Tensor& scale,
+    torch::Tensor const& input,
+    torch::Tensor const& sorted_ids,
+    torch::Tensor const& num_valid_ids,
+    int topk,
+    int block_m,
+    int group_size = 32
+)
+{
+    int cols = input.size(-1);
+    int token_num = input.numel() / (cols * topk);
+    
+    const int num_cu = get_num_cu_func();
+    int sub_block_m = (token_num * topk) > (num_cu * 8) ? 2 : 8;
+    TORCH_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
+    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
+    const bool persistent_mode = false;
+    const int input_stride     = input.stride(-2);
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+#if defined(__Float4_e2m1fn_x2)
+    if(output.dtype() == torch_fp4x2 || output.dtype() == torch::kUInt8)
+    {
+        MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, ": not support output type: ", output.dtype());
+    }
+#else
+    TORCH_CHECK(false, __func__, ": not support fp4x2 on this device");
+#endif
+}
+
 } // namespace aiter

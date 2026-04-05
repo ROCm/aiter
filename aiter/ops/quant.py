@@ -549,6 +549,46 @@ def moe_smooth_per_token_scaled_quant_v2(
 
 
 @compile_ops("module_quant")
+def fused_dynamic_mxfp4_quant_moe_sort_hip(
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    topk: int,
+    block_m: int,
+    group_size: int = 32,
+) -> None:
+    """
+    HIP path for fused dynamic MXFP4 quantization and MoE scale sorting.
+    """
+    ...
+
+
+def fused_dynamic_mxfp4_quant_moe_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    block_size: int,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    M, N = input.view(-1, input.shape[-1]).shape
+    out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
+    scales = torch.empty(
+        sorted_ids.shape[0],
+        (N + 31) // 32,
+        dtype=dtypes.fp8_e8m0,
+        device=input.device,
+    )
+    fused_dynamic_mxfp4_quant_moe_sort_hip(
+        out, scales, input, sorted_ids, num_valid_ids, topk, block_size, group_size
+    )
+    return out, scales
+
+
+@compile_ops("module_quant")
 def partial_transpose(
     out: Tensor,
     input: Tensor,
