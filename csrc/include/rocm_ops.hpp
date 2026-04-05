@@ -7,6 +7,13 @@
 
 namespace py = pybind11;
 
+#define AITER_SET_STREAM_PYBIND                                                                \
+    m.def("_set_current_hip_stream",                                                           \
+          [](int64_t stream_ptr) {                                                             \
+              aiter::setCurrentHIPStream((hipStream_t)stream_ptr);                              \
+          },                                                                                   \
+          py::arg("stream_ptr"));
+
 #define AITER_CORE_PYBIND                                                                      \
     pybind11::enum_<QuantType>(m, "QuantType")                                                 \
         .value("No", QuantType::No)                                                            \
@@ -26,11 +33,7 @@ namespace py = pybind11;
         .export_values();                                                                      \
     pybind11::implicitly_convertible<int, QuantType>();                                         \
     pybind11::implicitly_convertible<int, ActivationType>();                                    \
-    m.def("_set_current_hip_stream",                                                           \
-          [](int64_t stream_ptr) {                                                             \
-              aiter::setCurrentHIPStream((hipStream_t)stream_ptr);                              \
-          },                                                                                   \
-          py::arg("stream_ptr"));                                                              \
+    AITER_SET_STREAM_PYBIND                                                                    \
     pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                      \
         .def(pybind11::init<>())                                                               \
         .def_readwrite("numel_", &aiter_tensor_t::numel_)                                      \
@@ -370,6 +373,7 @@ namespace py = pybind11;
 
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \
+    AITER_SET_STREAM_PYBIND                                                                    \
     m.def("init_custom_ar",                                                                    \
           &aiter::init_custom_ar,                                                              \
           py::arg("meta_ptr"),                                                                 \
@@ -378,8 +382,7 @@ namespace py = pybind11;
           py::arg("ipc_handle_ptrs"),                                                          \
           py::arg("offsets"),                                                                  \
           py::arg("rank"),                                                                     \
-          py::arg("fully_connected"),                                                          \
-          py::arg("stream"));                                                                  \
+          py::arg("fully_connected"));                                                         \
     m.def("all_reduce",                                                                        \
           &aiter::all_reduce,                                                                  \
           py::arg("_fa"),                                                                      \
@@ -388,23 +391,20 @@ namespace py = pybind11;
           py::arg("use_new"),                                                                  \
           py::arg("open_fp8_quant"),                                                           \
           py::arg("reg_inp_ptr"),                                                              \
-          py::arg("reg_inp_bytes"),                                                            \
-          py::arg("stream"));                                                                  \
+          py::arg("reg_inp_bytes"));                                                           \
     m.def("reduce_scatter",                                                                    \
           &aiter::reduce_scatter,                                                              \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
-          py::arg("reg_bytes"),                                                                \
-          py::arg("stream"));                                                                  \
+          py::arg("reg_bytes"));                                                               \
     m.def("all_gather_reg",                                                                    \
           &aiter::all_gather_reg,                                                              \
           py::arg("_fa"),                                                                      \
           py::arg("inp"),                                                                      \
           py::arg("out"),                                                                      \
-          py::arg("dim"),                                                                      \
-          py::arg("stream"));                                                                  \
+          py::arg("dim"));                                                                     \
     m.def("all_gather_unreg",                                                                  \
           &aiter::all_gather_unreg,                                                            \
           py::arg("_fa"),                                                                      \
@@ -412,8 +412,7 @@ namespace py = pybind11;
           py::arg("reg_buffer"),                                                               \
           py::arg("out"),                                                                      \
           py::arg("reg_bytes"),                                                                \
-          py::arg("dim"),                                                                      \
-          py::arg("stream"));                                                                  \
+          py::arg("dim"));                                                                     \
     m.def("fused_allreduce_rmsnorm",                                                           \
           &aiter::fused_allreduce_rmsnorm,                                                     \
           py::arg("_fa"),                                                                      \
@@ -425,8 +424,7 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"),                                                                \
-          py::arg("stream"));                                                                  \
+          py::arg("use_1stage"));                                                              \
     m.def("fused_allreduce_rmsnorm_quant",                                                     \
           &aiter::fused_allreduce_rmsnorm_quant,                                               \
           py::arg("_fa"),                                                                      \
@@ -439,8 +437,7 @@ namespace py = pybind11;
           py::arg("eps"),                                                                      \
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
-          py::arg("use_1stage"),                                                                \
-          py::arg("stream"));                                                                  \
+          py::arg("use_1stage"));                                                              \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \
@@ -466,10 +463,7 @@ namespace py = pybind11;
           py::arg("_fa"),                                                                      \
           py::arg("handle_ptrs"),                                                              \
           py::arg("offset_ptrs"));                                                             \
-    m.def("allocate_meta_buffer",                                                              \
-          &aiter::allocate_meta_buffer,                                                        \
-          py::arg("size"),                                                                     \
-          py::arg("stream"));                                                                  \
+    m.def("allocate_meta_buffer", &aiter::allocate_meta_buffer, py::arg("size"));              \
     m.def("free_meta_buffer", &aiter::free_meta_buffer, py::arg("ptr"));                       \
     m.def("get_meta_buffer_ipc_handle",                                                        \
           &aiter::get_meta_buffer_ipc_handle,                                                  \

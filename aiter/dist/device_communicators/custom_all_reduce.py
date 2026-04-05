@@ -73,9 +73,7 @@ class IPCBuffer:
         self._uncached = uncached
         if uncached:
             self._buffer = None
-            self._raw_ptr = ops.allocate_meta_buffer(
-                size, torch.cuda.current_stream().cuda_stream
-            )
+            self._raw_ptr = ops.allocate_meta_buffer(size)
         else:
             self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
             self._raw_ptr = self._buffer.data_ptr()
@@ -381,7 +379,6 @@ class CustomAllreduce:
             offsets,
             rank,
             self.fully_connected,
-            torch.cuda.current_stream().cuda_stream,
         )
 
         # Register input IPC buffer with the C++ backend
@@ -484,7 +481,6 @@ class CustomAllreduce:
             open_fp8_quant,
             reg_inp,
             reg_inp_bytes,
-            stream,
         )
         return out
 
@@ -534,7 +530,6 @@ class CustomAllreduce:
             _torch_to_aiter(out),
             reg,
             reg_bytes,
-            torch.cuda.current_stream().cuda_stream,
         )
 
     def custom_reduce_scatter(
@@ -573,7 +568,6 @@ class CustomAllreduce:
             _torch_to_aiter(inp),
             _torch_to_aiter(out),
             dim,
-            torch.cuda.current_stream().cuda_stream,
         )
         return out
 
@@ -594,7 +588,6 @@ class CustomAllreduce:
             _torch_to_aiter(out),
             self._pool["input"].max_size,
             dim,
-            torch.cuda.current_stream().cuda_stream,
         )
         return out
 
@@ -643,7 +636,6 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
-                torch.cuda.current_stream().cuda_stream,
             )
             return out, res_out
         else:
@@ -666,7 +658,6 @@ class CustomAllreduce:
                 reg,
                 reg_bytes,
                 use_1stage,
-                torch.cuda.current_stream().cuda_stream,
             )
             return out, res_out, scale_out
 

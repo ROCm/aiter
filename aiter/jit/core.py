@@ -1503,6 +1503,12 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
 
+                if develop:
+                    import torch
+
+                    module._set_current_hip_stream(
+                        torch.cuda.current_stream().cuda_stream
+                    )
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
