@@ -41,10 +41,6 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
-@compile_ops("module_aiter_core", "make_aiter_tensor")
-def _make_aiter_tensor(data_ptr, numel, ndim, shape, strides, dtype, device_id): ...
-
-
 def torch_to_aiter_pybind(tensor: torch.Tensor):
     """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
 
@@ -52,7 +48,10 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
     this function constructs a *pybind11* aiter_tensor_t via
     module_aiter_core.  The two types are not interchangeable.
     """
-    return _make_aiter_tensor(
+    from ..jit.core import get_module
+
+    aiter_tensor_cls = get_module("module_aiter_core").aiter_tensor_t
+    return aiter_tensor_cls(
         tensor.data_ptr(),
         tensor.numel(),
         tensor.ndim,
