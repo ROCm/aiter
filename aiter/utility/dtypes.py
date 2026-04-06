@@ -48,6 +48,12 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
     this function constructs a *pybind11* aiter_tensor_t via
     module_aiter_core.  The two types are not interchangeable.
     """
+    assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
+    assert (
+        tensor.ndim <= 8
+    ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
+    assert tensor.dtype in _torch_to_aiter_dtype, f"Unsupported dtype: {tensor.dtype}"
+
     from ..jit.core import get_module
 
     aiter_tensor_cls = get_module("module_aiter_core").aiter_tensor_t
