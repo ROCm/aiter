@@ -67,6 +67,10 @@ def _flash_attn_forward(
     if window_size_left != -1 or window_size_right != -1:
         raise ValueError("Sliding Window is not supported yet in the Triton Backend")
 
+    # Triton cannot specialize on numpy scalar types; ensure native Python int
+    max_seqlen_q = int(max_seqlen_q)
+    max_seqlen_k = int(max_seqlen_k)
+
     # FP8
     IS_FP8 = types._is_fp8(q)
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
@@ -83,11 +87,11 @@ def _flash_attn_forward(
         # q and k are [total_tokens, num_head, head_dim_qk].
         # v is [total_tokens, num_head, head_dim_v].
         batch, seqlen_q, num_q_heads = (
-            len(cu_seqlens_q) - 1,
-            max_seqlen_q,
-            q.shape[1],
+            int(len(cu_seqlens_q) - 1),
+            int(max_seqlen_q),
+            int(q.shape[1]),
         )
-        num_k_heads = k.shape[1]
+        num_k_heads = int(k.shape[1])
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
         k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
         v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
@@ -96,20 +100,20 @@ def _flash_attn_forward(
         # Layout is bshd.
         # q and k are [batch, seq_len, num_head, head_dim_qk].
         # v is [batch, seq_len, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = q.shape[:-1]
-        num_k_heads = k.shape[2]
+        batch, seqlen_q, num_q_heads = (int(x) for x in q.shape[:-1])
+        num_k_heads = int(k.shape[2])
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
-    qk_head_dim = q.shape[-1]
-    v_head_dim = v.shape[-1]
+    qk_head_dim = int(q.shape[-1])
+    v_head_dim = int(v.shape[-1])
     pe_head_dim = qk_head_dim - v_head_dim
     # padding for head_dim. Power of 2 or 16
-    BLOCK_DMODEL_POW2 = max(triton.next_power_of_2(v_head_dim), 16)
+    BLOCK_DMODEL_POW2 = int(max(triton.next_power_of_2(v_head_dim), 16))
     BLOCK_DMODEL_PE_POW2 = (
-        0 if pe_head_dim == 0 else max(triton.next_power_of_2(pe_head_dim), 16)
+        0 if pe_head_dim == 0 else int(max(triton.next_power_of_2(pe_head_dim), 16))
     )
     assert (pe_head_dim == 0 and BLOCK_DMODEL_PE_POW2 == 0) or (
         v_head_dim == BLOCK_DMODEL_POW2 and pe_head_dim == BLOCK_DMODEL_PE_POW2

@@ -20,7 +20,6 @@ import os
 from typing import Optional
 
 import pandas as pd
-import aiter
 import torch
 import torch.nn.functional as F
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
@@ -28,7 +27,6 @@ from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
-from aiter.ops.flydsl.utils import is_flydsl_available
 from torch import Tensor
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -106,17 +104,6 @@ def get_GEMM_A16W16_config(
             None,
         )
         if config is not None:
-            if config["libtype"] == "flydsl":
-                if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-                        config["kernelName"]
-                    )
-                    if flydsl_config is None:
-                        config = None
-                else:
-                    config = None
-            if config is None:
-                continue
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
                 logger.info(
@@ -126,12 +113,17 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
+        gfx = get_gfx()
         logger.info(
             f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} , not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
         )
-        if bpreshuffle:
+        # gfx12/gfx11: no ASM/skinny/hipblaslt kernels, use torch
+        if gfx.startswith("gfx12") or gfx.startswith("gfx11"):
+            default_config["libtype"] = "torch"
+            default_config["solidx"] = 0
+        elif bpreshuffle:
             default_config["bpreshuflle"] = True
-            if get_gfx() == "gfx942":
+            if gfx == "gfx942":
                 default_config["libtype"] = "hipblaslt"
                 default_config["solidx"] = -1
                 default_config["kernelName"] = ""
@@ -259,30 +251,18 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
-    if config is not None and config["libtype"] == "flydsl":
-        flydsl_config = (
-            aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-                config["kernelName"]
-            )
-        )
-        return flydsl_gemm(
-            inp_view,
-            B,
-            bias,
-            otype,
-            scale_a,
-            scale_b,
-            scale_c,
-            config=flydsl_config,
-        )
-
-    if config is not None and config["libtype"] == "asm":
+    gfx = get_gfx()
+    _no_asm = gfx.startswith("gfx12") or gfx.startswith("gfx11")
+    if config is not None and config["libtype"] == "asm" and not _no_asm:
         kernelName = config["kernelName"]
         splitK = config["splitK"]
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
     else:
-        solution_idx = config["solidx"]
-        solfunc = solMap[config["libtype"]]
+        libtype = config["libtype"] if not _no_asm else "torch"
+        if libtype in ("asm", "skinny", "hipblaslt"):
+            libtype = "torch"
+        solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
+        solfunc = solMap[libtype]
         out = solfunc(
             inp_view,
             B,
@@ -359,7 +339,7 @@ def hipb_gemm(
     if otype is None:
         otype = inp.dtype
     global extensions_created
-    if not extensions_created:
+    if extensions_created == False:
         hipb_create_extension()
         extensions_created = True
     return hipb_mm(
@@ -378,7 +358,6 @@ def torch_gemm(
     scale_c: Optional[Tensor] = None,
     bpreshuffle=False,
 ):
-    assert not bpreshuffle, "bpreshuffle is not supported in torch_gemm!"
     if inp.dtype == dtypes.fp8:
         if scale_a is None:
             scale_a = torch.ones(1, dtype=dtypes.fp32, device=inp.device)
@@ -419,41 +398,6 @@ def asm_gemm(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
-
-
-def flydsl_gemm(
-    inp: Tensor,
-    weights: Tensor,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
-    config: dict = None,
-):
-    assert (
-        scale_a is None and scale_b is None and scale_c is None
-    ), "FlyDSL hgemm does not support scaling yet."
-    out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
-        inp,
-        weights,
-        tile_m=config["tile_m"],
-        tile_n=config["tile_n"],
-        tile_k=config["tile_k"],
-        split_k=config["split_k"],
-        block_m_warps=config["block_m_warps"],
-        block_n_warps=config["block_n_warps"],
-        stages=config["stage"],
-        async_copy=config["async_copy"],
-        b_to_lds=config["b_to_lds"],
-        b_preshuffle=config["b_preshuffle"],
-        c_to_lds=config["c_to_lds"],
-    )
-    if otype is not None and out.dtype != otype:
-        out = out.to(otype)
-    if bias is not None:
-        out = out + bias
-    return out
 
 
 def triton_gemm(
