@@ -481,8 +481,6 @@ def moe_gemm_a4w4(
             w_scales.stride(0),
             w_scales.stride(1),
             w_scales.stride(2),
-            x_static_scale,
-            quant_static_scale,
             bias,
             stride_bias,
             gammas,

@@ -132,14 +132,6 @@ def _swiglu(input, alpha, limit):
 
 
 @gluon.jit
-def _compute_static_fp8_quant(tensor, scale):
-    tensor = tensor.to(gl.float32)
-    tensor = tensor / scale
-    tensor = tensor.to(gl.float8e4nv)
-    return tensor
-
-
-@gluon.jit
 def _reduce_grouped_gfx1250(
     X,
     stride_xb: gl.uint64,
@@ -245,8 +237,6 @@ def _moe_gemm_a4w4_gfx1250(
     stride_w_mx_e,
     stride_w_mx_k,
     stride_w_mx_n,
-    X_static_scale,  # NOTE: not supported
-    Quant_static_scale,
     # bias
     B,
     stride_b_e,
@@ -675,14 +665,6 @@ def _moe_gemm_a4w4_gfx1250(
 
         acc = gl.amd.gfx1250.wmma_scaled(x, x_scales, "e2m1", w, w_scales, "e2m1", acc)
 
-    # scalar fp8 scale
-    if X_static_scale is not None:
-        # should not go in here since static scale fp4 is disabled
-        gl.static_assert(
-            X_static_scale is None,
-            f"Static scale is disabled for fp4 precision. got {X_static_scale}",
-        )
-
     # bias
     offs_m = BLOCK_M * block_id + gl.arange(
         0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
@@ -721,10 +703,6 @@ def _moe_gemm_a4w4_gfx1250(
         gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
         out *= gammas[:, None]
 
-    # quant
-    if Quant_static_scale is not None:
-        out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
-
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m
@@ -733,6 +711,5 @@ def _moe_gemm_a4w4_gfx1250(
         + offs_y_n.to(index_type)[None, :] * stride_y_n
     )
     mask = mask_m[:, None] & mask_n[None, :]
-    if Quant_static_scale is None:
-        out = out.to(gl.bfloat16)
+    out = out.to(gl.bfloat16)
     gl.amd.gfx1250.buffer_store(out, Y, offs_y, mask=mask)
