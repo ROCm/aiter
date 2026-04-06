@@ -7,6 +7,7 @@ from .common import apply_rotary
 from .utils import (
     DEBUG,
     AUTOTUNE,
+    AutotuneMode,
     get_arch,
     get_padded_headsize,
     get_shape_from_layout,
@@ -28,7 +29,7 @@ FWD_DECODE_AUTOTUNE_KEYS = [
 MAX_BLOCK_M = 64
 
 
-def get_fwd_decode_configs(autotune: bool):
+def get_fwd_decode_configs(mode: AutotuneMode):
     """
     Returns configs for both the splitK kernel and reduce kernel.
 
@@ -36,9 +37,8 @@ def get_fwd_decode_configs(autotune: bool):
         (splitk_configs, reduce_config): Tuple of config lists for each kernel
     """
 
-    if not autotune:
+    if mode == "off":
         arch = get_arch()
-
         if arch.is_rdna:
             return (
                 [
@@ -62,7 +62,6 @@ def get_fwd_decode_configs(autotune: bool):
                 [triton.Config({}, num_stages=1, num_warps=4)],
             )
         else:
-            # Default / fallback
             return (
                 [
                     triton.Config(
@@ -74,45 +73,82 @@ def get_fwd_decode_configs(autotune: bool):
                 [triton.Config({}, num_stages=1, num_warps=4)],
             )
 
-    # ===================== Autotune Sweep =====================
-    arch = get_arch()
-    splitk_configs = []
+    elif mode == "on":
+        arch = get_arch()
+        if arch.is_rdna:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 32, "BLOCK_N": 32},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
+        elif arch.is_cdna:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
+        else:
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
 
-    BLOCK_M_OPTIONS = [64, 32, 16]
-    BLOCK_N_OPTIONS = [128, 64, 32, 16]
-    NUM_WARPS_OPTIONS = [2, 4]
-    NUM_STAGES_OPTIONS = [1]
-    WAVES_PER_EU_OPTIONS = [4, 2, 1]
+    else:  # sweep
+        arch = get_arch()
+        splitk_configs = []
 
-    # Ensure BLOCK_M options don't exceed MAX_BLOCK_M
-    assert all(
-        bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS
-    ), f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
+        BLOCK_M_OPTIONS = [64, 32, 16]
+        BLOCK_N_OPTIONS = [128, 64, 32, 16]
+        NUM_WARPS_OPTIONS = [2, 4]
+        NUM_STAGES_OPTIONS = [1]
+        WAVES_PER_EU_OPTIONS = [4, 2, 1]
 
-    for bm in BLOCK_M_OPTIONS:
-        for bn in BLOCK_N_OPTIONS:
-            for waves in WAVES_PER_EU_OPTIONS:
-                for nw in NUM_WARPS_OPTIONS:
-                    for ns in NUM_STAGES_OPTIONS:
-                        splitk_configs.append(
-                            triton.Config(
-                                {
-                                    "BLOCK_M": bm,
-                                    "BLOCK_N": bn,
-                                    "waves_per_eu": waves,
-                                },
-                                num_stages=ns,
-                                num_warps=nw,
+        # Ensure BLOCK_M options don't exceed MAX_BLOCK_M
+        assert all(
+            bm <= MAX_BLOCK_M for bm in BLOCK_M_OPTIONS
+        ), f"BLOCK_M_OPTIONS {BLOCK_M_OPTIONS} exceeds MAX_BLOCK_M {MAX_BLOCK_M}"
+
+        for bm in BLOCK_M_OPTIONS:
+            for bn in BLOCK_N_OPTIONS:
+                for waves in WAVES_PER_EU_OPTIONS:
+                    for nw in NUM_WARPS_OPTIONS:
+                        for ns in NUM_STAGES_OPTIONS:
+                            splitk_configs.append(
+                                triton.Config(
+                                    {
+                                        "BLOCK_M": bm,
+                                        "BLOCK_N": bn,
+                                        "waves_per_eu": waves,
+                                    },
+                                    num_stages=ns,
+                                    num_warps=nw,
+                                )
                             )
-                        )
 
-    # Reduce kernel configs - sweep num_warps
-    NUM_WARPS_REDUCE_OPTIONS = [2, 4]
-    reduce_configs = [
-        triton.Config({}, num_stages=1, num_warps=nw) for nw in NUM_WARPS_REDUCE_OPTIONS
-    ]
+        # Reduce kernel configs - sweep num_warps
+        NUM_WARPS_REDUCE_OPTIONS = [2, 4]
+        reduce_configs = [
+            triton.Config({}, num_stages=1, num_warps=nw)
+            for nw in NUM_WARPS_REDUCE_OPTIONS
+        ]
 
-    return splitk_configs, reduce_configs
+        return splitk_configs, reduce_configs
 
 
 fwd_decode_splitk_configs, fwd_decode_reduce_configs = get_fwd_decode_configs(AUTOTUNE)

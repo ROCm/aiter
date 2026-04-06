@@ -6,6 +6,7 @@ from typing import Literal, Optional
 from .utils import (
     DEBUG,
     AUTOTUNE,
+    AutotuneMode,
     is_fp8,
     get_arch,
     remap_xcd,
@@ -38,13 +39,185 @@ NONCAUSAL_AUTOTUNE_KEYS = [
 ]
 
 
-def get_bwd_configs(autotune: bool):
+def get_bwd_configs(mode: AutotuneMode):
 
-    # default config
-    if not autotune:
+    if mode == "off":
         arch = get_arch()
+        if arch.name == "gfx942":
+            if arch.cu_count < 304:
+                preprocess_configs = [
+                    triton.Config(
+                        {"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=8
+                    ),
+                ]
+                noncausal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 128,
+                            "BLOCK_M2": 128,
+                            "BLOCK_N2": 64,
+                            "BLK_SLICE_FACTOR": 2,
+                            "waves_per_eu": 1,
+                            "matrix_instr_nonkdim": 16,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
+                causal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 128,
+                            "BLOCK_M2": 128,
+                            "BLOCK_N2": 64,
+                            "BLK_SLICE_FACTOR": 2,
+                            "waves_per_eu": 1,
+                            "matrix_instr_nonkdim": 16,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
+            else:
+                preprocess_configs = [
+                    triton.Config(
+                        {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
+                    ),
+                ]
+                noncausal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 128,
+                            "BLOCK_M2": 128,
+                            "BLOCK_N2": 64,
+                            "BLK_SLICE_FACTOR": 2,
+                            "waves_per_eu": 1,
+                            "matrix_instr_nonkdim": 16,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
+                causal_configs = [
+                    triton.Config(
+                        {
+                            "BLOCK_M1": 32,
+                            "BLOCK_N1": 128,
+                            "BLOCK_M2": 128,
+                            "BLOCK_N2": 64,
+                            "BLK_SLICE_FACTOR": 2,
+                            "waves_per_eu": 1,
+                            "matrix_instr_nonkdim": 16,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ]
+        elif arch.name == "gfx950":
+            preprocess_configs = [
+                triton.Config(
+                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
+                ),
+            ]
+            noncausal_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 64,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+            causal_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+        elif arch.is_rdna:
+            preprocess_configs = [
+                triton.Config({"PRE_BLOCK": 32}, num_stages=1, num_warps=4),
+            ]
+            noncausal_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 32,
+                        "BLOCK_M2": 32,
+                        "BLOCK_N2": 32,
+                        "BLK_SLICE_FACTOR": 2,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+            causal_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 32,
+                        "BLOCK_M2": 32,
+                        "BLOCK_N2": 32,
+                        "BLK_SLICE_FACTOR": 2,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+        else:
+            preprocess_configs = [
+                triton.Config(
+                    {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
+                ),
+            ]
+            noncausal_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+            causal_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+        return (preprocess_configs, causal_configs, noncausal_configs)
 
-        # configs for the kernels
+    elif mode == "on":
+        arch = get_arch()
         if arch.name == "gfx942":
             if arch.cu_count < 304:
                 preprocess_configs = [
@@ -444,120 +617,6 @@ def get_bwd_configs(autotune: bool):
             ), f"BLOCK_N1 ({causal_cfg.all_kwargs()['BLOCK_N1']}) must equal BLOCK_M2 ({causal_cfg.all_kwargs()['BLOCK_M2']})"
 
         return (preprocess_configs, causal_configs, noncausal_configs)
-
-    # ===================== Autotune Sweep =====================
-    # param options
-    PRE_BLOCK_OPTIONS = [64, 128]  # og: 128
-    PRE_WAVES_PER_EU_OPTIONS = [1, 2]
-    PRE_NUM_STAGES_OPTIONS = [1, 2]
-    PRE_NUM_WARPS_OPTIONS = [4, 8]
-    NUM_STAGES_OPTIONS = [1, 2]  # og: 1
-    NUM_WARPS_OPTIONS = [4, 8]  # og: 4
-    WAVES_PER_EU_OPTIONS = [1, 2]  # og: 1
-    NON_CAUSAL_BLOCK_M1_OPTIONS = [16, 32, 64, 128]  # og: 32
-    NON_CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128, 256]  # og: 128
-    NON_CAUSAL_BLOCK_N2_OPTIONS = [16, 32, 64, 128]  # og: 32
-    CAUSAL_BLOCK_M1_OPTIONS = [32, 64]  # og: 32
-    CAUSAL_BLOCK_N1_M2_OPTIONS = [32, 64, 128]  # og: 128
-    CAUSAL_BLOCK_N2_OPTIONS = [32, 64]  # og: 32
-    BLK_SLICE_FACTOR_OPTIONS = [2]  # og: 2
-
-    # ==================== sweep configs ================================
-    preprocess_autotune_configs = []
-    for pre_num_warps in PRE_NUM_WARPS_OPTIONS:
-        for pre_num_stages in PRE_NUM_STAGES_OPTIONS:
-            for pre_waves in PRE_WAVES_PER_EU_OPTIONS:
-                for pre_block in PRE_BLOCK_OPTIONS:
-                    preprocess_autotune_configs.append(
-                        triton.Config(
-                            {
-                                "PRE_BLOCK": pre_block,
-                                "waves_per_eu": pre_waves,
-                            },
-                            num_stages=pre_num_stages,
-                            num_warps=pre_num_warps,
-                        )
-                    )
-
-    causal_autotune_configs = []
-    for num_warps in NUM_WARPS_OPTIONS:
-        for num_stages in NUM_STAGES_OPTIONS:
-            for waves in WAVES_PER_EU_OPTIONS:
-                for m1 in CAUSAL_BLOCK_M1_OPTIONS:
-                    for n1 in CAUSAL_BLOCK_N1_M2_OPTIONS:
-                        m2 = n1
-                        for n2 in CAUSAL_BLOCK_N2_OPTIONS:
-                            # Ensure constraint
-                            assert (
-                                n1 == m2
-                            ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
-
-                            # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
-                            if m2 % n2 != 0:
-                                continue
-
-                            # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
-                            if n1 % m1 != 0:
-                                continue
-
-                            for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
-                                causal_autotune_configs.append(
-                                    triton.Config(
-                                        {
-                                            "BLOCK_M1": m1,
-                                            "BLOCK_N1": n1,
-                                            "BLOCK_M2": m2,
-                                            "BLOCK_N2": n2,
-                                            "BLK_SLICE_FACTOR": blk_slice,
-                                            "waves_per_eu": waves,
-                                        },
-                                        num_stages=num_stages,
-                                        num_warps=num_warps,
-                                    )
-                                )
-
-    noncausal_autotune_configs = []
-    for num_warps in NUM_WARPS_OPTIONS:
-        for num_stages in NUM_STAGES_OPTIONS:
-            for waves in WAVES_PER_EU_OPTIONS:
-                for m1 in NON_CAUSAL_BLOCK_M1_OPTIONS:
-                    for n1 in NON_CAUSAL_BLOCK_N1_M2_OPTIONS:
-                        m2 = n1
-                        for n2 in NON_CAUSAL_BLOCK_N2_OPTIONS:
-                            # Ensure constraint
-                            assert (
-                                n1 == m2
-                            ), f"BLOCK_N1 ({n1}) must equal BLOCK_M2 ({m2})"
-
-                            # Skip configs where BLOCK_M2 % BLOCK_N2 != 0
-                            if m2 % n2 != 0:
-                                continue
-
-                            # Skip configs where BLOCK_N1 % BLOCK_M1 != 0
-                            if n1 % m1 != 0:
-                                continue
-
-                            for blk_slice in BLK_SLICE_FACTOR_OPTIONS:
-                                noncausal_autotune_configs.append(
-                                    triton.Config(
-                                        {
-                                            "BLOCK_M1": m1,
-                                            "BLOCK_N1": n1,
-                                            "BLOCK_M2": m2,
-                                            "BLOCK_N2": n2,
-                                            "BLK_SLICE_FACTOR": blk_slice,
-                                            "waves_per_eu": waves,
-                                        },
-                                        num_stages=num_stages,
-                                        num_warps=num_warps,
-                                    )
-                                )
-
-    return (
-        preprocess_autotune_configs,
-        causal_autotune_configs,
-        noncausal_autotune_configs,
-    )
 
 
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
