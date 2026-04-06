@@ -353,7 +353,15 @@ def _moe_gemm_a4w4_gfx1250(
             0, PACKED_BLOCK_M_X, layout=IDX_LAYOUT
         )
         GatherIndx += start_m
-        offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.amd.gfx1250.buffer_load(GatherIndx, offs_x_m) // N_EXPTS_ACT
+
+    # B pointers
+    offs_w_n = pid_n * PACKED_BLOCK_N_W
+    W += expt_id * stride_w_e
+
+    # A scale pointers
+    if GatherIndx is None:
+        XMxScale += start_m * stride_x_mx_m
 
     # B scale pointers
     WMxScale += expt_id * stride_w_mx_e
@@ -369,14 +377,6 @@ def _moe_gemm_a4w4_gfx1250(
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
     offs_w_n_scale = pid_n * SCALE_BLOCK_N
-
-    # B pointers
-    offs_w_n = pid_n * PACKED_BLOCK_N_W
-    W += expt_id * stride_w_e
-
-    # A scale pointers
-    if GatherIndx is None:
-        XMxScale += start_m * stride_x_mx_m
 
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[PACKED_BLOCK_K_X, 16]], [PACKED_BLOCK_M_X, PACKED_BLOCK_K_X], [1, 0]
