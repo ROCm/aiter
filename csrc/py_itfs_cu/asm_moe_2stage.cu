@@ -3,7 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <memory>
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 #include "asm_fmoe_2stages_configs.hpp"
 
 struct __attribute__((packed)) KernelArgs
