@@ -8,6 +8,9 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
     _gemm_a8w8_kernel,
     _get_config,
 )
+from aiter.ops.triton.gluon.gfx1250_gemm_a8w8 import (
+    gfx1250_gemm_a8w8 as _gluon_gemm_a8w8,
+)
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -24,6 +27,7 @@ def gemm_a8w8(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    use_gluon: bool = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
@@ -39,14 +43,21 @@ def gemm_a8w8(
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M).
+        use_gluon (bool): If True, use the Gluon kernel (gfx1250) instead of the
+            default Triton kernel. Defaults to False.
 
     Returns:
         torch.Tensor: Output with shape (M, N) in higher precision format.
     """
 
     _LOGGER.info(
-        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+        f"GEMM_A8W8: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)} use_gluon={use_gluon}"
     )
+    
+    if use_gluon:
+        return _gluon_gemm_a8w8(
+            x, w, x_scale, w_scale, bias=bias, dtype=dtype, y=y, config=config,
+        )
 
     # Check constraints.
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
