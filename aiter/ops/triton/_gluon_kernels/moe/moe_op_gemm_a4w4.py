@@ -315,21 +315,13 @@ def _moe_gemm_a4w4_gfx1250(
     # get unpadded grid size
     unpadded_m = grid_m - padding_m
     gl.assume(unpadded_m >= 0)
-    total_actual_tiles = unpadded_m * grid_n * SPLIT_K
+    total_actual_tiles = unpadded_m * grid_n
     if padding_m > 0 and pid >= total_actual_tiles:
         return
 
     # swizzle program ids
-    pid_emnk = pid
-    # pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
-    pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
-    pid_k = pid_mnk % SPLIT_K
-    pid_mn = pid_mnk // SPLIT_K
+    pid_mn = pid % (unpadded_m * grid_n)
     pid_m, pid_n = pid_grid(pid_mn, unpadded_m, grid_n, GROUP_M)
-
-    # for split-k, advance to the output k slice
-    if SPLIT_K > 1:
-        Y += pid_k.to(index_type) * stride_y_k
 
     # unpack expert data
     expt_data = gl.load(ExptData + pid_m)
@@ -341,7 +333,7 @@ def _moe_gemm_a4w4_gfx1250(
     start_m = gl.load(ExptOffs + expt_id)
     expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
     start_m = start_m.to(index_type)
-    pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
+    pid_n = pid_n.to(index_type)
 
     # constants
     X_M_DIVISOR: gl.constexpr = 1

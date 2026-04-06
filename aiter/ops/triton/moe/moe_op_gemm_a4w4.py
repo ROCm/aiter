@@ -462,6 +462,7 @@ def moe_gemm_a4w4(
         IDX_LAYOUT = gl.BlockedLayout(
             [config["block_m"]], [32], [config["num_warps"]], [0]
         )
+        assert config["split_k"] == 1, "split_k is not currently supported for gfx1250"
         _moe_gemm_a4w4_gfx1250[(grid,)](
             y,
             y.stride(0),
