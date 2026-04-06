@@ -2100,10 +2100,31 @@ class FmoeTuner(TunerCommon):
 
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
+
+        new_fallbacks = getattr(self, "_flydsl_fallbacks", [])
+        new_fb_keys = set()
+        if new_fallbacks:
+            new_fb_df = pd.DataFrame(new_fallbacks, columns=self.columns)
+            new_fb_keys = set(
+                new_fb_df[self.keys].astype(str).apply(tuple, axis=1)
+            )
+
         if "_tag" in old_tunedf.columns:
-            old_tunedf = old_tunedf[
-                old_tunedf["_tag"].fillna("") != FLYDSL_FALLBACK_TAG
-            ].drop(columns=["_tag"])
+            old_fb_mask = old_tunedf["_tag"].fillna("") == FLYDSL_FALLBACK_TAG
+            if new_fb_keys:
+                old_fb_key_tuples = (
+                    old_tunedf.loc[old_fb_mask, self.keys]
+                    .astype(str)
+                    .apply(tuple, axis=1)
+                )
+                drop_mask = old_fb_mask & old_fb_key_tuples.isin(new_fb_keys)
+            else:
+                drop_mask = old_fb_mask & False
+            kept_old_fb = old_tunedf[old_fb_mask & ~drop_mask].copy()
+            old_tunedf = old_tunedf[~old_fb_mask].drop(columns=["_tag"])
+        else:
+            kept_old_fb = pd.DataFrame(columns=list(old_tunedf.columns) + ["_tag"])
+
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
         resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
@@ -2113,11 +2134,15 @@ class FmoeTuner(TunerCommon):
                 keep="last",
             )
         resultdf["_tag"] = ""
-        fallbacks = getattr(self, "_flydsl_fallbacks", [])
-        if fallbacks:
-            fb_df = pd.DataFrame(fallbacks, columns=self.columns)
-            fb_df["_tag"] = FLYDSL_FALLBACK_TAG
-            resultdf = pd.concat([resultdf, fb_df], ignore_index=True)
+
+        if new_fallbacks:
+            new_fb_df = pd.DataFrame(new_fallbacks, columns=self.columns)
+            new_fb_df["_tag"] = FLYDSL_FALLBACK_TAG
+            resultdf = pd.concat([resultdf, new_fb_df], ignore_index=True)
+
+        if len(kept_old_fb) > 0:
+            resultdf = pd.concat([resultdf, kept_old_fb], ignore_index=True)
+
         resultdf = resultdf.astype(str).drop_duplicates(
             subset=self.keys + ["_tag"], keep="last"
         )
