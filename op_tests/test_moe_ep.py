@@ -159,36 +159,38 @@ def test_fmoe_ep(
     )
     score = torch.randn((token, E), device="cuda", dtype=dtype)
 
-    # if shared_E > 0:
-    shared_E_score = 0.1
-    # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
-    total_topk_ids = torch.empty(
-        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
-    )
-    ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
-    shared_expert_ids = [E + i for i in range(shared_E + 1)]
-    s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
-    for i in range(ep_id, MAX_TOKENS, ep):
-        s_topk_ids_list[i] = shared_expert_ids
-    s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device=input.device)
+    if shared_E > 0:
+        shared_E_score = 0.1
+        # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
+        total_topk_ids = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.i32, device=input.device
+        )
+        ns_topk_ids, s_topk_ids = total_topk_ids.split([topk, shared_E + 1], dim=1)
+        shared_expert_ids = [E + i for i in range(shared_E + 1)]
+        s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
+        for i in range(ep_id, MAX_TOKENS, ep):
+            s_topk_ids_list[i] = shared_expert_ids
+        s_topk_ids[:] = torch.tensor(
+            s_topk_ids_list, dtype=dtypes.i32, device=input.device
+        )
 
-    # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
-    total_topk_weights = torch.empty(
-        (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
-    )
-    ns_topk_weights, s_topk_weights = total_topk_weights.split(
-        [topk, shared_E + 1], dim=1
-    )
-    s_topk_weights[:] = shared_E_score
+        # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
+        total_topk_weights = torch.empty(
+            (MAX_TOKENS, topk + shared_E + 1), dtype=dtypes.fp32, device=input.device
+        )
+        ns_topk_weights, s_topk_weights = total_topk_weights.split(
+            [topk, shared_E + 1], dim=1
+        )
+        s_topk_weights[:] = shared_E_score
 
-    # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
-    fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
-    # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
-    topk_ids = total_topk_ids[:token]
-    topk_weights = total_topk_weights[:token]
+        # inference time, use fused_topk to fill ns_topk_ids and ns_topk_weights
+        fused_topk(input, score, topk, True, ns_topk_ids, ns_topk_weights)
+        # inference time, topk_ids simply slices total_topk_ids into the number of input tokens, same for topk_weights
+        topk_ids = total_topk_ids[:token]
+        topk_weights = total_topk_weights[:token]
 
-    # else:
-    #     topk_ids, topk_weights = fused_topk(input, score, topk, True)
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if quantAlgoId == 0:
         # ref2 implement
@@ -442,12 +444,22 @@ parser.add_argument(
     help="""Expert Parallelism.
     e.g.: -ep 8""",
 )
+parser.add_argument(
+    "-se",
+    "--shared_expert",
+    type=int,
+    nargs="?",
+    default=None,
+    help="""Shared experts.
+    e.g.: -se 0""",
+)
 
 args = parser.parse_args()
 gpu_arch = get_gfx()
 
 for test in args.test:
     print(f"\nRunning test: {test}")
+    shared_E = 2 if args.shared_expert is None else args.shared_expert
     if test == "test_fmoe_16_bit":
         print("test test_fmoe 16 bit")
         # print("\ng1u0 no quant")
@@ -457,8 +469,7 @@ for test in args.test:
         #             for hdim in [1024, 1280]:
         #                 for ep in [4, 8]:
         #                     test_fmoe_ep(
-        #                         dtype, m, dim, hdim, 128, 6, quant="No", shared_E=2, ep=ep
-        #                     )
+        #                         dtype, m, dim, hdim, 128, 6, quant="No", shared_E=shared_E, ep=ep
 
     elif test == "g1u1_no_quant":
         for dtype in args.dtype:
@@ -477,7 +488,7 @@ for test in args.test:
                                 topk,
                                 quant="No",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=shared_E,
                                 ep=ep,
                             )
     elif test == "g1u1_int8quant":
@@ -497,7 +508,7 @@ for test in args.test:
                                 topk,
                                 quant="int8quant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=shared_E,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8quant":
@@ -517,7 +528,7 @@ for test in args.test:
                                 topk,
                                 quant="fp8quant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=shared_E,
                                 ep=ep,
                             )
     elif test == "g1u0_int8smoothquant":
@@ -540,7 +551,7 @@ for test in args.test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=False,
-                                shared_E=2,
+                                shared_E=shared_E,
                                 ep=ep,
                             )
     elif test == "g1u1_int8smoothquant":
@@ -560,7 +571,7 @@ for test in args.test:
                                 topk,
                                 quant="int8smoothquant",
                                 use_g1u1=True,
-                                shared_E=0,
+                                shared_E=shared_E,
                                 ep=ep,
                             )
     elif test == "g1u1_fp8smoothquant":
@@ -580,7 +591,7 @@ for test in args.test:
                                 topk,
                                 quant="fp8smoothquant",
                                 use_g1u1=True,
-                                shared_E=2,
+                                shared_E=shared_E,
                                 ep=ep,
                             )
     else:

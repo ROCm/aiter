@@ -1,0 +1,2 @@
+tile_m,tile_n,knl_name,co_name,smf,pf
+32,256,moe_stage2_kernel_func,stage1_moe.co,0,2
