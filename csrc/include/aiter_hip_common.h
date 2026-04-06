@@ -33,7 +33,7 @@ template <typename... Args>
     {                                                                   \
         if(!(x)) [[unlikely]]                                           \
         {                                                               \
-            detail::aiter_check_fatal(__FILE__, __LINE__, __VA_ARGS__); \
+            ::detail::aiter_check_fatal(__FILE__, __LINE__, __VA_ARGS__); \
         }                                                               \
     } while(0)
 
@@ -43,11 +43,11 @@ template <typename... Args>
         hipError_t err = call;                                                    \
         if(err != hipSuccess) [[unlikely]]                                        \
         {                                                                         \
-            detail::aiter_check_fatal(__FILE__,                                   \
-                                      __LINE__,                                   \
-                                      "fail to call " #call " ---> [HIP error](", \
-                                      hipGetErrorString(err),                     \
-                                      ')');                                       \
+            ::detail::aiter_check_fatal(__FILE__,                                 \
+                                        __LINE__,                                 \
+                                        "fail to call " #call " ---> [HIP error](", \
+                                        hipGetErrorString(err),                   \
+                                        ')');                                       \
         }                                                                         \
     } while(0)
 

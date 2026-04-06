@@ -27,8 +27,6 @@ static_assert(sizeof(void*) == sizeof(fptr_t));
 
 namespace aiter {
 
-namespace detail { using ::detail::aiter_check_fatal; }
-
 // ---- init / dispose / meta_size ----
 
 fptr_t init_custom_ar(int64_t meta_ptr,
