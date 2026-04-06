@@ -36,7 +36,7 @@ from .pipeline_utils import make_tail_plan
 
 # WMMA tile dimensions for FP8
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
-WAVE_SIZE = 32
+WAVE_SIZE = 32 #numthreads
 
 # FP8 WMMA operand: 16 VGPRs (vec<16xi32>)
 # Each lane holds 64 bytes = 64 FP8 elements (one K-half of 128)
@@ -90,7 +90,7 @@ def compile_gemm_a8w8(
     """
     if out_dtype not in ("f32", "bf16", "f16"):
         raise ValueError(f"out_dtype must be 'f32', 'bf16', or 'f16', got {out_dtype!r}")
-    elem_bytes_d = 2 if out_dtype in ("bf16", "f16") else 4
+    elem_bytes_d = 2 if out_dtype in ("bf16", "f16") else 4 # needed later for byte offsets in buffer_store
 
     if num_buffers not in (2, 3, 4):
         raise ValueError(f"num_buffers must be 2, 3, or 4, got {num_buffers}")
@@ -108,10 +108,6 @@ def compile_gemm_a8w8(
     num_warps = m_warp * n_warp
     block_threads = num_warps * WAVE_SIZE
 
-    # FP8: 1 byte per element
-    packed_tile_k = tile_k
-    K_packed = K
-
     if tile_k % WMMA_K != 0:
         raise ValueError(f"tile_k must be a multiple of {WMMA_K}, got {tile_k}")
     if tile_m % WMMA_M != 0:
@@ -119,8 +115,8 @@ def compile_gemm_a8w8(
     if tile_n % WMMA_N != 0:
         raise ValueError(f"tile_n must be a multiple of {WMMA_N}, got {tile_n}")
 
-    warp_tile_m = tile_m // m_warp
-    warp_tile_n = tile_n // n_warp
+    warp_tile_m = tile_m // m_warp # M chunk handled by each warp
+    warp_tile_n = tile_n // n_warp # N chunk handled by each warp
     if warp_tile_m % WMMA_M != 0:
         raise ValueError(f"warp_tile_m={warp_tile_m} must be a multiple of {WMMA_M}")
     if warp_tile_n % WMMA_N != 0:
@@ -140,50 +136,44 @@ def compile_gemm_a8w8(
     k_wmma_steps = tile_k // WMMA_K
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
-    n_accs = wmma_m_rep * wmma_n_rep
+    n_accs = wmma_m_rep * wmma_n_rep # each warp needs n_accs accumulator vectors (vec<8xf32> each accumulator vec is 8 VGPRs) 
 
-    # LDS layout: FP8 data stored as bytes, accessed via f16 memrefs
-    lds_a_stride_bytes = packed_tile_k + LDS_PAD_A_BYTES
-    lds_b_stride_bytes = packed_tile_k + LDS_PAD_B_BYTES
+    # LDS layout: FP8 data stored as bytes, accessed via f16 memrefs because you can't declare memref<sizexf8>
+    lds_a_stride_bytes = tile_k + LDS_PAD_A_BYTES
+    lds_b_stride_bytes = tile_k + LDS_PAD_B_BYTES
     lds_a_stride = lds_a_stride_bytes // 2  # in f16 elements
     lds_b_stride = lds_b_stride_bytes // 2
 
-    lds_a_data_bytes = tile_m * lds_a_stride_bytes
-    lds_b_data_bytes = tile_n * lds_b_stride_bytes
+    lds_a_data_bytes = tile_m * lds_a_stride_bytes # lds needed for tile A
+    lds_b_data_bytes = tile_n * lds_b_stride_bytes # lds needed for tile B
 
     # Allocate LDS for each pipeline stage
     stage_allocators = []
     stage_a_data_off = []
     stage_b_data_off = []
-
+    
+    # each stage has a separate memref.global symbol. mlir backend places them at non overlapping lds addresses
+    # stage_a_data_off and stage_b_data_off are byte offsets within each stage's allocation, not absolute LDS addresses
     for i in range(num_buffers):
         name = _STAGE_NAMES[i]
         alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name=f"a8w8_{name}")
 
-        off = alloc._align(alloc.ptr, 16)
-        stage_a_data_off.append(off)
-        alloc.ptr = off + lds_a_data_bytes
+        off = alloc._align(alloc.ptr, 16) # align to 16 bytes
+        stage_a_data_off.append(off) # would be 0
+        alloc.ptr = off + lds_a_data_bytes # advance pointer past A
 
         off = alloc._align(alloc.ptr, 16)
         stage_b_data_off.append(off)
-        alloc.ptr = off + lds_b_data_bytes
+        alloc.ptr = off + lds_b_data_bytes # advance pointer past B
 
         stage_allocators.append(alloc)
 
     # Pipeline plan
     pre_loaded = num_buffers - 1
-    loop_iters = (num_k_tiles - pre_loaded) // num_buffers
+    loop_iters = (num_k_tiles - pre_loaded) // num_buffers # I think this is kinda loop unrolling?
     _tail_start = loop_iters * num_buffers
     extra = num_k_tiles - _tail_start - pre_loaded
-    _raw_tail_plan = make_tail_plan(num_buffers, pre_loaded, extra)
-
-    # TDM loads per step: 2 (A data + B data)
-    TDM_LOADS_PER_STEP = 2
-
-    tail_plan = [
-        (ls, cs, o * TDM_LOADS_PER_STEP // 2 if o > 0 else o)
-        for ls, cs, o in _raw_tail_plan
-    ]
+    tail_plan = make_tail_plan(num_buffers, pre_loaded, extra)
 
     @flyc.kernel
     def kernel_gemm_a8w8(
@@ -196,14 +186,14 @@ def compile_gemm_a8w8(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
-        enable_wmma_pipeline()
+        enable_wmma_pipeline() # Enable back-to-back WMMA issue
 
-        tx = gpu.thread_id("x")
+        tx = gpu.thread_id("x") # thread index within workgroup (total 32 thrds/warp *8 warps = 256 thrds)
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
 
-        blk_m = bx * arith.index(tile_m)
-        blk_n = by * arith.index(tile_n)
+        blk_m = bx * arith.index(tile_m) # starting M row for the workgroup
+        blk_n = by * arith.index(tile_n) # starting N col for the workgroup
 
         # MCAST masks for cluster TDM loads
         if use_cluster:
@@ -218,19 +208,19 @@ def compile_gemm_a8w8(
         layout_thr = fx.make_layout(
             (m_warp, n_warp, 2, 16),
             (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1))
-        thr_coord = idx2crd(tx, layout_thr)
+        thr_coord = idx2crd(tx, layout_thr) # convert thread ID into a 4D coordinate
         wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
             fx.get(thr_coord, 0), fx.get(thr_coord, 1),
             fx.get(thr_coord, 2), fx.get(thr_coord, 3))
 
-        warp_m_base = wave_m_idx * arith.index(warp_tile_m)
-        warp_n_base = wave_n_idx * arith.index(warp_tile_n)
+        warp_m_base = wave_m_idx * arith.index(warp_tile_m) # starting row for this warp
+        warp_n_base = wave_n_idx * arith.index(warp_tile_n) # starting column for this warp
 
         # Buffer resources for output and scales
         m_idx = arith.index_cast(T.index, i32_m.ir_value())
         n_idx = arith.index_cast(T.index, i32_n.ir_value())
         n_stride = arith.index_cast(T.index, i32_n.ir_value())
-        c_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
+        c_nrec = m_idx * n_stride * arith.index(elem_bytes_d) # total bytes in C
         c_rsrc = buffer_ops.create_buffer_resource(arg_c, num_records_bytes=c_nrec)
 
         # Scale buffer resources (f32, 4 bytes per element)
@@ -249,7 +239,7 @@ def compile_gemm_a8w8(
         # Identity E8M0 scale for WMMA (2^0 = 1.0)
         identity_scale = arith.constant(E8M0_IDENTITY, type=T.i32)
 
-        elem_ty_lds = T.f16
+        elem_ty_lds = T.f16 # LDS memref element type
 
         # --- TDM async copy helpers ---
         # cache_policy=1 enables streaming/non-temporal for large matrices
@@ -257,13 +247,14 @@ def compile_gemm_a8w8(
 
         def copy_a_to_lds(k_base, lds_mem_ref):
             desc = tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_a, lds_memref=lds_mem_ref,
-                global_offset=(blk_m, k_base),
-                tensor_shape=(tile_m, packed_tile_k),
-                strides=(K_packed, 1),
-                tile_shape=(tile_m, packed_tile_k),
-                elem_bytes=1,
-                pad_interval=packed_tile_k, pad_amount=LDS_PAD_A_BYTES,
+                global_ptr=arg_a, # base ptr of A in global mem 
+                lds_memref=lds_mem_ref, # destination LDS memref (ping, pong, ... etc.)
+                global_offset=(blk_m, k_base), # offsets
+                tensor_shape=(tile_m, tile_k),
+                strides=(K, 1),
+                tile_shape=(tile_m, tile_k),
+                elem_bytes=1, # FP8
+                pad_interval=tile_k, pad_amount=LDS_PAD_A_BYTES, # pad_interval should be 256 (need to check this)
                 num_warps=num_warps,
                 workgroup_mask=a_mcast_mask)
             tdm_ops.tensor_load_2d(desc)
@@ -272,11 +263,11 @@ def compile_gemm_a8w8(
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_b, lds_memref=lds_mem_ref,
                 global_offset=(blk_n, k_base),
-                tensor_shape=(tile_n, packed_tile_k),
-                strides=(K_packed, 1),
-                tile_shape=(tile_n, packed_tile_k),
+                tensor_shape=(tile_n, tile_k),
+                strides=(K, 1),
+                tile_shape=(tile_n, tile_k),
                 elem_bytes=1,
-                pad_interval=packed_tile_k, pad_amount=LDS_PAD_B_BYTES,
+                pad_interval=tile_k, pad_amount=LDS_PAD_B_BYTES,
                 num_warps=num_warps,
                 workgroup_mask=b_mcast_mask,
                 cache_policy=_b_cache_policy)
@@ -291,12 +282,12 @@ def compile_gemm_a8w8(
         # --- Non-TDM copy: buffer_load + vector.store to LDS ---
         # A[M,K] is row-major FP8 (1 byte). LDS layout: tile_m rows, lds_a_stride_bytes cols.
         # Each thread copies vec4 i16 = 8 bytes = 8 FP8 elements at a time.
-        _a_copy_elems = tile_m * packed_tile_k  # total FP8 elements in tile
+        _a_copy_elems = tile_m * tile_k  # total FP8 elements in tile
         _a_vec_size = 8  # 8 bytes per copy = vec4 i16
         _a_total_vecs = _a_copy_elems // _a_vec_size
         _a_vecs_per_thread = (_a_total_vecs + block_threads - 1) // block_threads
 
-        _b_copy_elems = tile_n * packed_tile_k
+        _b_copy_elems = tile_n * tile_k
         _b_total_vecs = _b_copy_elems // _a_vec_size
         _b_vecs_per_thread = (_b_total_vecs + block_threads - 1) // block_threads
 
@@ -311,12 +302,12 @@ def compile_gemm_a8w8(
             # so we pass offset in i16 elements (= byte_offset / 2).
             for t in range_constexpr(_a_vecs_per_thread):
                 vec_idx = tx + arith.index(t * block_threads)
-                vecs_per_row = packed_tile_k // _a_vec_size
+                vecs_per_row = tile_k // _a_vec_size
                 a_row = vec_idx / arith.index(vecs_per_row)
                 a_col_v = vec_idx % arith.index(vecs_per_row)
 
                 # Global offset in i16 elements: byte_off / 2
-                g_byte_off = (blk_m + a_row) * arith.index(K_packed) + (k_base + a_col_v * arith.index(_a_vec_size))
+                g_byte_off = (blk_m + a_row) * arith.index(K) + (k_base + a_col_v * arith.index(_a_vec_size))
                 g_off_i16 = g_byte_off / arith.index(2)
                 v = buffer_ops.buffer_load(a_rsrc, g_off_i16, vec_width=4, dtype=T.i16)
                 v_f16 = vector.bitcast(T.vec(4, T.f16), v)
@@ -325,11 +316,11 @@ def compile_gemm_a8w8(
 
             for t in range_constexpr(_b_vecs_per_thread):
                 vec_idx = tx + arith.index(t * block_threads)
-                vecs_per_row = packed_tile_k // _a_vec_size
+                vecs_per_row = tile_k // _a_vec_size
                 b_row = vec_idx / arith.index(vecs_per_row)
                 b_col_v = vec_idx % arith.index(vecs_per_row)
 
-                g_byte_off = (blk_n + b_row) * arith.index(K_packed) + (k_base + b_col_v * arith.index(_a_vec_size))
+                g_byte_off = (blk_n + b_row) * arith.index(K) + (k_base + b_col_v * arith.index(_a_vec_size))
                 g_off_i16 = g_byte_off / arith.index(2)
                 v = buffer_ops.buffer_load(b_rsrc, g_off_i16, vec_width=4, dtype=T.i16)
                 v_f16 = vector.bitcast(T.vec(4, T.f16), v)
@@ -339,7 +330,7 @@ def compile_gemm_a8w8(
             gpu.barrier()
 
         # --- Fragment loading (FP8: 4 x ds_load_b128 -> vec<16xi32>) ---
-        def _precompute_a_lane_bases(lds_ptr):
+        def _precompute_a_lane_bases(lds_ptr): # for each warp get what elems each thread would load
             lds_buffer = get_lds_memref(lds_ptr)
             row_base = (warp_m_base + lane16) * arith.index(lds_a_stride)
             k_half_off = lane_kgrp * arith.index(32)  # 32 f16 elems = 64 bytes
@@ -349,19 +340,19 @@ def compile_gemm_a8w8(
                 bases.append(base)
             return lds_buffer, bases
 
-        def load_a_frag(lds_buffer, a_lane_base, ks):
+        def load_a_frag(lds_buffer, a_lane_base, ks): # ks selects which K-subtile. e.g say tile_K=256 then there would be 2 K-subtiles cuz wmma_k=128
             """Load one 16x128 FP8 A-fragment from LDS -> vec<16xi32>."""
-            k_elem_off = arith.index(ks * WMMA_K // 2)
+            k_elem_off = arith.index(ks * WMMA_K // 2) # //2 because fp16 units
             elem_off = a_lane_base + k_elem_off
             v0 = lds_load_b128(lds_buffer, elem_off)
             v1 = lds_load_b128(lds_buffer, elem_off + arith.index(8))
             v2 = lds_load_b128(lds_buffer, elem_off + arith.index(16))
             v3 = lds_load_b128(lds_buffer, elem_off + arith.index(24))
-            v01 = vector.shuffle(v0, v1, list(range(8)))
+            v01 = vector.shuffle(v0, v1, list(range(8))) # concatination
             v23 = vector.shuffle(v2, v3, list(range(8)))
             return vector.shuffle(v01, v23, list(range(16)))
 
-        def _precompute_b_lane_bases(lds_ptr):
+        def _precompute_b_lane_bases(lds_ptr): # same shit but for b
             lds_buffer = get_lds_memref(lds_ptr)
             row_base = (warp_n_base + lane16) * arith.index(lds_b_stride)
             k_half_off = lane_kgrp * arith.index(32)
@@ -376,13 +367,14 @@ def compile_gemm_a8w8(
             return load_a_frag(lds_buffer, b_lane_base, ks)
 
         # --- K-subtile compute (A-streaming with identity scales) ---
-        def _load_b_frags(b_buf, b_bases, ks):
+        def _load_b_frags(b_buf, b_bases, ks): # load all B frags upfront
             return [load_b_frag(b_buf, b_bases[wn], ks)
                     for wn in range_constexpr(wmma_n_rep)]
 
+        # we loaded all B frags upfront then A frags are loaded one at a time
         def _a_streaming_compute(accs, a_buf, a_bases, b_frags, ks,
                                  emit_filler=None, next_b_info=None):
-            """Stream A fragments per-wm, interleaved with WMMA_SCALE using identity scales."""
+            """Stream A fragments per-wm, interleaved with WMMA"""
             next_b_frags = None
             a_frag = load_a_frag(a_buf, a_bases[0], ks)
             for wm in range_constexpr(wmma_m_rep):
@@ -391,10 +383,12 @@ def compile_gemm_a8w8(
                     a_next = load_a_frag(a_buf, a_bases[wm + 1], ks)
                 if is_last:
                     rocdl.s_wait_dscnt(0)
+                    
+                    # this basically lets us compute the output addresses using the ALU while the last WMMA is going on
                     if emit_filler is not None:
-                        rocdl.sched_barrier(0)
-                        emit_filler()
-                    if next_b_info is not None:
+                        rocdl.sched_barrier(0) # tells the compiler that all instructions before this point must be issued before any instrucntions after thsi point
+                        emit_filler() # calls epilogue_prepare_addrs() and computes the output addresses for the final store
+                    if next_b_info is not None: # prefetching for next K-subtile
                         nb_buf, nb_bases, nb_ks = next_b_info
                         next_b_frags = _load_b_frags(nb_buf, nb_bases, nb_ks)
                 else:
@@ -462,7 +456,7 @@ def compile_gemm_a8w8(
                 # Load a_scale for this row (scalar f32)
                 row_idx = blk_m + warp_m_base + arith.index(wm * WMMA_M) + lane16
                 a_sc = buffer_ops.buffer_load(
-                    a_scale_rsrc, row_idx, vec_width=1, dtype=T.f32)
+                    a_scale_rsrc, row_idx, vec_width=1, dtype=T.f32) # load one f32 scale for this lane's row
 
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
@@ -523,10 +517,10 @@ def compile_gemm_a8w8(
                 return
             pf_k = k_base + arith.index(_effective_l2_pf * tile_k)
             tdm_ops.l2_prefetch_tile(
-                arg_a, (blk_m, pf_k), (tile_m, packed_tile_k), (K_packed, 1),
+                arg_a, (blk_m, pf_k), (tile_m, tile_k), (K, 1),
                 elem_bytes=1, thread_id=tx, block_threads=block_threads)
             tdm_ops.l2_prefetch_tile(
-                arg_b, (blk_n, pf_k), (tile_n, packed_tile_k), (K_packed, 1),
+                arg_b, (blk_n, pf_k), (tile_n, tile_k), (K, 1),
                 elem_bytes=1, thread_id=tx, block_threads=block_threads)
 
         # ====== Multi-stage pipeline ======
@@ -549,6 +543,7 @@ def compile_gemm_a8w8(
             for i in range_constexpr(num_buffers)
         ]
 
+        # get the actual MLIR memref value to pass to TDM later
         stages_a_mem = [stages_a[i].get() for i in range_constexpr(num_buffers)]
         stages_b_mem = [stages_b[i].get() for i in range_constexpr(num_buffers)]
 
@@ -557,7 +552,7 @@ def compile_gemm_a8w8(
             # Pattern: load → compute → fence (tensor_wait + barrier).
             # The fence ensures the next buffer is ready and all waves sync
             # before buffer reuse.
-            _main_outstanding = TDM_LOADS_PER_STEP * (num_buffers - 1)
+            _main_outstanding = 2 * (num_buffers - 2)
 
             # Prologue: load first (num_buffers - 1) tiles
             for i in range_constexpr(pre_loaded):
@@ -565,14 +560,14 @@ def compile_gemm_a8w8(
                     arith.index(i * tile_k),
                     stages_a_mem[i], stages_b_mem[i])
             pipeline_fence(outstanding=_main_outstanding,
-                           use_cluster=use_cluster)
+                           use_cluster=use_cluster) # basically adding the tensorwait at the start of the loop
 
             # Main loop
             main_end = loop_iters * num_buffers * tile_k
 
             if loop_iters > 0:
                 for iv, state in range(0, main_end, num_buffers * tile_k, init=list(accs)):
-                    rocdl.iglp_opt(1)
+                    rocdl.iglp_opt(1) # instruction level parallelism hint
                     accs_in = list(state)
                     for s in range_constexpr(num_buffers):
                         _load_stage = (s + num_buffers - 1) % num_buffers
@@ -581,17 +576,18 @@ def compile_gemm_a8w8(
                             iv + arith.index(_load_k_off),
                             stages_a_mem[_load_stage], stages_b_mem[_load_stage])
                         accs_in = compute_tile(accs_in, stages_a[s], stages_b[s])
-                        hot_loop_scheduler()
+                        hot_loop_scheduler() # rocdl.sched_barrier(0) compiler directive telling it not to reorder instructions before or after this
+
                         pipeline_fence(outstanding=_main_outstanding,
                                        use_cluster=use_cluster)
                     results = yield list(accs_in)
                 accs = list(results)
 
             # Tail
-            if loop_iters == 0 and use_cluster:
-                gpu.cluster_barrier()
-            _extra_j = 0
-            epi_addrs_box = [None]
+            # if loop_iters == 0 and use_cluster:
+            #     gpu.cluster_barrier() # we don't need this?
+            _extra_j = 0 # used to compute extra K-offset for each extra load
+            epi_addrs_box = [None] # to capture epilogue address calculation we do during the last compute stage
             for _load_stage, _compute_stage, _outstanding in tail_plan:
                 if _load_stage is not None:
                     _k_off = (_tail_start + pre_loaded + _extra_j) * tile_k
@@ -650,36 +646,46 @@ def compile_gemm_a8w8(
         i32_n: fx.Int32,
         stream: fx.Stream,
     ):
+        # needed to build the cache key so that compile_gemm_a8w8 knows if these values changed and it can't use the cached binary
         _ = cache_tag
+        
+        # finalize lds allocation (so far we only know how much LDS we need thanks to SmemAllocator objects we created earlier but now we emit it into the MLIR)
         ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
+        with ir.InsertionPoint(ctx.gpu_module_body): #ensures these land inside the gpu.module
             for alloc in stage_allocators:
-                alloc.finalized = False
+                alloc.finalized = False # reset needed incase this gets traced more than once (idk why this can happen but it can)
             for alloc in stage_allocators:
                 alloc.finalize()
 
-        idx_m = arith.index_cast(T.index, i32_m.ir_value())
+        # grid dimensions (just tracing MLIR no execution happening so grid size is not known at compile time)
+        idx_m = arith.index_cast(T.index, i32_m.ir_value()) # get the raw SSA and cast it to fx.index type. i32_m is in an fx.Int32 wrapper
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
         gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n)) # unwrap to get the raw SSA
 
+        # trigger tracing of the flyc.kernel function. builds the MLIR gpu.func
         launcher = kernel_gemm_a8w8(
             arg_c, arg_a, arg_b, arg_a_scale, arg_b_scale, arg_bias,
             i32_m, i32_n)
+        
+        # walk the MLIR module and find the gpu.func then attach the HW hints
+        # the attributes are added after tracing because they're metadata about the kernel, not ops inside it
         for op in ctx.gpu_module_body.operations:
             if hasattr(op, 'attributes') and op.OPERATION_NAME == "gpu.func":
                 if effective_waves_per_eu is not None:
                     _wpe = int(effective_waves_per_eu)
                     if _wpe >= 1:
                         op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            ir.IntegerType.get_signless(32), _wpe)
+                            ir.IntegerType.get_signless(32), _wpe) #gpu.func @kernel_gemm_a8w8(...) attributes {rocdl.waves_per_eu = 1 : i32}    
                 if use_cluster:
                     op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
                         f"{cluster_m},{cluster_n},1")
         cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+        
+        # emits gpu.launch_func into the MLIR module
         launcher.launch(
-            grid=(gx, gy, 1),
-            block=(block_threads, 1, 1),
+            grid=(gx, gy, 1), # runtime SSA values computed above
+            block=(block_threads, 1, 1), # compile time constant
             stream=stream,
             cluster=cluster_arg,
         )
