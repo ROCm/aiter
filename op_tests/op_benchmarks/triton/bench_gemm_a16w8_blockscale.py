@@ -1,4 +1,3 @@
-import sys
 import torch
 import triton
 import math
@@ -23,13 +22,22 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 block_shape = (128, 128)
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, preshuffle: bool = False):
+def bench_gemm_fn(
+    M: int, N: int, K: int, metric: str, layout: str, preshuffle: bool = False
+):
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
     x, weight, weight_shuffled, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
-        M, N, K, block_shape_n, block_shape_k,
-        dtype=c_dtype, layout=layout, output=True, shuffle=preshuffle,
+        M,
+        N,
+        K,
+        block_shape_n,
+        block_shape_k,
+        dtype=c_dtype,
+        layout=layout,
+        output=True,
+        shuffle=preshuffle,
     )
     if preshuffle:
         bench_weight = weight_shuffled
@@ -46,14 +54,16 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, preshuffle: 
             lambda: gemm_a16w8_blockscale_preshuffle(
                 x, bench_weight, w_scale, c_dtype, y, prequant=False
             ),
-            warmup=25, rep=100,
+            warmup=25,
+            rep=100,
         )
     else:
         ms = triton.testing.do_bench(
             lambda: gemm_a16w8_blockscale(
                 x, bench_weight, w_scale, c_dtype, y, prequant=False
             ),
-            warmup=25, rep=100,
+            warmup=25,
+            rep=100,
         )
 
     if metric == "time":

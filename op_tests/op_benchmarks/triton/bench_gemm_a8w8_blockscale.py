@@ -26,12 +26,29 @@ import math
 block_shape = (128, 128)
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callable, shuffle: bool = False):
+def bench_gemm_fn(
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    impl: callable,
+    shuffle: bool = False,
+):
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
-    x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M, N, K, block_shape_n, block_shape_k, layout=layout, output=True, shuffle=shuffle
+    x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y = (
+        generate_gemm_a8w8_blockscale_inputs(
+            M,
+            N,
+            K,
+            block_shape_n,
+            block_shape_k,
+            layout=layout,
+            output=True,
+            shuffle=shuffle,
+        )
     )
     if shuffle:
         bench_weight = weight_shuffled
@@ -99,7 +116,9 @@ def run_model_benchmark(args, impl):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl, shuffle=args.preshuffle)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
@@ -111,7 +130,9 @@ def run_shape_benchmark(args, impl):
     def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl, shuffle=args.preshuffle)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 

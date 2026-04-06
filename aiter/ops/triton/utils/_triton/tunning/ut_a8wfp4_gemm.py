@@ -1,4 +1,5 @@
 import sys
+import triton
 from _utils import (
     run_profile,
     get_input_shape_and_config_list,
@@ -24,7 +25,9 @@ _, e4m3_type = get_fp8_dtypes()
 dtype = torch.float16
 # Returns: (x, w, x_scales, w_scales, x_fp32, w_fp32, y)
 x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
-    M, N, K,
+    M,
+    N,
+    K,
     e4m3_type,
     dtype,
     layout="TN",
@@ -32,7 +35,6 @@ x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
 )
 ############################################################
 
-import triton
 
 for config in config_list:
     if config is not None:

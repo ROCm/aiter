@@ -7,7 +7,6 @@ from _utils import (
 ############################################################
 # <import>
 import torch
-import triton
 from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
     generate_gemm_a16w16_gated_inputs,
@@ -23,7 +22,9 @@ M, N, K = input_shape
 dtype = torch.bfloat16
 # Returns (x, weight, out_dtype, y) — 4 values
 x, w, _, y = generate_gemm_a16w16_gated_inputs(
-    M, N, K,
+    M,
+    N,
+    K,
     dtype,
     output=True,
 )

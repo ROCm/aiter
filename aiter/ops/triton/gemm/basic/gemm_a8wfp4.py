@@ -95,7 +95,7 @@ def gemm_a8wfp4(
             f"gemm_a8wfp4: split-K (NUM_KSPLIT={config.get('NUM_KSPLIT')}) is not supported "
             f"for M > 128 (M={M}). Set NUM_KSPLIT=1 in the config."
         )
-        SPLITK_BLOCK_SIZE = 2 * K
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
     grid = lambda META: (  # noqa: E731

@@ -22,7 +22,9 @@ M, N, K = input_shape
 # <generate input>
 dtype = torch.bfloat16
 x, w, _, _, y = generate_gemm_a16w16_inputs(
-    M, N, K,
+    M,
+    N,
+    K,
     dtype,
     output=True,
     bias=False,

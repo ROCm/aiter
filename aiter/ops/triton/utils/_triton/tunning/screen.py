@@ -299,7 +299,10 @@ def main():
             process.kill()
             stdout_data, stderr_data = process.communicate()
             if verbose:
-                print(f"[Error]: rocprofv3 timed out after {batch_timeout}s for {mnk_str}", flush=True)
+                print(
+                    f"[Error]: rocprofv3 timed out after {batch_timeout}s for {mnk_str}",
+                    flush=True,
+                )
             stderr_data = "TimeoutExpired"
 
         if process.returncode == 0:
@@ -368,7 +371,10 @@ def main():
                     # Compilation or runtime error for specific param combo,
                     # not necessarily all configs with this block size
                     if verbose:
-                        print(f"\tParam-specific error (not excluding block size):", flush=True)
+                        print(
+                            "\tParam-specific error (not excluding block size):",
+                            flush=True,
+                        )
                         for j_line in range(
                             max(0, i_line - 5), min(len(stderr_data), i_line + 5)
                         ):
@@ -387,7 +393,10 @@ def main():
                     print()
             else:
                 if verbose:
-                    print(f"Skipping batch {i_comb_start}~{i_comb_end-1} (block size NOT excluded)", flush=True)
+                    print(
+                        f"Skipping batch {i_comb_start}~{i_comb_end-1} (block size NOT excluded)",
+                        flush=True,
+                    )
                     print()
 
         i_comb_start = i_comb_end

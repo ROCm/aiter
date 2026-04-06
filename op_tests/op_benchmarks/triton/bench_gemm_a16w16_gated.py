@@ -1,4 +1,3 @@
-import sys
 import torch
 import triton
 import math
@@ -19,10 +18,14 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, activation: str = None):
+def bench_gemm_fn(
+    M: int, N: int, K: int, metric: str, layout: str, activation: str = None
+):
     c_dtype = torch.bfloat16
     x, w, _, y = generate_gemm_a16w16_gated_inputs(
-        M, N, K,
+        M,
+        N,
+        K,
         c_dtype,
         layout=layout,
         output=True,

@@ -135,6 +135,7 @@ def parse_args():
 
 def main():
     import aiter.ops.triton.utils._triton.arch_info as arch_info
+
     if not (arch_info.is_fp4_avail()):
         print("MXFP4 is not available on this architecture")
         sys.exit()

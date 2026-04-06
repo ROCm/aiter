@@ -23,7 +23,9 @@ dtype = torch.bfloat16
 # Signature: generate_gemm_a16wfp4_inputs(M, N, K, output, atomic_add, dtype, layout, shuffle)
 # Returns: (x, w, w_shuffled, x_scales, w_scales, w_scales_shuffled, y)
 x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
-    M, N, K,
+    M,
+    N,
+    K,
     output=True,
     atomic_add=False,
     dtype=dtype,
