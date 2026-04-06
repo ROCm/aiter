@@ -484,7 +484,6 @@ def moe_gemm_a4w4(
         alpha,
         limit,
         reduction_n_reduction,
-        backend=backend,
         out_dtype=out_dtype,
         add_residual=add_residual,
     )
