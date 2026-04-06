@@ -2105,9 +2105,7 @@ class FmoeTuner(TunerCommon):
         new_fb_keys = set()
         if new_fallbacks:
             new_fb_df = pd.DataFrame(new_fallbacks, columns=self.columns)
-            new_fb_keys = set(
-                new_fb_df[self.keys].astype(str).apply(tuple, axis=1)
-            )
+            new_fb_keys = set(new_fb_df[self.keys].astype(str).apply(tuple, axis=1))
 
         if "_tag" in old_tunedf.columns:
             old_fb_mask = old_tunedf["_tag"].fillna("") == FLYDSL_FALLBACK_TAG
