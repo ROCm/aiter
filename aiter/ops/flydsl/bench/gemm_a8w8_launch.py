@@ -78,6 +78,7 @@ def main():
     fp8_dtype = torch.float8_e4m3fn
     _out_torch = {"f16": torch.float16, "bf16": torch.bfloat16, "f32": torch.float32}[args.out_dtype]
 
+    # Pad dimensions
     mpad = (M + tile_m - 1) // tile_m * tile_m
     npad = (N + tile_n - 1) // tile_n * tile_n
     kpad = (K + tile_k - 1) // tile_k * tile_k
