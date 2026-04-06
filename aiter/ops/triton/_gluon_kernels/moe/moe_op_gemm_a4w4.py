@@ -1,6 +1,7 @@
 import torch
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -85,27 +86,6 @@ def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: gl.constexp
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
     return pid_m, pid_n
-
-
-@gluon.jit
-def clip(x, limit, clip_lower: gl.constexpr):
-    res = gl.minimum(x, limit)
-    if clip_lower:
-        res = gl.maximum(-limit, res)
-    return res
-
-
-@gluon.jit
-def _swiglu(input, alpha, limit):
-    gelu, linear = gl.split(gl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
-    gelu = gelu.to(gl.float32)
-    if limit is not None:
-        gelu = clip(gelu, limit, clip_lower=False)
-    linear = linear.to(gl.float32)
-    if limit is not None:
-        linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + gl.exp2(-1.44269504089 * alpha * gelu))
-    return gl.fma(s, linear, s)  # (s * (linear + 1))
 
 
 @gluon.jit
