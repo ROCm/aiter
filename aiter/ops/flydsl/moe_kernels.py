@@ -4,11 +4,17 @@
 """FlyDSL MOE kernel management: naming, compilation, and high-level API."""
 
 import functools
-from typing import Dict, Optional
+import re
 
+from typing import Dict, Optional
+from aiter.utility import dtypes
+
+import flydsl.compiler as flyc
 import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
+
+_SUFFIX_RE = re.compile(r"(?P<fq>_fq)?(?:_sbm(?P<sbm>\d+))?$")
 
 
 def flydsl_kernel_name(
@@ -20,17 +26,37 @@ def flydsl_kernel_name(
     tile_n: int,
     tile_k: int,
     mode: str = "",
+    sort_block_m: int = 0,
+    fuse_fp4_quant: bool = False,
 ) -> str:
-    """Construct kernel name: flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}]."""
+    """Construct kernel name: ``flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}][_fq][_sbm{S}]``."""
     name = f"flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     if mode:
         name += f"_{mode}"
+    if fuse_fp4_quant:
+        name += "_fq"
+    if sort_block_m > 0 and sort_block_m != tile_m:
+        name += f"_sbm{sort_block_m}"
     return name
 
 
 def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
-    """Lookup kernel params by name (O(1))."""
-    return _KERNEL_PARAMS.get(name)
+    """Lookup kernel params by name. Strips ``_fq`` / ``_sbm{N}`` suffixes transparently."""
+    params = _KERNEL_PARAMS.get(name)
+    if params is not None:
+        return params
+    m = _SUFFIX_RE.search(name)
+    if m and m.group(0):
+        base_name = name[: m.start()]
+        params = _KERNEL_PARAMS.get(base_name)
+        if params is not None:
+            extra: Dict = {}
+            if m.group("fq"):
+                extra["fuse_fp4_quant"] = True
+            if m.group("sbm") is not None:
+                extra["sort_block_m"] = int(m.group("sbm"))
+            return {**params, **extra}
+    return None
 
 
 def get_flydsl_stage1_kernels(
@@ -39,24 +65,51 @@ def get_flydsl_stage1_kernels(
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [256] if is_fp4 else [128]
-    tile_ks = [256] if is_fp4 else [128]
-    tile_ms = [16, 32, 64]
+
+    tile_ns = [32, 64, 128] if is_fp4 else [128]
+    tile_ks = [256]
+    tile_ms = [16, 32, 64, 128]
+    waves_per_eus = [1, 2, 3, 4]
+    k_batches = [1, 2, 4, 7, 14]
+    b_nts = [0, 2]
 
     for tm in tile_ms:
+        if tm in [16, 32]:
+            tile_ns = [32, 64, 128]
+        else:
+            tile_ns = [64, 128]
         for tn in tile_ns:
             for tk in tile_ks:
-                name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
-                kernels[name] = {
-                    "stage": 1,
-                    "a_dtype": a_dtype,
-                    "b_dtype": b_dtype,
-                    "out_dtype": out_dtype,
-                    "tile_m": tm,
-                    "tile_n": tn,
-                    "tile_k": tk,
-                    "MPerBlock": tm,
-                }
+                for wpe in waves_per_eus:
+                    for kb in k_batches if wpe == 3 else [1]:
+                        gate_onlys = [False, True] if kb > 1 else [False]
+                        for bnt in b_nts:
+                            for go in gate_onlys:
+                                name = flydsl_kernel_name(
+                                    1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                                )
+                                if wpe != 1:
+                                    name += f"_w{wpe}"
+                                if kb != 1:
+                                    name += f"_kb{kb}"
+                                if bnt != 2:
+                                    name += f"_bnt{bnt}"
+                                if go:
+                                    name += "_go"
+                                kernels[name] = {
+                                    "stage": 1,
+                                    "a_dtype": a_dtype,
+                                    "b_dtype": b_dtype,
+                                    "out_dtype": out_dtype,
+                                    "tile_m": tm,
+                                    "tile_n": tn,
+                                    "tile_k": tk,
+                                    "MPerBlock": tm,
+                                    "waves_per_eu": wpe,
+                                    "k_batch": kb,
+                                    "b_nt": bnt,
+                                    "gate_only": go,
+                                }
     return kernels
 
 
@@ -68,17 +121,17 @@ def get_flydsl_stage2_kernels(
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
     tile_ks = [256] if is_fp4 else [128]
-    tile_ms = [32, 64, 128]
+    tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
-                    name = flydsl_kernel_name(
+                    base_name = flydsl_kernel_name(
                         2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
                     )
-                    kernels[name] = {
+                    base_params = {
                         "stage": 2,
                         "a_dtype": a_dtype,
                         "b_dtype": b_dtype,
@@ -88,6 +141,12 @@ def get_flydsl_stage2_kernels(
                         "tile_k": tk,
                         "mode": mode,
                         "MPerBlock": tm,
+                    }
+                    kernels[base_name] = base_params
+                    # Persistent variant: round-robin over M tiles, grid_y=cu_num.
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
                     }
     return kernels
 
@@ -117,6 +176,14 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
+    persist_m: int = 1,
+    fuse_fp4_quant: bool = False,
+    fuse_sort_scale: bool = False,
+    use_async_copy: bool = False,
+    k_batch: int = 1,
+    waves_per_eu: int = 3,
+    b_nt: int = 2,
+    gate_only: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -135,6 +202,14 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
+            persist_m=persist_m,
+            fuse_fp4_quant=fuse_fp4_quant,
+            fuse_sort_scale=fuse_sort_scale,
+            use_async_copy=use_async_copy,
+            k_batch=k_batch,
+            waves_per_eu=waves_per_eu,
+            b_nt=b_nt,
+            gate_only=gate_only,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -166,6 +241,8 @@ def compile_flydsl_moe_stage2(
     b_dtype: str,
     out_dtype: str,
     accumulate: bool = True,
+    persist_m: int = 1,
+    sort_block_m: int = 0,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -184,6 +261,8 @@ def compile_flydsl_moe_stage2(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             accumulate=accumulate,
+            persist_m=persist_m,
+            sort_block_m=sort_block_m,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
@@ -203,254 +282,179 @@ def compile_flydsl_moe_stage2(
         )
 
 
-# Private: compiled kernel closures
+# Private helpers
+
+
+_DLPACK_SAFE = (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
+
+
+def _view_safe(t: torch.Tensor) -> torch.Tensor:
+    """View as uint8 if dtype is not dlpack-safe, otherwise return as-is."""
+    return (
+        t.view(torch.uint8)
+        if t is not None and t.numel() > 0 and t.dtype not in _DLPACK_SAFE
+        else t
+    )
+
+
+def _s1_args_fp4(
+    out,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    out_scale_sorted,
+    token_num,
+    n_in,
+    k_in,
+    size_expert_ids_in,
+    dev,
+):
+    empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
+    return (
+        _view_safe(out),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        empty_f32,
+        out_scale_sorted,
+        token_num,
+        n_in,
+        k_in,
+        size_expert_ids_in,
+        torch.cuda.current_stream(),
+    )
+
+
+def _s1_args_std(
+    out,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    token_num,
+    n_in,
+    k_in,
+    size_expert_ids_in,
+):
+    return (
+        out,
+        a,
+        w,
+        a_scale,
+        w_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        token_num,
+        n_in,
+        k_in,
+        size_expert_ids_in,
+        torch.cuda.current_stream(),
+    )
+
+
+def _s2_args_fp4(
+    target,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    token_num,
+    n_in,
+    k_in,
+    blocks,
+    dev,
+):
+    empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
+    return (
+        _view_safe(target),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        empty_f32,
+        token_num,
+        n_in,
+        k_in,
+        blocks,
+        torch.cuda.current_stream(),
+    )
+
+
+def _s2_args_std(
+    target,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    token_num,
+    n_in,
+    k_in,
+    blocks,
+):
+    return (
+        target,
+        a,
+        w,
+        a_scale,
+        w_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        token_num,
+        n_in,
+        k_in,
+        blocks,
+        torch.cuda.current_stream(),
+    )
+
+
+def _run_compiled(exe, args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_aiter_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._aiter_cf = cf
+    else:
+        cf(*args)
 
 
 @functools.cache
-def _get_compiled_stage1(
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    doweight: bool,
-    a_dtype: str,
-    b_dtype: str,
-    out_dtype: str,
-    act: str,
-):
-    """Compile and cache stage1 kernel, return a tensor_api closure."""
-    exe = compile_flydsl_moe_stage1(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage1=doweight,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        act=act,
-    )
-    is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
-    _k_in = model_dim
+def _get_compiled_silu_fq(inter_dim: int, topk: int):
+    """Compile and cache the fused silu_and_mul + mxfp4 quant + scale-sort kernel."""
+    from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
-    def tensor_api(
-        out: torch.Tensor,
-        a: torch.Tensor,
-        w: torch.Tensor,
-        a_scale: torch.Tensor,
-        w_scale: torch.Tensor,
-        sorted_ids: torch.Tensor,
-        sorted_expert_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_valid_ids: torch.Tensor,
-        token_num: int,
-        size_expert_ids_in: int,
-    ) -> None:
-        if is_fp4:
-            empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream()
-            # fp4/e8m0 dtypes are not supported by dlpack; reinterpret as uint8.
-            _a = (
-                a.view(torch.uint8)
-                if a.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a
-            )
-            _w = (
-                w.view(torch.uint8)
-                if w.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w
-            )
-            _as = (
-                a_scale.view(torch.uint8)
-                if a_scale is not None
-                and a_scale.numel() > 0
-                and a_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a_scale
-            )
-            _ws = (
-                w_scale.view(torch.uint8)
-                if w_scale is not None
-                and w_scale.numel() > 0
-                and w_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w_scale
-            )
-            exe(
-                out,
-                _a,
-                _w,
-                _as,
-                _ws,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                empty_bias,
-                token_num,
-                _n_in,
-                _k_in,
-                size_expert_ids_in,
-                stream,
-            )
-        else:
-            exe(
-                out,
-                a,
-                w,
-                a_scale,
-                w_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                token_num,
-                _n_in,
-                _k_in,
-                size_expert_ids_in,
-            )
-
-    return tensor_api
-
-
-@functools.cache
-def _get_compiled_stage2(
-    model_dim: int,
-    inter_dim: int,
-    experts: int,
-    topk: int,
-    tile_m: int,
-    tile_n: int,
-    tile_k: int,
-    doweight: bool,
-    a_dtype: str,
-    b_dtype: str,
-    out_dtype: str,
-    accumulate: bool = True,
-):
-    """Compile and cache stage2 kernel, return a tensor_api closure."""
-    exe = compile_flydsl_moe_stage2(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage2=doweight,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=out_dtype,
-        accumulate=accumulate,
-    )
-    is_fp4 = b_dtype == "fp4"
-    _n_in = model_dim
-    _k_in = inter_dim
-
-    _topk = topk
-
-    def tensor_api(
-        out: torch.Tensor,
-        a: torch.Tensor,
-        w: torch.Tensor,
-        a_scale: torch.Tensor,
-        w_scale: torch.Tensor,
-        sorted_ids: torch.Tensor,
-        sorted_expert_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        num_valid_ids: torch.Tensor,
-        token_num: int,
-        blocks: int,
-    ) -> None:
-        if accumulate:
-            target = out
-            target.zero_()
-        else:
-            target = torch.empty(
-                (token_num * topk * model_dim,),
-                device=out.device,
-                dtype=out.dtype,
-            )
-
-        if is_fp4:
-            empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream()
-            # fp4/e8m0 dtypes are not supported by dlpack; cast to uint8
-            _a = (
-                a.view(torch.uint8)
-                if a.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a
-            )
-            _w = (
-                w.view(torch.uint8)
-                if w.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w
-            )
-            _as = (
-                a_scale.view(torch.uint8)
-                if a_scale is not None
-                and a_scale.numel() > 0
-                and a_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else a_scale
-            )
-            _ws = (
-                w_scale.view(torch.uint8)
-                if w_scale is not None
-                and w_scale.numel() > 0
-                and w_scale.dtype
-                not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32)
-                else w_scale
-            )
-            exe(
-                target,
-                _a,
-                _w,
-                _as,
-                _ws,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                empty_bias,
-                token_num,
-                _n_in,
-                _k_in,
-                blocks,
-                stream,
-            )
-        else:
-            exe(
-                target,
-                a,
-                w,
-                a_scale,
-                w_scale,
-                sorted_ids,
-                sorted_expert_ids,
-                topk_weights,
-                num_valid_ids,
-                token_num,
-                _n_in,
-                _k_in,
-                blocks,
-            )
-
-        if not accumulate:
-            torch.sum(target.view(token_num, _topk, model_dim), dim=1, out=out)
-
-    return tensor_api
+    return build_silu_and_mul_fq_module(inter_dim, topk)
 
 
 # Public API
@@ -475,13 +479,34 @@ def flydsl_moe_stage1(
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    persist_m: int = 0,
+    fuse_fp4_quant: bool = False,
+    fuse_sort_scale: bool = False,
+    use_async_copy: bool = False,
+    k_batch: int = 1,
+    waves_per_eu: int = 3,
+    b_nt: int = 2,
+    gate_only: bool = False,
+):
     """Fused gate+up GEMM (MOE stage1).
 
     a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
-    For fp4 stage1, `w1`/`w1_scale` must use the same CK preshuffle layout as `shuffle_weight(..., (16, 16))`
-    and `e8m0_shuffle(...)`.
-    Returns (token_num, topk, inter_dim).
+    For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
+    `shuffle_weight(..., (16, 16))` and `e8m0_shuffle(...)`.
+
+    When fuse_sort_scale=True, the kernel writes e8m0 scales in sorted tiled
+    layout directly, avoiding a separate moe_mxfp4_sort call.
+
+    When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
+    add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
+
+    When gate_only=True (requires k_batch>1), each workgroup computes only
+    one B-tile stream (no gate/up interleaving).  The grid X doubles so
+    that by_n naturally covers both gate and up regions.
+
+    Returns:
+        Basic:                      out
+        fuse_sort_scale:            (out, out_scale_sorted)
     """
     token_num = a.shape[0]
     E = w1.shape[0]
@@ -491,14 +516,34 @@ def flydsl_moe_stage1(
     if a_dtype == "fp4":
         model_dim = model_dim * 2
 
-    torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-
-    if out is None:
-        out = torch.empty(
-            (token_num, topk, inter_dim), dtype=torch_out_dtype, device=a.device
-        )
+    torch_out_dtype = (
+        dtypes.fp4x2
+        if fuse_fp4_quant
+        else dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
+    )
+    _is_splitk = k_batch > 1
 
     dev = a.device
+    _splitk_fq = _is_splitk and fuse_fp4_quant
+
+    if out is None:
+        if fuse_fp4_quant:
+            out = torch.empty(
+                (token_num, topk, inter_dim // 2), dtype=torch_out_dtype, device=dev
+            )
+        else:
+            out = torch.empty(
+                (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
+            )
+
+    if _is_splitk:
+        torch_tmp_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
+        tmp_out = torch.zeros(
+            (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
+        )
+    else:
+        tmp_out = None
+
     flat_a_scale = (
         a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
     )
@@ -511,7 +556,78 @@ def flydsl_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    tensor_api = _get_compiled_stage1(
+    _need_quant = fuse_fp4_quant or _splitk_fq
+    _need_sort = _need_quant and (fuse_sort_scale or _splitk_fq)
+
+    _sort_block_m = max(32, tile_m)
+    _all_blks = sorted_expert_ids.shape[0]
+    _dense_blks = (
+        min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
+        // _sort_block_m
+    )
+    _grid_y = min(_dense_blks, _all_blks)
+
+    _persist_m = persist_m if persist_m > 0 else 1
+
+    # Allocate sorted-scale buffer with padding for tiled layout
+    scale_cols = inter_dim // 32
+    sorted_size = max(
+        sorted_token_ids.shape[0], sorted_expert_ids.shape[0] * _sort_block_m
+    )
+    padded_rows = (sorted_size + 255) // 256 * 256
+    padded_cols = (scale_cols + 7) // 8 * 8
+    out_scale_sorted_flat = (
+        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        if _need_sort
+        else torch.empty(0, dtype=torch.uint8, device=dev)
+    )
+
+    # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
+    # handles activation + quant + scale-sort after the GEMM completes.
+    _gemm_fq = fuse_fp4_quant and not _is_splitk
+    _gemm_fss = fuse_sort_scale and not _is_splitk
+
+    _kernel_out = tmp_out if _is_splitk else out
+    is_fp4 = b_dtype == "fp4"
+    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    _k_in = model_dim
+
+    if is_fp4:
+        args = _s1_args_fp4(
+            _kernel_out.view(-1),
+            a.view(-1),
+            w1.view(-1),
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            out_scale_sorted_flat.view(-1),
+            token_num,
+            _n_in,
+            _k_in,
+            _grid_y,
+            dev,
+        )
+    else:
+        args = _s1_args_std(
+            _kernel_out.view(-1),
+            a.view(-1),
+            w1.view(-1),
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            _grid_y,
+        )
+
+    exe = compile_flydsl_moe_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -519,25 +635,50 @@ def flydsl_moe_stage1(
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
-        doweight=(sorted_weights is not None),
+        doweight_stage1=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
+        persist_m=_persist_m,
+        fuse_fp4_quant=_gemm_fq,
+        fuse_sort_scale=_gemm_fss,
+        use_async_copy=use_async_copy,
+        k_batch=k_batch,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_only=gate_only,
     )
-    tensor_api(
-        out.view(-1),
-        a.view(-1),
-        w1.view(-1),
-        flat_a_scale,
-        flat_w_scale,
-        sorted_token_ids,
-        sorted_expert_ids,
-        sw,
-        num_valid_ids,
-        token_num,
-        sorted_expert_ids.shape[0],
-    )
+    _run_compiled(exe, args)
+
+    if _splitk_fq:
+        _silu_fq = _get_compiled_silu_fq(inter_dim, topk)
+        num_sorted_rows = sorted_token_ids.shape[0]
+        _run_compiled(
+            _silu_fq,
+            (
+                tmp_out.view(-1, inter_dim * 2),
+                out.view(-1).view(torch.uint8),
+                out_scale_sorted_flat,
+                sorted_token_ids,
+                num_valid_ids,
+                token_num,
+                num_sorted_rows,
+                torch.cuda.current_stream(),
+            ),
+        )
+    elif _is_splitk:
+        from aiter.ops.activation import silu_and_mul
+
+        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+
+    if fuse_fp4_quant:
+        from aiter.utility.dtypes import fp8_e8m0
+
+        out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(
+            padded_rows, padded_cols
+        )
+        return out, out_scale_sorted
 
     return out
 
@@ -561,11 +702,19 @@ def flydsl_moe_stage2(
     w2_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
+    sort_block_m: int = 0,
+    persist: Optional[bool] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
     a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
     Returns (token_num, model_dim).
+
+    sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
+        assumed equal to tile_m. When set, stage2 can use a different tile_m
+        from sorting/stage1.
+    persist: if True, use persistent round-robin mode (grid_y=cu_num);
+        if False, use legacy persist_m mode; if None, auto-select.
     """
 
     token_num = inter_states.shape[0]
@@ -580,7 +729,8 @@ def flydsl_moe_stage2(
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
     if out is None:
-        out = torch.empty(
+        alloc_fn = torch.zeros if accumulate else torch.empty
+        out = alloc_fn(
             (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
         )
 
@@ -594,10 +744,69 @@ def flydsl_moe_stage2(
     sw = (
         sorted_weights
         if sorted_weights is not None
-        else torch.zeros(sorted_token_ids.shape, dtype=torch.float32, device=dev)
+        else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
     )
 
-    tensor_api = _get_compiled_stage2(
+    _sbm = sort_block_m if sort_block_m > 0 else tile_m
+    if _sbm == tile_m:
+        m_blocks = min(sorted_expert_ids.shape[0], token_num * topk)
+    else:
+        total_sorted = sorted_expert_ids.shape[0] * _sbm
+        m_blocks = (total_sorted + tile_m - 1) // tile_m
+    if persist is True:
+        _persist_m = -1
+    elif persist is False:
+        _persist_m = 4 if m_blocks > 256 else 1
+    else:
+        _persist_m = -1 if m_blocks > 256 else 1
+
+    is_fp4 = b_dtype == "fp4"
+    _n_in = model_dim
+    _k_in = inter_dim
+
+    target = out
+    if not accumulate:
+        target = torch.empty(
+            (token_num * topk * model_dim,),
+            device=out.device,
+            dtype=out.dtype,
+        )
+
+    if is_fp4:
+        args = _s2_args_fp4(
+            target,
+            inter_states,
+            w2,
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            m_blocks,
+            dev,
+        )
+    else:
+        args = _s2_args_std(
+            target,
+            inter_states,
+            w2,
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            m_blocks,
+        )
+
+    exe = compile_flydsl_moe_stage2(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -605,24 +814,17 @@ def flydsl_moe_stage2(
         tile_m=tile_m,
         tile_n=tile_n,
         tile_k=tile_k,
-        doweight=(sorted_weights is not None),
+        doweight_stage2=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         accumulate=accumulate,
+        persist_m=_persist_m,
+        sort_block_m=sort_block_m,
     )
-    tensor_api(
-        out,
-        inter_states,
-        w2,
-        flat_a_scale,
-        flat_w_scale,
-        sorted_token_ids,
-        sorted_expert_ids,
-        sw,
-        num_valid_ids,
-        token_num,
-        int(sorted_expert_ids.numel()),
-    )
+    _run_compiled(exe, args)
+
+    if not accumulate:
+        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
     return out

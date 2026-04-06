@@ -12,7 +12,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .utils import is_flydsl_available
 
-_REQUIRED_FLYDSL_VERSION = "0.1.1.dev409"
+_REQUIRED_FLYDSL_VERSION = "0.1.1.dev442"
 
 __all__ = [
     "is_flydsl_available",
@@ -39,7 +39,10 @@ if is_flydsl_available():
         flydsl_moe_stage2,
     )
 
+    from .gemm_kernels import flydsl_hgemm
+
     __all__ += [
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_hgemm",
     ]

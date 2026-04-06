@@ -33,6 +33,7 @@ _CU_SOURCES = [
     "test_load_store_if.cu",
     "test_vector_add.cu",
     "test_async_load.cu",
+    "test_tr_load_f16.cu",
     "test_dtype_convert.cu",
     "test_mdiv.cu",
     "test_numeric_limits.cu",

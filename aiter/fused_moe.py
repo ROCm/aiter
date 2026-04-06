@@ -622,6 +622,7 @@ class MOEMetadata:
     run_1stage: bool = False
     has_bias: bool = False
     use_non_temporal_load: bool = True
+    fuse_fp4_quant: bool = False
 
 
 def _flydsl_stage1_wrapper(
@@ -638,12 +639,16 @@ def _flydsl_stage1_wrapper(
     w1_scale=None,
     a1_scale=None,
     sorted_weights=None,
+    fuse_fp4_quant=False,
+    fuse_sort_scale=False,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    _fq = fuse_fp4_quant or parsed.get("fuse_fp4_quant", False)
+    _fss = fuse_sort_scale or (_fq and not fuse_sort_scale)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
@@ -662,6 +667,12 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        fuse_fp4_quant=_fq,
+        fuse_sort_scale=_fss,
+        k_batch=parsed.get("k_batch", 1),
+        waves_per_eu=parsed.get("waves_per_eu", 3),
+        b_nt=parsed.get("b_nt", 2),
+        gate_only=parsed.get("gate_only", False),
     )
 
 
@@ -702,6 +713,7 @@ def _flydsl_stage2_wrapper(
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
+        sort_block_m=parsed.get("sort_block_m", 0),
     )
 
 
@@ -944,6 +956,7 @@ def get_2stage_cfgs(
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+        _s1_fq = is_flydsl1 and "_fq" in kernelName1
         if is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
@@ -981,6 +994,7 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
+            fuse_fp4_quant=_s1_fq,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -993,6 +1007,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
+                split_k=max(ksplit, 1),
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1256,7 +1271,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        a2,
+        None if metadata.fuse_fp4_quant else a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
@@ -1266,7 +1281,16 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    if (
+    if metadata.fuse_fp4_quant and isinstance(a2, tuple):
+        a2_raw, a2_scale = a2[0], a2[1]
+        _fp4_bytes = token_num * topk * (inter_dim // 2)
+        a2 = (
+            a2_raw.view(-1)
+            .view(torch.uint8)[:_fp4_bytes]
+            .view(dtypes.fp4x2)
+            .reshape(token_num, topk, -1)
+        )
+    elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
@@ -1707,13 +1731,14 @@ def ck_moe_stage1(
 ):
     token_num = hidden_states.shape[0]
     is_splitk = quant_type is aiter.QuantType.per_1x128 and splitk > 1
-    tmp_out = (
-        torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=dtypes.fp32, device=out.device
+    if is_splitk:
+        # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
+        sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
+        tmp_out = torch.empty(
+            (sorted_size, w1.shape[1]), dtype=dtypes.fp32, device=out.device
         )
-        if is_splitk
-        else out
-    )
+    else:
+        tmp_out = out
     aiter.ck_moe_stage1_fwd(
         hidden_states,
         w1,
@@ -1735,10 +1760,11 @@ def ck_moe_stage1(
         out.dtype,
     )
     if is_splitk:
+        valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
+            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32))
+            aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
     return out
 
 
@@ -1773,6 +1799,12 @@ def cktile_moe_stage1(
         D = D * 8
 
     out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
+    # WARNING: when split_k > 1, this allocation has the same undersized buffer
+    # pattern fixed in ck_moe_stage1 (see ROCm/aiter#2508). If the CK tile
+    # kernel calls hipMemsetAsync with sorted_size rows, this will overflow.
+    # When fp32 splitk is enabled, apply the same fix: use sorted_size =
+    # min(token_num * topk * block_m, sorted_token_ids.shape[0]) and slice
+    # valid_out = tmp_out[:token_num * topk, :] before silu_and_mul/gelu_and_mul.
     tmp_out = (
         torch.zeros(
             (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
@@ -1879,7 +1911,8 @@ def fused_topk(
     )
 
     if (
-        (expert, topk)
+        get_gfx() in ["gfx942", "gfx950"]
+        and (expert, topk)
         in [
             (128, 4),
             (128, 6),
