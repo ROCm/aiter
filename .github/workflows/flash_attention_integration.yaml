@@ -201,14 +201,14 @@ jobs:
                 tests/test_flash_attn_triton_amd.py
             "
           else
-            # PR: core API subset
+            # PR: one representative seqlen per test function
             docker exec fa_triton_test bash -c "
               cd /flash-attention
               FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
               FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0 \
               pytest -v --reruns 2 --timeout=120 \
                 tests/test_flash_attn_triton_amd.py \
-                -k 'test_flash_attn_output or test_flash_attn_kvcache'
+                -k '(test_flash_attn_output and 2048-2048) or (test_flash_attn_varlen_output and 2048-2048) or (test_flash_attn_kvcache and 16-20000)'
             "
           fi
 
