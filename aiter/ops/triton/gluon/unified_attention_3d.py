@@ -756,21 +756,21 @@ class AttentionProgram:
         return L, M, acc
 
     @gluon.jit
-    def load_physical_block_idx_with_mask(
-        self, j, block_tables_ptr_shifted, max_num_blocks_per_seq
+    def load_physical_block_idx_with_mod(
+        self, j, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
     ):
         if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             # TDM load
             physical_block_idx = gl.load(
-                block_tables_ptr_shifted + j, mask=j < max_num_blocks_per_seq, other=0
+                block_tables_ptr_shifted + j_hbm_start + (j % max_num_blocks_this_seg)
             )
         return j + 1, physical_block_idx
 
     @gluon.jit
-    def load_physical_block_idx(self, j, block_tables_ptr_shifted):
+    def load_physical_block_idx(self, j, block_tables_ptr_shifted, j_hbm_start):
         if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             # TDM load
-            physical_block_idx = gl.load(block_tables_ptr_shifted + j)
+            physical_block_idx = gl.load(block_tables_ptr_shifted + j_hbm_start + j)
         else:
             # TDM gather
             offs_j = gl.arange(
@@ -780,7 +780,7 @@ class AttentionProgram:
             )
             physical_block_idx = gl.load(
                 block_tables_ptr_shifted
-                + j * self.cfg.NUM_BLOCKS_GATHER_PER_TILE
+                + (j_hbm_start + j) * self.cfg.NUM_BLOCKS_GATHER_PER_TILE
                 + offs_j
             )
 
@@ -1112,39 +1112,40 @@ class AttentionProgram:
                 & self.query_mask_1_pv[:, None],
             )
 
-        segm_offset = (
-            self.query_offset_0_qk
-            * (self.cfg.NUM_QUERY_HEADS * self.cfg.NUM_SEGMENTS_PER_SEQ)
-            + self.query_offset_1_qk * self.cfg.NUM_SEGMENTS_PER_SEQ
-            + segm_idx
-        )
-        L = gl.convert_layout(L, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT))
-        M = gl.convert_layout(M, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT))
+        if self.cfg.NUM_SEGMENTS_PER_SEQ > 1:
+            segm_offset = (
+                self.query_offset_0_qk
+                * (self.cfg.NUM_QUERY_HEADS * self.cfg.NUM_SEGMENTS_PER_SEQ)
+                + self.query_offset_1_qk * self.cfg.NUM_SEGMENTS_PER_SEQ
+                + segm_idx
+            )
+            L = gl.convert_layout(L, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT))
+            M = gl.convert_layout(M, layout=gl.SliceLayout(1, self.cfg.QK_WMMA_LAYOUT))
 
-        if self.cfg.USE_STORE_BUFFER_OP:
-            gl.amd.cdna4.buffer_store(
-                stored_value=M,
-                ptr=self.segm_max_ptr,
-                offsets=segm_offset.to(gl.int32),
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
-            gl.amd.cdna4.buffer_store(
-                stored_value=L,
-                ptr=self.segm_expsum_ptr,
-                offsets=segm_offset.to(gl.int32),
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
-        else:
-            gl.store(
-                self.segm_max_ptr + segm_offset.to(gl.int64),
-                M,
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
-            gl.store(
-                self.segm_expsum_ptr + segm_offset.to(gl.int64),
-                L,
-                mask=self.query_mask_0_qk & self.query_mask_1_qk,
-            )
+            if self.cfg.USE_STORE_BUFFER_OP:
+                gl.amd.cdna4.buffer_store(
+                    stored_value=M,
+                    ptr=self.segm_max_ptr,
+                    offsets=segm_offset.to(gl.int32),
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
+                gl.amd.cdna4.buffer_store(
+                    stored_value=L,
+                    ptr=self.segm_expsum_ptr,
+                    offsets=segm_offset.to(gl.int32),
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
+            else:
+                gl.store(
+                    self.segm_max_ptr + segm_offset.to(gl.int64),
+                    M,
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
+                gl.store(
+                    self.segm_expsum_ptr + segm_offset.to(gl.int64),
+                    L,
+                    mask=self.query_mask_0_qk & self.query_mask_1_qk,
+                )
 
     @gluon.jit
     def store_output(
@@ -1289,7 +1290,8 @@ def _unified_attention_gluon_kernel_3d(
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
     q_scale_ptr,  # [1, ], float32
     k_scale_ptr,  # [1, ], float32
-    v_scale_ptr,  # [1, ], float32
+    v_scale_ptr,  # [1, ], float32v
+    out_scale_ptr,  # [1, ], float32
     softcap,  # float32
     num_seqs: gl.int32,  # int
     num_blocks: gl.int32,  # int
@@ -1332,6 +1334,8 @@ def _unified_attention_gluon_kernel_3d(
     USE_STORE_BUFFER_OP: gl.constexpr = False,  # bool
     IS_Q_FP8: gl.constexpr = False,  # bool
     IS_KV_FP8: gl.constexpr = False,  # bool
+    FP8_MIN: tl.constexpr = float8_info.min,
+    FP8_MAX: tl.constexpr = float8_info.max,
 ):
     assert num_stages == 2
     # Build config with all layouts and derived constants
@@ -1413,10 +1417,12 @@ def _unified_attention_gluon_kernel_3d(
     else:
         k_scale = None
 
+    out_factor: gl.float32 = 1.0
     if v_scale_ptr is not None:
-        v_scale = gl.load(v_scale_ptr)
-    else:
-        v_scale = None
+        out_factor = gl.load(v_scale_ptr)
+
+    if out_scale_ptr is not None:
+        out_factor = out_factor * tl.load(out_scale_ptr)
 
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
@@ -1468,6 +1474,7 @@ def _unified_attention_gluon_kernel_3d(
     )
     query_mask_0_qk = query_pos_qk < cur_batch_query_len
     query_mask_1_qk = query_offset_1_qk < cfg.NUM_QUERY_HEADS
+    # query_mask_qk = query_mask_0_qk[:, None] & query_mask_1_qk[:, None]
 
     query_offset_0_pv = gl.convert_layout(
         query_offset_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
@@ -1551,34 +1558,39 @@ def _unified_attention_gluon_kernel_3d(
         # qk_factor,
     )
 
-    j_hbm: gl.int32 = segm_idx * tiles_per_segment
+    j_hbm_start: gl.int32 = pgm.tile_start
+    max_num_blocks_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
+    j_hbm: gl.int32 = 0
     buffer_id: gl.int32 = 0
     need_addtional_mask: gl.constexpr = (
         cfg.SLIDING_WINDOW > 0 or cfg.USE_ALIBI_SLOPES or cfg.USE_QQ_BIAS
     )
+    # seq_offset = j_hbm_start * cfg.TILE_SIZE + gl.arange(
+    #     0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
+    # )
     if need_addtional_mask:
-        seq_offset = j_hbm * cfg.TILE_SIZE + gl.arange(
+        seq_offset = j_hbm_start * cfg.TILE_SIZE + gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
         )
 
+    # physical_block_idx: gl.int32 = j_hbm_start + seq_idx * block_table_stride
     j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-        j_hbm, block_tables_ptr_shifted
+        j_hbm, block_tables_ptr_shifted, j_hbm_start
     )
-    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mask(
-        j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
+    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+        j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
     )
     pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
     pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=buffer_id)
-    physical_block_idx = next_physical_block_idx
 
     # Main attention loop over KV tiles (staged, num_stages=2)
-    for j in range(pgm.tile_start, pgm.tile_end - (cfg.NUM_STAGES - 1)):
-        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mask(
-            j_hbm, block_tables_ptr_shifted, max_num_blocks_per_seq
+    for j in range(pgm.tile_start, pgm.tile_end - 1):
+        # physical_block_idx = physical_block_idx + 1
+        physical_block_idx = next_physical_block_idx
+        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
         )
-        k = pgm.tdm_shared_load_k(
-            wait_count=(cfg.NUM_STAGES - 2) * 2 + 1, buffer_id=buffer_id
-        )
+        k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
         next_buffer_id = pgm.get_next_buffer_id(buffer_id)
         # Prefetch next tile (shared is free since k, v are in registers)
         pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=next_buffer_id)
@@ -1594,17 +1606,15 @@ def _unified_attention_gluon_kernel_3d(
             S = pgm.apply_addtional_mask_qk(
                 S, seq_offset, alibi_slope, qq_bias_row_ptrs
             )
-        # p, alpha, M = pgm.softmax_part0(S, M, qk_factor)
+
         p, alpha, M = pgm.softmax_part0(S, M)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
-        v = pgm.tdm_shared_load_v(
-            wait_count=(cfg.NUM_STAGES - 1) * 2, buffer_id=buffer_id
-        )
+        v = pgm.tdm_shared_load_v(wait_count=2, buffer_id=buffer_id)
         acc = pgm.compute_pv(p, v, acc)
 
         buffer_id = next_buffer_id
-        physical_block_idx = next_physical_block_idx
+        # seq_offset += cfg.TILE_SIZE
         if need_addtional_mask:
             seq_offset += cfg.TILE_SIZE
 
@@ -1612,38 +1622,33 @@ def _unified_attention_gluon_kernel_3d(
         seq_offset = (pgm.tile_end - (cfg.NUM_STAGES - 1)) * cfg.TILE_SIZE + gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
         )
-    for _ in range(cfg.NUM_STAGES - 1):
-        # Load k_i, v_i from shared into registers
-        k = pgm.tdm_shared_load_k(
-            wait_count=(cfg.NUM_STAGES - 2) * 2 + 1, buffer_id=buffer_id
-        )
-        # Compute attention for current tile
-        S = pgm.compute_qk(k)
-        S = S * qk_factor
 
-        S = pgm.apply_softcap(S)
-        seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
-        S = gl.where(seq_mask, S, float("-inf"))
-        if need_addtional_mask:
-            S = pgm.apply_addtional_mask_qk(
-                S, seq_offset, alibi_slope, qq_bias_row_ptrs
-            )
-        # p, alpha, M = pgm.softmax_part0(S, M, qk_factor)
-        p, alpha, M = pgm.softmax_part0(S, M)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+    # Load k_i, v_i from shared into registers
+    k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
+    # Compute attention for current tile
+    S = pgm.compute_qk(k)
+    S = S * qk_factor
 
-        v = pgm.tdm_shared_load_v(
-            wait_count=(cfg.NUM_STAGES - 2) * 2, buffer_id=buffer_id
-        )
-        acc = pgm.compute_pv(p, v, acc)
+    S = pgm.apply_softcap(S)
+    seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
+    S = gl.where(seq_mask, S, float("-inf"))
+    if need_addtional_mask:
+        S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
 
-        if cfg.NUM_STAGES > 2:
-            seq_offset += cfg.TILE_SIZE
+    p, alpha, M = pgm.softmax_part0(S, M)
+    p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
+
+    v = pgm.tdm_shared_load_v(wait_count=0, buffer_id=buffer_id)
+    acc = pgm.compute_pv(p, v, acc)
 
     # M = M * qk_factor
 
-    if v_scale_ptr is not None:
-        acc = acc * v_scale
+    acc = acc * out_factor
+    if cfg.NUM_SEGMENTS_PER_SEQ == 1:
+        one_over_L = 1.0 / L[:, None]
+        acc = acc * gl.convert_layout(one_over_L, layout=cfg.PV_WMMA_LAYOUT)
+    if out_scale_ptr is not None:
+        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     pgm.store_output_3D(
         acc,

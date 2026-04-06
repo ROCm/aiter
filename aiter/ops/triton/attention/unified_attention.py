@@ -15,6 +15,9 @@ from aiter.ops.triton.gluon.unified_attention_3d import (
 from aiter.ops.triton.gluon.unified_attention_3d_unroll2 import (
     _unified_attention_gluon_kernel_3d_unroll2,
 )
+from aiter.ops.triton.gluon.unified_attention_3d_unroll2_simple import (
+    _unified_attention_gluon_kernel_3d_unroll2_simple,
+)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
@@ -89,21 +92,26 @@ def select_3d_config(
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
+    num_segments = 0
     if shuffled_kv_cache:
         if kv_cache_dtype == torch.bfloat16:
             if num_2d_prgms >= 256:
                 attn_warps = 1
                 waves_per_eu = 2
+                num_segments = 1
             else:
-                attn_warps = 2
-                waves_per_eu = 1
+                attn_warps = 1
+                waves_per_eu = 2
+                num_segments = 8
         else:
             if num_2d_prgms >= 256:
                 attn_warps = 1
                 waves_per_eu = 2
+                num_segments = 1
             else:
-                attn_warps = 2
-                waves_per_eu = 1
+                attn_warps = 1
+                waves_per_eu = 2
+                num_segments = 8
 
         assert (
             block_size >= 64
@@ -112,12 +120,13 @@ def select_3d_config(
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
-    num_segments = min(num_segments, MAX_SEGMENTS)
-    num_segments = triton.next_power_of_2(num_segments)
-    num_segments = min(num_segments, 128)
     MIN_SEGMENTS = min(8, MAX_SEGMENTS)
-    num_segments = max(num_segments, MIN_SEGMENTS)
+    if num_segments == 0:
+        num_segments = math.ceil(target_num_prgms / num_2d_prgms)
+        num_segments = min(num_segments, MAX_SEGMENTS)
+        num_segments = triton.next_power_of_2(num_segments)
+        num_segments = min(num_segments, 128)
+        num_segments = max(num_segments, MIN_SEGMENTS)
 
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
@@ -336,31 +345,37 @@ def unified_attention(
             shuffled_kv_cache,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
-        segm_output = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            triton.next_power_of_2(head_size),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        segm_max = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        segm_expsum = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            dtype=torch.float32,
-            device=q.device,
-        )
+        if NUM_SEGMENTS > 1:
+            segm_output = torch.empty(
+                q.shape[0],
+                num_query_heads,
+                NUM_SEGMENTS,
+                triton.next_power_of_2(head_size),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            segm_max = torch.empty(
+                q.shape[0],
+                num_query_heads,
+                NUM_SEGMENTS,
+                dtype=torch.float32,
+                device=q.device,
+            )
+            segm_expsum = torch.empty(
+                q.shape[0],
+                num_query_heads,
+                NUM_SEGMENTS,
+                dtype=torch.float32,
+                device=q.device,
+            )
+        else:
+            segm_output = out
+            segm_max = out  # dummy ptr
+            segm_expsum = out  # dummy ptr
 
         if IS_DEVICE_ARCH_GFX12:
             print(attn_config)
+            # _unified_attention_gluon_kernel_3d_unroll2_simple[
             # _unified_attention_gluon_kernel_3d_unroll2[
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
@@ -379,6 +394,11 @@ def unified_attention(
                 q_scale_ptr=q_descale,
                 k_scale_ptr=k_descale,
                 v_scale_ptr=v_descale,
+                out_scale_ptr=(
+                    1 / output_scale
+                    if (output_scale is not None and NUM_SEGMENTS == 1)
+                    else None
+                ),
                 softcap=softcap,
                 num_seqs=num_seqs,
                 num_blocks=num_blocks,
@@ -466,7 +486,9 @@ def unified_attention(
                 **attn_config,
             )
 
-        if skip_reduce:
+        if NUM_SEGMENTS == 1:
+            return segm_output
+        elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
         reduce_segments[(q.shape[0], num_query_heads)](
