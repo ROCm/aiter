@@ -88,29 +88,6 @@ def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: gl.constexp
 
 
 @gluon.jit
-def xcd_swizzle(pid, domain_size, XCD_SWIZZLE: gl.constexpr):
-    """
-    Swizzle the program id based on integer XCD_SWIZZLE.
-    This is useful for reording how blocks are ordered. A scheduler may, for example,
-    assign sequential blocks 0, 1, 2, 3, ..., 8, 9, 10.. to its 8 hardware units 0, 1, 2, 3, ..., 0, 1, 2.
-    This pattern may not be ideal for memory access, and it may be better to swizzle so the assignment
-    becomes 0, 0, 0, 0, ..., 1, 1, 1, ... In the swizzled arrangement, sequential blocks are assigned to
-    the same hardware unit.
-    """
-    # Number of pids per group in the new arrangement
-    pids_per_group = domain_size // XCD_SWIZZLE
-    extra_pid_groups = domain_size % XCD_SWIZZLE
-
-    # Compute current current and local pid within the group
-    group = pid % XCD_SWIZZLE
-    local_pid = pid // XCD_SWIZZLE
-
-    # Calculate new pid based on the new grouping
-    new_pid = group * pids_per_group + min(group, extra_pid_groups) + local_pid
-    return new_pid
-
-
-@gluon.jit
 def clip(x, limit, clip_lower: gl.constexpr):
     res = gl.minimum(x, limit)
     if clip_lower:
@@ -344,8 +321,6 @@ def _moe_gemm_a4w4_gfx1250(
 
     # swizzle program ids
     pid_emnk = pid
-    if XCD_SWIZZLE != 1:
-        pid_emnk = xcd_swizzle(pid_emnk, total_actual_tiles, XCD_SWIZZLE)
     # pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
     pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
     pid_k = pid_mnk % SPLIT_K
