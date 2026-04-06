@@ -12,12 +12,11 @@ from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _mxfp4_quant_kernel,
     _moe_gemm_a4w4,
-    _reduce_grouped,
 )
 from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_gfx1250,
-    _reduce_grouped_gfx1250,
 )
+from aiter.ops.triton.moe.reduce import reduce_grouped
 
 GLUON_SUPPORTED_ARCHS = set(["gfx1250"])
 
@@ -164,112 +163,6 @@ def swizzle_scales_gfx1250(data):
     return data.transpose(-1, -2)
 
 
-def reduce_grouped(
-    x: torch.Tensor,
-    indx: torch.Tensor,
-    out: torch.Tensor,
-    apply_swiglu=False,
-    alpha=1.0,
-    limit=1.0,
-    reduction_n=1,
-    backend: Optional[Literal["triton", "gluon"]] = None,
-    out_dtype: Optional[torch.dtype] = None,
-):
-    """
-    In-place grouped row reduction.
-
-    Arguments
-    - x: Tensor[AnyFloat] of shape [(num_groups * K), N]
-    - indx: Tensor[Int] of shape [num_groups, K]
-
-    Description
-    For each group g in [0, num_groups), this routine sums the K rows of `x`
-    specified by `indx[g, :]` and overwrites the row corresponding to the first
-    valid (non-negative) index with the per-group sum. Accumulation is performed
-    in float32 for numerical stability, and the result is written back in the
-    dtype of `x`.
-
-    Behavior and edge cases
-    - Invalid (-1) entries are skipped during accumulation and do not generate
-      memory traffic. If a group has no valid entries, nothing is written for
-      that group.
-    - Reduction is performed tile-by-tile along the N dimension within a single
-      kernel launch (persistent along N) to minimize launch overhead.
-
-    Performance notes
-    - Memory traffic per group is approximately (valid_rows_read + 1) * N * sizeof(x),
-      plus index reads. With no invalid entries, this becomes (K + 1) reads/writes
-      of length N per group.
-
-    Returns
-    - The input tensor `x` (modified in place).
-    """
-    if indx is None and x.shape[0] == 1:
-        return x.squeeze(0)
-    if indx is not None:
-        num_groups = indx.shape[0]
-    else:
-        num_groups = x.shape[-2]
-    K = 1 if indx is None else indx.shape[1]
-    out_dtype = x.dtype if out_dtype is None else out_dtype
-    assert x.shape[-1] % reduction_n == 0
-    BLOCK_N = 512
-    num_blocks = triton.cdiv(x.shape[-1], BLOCK_N)
-    num_warps = 2
-
-    if backend == "gluon" and get_arch() == "gfx1250":
-        BLOCKED_LAYOUT_N: gl.constexpr = gl.BlockedLayout(
-            [BLOCK_N], [32], [num_warps], [0]
-        )
-        BLOCKED_LAYOUT_N_OUT: gl.constexpr = gl.BlockedLayout(
-            [BLOCK_N // reduction_n], [32], [num_warps], [0]
-        )
-        _reduce_grouped_gfx1250[(num_blocks, num_groups)](
-            x,
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),  #
-            out,
-            out.stride(0),
-            out.stride(1),  #
-            indx,  #
-            x.shape[0],
-            x.shape[-1],  #
-            apply_swiglu,
-            alpha,
-            limit,
-            reduction_n,
-            BLOCK_N=BLOCK_N,
-            EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-            K=K,  #
-            BLOCKED_LAYOUT_N=BLOCKED_LAYOUT_N,
-            BLOCKED_LAYOUT_N_OUT=BLOCKED_LAYOUT_N_OUT,
-            num_warps=num_warps,  #
-        )
-    else:
-        _reduce_grouped[(num_blocks, num_groups)](
-            x,
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),  #
-            out,
-            out.stride(0),
-            out.stride(1),  #
-            indx,  #
-            x.shape[0],
-            x.shape[-1],  #
-            apply_swiglu,
-            alpha,
-            limit,
-            reduction_n,
-            BLOCK_N=BLOCK_N,
-            EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-            K=K,  #
-            num_warps=num_warps,  #
-        )
-    return out
-
-
 @gluon.constexpr_function
 def get_wmma_layout(num_warps, packed, scale_preshuffle):
     assert num_warps in (4, 8)
@@ -368,6 +261,7 @@ def moe_gemm_a4w4(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
+    add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
     config=None,
@@ -592,6 +486,7 @@ def moe_gemm_a4w4(
         reduction_n_reduction,
         backend=backend,
         out_dtype=out_dtype,
+        add_residual=add_residual,
     )
     return y_final
 
