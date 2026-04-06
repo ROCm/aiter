@@ -216,6 +216,7 @@ def _moe_gemm_a4w4_gfx1250(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
     # MoE config
     N_EXPTS_ACT: gl.constexpr,
     # optimization config

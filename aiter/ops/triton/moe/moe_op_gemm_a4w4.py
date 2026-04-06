@@ -393,6 +393,7 @@ def moe_gemm_a4w4(
             alpha,
             limit,
             reduction_n_matmul,
+            add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -452,6 +453,7 @@ def moe_gemm_a4w4(
             alpha,
             limit,
             reduction_n_matmul,
+            add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
@@ -495,7 +497,7 @@ def moe_gemm_a4w4(
 # -----------------------------------------------------------------------------
 
 
-def swiglu_torch(a, alpha, limit):
+def swiglu_torch(a, alpha, limit, add_residual=True):
     a_gelu = a[..., ::2]
     if limit is not None:
         a_gelu = a_gelu.clamp(max=limit)
@@ -504,7 +506,10 @@ def swiglu_torch(a, alpha, limit):
         a_linear = a_linear.clamp(min=-limit, max=limit)
 
     out_gelu = a_gelu * torch.sigmoid(alpha * a_gelu)
-    out = out_gelu * (a_linear + 1)
+    if add_residual:
+        out = out_gelu * (a_linear + 1)
+    else:
+        out = out_gelu * a_linear
     return out
 
 
@@ -519,6 +524,7 @@ def moe_gemm_torch(
     apply_swiglu=False,
     alpha=1.0,
     limit=1.0,
+    add_residual=True,
 ):
     assert x.dtype.itemsize > 1
     assert w.dtype.itemsize > 1
@@ -548,7 +554,7 @@ def moe_gemm_torch(
         if bias is not None:
             out += bias[i, :]
         if apply_swiglu:
-            out = swiglu_torch(out, alpha, limit)
+            out = swiglu_torch(out, alpha, limit, add_residual)
         if gammas is not None:
             out *= gammas[lo:hi, None]
         y[lo:hi, :] = out
