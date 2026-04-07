@@ -27,6 +27,13 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
+    if installed_flydsl_version != _REQUIRED_FLYDSL_VERSION:
+        raise ImportError(
+            "Unsupported `flydsl` version: "
+            f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
+            f"got `{installed_flydsl_version}`."
+        )
+
     from .moe_kernels import (
         flydsl_moe_stage1,
         flydsl_moe_stage2,
