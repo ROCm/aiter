@@ -378,15 +378,28 @@ def _moe_gemm_a4w4_gfx1250(
     offs_w_n_scale = pid_n * SCALE_BLOCK_N
 
     # shared layouts
-    SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[PACKED_BLOCK_K_X, 16]], [PACKED_BLOCK_M_X, PACKED_BLOCK_K_X], [1, 0]
-    )
-    SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[PACKED_BLOCK_K_W, 16]], [PACKED_BLOCK_N_W, PACKED_BLOCK_K_W], [1, 0]
-    )
-    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
-    )
+    if PACKED_BLOCK_K_X <= 256:
+        SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]], [PACKED_BLOCK_M_X, PACKED_BLOCK_K_X], [1, 0]
+        )
+    else:
+        SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[PACKED_BLOCK_K_X, 16]], [PACKED_BLOCK_M_X, PACKED_BLOCK_K_X], [1, 0]
+        )
+    if PACKED_BLOCK_K_W <= 256:
+        SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]], [PACKED_BLOCK_N_W, PACKED_BLOCK_K_W], [1, 0]
+        )
+    else:
+        SHARED_LAYOUT_W: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[PACKED_BLOCK_K_W, 16]], [PACKED_BLOCK_N_W, PACKED_BLOCK_K_W], [1, 0]
+        )
+    if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+        SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    else:
+        SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
+        )
 
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
