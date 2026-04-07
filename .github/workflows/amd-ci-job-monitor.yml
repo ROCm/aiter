@@ -218,8 +218,4 @@ jobs:
             --runner-report \
             --summary | tee runner-fleet-report.md
 
-          {
-            echo "## Runner Fleet Summary"
-            echo ""
-            cat runner-fleet-report.md
-          } >> "$GITHUB_STEP_SUMMARY"
+          cat runner-fleet-report.md >> "$GITHUB_STEP_SUMMARY"

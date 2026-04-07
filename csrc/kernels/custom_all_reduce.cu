@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "custom_all_reduce.cuh"
+#include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include <cstring>
 
@@ -71,9 +72,10 @@ int64_t meta_size() { return sizeof(aiter::Signal); }
 // ---- Internal dispatch helpers ----
 
 static void _all_reduce(fptr_t _fa, void* inp, void* out,
-                        int64_t numel, AiterDtype dtype, hipStream_t stream,
+                        int64_t numel, AiterDtype dtype,
                         bool use_new, bool open_fp8_quant, bool is_broadcast_reg_outptr)
 {
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     switch(dtype)
     {
@@ -116,8 +118,9 @@ static void _all_reduce(fptr_t _fa, void* inp, void* out,
 }
 
 static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
-                            int64_t size, AiterDtype dtype, hipStream_t stream)
+                            int64_t size, AiterDtype dtype)
 {
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     switch(dtype)
     {
@@ -151,9 +154,9 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
 
 static void _all_gather(fptr_t _fa, void* inp, void* out,
                         int64_t size, AiterDtype dtype,
-                        int64_t last_dim_size, int64_t gather_dim,
-                        hipStream_t stream)
+                        int64_t last_dim_size, int64_t gather_dim)
 {
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     switch(dtype)
     {
@@ -191,9 +194,9 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      void* scale_out, void* w,
                                      AiterDtype dtype, float eps,
                                      int m, int n,
-                                     bool use_1stage,
-                                     hipStream_t stream)
+                                     bool use_1stage)
 {
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     bool use_fp8_per_token_quant = (scale_out != nullptr);
 
@@ -320,9 +323,9 @@ void register_graph_buffers(fptr_t _fa,
 
 #ifdef USE_ROCM
 
-int64_t allocate_meta_buffer(int64_t size, int64_t stream_ptr)
+int64_t allocate_meta_buffer(int64_t size)
 {
-    auto stream = (hipStream_t)stream_ptr;
+    hipStream_t stream = aiter::getCurrentHIPStream();
     void* buffer;
     hipStreamCaptureMode mode = hipStreamCaptureModeRelaxed;
     HIP_CALL(hipThreadExchangeStreamCaptureMode(&mode));
@@ -351,11 +354,9 @@ void all_reduce(fptr_t _fa,
                 const aiter_tensor_t& inp,
                 const aiter_tensor_t& out,
                 bool use_new, bool open_fp8_quant,
-                int64_t reg_inp_ptr, int64_t reg_inp_bytes,
-                int64_t reg_out_ptr, int64_t reg_out_bytes,
-                int64_t stream_ptr)
+                int64_t reg_inp_ptr, int64_t reg_inp_bytes)
 {
-    auto stream    = (hipStream_t)stream_ptr;
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
@@ -363,14 +364,11 @@ void all_reduce(fptr_t _fa,
     void* actual_inp = inp.data_ptr();
     void* actual_out = out.data_ptr();
 
-    bool is_broadcast_reg_outptr = (reg_out_ptr == 0);
-
-    if(reg_inp_ptr == 0 && reg_out_ptr == 0)
-    {
-        _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
-                    use_new, open_fp8_quant, is_broadcast_reg_outptr);
-        return;
-    }
+    // reg_inp_ptr == 0 means the input tensor itself is IPC-registered
+    // (graph mode), so the write-mode kernel can directly write to peer
+    // GPUs via IPC-registered output buffers.  In eager mode (reg_inp_ptr
+    // != 0) the output is not IPC-registered, kernel uses temp-buffer path.
+    bool is_broadcast_reg_outptr = (reg_inp_ptr == 0);
 
     if(reg_inp_ptr != 0)
     {
@@ -381,30 +379,16 @@ void all_reduce(fptr_t _fa,
         actual_inp = (void*)reg_inp_ptr;
     }
 
-    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
-    {
-        if(data_bytes > reg_out_bytes)
-            throw std::runtime_error("registered output buffer is too small to contain the output");
-        actual_out = (void*)reg_out_ptr;
-    }
-
-    _all_reduce(_fa, actual_inp, actual_out, numel, dtype, stream,
+    _all_reduce(_fa, actual_inp, actual_out, numel, dtype,
                 use_new, open_fp8_quant, is_broadcast_reg_outptr);
-
-    if(reg_out_ptr != 0 && is_broadcast_reg_outptr)
-    {
-        HIP_CALL(hipMemcpyAsync(out.data_ptr(), (void*)reg_out_ptr, data_bytes,
-                                hipMemcpyDeviceToDevice, stream));
-    }
 }
 
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t reg_ptr, int64_t reg_bytes,
-                    int64_t stream_ptr)
+                    int64_t reg_ptr, int64_t reg_bytes)
 {
-    auto stream    = (hipStream_t)stream_ptr;
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t inp_numel  = inp.numel();
     int64_t data_bytes = inp_numel * inp.element_size();
@@ -415,24 +399,22 @@ void reduce_scatter(fptr_t _fa,
             throw std::runtime_error("registered buffer is too small to contain the input");
         HIP_CALL(hipMemcpyAsync((void*)reg_ptr, inp.data_ptr(), data_bytes,
                                 hipMemcpyDeviceToDevice, stream));
-        _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(), inp_numel, dtype, stream);
+        _reduce_scatter(_fa, (void*)reg_ptr, out.data_ptr(), inp_numel, dtype);
     }
     else
     {
-        _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(), inp_numel, dtype, stream);
+        _reduce_scatter(_fa, inp.data_ptr(), out.data_ptr(), inp_numel, dtype);
     }
 }
 
 void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t dim,
-                    int64_t stream_ptr)
+                    int64_t dim)
 {
-    auto stream = (hipStream_t)stream_ptr;
     int64_t last_dim_size = inp.size(-1);
     _all_gather(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
-                last_dim_size, dim, stream);
+                last_dim_size, dim);
 }
 
 void all_gather_unreg(fptr_t _fa,
@@ -440,10 +422,9 @@ void all_gather_unreg(fptr_t _fa,
                       int64_t reg_buffer,
                       const aiter_tensor_t& out,
                       int64_t reg_bytes,
-                      int64_t dim,
-                      int64_t stream_ptr)
+                      int64_t dim)
 {
-    auto stream    = (hipStream_t)stream_ptr;
+    hipStream_t stream = aiter::getCurrentHIPStream();
     int64_t data_bytes = inp.numel() * inp.element_size();
     int64_t last_dim_size = inp.size(-1);
 
@@ -452,7 +433,7 @@ void all_gather_unreg(fptr_t _fa,
     HIP_CALL(hipMemcpyAsync((void*)reg_buffer, inp.data_ptr(), data_bytes,
                             hipMemcpyDeviceToDevice, stream));
     _all_gather(_fa, (void*)reg_buffer, out.data_ptr(), inp.numel(), inp.dtype(),
-                last_dim_size, dim, stream);
+                last_dim_size, dim);
 }
 
 void fused_allreduce_rmsnorm(fptr_t _fa,
@@ -463,10 +444,9 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              const aiter_tensor_t& w,
                              double eps,
                              int64_t reg_ptr, int64_t reg_bytes,
-                             bool use_1stage,
-                             int64_t stream_ptr)
+                             bool use_1stage)
 {
-    auto stream    = (hipStream_t)stream_ptr;
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
@@ -482,14 +462,14 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage, stream);
+                                 dtype, (float)eps, m, n, use_1stage);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), nullptr, w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage, stream);
+                                 dtype, (float)eps, m, n, use_1stage);
     }
 }
 
@@ -502,10 +482,9 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& w,
                                    double eps,
                                    int64_t reg_ptr, int64_t reg_bytes,
-                                   bool use_1stage,
-                                   int64_t stream_ptr)
+                                   bool use_1stage)
 {
-    auto stream    = (hipStream_t)stream_ptr;
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
@@ -521,14 +500,14 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage, stream);
+                                 dtype, (float)eps, m, n, use_1stage);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, n, use_1stage, stream);
+                                 dtype, (float)eps, m, n, use_1stage);
     }
 }
 
