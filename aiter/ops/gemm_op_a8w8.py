@@ -284,31 +284,6 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     return out
 
 
-@compile_ops(
-    "module_gemm_gfx950_a8w8_blockscale_asm",
-    fc_name="mi350_a8w8_blockscale_asm",
-    ffi_type="ctypes",
-)
-def _gfx950_a8w8_blockscale_asm(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-) -> None: ...
-
-
-def gfx950_a8w8_blockscale_asm(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-) -> Tensor:
-    _gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, out)
-    return out
-
-
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
