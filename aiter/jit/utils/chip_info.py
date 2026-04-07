@@ -8,40 +8,12 @@ import subprocess
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
-GFX_MAP = {
-    0: "native",
-    1: "gfx90a",
-    2: "gfx908",
-    3: "gfx940",
-    4: "gfx941",
-    5: "gfx942",
-    6: "gfx945",
-    7: "gfx1100",
-    8: "gfx950",
-    9: "gfx1101",
-    10: "gfx1102",
-    11: "gfx1103",
-    12: "gfx1150",
-    13: "gfx1151",
-    14: "gfx1152",
-    15: "gfx1153",
-    16: "gfx1200",
-    17: "gfx1201",
-    18: "gfx1250",
-}
-
-# Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
-# present at build time (e.g. CI nodes with GPU_ARCHS set but no device visible).
-# For live GPU builds, get_cu_num() is used instead and correctly reflects the
-# actual visible CU count, including non-SPX partition modes (DPX / QPX / CPX)
-# and binned variants (e.g. MI308X is gfx942 but has fewer CUs than MI300X).
-# If building without a GPU for a binned or partitioned target, set CU_NUM
-# explicitly alongside GPU_ARCHS to override the default here.
-# Extend this table when adding support for new GPU targets.
-GFX_CU_NUM_MAP = {
-    "gfx942": 304,   # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
-    "gfx950": 256,   # MI350
-}
+from aiter.jit.utils.build_targets import (  # noqa: F401 — re-exported for callers
+    GFX_MAP,
+    GFX_CU_NUM_MAP,
+    filter_tune_df,
+    get_build_targets_env,
+)
 
 
 @functools.lru_cache(maxsize=1)
@@ -166,26 +138,13 @@ def get_build_targets() -> list[tuple[str, int]]:
     to exactly the right set of kernels for the target GPU(s).
 
     Priority:
-      1. GPU_ARCHS env var set → use those targets with GFX_CU_NUM_MAP for
-         cu_num (intended for CI nodes without a live GPU). Set CU_NUM alongside
-         GPU_ARCHS to override the default cu_num for binned or partitioned GPUs.
+      1. GPU_ARCHS env var set → delegates to get_build_targets_env() (no GPU needed).
       2. Live GPU detected → use actual (gfx, cu_num) from rocminfo, which
          correctly reflects partition mode and binned variants.
       3. Neither → raise RuntimeError with a clear message.
     """
-    gfx_env = os.getenv("GPU_ARCHS")
-    if gfx_env:
-        targets = []
-        for gfx in [g.strip() for g in gfx_env.split(";") if g.strip()]:
-            if gfx not in GFX_CU_NUM_MAP:
-                raise RuntimeError(
-                    f"Unknown gfx '{gfx}' in GPU_ARCHS — add it to "
-                    f"GFX_CU_NUM_MAP in chip_info.py. Known targets: "
-                    f"{list(GFX_CU_NUM_MAP.keys())}"
-                )
-            cu_num = int(os.getenv("CU_NUM", GFX_CU_NUM_MAP[gfx]))
-            targets.append((gfx, cu_num))
-        return targets
+    if os.getenv("GPU_ARCHS"):
+        return get_build_targets_env()
 
     try:
         return [(get_gfx(), get_cu_num())]
@@ -225,15 +184,13 @@ def build_tune_dict(tune_df, default_dict, kernels_list, libtype=None, kernels_b
 
     tune_dict = dict(default_dict)
     targets = get_build_targets()
-    mask = pd.Series([False] * len(tune_df), index=tune_df.index)
-    for gfx, cu_num in targets:
-        mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
+    filtered = filter_tune_df(tune_df, targets)
     if libtype is not None and "libtype" in tune_df.columns:
-        mask &= tune_df["libtype"] == libtype
+        filtered = filtered[filtered["libtype"] == libtype]
     use_name = kernels_by_name is not None and "kernelName" in tune_df.columns
     if kernels_by_name is not None and not use_name:
         print("[Warning]: kernels_by_name provided but CSV has no kernelName column, falling back to kernelId.")
-    for _, row in tune_df[mask].iterrows():
+    for _, row in filtered.iterrows():
         key = (int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
         if use_name:
             kname = str(row["kernelName"])
@@ -264,16 +221,12 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
         dict with mixed keys: negative ints (from default_dict) and
         (cu_num, B, M, N, K) 5-tuples (from the filtered CSV rows).
     """
-    import pandas as pd
-
     tune_dict = dict(default_dict)
     targets = get_build_targets()
-    mask = pd.Series([False] * len(tune_df), index=tune_df.index)
-    for gfx, cu_num in targets:
-        mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
+    filtered = filter_tune_df(tune_df, targets)
     if libtype is not None and "libtype" in tune_df.columns:
-        mask &= tune_df["libtype"] == libtype
-    for _, row in tune_df[mask].iterrows():
+        filtered = filtered[filtered["libtype"] == libtype]
+    for _, row in filtered.iterrows():
         key = (int(row["cu_num"]), int(row["B"]), int(row["M"]), int(row["N"]), int(row["K"]))
         tune_dict[key] = kernels_list[int(row["kernelId"])]
     return tune_dict

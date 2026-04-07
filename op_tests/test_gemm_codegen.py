@@ -27,7 +27,11 @@ import tempfile
 import textwrap
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+# Import arch constants directly from build_targets — no torch dependency.
+sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
+from build_targets import GFX_CU_NUM_MAP, filter_tune_df, get_build_targets_env  # noqa: E402
 
 import pandas as pd
 
@@ -39,6 +43,12 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "configs", "gemm_codegen_gfx_filter_bpreshuffle.csv",
 )
+
+# GPU targets used throughout this test.  cu_num values match GFX_CU_NUM_MAP
+# in aiter/jit/utils/chip_info.py — update here if that mapping changes.
+TARGET_A = ("gfx942", 304)  # MI300X
+TARGET_B = ("gfx950", 256)  # MI350
+TARGET_C = ("gfx942", 80)   # MI308X — gfx942 with CU_NUM override
 
 # ---------------------------------------------------------------------------
 # Minimal test harness (no external test framework required)
@@ -73,43 +83,41 @@ def _section(title: str) -> None:
 def test_get_build_targets():
     _section("1. get_build_targets() — env-driven target selection")
 
-    from aiter.jit.utils.chip_info import get_build_targets, GFX_CU_NUM_MAP
-
     orig_archs = os.environ.pop("GPU_ARCHS", None)
     orig_cu    = os.environ.pop("CU_NUM",    None)
 
     try:
         # 1.1 Single known arch
-        os.environ["GPU_ARCHS"] = "gfx942"
-        t = get_build_targets()
-        _check("GPU_ARCHS=gfx942 → [('gfx942', 304)]",
-               t == [("gfx942", 304)], str(t))
+        os.environ["GPU_ARCHS"] = TARGET_A[0]
+        t = get_build_targets_env()
+        _check(f"GPU_ARCHS={TARGET_A[0]} → [{TARGET_A}]",
+               t == [TARGET_A], str(t))
 
         # 1.2 CU_NUM override (MI308X: gfx942 but cu_num=80)
-        os.environ["GPU_ARCHS"] = "gfx942"
-        os.environ["CU_NUM"] = "80"
-        t = get_build_targets()
-        _check("GPU_ARCHS=gfx942 + CU_NUM=80 → [('gfx942', 80)]",
-               t == [("gfx942", 80)], str(t))
+        os.environ["GPU_ARCHS"] = TARGET_C[0]
+        os.environ["CU_NUM"] = str(TARGET_C[1])
+        t = get_build_targets_env()
+        _check(f"GPU_ARCHS={TARGET_C[0]} + CU_NUM={TARGET_C[1]} → [{TARGET_C}]",
+               t == [TARGET_C], str(t))
         del os.environ["CU_NUM"]
 
         # 1.3 Second known arch
-        os.environ["GPU_ARCHS"] = "gfx950"
-        t = get_build_targets()
-        _check("GPU_ARCHS=gfx950 → [('gfx950', 256)]",
-               t == [("gfx950", 256)], str(t))
+        os.environ["GPU_ARCHS"] = TARGET_B[0]
+        t = get_build_targets_env()
+        _check(f"GPU_ARCHS={TARGET_B[0]} → [{TARGET_B}]",
+               t == [TARGET_B], str(t))
 
         # 1.4 Multi-arch (semicolon-separated)
-        os.environ["GPU_ARCHS"] = "gfx942;gfx950"
-        t = get_build_targets()
-        _check("GPU_ARCHS=gfx942;gfx950 → two targets",
-               t == [("gfx942", 304), ("gfx950", 256)], str(t))
+        os.environ["GPU_ARCHS"] = f"{TARGET_A[0]};{TARGET_B[0]}"
+        t = get_build_targets_env()
+        _check(f"GPU_ARCHS={TARGET_A[0]};{TARGET_B[0]} → two targets",
+               t == [TARGET_A, TARGET_B], str(t))
 
         # 1.5 Unknown arch raises RuntimeError
         os.environ["GPU_ARCHS"] = "gfx999"
         raised = False
         try:
-            get_build_targets()
+            get_build_targets_env()
         except RuntimeError:
             raised = True
         _check("GPU_ARCHS=gfx999 → RuntimeError", raised)
@@ -118,13 +126,16 @@ def test_get_build_targets():
         _check("GFX_CU_NUM_MAP contains gfx942 and gfx950",
                "gfx942" in GFX_CU_NUM_MAP and "gfx950" in GFX_CU_NUM_MAP)
 
-        # 1.7 Live GPU fallback (only meaningful when a GPU is present)
+        # 1.7 Live GPU fallback — requires torch and a GPU; skipped otherwise
         del os.environ["GPU_ARCHS"]
         try:
+            from aiter.jit.utils.chip_info import get_build_targets
             t = get_build_targets()
             _check("No GPU_ARCHS + live GPU → single (gfx, cu_num) pair",
                    len(t) == 1 and isinstance(t[0], tuple) and len(t[0]) == 2,
                    str(t))
+        except (ImportError, ModuleNotFoundError):
+            print("  SKIP  No GPU_ARCHS + live GPU (torch not available)")
         except RuntimeError:
             print("  SKIP  No GPU_ARCHS + live GPU (no GPU detected — expected in CI)")
 
@@ -140,32 +151,11 @@ def test_get_build_targets():
 
 
 # ---------------------------------------------------------------------------
-# Section 2: gen_instances filter simulation
-# Replicates the exact filter block from csrc/*/gen_instances.py so we can
-# verify CSV row selection without running a build.
+# Section 2: gen_instances filter — uses filter_tune_df from build_targets
 # ---------------------------------------------------------------------------
 
-def _apply_filter(tune_df: pd.DataFrame, targets: list) -> pd.DataFrame:
-    """Mirror of the filter block in the fixed gen_instances.py files."""
-    mask = pd.Series([False] * len(tune_df), index=tune_df.index)
-    for gfx, cu_num in targets:
-        mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
-    return tune_df[mask].reset_index(drop=True)
-
-
-def test_gen_instances_filter(
-    csv_path=None,
-    target_a=("gfx942", 80),
-    target_b=("gfx950", 256),
-    label="",
-):
-    """
-    Verify gen_instances filter behaviour against a repro CSV.
-
-    target_a / target_b: (gfx, cu_num) pairs for the two GPU targets in the CSV.
-      main CSV:         target_a=("gfx942", 80),  target_b=("gfx950", 256)
-      bpreshuffle CSV:  target_a=("gfx942", 304), target_b=("gfx950", 256)
-    """
+def test_gen_instances_filter(csv_path=None, target_a=TARGET_A, target_b=TARGET_B, label=""):
+    """Verify gen_instances filter behaviour against a repro CSV."""
     if csv_path is None:
         csv_path = REPRO_CSV
     pfx = f"[{label}] " if label else ""
@@ -189,7 +179,7 @@ def test_gen_instances_filter(
            f"gfx targets found: {df['gfx'].unique().tolist()}")
 
     # 2.3 Fix: filter for target_a selects only those rows
-    filtered = _apply_filter(df, [target_a])
+    filtered = filter_tune_df(df, [target_a])
     _check(f"{pfx}{gfx_a}/cu_num={cu_a} filter keeps only {gfx_a} rows",
            len(filtered) > 0
            and all(filtered["gfx"] == gfx_a)
@@ -197,7 +187,7 @@ def test_gen_instances_filter(
            f"rows={len(filtered)}, gfx={filtered['gfx'].unique().tolist()}")
 
     # 2.4 Fix: filter for target_b selects only those rows
-    filtered = _apply_filter(df, [target_b])
+    filtered = filter_tune_df(df, [target_b])
     _check(f"{pfx}{gfx_b}/cu_num={cu_b} filter keeps only {gfx_b} rows",
            len(filtered) > 0
            and all(filtered["gfx"] == gfx_b)
@@ -205,9 +195,9 @@ def test_gen_instances_filter(
            f"rows={len(filtered)}")
 
     # 2.5 Multi-arch filter is the union of per-arch filters
-    n_a = len(_apply_filter(df, [target_a]))
-    n_b = len(_apply_filter(df, [target_b]))
-    n_multi = len(_apply_filter(df, [target_a, target_b]))
+    n_a = len(filter_tune_df(df, [target_a]))
+    n_b = len(filter_tune_df(df, [target_b]))
+    n_multi = len(filter_tune_df(df, [target_a, target_b]))
     _check(f"{pfx}multi-arch filter row count equals sum of individual filters",
            n_multi == n_a + n_b,
            f"multi={n_multi}, {gfx_a}/{cu_a}={n_a}, {gfx_b}/{cu_b}={n_b}")
@@ -220,8 +210,8 @@ def test_gen_instances_filter(
            f"shapes with diverging kernelIds: {len(shapes_with_diff)}/{len(grp)}")
 
     # 2.7 Contamination: the two targets share MNK shapes with different kernelIds
-    d_a = _apply_filter(df, [target_a]).set_index(["M", "N", "K"])
-    d_b = _apply_filter(df, [target_b]).set_index(["M", "N", "K"])
+    d_a = filter_tune_df(df, [target_a]).set_index(["M", "N", "K"])
+    d_b = filter_tune_df(df, [target_b]).set_index(["M", "N", "K"])
     common = d_a.index.intersection(d_b.index)
     if len(common) > 0:
         n_diff = sum(
@@ -262,12 +252,10 @@ def test_runtime_dispatch_key():
         print(f"  SKIP  could not import get_CKGEMM_config ({e})")
         return
 
-    from aiter.jit.utils.chip_info import GFX_CU_NUM_MAP
     # Use GPU_ARCHS so the test is deterministic even without a live GPU.
     orig_archs = os.environ.get("GPU_ARCHS")
-    os.environ["GPU_ARCHS"] = "gfx942"
-    gfx    = "gfx942"
-    cu_num = GFX_CU_NUM_MAP["gfx942"]   # 304
+    os.environ["GPU_ARCHS"] = TARGET_A[0]
+    gfx, cu_num = TARGET_A
 
     csv_with_gfx = wrong_gfx_csv = old_csv = None
     try:
@@ -338,14 +326,14 @@ if __name__ == "__main__":
     test_get_build_targets()
     test_gen_instances_filter(
         csv_path=REPRO_CSV,
-        target_a=("gfx942", 80),
-        target_b=("gfx950", 256),
+        target_a=TARGET_C,
+        target_b=TARGET_B,
         label="module_gemm_a8w8",
     )
     test_gen_instances_filter(
         csv_path=REPRO_BPRESHUFFLE_CSV,
-        target_a=("gfx942", 304),
-        target_b=("gfx950", 256),
+        target_a=TARGET_A,
+        target_b=TARGET_B,
         label="module_gemm_a8w8_bpreshuffle",
     )
     test_runtime_dispatch_key()
