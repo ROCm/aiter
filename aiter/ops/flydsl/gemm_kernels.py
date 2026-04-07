@@ -47,6 +47,31 @@ KERNEL_CONFIG_VARIANTS = (
 _SPLITK_HGEMM_KERNELS: Dict[str, Dict] = {}
 
 
+def _normalize_supported_kernel_metadata(
+    *,
+    stage: int,
+    async_copy: bool,
+    c_to_lds: bool,
+) -> tuple[int, bool, bool]:
+    # Latest `hgemm.py` fixes these choices internally instead of exposing
+    # multiple codegen variants to the wrapper layer.
+    if stage != FIXED_STAGE:
+        raise ValueError(
+            f"Current kernel only supports stage={FIXED_STAGE}; got stage={stage}"
+        )
+    if async_copy != KERNEL_ASYNC_COPY:
+        raise ValueError(
+            "Current kernel fixes async_copy from the active GPU architecture; "
+            f"got async_copy={async_copy}, expected {KERNEL_ASYNC_COPY}"
+        )
+    if c_to_lds != FIXED_C_TO_LDS:
+        raise ValueError(
+            f"Current kernel only supports c_to_lds={FIXED_C_TO_LDS}; "
+            f"got c_to_lds={c_to_lds}"
+        )
+    return FIXED_STAGE, KERNEL_ASYNC_COPY, FIXED_C_TO_LDS
+
+
 def flydsl_kernel_name(
     stage: int,
     dtype: str,
@@ -62,6 +87,15 @@ def flydsl_kernel_name(
     b_preshuffle: bool,
     c_to_lds: bool,
 ) -> str:
+    stage, async_copy, c_to_lds = _normalize_supported_kernel_metadata(
+        stage=stage,
+        async_copy=async_copy,
+        c_to_lds=c_to_lds,
+    )
+    if b_preshuffle and b_to_lds:
+        raise ValueError(
+            "Current kernel requires b_to_lds=False when b_preshuffle=True"
+        )
     name = (
         f"flydsl_gemm{stage}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     )
@@ -327,7 +361,7 @@ def _normalize_registry_config(
         "b_preshuffle": bool(b_preshuffle),
         "c_to_lds": FIXED_C_TO_LDS,
     }
-    if stage not in (1, FIXED_STAGE):
+    if stage != FIXED_STAGE:
         return None
     if config["b_preshuffle"] and config["b_to_lds"]:
         return None
