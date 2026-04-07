@@ -20,7 +20,7 @@ M, N, K = input_shape
 ############################################################
 # <generate input>
 dtype = torch.bfloat16
-# Returns (x, weight, out_dtype, y) -- 4 values
+# Returns (x, weight, out_dtype, y) — 4 values
 x, w, _, y = generate_gemm_a16w16_gated_inputs(
     M,
     N,

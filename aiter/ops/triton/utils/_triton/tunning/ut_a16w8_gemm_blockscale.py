@@ -21,7 +21,7 @@ input_shape, config_list = get_input_shape_and_config_list(sys.argv, shape_size=
 dtype = torch.bfloat16
 shuffle = False
 block_shape_n, block_shape_k = 128, 128
-# Returns: (x, weight, weight_shuffled, w_scale, y) -- 5 values
+# Returns: (x, weight, weight_shuffled, w_scale, y) — 5 values
 x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
     *input_shape,
     block_shape_n,

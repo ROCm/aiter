@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import pytest
 import argparse
@@ -1132,7 +1132,7 @@ def _vsink_reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
 
     dout       : [total_q, H, Dv]
     out        : [total_q, H, Dv]
-    lse_group  : [H, total_q]   - group-mode LSE (flattened across batches)
+    lse_group  : [H, total_q]   – group-mode LSE (flattened across batches)
     sink       : [B, H]
     seqlens_q  : list of per-batch sequence lengths
     returns d_sink : [H]
