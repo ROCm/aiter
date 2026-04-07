@@ -4,11 +4,11 @@ from ..jit.core import compile_ops
 Enum = int
 
 
-@compile_ops("module_aiter_enum", "ActivationType")
+@compile_ops("module_aiter_core", "ActivationType")
 def _ActivationType(dummy): ...
 
 
-@compile_ops("module_aiter_enum", "QuantType")
+@compile_ops("module_aiter_core", "QuantType")
 def _QuantType(dummy): ...
 
 

@@ -10,7 +10,7 @@ from ..jit.core import compile_ops
 MD_NAME = "module_custom_all_reduce"
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def init_custom_ar(
     meta_ptr: int,
     rank_data_ptr: int,
@@ -22,7 +22,7 @@ def init_custom_ar(
 ) -> int: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_reduce(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -31,34 +31,29 @@ def all_reduce(
     open_fp8_quant: bool,
     reg_inp_ptr: int,
     reg_inp_bytes: int,
-    reg_out_ptr: int,
-    reg_out_bytes: int,
-    stream: int,
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
     inp,  # aiter_tensor_t
     out,  # aiter_tensor_t
     reg_ptr: int,
     reg_bytes: int,
-    stream: int,
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_reg(
     _fa: int,
     inp,  # aiter_tensor_t
     out,  # aiter_tensor_t
     dim: int,
-    stream: int,
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_unreg(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -66,11 +61,10 @@ def all_gather_unreg(
     out,  # aiter_tensor_t
     reg_bytes: int,
     dim: int,
-    stream: int,
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -82,11 +76,10 @@ def fused_allreduce_rmsnorm(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
-    stream: int,
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm_quant(
     _fa: int,
     inp,  # aiter_tensor_t
@@ -99,7 +92,6 @@ def fused_allreduce_rmsnorm_quant(
     reg_ptr: int,
     reg_bytes: int,
     use_1stage: bool,
-    stream: int,
 ) -> None: ...
 
 
@@ -118,7 +110,9 @@ def all_reduce_asm_fake_tensor(
     )
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=all_reduce_asm_fake_tensor)
+@compile_ops(
+    "module_custom_all_reduce", gen_fake=all_reduce_asm_fake_tensor, develop=True
+)
 def all_reduce_asm_(
     inp: torch.Tensor,
     ca: int,
@@ -151,7 +145,9 @@ def all_reduce_rmsnorm_fake_tensors(
     return [output, residual_out]
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=all_reduce_rmsnorm_fake_tensors)
+@compile_ops(
+    "module_custom_all_reduce", gen_fake=all_reduce_rmsnorm_fake_tensors, develop=True
+)
 def all_reduce_rmsnorm_(
     input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -194,7 +190,11 @@ def all_reduce_rmsnorm_quant_fake_tensors(
     return [output, residual_out, y_scale]
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=all_reduce_rmsnorm_quant_fake_tensors)
+@compile_ops(
+    "module_custom_all_reduce",
+    gen_fake=all_reduce_rmsnorm_quant_fake_tensors,
+    develop=True,
+)
 def all_reduce_rmsnorm_quant_(
     input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -209,47 +209,47 @@ def all_reduce_rmsnorm_quant_(
 ) -> List[torch.Tensor]: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def dispose(_fa: int) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def meta_size() -> int: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def register_input_buffer(
     _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def register_output_buffer(
     _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def get_graph_buffer_count(_fa: int) -> int: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def get_graph_buffer_ipc_meta(_fa: int, handle_out: int, offset_out: int) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def register_graph_buffers(
     _fa: int, handle_ptrs: List[int], offset_ptrs: List[int]
 ) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
-def allocate_meta_buffer(size: int, stream: int) -> int: ...
+@compile_ops("module_custom_all_reduce", develop=True)
+def allocate_meta_buffer(size: int) -> int: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def free_meta_buffer(ptr: int) -> None: ...
 
 
-@compile_ops("module_custom_all_reduce")
+@compile_ops("module_custom_all_reduce", develop=True)
 def get_meta_buffer_ipc_handle(inp_ptr: int, out_handle_ptr: int) -> None: ...
