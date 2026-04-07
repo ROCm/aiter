@@ -220,7 +220,17 @@ class FmoeTuner(TunerCommon):
                 aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
             else:
                 aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
+        # Between-stage quant: match fused_moe_2stages cost.
+        # per_1x128/per_Token/per_Tensor each incur 1 GPU kernel for output
+        # quantization. per_1x32 is handled via us_quant_sort in post_process().
         if q_type == QuantType.per_1x128:
+            quant_func = aiter.get_hip_quant(q_type)
+            a2, a2_scale = quant_func(
+                out,
+                quant_dtype=a1_qt.dtype,
+            )
+            out = a2
+        elif q_type in (QuantType.per_Token, QuantType.per_Tensor):
             quant_func = aiter.get_hip_quant(q_type)
             a2, a2_scale = quant_func(
                 out,
@@ -272,6 +282,15 @@ class FmoeTuner(TunerCommon):
             1,  # split_k
             kernelName,
         )
+        # Between-stage fp8 cast: in fused_moe(), per_1x32 + fp8 act + Swiglu
+        # (gfx950 M>=512) casts bf16 output to fp8 before stage2.
+        # Other per_1x32 CKTile paths set a2_scale=None (no between-stage cost).
+        if (
+            q_type == QuantType.per_1x32
+            and a1_qt.dtype == dtypes.fp8
+            and act_type == ActivationType.Swiglu
+        ):
+            out = out.to(dtypes.fp8)
         return out
 
     @staticmethod
@@ -501,6 +520,15 @@ class FmoeTuner(TunerCommon):
             w1_scale,
             sorted_weights,
         )
+        # Between-stage quant: match fused_moe_2stages cost.
+        # per_1x128 ASM embeds quant in the kernel output buffer, already fair.
+        if quant_type in (QuantType.per_Token, QuantType.per_Tensor):
+            quant_func = aiter.get_hip_quant(quant_type)
+            a2, a2_scale = quant_func(
+                out,
+                quant_dtype=input.dtype,
+            )
+            out = a2
         return out
 
     # do weight at stage1
@@ -1179,6 +1207,10 @@ class FmoeTuner(TunerCommon):
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
             )
             ref1 = ref1.view(ref1.shape[0], topk, -1)
+        elif quant_type in (QuantType.per_Token, QuantType.per_Tensor):
+            torch_quant = aiter.get_torch_quant(quant_type)
+            ref1, _ = torch_quant(ref1, quant_dtype=a1_qt.dtype)
+            ref1 = ref1.view(ref1.shape[0], topk, -1)
         return ref1
 
     @staticmethod
@@ -1264,6 +1296,10 @@ class FmoeTuner(TunerCommon):
                 (token, topk, inter_dim),
                 dtype=dtype,
             )
+            if quant_type in (QuantType.per_Token, QuantType.per_Tensor):
+                torch_quant = aiter.get_torch_quant(quant_type)
+                ref1, _ = torch_quant(ref1, quant_dtype=a1_qt.dtype)
+                ref1 = ref1.view(token, topk, -1)
             return ref1
 
     ## 1 stage ref
