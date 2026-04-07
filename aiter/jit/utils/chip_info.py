@@ -8,7 +8,7 @@ import subprocess
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
-from aiter.jit.utils.build_targets import (  # noqa: F401 — re-exported for callers
+from build_targets import (  # noqa: F401 — re-exported for callers
     GFX_MAP,
     GFX_CU_NUM_MAP,
     filter_tune_df,
