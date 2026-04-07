@@ -21,9 +21,6 @@ from typing import Optional
 
 from .mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
-    lds_load_pack_k32,
-    lds_store_16b_xor16,
-    make_preshuffle_b_layout,
     load_b_pack_k32,
     tile_chunk_coord_i32,
     swizzle_xor16,
