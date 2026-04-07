@@ -78,7 +78,7 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
 @triton.jit
 def _act_mul_and_dynamic_mxfp4_quant_kernel(
     x_ptr,
-    x_fp4_ptr,
+    x_out_ptr,
     bs_ptr,
     stride_x_m_in,
     stride_x_n_in,
@@ -121,9 +121,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 
         if EVEN_M_N:
             a = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
-            b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg").to(
-                tl.float32
-            )
+            b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg")
         else:
             x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
             a = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
@@ -132,9 +130,8 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             # a and b can share the same mask
             b = tl.load(
                 x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
-            ).to(tl.float32)
-
-        x = _apply_activation_from_str(a, ACTIVATION) * b
+            )
+        x = _apply_activation_from_str(a, ACTIVATION).to(b.dtype) * b
         if DO_QUANT:
             out_tensor, bs_e8m0 = _mxfp4_quant_op(
                 x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
@@ -148,10 +145,10 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             )
 
             if EVEN_M_N:
-                tl.store(x_fp4_ptr + out_offs, out_tensor)
+                tl.store(x_out_ptr + out_offs, out_tensor)
             else:
                 out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-                tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+                tl.store(x_out_ptr + out_offs, out_tensor, mask=out_mask)
 
             bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
             bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
@@ -197,12 +194,12 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
                 out_offs_m[:, None] * stride_x_fp4_m
                 + out_offs_n[None, :] * stride_x_fp4_n
             )
-            x_out = x.to(x_fp4_ptr.dtype.element_ty)
+            x_out = x.to(x_out_ptr.dtype.element_ty)
             if EVEN_M_N:
-                tl.store(x_fp4_ptr + out_offs, x_out)
+                tl.store(x_out_ptr + out_offs, x_out)
             else:
                 out_mask = (out_offs_m < M)[:, None] & (out_offs_n < N)[None, :]
-                tl.store(x_fp4_ptr + out_offs, x_out, mask=out_mask)
+                tl.store(x_out_ptr + out_offs, x_out, mask=out_mask)
 
 
 @triton.heuristics(
@@ -213,7 +210,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 @triton.jit
 def _act_mul_and_dynamic_fp8_group_quant_kernel(
     x_ptr,
-    x_fp8_ptr,
+    x_out_ptr,
     x_bs_ptr,
     stride_x_m_in,
     stride_x_n_in,
@@ -247,18 +244,16 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
 
     if EVEN_N:
         a = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
-        b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg").to(
-            tl.float32
-        )
+        b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg")
     else:
         x_mask = x_offs_n < N
         a = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(tl.float32)
         # a and b can share the same mask
         b = tl.load(
             x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
-        ).to(tl.float32)
+        )
 
-    x = _apply_activation_from_str(a, ACTIVATION) * b
+    x = _apply_activation_from_str(a, ACTIVATION).to(b.dtype) * b
 
     out_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     out_offs = pid_m * stride_x_fp8_m + out_offs_n * stride_x_fp8_n
@@ -271,12 +266,12 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
         x_bs = tl.ravel(x_bs)
 
         if EVEN_N:
-            tl.store(x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.dtype.element_ty))
+            tl.store(x_out_ptr + out_offs, x_fp8.to(x_out_ptr.dtype.element_ty))
         else:
             out_mask = out_offs_n < N
             tl.store(
-                x_fp8_ptr + out_offs,
-                x_fp8.to(x_fp8_ptr.dtype.element_ty),
+                x_out_ptr + out_offs,
+                x_fp8.to(x_out_ptr.dtype.element_ty),
                 mask=out_mask,
             )
 
@@ -292,9 +287,9 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
                 mask=bs_mask,
             )
     else:
-        x_out = x.to(x_fp8_ptr.dtype.element_ty)
+        x_out = x.to(x_out_ptr.dtype.element_ty)
         if EVEN_N:
-            tl.store(x_fp8_ptr + out_offs, x_out)
+            tl.store(x_out_ptr + out_offs, x_out)
         else:
             out_mask = out_offs_n < N
-            tl.store(x_fp8_ptr + out_offs, x_out, mask=out_mask)
+            tl.store(x_out_ptr + out_offs, x_out, mask=out_mask)
