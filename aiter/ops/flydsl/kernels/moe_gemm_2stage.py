@@ -44,7 +44,6 @@ from flydsl.expr.typing import T
 
 from .mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
-    lds_load_pack_k32,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
     lds_store_16b_xor16,
@@ -140,11 +139,12 @@ def compile_moe_gemm1(
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
-    out_mlir = lambda: (
-        (lambda ty: ty() if callable(ty) else ty)(
-            T.f16 if out_dtype == "f16" else T.bf16
+    def out_mlir():
+        return (
+            (lambda ty: ty() if callable(ty) else ty)(
+                T.f16 if out_dtype == "f16" else T.bf16
+            )
         )
-    )
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
     if (tile_k_bytes % 64) != 0:
@@ -180,18 +180,6 @@ def compile_moe_gemm1(
                 "BF16 K16 MFMA op not found: expected `rocdl.mfma_f32_16x16x16bf16_1k` "
                 "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)."
             )
-
-    DYN = ir.ShapedType.get_dynamic_size()
-    size_out = DYN
-    size_x = DYN
-    # W is packed int4 for W4A8: 2 values per byte.
-    size_w = (
-        (experts * (2 * inter_dim) * model_dim) // 2
-        if (is_int4 or is_int4_bf16)
-        else (experts * (2 * inter_dim) * model_dim)
-    )
-    size_sorted = DYN
-    size_expert_ids = DYN
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
@@ -293,7 +281,6 @@ def compile_moe_gemm1(
             )
             vec16_elems = 16 if elem_bytes == 1 else 8
             vec8_elems = 8 if elem_bytes == 1 else 4
-            vec4_elems = 4 if elem_bytes == 1 else 2
             vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
 
@@ -1055,7 +1042,6 @@ def compile_moe_gemm1(
 
                 # Store epilogue to out[t, slot, inter]
                 expert_off = expert_off_idx
-                bx_m0 = bx_m
                 tokens_i32_v = tokens_i32
                 topk_i32_v = topk_i32
                 inter_i32_v = fx.Int32(inter_dim)
@@ -1471,19 +1457,6 @@ def compile_moe_gemm2(
                 "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)."
             )
 
-    DYN = ir.ShapedType.get_dynamic_size()
-    size_out = DYN
-    size_x = DYN
-    size_sorted = DYN
-    size_expert_ids_shape = DYN
-    size_scale_x = DYN
-    # W is packed int4 for W4A8/W4A16: 2 values per byte.
-    size_w = (
-        (experts * model_dim * inter_dim) // 2
-        if (is_int4 or is_int4_bf16)
-        else (experts * model_dim * inter_dim)
-    )
-
     total_threads = 256
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     if (tile_k_bytes % 64) != 0:
@@ -1628,7 +1601,6 @@ def compile_moe_gemm2(
             )
             vec16_elems = 16 if elem_bytes == 1 else 8
             vec8_elems = 8 if elem_bytes == 1 else 4
-            vec4_elems = 4 if elem_bytes == 1 else 2
             vec8_x = T.vec(vec8_elems, x_elem)
             vec16_x = T.vec(vec16_elems, x_elem)
 
@@ -2745,11 +2717,6 @@ def compile_moe_reduction(
     # Kernel Config
     BLOCK_SIZE = 256
     VEC_WIDTH = 8
-    USE_NONTEMPORAL = True
-    VEC_ALIGN = 16
-
-    masked = "masked" if use_mask else ""
-
     if dtype_str == "f32":
         elem_type_tag = "f32"
     elif dtype_str == "f16":
@@ -2758,9 +2725,14 @@ def compile_moe_reduction(
         elem_type_tag = "bf16"
     else:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
-    compute_type = lambda: T.f32
-    i32_type = lambda: T.i32
-    i8_type = lambda: T.i8
+    def compute_type():
+        return T.f32
+
+    def i32_type():
+        return T.i32
+
+    def i8_type():
+        return T.i8
 
     def elem_type():
         ty = (
