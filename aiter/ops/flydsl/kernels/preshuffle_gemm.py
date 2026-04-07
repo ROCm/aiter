@@ -16,7 +16,6 @@ from flydsl.expr import buffer_ops, rocdl
 
 
 from flydsl.expr.typing import T
-from flydsl.compiler.protocol import fly_values
 from typing import Optional
 
 
