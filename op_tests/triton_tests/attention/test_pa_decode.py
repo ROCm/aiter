@@ -74,8 +74,12 @@ def input_helper(
     kv_cache_dtype,
     output_type,
     num_blocks=4,
+    random_seed: int = 0,
 ):
     """Helper function to generate input tensors for paged attention testing."""
+    torch.cuda.manual_seed(random_seed)
+    random.seed(random_seed)
+
     # Query tensor generation
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         query = torch.randn(
