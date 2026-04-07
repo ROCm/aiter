@@ -555,7 +555,7 @@ def fused_dynamic_mxfp4_quant_moe_sort_hip(
     input: torch.Tensor,
     sorted_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
-    topk: int,
+    topk: int,  # stage1 : 1, stage2 : topk
     block_m: int,
     group_size: int = 32,
 ) -> None:
@@ -570,22 +570,38 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     sorted_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
     token_num: int,
-    topk: int,
+    topk: int,  # stage1 and stage2: same topk value
     block_size: int,
     group_size: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    token_num_quant_moe_sort_switch = [
+        8 * 64 / topk,
+        8 * 1024 / topk,
+    ]  # [stage1, stage2]
     M, N = input.view(-1, input.shape[-1]).shape
-    out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
-    scales = torch.empty(
-        ((sorted_ids.shape[0] + 31) // 32 * 32, N // 32),
+    is_stage1 = M == token_num
+    topk = 1 if is_stage1 else topk
+    scale = torch.empty(
+        (sorted_ids.shape[0] + 31) // 32 * 32,
         (N + 31) // 32,
         dtype=dtypes.fp8_e8m0,
         device=input.device,
     )
-    fused_dynamic_mxfp4_quant_moe_sort_hip(
-        out, scales, input, sorted_ids, num_valid_ids, topk, block_size, group_size
-    )
-    return out, scales
+    if (
+        (is_stage1 and M <= token_num_quant_moe_sort_switch[0])
+        or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1])
+        or group_size != 32
+    ):
+        out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
+        fused_dynamic_mxfp4_quant_moe_sort_hip(
+            out, scale, input, sorted_ids, num_valid_ids, topk, block_size, group_size
+        )
+    else:
+        out, scale_ = per_1x32_f4_quant_hip(input, None, dtypes.fp4x2)
+        mxfp4_moe_sort_hip(
+            scale, scale_, sorted_ids, num_valid_ids, token_num, N, topk, block_size
+        )
+    return out, scale
 
 
 @compile_ops("module_quant")
@@ -596,7 +612,7 @@ def mxfp4_moe_sort_hip(
     num_valid_ids: torch.Tensor,
     token_num: int,
     cols: int,
-    topk: int,
+    topk: int,  # stage1 : 1, stage2 : topk
     block_m: int,
 ) -> None:
     """

@@ -253,12 +253,20 @@ parser.add_argument(
     e.g.: -d bf16""",
 )
 parser.add_argument(
-    "-dim",
+    "-dim1",
     type=int,
     nargs="*",
     default=[4096, 7168],
-    help="""Model dimension.
-    e.g.: -dim 4096""",
+    help="""Model dimension for stage1.
+    e.g.: -dim1 4096""",
+)
+parser.add_argument(
+    "-dim2",
+    type=int,
+    nargs="*",
+    default=[256, 2048],
+    help="""Inter dimension for stage2.
+    e.g.: -dim2 256""",
 )
 parser.add_argument(
     "-ek",
@@ -295,7 +303,7 @@ for dtype in args.dtype:
         dim,
         (E, topk),
         m,
-    ) in itertools.product(args.dim, args.expert_topk, args.m):
+    ) in itertools.product(args.dim1, args.expert_topk, args.m):
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, args.block_m, "stage1")
         df.append(ret)
 df = pd.DataFrame(df)
@@ -308,7 +316,7 @@ for dtype in args.dtype:
         dim,
         (E, topk),
         m,
-    ) in itertools.product(args.dim, args.expert_topk, args.m):
+    ) in itertools.product(args.dim2, args.expert_topk, args.m):
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, args.block_m, "stage2")
         df.append(ret)
 df = pd.DataFrame(df)
@@ -321,7 +329,7 @@ for dtype in args.dtype:
         dim,
         (E, topk),
         m,
-    ) in itertools.product(args.dim, args.expert_topk, args.m):
+    ) in itertools.product(args.dim1, args.expert_topk, args.m):
         ret = test_moe_mxfp4_quant_sort(dtype, m, dim, E, topk, args.block_m, "stage1")
         df.append(ret)
 df = pd.DataFrame(df)
@@ -334,7 +342,7 @@ for dtype in args.dtype:
         dim,
         (E, topk),
         m,
-    ) in itertools.product(args.dim, args.expert_topk, args.m):
+    ) in itertools.product(args.dim2, args.expert_topk, args.m):
         ret = test_moe_mxfp4_quant_sort(dtype, m, dim, E, topk, args.block_m, "stage2")
         df.append(ret)
 df = pd.DataFrame(df)
