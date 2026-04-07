@@ -340,6 +340,16 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
     # ---- Types ----
     fm_fast = _std_arith.FastMathFlags.fast
+    # fastmath without ninf: safe for operations that may encounter -inf
+    # (boundary masking sets OOB attention scores to -inf)
+    fm_no_inf = (
+        _std_arith.FastMathFlags.nnan
+        | _std_arith.FastMathFlags.nsz
+        | _std_arith.FastMathFlags.arcp
+        | _std_arith.FastMathFlags.contract
+        | _std_arith.FastMathFlags.afn
+        | _std_arith.FastMathFlags.reassoc
+    )
 
     def _mfma_fp8(result_type, operands, **kw):
         return rocdl.mfma_f32_16x16x32_fp8_fp8(result_type, operands, **kw)
@@ -854,7 +864,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         for sh in [32, 16]:
             offset = _std_arith.ConstantOp(T.i32, ir.IntegerAttr.get(T.i32, sh)).result
             peer = _shfl_xor_f32(w, offset, width)
-            w = _std_arith.MaximumFOp(w, peer, fastmath=fm_fast).result
+            w = _std_arith.MaximumFOp(w, peer, fastmath=fm_no_inf).result
         return w
 
     def _warp_reduce_add_16(val):
@@ -1046,7 +1056,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         local_max = scaled[0]
         for i in range_constexpr(1, 8):
             local_max = _std_arith.MaximumFOp(
-                local_max, _raw(scaled[i]), fastmath=fm_fast
+                local_max, _raw(scaled[i]), fastmath=fm_no_inf
             ).result
 
         # Warp reduce max (within 16-lane groups)
@@ -1058,14 +1068,14 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             rescale = _raw(c_one_f32)
         else:
             new_row_max = _std_arith.MaximumFOp(
-                local_max, _raw(row_max_old), fastmath=fm_fast
+                local_max, _raw(row_max_old), fastmath=fm_no_inf
             ).result
             # rescale = exp2((old_max - new_max) * log2e)
             diff = _std_arith.SubFOp(
-                _raw(row_max_old), new_row_max, fastmath=fm_fast
+                _raw(row_max_old), new_row_max, fastmath=fm_no_inf
             ).result
             rescale_arg = _std_arith.MulFOp(
-                diff, _raw(c_log2e), fastmath=fm_fast
+                diff, _raw(c_log2e), fastmath=fm_no_inf
             ).result
             rescale = _fast_exp2(rescale_arg)
 
@@ -1075,9 +1085,9 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         for i in range_constexpr(8):
             # exp2((p[i] - new_max) * log2e)
             diff = _std_arith.SubFOp(
-                _raw(scaled[i]), new_row_max, fastmath=fm_fast
+                _raw(scaled[i]), new_row_max, fastmath=fm_no_inf
             ).result
-            exp_arg = _std_arith.MulFOp(diff, _raw(c_log2e), fastmath=fm_fast).result
+            exp_arg = _std_arith.MulFOp(diff, _raw(c_log2e), fastmath=fm_no_inf).result
             p_exp_vals[i] = _fast_exp2(exp_arg)
             local_sum = _std_arith.AddFOp(
                 local_sum, p_exp_vals[i], fastmath=fm_fast
@@ -1292,19 +1302,27 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
         When p_lds_kv_next_warp_i32 is provided, interleaves prefetch
         of the next tile's KV data during GEMM1 NoPE loop.
+        Prefetch is always unconditional -- for the last tile, caller
+        passes row_kv_ld_next=-1 which triggers OOB zeroing (harmless
+        since that buffer won't be consumed).
 
         Returns (row_max, row_sum_e, oaccu).
         """
         do_prefetch = p_lds_kv_next_warp_i32 is not None
 
-        # ---- Prefetch block 0 of next tile (inline asm, opaque to LLVM) ----
-        if do_prefetch:
+        def _maybe_prefetch(block_idx):
+            """Issue prefetch unconditionally (OOB handled by row=-1)."""
+            if not do_prefetch:
+                return
             _prefetch_k_tile_asm(
                 p_lds_kv_next_warp_i32,
                 row_kv_ld_next,
                 kv_ld_col_base_i32_arg,
-                0,
+                block_idx,
             )
+
+        # ---- Prefetch block 0 of next tile (inline asm, opaque to LLVM) ----
+        _maybe_prefetch(0)
 
         # ---- GEMM1: QK attention scores ----
         p_comp = [_raw(c_zero_v4f32), _raw(c_zero_v4f32)]
@@ -1319,13 +1337,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             k1_hi = _load_k_from_lds(p_lds_kv_base, 16, tile_1 * BLOCK_K)
 
             # Prefetch block nope_pair+1 of next tile (inline asm)
-            if do_prefetch:
-                _prefetch_k_tile_asm(
-                    p_lds_kv_next_warp_i32,
-                    row_kv_ld_next,
-                    kv_ld_col_base_i32_arg,
-                    nope_pair + 1,
-                )
+            _maybe_prefetch(nope_pair + 1)
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
@@ -1525,8 +1537,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         ).result
         row_kv_ld_tile1 = _get_kv_ld_row(kv_start_plus_bn, _raw(kv_end), True)
 
-        # Process first tile; interleave prefetch of tile 1 to KV_1
-        # _prefetch_k_tile_asm handles OOB (row==-1) by writing zeros.
+        # Process first tile -- always prefetch tile 1 to KV_1.
+        # When num_tiles == 1, row_kv_ld_tile1 == -1 (OOB), which
+        # triggers the OOB zeroing path in _prefetch_k_tile_asm.
+        # Those zeros land in KV_1 which won't be consumed -- harmless.
         row_max, row_sum_e, oaccu = _process_tile(
             p_lds_kv_0_base,
             kv_start,
@@ -1587,11 +1601,6 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 _raw(p_lds_kv_1_base),
                 _raw(p_lds_kv_0_base),
             ).result
-            curr_warp = _std_arith.SelectOp(
-                is_odd,
-                p_lds_kv_1_warp_i32,
-                p_lds_kv_0_warp_i32,
-            ).result
             next_warp = _std_arith.SelectOp(
                 is_odd,
                 p_lds_kv_0_warp_i32,
@@ -1602,8 +1611,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
 
-            # Resolve row for next tile prefetch (fresh, may be -1 for OOB).
-            # _prefetch_k_tile_asm handles OOB by writing zeros to LDS.
+            # Resolve row for next tile prefetch (may be -1 for OOB).
             kv_tile_next_start = _std_arith.AddIOp(
                 kv_tile_start_i32,
                 _raw(arith.constant(BLOCK_N, type=T.i32)),
