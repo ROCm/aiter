@@ -7,18 +7,19 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
-import torch
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = (
     os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
-    if os.path.exists(os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta"))
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header
+from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
 
-from gemm_a8w8_blockscale_instance import (
+from gemm_a8w8_blockscale_instance import (  # noqa: E402
     default_kernels_dict,
     KernelInstance,
     candidate_kernels_dict,
@@ -46,7 +47,9 @@ class gemm_a8w8_blockscale_codegen:
         """
         if os.path.exists(tune_dict_csv):
             return build_tune_dict(
-                pd.read_csv(tune_dict_csv), default_kernels_dict, candidate_kernels_dict,
+                pd.read_csv(tune_dict_csv),
+                default_kernels_dict,
+                candidate_kernels_dict,
                 libtype="ck",
             )
         return default_kernels_dict

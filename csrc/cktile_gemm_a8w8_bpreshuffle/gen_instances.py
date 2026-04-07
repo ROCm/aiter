@@ -2,24 +2,23 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
-from dataclasses import dataclass
-import copy
 from pathlib import Path
 import pandas as pd
 import argparse
 import shutil
-import torch
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = (
     os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
-    if os.path.exists(os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta"))
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header
+from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
 
-from gemm_a8w8_bpreshuffle_cktile_common import (
+from gemm_a8w8_bpreshuffle_cktile_common import (  # noqa: E402
     kernelInstance,
     kernels_list,
     default_kernels_dict,
@@ -230,8 +229,11 @@ torch::Tensor
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         return build_tune_dict(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list,
-            libtype="cktile", kernels_by_name=kernels_by_name,
+            pd.read_csv(tune_dict_csv),
+            default_kernels_dict,
+            kernels_list,
+            libtype="cktile",
+            kernels_by_name=kernels_by_name,
         )
     return default_kernels_dict
 

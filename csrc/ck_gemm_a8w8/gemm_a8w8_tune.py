@@ -56,7 +56,17 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
+            columns=[
+                "gfx",
+                "cu_num",
+                "M",
+                "N",
+                "K",
+                "kernelId",
+                "splitK",
+                "us",
+                "kernelName",
+            ]
         )
     return tunedf
 
@@ -118,7 +128,6 @@ class GemmA8W8Tuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
         shape_grouped = False

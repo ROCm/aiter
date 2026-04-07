@@ -7,18 +7,23 @@ import shutil
 from pathlib import Path
 
 import pandas as pd
-import torch
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = (
     os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
-    if os.path.exists(os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta"))
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict_batched, write_lookup_header
+from chip_info import build_tune_dict_batched, write_lookup_header  # noqa: E402
 
-from batched_gemm_a8w8_common import default_kernels_dict, kernelInstance, kernels_list
+from batched_gemm_a8w8_common import (  # noqa: E402
+    default_kernels_dict,
+    kernelInstance,
+    kernels_list,
+)
 
 
 class batched_gemm_a8w8_fwd_codegen:
@@ -256,7 +261,9 @@ torch::Tensor
 
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
-        return build_tune_dict_batched(pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list)
+        return build_tune_dict_batched(
+            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
+        )
     return default_kernels_dict
 
 

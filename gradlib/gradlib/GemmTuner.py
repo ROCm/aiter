@@ -892,7 +892,9 @@ class GemmTuner(GemmCommonTuner):
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
             outdtype = outdtype if outdtype is not None else indtype
-            self.set_run_iters((self.gfx, self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype))
+            self.set_run_iters(
+                (self.gfx, self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype)
+            )
 
             gemmobj = Gemm(
                 ds["M"],
