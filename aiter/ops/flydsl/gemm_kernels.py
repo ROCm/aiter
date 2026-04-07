@@ -65,9 +65,7 @@ def flydsl_kernel_name(
     name = (
         f"flydsl_gemm{stage}_a{dtype}_w{dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     )
-    name += (
-        f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}"
-    )
+    name += f"_split_k{split_k}_block_m_warp{block_m_warp}_block_n_warp{block_n_warp}"
     name += (
         f"_async_copy{async_copy}_b_to_lds{b_to_lds}_b_preshuffle{b_preshuffle}"
         f"_c_to_lds{c_to_lds}"
@@ -87,7 +85,9 @@ def _normalize_launch_stream(
     device: torch.device,
     stream: Optional[torch.cuda.Stream],
 ) -> torch.cuda.Stream:
-    launch_stream = torch.cuda.current_stream(device=device) if stream is None else stream
+    launch_stream = (
+        torch.cuda.current_stream(device=device) if stream is None else stream
+    )
     if launch_stream.device != device:
         raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
     return launch_stream
