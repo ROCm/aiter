@@ -42,7 +42,6 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::hip::getCurrentHIPStream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -149,6 +148,7 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
     }
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    auto stream = at::hip::getCurrentHIPStream();
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
@@ -196,7 +196,7 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
         hipLaunchKernelGGL(
-            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
+            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream,
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
     } else {
         rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
@@ -338,6 +338,8 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
                                 dq_accum.data_ptr(), // dq_acc
+                                nullptr, // sink_ptr (not used in v3 asm path)
+                                nullptr, // d_sink_ptr (not used in v3 asm path)
                                 seqstart_q_ptr, // seqstart_q
                                 seqstart_k_ptr, // seqstart_k
                                 nullptr, // seqlen_q_ptr
