@@ -504,6 +504,7 @@ def _moe_gemm_a4w4_gfx1250(
             XMxScale, 
             offs_x_m_scale[:, None] * stride_x_mx_m + (offs_x_k_scale[None, :] + scale_idx * MX_SCALE_BLOCK_K) * stride_x_mx_k
         )
+        scale_idx += 1
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_LOADS_IN_BATCH)
 
