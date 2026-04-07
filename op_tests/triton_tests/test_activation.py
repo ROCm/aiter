@@ -144,7 +144,7 @@ def test_act_mul_and_mxfp4_quant(
 
 def torch_act_mul_ref(x: torch.Tensor, activation: str) -> torch.Tensor:
     d = x.shape[-1] // 2
-    a, b = x[:, :d], x[:, d:]
+    a, b = x[..., :d], x[..., d:]
     if activation == "silu":
         y = F.silu(a) * b
     elif activation == "gelu":
@@ -175,4 +175,23 @@ def test_act_mul_no_quant(M, N_half, dtype, activation, use_out):
         act_mul(x, activation, out=out)
     else:
         out = act_mul(x, activation)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (2, 4, 64),
+        (3, 5, 128),
+        (2, 3, 4, 32),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("activation", ["silu", "gelu"])
+def test_act_mul_no_quant_higher_rank(shape, dtype, activation):
+    """act_mul should handle any input rank by flattening/unflattening internally."""
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    ref = torch_act_mul_ref(x, activation)
+    out = act_mul(x, activation)
+    assert out.shape == ref.shape
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)

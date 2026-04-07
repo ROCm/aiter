@@ -138,19 +138,28 @@ def act_mul(
     Gated activation along the last dimension only (no quantization): ``act(x0) * x1``
     where ``x`` is ``[..., 2 * d]`` split into two ``[..., d]`` halves.
 
+    Accepts any input rank; leading dimensions are flattened before the kernel and
+    restored in the returned tensor, which has shape ``[..., d]``.
+
     Uses the same Triton path as ``act_mul_and_fp8_group_quant`` with quantization disabled.
     """
     _LOGGER.info(f"ACT_MUL: x={tuple(x.shape)} activation={activation}")
     assert x.is_cuda and x.is_contiguous()
-    M, N = x.shape
-    assert N % 2 == 0
+    assert x.shape[-1] % 2 == 0
+
+    # Flatten all leading dimensions so the kernel always sees a 2-D tensor.
+    orig_shape = x.shape
+    x_2d = x.view(-1, orig_shape[-1])
+    M, N = x_2d.shape
     N_half = N // 2
+    out_shape = orig_shape[:-1] + (N_half,)
 
     if out is None:
-        out = torch.empty((M, N_half), dtype=x.dtype, device=x.device)
+        out_2d = torch.empty((M, N_half), dtype=x.dtype, device=x.device)
     else:
-        assert out.shape == (M, N_half)
+        assert out.shape == out_shape
         assert out.dtype == x.dtype and out.is_contiguous()
+        out_2d = out.view(M, N_half)
 
     if group_size is None:
         group_size = min(256, triton.next_power_of_2(N_half))
@@ -170,11 +179,11 @@ def act_mul(
         triton.cdiv(N_half, BLOCK_SIZE_N),
     )
     _act_mul_and_dynamic_fp8_group_quant_kernel[grid](
-        x,
-        out,
+        x_2d,
+        out_2d,
         dummy_bs,
-        *x.stride(),
-        *out.stride(),
+        *x_2d.stride(),
+        *out_2d.stride(),
         *dummy_bs.stride(),
         N=N_half,
         ACTIVATION=activation,
@@ -185,7 +194,7 @@ def act_mul(
         DTYPE_MIN=-DTYPE_MAX,
         DO_QUANT=False,
     )
-    return out
+    return out_2d.view(out_shape)
 
 
 def act_mul_and_fp8_group_quant(
