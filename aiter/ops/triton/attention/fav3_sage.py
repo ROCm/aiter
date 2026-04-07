@@ -93,6 +93,12 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         if block_lut is not None:
             kv_block_indices, lut_start, lut_count = block_lut
             use_block_sparse = True
+            if causal or window_size != (-1, -1):
+                raise NotImplementedError(
+                    "The Triton block-sparse attention path selected by block_lut "
+                    "does not support causal or sliding-window masking; "
+                    "require causal=False and window_size=(-1, -1)."
+                )
         else:
             kv_block_indices = lut_start = lut_count = None
             use_block_sparse = False
