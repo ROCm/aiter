@@ -1,9 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# Gluon MLA decode kernel modified from FlashMLA triton kernel(https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
+# Gluon MLA decode kernel originated from FlashMLA triton kernel(https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 # Single-stage (NUM_KV_SPLITS=1) MLA attention using explicit Gluon layouts,
 # Constraints: CDNA4, PAGE_SIZE=1, bf16, BLOCK_H=64, BLOCK_N=64.
+#
+# 3-stage software pipeline (double-buffered, BLOCK_N=64 with 2x32 KV slices):
+#   AC = async_copy (global->LDS), LL = load (LDS->reg), P = page, K = K-cache, V = V-cache
+#
+#                      iter i          iter i+1        iter i+2
+#   ACP(page):        [i+2]           [i+3]           [i+4]
+#   LLP+ACK(K):       [i+1]           [i+2]           [i+3]
+#   LLK+MFMA+LLV:     [i]             [i+1]           [i+2]
+#
+#   Within each loop iteration (operating on buf_idx=current, async_idx=next):
+#     ACP                                -- async_copy page numbers [i+2]
+#     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
+#     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
 import torch
 import triton
@@ -92,7 +105,7 @@ def _mla_decode_gluon(
     buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
     # layout for KV
-    # conflict free for kv
+    # 512x64
     blocked_kv: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=((1, 0), (2, 0), (4, 0), (0, 8), (0, 4), (0, 16), (0, 32)),
         lane_bases=((8, 0), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
@@ -182,6 +195,7 @@ def _mla_decode_gluon(
     gl.static_assert(PAGE_SIZE == 1)
 
     offs_page_raw = gl.arange(0, BLOCK_N, layout=blocked_page)
+
     ################ prologue
     #### global load page number
     offs_n_page = start_n + offs_page_raw
@@ -225,7 +239,7 @@ def _mla_decode_gluon(
     kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
     kv_loc0 = kv_page_number_0
 
-    # global load K_nope  0
+    # global load K_nope slice 0
     offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
     offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
     bufs_kv0 = bufs_kv.index(0).slice(0, 32, 1)
@@ -243,7 +257,7 @@ def _mla_decode_gluon(
     kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
     kv_loc1 = kv_page_number_1
 
-    # global load K_nope  1
+    # global load K_nope slice 1
     bufs_kv1 = bufs_kv.index(0).slice(32, 32, 1)
     offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
     gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1)
@@ -269,7 +283,7 @@ def _mla_decode_gluon(
         bufs_page_0 = bufs_page.index(async_idx).slice(0, 32, 0)
         kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
         kv_loc0 = kv_page_number_0
-        # global load K_nope  0
+        # global load K_nope slice 0
         offs_n_nope0 = start_n + gl.arange(0, 32, layout=gl.SliceLayout(0, blocked_kv_slice))
         offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
         offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
@@ -286,7 +300,7 @@ def _mla_decode_gluon(
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
         gl.amd.cdna4.async_copy.commit_group()
 
-        #### dot, softmax, dot
+        #### dot, softmax, dot (part0)
         k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
         qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
@@ -297,12 +311,13 @@ def _mla_decode_gluon(
         bufs_page_1 = bufs_page.index(async_idx).slice(32, 32, 0)
         kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
         kv_loc1 = kv_page_number_1
-        # global load K_nope  1
+        # global load K_nope slice 1
         offs_n1 = offs_n_nope0 + 32
         offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n1[None, :] < split_kv_end)
         gl.amd.cdna4.async_copy.commit_group()
 
+        #### dot, softmax, dot (part1)
         qk *= sm_scale
         offs_n_qk = i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
         qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
