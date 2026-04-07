@@ -1,5 +1,9 @@
 name: AMD CI Job Monitor
 
+permissions:
+  actions: read
+  contents: read
+
 on:
   schedule:
     - cron: "0 0 * * *"
@@ -34,7 +38,7 @@ on:
 jobs:
   parse-workflows:
     name: Parse Workflow Jobs
-    if: ${{ !inputs.job_filter }}
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '' }}
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.parse.outputs.matrix }}
@@ -56,9 +60,9 @@ jobs:
         run: |
           python .github/scripts/list_jobs.py \
             --workflow-dir ".github/workflows" \
-            --workflows "${{ inputs.workflows }}" \
+            --workflows "${{ github.event.inputs.workflows || '' }}" \
             --exclude-workflows "amd-ci-job-monitor.yml" \
-            --exclude-jobs "${{ inputs.exclude_jobs }}" \
+            --exclude-jobs "${{ github.event.inputs.exclude_jobs || 'call-gate,check-changes,pr-test-amd-finish,cancel,check-all-jobs' }}" \
             --out-matrix matrix.json \
             --out-workflow-map workflow_map.json
 
@@ -83,7 +87,7 @@ jobs:
 
   custom-report:
     name: Custom Job Report
-    if: ${{ inputs.job_filter != '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.job_filter != '' }}
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -101,24 +105,60 @@ jobs:
 
       - name: Generate custom report
         run: |
+          if [ -z "${{ github.event.inputs.workflows || '' }}" ]; then
+            echo "Error: 'workflows' input is required when 'job_filter' is set."
+            exit 1
+          fi
           python .github/scripts/query_job_status.py \
             --repo "${{ github.repository }}" \
-            --workflows "${{ inputs.workflows }}" \
-            --job "${{ inputs.job_filter }}" \
-            --hours "${{ inputs.hours || '24' }}" \
+            --workflows "${{ github.event.inputs.workflows }}" \
+            --job "${{ github.event.inputs.job_filter }}" \
+            --hours "${{ github.event.inputs.hours || '24' }}" \
             --summary
+
+  fetch-actions-snapshot:
+    name: Fetch Actions Snapshot
+    needs: parse-workflows
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '') && needs.parse-workflows.outputs.workflow_list != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install requests tabulate
+
+      - name: Fetch snapshot
+        run: |
+          HOURS="${{ github.event_name == 'pull_request' && '1' || (github.event.inputs.hours || '24') }}"
+          python .github/scripts/query_job_status.py \
+            --repo "${{ github.repository }}" \
+            --workflows "${{ needs.parse-workflows.outputs.workflow_list }}" \
+            --hours "${HOURS}" \
+            --snapshot-out actions-snapshot.json
+
+      - name: Upload snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: actions-snapshot.json
 
   matrix-reports:
     name: ${{ matrix.workflow }} - ${{ matrix.job_name }}
-    needs: parse-workflows
-    if: ${{ github.event_name != 'pull_request' && !inputs.job_filter && needs.parse-workflows.outputs.matrix != '[]' }}
+    needs: [parse-workflows, fetch-actions-snapshot]
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '') && needs.parse-workflows.outputs.matrix != '[]' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.parse-workflows.outputs.matrix) }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -130,23 +170,27 @@ jobs:
 
       - name: Install dependencies
         run: pip install requests tabulate
+
+      - name: Download actions snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: .
 
       - name: Generate report
         run: |
           python .github/scripts/query_job_status.py \
             --repo "${{ github.repository }}" \
+            --snapshot-in "actions-snapshot.json" \
             --workflows "${{ matrix.workflow }}" \
             --job "${{ matrix.job_name }}" \
-            --hours "${{ inputs.hours || '24' }}" \
             --summary
 
   runner-fleet-report:
     name: Runner Fleet Report
-    needs: parse-workflows
-    if: ${{ !inputs.job_filter && needs.parse-workflows.outputs.workflow_list != '' }}
+    needs: [parse-workflows, fetch-actions-snapshot]
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '') && needs.parse-workflows.outputs.workflow_list != '' }}
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -159,18 +203,19 @@ jobs:
       - name: Install dependencies
         run: pip install requests tabulate
 
+      - name: Download actions snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: .
+
       - name: Generate runner fleet report
         run: |
-          HOURS="${{ github.event_name == 'pull_request' && '1' || (inputs.hours || '24') }}"
           python .github/scripts/query_job_status.py \
             --repo "${{ github.repository }}" \
+            --snapshot-in "actions-snapshot.json" \
             --workflows "${{ needs.parse-workflows.outputs.workflow_list }}" \
-            --hours "${HOURS}" \
             --runner-report \
             --summary | tee runner-fleet-report.md
 
-          {
-            echo "## Runner Fleet Summary"
-            echo ""
-            cat runner-fleet-report.md
-          } >> "$GITHUB_STEP_SUMMARY"
+          cat runner-fleet-report.md >> "$GITHUB_STEP_SUMMARY"
