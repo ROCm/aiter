@@ -440,9 +440,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         cu_num, M, N, K, q_dtype_w = info_keys
         q_dtype_eval = eval(q_dtype_w)
         if q_dtype_eval == dtypes.fp8:
-            in_dtype = "fp8"
+            pass
         elif q_dtype_eval == dtypes.i8:
-            in_dtype = "int8"
+            pass
         else:
             print(f"[FlyDSL] unsupported q_dtype_w {q_dtype_w}, skipping")
             return []

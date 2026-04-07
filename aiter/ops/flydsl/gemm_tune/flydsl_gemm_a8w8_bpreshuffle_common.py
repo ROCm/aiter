@@ -11,9 +11,6 @@ def get_gfx():
     if env and env != "native":
         return env.split(";")[-1].strip()
     try:
-        import sys
-
-        this_dir = os.path.dirname(os.path.abspath(__file__))
         from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
         return _get_gfx()

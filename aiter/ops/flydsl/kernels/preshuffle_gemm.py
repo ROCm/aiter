@@ -16,6 +16,7 @@ from flydsl.expr import buffer_ops, rocdl
 
 
 from flydsl.expr.typing import T
+from typing import Optional
 from .mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
     load_b_pack_k32,
@@ -234,7 +235,6 @@ def compile_preshuffle_gemm_a8(
 
     wave_size = 64
     num_a_lds_load = bytes_a_per_tile // wave_size // a_load_bytes
-    num_a_async_loads = bytes_per_thread_a // a_async_load_bytes
 
     _is_gfx950 = str(gpu_arch).startswith("gfx950")
     _is_gfx942 = str(gpu_arch).startswith("gfx942")
@@ -268,11 +268,6 @@ def compile_preshuffle_gemm_a8(
 
     def _out_elem():
         return T.bf16 if _out_is_bf16 else T.f16
-
-    epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
-    module_name = f"mfma_preshuffle_{lds_stage}stages_{in_dtype}_{out_dtype}_{epilog_tag}".replace(
-        "-", "_"
-    )
 
     # ── LDS sizing (pure Python, no MLIR ops) ────────────────────────────────
     lds_tile_bytes = int(tile_m) * int(lds_stride_bytes) // a_elem_vec_pack
@@ -324,7 +319,6 @@ def compile_preshuffle_gemm_a8(
         kpack_bytes = 8 if is_int4 else 16
         kpack_elems = kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
         k_bytes_b = K * elem_bytes // b_elem_vec_pack
-        k_bytes = K * elem_bytes
         n0_val = N // 16
         k0_val = k_bytes_b // 64
         _stride_nlane = kpack_elems
@@ -337,9 +331,6 @@ def compile_preshuffle_gemm_a8(
         )
 
         lds_k_dim = tile_k // a_elem_vec_pack
-        shape_lds = fx.make_shape(tile_m, lds_k_dim)
-        stride_lds = fx.make_stride(lds_k_dim, 1)
-        layout_lds = fx.make_layout(shape_lds, stride_lds)
 
         k_blocks16 = arith.index(tile_k_bytes // a_elem_vec_pack // 16)
 
@@ -466,7 +457,6 @@ def compile_preshuffle_gemm_a8(
             )
 
         c64_b = 64
-        c0_idx = 0
 
         _b_stride_n0_c = fx.Index(_stride_n0)
         _b_stride_k0_c = fx.Index(_stride_k0)
@@ -659,7 +649,6 @@ def compile_preshuffle_gemm_a8(
         num_a_async_loads = bytes_per_thread_a // a_async_load_bytes
         tx_i32_async_base = tx * a_async_load_dword
         k_bytes_factor = K * elem_bytes // a_elem_vec_pack
-        layout_a_bytes = fx.make_layout((tile_m, k_bytes_factor), (k_bytes_factor, 1))
 
         def a_tile_chunk_coord_i32_async(i: int):
             return tile_chunk_coord_i32(
@@ -1168,8 +1157,6 @@ def compile_preshuffle_gemm_a8(
         rocdl.sched_barrier(0)
 
         def hot_loop_scheduler():
-            import math as _math
-
             def _build_scheduler(numer: int, denom: int):
                 if denom <= 0:
                     return []

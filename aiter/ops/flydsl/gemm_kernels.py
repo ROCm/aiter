@@ -9,9 +9,14 @@ from itertools import product
 from typing import Dict, Optional
 
 import torch
+from torch import Tensor
+
+from aiter import logger
+from aiter.utility import dtypes
 
 from ..shuffle import shuffle_weight
 from .kernels.splitk_hgemm import compile_hgemm_kernel
+from .utils import is_flydsl_available
 
 from aiter.jit.utils.chip_info import get_gfx
 
@@ -475,13 +480,6 @@ def flydsl_hgemm(
 # ---------------------------------------------------------------------------
 # FlyDSL preshuffle GEMM kernel management
 # ---------------------------------------------------------------------------
-
-from torch import Tensor
-
-from aiter import logger
-from aiter.utility import dtypes
-
-from .utils import is_flydsl_available
 
 _flydsl_compile_fn = None
 _flydsl_import_done = False
