@@ -477,12 +477,15 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#if defined(__GFX9__)
             const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
             uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
             asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+#else
+            buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#endif
         }
     }
 
@@ -506,7 +509,11 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             {
                 auto buffer_map = opus::make_gmem<int>(smooth_scale_map + chunk_start, chunk_size * sizeof(int));
                 smscale_map_idx_list = buffer_map.load(lane_idx + i)[0];
+#if defined(__gfx1250__)
+                opus::s_wait_loadcnt(opus::number<0>{});
+#else
                 opus::s_waitcnt_vmcnt(opus::number<0>{});
+#endif
                 if (i == 0)
                 {
                     __syncthreads();
@@ -1187,12 +1194,15 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#if defined(__GFX9__)
             const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
             uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
             asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+#else
+            buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#endif
         }
     }
     int smscale_map_idx_list = 0;
@@ -1204,7 +1214,11 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
     auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
     vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
+#if defined(__gfx1250__)
+    opus::s_wait_loadcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
+#else
     opus::s_waitcnt_vmcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
+#endif
     __syncthreads();
     if constexpr(has_smscale_hash)
     {
@@ -1494,7 +1508,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
 
 #define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)  \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                            \
-        using input_dtype = typename t2ck<scalar_t>::type;                                                \
+        using input_dtype = typename t2opus<scalar_t>::type;                                                \
         int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE;                                                    \
         int num_tg = persistent_mode? num_cu * warps_per_cu : num_blocks;                                 \
         dim3 const grid(num_tg);                                                                          \

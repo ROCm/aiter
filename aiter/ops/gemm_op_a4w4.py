@@ -6,10 +6,9 @@ from typing import Optional
 
 import pandas as pd
 import torch
-from torch import Tensor
-
 from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from torch import Tensor
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
@@ -32,7 +31,9 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config(M: int, N: int, K: int):
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
     if not hasattr(get_GEMM_config, "gemm_dict"):
+<<<<<<< HEAD
         gemm_dict = pd.read_csv(
             AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
         ).drop_duplicates()
@@ -53,6 +54,12 @@ def get_GEMM_config(M: int, N: int, K: int):
             ).to_dict("index")
             get_GEMM_config.has_gfx = False
     gfx = get_gfx()
+=======
+        gemm_dict = pd.read_csv(tuned_file).drop_duplicates()
+        get_GEMM_config.gemm_dict = gemm_dict.set_index(
+            ["cu_num", "M", "N", "K"]
+        ).to_dict("index")
+>>>>>>> main
     cu_num = get_cu_num()
     padded_M = M
     config = None
@@ -68,7 +75,7 @@ def get_GEMM_config(M: int, N: int, K: int):
             break
     else:
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in CKGEMM or asmGEMM, will use default config!"
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
     return config
 

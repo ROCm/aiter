@@ -36,6 +36,33 @@ class Provider:
 _PROVIDERS: dict[str, Provider] = {}
 
 
+def _has_sliding_window(window_size: tuple[int, int]) -> bool:
+    return window_size[0] >= 0
+
+
+def _count_valid_attention_elements(
+    seqlen_q: int,
+    seqlen_k: int,
+    causal: bool,
+    window_size: tuple[int, int],
+) -> int:
+    window_size_left, _ = window_size
+    shift = seqlen_k - seqlen_q
+    total = 0
+
+    for q_idx in range(seqlen_q):
+        right = seqlen_k - 1
+        if causal:
+            right = min(right, q_idx + shift)
+        left = 0
+        if window_size_left >= 0:
+            left = max(left, q_idx + shift - window_size_left)
+        if right >= left:
+            total += right - left + 1
+
+    return total
+
+
 def _make_bf16_fn(q, k, v, **kw):
     mha_set_use_fused_bwd_kernel(False)
     return lambda: flash_attn_func(
@@ -45,6 +72,7 @@ def _make_bf16_fn(q, k, v, **kw):
         dropout_p=kw["dropout"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw["window_size"],
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
@@ -64,6 +92,7 @@ def _make_bf16_varlen_fn(q, k, v, **kw):
         dropout_p=kw["dropout"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw["window_size"],
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
@@ -71,8 +100,10 @@ def _make_bf16_varlen_fn(q, k, v, **kw):
 
 
 def _make_bf16_fused_fn(q, k, v, **kw):
-    if kw.get("has_pe") or kw.get("has_sink"):
-        warnings.warn("Skipping: PE or sink not supported for this provider.")
+    if kw.get("has_pe") or kw.get("has_sink") or _has_sliding_window(kw["window_size"]):
+        warnings.warn(
+            "Skipping: PE, sink, or sliding window not supported for this provider."
+        )
         return None
     mha_set_use_fused_bwd_kernel(True)
     return lambda: flash_attn_func(
@@ -82,6 +113,7 @@ def _make_bf16_fused_fn(q, k, v, **kw):
         dropout_p=kw["dropout"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw["window_size"],
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
@@ -89,8 +121,10 @@ def _make_bf16_fused_fn(q, k, v, **kw):
 
 
 def _make_bf16_fused_varlen_fn(q, k, v, **kw):
-    if kw.get("has_pe") or kw.get("has_sink"):
-        warnings.warn("Skipping: PE or sink not supported for this provider.")
+    if kw.get("has_pe") or kw.get("has_sink") or _has_sliding_window(kw["window_size"]):
+        warnings.warn(
+            "Skipping: PE, sink, or sliding window not supported for this provider."
+        )
         return None
     mha_set_use_fused_bwd_kernel(True)
     return lambda: flash_attn_varlen_func(
@@ -104,6 +138,7 @@ def _make_bf16_fused_varlen_fn(q, k, v, **kw):
         dropout_p=kw["dropout"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw["window_size"],
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
@@ -121,6 +156,7 @@ def _make_fp8_fn(q, k, v, **kw):
         v,
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw["window_size"],
     )
 
 
@@ -139,6 +175,7 @@ def _make_fp8_varlen_fn(q, k, v, **kw):
         kw["max_seqlen_k"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw["window_size"],
     )
 
 
@@ -249,7 +286,12 @@ def create_benchmark_configs(custom, args):
     varlen = args.layout == "thd"
 
     configs = []
-    plot_name = get_caller_name_no_ext()
+    plot_name_parts = [get_caller_name_no_ext()]
+    if args.sink:
+        plot_name_parts.append("sink")
+    if args.window_size_left >= 0:
+        plot_name_parts.append(f"window_left_{args.window_size_left}")
+    plot_name = "-".join(plot_name_parts)
     extra_args = {
         "D_HEAD": head_size,
         "D_HEAD_V": head_size_v,
@@ -278,7 +320,11 @@ def create_benchmark_configs(custom, args):
                 "D_HEAD",
                 "D_HEAD_V",
             ]
-            plot_name = f"fused-attention-{mode}-layout-{args.layout}-dtype-{args.dtype}-causal-{causal}"
+            plot_name = (
+                f"fused-attention-{mode}-layout-{args.layout}-dtype-{args.dtype}"
+                f"-causal-{causal}-sink-{args.sink}"
+                f"-window-left-{args.window_size_left}"
+            )
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
     if args.metric == "time":
@@ -364,6 +410,7 @@ def run_benchmark(custom, args):
         return_attn_probs = False
         varlen = args.layout == "thd"
         has_pe = D_HEAD > D_HEAD_V
+        window_size = (args.window_size_left, -1)
         provider_obj = _PROVIDERS[provider]
 
         # Default softmax scale to match standard attention
@@ -390,7 +437,12 @@ def run_benchmark(custom, args):
             requires_grad=requires_grad,
         )
         sink = (
-            torch.randn((HQ,), device=device, dtype=dtype, requires_grad=requires_grad)
+            torch.randn(
+                (HQ,),
+                device=device,
+                dtype=torch.float32,
+                requires_grad=requires_grad,
+            )
             if args.sink
             else None
         )
@@ -433,31 +485,32 @@ def run_benchmark(custom, args):
             for i in range(num_contexts):
                 seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
                 seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
-                if causal:
-                    valid_out_elements = (
-                        ((seqlen_k**2 + seqlen_k) / 2)
-                        if seqlen_q > seqlen_k
-                        else (seqlen_q * seqlen_k - ((seqlen_q**2 - seqlen_q) / 2))
+                total_flops += (
+                    _count_valid_attention_elements(
+                        seqlen_q,
+                        seqlen_k,
+                        causal,
+                        window_size,
                     )
-                    total_flops += valid_out_elements * HQ * (D_HEAD + D_HEAD_V) * 2.0
-                else:
-                    total_flops += seqlen_q * seqlen_k * HQ * (D_HEAD + D_HEAD_V) * 2.0
+                    * HQ
+                    * (D_HEAD + D_HEAD_V)
+                    * 2.0
+                )
         else:
             q_input, k_input, v_input = q, k, v
 
-            if causal:
-                valid_out_elements = (
-                    ((N_CTX_K**2 + N_CTX_K) / 2)
-                    if N_CTX_Q > N_CTX_K
-                    else (N_CTX_Q * N_CTX_K - ((N_CTX_Q**2 - N_CTX_Q) / 2))
+            total_flops += (
+                2.0
+                * BATCH
+                * HQ
+                * _count_valid_attention_elements(
+                    N_CTX_Q,
+                    N_CTX_K,
+                    causal,
+                    window_size,
                 )
-                total_flops += (
-                    2.0 * BATCH * HQ * valid_out_elements * (D_HEAD + D_HEAD_V)
-                )
-            else:
-                total_flops += (
-                    2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
-                )
+                * (D_HEAD + D_HEAD_V)
+            )
 
         # Build fn from provider
         fn_kwargs = dict(
@@ -467,6 +520,7 @@ def run_benchmark(custom, args):
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
             sink=sink,
+            window_size=window_size,
             has_pe=has_pe,
             has_sink=args.sink,
         )
@@ -662,6 +716,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-sink", action="store_true", default=False, help="use attention sink"
     )
+    parser.add_argument(
+        "--window-size-left",
+        type=int,
+        default=-1,
+        help="left sliding window size (-1 disables sliding window attention)",
+    )
     return parser.parse_args(args=args)
 
 
@@ -728,6 +788,10 @@ def post_process_args(args: argparse.Namespace) -> tuple[argparse.Namespace, boo
             "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
             category=RuntimeWarning,
         )
+
+    assert (
+        args.window_size_left >= -1
+    ), f"Invalid --window-size-left={args.window_size_left}. Expected -1 or a non-negative integer."
 
     return args, custom_config
 

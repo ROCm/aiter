@@ -41,8 +41,21 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
-@compile_ops("module_aiter_tensor", "make_aiter_tensor")
+@compile_ops("module_aiter_core", "make_aiter_tensor")
 def _make_aiter_tensor(data_ptr, numel, ndim, shape, strides, dtype, device_id): ...
+
+
+def _sync_hip_stream():
+    """Sync the aiter thread-local HIP stream with torch's current stream.
+
+    Called automatically by torch_to_aiter_pybind() so that C++ kernels
+    always see the correct stream (including CUDA Graph capture streams)
+    without requiring an explicit stream parameter on every op.
+    """
+    from ..jit.core import get_module
+
+    stream = torch.cuda.current_stream()
+    get_module("module_aiter_core")._set_current_hip_stream(stream.cuda_stream)
 
 
 def torch_to_aiter_pybind(tensor: torch.Tensor):
@@ -50,8 +63,9 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
 
     Unlike torch_to_aiter() which returns a ctypes aiter_tensor_t struct,
     this function constructs a *pybind11* aiter_tensor_t via
-    module_aiter_tensor.  The two types are not interchangeable.
+    module_aiter_core.  The two types are not interchangeable.
     """
+    _sync_hip_stream()
     return _make_aiter_tensor(
         tensor.data_ptr(),
         tensor.numel(),
