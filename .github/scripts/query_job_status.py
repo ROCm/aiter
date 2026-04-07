@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,18 @@ import requests
 from tabulate import tabulate
 
 API_BASE = "https://api.github.com"
+GENERIC_RUNNER_LABELS = {
+    "self-hosted",
+    "linux",
+    "windows",
+    "macos",
+    "x64",
+    "x86_64",
+    "arm64",
+    "ubuntu-latest",
+    "ubuntu-22.04",
+    "ubuntu-24.04",
+}
 
 
 def parse_args():
@@ -32,7 +45,7 @@ def parse_args():
     parser.add_argument(
         "--runner-report",
         action="store_true",
-        help="Print runner utilization summary.",
+        help="Print runner fleet summary grouped by runner label.",
     )
     parser.add_argument(
         "--summary",
@@ -56,6 +69,21 @@ def iso_to_datetime(value: str):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def parse_time(value: str):
+    if not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def split_csv(raw: str):
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def workflow_file_from_path(path_value: str):
+    normalized = path_value.split("@", 1)[0]
+    return Path(normalized).name
+
+
 class RateLimitExceededError(RuntimeError):
     def __init__(self, reset_epoch: int | None):
         self.reset_epoch = reset_epoch
@@ -76,7 +104,6 @@ def github_get(url: str, token: str, params=None):
             timeout=30,
         )
 
-        # Handle API rate-limit gracefully with small bounded retry.
         if response.status_code == 403:
             remaining = response.headers.get("X-RateLimit-Remaining")
             reset_header = response.headers.get("X-RateLimit-Reset")
@@ -97,16 +124,6 @@ def github_get(url: str, token: str, params=None):
         return response.json()
 
     raise RuntimeError("Unexpected retry loop exit in github_get.")
-
-
-def split_csv(raw: str):
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def workflow_file_from_path(path_value: str):
-    # Example: ".github/workflows/pre-checks.yaml@refs/heads/main"
-    normalized = path_value.split("@", 1)[0]
-    return Path(normalized).name
 
 
 def list_recent_runs(
@@ -164,7 +181,6 @@ def job_name_matches(filter_name: str, actual_name: str):
         return True
     if actual_name == filter_name:
         return True
-    # Handle matrix-expanded names like "Foo (bar=1)".
     if actual_name.startswith(f"{filter_name} ("):
         return True
     if actual_name.startswith(f"{filter_name} / "):
@@ -172,79 +188,317 @@ def job_name_matches(filter_name: str, actual_name: str):
     return False
 
 
-def row_to_dict(row: list[str]):
+def normalize_labels(raw_labels):
+    if not raw_labels:
+        return []
+    if isinstance(raw_labels, str):
+        return split_csv(raw_labels)
+    return [str(label).strip() for label in raw_labels if str(label).strip()]
+
+
+def record_from_job(workflow: str, branch: str, run_url: str, job: dict):
     return {
-        "workflow": row[0],
-        "job": row[1],
-        "runner": row[2],
-        "runner_group": row[3],
-        "status": row[4],
-        "conclusion": row[5],
-        "branch": row[6],
-        "run_url": row[7],
+        "workflow": workflow,
+        "job": job.get("name", "-"),
+        "runner": job.get("runner_name") or "-",
+        "runner_group": job.get("runner_group_name") or "-",
+        "status": job.get("status") or "-",
+        "conclusion": job.get("conclusion") or "-",
+        "branch": branch or "-",
+        "run_url": run_url or "-",
+        "job_url": job.get("html_url") or run_url or "-",
+        "created_at": job.get("created_at") or "",
+        "started_at": job.get("started_at") or "",
+        "completed_at": job.get("completed_at") or "",
+        "labels": normalize_labels(job.get("labels")),
     }
 
 
-def row_from_dict(data: dict):
-    return [
-        data.get("workflow", "-"),
-        data.get("job", "-"),
-        data.get("runner", "-"),
-        data.get("runner_group", "-"),
-        data.get("status", "-"),
-        data.get("conclusion", "-"),
-        data.get("branch", "-"),
-        data.get("run_url", "-"),
+def normalize_record(data: dict):
+    return {
+        "workflow": data.get("workflow", "-"),
+        "job": data.get("job", "-"),
+        "runner": data.get("runner", "-"),
+        "runner_group": data.get("runner_group", "-"),
+        "status": data.get("status", "-"),
+        "conclusion": data.get("conclusion", "-"),
+        "branch": data.get("branch", "-"),
+        "run_url": data.get("run_url", "-"),
+        "job_url": data.get("job_url") or data.get("run_url", "-"),
+        "created_at": data.get("created_at", ""),
+        "started_at": data.get("started_at", ""),
+        "completed_at": data.get("completed_at", ""),
+        "labels": normalize_labels(data.get("labels")),
+    }
+
+
+def load_snapshot_records(path: str):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw_records = payload.get("rows") or payload.get("jobs") or []
+    return [normalize_record(item) for item in raw_records]
+
+
+def write_snapshot_records(path: str, records: list[dict]):
+    snapshot_payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "rows": records,
+    }
+    Path(path).write_text(
+        json.dumps(snapshot_payload, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def format_seconds(seconds: float | None):
+    if seconds is None:
+        return "-"
+    total_seconds = int(round(seconds))
+    if total_seconds < 0:
+        return "-"
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m{secs}s"
+
+
+def average(values: list[float]):
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def percentile(values: list[float], p: int):
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    index = min(int(len(sorted_values) * p / 100), len(sorted_values) - 1)
+    return sorted_values[index]
+
+
+def extract_runner_label(record: dict):
+    labels = normalize_labels(record.get("labels"))
+    custom_labels = [
+        label
+        for label in labels
+        if label.lower() not in GENERIC_RUNNER_LABELS
+        and not label.lower().startswith("ubuntu-")
     ]
+    if not custom_labels:
+        return ""
+
+    preferred = [
+        label
+        for label in custom_labels
+        if any(
+            token in label.lower()
+            for token in ("mi", "gpu", "runner", "aiter", "linux-")
+        )
+    ]
+    candidates = preferred or custom_labels
+    return sorted(candidates, key=lambda value: (-len(value), value.lower()))[0]
+
+
+def runner_label_sort_key(label: str):
+    lowered = label.lower()
+    family_match = re.search(r"(mi\d+[a-z0-9x]*)", lowered)
+    family = family_match.group(1) if family_match else lowered
+
+    gpu_count = 0
+    for pattern in (r"(\d+)\s*gpu", r"gpu[-_]?(\d+)", r"-(\d+)$"):
+        match = re.search(pattern, lowered)
+        if match:
+            gpu_count = int(match.group(1))
+            break
+
+    return (family, gpu_count, lowered)
+
+
+def queue_time_seconds(record: dict, report_time: datetime):
+    created_at = parse_time(record.get("created_at", ""))
+    if not created_at:
+        return None
+
+    runner = record.get("runner") or ""
+    if runner and runner != "-":
+        started_at = parse_time(record.get("started_at", ""))
+        if not started_at:
+            return None
+        queue_seconds = (started_at - created_at).total_seconds()
+        return queue_seconds if queue_seconds >= 0 else None
+
+    if record.get("status") not in ("queued", "waiting"):
+        return None
+
+    queue_seconds = (report_time - created_at).total_seconds()
+    return queue_seconds if queue_seconds >= 0 else None
+
+
+def duration_seconds(record: dict, report_time: datetime):
+    runner = record.get("runner") or ""
+    if not runner or runner == "-":
+        return None
+
+    started_at = parse_time(record.get("started_at", ""))
+    if not started_at:
+        return None
+
+    completed_at = parse_time(record.get("completed_at", ""))
+    end_time = completed_at or report_time
+    duration = (end_time - started_at).total_seconds()
+    return duration if duration >= 0 else None
+
+
+def analyze_runner_labels(records: list[dict], report_time: datetime):
+    by_label = defaultdict(list)
+    for record in records:
+        label = extract_runner_label(record)
+        if not label:
+            continue
+        by_label[label].append(record)
+
+    report = {}
+    for label, items in by_label.items():
+        queue_samples = []
+        duration_samples = []
+        events = []
+
+        for item in items:
+            queue_sample = queue_time_seconds(item, report_time)
+            if queue_sample is not None:
+                queue_samples.append(queue_sample)
+
+            duration_sample = duration_seconds(item, report_time)
+            if duration_sample is not None:
+                duration_samples.append(duration_sample)
+
+            runner = item.get("runner") or ""
+            started_at = parse_time(item.get("started_at", ""))
+            if not runner or runner == "-" or not started_at:
+                continue
+
+            completed_at = parse_time(item.get("completed_at", ""))
+            end_time = completed_at or report_time
+            if end_time < started_at:
+                continue
+
+            events.append((started_at, 1))
+            events.append((end_time, -1))
+
+        peak = 0
+        avg_concurrent = 0.0
+        if events:
+            events.sort(key=lambda entry: (entry[0], entry[1]))
+            concurrent = 0
+            weighted_sum = 0.0
+            active_window = 0.0
+            prev_time = events[0][0]
+
+            for timestamp, delta in events:
+                if concurrent > 0:
+                    elapsed = (timestamp - prev_time).total_seconds()
+                    if elapsed > 0:
+                        weighted_sum += concurrent * elapsed
+                        active_window += elapsed
+                concurrent += delta
+                peak = max(peak, concurrent)
+                prev_time = timestamp
+
+            if active_window > 0:
+                avg_concurrent = weighted_sum / active_window
+
+        report[label] = {
+            "peak": peak,
+            "avg_concurrent": round(avg_concurrent, 1),
+            "total_jobs": len(items),
+            "avg_queue_seconds": average(queue_samples),
+            "p50_queue_seconds": percentile(queue_samples, 50),
+            "p99_queue_seconds": percentile(queue_samples, 99),
+            "avg_duration_seconds": average(duration_samples),
+        }
+
+    return report
+
+
+def render_job_report(records: list[dict]):
+    table = [
+        [
+            record["workflow"],
+            record["job"],
+            record["runner"],
+            record["runner_group"],
+            record["status"],
+            record["conclusion"],
+            record["branch"],
+            record["run_url"],
+        ]
+        for record in records
+    ]
+    return tabulate(
+        table,
+        headers=[
+            "workflow",
+            "job",
+            "runner",
+            "runner_group",
+            "status",
+            "conclusion",
+            "branch",
+            "run_url",
+        ],
+        tablefmt="github",
+    )
+
+
+def render_runner_report(records: list[dict], report_time: datetime):
+    label_summary = analyze_runner_labels(records, report_time)
+    if not label_summary:
+        return "No matching self-hosted runner label records in the selected time window."
+
+    lines = [
+        "| Runner Label | Peak Concurrent | Avg Concurrent | Total Jobs | Avg Queue | P50 Queue | P99 Queue | Avg Duration |",
+        "|-------------|-----------------|----------------|------------|-----------|-----------|-----------|--------------|",
+    ]
+    for label in sorted(label_summary, key=runner_label_sort_key):
+        stats = label_summary[label]
+        lines.append(
+            f"| `{label}` | {stats['peak']} | {stats['avg_concurrent']:.1f} | "
+            f"{stats['total_jobs']} | {format_seconds(stats['avg_queue_seconds'])} | "
+            f"{format_seconds(stats['p50_queue_seconds'])} | "
+            f"{format_seconds(stats['p99_queue_seconds'])} | "
+            f"{format_seconds(stats['avg_duration_seconds'])} |"
+        )
+
+    return "\n".join(lines)
 
 
 def main():
     args = parse_args()
     token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
-    if not token:
+    if not token and not args.snapshot_in:
         raise RuntimeError("GH_TOKEN or GITHUB_TOKEN is required.")
 
     owner, repo = args.repo.split("/", 1)
     workflows = split_csv(args.workflows)
     if not workflows:
         raise RuntimeError("No workflows specified. Please pass --workflows.")
-    lookback = datetime.now(timezone.utc) - timedelta(hours=args.hours)
 
-    job_rows = []
-    runner_stats = defaultdict(lambda: defaultdict(int))
+    lookback = datetime.now(timezone.utc) - timedelta(hours=args.hours)
+    report_time = datetime.now(timezone.utc)
     rate_limited = False
     rate_limit_reset_epoch = None
 
-    all_rows = []
+    all_records = []
     if args.snapshot_in:
-        snapshot_payload = json.loads(Path(args.snapshot_in).read_text(encoding="utf-8"))
-        all_rows = [row_from_dict(item) for item in snapshot_payload.get("rows", [])]
+        all_records = load_snapshot_records(args.snapshot_in)
     else:
         try:
             runs = list_recent_runs(owner, repo, workflows, token, lookback)
             for run in runs:
-                run_id = run["id"]
                 run_url = run["html_url"]
                 branch = run.get("head_branch") or "-"
                 workflow = run.get("workflow_file", "-")
                 for job in list_jobs_for_run(owner, repo, run_id, token):
-                    runner_name = job.get("runner_name") or "-"
-                    runner_group = job.get("runner_group_name") or "-"
-                    status = job.get("status") or "-"
-                    conclusion = job.get("conclusion") or "-"
-
-                    all_rows.append(
-                        [
-                            workflow,
-                            job["name"],
-                            runner_name,
-                            runner_group,
-                            status,
-                            conclusion,
-                            branch,
-                            run_url,
-                        ]
-                    )
+                    all_records.append(record_from_job(workflow, branch, run_url, job))
         except RateLimitExceededError as exc:
             rate_limited = True
             rate_limit_reset_epoch = exc.reset_epoch
@@ -253,27 +507,29 @@ def main():
             print(f"[warn] Failed to query workflow runs: {exc}")
 
     if args.snapshot_out:
-        snapshot_payload = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "rows": [row_to_dict(row) for row in all_rows],
-        }
-        Path(args.snapshot_out).write_text(
-            json.dumps(snapshot_payload, ensure_ascii=False), encoding="utf-8"
-        )
+        write_snapshot_records(args.snapshot_out, all_records)
 
     workflow_set = set(workflows)
-    for row in all_rows:
-        if row[0] not in workflow_set:
-            continue
-        if not job_name_matches(args.job, row[1]):
-            continue
+    matching_records = [
+        record
+        for record in all_records
+        if record["workflow"] in workflow_set and job_name_matches(args.job, record["job"])
+    ]
 
-        job_rows.append(row)
-        key = (row[0], row[2], row[3])
-        runner_stats[key]["total"] += 1
-        runner_stats[key][row[5]] += 1
+    if args.runner_report:
+        if not args.summary:
+            print("=== Runner Fleet Summary ===")
+        print(render_runner_report(matching_records, report_time))
+        if rate_limited and rate_limit_reset_epoch:
+            reset_time = datetime.fromtimestamp(rate_limit_reset_epoch, timezone.utc)
+            print("")
+            print(
+                f"> NOTE: Partial data due to GitHub API rate limit. "
+                f"Reset at {reset_time.isoformat()} (UTC)."
+            )
+        return
 
-    if not job_rows:
+    if not matching_records:
         print("No matching job records in the selected time window.")
         if rate_limited and rate_limit_reset_epoch:
             reset_time = datetime.fromtimestamp(rate_limit_reset_epoch, timezone.utc)
@@ -283,68 +539,9 @@ def main():
             )
         return
 
-    if args.summary and not args.runner_report:
+    if args.summary:
         print("=== Job Status Report ===")
-        print(
-            tabulate(
-                job_rows,
-                headers=[
-                    "workflow",
-                    "job",
-                    "runner",
-                    "runner_group",
-                    "status",
-                    "conclusion",
-                    "branch",
-                    "run_url",
-                ],
-                tablefmt="github",
-            )
-        )
-
-    if args.runner_report:
-        rows = []
-        for (workflow, runner_name, runner_group), counts in sorted(
-            runner_stats.items()
-        ):
-            rows.append(
-                [
-                    workflow,
-                    runner_name,
-                    runner_group,
-                    counts.get("total", 0),
-                    counts.get("success", 0),
-                    counts.get("failure", 0),
-                    counts.get("cancelled", 0),
-                    counts.get("timed_out", 0),
-                    counts.get("skipped", 0),
-                ]
-            )
-        print("=== Runner Fleet Summary ===")
-        print(
-            tabulate(
-                rows,
-                headers=[
-                    "workflow",
-                    "runner",
-                    "runner_group",
-                    "total",
-                    "success",
-                    "failure",
-                    "cancelled",
-                    "timed_out",
-                    "skipped",
-                ],
-                tablefmt="github",
-            )
-        )
-        if rate_limited and rate_limit_reset_epoch:
-            reset_time = datetime.fromtimestamp(rate_limit_reset_epoch, timezone.utc)
-            print("")
-            print(
-                f"> NOTE: Partial data due to GitHub API rate limit. "
-                f"Reset at {reset_time.isoformat()} (UTC)."
-            )
+    print(render_job_report(matching_records))
 
 
 if __name__ == "__main__":
