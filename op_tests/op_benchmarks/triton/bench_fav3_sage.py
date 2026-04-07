@@ -975,9 +975,7 @@ def run_benchmark(args):
 
         block_attn_mask = make_block_attn_mask(args, BATCH, N_CTX_Q, N_CTX_K, device)
         block_lut = (
-            block_attn_mask_to_ragged_lut(
-                block_attn_mask, return_none_if_dense=True
-            )
+            block_attn_mask_to_ragged_lut(block_attn_mask, return_none_if_dense=True)
             if block_attn_mask is not None
             else None
         )
