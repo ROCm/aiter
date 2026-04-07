@@ -61,8 +61,8 @@ class AiterCommunicator:
         self._buf_shape = None
         self._buf_dtype = None
 
-        # Zero-copy cache: data_ptr -> (sym_input, sym_output, workspace)
-        self._sym_cache: dict[int, tuple[torch.Tensor, torch.Tensor,
+        # Zero-copy cache: data_ptr -> (sym_tensor, workspace)
+        self._sym_cache: dict[int, tuple[torch.Tensor,
                                          Optional[object]]] = {}
         self._allocator_type: str = allocator_type
 
@@ -118,24 +118,21 @@ class AiterCommunicator:
     # ------------------------------------------------------------------
 
     def _get_or_import(self, inp: torch.Tensor):
-        """Return cached (sym_input, sym_output, workspace) for *inp*.
+        """Return cached (sym_tensor, workspace) for *inp*.
 
         On first call for a given ``data_ptr``, imports *inp* into the
-        symmetric heap via DMA-BUF (``as_symmetric``) and allocates an
-        output buffer on the heap.  ``refresh_peer_access()`` is called
-        once inside ``as_symmetric`` — this is a collective, so all ranks
-        must hit this together (safe because every rank executes the same
-        allreduce in lockstep).
+        symmetric heap via DMA-BUF (``as_symmetric``).
+        ``refresh_peer_access()`` is called once inside ``as_symmetric``
+        — this is a collective, so all ranks must hit this together
+        (safe because every rank executes the same allreduce in lockstep).
         """
         ptr = inp.data_ptr()
         entry = self._sym_cache.get(ptr)
         if entry is not None:
             return entry
 
-        shmem = self._shmem
-        sym_input = shmem.as_symmetric(inp)
-        sym_output = shmem.empty(inp.shape, dtype=inp.dtype)
-        entry = (sym_input, sym_output, None)
+        sym_tensor = self._shmem.as_symmetric(inp)
+        entry = (sym_tensor, None)
         self._sym_cache[ptr] = entry
         logger.debug(
             "Imported tensor ptr=%#x shape=%s dtype=%s into symmetric heap",
@@ -144,21 +141,17 @@ class AiterCommunicator:
         return entry
 
     def _all_reduce_zerocopy(self, inp: torch.Tensor) -> torch.Tensor:
-        sym_input, sym_output, workspace = self._get_or_import(inp)
+        sym_tensor, workspace = self._get_or_import(inp)
 
+        # In-place allreduce: output == input. Safe with the default
+        # two_shot variant which processes tiles atomically
+        # (gather → write → broadcast, no interleaving).
         workspace = self._shmem.ccl.all_reduce(
-            sym_output, sym_input, workspace=workspace
+            sym_tensor, sym_tensor, workspace=workspace
         )
 
         # Update cached workspace for next call
-        ptr = inp.data_ptr()
-        self._sym_cache[ptr] = (sym_input, sym_output, workspace)
-
-        # Copy result back into the original tensor so the caller's
-        # reference is updated in-place (mirrors the contract of the
-        # copy path where a new tensor is returned, but avoids an extra
-        # allocation — the caller already holds *inp*).
-        inp.copy_(sym_output)
+        self._sym_cache[inp.data_ptr()] = (sym_tensor, workspace)
         return inp
 
     # ------------------------------------------------------------------
