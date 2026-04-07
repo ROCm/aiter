@@ -33,7 +33,6 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 def get_GEMM_config(M: int, N: int, K: int):
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
     if not hasattr(get_GEMM_config, "gemm_dict"):
-<<<<<<< HEAD
         gemm_dict = pd.read_csv(
             AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
         ).drop_duplicates()
@@ -54,12 +53,6 @@ def get_GEMM_config(M: int, N: int, K: int):
             ).to_dict("index")
             get_GEMM_config.has_gfx = False
     gfx = get_gfx()
-=======
-        gemm_dict = pd.read_csv(tuned_file).drop_duplicates()
-        get_GEMM_config.gemm_dict = gemm_dict.set_index(
-            ["cu_num", "M", "N", "K"]
-        ).to_dict("index")
->>>>>>> main
     cu_num = get_cu_num()
     padded_M = M
     config = None
