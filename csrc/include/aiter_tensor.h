@@ -2,7 +2,6 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "aiter_hip_common.h"
-#include <algorithm>
 #include <cstring>
 #include <initializer_list>
 
