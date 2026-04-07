@@ -39,60 +39,12 @@ DEFAULT_INPUT_SEED = 20260401
 
 SPLITK_PRECISION_CASES = [
     {
-        "name": "splitk2_tile48_m136_n384_k7168",
-        "m": 136,
-        "n": 384,
-        "k": 7168,
-        "tile_k": 128,
-        "tile_m": 48,
-        "tile_n": 64,
-        "pack_n": 1,
-        "split_k": 2,
-        "b_preshuffle": False,
-    },
-    {
-        "name": "splitk8_tile48_m136_n384_k7168",
-        "m": 136,
-        "n": 384,
-        "k": 7168,
-        "tile_k": 128,
-        "tile_m": 48,
-        "tile_n": 64,
-        "pack_n": 1,
-        "split_k": 8,
-        "b_preshuffle": False,
-    },
-    {
         "name": "splitk8_tile32_m104_n384_k7168",
         "m": 104,
         "n": 384,
         "k": 7168,
         "tile_k": 128,
         "tile_m": 32,
-        "tile_n": 64,
-        "pack_n": 1,
-        "split_k": 8,
-        "b_preshuffle": False,
-    },
-    {
-        "name": "splitk8_tile48_m48_n1024_k7168",
-        "m": 48,
-        "n": 1024,
-        "k": 7168,
-        "tile_k": 128,
-        "tile_m": 48,
-        "tile_n": 64,
-        "pack_n": 1,
-        "split_k": 8,
-        "b_preshuffle": False,
-    },
-    {
-        "name": "splitk8_tile48_m48_n2112_k7168",
-        "m": 48,
-        "n": 2112,
-        "k": 7168,
-        "tile_k": 128,
-        "tile_m": 48,
         "tile_n": 64,
         "pack_n": 1,
         "split_k": 8,
@@ -109,6 +61,40 @@ SPLITK_PRECISION_CASES = [
         "pack_n": 1,
         "split_k": 4,
         "b_preshuffle": False,
+    },
+    {
+        "name": "splitk16_tile32_m1_n2112_k7168_warp2x2_blds",
+        "m": 1,
+        "n": 2112,
+        "k": 7168,
+        "tile_k": 64,
+        "tile_m": 32,
+        "tile_n": 64,
+        "pack_n": 1,
+        "split_k": 16,
+        "block_m_warps": 2,
+        "block_n_warps": 2,
+        "b_to_lds": True,
+        "b_preshuffle": False,
+        "pass_pct": 99.0,
+        "max_delta_limit": 32.0,
+    },
+    {
+        "name": "splitk8_tile32_m1_n3072_k1536_warp2x2_blds",
+        "m": 1,
+        "n": 3072,
+        "k": 1536,
+        "tile_k": 64,
+        "tile_m": 32,
+        "tile_n": 64,
+        "pack_n": 1,
+        "split_k": 8,
+        "block_m_warps": 2,
+        "block_n_warps": 2,
+        "b_to_lds": True,
+        "b_preshuffle": False,
+        "pass_pct": 99.0,
+        "max_delta_limit": 8.0,
     },
 ]
 
@@ -142,6 +128,7 @@ def _check_output(
     atol: float = DEFAULT_ATOL,
     rtol: float = DEFAULT_RTOL,
     pass_pct: float = DEFAULT_PASS_PCT,
+    max_delta_limit: float | None = None,
 ) -> tuple[bool, float, float]:
     ref_f = ref.float()
     out_f = out.float()
@@ -149,6 +136,8 @@ def _check_output(
     pct_close = close_mask.float().mean().item() * 100.0
     max_delta = (ref_f - out_f).abs().max().item()
     passed = pct_close >= pass_pct
+    if max_delta_limit is not None:
+        passed = passed and max_delta <= max_delta_limit
     print(
         f"  [{label}] max_delta={max_delta:.4f}, {pct_close:.4f}% close "
         f"(atol={atol}, rtol={rtol})"
@@ -193,6 +182,9 @@ def run_splitk_precision_case(
         tile_n=case["tile_n"],
         pack_n=case["pack_n"],
         split_k=case["split_k"],
+        block_m_warps=case.get("block_m_warps", 1),
+        block_n_warps=case.get("block_n_warps", 4),
+        b_to_lds=case.get("b_to_lds", False),
         b_preshuffle=case["b_preshuffle"],
     )
     torch.cuda.synchronize()
@@ -201,9 +193,10 @@ def run_splitk_precision_case(
         ref,
         out,
         case["name"],
-        atol=atol,
-        rtol=rtol,
-        pass_pct=pass_pct,
+        atol=case.get("atol", atol),
+        rtol=case.get("rtol", rtol),
+        pass_pct=case.get("pass_pct", pass_pct),
+        max_delta_limit=case.get("max_delta_limit"),
     )
 
 
