@@ -308,6 +308,11 @@ def fused_moe_(
         moe_sorting_dispatch_policy,
     )
 
+    # Clamp sorted_ids to valid token range to prevent OOB memory access.
+    # moe_sorting pads partially-filled blocks with sentinel token IDs (>= M),
+    # which cause OOB reads when the CK kernel gathers from hidden_states.
+    sorted_ids = sorted_ids.clamp(max=M - 1)
+
     if metadata.run_1stage:
         return metadata.stage1(
             hidden_states,
