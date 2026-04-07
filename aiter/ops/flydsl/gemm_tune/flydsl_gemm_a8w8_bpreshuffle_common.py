@@ -14,12 +14,7 @@ def get_gfx():
         import sys
 
         this_dir = os.path.dirname(os.path.abspath(__file__))
-        jit_utils = os.path.abspath(
-            os.path.join(this_dir, "..", "aiter", "jit", "utils")
-        )
-        if jit_utils not in sys.path:
-            sys.path.insert(0, jit_utils)
-        from chip_info import get_gfx as _get_gfx
+        from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
         return _get_gfx()
     except Exception:
