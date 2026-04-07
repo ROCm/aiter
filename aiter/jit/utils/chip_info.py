@@ -196,6 +196,128 @@ def get_build_targets() -> list[tuple[str, int]]:
         ) from e
 
 
+def build_tune_dict(tune_df, default_dict, kernels_list, libtype=None, kernels_by_name=None):
+    """Filter tune_df to rows matching the current build targets and return a
+    (cu_num, M, N, K)-keyed dispatch dict, starting from a copy of default_dict.
+
+    Replaces the duplicated get_tune_dict filtering loop in each gen_instances.py.
+    Modules keep their own default_dict and kernels_list; only the CSV filtering
+    and key construction are shared here.
+
+    Args:
+        tune_df:          pandas DataFrame already loaded from the tuning CSV.
+        default_dict:     module-level fallback dict (negative-int keys) to start from.
+        kernels_list:     module-level dict mapping kernelId → kernelInstance.
+        libtype:          Optional string to filter the "libtype" column (e.g. "ck").
+                          Required for CSVs that mix multiple library types (e.g.
+                          a8w8_bpreshuffle_tuned_gemm.csv mixes "ck" and "cktile").
+                          If None, no libtype filtering is applied.
+        kernels_by_name:  Optional dict mapping kernelName string → kernelInstance.
+                          When provided and the CSV has a "kernelName" column, kernel
+                          lookup uses the name instead of kernelId. Falls back to
+                          kernelId if the name is not found or the column is absent.
+
+    Returns:
+        dict with mixed keys: negative ints (from default_dict) and
+        (cu_num, M, N, K) 4-tuples (from the filtered CSV rows).
+    """
+    import pandas as pd
+
+    tune_dict = dict(default_dict)
+    targets = get_build_targets()
+    mask = pd.Series([False] * len(tune_df), index=tune_df.index)
+    for gfx, cu_num in targets:
+        mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
+    if libtype is not None and "libtype" in tune_df.columns:
+        mask &= tune_df["libtype"] == libtype
+    use_name = kernels_by_name is not None and "kernelName" in tune_df.columns
+    if kernels_by_name is not None and not use_name:
+        print("[Warning]: kernels_by_name provided but CSV has no kernelName column, falling back to kernelId.")
+    for _, row in tune_df[mask].iterrows():
+        key = (int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
+        if use_name:
+            kname = str(row["kernelName"])
+            if kname in kernels_by_name:
+                tune_dict[key] = kernels_by_name[kname]
+            else:
+                print(f"[Warning]: kernelName '{kname}' not found, skip it")
+        else:
+            tune_dict[key] = kernels_list[int(row["kernelId"])]
+    return tune_dict
+
+
+def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
+    """Like build_tune_dict, but for batched GEMM modules whose dispatch key
+    includes the batch dimension B.
+
+    Builds a (cu_num, B, M, N, K) 5-tuple keyed dict suitable for use with
+    BatchedGemmDispatchMap in the C++ dispatch layer.
+
+    Args:
+        tune_df:      pandas DataFrame loaded from the batched tuning CSV.
+        default_dict: module-level fallback dict (negative-int keys) to start from.
+        kernels_list: module-level dict mapping kernelId → kernelInstance.
+        libtype:      Optional string to filter the "libtype" column (same semantics
+                      as build_tune_dict).
+
+    Returns:
+        dict with mixed keys: negative ints (from default_dict) and
+        (cu_num, B, M, N, K) 5-tuples (from the filtered CSV rows).
+    """
+    import pandas as pd
+
+    tune_dict = dict(default_dict)
+    targets = get_build_targets()
+    mask = pd.Series([False] * len(tune_df), index=tune_df.index)
+    for gfx, cu_num in targets:
+        mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
+    if libtype is not None and "libtype" in tune_df.columns:
+        mask &= tune_df["libtype"] == libtype
+    for _, row in tune_df[mask].iterrows():
+        key = (int(row["cu_num"]), int(row["B"]), int(row["M"]), int(row["N"]), int(row["K"]))
+        tune_dict[key] = kernels_list[int(row["kernelId"])]
+    return tune_dict
+
+
+def write_lookup_header(
+    output_path, kernels_dict, lookup_head, lookup_template, lookup_end, istune=False
+):
+    """Write a C++ GEMM dispatch lookup header from a kernels_dict.
+
+    Replaces the duplicated gen_lookup_dict loop in each gen_instances.py codegen
+    class.  Each module still defines its own lookup_head / lookup_template /
+    lookup_end strings (they embed the module-specific GENERATE_LOOKUP_TABLE macro
+    type parameters), but the iteration and key-formatting logic is shared here.
+
+    Key layout in kernels_dict:
+      - Negative ints   (default_dict entries)  → skipped in non-tune mode.
+      - (cu_num,M,N,K) 4-tuples (tuned entries) → written as {cu_num,M,N,K} C++ key.
+      - (cu_num,B,M,N,K) 5-tuples (batched)     → written as {cu_num,B,M,N,K} C++ key.
+      - Non-negative ints (tune mode only)       → written as plain integer kernel ID.
+
+    Args:
+        output_path:     Full path of the .h file to write.
+        kernels_dict:    Dict returned by build_tune_dict (or get_tune_dict).
+        lookup_head:     String written before the loop (defines the macro header).
+        lookup_template: String with {MNK} and {kernel_name} placeholders.
+        lookup_end:      String written after the loop (closes the macro / #endif).
+        istune:          True when generating the tune-mode lookup (int kernelId keys).
+    """
+    with open(output_path, "w") as f:
+        f.write(lookup_head)
+        for key, k in kernels_dict.items():
+            if not istune and (isinstance(key, tuple) and key[1] > 0):
+                # 4-tuple key: (cu_num, M, N, K) — key[1] = M > 0 for real shapes
+                # 5-tuple key: (cu_num, B, M, N, K) — key[1] = B >= 1 for batched shapes
+                f.write(lookup_template.format(
+                    MNK="{" + ", ".join(str(x) for x in key) + "}",
+                    kernel_name=k.name,
+                ))
+            elif istune and isinstance(key, int) and key >= 0:
+                f.write(lookup_template.format(MNK=key, kernel_name=k.name))
+        f.write(lookup_end)
+
+
 def _get_pci_chip_id(device_id=0):
     import ctypes
 

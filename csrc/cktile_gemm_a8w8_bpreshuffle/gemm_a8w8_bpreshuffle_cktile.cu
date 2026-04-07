@@ -5,24 +5,13 @@
 #include "gemm_a8w8_bpreshuffle_cktile_lookup.h"
 #include "gemm_a8w8_bpreshuffle_cktile_manifest.h"
 #include "gemm_common.h"
+#include "gemm_dispatch_utils.h"
 #include <cmath>
 
 using RowwiseKernel = std::function<torch::Tensor(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
 
-// Define a custom hash function for std::tuple<int, int, int>
-struct IntTupleHash
-{
-    size_t operator()(const std::tuple<int, int, int>& t) const
-    {
-        auto hash1 = std::hash<int>{}(std::get<0>(t));
-        auto hash2 = std::hash<int>{}(std::get<1>(t));
-        auto hash3 = std::hash<int>{}(std::get<2>(t));
-        return hash1 ^ hash2 ^ hash3;
-    }
-};
-
-using RowwiseKernelMap = std::unordered_map<std::tuple<int, int, int>, RowwiseKernel, IntTupleHash>;
+using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
 
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
@@ -62,8 +51,10 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
         }
     }();
 
+    const int cu_num = get_device_cu_num();
+
     // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({M, N, K});
+    auto it = lookup.find({cu_num, M, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
@@ -75,7 +66,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     // Fine-grained search
     padded_m = getPaddedM(M, N, K, 0);
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({padded_m, N, K});
+    it = lookup.find({cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
@@ -85,7 +76,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
     // Third check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({padded_m, N, K});
+    it = lookup.find({cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {

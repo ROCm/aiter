@@ -16,7 +16,7 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import get_build_targets
+from chip_info import build_tune_dict, write_lookup_header
 
 from gemm_a8w8_blockscale_instance import (
     default_kernels_dict,
@@ -44,34 +44,12 @@ class gemm_a8w8_blockscale_codegen:
         """
         Get tune dict from csv file
         """
-
-        tune_dict = default_kernels_dict
-
         if os.path.exists(tune_dict_csv):
-            tune_df = pd.read_csv(tune_dict_csv)
-            # Build a row mask that is True for any (gfx, cu_num) build target.
-            # |= accumulates matches across all targets so multi-arch builds
-            # (e.g. GPU_ARCHS=gfx942;gfx950) include rows for every target.
-            targets = get_build_targets()
-            mask = pd.Series([False] * len(tune_df))
-            for gfx, cu_num in targets:
-                mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
-            tune_df = tune_df[mask & (tune_df["libtype"] == "ck")].reset_index(drop=True)
-
-            for i in range(len(tune_df)):
-                M = int(tune_df.loc[i, "M"])
-                N = int(tune_df.loc[i, "N"])
-                K = int(tune_df.loc[i, "K"])
-                kid = int(tune_df.loc[i, "kernelId"])
-
-                if kid in candidate_kernels_dict:
-                    tune_dict[(M, N, K)] = candidate_kernels_dict[kid]
-                else:
-                    print(
-                        f"Warning: kernelId {kid} not found in candidate_kernels_dict for shape ({M}, {N}, {K})"
-                    )
-
-        return tune_dict
+            return build_tune_dict(
+                pd.read_csv(tune_dict_csv), default_kernels_dict, candidate_kernels_dict,
+                libtype="ck",
+            )
+        return default_kernels_dict
 
     def gen_ck_instance(self, k: KernelInstance):
         """
@@ -299,24 +277,14 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h"), "w"
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+        write_lookup_header(
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h"),
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         """

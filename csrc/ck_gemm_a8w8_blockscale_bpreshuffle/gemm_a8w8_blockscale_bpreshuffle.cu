@@ -5,26 +5,14 @@
 #include "gemm_a8w8_blockscale_bpreshuffle_lookup.h"
 #include "gemm_common.h"
 #include "gemm_a8w8_blockscale_bpreshuffle_manifest.h"
+#include "gemm_dispatch_utils.h"
 
 #include <cmath>
 
 using BlockwiseKernel = std::function<torch::Tensor(
     torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&)>;
 
-// Define a custom hash function for std::tuple<int, int, int>
-struct IntTupleHash
-{
-    size_t operator()(const std::tuple<int, int, int>& t) const
-    {
-        auto hash1 = std::hash<int>{}(std::get<0>(t));
-        auto hash2 = std::hash<int>{}(std::get<1>(t));
-        auto hash3 = std::hash<int>{}(std::get<2>(t));
-        return hash1 ^ hash2 ^ hash3;
-    }
-};
-
-using BlockwiseKernelMap =
-    std::unordered_map<std::tuple<int, int, int>, BlockwiseKernel, IntTupleHash>;
+using BlockwiseKernelMap = GemmDispatchMap<BlockwiseKernel>;
 
 // Helper function to return the next largest power of 2
 static constexpr int nextPow2(unsigned int num)
@@ -56,8 +44,10 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
         }
     }();
 
+    const int cu_num = get_device_cu_num();
+
     // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({M, N, K});
+    auto it = lookup.find({cu_num, M, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
@@ -65,24 +55,24 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-  
+
     // Fine-grained search
     padded_m = getPaddedM(M, N, K, 0);
 
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({padded_m, N, K});
+    it = lookup.find({cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
         return it->second;
     }
-  
+
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
-    it = lookup.find({padded_m, N, K});
-    if (it != lookup.end())
+    it = lookup.find({cu_num, padded_m, N, K});
+    if(it != lookup.end())
     {
-      return it->second;
+        return it->second;
     }
   
     // Otherwise, use heuristics.
