@@ -476,7 +476,6 @@ def flydsl_hgemm(
 # FlyDSL preshuffle GEMM kernel management
 # ---------------------------------------------------------------------------
 
-import torch
 from torch import Tensor
 
 from aiter import logger
