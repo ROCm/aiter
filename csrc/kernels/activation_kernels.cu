@@ -17,11 +17,7 @@ static constexpr int32_t max_wave_num = 8;
 
 namespace aiter {
 
-// HIP native type -> opus type (replaces t2opus which used c10::Half/c10::BFloat16)
-template <typename T> struct hip2opus;
-template <> struct hip2opus<float>         { using type = opus::fp32_t; };
-template <> struct hip2opus<__half>        { using type = opus::fp16_t; };
-template <> struct hip2opus<hip_bfloat16>  { using type = opus::bf16_t; };
+
 
 // Activation and gating kernel template with flexible input/output types.
 // DTYPE_I: input type (fp32/bf16/fp16), DTYPE_O: output type (fp32/bf16/fp16)
