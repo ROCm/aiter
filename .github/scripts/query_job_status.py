@@ -23,6 +23,8 @@ GENERIC_LABELS = {
     "arm64",
     "default",
     "ubuntu-latest",
+    "ubuntu-22.04",
+    "ubuntu-24.04",
 }
 
 
@@ -135,6 +137,14 @@ def workflow_file_from_path(path_value: str):
     return Path(normalized).name
 
 
+def normalize_labels(raw_labels: Any):
+    if not raw_labels:
+        return []
+    if isinstance(raw_labels, str):
+        return split_csv(raw_labels)
+    return [str(label).strip() for label in raw_labels if str(label).strip()]
+
+
 def list_recent_runs(
     owner: str, repo: str, workflows: list[str], token: str, lookback: datetime
 ):
@@ -232,7 +242,7 @@ def row_from_dict(data: Any):
         "started_at": data.get("started_at", ""),
         "completed_at": data.get("completed_at", ""),
         "html_url": data.get("html_url", data.get("run_url", "-")),
-        "labels": data.get("labels", []) or [],
+        "labels": normalize_labels(data.get("labels", []) or []),
     }
 
 
@@ -327,12 +337,35 @@ def format_duration_seconds(seconds: float | None):
     return f"{minutes}m{secs}s"
 
 
+def get_custom_runner_labels(row: dict[str, Any]):
+    labels = normalize_labels(row.get("labels", []) or [])
+    return [
+        label
+        for label in labels
+        if label.lower() not in GENERIC_LABELS
+        and not label.lower().startswith("ubuntu-")
+    ]
+
+
+def select_primary_runner_label(labels: list[str]):
+    if not labels:
+        return ""
+
+    preferred = [
+        label
+        for label in labels
+        if any(
+            token in label.lower()
+            for token in ("mi", "gpu", "runner", "aiter", "linux-")
+        )
+    ]
+    candidates = preferred or labels
+    return sorted(candidates, key=lambda value: (-len(value), value.lower()))[0]
+
+
 def get_runner_label(row: dict[str, Any]):
-    labels = row.get("labels", []) or []
-    for label in labels:
-        lowered = label.lower()
-        if lowered in GENERIC_LABELS or lowered.startswith("ubuntu-"):
-            continue
+    label = select_primary_runner_label(get_custom_runner_labels(row))
+    if label:
         return label
     runner_name = row.get("runner") or "-"
     return runner_name if runner_name and runner_name != "-" else "unknown"
@@ -340,37 +373,28 @@ def get_runner_label(row: dict[str, Any]):
 
 def runner_label_sort_key(label: str):
     lowered = label.lower()
-    gpu_match = re.search(r"(mi[0-9a-z]+)", lowered)
-    count_match = re.search(r"(\d+)gpu", lowered)
-    gpu = gpu_match.group(1) if gpu_match else "zzz"
-    count = int(count_match.group(1)) if count_match else 0
-    return (gpu, count, lowered)
+    family_match = re.search(r"(mi\d+[a-z0-9x]*)", lowered)
+    family = family_match.group(1) if family_match else "zzz"
+
+    count = 0
+    for pattern in (r"(\d+)\s*gpu", r"gpu[-_]?(\d+)", r"-(\d+)$"):
+        match = re.search(pattern, lowered)
+        if match:
+            count = int(match.group(1))
+            break
+
+    return (family, count, lowered)
 
 
-def get_concurrency_labels(row: dict[str, Any]):
-    labels = row.get("labels", []) or []
-    selected: list[str] = []
-
-    for label in labels:
-        lowered = label.lower()
-        if lowered in GENERIC_LABELS or lowered.startswith("ubuntu-"):
-            continue
-        if lowered == "build-only-aiter" or "mi35x" in lowered:
-            selected.append(label)
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for label in selected:
-        if label not in seen:
-            deduped.append(label)
-            seen.add(label)
-    return deduped
+def get_concurrency_label(row: dict[str, Any]):
+    return select_primary_runner_label(get_custom_runner_labels(row))
 
 
 def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
     stats_by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in job_rows:
-        for label in get_concurrency_labels(row):
+        label = get_concurrency_label(row)
+        if label:
             stats_by_label[label].append(row)
 
     results = {}
@@ -394,18 +418,19 @@ def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
                 events.append((report_time, -1))
                 durations.append((report_time - started).total_seconds())
 
-            if created and started:
-                queue_seconds = (started - created).total_seconds()
-                if queue_seconds >= 0:
-                    queue_times.append(queue_seconds)
+            queue_seconds = queue_time_seconds(row, report_time)
+            if queue_seconds is not None:
+                queue_times.append(queue_seconds)
 
         if not events:
             results[label] = {
                 "peak": 0,
                 "avg_concurrent": 0.0,
                 "total_jobs": len(label_rows),
-                "avg_queue_seconds": average(queue_times) or 0.0,
-                "avg_duration_seconds": average(durations) or 0.0,
+                "avg_queue_seconds": average(queue_times),
+                "p50_queue_seconds": percentile(queue_times, 50),
+                "p99_queue_seconds": percentile(queue_times, 99),
+                "avg_duration_seconds": average(durations),
             }
             continue
 
@@ -432,8 +457,10 @@ def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
                 round(time_weighted_sum / total_time, 1) if total_time > 0 else 0.0
             ),
             "total_jobs": len(label_rows),
-            "avg_queue_seconds": average(queue_times) or 0.0,
-            "avg_duration_seconds": average(durations) or 0.0,
+            "avg_queue_seconds": average(queue_times),
+            "p50_queue_seconds": percentile(queue_times, 50),
+            "p99_queue_seconds": percentile(queue_times, 99),
+            "avg_duration_seconds": average(durations),
         }
 
     return results
@@ -620,7 +647,7 @@ def main():
                             "started_at": job.get("started_at", ""),
                             "completed_at": job.get("completed_at", ""),
                             "html_url": job.get("html_url", ""),
-                            "labels": job.get("labels", []) or [],
+                            "labels": normalize_labels(job.get("labels", []) or []),
                         }
                     )
         except RateLimitExceededError as exc:
@@ -674,10 +701,13 @@ def main():
                             values["avg_concurrent"],
                             values["total_jobs"],
                             format_duration_seconds(values["avg_queue_seconds"]),
+                            format_duration_seconds(values["p50_queue_seconds"]),
+                            format_duration_seconds(values["p99_queue_seconds"]),
                             format_duration_seconds(values["avg_duration_seconds"]),
                         ]
                         for label, values in sorted(
-                            concurrency.items(), key=lambda item: -item[1]["peak"]
+                            concurrency.items(),
+                            key=lambda item: runner_label_sort_key(item[0]),
                         )
                     ],
                     headers=[
@@ -686,6 +716,8 @@ def main():
                         "avg_concurrent",
                         "total_jobs",
                         "avg_queue",
+                        "p50_queue",
+                        "p99_queue",
                         "avg_duration",
                     ],
                     tablefmt=tablefmt,
@@ -693,8 +725,7 @@ def main():
             )
         else:
             print(
-                "No matching `build-only-aiter` or `mi35x` runner labels found "
-                "in the selected time window."
+                "No matching self-hosted runner labels found in the selected time window."
             )
     else:
         print("### Job Status Report")
