@@ -607,8 +607,9 @@ def flydsl_preshuffle_gemm_a8(
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
+    out_contig = Out.contiguous()
     exe(
-        Out.contiguous().view(-1),
+        out_contig.view(-1),
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
@@ -617,5 +618,7 @@ def flydsl_preshuffle_gemm_a8(
         n,
         torch.cuda.current_stream(),
     )
+    if out_contig is not Out:
+        Out.copy_(out_contig)
 
     return Out
