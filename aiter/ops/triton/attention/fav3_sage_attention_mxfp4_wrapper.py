@@ -110,6 +110,12 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         if block_lut is not None:
             kv_block_indices, lut_start, lut_count = block_lut
             use_block_sparse = True
+            if causal:
+                raise NotImplementedError(
+                    "The Triton block-sparse attention path selected by block_lut "
+                    "does not support causal masking."
+                    "require causal=False."
+                )
         else:
             kv_block_indices = lut_start = lut_count = None
             use_block_sparse = False
@@ -245,6 +251,12 @@ def fav3_sage_mxfp4_func(
             raise ValueError(
                 "kv_block_indices, lut_start, and lut_count must be provided "
                 "when use_block_sparse=True"
+            )
+        if causal:
+            raise NotImplementedError(
+                "The Triton block-sparse attention path selected by block_lut "
+                "does not support causal masking."
+                "require causal=False."
             )
     else:
         kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)

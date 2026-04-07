@@ -200,6 +200,8 @@ def make_block_attn_mask(
 
     Returns None if neither block_sparsity nor block_mask_file is set, or if file contains "masks" list (use list flow instead).
     """
+    assert args.hq > 0, "hq must be greater than 0"
+    assert args.hq is not None, "hq must be set"
     if not getattr(args, "block_sparsity", None) and not getattr(
         args, "block_mask_file", None
     ):
@@ -465,7 +467,6 @@ def fav3_sage_forward_func(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool,
-    inference_mode: bool,  # not return softmax_lse
     layout: Literal["bshd", "bhsd"],
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
@@ -685,7 +686,6 @@ def attn_forward_func(
             k,
             v,
             causal=False,
-            inference_mode=True,
             layout=layout,
             block_lut=block_lut,
         )

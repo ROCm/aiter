@@ -207,7 +207,7 @@ def fav3_sage_wrapper_func(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
-    return_lse: bool = True,
+    return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
     block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
@@ -238,7 +238,7 @@ def fav3_sage_wrapper_func(
         pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
-        inference_mode: do not return softmax_lse
+        return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
@@ -333,7 +333,7 @@ def fav3_sage_func(
         pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
-        inference_model: do not return softmax_lse
+        return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
@@ -421,6 +421,12 @@ def fav3_sage_func(
             raise ValueError(
                 "kv_block_indices, lut_start, and lut_count must be provided "
                 "when use_block_sparse=True"
+            )
+        if causal:
+            raise NotImplementedError(
+                "The Triton block-sparse attention path selected by block_lut "
+                "does not support causal masking."
+                "require causal=False."
             )
     else:
         kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
