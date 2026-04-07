@@ -121,27 +121,20 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 
         if EVEN_M_N:
             a = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
+            b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg").to(
+                tl.float32
+            )
         else:
             x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
             a = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
                 tl.float32
             )
             # a and b can share the same mask
-
-        activated_a = _apply_activation_from_str(a, ACTIVATION)
-
-        if EVEN_M_N:
-            b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg").to(
-                tl.float32
-            )
-        else:
-            x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-            # a and b can share the same mask
             b = tl.load(
                 x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
             ).to(tl.float32)
 
-        x = activated_a * b
+        x = _apply_activation_from_str(a, ACTIVATION) * b
         if DO_QUANT:
             out_tensor, bs_e8m0 = _mxfp4_quant_op(
                 x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
