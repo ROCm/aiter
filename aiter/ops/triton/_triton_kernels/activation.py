@@ -249,9 +249,7 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
         x_mask = x_offs_n < N
         a = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(tl.float32)
         # a and b can share the same mask
-        b = tl.load(
-            x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
-        )
+        b = tl.load(x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg")
 
     x = _apply_activation_from_str(a, ACTIVATION).to(b.dtype) * b
 
