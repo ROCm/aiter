@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 
 from setuptools import Distribution, setup
@@ -10,6 +11,12 @@ from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
+
+FLYDSL_FIND_LINKS = (
+    "https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/flydsl/"
+)
+FLYDSL_VERSION = "flydsl==0.1.1.dev442"
+
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
@@ -46,6 +53,26 @@ def is_develop_mode():
         elif "editable" in arg:
             return True
     return False
+
+
+if not IS_WINDOWS and is_develop_mode():
+    try:
+        from importlib.metadata import version as pkg_version
+
+        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+            raise ImportError("version mismatch")
+    except Exception:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--find-links",
+                FLYDSL_FIND_LINKS,
+                FLYDSL_VERSION,
+            ]
+        )
 
 
 def write_install_mode():
@@ -315,7 +342,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        "flydsl==0.1.1.dev409",
+        FLYDSL_VERSION,
     ]
 
 setup(

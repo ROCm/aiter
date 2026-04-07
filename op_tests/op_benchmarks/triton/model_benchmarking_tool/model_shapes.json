@@ -252,7 +252,9 @@
                 "hq": 64,
                 "hkv": 8,
                 "dqk": 64,
-                "dv": 64
+                "dv": 64,
+                "sink": true,
+                "sliding_window_left": 128
             }
         ]
     },

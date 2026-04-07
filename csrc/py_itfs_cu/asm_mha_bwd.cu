@@ -277,6 +277,8 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
                                 dq_accum.data_ptr(),
+                                nullptr, // sink_ptr (not used in v3 asm path)
+                                nullptr, // d_sink_ptr (not used in v3 asm path)
                                 nullptr, // seqstart_q_ptr (batch mode)
                                 nullptr, // seqstart_k_ptr (batch mode)
                                 nullptr, // seqlen_q_ptr (batch mode)

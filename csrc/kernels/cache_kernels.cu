@@ -323,7 +323,7 @@ template <typename scalar_t,
           typename cache_t,
           typename dequant_scale_t,
           bool asmLayout = false,
-          int wg_size    = 64>
+          int wg_size_    = -1>
 __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const scalar_t* __restrict__ key,   // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value, // [num_tokens, num_heads, head_size]
@@ -342,11 +342,12 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const int max_kv_tokens)
 {
     float dtypeMax              = static_cast<float>(opus::finfo<cache_t>::max());
-    const int32_t tokens_per_wg = wg_size / warpSize;
+    constexpr int wg_size = wg_size_ == -1 ? WARP_SIZE : wg_size_;
+    const int32_t tokens_per_wg = wg_size / WARP_SIZE;
 
     // every wave compute one token, one head, all the headim
-    int wave_id = threadIdx.x / warpSize;
-    int lane_id = threadIdx.x % warpSize;
+    int wave_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
 
     const int64_t token_idx = static_cast<int64_t>(blockIdx.x * tokens_per_wg + wave_id);
     const int32_t head_idx  = blockIdx.y;
@@ -373,7 +374,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
 #pragma unroll
     for(int i_d = 0; i_d < local_dim_elems; i_d++)
     {
-        int current_d           = lane_id + i_d * warpSize;
+        int current_d           = lane_id + i_d * WARP_SIZE;
         const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
         const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
         if(current_d < head_size)
@@ -441,7 +442,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     {
         // const int head_idx = i / head_size;
         // const int head_offset = i % head_size;
-        int i_d = lane_id + i * warpSize;
+        int i_d = lane_id + i * WARP_SIZE;
         if(i_d >= head_size)
         {
             break;
@@ -3024,7 +3025,7 @@ void reshape_and_cache_with_pertoken_quant(
     int value_stride = value.stride(0);
 
     dim3 grid(num_tokens, num_heads);
-    dim3 block(64);
+    dim3 block(WARP_SIZE);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
