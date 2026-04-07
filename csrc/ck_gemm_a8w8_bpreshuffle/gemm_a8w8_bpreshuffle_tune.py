@@ -447,7 +447,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             print(f"[FlyDSL] unsupported q_dtype_w {q_dtype_w}, skipping")
             return []
 
-        if not kernels_list_flydsl:
+        # Guard FlyDSL task generation on both kernel metadata and actual FlyDSL kernel availability.
+        if (not kernels_list_flydsl) or ("flydsl_preshuffle_gemm_a8" not in globals()):
             return []
 
         gemm_flydsl_data_idx = [0, 1, 2, 3, 4]
