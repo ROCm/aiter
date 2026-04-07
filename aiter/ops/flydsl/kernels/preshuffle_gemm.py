@@ -16,9 +16,6 @@ from flydsl.expr import buffer_ops, rocdl
 
 
 from flydsl.expr.typing import T
-from typing import Optional
-
-
 from .mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
     load_b_pack_k32,
