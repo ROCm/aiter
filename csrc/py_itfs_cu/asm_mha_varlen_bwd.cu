@@ -338,6 +338,8 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
                                 dq_accum.data_ptr(), // dq_acc
+                                nullptr, // sink_ptr (not used in v3 asm path)
+                                nullptr, // d_sink_ptr (not used in v3 asm path)
                                 seqstart_q_ptr, // seqstart_q
                                 seqstart_k_ptr, // seqstart_k
                                 nullptr, // seqlen_q_ptr

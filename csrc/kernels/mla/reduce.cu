@@ -835,6 +835,7 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
     MLA_REDUCE_CASE_EF(NUM_HEAD, 64, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)  \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 128, HEAD_DIM, 128, NUM_WG_PER_BH, NAME, __VA_ARGS__) \
     MLA_REDUCE_CASE_EF(NUM_HEAD, 128, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__) \
+    MLA_REDUCE_CASE_EF(NUM_HEAD, 8, HEAD_DIM, 512, NUM_WG_PER_BH, NAME, __VA_ARGS__)   \
     else MLA_REDUCE_ERROR(NUM_HEAD, HEAD_DIM, NAME);
 
 #define DISPATCH_MLA_REDUCE_KERNEL(                                                              \
