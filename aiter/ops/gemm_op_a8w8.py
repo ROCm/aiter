@@ -323,7 +323,10 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
 
     gfx = get_gfx()
     cu_num = get_cu_num()
-    has_gfx = isinstance(next(iter(_CKGEMM_CONFIG_CACHE[tuned_file])), tuple) and len(next(iter(_CKGEMM_CONFIG_CACHE[tuned_file]))) == 5
+    has_gfx = (
+        isinstance(next(iter(_CKGEMM_CONFIG_CACHE[tuned_file])), tuple)
+        and len(next(iter(_CKGEMM_CONFIG_CACHE[tuned_file]))) == 5
+    )
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
@@ -362,7 +365,9 @@ def get_GEMM_config_with_quant_type(
         # Fall back to (cu_num, M, N, K, q_dtype_w) for old CSVs that pre-date the gfx column.
         if "gfx" in asmGemmDictDf.columns:
             get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
-                asmGemmDictDf.set_index(["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]).to_dict("index")
+                asmGemmDictDf.set_index(
+                    ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
+                ).to_dict("index")
             )
         else:
             logger.warning(
@@ -370,17 +375,28 @@ def get_GEMM_config_with_quant_type(
                 "Re-run the tuner or migrate the CSV to add a gfx column."
             )
             get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
-                asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict("index")
+                asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
+                    "index"
+                )
             )
 
     gfx = get_gfx()
     cu_num = get_cu_num()
-    has_gfx = isinstance(next(iter(get_GEMM_config_with_quant_type.file_cache[tuned_file])), tuple) and len(next(iter(get_GEMM_config_with_quant_type.file_cache[tuned_file]))) == 6
+    has_gfx = (
+        isinstance(
+            next(iter(get_GEMM_config_with_quant_type.file_cache[tuned_file])), tuple
+        )
+        and len(next(iter(get_GEMM_config_with_quant_type.file_cache[tuned_file]))) == 6
+    )
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        key = (gfx, cu_num, padded_M, N, K, str(q_dtype_w)) if has_gfx else (cu_num, padded_M, N, K, str(q_dtype_w))
+        key = (
+            (gfx, cu_num, padded_M, N, K, str(q_dtype_w))
+            if has_gfx
+            else (cu_num, padded_M, N, K, str(q_dtype_w))
+        )
         config = get_GEMM_config_with_quant_type.file_cache[tuned_file].get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:

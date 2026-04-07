@@ -37,8 +37,8 @@ GFX_MAP = {
 # explicitly alongside GPU_ARCHS to override the default here.
 # Extend this table when adding support for new GPU targets.
 GFX_CU_NUM_MAP = {
-    "gfx942": 304,   # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
-    "gfx950": 256,   # MI350
+    "gfx942": 304,  # MI300X (SPX, full GPU); MI308X shares gfx942 — use CU_NUM override
+    "gfx950": 256,  # MI350
 }
 
 
@@ -68,7 +68,7 @@ def get_build_targets_env() -> list[tuple[str, int]]:
     return targets
 
 
-def filter_tune_df(tune_df, targets: list) -> "pd.DataFrame":
+def filter_tune_df(tune_df, targets: list):
     """Return the subset of tune_df whose (gfx, cu_num) matches any entry in targets.
 
     Args:

@@ -270,7 +270,9 @@ class TunerCommon:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             gfx = self.get_gfx()
             cu_num = self.get_cu_num()
-            target_mask = (self.untunedf["gfx"] == gfx) & (self.untunedf["cu_num"] == cu_num)
+            target_mask = (self.untunedf["gfx"] == gfx) & (
+                self.untunedf["cu_num"] == cu_num
+            )
             self.tunedf = self.untunedf[~target_mask]
             self.untunedf = self.untunedf[target_mask]
             self.untunedf = self.untunedf[self.keys]
@@ -283,7 +285,7 @@ class TunerCommon:
                 untunedf["gfx"] = gfx
                 untunedf["cu_num"] = cu_num
             else:
-                target_mask = (untunedf["cu_num"] == cu_num)
+                target_mask = untunedf["cu_num"] == cu_num
                 if "gfx" in untunedf.columns:
                     target_mask = target_mask & (untunedf["gfx"] == gfx)
                 else:

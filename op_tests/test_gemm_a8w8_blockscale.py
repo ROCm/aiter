@@ -255,7 +255,9 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-l_preshuffle = args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
+l_preshuffle = (
+    args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
+)
 
 df = []
 if args.csv is not None:
@@ -266,7 +268,13 @@ if args.csv is not None:
     for dtype in args.dtype:
         for preshuffle in l_preshuffle:
             for _, row in shapes_df.iterrows():
-                ret = test_gemm(dtype, int(row["M"]), int(row["N"]), int(row["K"]), ck_preshuffle=preshuffle)
+                ret = test_gemm(
+                    dtype,
+                    int(row["M"]),
+                    int(row["N"]),
+                    int(row["K"]),
+                    ck_preshuffle=preshuffle,
+                )
                 df.append(ret)
 else:
     for dtype in args.dtype:

@@ -58,7 +58,11 @@ def get_GEMM_config(M: int, N: int, K: int):
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        key = (gfx, cu_num, padded_M, N, K) if get_GEMM_config.has_gfx else (cu_num, padded_M, N, K)
+        key = (
+            (gfx, cu_num, padded_M, N, K)
+            if get_GEMM_config.has_gfx
+            else (cu_num, padded_M, N, K)
+        )
         config = get_GEMM_config.gemm_dict.get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:

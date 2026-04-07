@@ -155,7 +155,9 @@ def get_build_targets() -> list[tuple[str, int]]:
         ) from e
 
 
-def build_tune_dict(tune_df, default_dict, kernels_list, libtype=None, kernels_by_name=None):
+def build_tune_dict(
+    tune_df, default_dict, kernels_list, libtype=None, kernels_by_name=None
+):
     """Filter tune_df to rows matching the current build targets and return a
     (cu_num, M, N, K)-keyed dispatch dict, starting from a copy of default_dict.
 
@@ -180,8 +182,6 @@ def build_tune_dict(tune_df, default_dict, kernels_list, libtype=None, kernels_b
         dict with mixed keys: negative ints (from default_dict) and
         (cu_num, M, N, K) 4-tuples (from the filtered CSV rows).
     """
-    import pandas as pd
-
     tune_dict = dict(default_dict)
     targets = get_build_targets()
     filtered = filter_tune_df(tune_df, targets)
@@ -189,7 +189,9 @@ def build_tune_dict(tune_df, default_dict, kernels_list, libtype=None, kernels_b
         filtered = filtered[filtered["libtype"] == libtype]
     use_name = kernels_by_name is not None and "kernelName" in tune_df.columns
     if kernels_by_name is not None and not use_name:
-        print("[Warning]: kernels_by_name provided but CSV has no kernelName column, falling back to kernelId.")
+        print(
+            "[Warning]: kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
+        )
     for _, row in filtered.iterrows():
         key = (int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
         if use_name:
@@ -227,7 +229,13 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
     if libtype is not None and "libtype" in tune_df.columns:
         filtered = filtered[filtered["libtype"] == libtype]
     for _, row in filtered.iterrows():
-        key = (int(row["cu_num"]), int(row["B"]), int(row["M"]), int(row["N"]), int(row["K"]))
+        key = (
+            int(row["cu_num"]),
+            int(row["B"]),
+            int(row["M"]),
+            int(row["N"]),
+            int(row["K"]),
+        )
         tune_dict[key] = kernels_list[int(row["kernelId"])]
     return tune_dict
 
@@ -262,10 +270,12 @@ def write_lookup_header(
             if not istune and (isinstance(key, tuple) and key[1] > 0):
                 # 4-tuple key: (cu_num, M, N, K) — key[1] = M > 0 for real shapes
                 # 5-tuple key: (cu_num, B, M, N, K) — key[1] = B >= 1 for batched shapes
-                f.write(lookup_template.format(
-                    MNK="{" + ", ".join(str(x) for x in key) + "}",
-                    kernel_name=k.name,
-                ))
+                f.write(
+                    lookup_template.format(
+                        MNK="{" + ", ".join(str(x) for x in key) + "}",
+                        kernel_name=k.name,
+                    )
+                )
             elif istune and isinstance(key, int) and key >= 0:
                 f.write(lookup_template.format(MNK=key, kernel_name=k.name))
         f.write(lookup_end)

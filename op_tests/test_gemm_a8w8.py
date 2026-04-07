@@ -43,9 +43,7 @@ def is_shape_tuned(
                 if "gfx" in df.columns:
                     mask = mask & (df["gfx"] == gfx)
                 _TUNED_SHAPES_CACHE[tuned_file] = set(
-                    df[mask][["M", "N", "K", "q_dtype_w"]].apply(
-                        tuple, axis=1
-                    )
+                    df[mask][["M", "N", "K", "q_dtype_w"]].apply(tuple, axis=1)
                 )
             except Exception as e:
                 print(f"Warning: Could not load tuned shapes: {e}")
@@ -148,7 +146,9 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         avg_b = err_b = None
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-        shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(m, n, k, quantDtype)
+        shape_is_tuned = (quantDtype == dtypes.fp8) and is_shape_tuned(
+            m, n, k, quantDtype
+        )
         if shape_is_tuned:
             err_b = checkAllclose(
                 a,
@@ -333,12 +333,16 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False):
+def test_normal_gemm_a8w8_pertoken_quant(
+    l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False
+):
     df = []
     for dtype in l_dtype:
         for quantDtype in l_quantDtype:
             for m, n, k in l_mnk:
-                ret = test_gemm(dtype, m, n, k, quantDtype, pad_a=pad_a, skip_ck=skip_ck)
+                ret = test_gemm(
+                    dtype, m, n, k, quantDtype, pad_a=pad_a, skip_ck=skip_ck
+                )
                 df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
@@ -518,9 +522,13 @@ if args.csv is not None:
         raise FileNotFoundError(f"CSV file not found: {args.csv}")
     shapes_df = pd.read_csv(args.csv)
     print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
-    args.mnk = list(zip(shapes_df["M"].tolist(), shapes_df["N"].tolist(), shapes_df["K"].tolist()))
+    args.mnk = list(
+        zip(shapes_df["M"].tolist(), shapes_df["N"].tolist(), shapes_df["K"].tolist())
+    )
 
-df = test_normal_gemm_a8w8_pertoken_quant(args.dtype, args.quantDtype, args.mnk, args.pad_a)
+df = test_normal_gemm_a8w8_pertoken_quant(
+    args.dtype, args.quantDtype, args.mnk, args.pad_a
+)
 test_skinny_gemm_a8w8_pertoken_quant()
 
 if args.output and df is not None:
@@ -537,13 +545,20 @@ if args.bpreshuffle_csv is not None:
     if not os.path.exists(args.bpreshuffle_csv):
         raise FileNotFoundError(f"bpreshuffle CSV not found: {args.bpreshuffle_csv}")
     bpre_df = pd.read_csv(args.bpreshuffle_csv)
-    print(f"Loaded {len(bpre_df)} bpreshuffle shapes from {args.bpreshuffle_csv}", flush=True)
-    bpre_mnk = list(zip(bpre_df["M"].tolist(), bpre_df["N"].tolist(), bpre_df["K"].tolist()))
+    print(
+        f"Loaded {len(bpre_df)} bpreshuffle shapes from {args.bpreshuffle_csv}",
+        flush=True,
+    )
+    bpre_mnk = list(
+        zip(bpre_df["M"].tolist(), bpre_df["N"].tolist(), bpre_df["K"].tolist())
+    )
     df_bpre = test_normal_gemm_a8w8_pertoken_quant(
         args.dtype, args.quantDtype, bpre_mnk, args.pad_a, skip_ck=True
     )
     if args.output and df_bpre is not None:
-        bpre_filename = os.path.basename(args.bpreshuffle_csv).replace(".csv", f"_{args.suffix}.csv")
+        bpre_filename = os.path.basename(args.bpreshuffle_csv).replace(
+            ".csv", f"_{args.suffix}.csv"
+        )
         bpre_out = os.path.join(args.output, bpre_filename)
         df_bpre.to_csv(bpre_out, index=False)
         print(f"Saved bpreshuffle results to: {bpre_out}")
