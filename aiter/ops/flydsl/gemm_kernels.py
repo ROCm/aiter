@@ -553,8 +553,12 @@ def flydsl_preshuffle_gemm_a8(
 
     if Out.dtype == torch.bfloat16:
         out_dtype = "bf16"
-    else:
+    elif Out.dtype == torch.float16:
         out_dtype = "fp16"
+    else:
+        raise ValueError(
+            f"[FlyDSL] unsupported output dtype {Out.dtype}; expected torch.bfloat16 or torch.float16"
+        )
 
     cache_key = (
         m,
