@@ -217,6 +217,7 @@ static constexpr int nextPow2(unsigned int num)
     num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;           \
     dim3 grid(num_tokens);                                                            \
     dim3 block(num_wave * warp_size);                                                 \
+    HipDeviceGuard device_guard(input.device_id);                                     \
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
 // Helper macro for fp32 vec_size dispatch (VEC_SIZE <= 16 for fp32 path)
@@ -447,6 +448,7 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
     num_blocks         = num_blocks > 2048 ? 2048 : num_blocks;                                    \
     dim3 grid(num_blocks);                                                                         \
     dim3 block(block_size);                                                                        \
+    HipDeviceGuard device_guard(input.device_id);                                                  \
     const hipStream_t stream = aiter::getCurrentHIPStream();                                       \
     AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "activation_kernel_vec", [&] {                  \
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                              \
