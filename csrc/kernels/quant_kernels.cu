@@ -1740,8 +1740,8 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "mxfp4_quant_moe_sort_kernel", [&] { \
         AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
         using input_dtype = typename t2opus<scalar_t>::type;                                   \
-        int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE;                                         \
-        int num_tg = persistent_mode ? num_cu * warps_per_cu : num_blocks;                     \
+        int blocks_per_cu = 8 * (BLOCK_SIZE / WARP_SIZE);                                      \
+        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                     \
         dim3 const grid(num_tg);                                                               \
         mxfp4_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>             \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                           \
@@ -1763,7 +1763,11 @@ __global__ void mxfp4_quant_moe_sort_kernel(
 
 
 #define MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(DTYPE_O, cols_)                                   \
-    if(cols_ <= 4 * BlockSize)                                                                 \
+    if(cols_ <= 2 * BlockSize)                                                                 \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 4)                           \
+    }                                                                                          \
+    else if(cols_ <= 4 * BlockSize)                                                            \
     {                                                                                          \
         MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 2)                           \
     }                                                                                          \
@@ -1800,7 +1804,7 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
     int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
     
     const int num_cu = get_num_cu_func();
-    int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 8;
+    int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
     TORCH_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
     int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
     const bool persistent_mode = false;
@@ -1821,6 +1825,150 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
 #else
     TORCH_CHECK(false, __func__, ": not support fp4x2 on this device");
 #endif
+}
+
+template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
+__global__ void mxfp4_moe_sort_kernel(
+    uint8_t* __restrict__ out_scale,
+    uint8_t* __restrict__ scale,
+    int32_t const* __restrict__ sorted_ids,
+    int32_t const* __restrict__ num_valid_ids,
+    const int32_t num_tokens,
+    const int32_t cols,
+    const int32_t num_blocks,
+    const int32_t num_tg,
+    const int32_t topk)
+{
+    constexpr int threads_per_row = block_size / num_rows;
+    int num_valid_ids_value  = num_valid_ids[0];
+    int block_idx            = blockIdx.x;
+    int row_i                = threadIdx.x / threads_per_row;
+    int scale_k              = threadIdx.x % threads_per_row * thread_data_size;
+    const int scale_per_row = (cols + group_size - 1) / group_size;
+    static constexpr int32_t vec_size_i = thread_data_size;
+    static constexpr int32_t load_chunk_bytes =
+        (sizeof(uint8_t) * vec_size_i % 16 == 0 ? 16
+                                                : (sizeof(uint8_t) * vec_size_i % 8 == 0 ? 8 
+                                                : (sizeof(uint8_t) * vec_size_i % 4 == 0 ? 4 : 2)));
+    using vec_i = opus::vector_t<uint8_t, vec_size_i>;
+    const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
+    const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
+    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
+        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
+               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
+    };
+    auto buffer_scale =
+                opus::make_gmem<uint8_t>(scale, scale_per_row * num_tokens * topk * sizeof(uint8_t));
+    for(; block_idx < num_blocks; block_idx += num_tg)
+    {
+        int sorted_row = block_idx * num_rows + row_i;
+        int token_id_info = num_tokens;
+        if (sorted_row < num_valid_ids_value)
+        {
+            token_id_info = sorted_ids[sorted_row];
+        }
+        int token_idx = token_id_info & 0xFFFFFF;
+        int topk_id   = token_id_info >> 24;
+        if(token_idx < num_tokens && (topk == 1 || topk_id < topk))
+        {
+            int64_t scale_offset;
+            if (topk == 1)
+            {
+                scale_offset = (int64_t)(token_idx) * scale_per_row;
+            }
+            else
+            {
+                scale_offset = (int64_t)(token_idx * topk + topk_id) * scale_per_row;
+            }
+            vec_i vec_scale = load_vector_nbytes<uint8_t, vec_size_i, load_chunk_bytes, RT>(
+                buffer_scale, scale_offset + scale_k);
+
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                if((scale_k + j) < scaleN_valid)
+                {
+                    int addr = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k + j);
+                    out_scale[addr] = vec_scale[j];
+                }
+            }
+        }
+    }
+}
+
+
+#define MXFP4_MOE_SORT_KERNEL_IMPL(MAX_COL, THREAD_DATA, BLOCK_SIZE)                    \
+    constexpr int GROUP_SIZE = 32;                                                      \
+    constexpr int NUM_ROWS = BLOCK_SIZE / (MAX_COL /(GROUP_SIZE * THREAD_DATA));        \
+    TORCH_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
+    int num_blocks = (sorted_ids.size(0) + NUM_ROWS - 1) / NUM_ROWS;                    \
+    int blocks_per_cu = 8 * (BLOCK_SIZE / WARP_SIZE);                                   \
+    int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
+    dim3 const grid(num_tg);                                                            \
+    mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE>                \
+        <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                        \
+            reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                           \
+            reinterpret_cast<uint8_t*>(scale.data_ptr()),                               \
+            sorted_ids.data_ptr<int32_t>(),                                             \
+            num_valid_ids.data_ptr<int32_t>(),                                          \
+            token_num, cols, num_blocks, num_tg, topk); 
+
+
+#define MXFP4_MOE_SORT_KERNEL_DISPATCH(cols_)                                                  \
+    if(cols_ <= 256)                                                                           \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(256, 4, 256)                                                \
+    }                                                                                          \
+    else if(cols_ <= 512)                                                                      \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(512, 4, 256)                                                \
+    }                                                                                          \
+    else if(cols_ <= 1024)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(1024, 4, 256)                                               \
+    }                                                                                          \
+    else if(cols_ <= 2048)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(2048, 8, 256)                                               \
+    }                                                                                          \
+    else if(cols_ <= 4096)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(4096, 16, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 6144)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(6144, 24, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 8192)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(8192, 32, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 16384)                                                                    \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(16384, 32, 256)                                             \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 16384)            \
+    }
+
+void mxfp4_moe_sort_hip(
+    torch::Tensor& out_scale,
+    torch::Tensor const& scale,
+    torch::Tensor const& sorted_ids,
+    torch::Tensor const& num_valid_ids,
+    int token_num,
+    int cols,
+    int topk,
+    int block_m
+)
+{
+    const int num_cu = get_num_cu_func();
+    const bool persistent_mode = false;
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(scale));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    MXFP4_MOE_SORT_KERNEL_DISPATCH(cols);
 }
 
 } // namespace aiter

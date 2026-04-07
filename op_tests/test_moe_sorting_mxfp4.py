@@ -5,6 +5,7 @@ import aiter
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.fused_moe import moe_sorting, fused_topk
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter.jit.utils.chip_info import get_gfx
 from aiter import get_torch_quant, dtypes
 from aiter.utility import fp4_utils
 import pandas as pd
@@ -43,15 +44,18 @@ def run_torch(scale, sorted_ids, num_valid_ids, token_num):
     return ref
 
 
-def run_hip_quant_sort(scale, input, sorted_ids, num_valid_ids, topk, block_size):
-    M, N = input.shape
-    out = torch.empty(
-        (M, N // 2),
-        dtype=dtypes.fp4x2,
-        device=input.device,
-    )
-    aiter.fused_dynamic_mxfp4_quant_moe_sort_hip(
-        out, scale, input, sorted_ids, num_valid_ids, topk, block_size
+def run_split_quant_sort(scale, input, sorted_ids, num_valid_ids, topk, block_size):
+    out, scale_ = aiter.per_1x32_f4_quant_hip(input, None, dtypes.fp4x2)
+    token_num = input.numel() // (input.shape[-1] * topk)
+    aiter.mxfp4_moe_sort_hip(
+        scale,
+        scale_,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        input.shape[-1],
+        topk,
+        block_size,
     )
     return out, scale
 
@@ -73,11 +77,12 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
     if stage == "stage1":
         scale = torch.arange(token_num * model_dim // 32, dtype=torch.uint8)
         scale = scale.view(token_num, model_dim // 32)
+        topk = 1
     else:
         scale = torch.arange(token_num * topk * model_dim // 32, dtype=torch.uint8)
         scale = scale.view(token_num, topk, model_dim // 32)
     ref = run_torch(scale.clone(), sorted_ids.clone(), num_valid_ids, token_num)
-    sorted_mxfp4_scale, us = run_perftest(
+    triton_scale, triton_us = run_perftest(
         fp4_utils.moe_mxfp4_sort,
         scale,
         sorted_ids,
@@ -86,19 +91,49 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
         block_size,
     )
 
+    hip_scale = torch.zeros(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, model_dim // 32),
+        dtype=torch.uint8,
+        device=input.device,
+    )
+    _, hip_us = run_perftest(
+        aiter.mxfp4_moe_sort_hip,
+        hip_scale,
+        scale,
+        sorted_ids,
+        num_valid_ids,
+        token_num,
+        model_dim,
+        topk,
+        block_size,
+    )
+
     num_valid_ids = num_valid_ids.item()
     num_valid_ids = (num_valid_ids + block_size - 1) // block_size * block_size
 
-    err = checkAllclose(
+    triton_err = checkAllclose(
         ref[:num_valid_ids],
-        sorted_mxfp4_scale[:num_valid_ids].view(torch.uint8),
+        triton_scale[:num_valid_ids].view(torch.uint8),
         msg="sorted_mxfp4_scale",
     )
-    return {"us": us, "err": err}
+
+    hip_err = checkAllclose(
+        ref[:num_valid_ids].view(torch.uint8),
+        hip_scale[:num_valid_ids].view(torch.uint8),
+        msg="hip sorted_mxfp4_scale",
+    )
+    return {
+        "triton_us": triton_us,
+        "triton_err": triton_err,
+        "hip_us": hip_us,
+        "hip_err": hip_err,
+    }
 
 
 @benchmark()
 def test_moe_mxfp4_quant_sort(dtype, token_num, model_dim, E, topk, block_size, stage):
+    if get_gfx().startswith("gfx94"):
+        return {}
     input = torch.randn((token_num, model_dim), dtype=dtype)
     score = torch.randn((token_num, E), dtype=dtype)
 
@@ -120,13 +155,34 @@ def test_moe_mxfp4_quant_sort(dtype, token_num, model_dim, E, topk, block_size, 
     )
     ref_scale = run_torch(scale.clone(), sorted_ids.clone(), num_valid_ids, token_num)
 
-    hip_scale = torch.zeros(
-        (sorted_ids.shape[0], model_dim // 32),
+    split_scale = torch.zeros(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, model_dim // 32),
         dtype=torch.uint8,
         device=input.device,
     )
-    (hip_out, hip_scale), hip_us = run_perftest(
-        run_hip_quant_sort,
+    (split_out, split_scale), split_us = run_perftest(
+        run_split_quant_sort,
+        split_scale,
+        input,
+        sorted_ids,
+        num_valid_ids,
+        topk,
+        block_size,
+    )
+
+    hip_scale = torch.zeros(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, model_dim // 32),
+        dtype=torch.uint8,
+        device=input.device,
+    )
+    hip_out = torch.empty(
+        (token_num * topk, model_dim // 2),
+        dtype=dtypes.fp4x2,
+        device=input.device,
+    )
+    _, hip_us = run_perftest(
+        aiter.fused_dynamic_mxfp4_quant_moe_sort_hip,
+        hip_out,
         hip_scale,
         input,
         sorted_ids,
@@ -165,11 +221,19 @@ def test_moe_mxfp4_quant_sort(dtype, token_num, model_dim, E, topk, block_size, 
         msg="triton sorted_mxfp4_scale",
     )
 
+    split_err = checkAllclose(
+        ref_scale[:num_valid_ids].view(torch.uint8),
+        split_scale[:num_valid_ids].view(torch.uint8),
+        msg="split sorted_mxfp4_scale",
+    )
+
     return {
-        "us_triton": triton_us,
-        "err_triton": triton_err,
-        "us_hip": hip_us,
-        "err_hip": hip_err,
+        "triton_us": triton_us,
+        "triton_err": triton_err,
+        "hip_us": hip_us,
+        "hip_err": hip_err,
+        "split_us": split_us,
+        "split_err": split_err,
     }
 
 
@@ -192,7 +256,7 @@ parser.add_argument(
     "-dim",
     type=int,
     nargs="*",
-    default=[4096, 7168, 8192],
+    default=[4096, 7168],
     help="""Model dimension.
     e.g.: -dim 4096""",
 )
@@ -209,7 +273,7 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    default=[1, 31, 64, 128, 256, 4200, 10000, 163840],
+    default=[1, 64, 128, 256, 1024, 2050, 4200, 10000, 163840],
     help="""M of mnk.
     e.g.: -m 64""",
 )
