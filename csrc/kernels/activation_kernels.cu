@@ -17,8 +17,6 @@ static constexpr int32_t max_wave_num = 8;
 
 namespace aiter {
 
-
-
 // Activation and gating kernel template with flexible input/output types.
 // DTYPE_I: input type (fp32/bf16/fp16), DTYPE_O: output type (fp32/bf16/fp16)
 // Computes in float, converts to DTYPE_O on output.
