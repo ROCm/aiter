@@ -1456,6 +1456,26 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         return row_max_new, row_sum_e_new, oaccu_out
 
     # ==================================================================
+    # KV LDS buffer pointers -- computed once, persist across work items
+    # ==================================================================
+    p_lds_kv_0_base = lds_base_idx + arith.index(P_LDS_KV_0)
+    p_lds_kv_1_base = lds_base_idx + arith.index(P_LDS_KV_1)
+
+    kv_warp_offset_i32 = _std_arith.MulIOp(
+        _raw(warp_idx_i32),
+        _raw(arith.constant(KV_SUB_BYTES, type=T.i32)),
+    ).result
+
+    p_lds_kv_0_warp_i32 = _std_arith.AddIOp(
+        _raw(_index_cast_to_i32(p_lds_kv_0_base)),
+        kv_warp_offset_i32,
+    ).result
+    p_lds_kv_1_warp_i32 = _std_arith.AddIOp(
+        _raw(_index_cast_to_i32(p_lds_kv_1_base)),
+        kv_warp_offset_i32,
+    ).result
+
+    # ==================================================================
     # Main kernel body: persistent-thread work loop
     # ==================================================================
     for work_idx in range(work_start_idx, work_end_idx):
@@ -1485,23 +1505,6 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         rocdl.sched_barrier(0)
 
         # ---- KV tile iteration ----
-        p_lds_kv_0_base = lds_base_idx + arith.index(P_LDS_KV_0)
-        p_lds_kv_1_base = lds_base_idx + arith.index(P_LDS_KV_1)
-
-        kv_warp_offset_i32 = _std_arith.MulIOp(
-            _raw(warp_idx_i32),
-            _raw(arith.constant(KV_SUB_BYTES, type=T.i32)),
-        ).result
-
-        p_lds_kv_0_warp_i32 = _std_arith.AddIOp(
-            _raw(_index_cast_to_i32(p_lds_kv_0_base)),
-            kv_warp_offset_i32,
-        ).result
-        p_lds_kv_1_warp_i32 = _std_arith.AddIOp(
-            _raw(_index_cast_to_i32(p_lds_kv_1_base)),
-            kv_warp_offset_i32,
-        ).result
-
         # Initialize softmax state
         row_max = _raw(c_neg_inf_f32)
         row_sum_e = _raw(c_zero_f32)
@@ -1655,8 +1658,26 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 oaccu[i], _raw(reci_vec), fastmath=fm_fast
             ).result
 
-        # ---- Output dispatch ----
-        p_lds_o = p_lds_kv_0_base
+        # ---- Output dispatch: reuse the *current* KV buffer ----
+        # Tile 0 used KV_0. After num_tiles tiles, last tile_idx = num_tiles-1.
+        # Parity: (num_tiles-1) & 1 == 0 -> curr=KV_0, == 1 -> curr=KV_1.
+        last_tile_parity = _std_arith.AndIOp(
+            _std_arith.SubIOp(
+                _raw(num_tiles),
+                _raw(arith.constant(1, type=T.i32)),
+            ).result,
+            _raw(arith.constant(1, type=T.i32)),
+        ).result
+        last_is_odd = _std_arith.CmpIOp(
+            CmpIPredicate.ne,
+            last_tile_parity,
+            _raw(arith.constant(0, type=T.i32)),
+        ).result
+        p_lds_o = _std_arith.SelectOp(
+            last_is_odd,
+            _raw(p_lds_kv_1_base),
+            _raw(p_lds_kv_0_base),
+        ).result
 
         if arith.cmpi(CmpIPredicate.slt, partial_qo_loc, arith.constant(0, type=T.i32)):
             _write_output_bf16(oaccu, qo_start, p_lds_o)
