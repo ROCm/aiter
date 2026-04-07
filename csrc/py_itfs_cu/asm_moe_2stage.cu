@@ -3,8 +3,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <memory>
-#include <string>
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_fmoe_2stages_configs.hpp"
 

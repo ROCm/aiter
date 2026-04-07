@@ -6,7 +6,6 @@
 
 #include "aiter_enum.h"
 #include "aiter_logger.h"
-#include "aiter_tensor.h"
 #if !ENABLE_CK
 #include "ck_tile_shim.h"
 #else
@@ -66,11 +65,11 @@ template <typename... Args>
         hipError_t err = call;                                                    \
         if(err != hipSuccess) [[unlikely]]                                        \
         {                                                                         \
-            aiter_detail::aiter_check_fatal(__FILE__,                             \
-                                      __LINE__,                                   \
-                                      "fail to call " #call " ---> [HIP error](", \
-                                      hipGetErrorString(err),                     \
-                                      ')');                                       \
+            aiter_detail::aiter_check_fatal(__FILE__,                                 \
+                                        __LINE__,                                 \
+                                        "fail to call " #call " ---> [HIP error](", \
+                                        hipGetErrorString(err),                   \
+                                        ')');                                       \
         }                                                                         \
     } while(0)
 
@@ -278,6 +277,8 @@ struct WarpSizeValue
     }
 };
 
+// WARNING: Do not use WARP_SIZE as const/constexpr in host code;
+// it will take the host-pass fallback path and cause a compile error.
 inline constexpr WarpSizeValue WARP_SIZE{};
 
 static int get_pci_chip_id()
