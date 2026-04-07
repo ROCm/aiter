@@ -121,7 +121,9 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 
         if EVEN_M_N:
             a = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
-            b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg")
+            b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg").to(
+                tl.float32
+            )
         else:
             x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
             a = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
@@ -130,8 +132,9 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             # a and b can share the same mask
             b = tl.load(
                 x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
-            )
-        x = _apply_activation_from_str(a, ACTIVATION).to(b.dtype) * b
+            ).to(tl.float32)
+
+        x = _apply_activation_from_str(a, ACTIVATION) * b
         if DO_QUANT:
             out_tensor, bs_e8m0 = _mxfp4_quant_op(
                 x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
@@ -244,14 +247,18 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
 
     if EVEN_N:
         a = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
-        b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg")
+        b = tl.load(x_ptr + x_offs + stride_x_n * N, cache_modifier=".cg").to(
+            tl.float32
+        )
     else:
         x_mask = x_offs_n < N
         a = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(tl.float32)
         # a and b can share the same mask
-        b = tl.load(x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg")
+        b = tl.load(
+            x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
+        ).to(tl.float32)
 
-    x = _apply_activation_from_str(a, ACTIVATION).to(b.dtype) * b
+    x = _apply_activation_from_str(a, ACTIVATION) * b
 
     out_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     out_offs = pid_m * stride_x_fp8_m + out_offs_n * stride_x_fp8_n
