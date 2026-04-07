@@ -706,7 +706,8 @@ def main():
                             format_duration_seconds(values["avg_duration_seconds"]),
                         ]
                         for label, values in sorted(
-                            concurrency.items(), key=lambda item: runner_label_sort_key(item[0])
+                            concurrency.items(),
+                            key=lambda item: runner_label_sort_key(item[0]),
                         )
                     ],
                     headers=[
@@ -723,7 +724,9 @@ def main():
                 )
             )
         else:
-            print("No matching self-hosted runner labels found in the selected time window.")
+            print(
+                "No matching self-hosted runner labels found in the selected time window."
+            )
     else:
         print("### Job Status Report")
         print(
