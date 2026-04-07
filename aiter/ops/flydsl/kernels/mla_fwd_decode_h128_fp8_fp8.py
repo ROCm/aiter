@@ -1500,10 +1500,6 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         kv_end = rocdl.readfirstlane(T.i32, _raw(wi_dw5))
         kv_len = arith.subi(kv_end, kv_start)
 
-        # ---- Load Q from VRAM to registers ----
-        q_nope_packs, q_rope_packs = _load_q_to_regs(qo_start)
-        rocdl.sched_barrier(0)
-
         # ---- KV tile iteration ----
         # Initialize softmax state
         row_max = _raw(c_neg_inf_f32)
@@ -1516,49 +1512,84 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         num_tiles = arith.divui(arith.addi(kv_len, c_block_n_m1), c_block_n)
         num_tiles_idx = arith.index_cast(T.index, num_tiles)
 
-        # ---- Double-buffered tile loop ----
-        # Buffer 0: first tile loaded synchronously
-        # Prefetch of next tile interleaved in _process_tile during GEMM1
-        # Subsequent tiles alternate buffers via tile_idx parity.
-
-        # --- First tile: load all 9 blocks to KV_0 synchronously ---
-        row_kv_ld_first = _get_kv_ld_row(kv_start, kv_end, True)
-        _async_load_kv_all(
-            p_lds_kv_0_warp_i32,
-            row_kv_ld_first,
-            kv_ld_col_base_i32,
-            check_boundary=True,
-        )
-
-        _barrier(vmcnt=0, lgkmcnt=0)
-        rocdl.sched_barrier(0)
-
-        # Resolve row for tile 1 prefetch (raw, may be -1 for OOB)
-        kv_start_plus_bn = _std_arith.AddIOp(
-            _raw(kv_start),
-            _raw(arith.constant(BLOCK_N, type=T.i32)),
+        # --- First tile: runtime branch on boundary check ---
+        # HK pattern: check_boundary only when kv_len < BLOCK_N (partial first tile).
+        # When kv_len >= BLOCK_N the first tile is always full.
+        first_tile_needs_boundary = _std_arith.CmpIOp(
+            CmpIPredicate.slt,
+            _raw(kv_len),
+            _raw(c_block_n),
         ).result
-        row_kv_ld_tile1 = _get_kv_ld_row(kv_start_plus_bn, _raw(kv_end), True)
 
-        # Process first tile -- always prefetch tile 1 to KV_1.
-        # When num_tiles == 1, row_kv_ld_tile1 == -1 (OOB), which
-        # triggers the OOB zeroing path in _prefetch_k_tile_asm.
-        # Those zeros land in KV_1 which won't be consumed -- harmless.
-        row_max, row_sum_e, oaccu = _process_tile(
-            p_lds_kv_0_base,
-            kv_start,
-            kv_end,
-            q_nope_packs,
-            q_rope_packs,
-            row_max,
-            row_sum_e,
-            oaccu,
-            is_first_iter=True,
-            check_boundary=True,
-            p_lds_kv_next_warp_i32=p_lds_kv_1_warp_i32,
-            row_kv_ld_next=row_kv_ld_tile1,
-            kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+        # Load Q to GPR (independent of boundary check)
+        q_nope_packs, q_rope_packs = _load_q_to_regs(qo_start)
+
+        def _first_tile_sequence(check_boundary):
+            """Get KV row, async load KV, resolve tile1 row, barrier, process."""
+            # 1. Resolve KV row
+            if check_boundary:
+                row_kv_ld_first = _get_kv_ld_row(kv_start, kv_end, True)
+            else:
+                kv_first_end = _std_arith.AddIOp(
+                    _raw(kv_start),
+                    _raw(c_block_n),
+                ).result
+                row_kv_ld_first = _get_kv_ld_row(kv_start, kv_first_end, False)
+            # 2. Async load first tile KV to LDS
+            _async_load_kv_all(
+                p_lds_kv_0_warp_i32,
+                row_kv_ld_first,
+                kv_ld_col_base_i32,
+                check_boundary=check_boundary,
+            )
+            # 3. Resolve row for tile 1 prefetch
+            kv_start_plus_bn_ = _std_arith.AddIOp(
+                _raw(kv_start),
+                _raw(arith.constant(BLOCK_N, type=T.i32)),
+            ).result
+            row_kv_ld_tile1_ = _get_kv_ld_row(kv_start_plus_bn_, _raw(kv_end), True)
+            # 4. Barrier
+            _barrier(vmcnt=0, lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            # 5. Process first tile
+            rm, rse, oa = _process_tile(
+                p_lds_kv_0_base,
+                kv_start,
+                kv_end,
+                q_nope_packs,
+                q_rope_packs,
+                row_max,
+                row_sum_e,
+                oaccu,
+                is_first_iter=True,
+                check_boundary=check_boundary,
+                p_lds_kv_next_warp_i32=p_lds_kv_1_warp_i32,
+                row_kv_ld_next=row_kv_ld_tile1_,
+                kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+            )
+            return rm, rse, oa
+
+        # Branch: check_boundary=True vs False
+        result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
+        if_op_first = scf.IfOp(
+            first_tile_needs_boundary,
+            result_types,
+            has_else=True,
         )
+        with ir.InsertionPoint(if_op_first.regions[0].blocks[0]):
+            rm_t, rse_t, oa_t = _first_tile_sequence(check_boundary=True)
+            yield_t = [rm_t, rse_t] + oa_t
+            yield_t = [_raw(v) if not isinstance(v, ir.Value) else v for v in yield_t]
+            scf.YieldOp(yield_t)
+        with ir.InsertionPoint(if_op_first.regions[1].blocks[0]):
+            rm_f, rse_f, oa_f = _first_tile_sequence(check_boundary=False)
+            yield_f = [rm_f, rse_f] + oa_f
+            yield_f = [_raw(v) if not isinstance(v, ir.Value) else v for v in yield_f]
+            scf.YieldOp(yield_f)
+
+        row_max = if_op_first.results[0]
+        row_sum_e = if_op_first.results[1]
+        oaccu = [if_op_first.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
 
         # --- Remaining tiles [1, num_tiles) via scf.ForOp ---
         # Carried state: row_max, row_sum_e, oaccu[0..31]
