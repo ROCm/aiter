@@ -1,6 +1,5 @@
 from typing import Literal, Optional
 import triton
-import triton.language as tl
 import torch
 import aiter
 

@@ -3,7 +3,7 @@
 
 #include "aiter_hip_common.h"
 #include "py_itfs_common.h"
-#include "opus.hpp"
+#include "opus/opus.hpp"
 // #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"

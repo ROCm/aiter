@@ -3,7 +3,7 @@
 #pragma once
 
 #include "hip_reduce.h"
-#include "opus.hpp"
+#include "opus/opus.hpp"
 // todo: remove this to use aiterTensor dtype
 #include <c10/util/BFloat16.h>
 #include <c10/util/Half.h>

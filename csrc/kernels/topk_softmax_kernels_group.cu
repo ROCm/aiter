@@ -15,6 +15,7 @@
 #include "py_itfs_common.h"
 #include "aiter_hip_common.h"
 #include "warp_sort.h"
+#include "aiter_opus_plus.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_runtime.h>
@@ -48,37 +49,37 @@ struct kvpair_t
 using topk_score_t = kvpair_t<int, float>;
 } // namespace impl
 
-template <typename T, typename F, int wave_size_ = 64>
-__device__ constexpr T wave_reduce(T local, F reduce_f, ck_tile::number<wave_size_> = {})
-{
-    constexpr int reduce_stage = []() {
-        if constexpr(wave_size_ == 2)
-            return 1;
-        else if constexpr(wave_size_ == 4)
-            return 2;
-        else if constexpr(wave_size_ == 8)
-            return 3;
-        else if constexpr(wave_size_ == 16)
-            return 4;
-        else if constexpr(wave_size_ == 32)
-            return 5;
-        else if constexpr(wave_size_ == 64)
-            return 6;
-        else
-            return 0;
-    }();
-    T v_local = local;
-#pragma unroll
-    for(int i_stage = 0; i_stage < reduce_stage; i_stage++)
-    {
-        int src_lane = __lane_id() ^ (1 << i_stage);
-        int32_t v_remote_tmp =
-            __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
-        T v_remote = __builtin_bit_cast(T, v_remote_tmp);
-        v_local    = reduce_f(v_local, v_remote);
-    }
-    return v_local;
-}
+// template <typename T, typename F, int wave_size_ = 64>
+// __device__ constexpr T wave_reduce(T local, F reduce_f, opus::number<wave_size_> = {})
+// {
+//     constexpr int reduce_stage = []() {
+//         if constexpr(wave_size_ == 2)
+//             return 1;
+//         else if constexpr(wave_size_ == 4)
+//             return 2;
+//         else if constexpr(wave_size_ == 8)
+//             return 3;
+//         else if constexpr(wave_size_ == 16)
+//             return 4;
+//         else if constexpr(wave_size_ == 32)
+//             return 5;
+//         else if constexpr(wave_size_ == 64)
+//             return 6;
+//         else
+//             return 0;
+//     }();
+//     T v_local = local;
+// #pragma unroll
+//     for(int i_stage = 0; i_stage < reduce_stage; i_stage++)
+//     {
+//         int src_lane = __lane_id() ^ (1 << i_stage);
+//         int32_t v_remote_tmp =
+//             __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
+//         T v_remote = __builtin_bit_cast(T, v_remote_tmp);
+//         v_local    = reduce_f(v_local, v_remote);
+//     }
+//     return v_local;
+// }
 
 // every thread hold one value, with pivot (topk value)
 // need to find the first topk value that is >= pivot
@@ -100,27 +101,27 @@ __device__ constexpr T wave_reduce(T local, F reduce_f, ck_tile::number<wave_siz
 // mask    : [1, 1, 0, 0, 1] (of above condition per lane)
 // position: [0, 2, x, x, 1] => this is cumsum-1
 //
-template <typename T, int lanegroup_size_ = 64>
+template <typename T, int lanegroup_size_ = WARP_SIZE>
 __device__ constexpr int
-cumsum_topk_with_pivot(const T& v, const T& pivot, ck_tile::number<lanegroup_size_> = {})
+cumsum_topk_with_pivot(const T& v, const T& pivot, opus::number<lanegroup_size_> = {})
 {
     // lanegroup_size_ must be power of 2!
 
     // fisrt count larger than pivot
     int cnt_ = v > pivot ? 1 : 0;
-    warp_cumsum(cnt_, ck_tile::number<lanegroup_size_>{});
+    warp_cumsum(cnt_, opus::number<lanegroup_size_>{});
     int total_ = __builtin_amdgcn_readlane(cnt_, lanegroup_size_ - 1);
 
     // 2nd count equal to pivot
     int cnt_2_ = v == pivot ? 1 : 0;
-    warp_cumsum(cnt_2_, ck_tile::number<lanegroup_size_>{});
+    warp_cumsum(cnt_2_, opus::number<lanegroup_size_>{});
     return v == pivot ? (total_ + cnt_2_) : cnt_;
 }
 
 // make sure local_max is local_value, local_max_2 is -INF
-template <typename T, int wave_size_ = 64>
+template <typename T, int wave_size_ = WARP_SIZE>
 __device__ constexpr void
-wave_reduce_max2(T& local_max, T& local_max_2, ck_tile::number<wave_size_> = {})
+wave_reduce_max2(T& local_max, T& local_max_2, opus::number<wave_size_> = {})
 {
     constexpr int reduce_stage = []() {
         if constexpr(wave_size_ == 2)
@@ -158,9 +159,9 @@ wave_reduce_max2(T& local_max, T& local_max_2, ck_tile::number<wave_size_> = {})
     }
 }
 
-template <typename T, typename I, int wave_size_ = 64>
+template <typename T, typename I, int wave_size_ = WARP_SIZE>
 __device__ constexpr void wave_reduce_argmax2(
-    T& local_max, I& idx, T& local_max_2, I& idx_2, ck_tile::number<wave_size_> = {})
+    T& local_max, I& idx, T& local_max_2, I& idx_2, opus::number<wave_size_> = {})
 {
     constexpr int reduce_stage = []() {
         if constexpr(wave_size_ == 2)
@@ -203,47 +204,55 @@ __device__ constexpr void wave_reduce_argmax2(
 
 __inline__ __device__ void warpReduceMax(float& val_o, int& idx)
 {
-    static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
-    constexpr int lane_steps  = 6;
-    constexpr int row_mask    = 0xf;
-    constexpr int bank_mask   = 0xf;
-    constexpr bool bound_ctrl = true;
-    float val                 = val_o;
+    using kvp = hipcub::KeyValuePair<int, float>;
+    kvp thread_kvp;
+    thread_kvp.key       = idx;
+    thread_kvp.value     = val_o;
+    auto arg_max = [](kvp a, kvp b) { return a.value > b.value ? a : b; };
+    const kvp result_kvp = wave_reduce<kvp, decltype(arg_max), WARP_SIZE, false>(thread_kvp, arg_max);
+    val_o = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, result_kvp.value), WARP_SIZE - 1));
+    idx = __builtin_bit_cast(int, __builtin_amdgcn_readlane(result_kvp.key, WARP_SIZE - 1));
+    // static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
+    // constexpr int lane_steps  = 6;
+    // constexpr int row_mask    = 0xf;
+    // constexpr int bank_mask   = 0xf;
+    // constexpr bool bound_ctrl = true;
+    // float val                 = val_o;
 
-    constexpr auto get_dpp_i = [&](auto i_step) {
-        if constexpr(i_step.value == 0)
-            return 0xb1; // quad_perm:[1,0,3,2]
-        if constexpr(i_step.value == 1)
-            return 0x4e; // quad_perm:[2,3,0,1]
-        if constexpr(i_step.value == 2)
-            return 0x114; // row_shr:4
-        if constexpr(i_step.value == 3)
-            return 0x118; // row_shr:8
-        if constexpr(i_step.value == 4)
-            return 0x142; // row_bcast:15
-        if constexpr(i_step.value == 5)
-            return 0x143; // row_bcast:31
-        else
-            return 0xffff; // return a value to let compile crash
-    };
-    ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
-        constexpr int dpp_i = get_dpp_i(i_step);
+    // constexpr auto get_dpp_i = [&](auto i_step) {
+    //     if constexpr(i_step.value == 0)
+    //         return 0xb1; // quad_perm:[1,0,3,2]
+    //     if constexpr(i_step.value == 1)
+    //         return 0x4e; // quad_perm:[2,3,0,1]
+    //     if constexpr(i_step.value == 2)
+    //         return 0x114; // row_shr:4
+    //     if constexpr(i_step.value == 3)
+    //         return 0x118; // row_shr:8
+    //     if constexpr(i_step.value == 4)
+    //         return 0x142; // row_bcast:15
+    //     if constexpr(i_step.value == 5)
+    //         return 0x143; // row_bcast:31
+    //     else
+    //         return 0xffff; // return a value to let compile crash
+    // };
+    // opus::static_for<lane_steps>([&](auto i_step) {
+    //     constexpr int dpp_i = get_dpp_i(i_step);
 
-        float remote_val = __builtin_bit_cast(
-            float,
-            __builtin_amdgcn_mov_dpp(
-                __builtin_bit_cast(int, val), dpp_i, row_mask, bank_mask, bound_ctrl));
-        int remote_idx = __builtin_bit_cast(
-            int,
-            __builtin_amdgcn_mov_dpp(
-                __builtin_bit_cast(int, idx), dpp_i, row_mask, bank_mask, bound_ctrl));
+    //     float remote_val = __builtin_bit_cast(
+    //         float,
+    //         __builtin_amdgcn_mov_dpp(
+    //             __builtin_bit_cast(int, val), dpp_i, row_mask, bank_mask, bound_ctrl));
+    //     int remote_idx = __builtin_bit_cast(
+    //         int,
+    //         __builtin_amdgcn_mov_dpp(
+    //             __builtin_bit_cast(int, idx), dpp_i, row_mask, bank_mask, bound_ctrl));
 
-        idx = val > remote_val ? idx : remote_idx;
-        val = val > remote_val ? val : remote_val;
-    });
-    val_o = __builtin_bit_cast(
-        float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), WARP_SIZE - 1));
-    idx = __builtin_amdgcn_readlane(idx, WARP_SIZE - 1);
+    //     idx = val > remote_val ? idx : remote_idx;
+    //     val = val > remote_val ? val : remote_val;
+    // });
+    // val_o = __builtin_bit_cast(
+    //     float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), WARP_SIZE - 1));
+    // idx = __builtin_amdgcn_readlane(idx, WARP_SIZE - 1);
 
     // val = __builtin_bit_cast(float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, val), 63));
     // if (val==val_o)
@@ -348,9 +357,9 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     // float *topk_values_f = reinterpret_cast<float *>(ptr);
 
     f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
-    using cktype_i                = typename t2ck<DTYPE_I>::type;
-    static constexpr int vec_size = ck_tile::vector_traits<f32vec>::vector_size;
-    using vec_i                   = ck_tile::ext_vector_t<cktype_i, vec_size>;
+    using cktype_i                = typename t2opus<DTYPE_I>::type;
+    static constexpr int vec_size = opus::vector_traits<f32vec>::size();
+    using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
 
     if constexpr(!isSoftmax)
@@ -367,11 +376,11 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 #pragma unroll
             for(size_t i = 0; i < vec_size; i++)
             {
-                gating[i] = ck_tile::type_convert<float>(tmp[i]);
+                gating[i] = static_cast<float>(tmp[i]);
                 gating[i] = 1.0f / (1.0f + expf(-gating[i]));
                 if constexpr(isBiased)
                 {
-                    tmp2_f32[i] = ck_tile::type_convert<float>(tmp2[i]);
+                    tmp2_f32[i] = static_cast<float>(tmp2[i]);
                     gating[i] += tmp2_f32[i];
                 }
             }
@@ -385,7 +394,6 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     }
     else
     {
-        __shared__ float sdata;
         float max_val = -INFINITY;
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
@@ -398,22 +406,8 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             }
         }
         __syncthreads();
-#pragma unroll
-        for(int i = 0; i < 6; i++)
-        {
-            int offset    = 1 << i;
-            float tmp_val = __shfl_down(max_val, offset);
-            if(tmp_val > max_val)
-            {
-                max_val = tmp_val;
-            }
-        }
-        if(threadIdx.x == 0)
-        {
-            sdata = max_val;
-        }
-        __syncthreads();
-        max_val          = sdata;
+        auto max_reduce = [](float a, float b) { return a > b ? a : b; };
+        max_val = wave_reduce<float, decltype(max_reduce), WARP_SIZE, true>(max_val, max_reduce);
         float thread_sum = 0.0;
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
@@ -421,7 +415,8 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             thread_sum += scores[e];
         }
         __syncthreads();
-        thread_sum = wave_reduce(thread_sum, [](float a, float b) { return a + b; });
+        auto sum_reduce = [](float a, float b) { return a + b; };
+        thread_sum = wave_reduce<float, decltype(sum_reduce), WARP_SIZE, true>(thread_sum, sum_reduce);
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
             scores[e] /= thread_sum;
@@ -429,115 +424,118 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         __syncthreads();
     }
 
-    if constexpr(isBiased)
+    if constexpr(NUM_GRP > 1)
     {
-        constexpr int lane_steps = [&]() {
-            if constexpr(THREAD_PER_GRP == 8)
-                return 3;
-            if constexpr(THREAD_PER_GRP == 4)
-                return 2;
-            if constexpr(THREAD_PER_GRP == 2)
-                return 1;
-            else
-                return 0;
-        }();
-        const int lane_id = threadIdx.x % THREAD_PER_GRP;
-        for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
+        if constexpr(isBiased)
         {
-            float max1 = -INFINITY, max2 = -INFINITY;
-            const int start = g * experts_per_group;
-            const int end   = experts_per_group / vec_size;
-            f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
-
-            for(int e = lane_id; e < end; e += THREAD_PER_GRP)
+            constexpr int lane_steps = [&]() {
+                if constexpr(THREAD_PER_GRP == 8)
+                    return 3;
+                if constexpr(THREAD_PER_GRP == 4)
+                    return 2;
+                if constexpr(THREAD_PER_GRP == 2)
+                    return 1;
+                else
+                    return 0;
+            }();
+            const int lane_id = threadIdx.x % THREAD_PER_GRP;
+            for(int g = threadIdx.x / THREAD_PER_GRP; g < NUM_GRP; g += blockDim.x / THREAD_PER_GRP)
             {
-                auto s_vec = sc[e];
-                for(int j = 0; j < vec_size; j++)
+                float max1 = -INFINITY, max2 = -INFINITY;
+                const int start = g * experts_per_group;
+                const int end   = experts_per_group / vec_size;
+                f32vec* sc      = reinterpret_cast<f32vec*>(scores + start);
+
+                for(int e = lane_id; e < end; e += THREAD_PER_GRP)
                 {
-                    auto s_tmp = s_vec[j];
-                    max2       = dev_max_(s_tmp, max2);
-                    max2       = s_tmp > max1 ? max1 : max2;
-                    max1       = dev_max_(s_tmp, max1);
+                    auto s_vec = sc[e];
+                    for(int j = 0; j < vec_size; j++)
+                    {
+                        auto s_tmp = s_vec[j];
+                        max2       = dev_max_(s_tmp, max2);
+                        max2       = s_tmp > max1 ? max1 : max2;
+                        max1       = dev_max_(s_tmp, max1);
+                    }
                 }
-            }
 
+                {
+                    constexpr int row_mask    = 0xf;
+                    constexpr int bank_mask   = 0xf;
+                    constexpr bool bound_ctrl = true; // ! out-of-bound is zero !
+
+                    constexpr auto get_dpp_i = [&](auto i_step) {
+                        if constexpr(i_step.value == 0)
+                            return 0xb1; // quad_perm:[1,0,3,2]
+                        if constexpr(i_step.value == 1)
+                            return 0x4e; // quad_perm:[2,3,0,1]
+                        if constexpr(i_step.value == 2)
+                            return 0x141; // row_half_mirror
+                        else
+                            return 0xffff; // return a value to let compile crash
+                    };
+                    opus::static_for<lane_steps>([&](auto i_step) {
+                        constexpr int dpp_i = get_dpp_i(i_step);
+                        float remote_max_1  = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(
+                                __builtin_bit_cast(int, max1), dpp_i, row_mask, bank_mask, bound_ctrl));
+                        float remote_max_2 = __builtin_bit_cast(
+                            float,
+                            __builtin_amdgcn_mov_dpp(
+                                __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
+
+                        max2 = dev_max_(remote_max_1, max2);
+                        max2 = remote_max_1 > max1 ? max1 : max2;
+                        max1 = dev_max_(remote_max_1, max1);
+                        max2 = dev_max_(max2, remote_max_2);
+                    });
+                }
+                if(lane_id == 0)
+                    group_scores[g] = max1 + max2;
+            }
+            __syncthreads();
+        }
+        else
+        {
+    #pragma unroll
+            for(int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
             {
-                constexpr int row_mask    = 0xf;
-                constexpr int bank_mask   = 0xf;
-                constexpr bool bound_ctrl = true; // ! out-of-bound is zero !
-
-                constexpr auto get_dpp_i = [&](auto i_step) {
-                    if constexpr(i_step.value == 0)
-                        return 0xb1; // quad_perm:[1,0,3,2]
-                    if constexpr(i_step.value == 1)
-                        return 0x4e; // quad_perm:[2,3,0,1]
-                    if constexpr(i_step.value == 2)
-                        return 0x141; // row_half_mirror
-                    else
-                        return 0xffff; // return a value to let compile crash
-                };
-                ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
-                    constexpr int dpp_i = get_dpp_i(i_step);
-                    float remote_max_1  = __builtin_bit_cast(
-                        float,
-                        __builtin_amdgcn_mov_dpp(
-                            __builtin_bit_cast(int, max1), dpp_i, row_mask, bank_mask, bound_ctrl));
-                    float remote_max_2 = __builtin_bit_cast(
-                        float,
-                        __builtin_amdgcn_mov_dpp(
-                            __builtin_bit_cast(int, max2), dpp_i, row_mask, bank_mask, bound_ctrl));
-
-                    max2 = dev_max_(remote_max_1, max2);
-                    max2 = remote_max_1 > max1 ? max1 : max2;
-                    max1 = dev_max_(remote_max_1, max1);
-                    max2 = dev_max_(max2, remote_max_2);
-                });
+                float max1      = -INFINITY;
+                const int start = g * experts_per_group;
+                const int end   = start + experts_per_group;
+                for(int e = start; e < end; ++e)
+                {
+                    max1 = scores[e] > max1 ? scores[e] : max1;
+                }
+                group_scores[g] = max1;
             }
-            if(lane_id == 0)
-                group_scores[g] = max1 + max2;
+            __syncthreads();
+        }
+    
+        for(int k = 0; k < topk_group; k++)
+        {
+            float max_val = -INFINITY;
+            int max_idx   = NUM_GRP;
+    #pragma unroll
+            for(int g = 0; g < NUM_GRP; g++)
+            {
+                auto gs_tmp = group_scores[g];
+                max_idx     = gs_tmp > max_val ? g : max_idx;
+                max_val     = gs_tmp > max_val ? gs_tmp : max_val;
+            }
+            group_scores[max_idx] = -INFINITY;
+        }
+
+        for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
+        {
+            int group_idx = e * vec_size / experts_per_group;
+            if(group_scores[group_idx] != -INFINITY)
+            {
+                scores_vec[e] = -INFINITY;
+            }
         }
         __syncthreads();
     }
-    else
-    {
-#pragma unroll
-        for(int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
-        {
-            float max1      = -INFINITY;
-            const int start = g * experts_per_group;
-            const int end   = start + experts_per_group;
-            for(int e = start; e < end; ++e)
-            {
-                max1 = scores[e] > max1 ? scores[e] : max1;
-            }
-            group_scores[g] = max1;
-        }
-        __syncthreads();
-    }
-
-    for(int k = 0; k < topk_group; k++)
-    {
-        float max_val = -INFINITY;
-        int max_idx   = NUM_GRP;
-#pragma unroll
-        for(int g = 0; g < NUM_GRP; g++)
-        {
-            auto gs_tmp = group_scores[g];
-            max_idx     = gs_tmp > max_val ? g : max_idx;
-            max_val     = gs_tmp > max_val ? gs_tmp : max_val;
-        }
-        group_scores[max_idx] = -INFINITY;
-    }
-
-    for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
-    {
-        int group_idx = e * vec_size / experts_per_group;
-        if(group_scores[group_idx] != -INFINITY)
-        {
-            scores_vec[e] = -INFINITY;
-        }
-    }
-    __syncthreads();
 
     // using kvp = hipcub::KeyValuePair<int, float>;
     // using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
@@ -672,9 +670,9 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     // float *topk_values_f = reinterpret_cast<float *>(ptr);
 
     f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
-    using cktype_i                = typename t2ck<DTYPE_I>::type;
-    static constexpr int vec_size = ck_tile::vector_traits<f32vec>::vector_size;
-    using vec_i                   = ck_tile::ext_vector_t<cktype_i, vec_size>;
+    using cktype_i                = typename t2opus<DTYPE_I>::type;
+    static constexpr int vec_size = opus::vector_traits<f32vec>::size();
+    using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
 
     f32vec gating;
@@ -695,12 +693,12 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
 #pragma unroll
             for(size_t i = 0; i < vec_size; i++)
             {
-                gating[i] = ck_tile::type_convert<float>(tmp[i]);
+                gating[i] = static_cast<float>(tmp[i]);
                 // gating[i] = __builtin_amdgcn_rcpf(1.0f + expf(-gating[i]));
                 gating[i] = __builtin_amdgcn_rcpf(1.0f + exp2f(-C_LOG2E * gating[i]));
                 if constexpr(isBiased)
                 {
-                    tmp2_f32[i] = ck_tile::type_convert<float>(tmp2[i]);
+                    tmp2_f32[i] = static_cast<float>(tmp2[i]);
                     gating[i] += tmp2_f32[i];
                 }
                 gating[i] = ::isnan(gating[i]) ? -INFINITY : gating[i];
@@ -800,7 +798,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                     else
                         return 0xffff; // return a value to let compile crash
                 };
-                ck_tile::static_for<0, lane_steps, 1>{}([&](auto i_step) {
+                opus::static_for<lane_steps>([&](auto i_step) {
                     constexpr int dpp_i = get_dpp_i(i_step);
                     float remote_max_1  = __builtin_bit_cast(
                         float,
@@ -849,7 +847,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                 max_ = scores[i_ * experts_per_group + threadIdx.x];
             }
             max_ = wave_reduce(
-                max_, [](auto a, auto b) { return a > b ? a : b; }, ck_tile::number<32>{});
+                max_, [](auto a, auto b) { return a > b ? a : b; }, opus::number<32>{});
             group_scores[i_] = max_;
         }
         __syncthreads();
@@ -861,10 +859,10 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         float gs_tmp_remote = __shfl(group_score_, threadIdx.x * THREAD_PER_GRP);
         float gs_tmp        =  gs_tmp_remote;
 
-        auto sort_res = warp_bitonic_merge_sort_to_reg(gs_tmp, ck_tile::number<NUM_GRP>{});
+        auto sort_res = warp_bitonic_merge_sort_to_reg(gs_tmp, opus::number<NUM_GRP>{});
         auto pivot    = __shfl(sort_res, 3);
 
-        int local_cnt = cumsum_topk_with_pivot(gs_tmp, pivot, ck_tile::number<NUM_GRP>{});
+        int local_cnt = cumsum_topk_with_pivot(gs_tmp, pivot, opus::number<NUM_GRP>{});
 
         if(gs_tmp >= pivot && local_cnt <= topk_group && threadIdx.x < NUM_GRP)
         {
@@ -897,8 +895,8 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         constexpr int experts_per_group___ = 32;
         constexpr int final_score_vec      = 2;
 
-        using final_score_vec_t = ck_tile::ext_vector_t<float, final_score_vec>;
-        using final_expid_vec_t = ck_tile::ext_vector_t<int, final_score_vec>;
+        using final_score_vec_t = opus::vector_t<float, final_score_vec>;
+        using final_expid_vec_t = opus::vector_t<int, final_score_vec>;
         final_score_vec_t s;
         final_expid_vec_t e;
         final_expid_vec_t remapped_group_ids;
@@ -913,8 +911,8 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         }
 
 #if 1
-        float o_sorted_32_0 = warp_bitonic_merge_sort_build_with_early_stop(s[0], threadIdx.x, ck_tile::number<64>{}, ck_tile::number<32>{}, ck_tile::number<1>{});
-        float o_sorted_32_1 = warp_bitonic_merge_sort_build_with_early_stop(s[1], threadIdx.x, ck_tile::number<64>{}, ck_tile::number<32>{}, ck_tile::number<1>{});
+        float o_sorted_32_0 = warp_bitonic_merge_sort_build_with_early_stop(s[0], threadIdx.x, opus::number<64>{}, opus::number<32>{}, opus::number<1>{});
+        float o_sorted_32_1 = warp_bitonic_merge_sort_build_with_early_stop(s[1], threadIdx.x, opus::number<64>{}, opus::number<32>{}, opus::number<1>{});
 
         // descending
         // 0..>..15, 16..<..31, 32..>..47, 48..<..63
@@ -930,22 +928,22 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         float o_t_0 = __shfl(o_sorted_32_0, half_lane_id ^ twi_1_);
         float o_t_1 = __shfl(o_sorted_32_1, half_lane_id ^ twi_1_);
         float o_t  = threadIdx.x < 32 ? o_t_0 : o_t_1;
-        float o_r = warp_swap_(o_t, threadIdx.x, ck_tile::number<16>{});
+        float o_r = warp_swap_(o_t, threadIdx.x, opus::number<16>{});
         // 0..>..15, 16..<..31, 32..>..47, 48..<..63
-        float o_y = warp_bitonic_merge_sort_combine(o_t, o_r, threadIdx.x, (threadIdx.x / 16) & 1, ck_tile::number<16>{}, ck_tile::number<1>{});
+        float o_y = warp_bitonic_merge_sort_combine(o_t, o_r, threadIdx.x, (threadIdx.x / 16) & 1, opus::number<16>{}, opus::number<1>{});
         float o_q = __shfl(o_y, threadIdx.x ^ twi_1_);
-        float o_w = warp_swap_(o_q, threadIdx.x, ck_tile::number<16>{});
+        float o_w = warp_swap_(o_q, threadIdx.x, opus::number<16>{});
         // 0..>..15, 16..<..31
-        float o_o = warp_bitonic_merge_sort_combine(o_q, o_w, threadIdx.x, (threadIdx.x / 16) & 1, ck_tile::number<16>{}, ck_tile::number<1>{});
+        float o_o = warp_bitonic_merge_sort_combine(o_q, o_w, threadIdx.x, (threadIdx.x / 16) & 1, opus::number<16>{}, opus::number<1>{});
         float o_p = __shfl(o_o, threadIdx.x ^ twi_1_);
-        float o_z = warp_swap_(o_p, threadIdx.x, ck_tile::number<16>{});
+        float o_z = warp_swap_(o_p, threadIdx.x, opus::number<16>{});
         // 0..>..15,
-        float o_n = warp_bitonic_merge_sort_combine(o_p, o_z, threadIdx.x, 0, ck_tile::number<16>{}, ck_tile::number<1>{});
+        float o_n = warp_bitonic_merge_sort_combine(o_p, o_z, threadIdx.x, 0, opus::number<16>{}, opus::number<1>{});
         float pivot = __shfl(o_n, 7);
 #else
         auto bitonic_get = [&](float v_, auto is_descending_){
             
-            float o_x = warp_bitonic_merge_sort_build_with_early_stop(v_, threadIdx.x, ck_tile::number<64>{}, ck_tile::number<32>{}, ck_tile::number<1>{});
+            float o_x = warp_bitonic_merge_sort_build_with_early_stop(v_, threadIdx.x, opus::number<64>{}, opus::number<32>{}, opus::number<1>{});
             // descending
             // 0..>..15, 16..<..31, 32..>..47, 48..<..63
             // 0..7=>0..7, 24..31=> 8..15, 32..39=>16..23, 56..63=>24..31
@@ -955,26 +953,26 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             int twi_0_ = m8_gid ^ (m8_gid / 2); // 0,1,2,3 ^ 0,0,1,1 -> 0,1,3,2
             int twi_1_ = twi_0_ * 16;
             float o_t = __shfl(o_x, threadIdx.x ^ twi_1_);
-            float o_r = warp_swap_(o_t, threadIdx.x, ck_tile::number<16>{});
+            float o_r = warp_swap_(o_t, threadIdx.x, opus::number<16>{});
             
 
             // 0..>..15, 16..<..31,
-            float o_y = warp_bitonic_merge_sort_combine(o_t, o_r, threadIdx.x, (threadIdx.x / 16) & 1, ck_tile::number<16>{}, ck_tile::number<1>{});
+            float o_y = warp_bitonic_merge_sort_combine(o_t, o_r, threadIdx.x, (threadIdx.x / 16) & 1, opus::number<16>{}, opus::number<1>{});
             float o_q = __shfl(o_y, threadIdx.x ^ twi_1_);
 
             
-            float o_w = warp_swap_(o_q, threadIdx.x, ck_tile::number<16>{});
-            float o_o = warp_bitonic_merge_sort_combine(o_q, o_w, threadIdx.x, 0, ck_tile::number<16>{}, is_descending_);
+            float o_w = warp_swap_(o_q, threadIdx.x, opus::number<16>{});
+            float o_o = warp_bitonic_merge_sort_combine(o_q, o_w, threadIdx.x, 0, opus::number<16>{}, is_descending_);
             // printf("[%2d] v:%f, o_x:%f, o_t:%f, o_r:%f o_y:%f, o_q:%f, o_w:%f, o_o:%f\n", threadIdx.x, v_, o_x, o_t, o_r, o_y, o_q, o_w, o_o);
             return o_o;
         };
 
         // o_0: 0..>.16, o_1: 0..<..15
-        float o_0 = bitonic_get(s[0], ck_tile::number<1>{});
-        float o_1 = bitonic_get(s[1], ck_tile::number<0>{});
+        float o_0 = bitonic_get(s[0], opus::number<1>{});
+        float o_1 = bitonic_get(s[1], opus::number<0>{});
         float o_m = ((threadIdx.x / 8) == 0) ? o_0 : o_1;
-        float o_t = warp_swap_(o_m, threadIdx.x, ck_tile::number<16>{});
-        float o_sorted = warp_bitonic_merge_sort_combine(o_m, o_t, threadIdx.x, 0, ck_tile::number<16>{}, ck_tile::number<1>{});
+        float o_t = warp_swap_(o_m, threadIdx.x, opus::number<16>{});
+        float o_sorted = warp_bitonic_merge_sort_combine(o_m, o_t, threadIdx.x, 0, opus::number<16>{}, opus::number<1>{});
         float pivot = __shfl(o_sorted, 7);
 #endif
         int offset = 0;
@@ -983,7 +981,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         for(int i = 0; i < final_score_vec; i++)
         {
             int cnt_ = s[i] > pivot ? 1 : 0;
-            warp_cumsum(cnt_, ck_tile::number<64>{});
+            warp_cumsum(cnt_, opus::number<64>{});
             cnt_ += offset;
 
             offset        = __builtin_amdgcn_readlane(cnt_, 63);
@@ -993,7 +991,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         for(int i = 0; i < final_score_vec; i++)
         {
             int cnt_ = s[i] == pivot ? 1 : 0;
-            warp_cumsum(cnt_, ck_tile::number<64>{});
+            warp_cumsum(cnt_, opus::number<64>{});
             cnt_ += offset;
 
             offset        = __builtin_amdgcn_readlane(cnt_, 63);
@@ -1029,7 +1027,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             );
         }
 #else
-        ck_tile::static_for<0, final_score_vec, 1>{}([&](auto i_){
+        opus::static_for<final_score_vec>([&](auto i_){
             constexpr int i = i_.value;
 
             int remote_lane_id = (s[i] >= pivot && cumsum_cnt[i] <= topk) ?  ((cumsum_cnt[i] - 1) << 2) : (topk << 2);
@@ -1050,7 +1048,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         {
             if constexpr(isBiased)
             {
-                topk_v -= ck_tile::type_convert<float>(correction_bias[topk_i]);
+                topk_v -= static_cast<float>(correction_bias[topk_i]);
             }
             if(need_renorm)
             {
@@ -1079,7 +1077,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             int topk_i   = final_topk_idx[threadIdx.x];
             if constexpr(isBiased)
             {
-                topk_v -= ck_tile::type_convert<float>(correction_bias[topk_i]);
+                topk_v -= static_cast<float>(correction_bias[topk_i]);
             }
             if(need_renorm)
             {
@@ -1098,15 +1096,15 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     switch(num_experts % 4)                                \
     {                                                      \
     case 0:                                                \
-        using vec4_type = ck_tile::ext_vector_t<float, 4>; \
+        using vec4_type = opus::vector_t<float, 4>; \
         LAUNCHER2(vec4_type)                               \
         break;                                             \
     case 2:                                                \
-        using vec2_type = ck_tile::ext_vector_t<float, 2>; \
+        using vec2_type = opus::vector_t<float, 2>; \
         LAUNCHER2(vec2_type)                               \
         break;                                             \
     default:                                               \
-        using vec1_type = ck_tile::ext_vector_t<float, 1>; \
+        using vec1_type = opus::vector_t<float, 1>; \
         LAUNCHER2(vec1_type)                               \
         break;                                             \
     }
@@ -1233,18 +1231,19 @@ void biased_grouped_topk(torch::Tensor& gating_output,   // [num_tokens, num_exp
     int num_experts     = gating_output.size(1);
     int topk            = topk_ids.size(1);
     size_t stride_tk    = topk_ids.stride(0);
-    TORCH_CHECK(stride_tk == topk_weights.stride(0),
-                "topk_ids.stride(0) == topk_weights.stride(0)");
-    TORCH_CHECK(gating_output.dtype() == correction_bias.dtype(),
-                "gating_output.dtype() == correction_bias.dtype()");
+    TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
+                "topk_grp must be in [1, num_expert_group], but got topk_grp=",
+                topk_grp,
+                ", num_expert_group=",
+                num_expert_group);
 
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
-                        (topk_grp == 4) && (isBiased == true);
+                        (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64);
 
     dim3 grid(num_tokens);
-    dim3 block(64);
+    dim3 block(get_warp_size_func());
     size_t shared_mem_size = (num_experts * sizeof(float) + num_expert_group * sizeof(float));
     shared_mem_size += !use_opt_sort
                            ? 0
@@ -1279,14 +1278,17 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
     int topk             = topk_ids.size(1);
     size_t stride_tk     = topk_ids.stride(0);
     auto correction_bias = topk_ids;
-    TORCH_CHECK(stride_tk == topk_weights.stride(0),
-                "topk_ids.stride(0) == topk_weights.stride(0)");
+    TORCH_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
+                "topk_grp must be in [1, num_expert_group], but got topk_grp=",
+                topk_grp,
+                ", num_expert_group=",
+                num_expert_group);
 
     // TODO: expand usage in the future
     bool use_opt_sort = false;
 
     dim3 grid(num_tokens);
-    dim3 block(64);
+    dim3 block(get_warp_size_func());
     size_t shared_mem_size = (num_experts * sizeof(float) + (num_expert_group + 1) * sizeof(float) +
                               topk * sizeof(int) + topk * sizeof(float) + 255) &
                              ~255;

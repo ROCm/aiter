@@ -95,9 +95,10 @@ def _gemm_a8w8_kernel(
         order=[0, 1],
     )
 
+    mfma_instr_k: gl.constexpr = 128 if FP8_FORMAT is not None else 64
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16],
+        instr_shape=[16, 16, mfma_instr_k],
         transposed=True,
         warps_per_cta=[2, NUM_WARPS // 2],
     )
@@ -373,9 +374,10 @@ def _gemm_a8w8_preshuffled_kernel(
         shape=[BLOCK_SIZE_N // 16, BLOCK_SIZE_K * 16],
     )
 
+    mfma_instr_k: gl.constexpr = 128 if FP8_FORMAT is not None else 64
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16],
+        instr_shape=[16, 16, mfma_instr_k],
         transposed=True,
         warps_per_cta=[1, NUM_WARPS],
     )
