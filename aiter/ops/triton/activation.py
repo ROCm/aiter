@@ -156,9 +156,9 @@ def act_mul(
         group_size = min(256, triton.next_power_of_2(N_half))
         group_size = max(32, group_size)
 
-    scaleN = triton.cdiv(N, group_size)
+    scaleN = triton.cdiv(N_half, group_size)
     dummy_bs = torch.empty(
-        (M, triton.cdiv(N_half, group_size)),
+        (1, 1),
         dtype=torch.float32,
         device=x.device,
     )
