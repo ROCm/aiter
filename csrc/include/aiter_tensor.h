@@ -58,11 +58,8 @@ public:
         size_t nbytes = t.numel_ * AiterDtype_element_size(dtype);
         if(nbytes > 0)
         {
-            int prev_dev;
-            HIP_CALL(hipGetDevice(&prev_dev));
-            HIP_CALL(hipSetDevice(device_id));
+            HipDeviceGuard guard(device_id);
             HIP_CALL(hipMalloc(&t.ptr, nbytes));
-            HIP_CALL(hipSetDevice(prev_dev));
         }
         t.owns_memory_ = true;
         return t;
@@ -75,6 +72,8 @@ public:
                                   hipStream_t stream = nullptr)
     {
         (void)stream; // reserved for future async alloc
+        AITER_CHECK(other != nullptr, __func__, ": other must not be null");
+        AITER_CHECK(other->ndim <= 8, __func__, ": ndim ", other->ndim, " exceeds max 8");
         AiterTensor t;
         t.ndim = other->ndim;
         t.numel_ = other->numel_;
@@ -98,11 +97,8 @@ public:
         size_t nbytes = storage_nelem * AiterDtype_element_size(t.dtype_);
         if(nbytes > 0)
         {
-            int prev_dev;
-            HIP_CALL(hipGetDevice(&prev_dev));
-            HIP_CALL(hipSetDevice(t.device_id));
+            HipDeviceGuard guard(t.device_id);
             HIP_CALL(hipMalloc(&t.ptr, nbytes));
-            HIP_CALL(hipSetDevice(prev_dev));
         }
         t.owns_memory_ = true;
         return t;
