@@ -121,16 +121,27 @@ def gemm_a8w8_bpreshuffle_flydsl(
         ki = kernels_list_flydsl[kernel_id]
         tm, tn, tk = ki.tile_m, ki.tile_n, ki.tile_k
         lds, csh, acp, wpe = (
-            ki.lds_stage, ki.use_cshuffle_epilog,
-            ki.use_async_copy, ki.waves_per_eu,
+            ki.lds_stage,
+            ki.use_cshuffle_epilog,
+            ki.use_async_copy,
+            ki.waves_per_eu,
         )
     else:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
 
     flydsl_preshuffle_gemm_a8(
-        XQ.contiguous(), WQ.contiguous(),
-        x_scale, w_scale, Out,
-        tm, tn, tk, lds, csh, acp, wpe,
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale,
+        w_scale,
+        Out,
+        tm,
+        tn,
+        tk,
+        lds,
+        csh,
+        acp,
+        wpe,
     )
     return Out
 

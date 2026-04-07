@@ -303,8 +303,14 @@ def load_b_raw_w4a16(
     idx_bytes = idx_pack + k2_base
 
     b4 = _buffer_load_vec(
-        buffer_ops, vector, b_rsrc, idx_bytes,
-        elem_type=elem_type, vec_elems=4, elem_bytes=1, offset_in_bytes=True,
+        buffer_ops,
+        vector,
+        b_rsrc,
+        idx_bytes,
+        elem_type=elem_type,
+        vec_elems=4,
+        elem_bytes=1,
+        offset_in_bytes=True,
     )
     packed32 = vector.extract(
         vector.bitcast(T.vec(1, T.i32), b4),
@@ -380,8 +386,14 @@ def load_b_pack_k32(
     if unpack_int4:
         idx_bytes = idx_pack + k2_base
         b4 = _buffer_load_vec(
-            buffer_ops, vector, b_rsrc, idx_bytes,
-            elem_type=elem_type, vec_elems=4, elem_bytes=1, offset_in_bytes=True,
+            buffer_ops,
+            vector,
+            b_rsrc,
+            idx_bytes,
+            elem_type=elem_type,
+            vec_elems=4,
+            elem_bytes=1,
+            offset_in_bytes=True,
         )
         packed32 = vector.extract(
             vector.bitcast(T.vec(1, T.i32), b4),
@@ -407,8 +419,13 @@ def load_b_pack_k32(
 
     vec_elems = kpack_bytes // int(elem_bytes)
     b16 = _buffer_load_vec(
-        buffer_ops, vector, b_rsrc, idx_pack,
-        elem_type=elem_type, vec_elems=vec_elems, elem_bytes=elem_bytes,
+        buffer_ops,
+        vector,
+        b_rsrc,
+        idx_pack,
+        elem_type=elem_type,
+        vec_elems=vec_elems,
+        elem_bytes=elem_bytes,
         offset_in_bytes=(elem_bytes == 1),
     )
 
@@ -461,8 +478,13 @@ def buffer_copy_gmem16_dwordx4(
     if int(vec_elems) <= 0:
         raise ValueError(f"vec_elems must be > 0, got {vec_elems!r}")
     return _buffer_load_vec(
-        buffer_ops, vector, rsrc, idx_i32,
-        elem_type=elem_type, vec_elems=vec_elems, elem_bytes=elem_bytes,
+        buffer_ops,
+        vector,
+        rsrc,
+        idx_i32,
+        elem_type=elem_type,
+        vec_elems=vec_elems,
+        elem_bytes=elem_bytes,
         offset_in_bytes=False,
     )
 

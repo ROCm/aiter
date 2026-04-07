@@ -558,15 +558,28 @@ def flydsl_preshuffle_gemm_a8(
         out_dtype = "fp16"
 
     cache_key = (
-        m, n, k, in_dtype, out_dtype,
-        tile_m, tile_n, tile_k,
-        lds_stage, use_cshuffle_epilog, use_async_copy, wpe,
+        m,
+        n,
+        k,
+        in_dtype,
+        out_dtype,
+        tile_m,
+        tile_n,
+        tile_k,
+        lds_stage,
+        use_cshuffle_epilog,
+        use_async_copy,
+        wpe,
     )
     if cache_key not in _flydsl_kernel_cache:
         try:
             exe = compile_fn(
-                M=m, N=n, K=k,
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                M=m,
+                N=n,
+                K=k,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
                 in_dtype=in_dtype,
                 out_dtype=out_dtype,
                 lds_stage=lds_stage,
@@ -597,7 +610,8 @@ def flydsl_preshuffle_gemm_a8(
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
-        m, n,
+        m,
+        n,
         torch.cuda.current_stream(),
     )
 

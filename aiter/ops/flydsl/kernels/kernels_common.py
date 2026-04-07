@@ -6,7 +6,12 @@ but this module is intentionally small and MLIR-dialect facing.
 
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
-from flydsl._mlir.dialects import arith as _std_arith, builtin, gpu as _gpu, llvm as _llvm
+from flydsl._mlir.dialects import (
+    arith as _std_arith,
+    builtin,
+    gpu as _gpu,
+    llvm as _llvm,
+)
 from flydsl.expr import buffer_ops
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 

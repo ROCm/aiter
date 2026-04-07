@@ -40,6 +40,7 @@ except ImportError:
     def max_lds_bytes_for_tune():
         return 1 << 30
 
+
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 if is_flydsl_available():
@@ -124,9 +125,18 @@ def run_gemm_a8w8_asm(
 def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
     ki = kernels_list_flydsl[kernel_id]
     flydsl_preshuffle_gemm_a8(
-        x, weight_shuffle, x_scale, w_scale, out,
-        ki.tile_m, ki.tile_n, ki.tile_k,
-        ki.lds_stage, ki.use_cshuffle_epilog, ki.use_async_copy, ki.waves_per_eu,
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        ki.lds_stage,
+        ki.use_cshuffle_epilog,
+        ki.use_async_copy,
+        ki.waves_per_eu,
     )
     return out
 
@@ -427,7 +437,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         info_keys,
         seed,
     ):
-        (cu_num, M, N, K, q_dtype_w) = info_keys
+        cu_num, M, N, K, q_dtype_w = info_keys
         q_dtype_eval = eval(q_dtype_w)
         if q_dtype_eval == dtypes.fp8:
             in_dtype = "fp8"

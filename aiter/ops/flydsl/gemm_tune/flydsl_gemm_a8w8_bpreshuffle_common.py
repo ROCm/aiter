@@ -12,14 +12,19 @@ def get_gfx():
         return env.split(";")[-1].strip()
     try:
         import sys
+
         this_dir = os.path.dirname(os.path.abspath(__file__))
-        jit_utils = os.path.abspath(os.path.join(this_dir, "..", "aiter", "jit", "utils"))
+        jit_utils = os.path.abspath(
+            os.path.join(this_dir, "..", "aiter", "jit", "utils")
+        )
         if jit_utils not in sys.path:
             sys.path.insert(0, jit_utils)
         from chip_info import get_gfx as _get_gfx
+
         return _get_gfx()
     except Exception:
         return "gfx942"
+
 
 _DTYPE_SHORT = {
     "fp8": "F8",
@@ -34,46 +39,69 @@ class kernelInstance:
     tile_m: int
     tile_n: int
     tile_k: int
-    q_dtype_a: str          # "fp8" | "int8"
-    q_dtype_w: str          # "fp8" | "int8"
-    dtype: str              # output dtype: "bf16" | "fp16"
-    lds_stage: int          # 1 or 2
+    q_dtype_a: str  # "fp8" | "int8"
+    q_dtype_w: str  # "fp8" | "int8"
+    dtype: str  # output dtype: "bf16" | "fp16"
+    lds_stage: int  # 1 or 2
     use_cshuffle_epilog: int  # 0 or 1
-    use_async_copy: int       # 0 or 1
-    waves_per_eu: int         # 0=no hint, 1-4=occupancy limit
-    sScheduler: str           # "Default"
+    use_async_copy: int  # 0 or 1
+    waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
+    sScheduler: str  # "Default"
 
     @property
     def name(self) -> str:
         qa = _DTYPE_SHORT.get(self.q_dtype_a, self.q_dtype_a.upper())
         qw = _DTYPE_SHORT.get(self.q_dtype_w, self.q_dtype_w.upper())
         dt = _DTYPE_SHORT.get(self.dtype, self.dtype.upper())
-        return "_".join([
-            "flydsl",
-            "bpreshuflle",
-            "x".join(map(str, [self.tile_m, self.tile_n, self.tile_k])),
-            qa,
-            qw,
-            dt,
-            "x".join(map(str, [
-                self.lds_stage,
-                self.use_cshuffle_epilog,
-                self.use_async_copy,
-                self.waves_per_eu,
-            ])),
-            self.sScheduler.lower(),
-        ])
+        return "_".join(
+            [
+                "flydsl",
+                "bpreshuflle",
+                "x".join(map(str, [self.tile_m, self.tile_n, self.tile_k])),
+                qa,
+                qw,
+                dt,
+                "x".join(
+                    map(
+                        str,
+                        [
+                            self.lds_stage,
+                            self.use_cshuffle_epilog,
+                            self.use_async_copy,
+                            self.waves_per_eu,
+                        ],
+                    )
+                ),
+                self.sScheduler.lower(),
+            ]
+        )
 
 
-def _ki(tile_m, tile_n, tile_k, lds_stage,
-        cshuffle=0, async_copy=0, waves_per_eu=0,
-        scheduler="Default",
-        q_dtype_a="fp8", q_dtype_w="fp8", dtype="bf16"):
+def _ki(
+    tile_m,
+    tile_n,
+    tile_k,
+    lds_stage,
+    cshuffle=0,
+    async_copy=0,
+    waves_per_eu=0,
+    scheduler="Default",
+    q_dtype_a="fp8",
+    q_dtype_w="fp8",
+    dtype="bf16",
+):
     return kernelInstance(
-        tile_m, tile_n, tile_k,
-        q_dtype_a, q_dtype_w, dtype,
-        lds_stage, cshuffle, async_copy,
-        waves_per_eu, scheduler,
+        tile_m,
+        tile_n,
+        tile_k,
+        q_dtype_a,
+        q_dtype_w,
+        dtype,
+        lds_stage,
+        cshuffle,
+        async_copy,
+        waves_per_eu,
+        scheduler,
     )
 
 
@@ -112,9 +140,7 @@ def preshuffle_gemm_estimated_lds_bytes(
     tile_k_bytes = int(tile_k) * elem_bytes
     lds_tile_bytes = int(tile_m) * tile_k_bytes // a_elem_vec_pack
     # Epilogue staging in LDS is fp16/bf16-sized (2 bytes per element).
-    lds_out_bytes = (
-        2 * int(tile_m) * int(tile_n) if int(use_cshuffle_epilog) else 0
-    )
+    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if int(use_cshuffle_epilog) else 0
 
     ptr_pong = 0
     ptr_ping = 0
@@ -128,9 +154,7 @@ def preshuffle_gemm_estimated_lds_bytes(
         ptr_ping = _smem_align(ptr_ping) + bsz
     else:
         lds_total_bytes = max(lds_tile_bytes, lds_out_bytes)
-        lds_total_elems = (
-            lds_total_bytes if elem_bytes == 1 else lds_total_bytes // 2
-        )
+        lds_total_elems = lds_total_bytes if elem_bytes == 1 else lds_total_bytes // 2
         ptr_pong = _smem_align(ptr_pong) + lds_total_elems * elem_bytes
 
     return _smem_finalize_size(ptr_pong) + _smem_finalize_size(ptr_ping)
@@ -294,20 +318,20 @@ kernels_list_950 = _build_kernels_list(
 # fmt: on
 
 default_kernels_dict_942 = {
-    (-1): _ki(128,  128,    128,    2, 0, 0, 2, "Default"),
-    (-2): _ki(16,   64,     512,    2, 0, 0, 2, "Default"),
-    (-3): _ki(32,   64,     512,    2, 0, 0, 2, "Default"),
-    (-4): _ki(64,   256,    64,     2, 0, 0, 2, "Default"),
-    (-5): _ki(128,  128,    64,     2, 0, 0, 2, "Default"),
-    (-6): _ki(128,  64,     128,    2, 0, 0, 2, "Default"),
-    (-7): _ki(64,   256,    128,    2, 0, 0, 2, "Default"),
+    (-1): _ki(128, 128, 128, 2, 0, 0, 2, "Default"),
+    (-2): _ki(16, 64, 512, 2, 0, 0, 2, "Default"),
+    (-3): _ki(32, 64, 512, 2, 0, 0, 2, "Default"),
+    (-4): _ki(64, 256, 64, 2, 0, 0, 2, "Default"),
+    (-5): _ki(128, 128, 64, 2, 0, 0, 2, "Default"),
+    (-6): _ki(128, 64, 128, 2, 0, 0, 2, "Default"),
+    (-7): _ki(64, 256, 128, 2, 0, 0, 2, "Default"),
 }
 
 default_kernels_dict_950 = {
-    (-1): _ki(128,  256,    256,    2, 0, 0, 2, "Default"),
-    (-2): _ki(16,   64,     512,    2, 0, 0, 2, "Default"),
-    (-3): _ki(32,   64,     512,    2, 0, 0, 2, "Default"),
-    (-4): _ki(128,  128,    128,    2, 0, 0, 2, "Default"),
+    (-1): _ki(128, 256, 256, 2, 0, 0, 2, "Default"),
+    (-2): _ki(16, 64, 512, 2, 0, 0, 2, "Default"),
+    (-3): _ki(32, 64, 512, 2, 0, 0, 2, "Default"),
+    (-4): _ki(128, 128, 128, 2, 0, 0, 2, "Default"),
 }
 
 arch = get_gfx()

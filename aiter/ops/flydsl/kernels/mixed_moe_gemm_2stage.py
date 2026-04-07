@@ -407,9 +407,7 @@ def compile_mixed_moe_gemm1(
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
             n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
             k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
-            size_expert_ids_in = arith.index_cast(
-                T.index, i32_size_expert_ids_in
-            )
+            size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
 
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
             f32 = T.f32
@@ -2575,9 +2573,7 @@ def compile_mixed_moe_gemm2(
             tokens_in = arith.index_cast(ir.IndexType.get(), i32_tokens_in.ir_value())
             n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
             k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
-            size_expert_ids_in = arith.index_cast(
-                T.index, i32_size_expert_ids_in
-            )
+            size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
             x_elem = T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
             # For int4, weights are stored as packed bytes (i8) and unpacked to i8 packs.
             f32 = T.f32
