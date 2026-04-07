@@ -12,12 +12,6 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 from aiter.ops.triton.gluon.unified_attention_3d import (
     _unified_attention_gluon_kernel_3d,
 )
-from aiter.ops.triton.gluon.unified_attention_3d_unroll2 import (
-    _unified_attention_gluon_kernel_3d_unroll2,
-)
-from aiter.ops.triton.gluon.unified_attention_3d_unroll2_simple import (
-    _unified_attention_gluon_kernel_3d_unroll2_simple,
-)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
