@@ -13,7 +13,7 @@ import torch
 
 from aiter import dtypes
 from aiter import per_tensor_quant
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.jit.utils.chip_info import get_gfx
 
 from typing import Tuple, Optional
@@ -29,28 +29,25 @@ torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 
-def calculate_pass_rate(df):
-    if "acc result" not in df.columns:
+def _print_pass_rate(df, column, label):
+    if column not in df.columns:
         return
-
-    num_tests = df["acc result"].value_counts().sum()
-    if "passed" in df["acc result"].value_counts():
-        num_passed = df["acc result"].value_counts()["passed"]
-    else:
-        num_passed = 0
-    if "warning" in df["acc result"].value_counts():
-        num_warning = df["acc result"].value_counts()["warning"]
-    else:
-        num_warning = 0
-    if "failed" in df["acc result"].value_counts():
-        num_failed = df["acc result"].value_counts()["failed"]
-    else:
-        num_failed = 0
+    counts = df[column].value_counts()
+    num_tests = counts.sum()
+    num_passed = counts.get("passed", 0)
+    num_warning = counts.get("warning", 0)
+    num_failed = counts.get("failed", 0)
     aiter.logger.info(
-        f"\033[32mpassed {num_passed}/{num_tests}({num_passed / num_tests * 100:.2f}%) \
-        \033[33mwarning {num_warning}/{num_tests}({num_warning / num_tests * 100:.2f}%) \
-        \033[31mfailed {num_failed}/{num_tests}({num_failed / num_tests * 100:.2f}%) \033[0m"
+        f"{label}: "
+        f"\033[32mpassed {num_passed}/{num_tests}({num_passed / num_tests * 100:.2f}%) "
+        f"\033[33mwarning {num_warning}/{num_tests}({num_warning / num_tests * 100:.2f}%) "
+        f"\033[31mfailed {num_failed}/{num_tests}({num_failed / num_tests * 100:.2f}%) \033[0m"
     )
+
+
+def calculate_pass_rate(df):
+    _print_pass_rate(df, "acc result", "Output")
+    _print_pass_rate(df, "lse result", "LSE")
 
 
 def ref_masked_attention(
@@ -152,7 +149,7 @@ def torch_mla_extend(
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
-    lse = torch.concat(lses).transpose(0, 1)
+    lse = torch.concat(lses, dim=1)  # [nhead, total_q]
     return o, lse
 
 
@@ -219,7 +216,7 @@ def run_aiter_mla_reduce(
         output,
         final_lse,
     )
-    return output, attn_lse
+    return output, final_lse
 
 
 @benchmark()
@@ -389,58 +386,60 @@ def test_mla_prefill(
 
     output = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
 
+    # Always run two-phase (asm + reduce) to get both output and final_lse
+    # for LSE validation, regardless of profile_ps.
+    total_s, nhead, _ = output.shape
+    tile_q = 256
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+
+    out_mla_prefill_asm, us_mla_prefill_asm = run_aiter_mla_prefill_asm(
+        q_quant,
+        k_quant,
+        v_quant,
+        output,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        work_indptr,
+        work_info,
+        max_qlen,
+        is_causal,
+        softmax_scale,
+        logits,
+        attn_lse,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
+    output, logits, attn_lse = out_mla_prefill_asm
+
+    out_reduce, us_reduce = run_aiter_mla_reduce(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        tile_q,
+        output,
+        final_lse,
+    )
+    output, final_lse = out_reduce
+    output = output.view(total_s, nhead, v_head_dim)
+
+    us_mla_prefill_ps = us_mla_prefill_asm + us_reduce
+    ret["us_mla_prefill_ps"] = us_mla_prefill_ps
+
     if profile_ps:
-        # pre-allocate final and partial output & lse
-        total_s, nhead, v_head_dim = output.shape
-
-        tile_q = 256
-        logits = torch.empty(
-            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
-            dtype=dtypes.fp32,
-            device=device,
-        )
-        attn_lse = torch.empty(
-            (reduce_partial_map.size(0) * tile_q, nhead),
-            dtype=dtypes.fp32,
-            device=device,
-        )
-        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
-
-        out_mla_prefill_asm, us_mla_prefill_asm = run_aiter_mla_prefill_asm(
-            q_quant,
-            k_quant,
-            v_quant,
-            output,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            work_indptr,
-            work_info,
-            max_qlen,
-            is_causal,
-            softmax_scale,
-            logits,
-            attn_lse,
-            q_scale,
-            k_scale,
-            v_scale,
-        )
-        output, logits, attn_lse = out_mla_prefill_asm
-
-        out_reduce, us_reduce = run_aiter_mla_reduce(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            tile_q,
-            output,
-            final_lse,
-        )
-        output, final_lse = out_reduce
-        output = output.view(total_s, nhead, v_head_dim)
-
-        us_mla_prefill_ps = us_mla_prefill_asm + us_reduce
         # calculate mla_prefill_ps kernel tflops
         # for causal, only take the lower triangle(ops/2)
         g_div = 2 if is_causal else 1
@@ -505,30 +504,6 @@ def test_mla_prefill(
         ret["us_reduce"] = us_reduce
         ret["us_reduce_ratio"] = us_reduce / us_mla_prefill_ps
         ret["bw_reduce(TB/s)"] = bw_reduce if effective_final_tiles > 0 else 0
-    else:
-        _, us_aiter_asm = run_perftest(
-            aiter.mla.mla_prefill_ps_fwd,
-            q_quant,
-            k_quant,
-            v_quant,
-            output,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            work_indptr,
-            work_info,
-            max_qlen,
-            is_causal,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            softmax_scale,
-            q_scale,
-            k_scale,
-            v_scale,
-        )
-
-        ret["us_mla_prefill_ps"] = us_aiter_asm
 
     if not skip_reference:
         # TODO: optimize reference implementation(too slow for large context length)
@@ -561,6 +536,42 @@ def test_mla_prefill(
             status = "failed"
         ret["err fp8"] = err
         ret["acc result"] = status
+
+        # LSE validation: final_lse [total_q, nhead] vs lse_ref [nhead, total_q]
+        # Transpose final_lse to [nhead, total_q] for comparison.
+        asm_lse = final_lse.transpose(0, 1)  # [nhead, total_q]
+        valid_mask = lse_ref.isfinite()
+        if valid_mask.any():
+            asm_lse_valid = asm_lse[valid_mask]
+            ref_lse_valid = lse_ref[valid_mask]
+            lse_err = checkAllclose(
+                ref_lse_valid,
+                asm_lse_valid,
+                rtol=5e-2,
+                atol=5e-2,
+                msg="mla_prefill_lse   [torch vs aiter_asm]: us......",
+            )
+            if lse_err == 0:
+                lse_status = "passed"
+            elif 0 < lse_err <= 0.05:
+                lse_status = "warning"
+            else:
+                lse_status = "failed"
+        else:
+            lse_err = 0
+            lse_status = "passed"
+        ret["err lse"] = lse_err
+        ret["lse result"] = lse_status
+
+        # Detailed LSE stats for debugging
+        if valid_mask.any():
+            lse_diff = (asm_lse_valid - ref_lse_valid).abs()
+            ret["lse max_abs_diff"] = lse_diff.max().item()
+            ret["lse mean_abs_diff"] = lse_diff.mean().item()
+            lse_denom = ref_lse_valid.abs().clamp(min=1e-6)
+            lse_rel = lse_diff / lse_denom
+            ret["lse max_rel_err"] = lse_rel.max().item()
+            ret["lse mean_rel_err"] = lse_rel.mean().item()
 
     return ret
 
