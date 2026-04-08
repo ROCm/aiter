@@ -264,12 +264,21 @@ def run_hip(
     quant_out_dtype: torch.dtype,
 ):
     m, n1 = x1.shape
+    num_scale_cols = n1 // group_size
     if quant_out_dtype == dtypes.fp8:
         x1_q = torch.empty((m, n1), dtype=dtypes.fp8, device=x1.device)
-        x1_s = torch.empty((m, n1 // group_size), dtype=torch.float32, device=x1.device)
+        if transpose_scale:
+            # Match Triton's transposed-storage convention while keeping the public shape [m, g].
+            x1_s = torch.empty(
+                (num_scale_cols, m), dtype=torch.float32, device=x1.device
+            ).view(m, num_scale_cols)
+        else:
+            x1_s = torch.empty(
+                (m, num_scale_cols), dtype=torch.float32, device=x1.device
+            )
     elif quant_out_dtype == dtypes.fp4x2:
         x1_q = torch.empty((m, n1 // 2), dtype=dtypes.fp4x2, device=x1.device)
-        x1_s = torch.empty((m, n1 // group_size), dtype=torch.uint8, device=x1.device)
+        x1_s = torch.empty((m, num_scale_cols), dtype=torch.uint8, device=x1.device)
     else:
         raise ValueError(f"Unsupported quant_out_dtype={quant_out_dtype}")
     x1_u = torch.empty_like(x1) if output_unquantized_inp1 else None
@@ -400,25 +409,27 @@ def test_fused_qk_rmsnorm_group_quant(
         assert n2 % group_size == 0
         assert n2 % head_dim == 0
 
-    # Build tensors in [token, num_head, head_dim] and merge to [token, num_head*head_dim].
-    x1 = (
-        torch.randn((m, num_head1, head_dim), dtype=dtype, device="cuda")
-        .reshape(m, n1)
-        .contiguous()
-        / 10
-    )
+    # Build strided x1/x2 by splitting one full tensor, mirroring model flow:
+    # q_c, kv_c, _ = torch.split(full, [n1, n2, tail], dim=-1)
+    split_tail_dim = head_dim
+    if n2 > 0:
+        full_qk = (
+            torch.randn((m, n1 + n2 + split_tail_dim), dtype=dtype, device="cuda") / 10
+        )
+        x1, x2, _ = torch.split(full_qk, [n1, n2, split_tail_dim], dim=1)
+    else:
+        full_q = torch.randn((m, n1 + split_tail_dim), dtype=dtype, device="cuda") / 10
+        x1, _ = torch.split(full_q, [n1, split_tail_dim], dim=1)
+        x2 = None
+    assert x1.stride(1) == 1 and x1.stride(0) >= n1 and not x1.is_contiguous()
+    if n2 > 0:
+        assert x2 is not None
+        assert x2.stride(1) == 1 and x2.stride(0) >= n2 and not x2.is_contiguous()
+
     x1_weight = (
         torch.randn((num_head1, head_dim), dtype=dtype, device="cuda")
         .reshape(n1)
         .contiguous()
-    )
-    x2 = (
-        torch.randn((m, num_head2, head_dim), dtype=dtype, device="cuda")
-        .reshape(m, n2)
-        .contiguous()
-        / 10
-        if n2 > 0
-        else None
     )
     x2_weight = (
         torch.randn((num_head2, head_dim), dtype=dtype, device="cuda")
@@ -427,14 +438,14 @@ def test_fused_qk_rmsnorm_group_quant(
         if n2 > 0
         else None
     )
-    res1 = (
-        torch.randn((m, num_head1, head_dim), dtype=dtype, device="cuda")
-        .reshape(m, n1)
-        .contiguous()
-        / 10
-        if add_residual
-        else None
-    )
+    if add_residual:
+        full_res = (
+            torch.randn((m, n1 + split_tail_dim), dtype=dtype, device="cuda") / 10
+        )
+        res1, _ = torch.split(full_res, [n1, split_tail_dim], dim=1)
+        assert res1.stride(1) == 1 and res1.stride(0) >= n1 and not res1.is_contiguous()
+    else:
+        res1 = None
 
     torch_out = run_torch_ref(
         x1,
@@ -796,7 +807,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--broad_sweep",
         action="store_true",
-        help="Use broader stress matrix (num_head1=[1,12,56], num_head2=[0,1,4], residual=[0,1]).",
+        help="Expand the default head/residual test matrix for broader stress/perf sweep "
+        "(num_head1=[1,12,56], num_head2=[0,1,4], residual=[0,1]).",
     )
     parser.add_argument(
         "-m",
