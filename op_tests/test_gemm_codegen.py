@@ -51,7 +51,8 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
 )
 
 # GPU targets used throughout this test.  cu_num values match GFX_CU_NUM_MAP
-# in aiter/jit/utils/chip_info.py — update here if that mapping changes.
+# in aiter/jit/utils/build_targets.py (re-exported via chip_info.py) — update
+# here if that mapping changes.
 TARGET_A = ("gfx942", 304)  # MI300X
 TARGET_B = ("gfx950", 256)  # MI350
 TARGET_C = ("gfx942", 80)  # MI308X — gfx942 with CU_NUM override
