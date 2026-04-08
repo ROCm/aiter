@@ -12,9 +12,6 @@ Usage:
     # Compile all unique FlyDSL kernels from CSV
     python -m aiter.aot.moe
 
-    # Only compile stage1 kernels
-    python -m aiter.aot.moe --stage 1
-
     # Compile and run kernels on GPU (triggers real compilation + cache write)
     python -m aiter.aot.moe --run_kernel
 
@@ -542,13 +539,6 @@ def main():
         help="Path to the tuned CSV config file",
     )
     parser.add_argument(
-        "--stage",
-        type=int,
-        default=0,
-        choices=[0, 1, 2],
-        help="Only compile specific stage (0=both, 1=stage1, 2=stage2)",
-    )
-    parser.add_argument(
         "--run_kernel",
         action="store_true",
         help="After compilation, launch each kernel with random data to verify it runs",
@@ -569,9 +559,6 @@ def main():
     arch = os.environ.get("ARCH", "(auto-detect)")
 
     all_jobs = parse_csv(csv_path)
-
-    if args.stage != 0:
-        all_jobs = [j for j in all_jobs if j["stage"] == args.stage]
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
