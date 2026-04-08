@@ -15,7 +15,7 @@ from ..jit.core import (
     AITER_LOG_TUNED_CONFIG,
     compile_ops,
 )
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -607,7 +607,7 @@ def gemm_a8w8_blockscale(
     n = WQ.shape[0]
     k = XQ.shape[1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:

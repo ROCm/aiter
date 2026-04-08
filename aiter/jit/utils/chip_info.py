@@ -10,7 +10,6 @@ from torch_guard import torch_compile_guard
 
 from build_targets import (  # noqa: F401 — re-exported for callers
     GFX_MAP,
-    GFX_CU_NUM_MAP,
     filter_tune_df,
     get_build_targets_env,
 )
@@ -28,8 +27,9 @@ def _detect_native() -> list[str]:
             check=True,
         )
         for line in result.stdout.splitlines():
-            if "gfx" in line.lower():
-                return [line.split(":", 1)[-1].strip()]
+            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+            if match:
+                return [match.group(1).lower()]
     except Exception as e:
         raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
     raise RuntimeError("No gfx arch found in rocminfo output.")
@@ -44,29 +44,12 @@ def get_gfx_custom_op() -> int:
 def get_gfx_custom_op_core() -> int:
     gfx = os.getenv("GPU_ARCHS", "native")
     gfx_mapping = {v: k for k, v in GFX_MAP.items()}
-    # gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
-        try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            for line in output.split("\n"):
-                match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
-                if match:
-                    gfx_arch = match.group(1).lower()
-                    try:
-                        return gfx_mapping[gfx_arch]
-                    except KeyError:
-                        raise KeyError(
-                            f"Unknown GPU architecture: {gfx_arch}. "
-                            f"Supported architectures: {list(gfx_mapping.keys())}"
-                        )
-
-        except Exception as e:
-            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
+        gfx = _detect_native()[0]
     elif ";" in gfx:
+        # TODO: multi-arch GPU_ARCHS (e.g. "gfx942;gfx950") — picking the
+        # last entry is a known limitation for build-time codegen callers.
+        # For runtime dispatch, prefer get_gfx_runtime().
         gfx = gfx.split(";")[-1]
     try:
         return gfx_mapping[gfx]
@@ -81,6 +64,25 @@ def get_gfx_custom_op_core() -> int:
 def get_gfx():
     gfx_num = get_gfx_custom_op()
     return GFX_MAP.get(gfx_num, "unknown")
+
+
+@functools.lru_cache(maxsize=1)
+def get_gfx_runtime() -> str:
+    """Return the arch of the live GPU, always via rocminfo.
+
+    Unlike get_gfx(), ignores GPU_ARCHS — always detects the actual running
+    GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
+    code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
+    csrc module-level arch selection) where no GPU may be available.
+    """
+    gfx_arch = _detect_native()[0]
+    supported = set(GFX_MAP.values())
+    if gfx_arch not in supported:
+        raise KeyError(
+            f"Unknown GPU architecture: {gfx_arch}. "
+            f"Supported architectures: {sorted(supported)}"
+        )
+    return gfx_arch
 
 
 @functools.lru_cache(maxsize=1)
@@ -138,19 +140,25 @@ def get_build_targets() -> list[tuple[str, int]]:
     to exactly the right set of kernels for the target GPU(s).
 
     Priority:
-      1. GPU_ARCHS env var set → delegates to get_build_targets_env() (no GPU needed).
-      2. Live GPU detected → use actual (gfx, cu_num) from rocminfo, which
-         correctly reflects partition mode and binned variants.
+      1. GPU_ARCHS set to an explicit non-empty target list → delegate to
+         get_build_targets_env() (no GPU needed).
+      2. GPU_ARCHS unset, empty/whitespace, or "native" → detect the live GPU
+         and use actual (gfx, cu_num) from rocminfo, which correctly reflects
+         partition mode and binned variants.
       3. Neither → raise RuntimeError with a clear message.
     """
-    if os.getenv("GPU_ARCHS"):
+    gpu_archs = os.getenv("GPU_ARCHS")
+    gpu_archs_normalized = gpu_archs.strip() if gpu_archs is not None else ""
+    if gpu_archs_normalized and gpu_archs_normalized.lower() != "native":
         return get_build_targets_env()
 
     try:
+        # get_gfx() is intentional here — this is a build-time path; get_gfx_runtime()
+        # would fail in CI environments without a live GPU.
         return [(get_gfx(), get_cu_num())]
     except Exception as e:
         raise RuntimeError(
-            "No GPU detected and GPU_ARCHS is not set. "
+            "No GPU detected and GPU_ARCHS is not set to an explicit target. "
             "Set GPU_ARCHS=gfx942 (or similar) to build without a GPU."
         ) from e
 

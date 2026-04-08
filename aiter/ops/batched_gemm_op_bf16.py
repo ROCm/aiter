@@ -12,7 +12,7 @@ from ..jit.core import (
     AITER_LOG_TUNED_CONFIG,
 )
 from ..utility import dtypes
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from aiter import logger
 
 
