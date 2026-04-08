@@ -1094,14 +1094,13 @@ def _mla_decode_fwd_kernel(
 
         S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
         kv_lora = pgm.tdm_shared_load_kv_lora(1, buffer_id)
-        S = pgm.compute_qk_lora(kv_lora, S)  # old
+        S = pgm.compute_qk_lora(kv_lora, S)
 
         next_buffer_id = pgm.get_next_buffer_id(buffer_id)
         row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
         pgm.tdm_load_global_to_shared_kv_lora(row_offsets, next_buffer_id)
         pgm.tdm_load_global_to_shared_k_rope(row_offsets, next_buffer_id)
 
-        # S = pgm.compute_qk_lora(kv_lora, S) # _old_ver1
         k_rope = pgm.tdm_shared_load_k_rope(2, buffer_id)
         S = pgm.compute_qk_rope(k_rope, S)
         S = S * qk_factor
