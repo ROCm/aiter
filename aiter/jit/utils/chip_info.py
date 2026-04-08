@@ -6,8 +6,6 @@ import os
 import re
 import subprocess
 
-logger = logging.getLogger("aiter")
-
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
@@ -16,6 +14,8 @@ from build_targets import (  # noqa: F401 — re-exported for callers
     filter_tune_df,
     get_build_targets_env,
 )
+
+logger = logging.getLogger("aiter")
 
 
 @functools.lru_cache(maxsize=1)
