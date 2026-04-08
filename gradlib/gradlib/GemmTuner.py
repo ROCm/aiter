@@ -33,6 +33,15 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
+try:
+    from aiter.ops.flydsl.gemm_kernels import (
+        flydsl_hgemm,
+        get_flydsl_splitk_hgemm_kernels,
+    )
+    _FLYDSL_AVAILABLE = True
+except ImportError:
+    _FLYDSL_AVAILABLE = False
+
 
 @lru_cache(maxsize=1)
 def init_hipblas():
@@ -75,6 +84,14 @@ def run_gemm_bf16_asm(
 
 def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
+
+
+def run_flydsl_hgemm(inp, weight, bias, params):
+    """Execute a single FlyDSL HGEMM configuration and optional bias add."""
+    out = flydsl_hgemm(inp, weight, auto_shuffle_b=True, **params)
+    if bias is not None:
+        out = out + bias
+    return out
 
 
 @functools.lru_cache(maxsize=1024)
@@ -436,6 +453,8 @@ class Gemm:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
             tasks.extend(self.asm_gemm_all_solutions())
+        if "all" in self.libtype or "flydsl" in self.libtype:
+            tasks.extend(self.flydsl_gemm_all_solutions())
         solutions = len(tasks)
         in_data = [
             (
@@ -506,6 +525,96 @@ class Gemm:
             )
         )
         return task
+
+    def flydsl_gemm_all_solutions(self):
+        if not _FLYDSL_AVAILABLE:
+            logger.warning("FlyDSL not available — skipping FlyDSL candidates")
+            return []
+        # FlyDSL HGEMM supports bf16→bf16 and f16→f16 only; no fp8, no scaleAB.
+        if self.scaleAB or self.indtype not in (dtypes.bf16, dtypes.f16) or self.outdtype != self.indtype:
+            logger.warning(
+                f"FlyDSL HGEMM requires indtype==outdtype in {{bf16, f16}} and no scaleAB; "
+                f"skipping for indtype={self.indtype} outdtype={self.outdtype} scaleAB={self.scaleAB}"
+            )
+            return []
+        all_kernels = get_flydsl_splitk_hgemm_kernels(
+            dtype=self.indtype, out_dtype=self.outdtype
+        )
+        m, n, k = self.m, self.n, self.k
+        tasks = []
+        skipped = 0
+        for params in all_kernels:
+            tile_m = params["tile_m"]
+            tile_n = params["tile_n"]
+            tile_k = params["tile_k"]
+            split_k = params["split_k"]
+            # b_to_lds=True raises NotImplementedError in the kernel compiler.
+            if params.get("b_to_lds", False):
+                skipped += 1
+                continue
+            # Dimension alignment checks (mirrors _validate_hgemm_tiling constraints).
+            if n % tile_n != 0 or n < tile_n:
+                skipped += 1
+                continue
+            if k % split_k != 0:
+                skipped += 1
+                continue
+            k_per_split = k // split_k
+            if k_per_split < tile_k or k_per_split % tile_k != 0:
+                skipped += 1
+                continue
+            # LDG_REG_A_COUNT = (tile_m * tile_k) // 8 // 256 must be >= 1
+            if (tile_m * tile_k) // 8 // 256 < 1:
+                skipped += 1
+                continue
+            info = (
+                (
+                    m, n, k,
+                    False if self.bias is None else True,
+                    str(self.indtype),
+                    str(self.outdtype),
+                    self.scaleAB,
+                    self.is_shuffle,
+                ),
+                0,       # solidx (no numeric index for FlyDSL)
+                split_k, # reuse splitK slot for split_k
+                "flydsl",
+                str(params),
+            )
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (
+                        m, n, k,
+                        self.indtype,
+                        self.outdtype,
+                        self.scaleAB,
+                        self.is_shuffle,
+                        0,
+                        True if self.bias is not None else False,
+                    ),
+                    run_flydsl_hgemm,
+                    # indices 0→inp, 1→weights (N,K), 3→bias
+                    ([0, 1, 3], params),
+                    {
+                        "num_warmup": self.num_warmup,
+                        "num_iters": 101,
+                    },
+                    get_gemm_ref,
+                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                    {},
+                    None,
+                    self.rtol,
+                    self.atol,
+                )
+            )
+        print(
+            f"FlyDSL: {len(tasks)} valid candidates, {skipped} skipped "
+            f"(M={m} N={n} K={k})",
+            flush=True,
+        )
+        return tasks
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
         coldi = 50
@@ -662,7 +771,7 @@ class Gemm:
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "hipblaslt", "triton"]:
+        if value not in ["all", "asm", "hipblaslt", "triton", "flydsl"]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 
@@ -720,7 +829,7 @@ class GemmTuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton']",
+            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl']",
         )
 
     def __init__(
