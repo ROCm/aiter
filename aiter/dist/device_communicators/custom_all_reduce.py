@@ -28,7 +28,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
-from aiter.utility.dtypes import fp8, _torch_to_aiter_dtype, torch_to_aiter_pybind
+from aiter.utility.dtypes import fp8
 
 try:
     ops.meta_size()
@@ -44,9 +44,6 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
-
-
-_torch_to_aiter = torch_to_aiter_pybind
 
 
 class IPCBuffer:
@@ -475,8 +472,8 @@ class CustomAllreduce:
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
         ops.all_reduce(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             use_new,
             open_fp8_quant,
             reg_inp,
@@ -526,8 +523,8 @@ class CustomAllreduce:
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             reg,
             reg_bytes,
         )
@@ -565,8 +562,8 @@ class CustomAllreduce:
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         ops.all_gather_reg(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             dim,
         )
         return out
@@ -583,9 +580,9 @@ class CustomAllreduce:
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         ops.all_gather_unreg(
             self._ptr,
-            _torch_to_aiter(inp),
+            inp,
             self._pool["input"].data_ptr,
-            _torch_to_aiter(out),
+            out,
             self._pool["input"].max_size,
             dim,
         )
@@ -627,11 +624,11 @@ class CustomAllreduce:
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             ops.fused_allreduce_rmsnorm(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
@@ -648,12 +645,12 @@ class CustomAllreduce:
                 )
             ops.fused_allreduce_rmsnorm_quant(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(scale_out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                scale_out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
