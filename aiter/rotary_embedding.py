@@ -1169,6 +1169,46 @@ class MRotaryEmbedding(RotaryEmbedding):
         ]
 
 
+class ProportionalRotaryEmbedding(RotaryEmbedding):
+    """Gemma4-style proportional RoPE.
+
+    Frequency exponents use head_size (not rotary_dim) as the denominator.
+    Non-rotated dims are zero-padded so cos=1, sin=0 (identity rotation).
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        self.rope_angles = rotary_dim // 2
+        self.nope_angles = (head_size // 2) - self.rope_angles
+        super().__init__(
+            head_size,
+            head_size,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+        )
+
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        freq_exponents = (
+            torch.arange(0, 2 * self.rope_angles, 2, dtype=dtypes.fp32)
+            / self.head_size
+        )
+        inv_freq = 1.0 / (base**freq_exponents)
+        if self.nope_angles > 0:
+            inv_freq = torch.cat(
+                [inv_freq, torch.zeros(self.nope_angles, dtype=dtypes.fp32)]
+            )
+        return inv_freq
+
+
 @dataclass
 class AiterFusedSetKVBufferArg:
     kv_cache: Tuple[torch.Tensor, torch.Tensor]
@@ -1933,6 +1973,15 @@ def get_rope(
                 is_neox_style,
                 dtype,
                 mrope_section=rope_scaling["mrope_section"],
+            )
+        elif scaling_type == "proportional":
+            rotary_emb = ProportionalRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
