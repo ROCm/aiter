@@ -568,16 +568,24 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             )
 
     # ---- Inline-asm prefetch: fully opaque to LLVM waitcnt analysis ----
-    def _prefetch_k_tile_asm(p_lds_kv_warp_i32, row_i32, col_base_i32, block_idx_const):
+    def _prefetch_k_tile_asm(
+        p_lds_kv_warp_i32,
+        row_i32,
+        col_base_i32,
+        block_idx_const,
+        check_boundary=True,
+    ):
         """Prefetch one KV block via inline asm buffer_load_dword lds.
 
         Uses inline asm for BOTH the normal load AND the OOB zero-write
         so LLVM sees no LDS operations and won't insert spurious
         s_waitcnt vmcnt(0) before subsequent ds_read ops.
 
-        Per-lane OOB check (row_i32 == -1): scf.IfOp for branching,
-        but both branches use inline asm for LDS operations so LLVM
-        can't see them.
+        check_boundary: controls OOB row==-1 check.
+          - False (Python): skips check entirely -- caller guarantees valid row.
+          - True (Python): always emits scf.IfOp(row==-1).
+          - ir.Value (i1): emits scf.IfOp(check_boundary AND row==-1),
+            allowing runtime bypass.
         """
         lds_warp_offset = block_idx_const * KV_BLOCK_BYTES
         lds_base_i32 = _std_arith.AddIOp(
@@ -589,34 +597,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             ),
         ).result
 
-        neg_one = _raw(arith.constant(-1, type=T.i32))
-        is_oob = _std_arith.CmpIOp(CmpIPredicate.eq, _raw(row_i32), neg_one).result
-
-        if_op = scf.IfOp(is_oob, [], has_else=True)
-        with ir.InsertionPoint(if_op.regions[0].blocks[0]):
-            # OOB: write zero to LDS via inline asm ds_write_b32
-            lane_offset = _std_arith.MulIOp(
-                _raw(lane_idx_i32),
-                _raw(arith.constant(4, type=T.i32)),
-            ).result
-            lds_zero_addr = _std_arith.AddIOp(
-                lds_base_i32,
-                _std_arith.AddIOp(
-                    _raw(arith.constant(block_idx_const * KV_NUM_COLS, type=T.i32)),
-                    lane_offset,
-                ).result,
-            ).result
-            llvm.InlineAsmOp(
-                res=None,
-                operands_=[lds_zero_addr, _raw(arith.constant(0, type=T.i32))],
-                asm_string="ds_write_b32 $0, $1",
-                constraints="v,v",
-                has_side_effects=True,
-                is_align_stack=False,
-            )
-            scf.YieldOp([])
-        with ir.InsertionPoint(if_op.regions[1].blocks[0]):
-            # Normal: inline asm buffer_load_dword lds
+        def _emit_normal_load():
             voff = _std_arith.AddIOp(
                 _std_arith.MulIOp(
                     _raw(row_i32),
@@ -638,7 +619,58 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 has_side_effects=True,
                 is_align_stack=False,
             )
-            scf.YieldOp([])
+
+        if check_boundary is False:
+            _emit_normal_load()
+        else:
+            # Build OOB condition: row == -1
+            neg_one = _raw(arith.constant(-1, type=T.i32))
+            is_oob = _std_arith.CmpIOp(CmpIPredicate.eq, _raw(row_i32), neg_one).result
+            # If check_boundary is a runtime i1, AND it in
+            if check_boundary is not True:
+                is_oob = _std_arith.AndIOp(check_boundary, is_oob).result
+
+            if_op = scf.IfOp(is_oob, [], has_else=True)
+            with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+                # OOB: write zero to LDS via inline asm ds_write_b32
+                lane_offset = _std_arith.MulIOp(
+                    _raw(lane_idx_i32),
+                    _raw(arith.constant(4, type=T.i32)),
+                ).result
+                lds_zero_addr = _std_arith.AddIOp(
+                    lds_base_i32,
+                    _std_arith.AddIOp(
+                        _raw(arith.constant(block_idx_const * KV_NUM_COLS, type=T.i32)),
+                        lane_offset,
+                    ).result,
+                ).result
+                llvm.InlineAsmOp(
+                    res=None,
+                    operands_=[lds_zero_addr, _raw(arith.constant(0, type=T.i32))],
+                    asm_string="ds_write_b32 $0, $1",
+                    constraints="v,v",
+                    has_side_effects=True,
+                    is_align_stack=False,
+                )
+                scf.YieldOp([])
+            with ir.InsertionPoint(if_op.regions[1].blocks[0]):
+                _emit_normal_load()
+                scf.YieldOp([])
+
+    # ---- K LDS lane base pointer (computed once, shared across all K loads) ----
+    # Per-lane dynamic part of the K LDS address, stored as an LDS pointer.
+    # All K loads use this as base + GEP(fixed_offset), so LLVM can fold
+    # the fixed_offset into ds_read's 16-bit immediate offset field.
+    _k_row_in_mfma = lane_idx % arith.index(MFMA_M)
+    _k_row_phy = (_k_row_in_mfma / arith.index(2)) * arith.index(
+        4
+    ) + _k_row_in_mfma % arith.index(2)
+    _k_col_in_lane = (lane_idx / arith.index(MFMA_M)) * arith.index(MFMA_ELEM_PER_THR)
+    _k_lds_lane_offset = (
+        (_k_row_phy / arith.index(4)) * arith.index(KV_SUB_BYTES)
+        + (_k_row_phy % arith.index(4)) * arith.index(KV_BYTES_PER_ROW)
+        + (_k_col_in_lane % arith.index(KV_NUM_COLS))
+    )
 
     # ---- Helper: load K sub-tile from LDS (16x32 for MFMA) ----
     def _load_k_from_lds(p_lds_kv_base_idx, row_offset, col_offset):
@@ -654,32 +686,24 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
           fixed_offset = (row_offset/16)*2*KV_BYTES_PER_ROW
                        + (col_offset%64)*sizeof(kv_t)
                        + (col_offset/64)*KV_BLOCK_BYTES
+
+        NOTE: The fixed_offset is passed via static_byte_offset so LLVM
+        can potentially fold it into ds_read's immediate. Currently LLVM
+        lowers this to ds_read2_b64 due to inttoptr; a proper fix needs
+        FlyDSL infrastructure changes to emit ds_read_b64 with large offsets.
         """
-        row_in_mfma = lane_idx % arith.index(MFMA_M)
-        # row_phy = (row/2)*4 + (row%2)
-        row_phy = (row_in_mfma / arith.index(2)) * arith.index(
-            4
-        ) + row_in_mfma % arith.index(2)
-        col_in_lane = (lane_idx / arith.index(MFMA_M)) * arith.index(MFMA_ELEM_PER_THR)
-
-        # Dynamic part: based on lane position
-        lds_lane_offset = (
-            (row_phy / arith.index(4)) * arith.index(KV_SUB_BYTES)
-            + (row_phy % arith.index(4)) * arith.index(KV_BYTES_PER_ROW)
-            + (col_in_lane % arith.index(KV_NUM_COLS))
-        )
-
-        # Fixed part: based on compile-time row/col offsets
+        # Fixed part: compile-time constant
         fixed_offset = (
             (row_offset // 16) * 2 * KV_BYTES_PER_ROW
             + (col_offset % KV_NUM_COLS)
             + (col_offset // KV_NUM_COLS) * KV_BLOCK_BYTES
         )
 
-        lds_addr = p_lds_kv_base_idx + lds_lane_offset + arith.index(fixed_offset)
+        # Dynamic base: p_lds_kv_base + lane_offset (one VGPR)
+        lds_addr = p_lds_kv_base_idx + _k_lds_lane_offset
 
         # ds_read_b64 -> 8 bytes = 1 i64 for MFMA input
-        data = _lds_load(lds_addr, T.i64)
+        data = _lds_load(lds_addr, T.i64, static_byte_offset=fixed_offset)
         return data
 
     # ---- Helper: load V from KV LDS (un-transposed) ----
@@ -1004,14 +1028,18 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
     # ---- Helper: softmax scale + boundary masking ----
     def _softmax_scale_p(p_vals, col_0_start_i32, kv_end_i32, check_boundary):
-        """Scale p_vals by softmax_scale, mask OOB to -inf."""
+        """Scale p_vals by softmax_scale, mask OOB to -inf.
+
+        check_boundary: False (skip), True (always mask), or ir.Value i1
+        (runtime: mask only when True at runtime).
+        """
         result = [None] * 8
         for i in range_constexpr(8):
             result[i] = _std_arith.MulFOp(
                 _raw(p_vals[i]), _raw(softmax_scale), fastmath=fm_fast
             ).result
 
-        if check_boundary:
+        if check_boundary is not False:
             for i in range_constexpr(8):
                 # Position of this element: col_0_start + (i//4)*16 + (i%4)
                 sub_offset = (i // 4) * 16 + (i % 4)
@@ -1022,6 +1050,9 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 is_oob = _std_arith.CmpIOp(
                     CmpIPredicate.sge, pos_i32, _raw(kv_end_i32)
                 ).result
+                # If check_boundary is a runtime i1, AND it in
+                if check_boundary is not True:
+                    is_oob = _std_arith.AndIOp(check_boundary, is_oob).result
                 result[i] = _std_arith.SelectOp(
                     is_oob, _raw(c_neg_inf_f32), result[i]
                 ).result
@@ -1297,21 +1328,23 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         p_lds_kv_next_warp_i32=None,
         row_kv_ld_next=None,
         kv_ld_col_base_i32_arg=None,
+        check_boundary_next=True,
     ):
         """Process one KV tile: QK GEMM -> softmax -> V transpose -> PV GEMM.
 
         When p_lds_kv_next_warp_i32 is provided, interleaves prefetch
         of the next tile's KV data during GEMM1 NoPE loop.
-        Prefetch is always unconditional -- for the last tile, caller
-        passes row_kv_ld_next=-1 which triggers OOB zeroing (harmless
-        since that buffer won't be consumed).
+
+        check_boundary_next: controls whether prefetch checks row==-1 (OOB).
+        When False, prefetch skips the OOB branch -- caller guarantees the
+        next tile is full.
 
         Returns (row_max, row_sum_e, oaccu).
         """
         do_prefetch = p_lds_kv_next_warp_i32 is not None
 
         def _maybe_prefetch(block_idx):
-            """Issue prefetch unconditionally (OOB handled by row=-1)."""
+            """Issue prefetch (OOB check controlled by check_boundary_next)."""
             if not do_prefetch:
                 return
             _prefetch_k_tile_asm(
@@ -1319,6 +1352,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 row_kv_ld_next,
                 kv_ld_col_base_i32_arg,
                 block_idx,
+                check_boundary=check_boundary_next,
             )
 
         # ---- Prefetch block 0 of next tile (inline asm, opaque to LLVM) ----
@@ -1512,47 +1546,116 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         num_tiles = arith.divui(arith.addi(kv_len, c_block_n_m1), c_block_n)
         num_tiles_idx = arith.index_cast(T.index, num_tiles)
 
-        # --- First tile: runtime branch on boundary check ---
-        # HK pattern: check_boundary only when kv_len < BLOCK_N (partial first tile).
-        # When kv_len >= BLOCK_N the first tile is always full.
+        # --- Pre-compute boundary flags ---
         first_tile_needs_boundary = _std_arith.CmpIOp(
             CmpIPredicate.slt,
             _raw(kv_len),
             _raw(c_block_n),
         ).result
+        has_multi_tiles = _std_arith.CmpIOp(
+            CmpIPredicate.sgt,
+            _raw(kv_len),
+            _raw(c_block_n),
+        ).result
+        # last_tile_partial: (kv_len & (BLOCK_N-1)) != 0
+        last_tile_partial = _std_arith.CmpIOp(
+            CmpIPredicate.ne,
+            _std_arith.AndIOp(_raw(kv_len), _raw(c_block_n_m1)).result,
+            _raw(arith.constant(0, type=T.i32)),
+        ).result
+
+        # --- First tile: resolve KV row (branched on boundary) ---
+        if_setup = scf.IfOp(first_tile_needs_boundary, [T.i32], has_else=True)
+        with ir.InsertionPoint(if_setup.regions[0].blocks[0]):
+            row_cb = _get_kv_ld_row(kv_start, kv_end, True)
+            scf.YieldOp([row_cb])
+        with ir.InsertionPoint(if_setup.regions[1].blocks[0]):
+            kv_first_end = _std_arith.AddIOp(
+                _raw(kv_start),
+                _raw(c_block_n),
+            ).result
+            row_nc = _get_kv_ld_row(kv_start, kv_first_end, False)
+            scf.YieldOp([row_nc])
+        row_kv_ld_first = if_setup.results[0]
 
         # Load Q to GPR (independent of boundary check)
         q_nope_packs, q_rope_packs = _load_q_to_regs(qo_start)
 
-        def _first_tile_sequence(check_boundary):
-            """Get KV row, async load KV, resolve tile1 row, barrier, process."""
-            # 1. Resolve KV row
-            if check_boundary:
-                row_kv_ld_first = _get_kv_ld_row(kv_start, kv_end, True)
-            else:
-                kv_first_end = _std_arith.AddIOp(
-                    _raw(kv_start),
-                    _raw(c_block_n),
-                ).result
-                row_kv_ld_first = _get_kv_ld_row(kv_start, kv_first_end, False)
-            # 2. Async load first tile KV to LDS
+        # Async load first tile KV to LDS (branched)
+        if_load = scf.IfOp(first_tile_needs_boundary, [], has_else=True)
+        with ir.InsertionPoint(if_load.regions[0].blocks[0]):
             _async_load_kv_all(
                 p_lds_kv_0_warp_i32,
                 row_kv_ld_first,
                 kv_ld_col_base_i32,
-                check_boundary=check_boundary,
+                check_boundary=True,
             )
-            # 3. Resolve row for tile 1 prefetch
-            kv_start_plus_bn_ = _std_arith.AddIOp(
-                _raw(kv_start),
-                _raw(arith.constant(BLOCK_N, type=T.i32)),
-            ).result
-            row_kv_ld_tile1_ = _get_kv_ld_row(kv_start_plus_bn_, _raw(kv_end), True)
-            # 4. Barrier
+            scf.YieldOp([])
+        with ir.InsertionPoint(if_load.regions[1].blocks[0]):
+            _async_load_kv_all(
+                p_lds_kv_0_warp_i32,
+                row_kv_ld_first,
+                kv_ld_col_base_i32,
+                check_boundary=False,
+            )
+            scf.YieldOp([])
+
+        # --- Tile-1 row resolution (only meaningful for multi-tile) ---
+        # tile1_is_full: kv_start + 2*BN <= kv_end (equiv to num_tiles >= 3)
+        c_2bn = arith.constant(2 * BLOCK_N, type=T.i32)
+        kv_start_plus_bn = _std_arith.AddIOp(
+            _raw(kv_start),
+            _raw(c_block_n),
+        ).result
+        kv_start_plus_2bn = _std_arith.AddIOp(
+            _raw(kv_start),
+            _raw(c_2bn),
+        ).result
+        tile1_is_full = _std_arith.CmpIOp(
+            CmpIPredicate.sle,
+            kv_start_plus_2bn,
+            _raw(kv_end),
+        ).result
+        if_tile1_row = scf.IfOp(tile1_is_full, [T.i32], has_else=True)
+        with ir.InsertionPoint(if_tile1_row.regions[0].blocks[0]):
+            # Tile 1 is full -> no boundary check, tile_end = start+2*BN
+            row_t1_full = _get_kv_ld_row(kv_start_plus_bn, kv_start_plus_2bn, False)
+            scf.YieldOp([row_t1_full])
+        with ir.InsertionPoint(if_tile1_row.regions[1].blocks[0]):
+            # Tile 1 may be partial -> boundary check, tile_end = kv_end
+            row_t1_partial = _get_kv_ld_row(kv_start_plus_bn, _raw(kv_end), True)
+            scf.YieldOp([row_t1_partial])
+        row_kv_ld_tile1 = if_tile1_row.results[0]
+
+        # check_boundary_next for first tile: True only when
+        # num_tiles==2 AND last_tile_partial (next tile is partial last)
+        # Equiv: !tile1_is_full AND last_tile_partial
+        # But simpler: cbn = !tile1_is_full (when num_tiles>=2, !tile1_is_full
+        # means num_tiles==2, and if num_tiles==2 and tile1 not full then
+        # last_tile_partial must be true). Actually just use: !tile1_is_full AND has_multi_tiles AND last_tile_partial.
+        # Simplest correct: HK uses (kv_1st_end + BN - 1) < kv_end -> !(kv_start+2*BN <= kv_end) -> !tile1_is_full
+        # Wait: HK condition for cbn=False is (kv_1st_end + BN - 1) < kv_end  i.e. kv_start+2*BN-1 < kv_end
+        # i.e. kv_start+2*BN <= kv_end i.e. tile1_is_full. So cbn=False when tile1_is_full.
+        # cbn=True when !tile1_is_full. This is correct regardless of last_tile_partial because
+        # when num_tiles==2 and !tile1_is_full, the next tile IS the last and IS partial.
+        # !tile1_is_full: kv_start + 2*BN > kv_end (num_tiles == 2, next tile partial)
+        first_tile_cbn = _std_arith.CmpIOp(
+            CmpIPredicate.sgt,
+            kv_start_plus_2bn,
+            _raw(kv_end),
+        ).result
+
+        # --- Process first tile ---
+        result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
+
+        # Branch on has_multi_tiles: multi-tile gets prefetch, single doesn't
+        if_first = scf.IfOp(has_multi_tiles, result_types, has_else=True)
+        with ir.InsertionPoint(if_first.regions[0].blocks[0]):
+            # Multi-tile: first tile is always full, prefetch tile 1
+            # check_boundary_next is runtime i1 (first_tile_cbn)
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
-            # 5. Process first tile
-            rm, rse, oa = _process_tile(
+            rm1, rse1, oa1 = _process_tile(
                 p_lds_kv_0_base,
                 kv_start,
                 kv_end,
@@ -1562,44 +1665,54 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 row_sum_e,
                 oaccu,
                 is_first_iter=True,
-                check_boundary=check_boundary,
+                check_boundary=False,
                 p_lds_kv_next_warp_i32=p_lds_kv_1_warp_i32,
-                row_kv_ld_next=row_kv_ld_tile1_,
+                row_kv_ld_next=row_kv_ld_tile1,
                 kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                check_boundary_next=first_tile_cbn,
             )
-            return rm, rse, oa
+            y1 = [rm1, rse1] + oa1
+            y1 = [_raw(v) if not isinstance(v, ir.Value) else v for v in y1]
+            scf.YieldOp(y1)
+        with ir.InsertionPoint(if_first.regions[1].blocks[0]):
+            # Single tile: no prefetch, boundary check is runtime i1
+            _barrier(vmcnt=0, lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            rm2, rse2, oa2 = _process_tile(
+                p_lds_kv_0_base,
+                kv_start,
+                kv_end,
+                q_nope_packs,
+                q_rope_packs,
+                row_max,
+                row_sum_e,
+                oaccu,
+                is_first_iter=True,
+                check_boundary=first_tile_needs_boundary,
+            )
+            y2 = [rm2, rse2] + oa2
+            y2 = [_raw(v) if not isinstance(v, ir.Value) else v for v in y2]
+            scf.YieldOp(y2)
 
-        # Branch: check_boundary=True vs False
-        result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
-        if_op_first = scf.IfOp(
-            first_tile_needs_boundary,
-            result_types,
-            has_else=True,
-        )
-        with ir.InsertionPoint(if_op_first.regions[0].blocks[0]):
-            rm_t, rse_t, oa_t = _first_tile_sequence(check_boundary=True)
-            yield_t = [rm_t, rse_t] + oa_t
-            yield_t = [_raw(v) if not isinstance(v, ir.Value) else v for v in yield_t]
-            scf.YieldOp(yield_t)
-        with ir.InsertionPoint(if_op_first.regions[1].blocks[0]):
-            rm_f, rse_f, oa_f = _first_tile_sequence(check_boundary=False)
-            yield_f = [rm_f, rse_f] + oa_f
-            yield_f = [_raw(v) if not isinstance(v, ir.Value) else v for v in yield_f]
-            scf.YieldOp(yield_f)
+        row_max = if_first.results[0]
+        row_sum_e = if_first.results[1]
+        oaccu = [if_first.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
 
-        row_max = if_op_first.results[0]
-        row_sum_e = if_op_first.results[1]
-        oaccu = [if_op_first.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
-
-        # --- Remaining tiles [1, num_tiles) via scf.ForOp ---
-        # Carried state: row_max, row_sum_e, oaccu[0..31]
+        # --- Middle tiles [1, num_tiles-1) via scf.ForOp ---
+        # These tiles are never the last tile. check_boundary=False always.
+        # check_boundary_next: True only when this is the second-to-last
+        # tile AND the last tile is partial.
         c_one_idx = arith.index(1)
+        num_tiles_m1 = arith.subi(num_tiles, arith.constant(1, type=T.i32))
+        num_tiles_m1_idx = arith.index_cast(T.index, num_tiles_m1)
+        num_tiles_m2 = arith.subi(num_tiles, arith.constant(2, type=T.i32))
+
         init_args = [row_max, row_sum_e] + oaccu
         init_args = [_raw(v) if not isinstance(v, ir.Value) else v for v in init_args]
 
         for_op = scf.ForOp(
             _raw(c_one_idx),
-            _raw(num_tiles_idx),
+            _raw(num_tiles_m1_idx),
             _raw(c_one_idx),
             init_args,
         )
@@ -1618,9 +1731,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 for_op.inner_iter_args[2 + i] for i in range(NUM_PV_ITERS * 2)
             ]
 
-            # Buffer parity: tile 0 used KV_0 and prefetched to KV_1.
-            #   tile 1 (odd):  curr=KV_1, next=KV_0
-            #   tile 2 (even): curr=KV_0, next=KV_1
+            # Buffer parity
             tile_parity = _std_arith.AndIOp(
                 tile_iv_i32,
                 _raw(arith.constant(1, type=T.i32)),
@@ -1641,18 +1752,44 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 p_lds_kv_1_warp_i32,
             ).result
 
-            # Wait for previous prefetch, then process curr buffer
-            _barrier(vmcnt=0, lgkmcnt=0)
-            rocdl.sched_barrier(0)
+            # check_boundary_next: True when tile_idx == num_tiles-2 AND last_tile_partial
+            is_second_to_last = _std_arith.CmpIOp(
+                CmpIPredicate.eq,
+                tile_iv_i32,
+                _raw(num_tiles_m2),
+            ).result
+            mid_cbn = _std_arith.AndIOp(is_second_to_last, last_tile_partial).result
 
-            # Resolve row for next tile prefetch (may be -1 for OOB).
+            # Resolve row for next tile prefetch.
+            # Next tile start = kv_tile_start + BN
             kv_tile_next_start = _std_arith.AddIOp(
                 kv_tile_start_i32,
                 _raw(arith.constant(BLOCK_N, type=T.i32)),
             ).result
-            row_kv_ld_next = _get_kv_ld_row(kv_tile_next_start, _raw(kv_end), True)
+            # Next tile full end: kv_tile_start + 2*BN
+            kv_tile_next_end_full = _std_arith.AddIOp(
+                kv_tile_start_i32,
+                _raw(c_2bn),
+            ).result
 
-            rm_new, rse_new, oaccu_new = _process_tile(
+            # Resolve row with appropriate boundary check
+            if_mid_cbn = scf.IfOp(mid_cbn, [T.i32], has_else=True)
+            with ir.InsertionPoint(if_mid_cbn.regions[0].blocks[0]):
+                # Next tile is partial last -> boundary check
+                row_mid_cb = _get_kv_ld_row(kv_tile_next_start, _raw(kv_end), True)
+                scf.YieldOp([row_mid_cb])
+            with ir.InsertionPoint(if_mid_cbn.regions[1].blocks[0]):
+                # Next tile is full -> no boundary check
+                row_mid_nc = _get_kv_ld_row(
+                    kv_tile_next_start, kv_tile_next_end_full, False
+                )
+                scf.YieldOp([row_mid_nc])
+            row_kv_ld_next = if_mid_cbn.results[0]
+
+            # Process tile: cb=False always, cbn is runtime i1 (mid_cbn)
+            _barrier(vmcnt=0, lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            rm_m, rse_m, oa_m = _process_tile(
                 curr_base_idx,
                 kv_tile_start_i32,
                 _raw(kv_end),
@@ -1662,22 +1799,75 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 rse_carried,
                 oaccu_carried,
                 is_first_iter=False,
-                check_boundary=True,
+                check_boundary=False,
                 p_lds_kv_next_warp_i32=next_warp,
                 row_kv_ld_next=row_kv_ld_next,
                 kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                check_boundary_next=mid_cbn,
             )
-
-            yield_vals = [rm_new, rse_new] + oaccu_new
+            yield_vals = [rm_m, rse_m] + oa_m
             yield_vals = [
                 _raw(v) if not isinstance(v, ir.Value) else v for v in yield_vals
             ]
             scf.YieldOp(yield_vals)
 
-        # Unpack results from for loop
+        # Unpack results from middle tiles loop
         row_max = for_op.results[0]
         row_sum_e = for_op.results[1]
         oaccu = [for_op.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
+
+        # --- Last tile (when num_tiles > 1): no prefetch ---
+        # Branch on last_tile_partial for check_boundary.
+        if_has_last = scf.IfOp(has_multi_tiles, result_types, has_else=True)
+        with ir.InsertionPoint(if_has_last.regions[0].blocks[0]):
+            # Compute last tile's buffer parity and start
+            last_tile_iv_i32 = _raw(num_tiles_m1)
+            kv_last_start = _std_arith.AddIOp(
+                _raw(kv_start),
+                _std_arith.MulIOp(last_tile_iv_i32, _raw(c_block_n)).result,
+            ).result
+            last_parity = _std_arith.AndIOp(
+                last_tile_iv_i32,
+                _raw(arith.constant(1, type=T.i32)),
+            ).result
+            last_is_odd = _std_arith.CmpIOp(
+                CmpIPredicate.ne,
+                last_parity,
+                _raw(arith.constant(0, type=T.i32)),
+            ).result
+            last_curr_base = _std_arith.SelectOp(
+                last_is_odd,
+                _raw(p_lds_kv_1_base),
+                _raw(p_lds_kv_0_base),
+            ).result
+
+            # Last tile: cb is runtime i1 (last_tile_partial), no prefetch
+            _barrier(vmcnt=0, lgkmcnt=0)
+            rocdl.sched_barrier(0)
+            rm_l, rse_l, oa_l = _process_tile(
+                last_curr_base,
+                kv_last_start,
+                _raw(kv_end),
+                q_nope_packs,
+                q_rope_packs,
+                row_max,
+                row_sum_e,
+                oaccu,
+                is_first_iter=False,
+                check_boundary=last_tile_partial,
+            )
+            yl = [rm_l, rse_l] + oa_l
+            yl = [_raw(v) if not isinstance(v, ir.Value) else v for v in yl]
+            scf.YieldOp(yl)
+        with ir.InsertionPoint(if_has_last.regions[1].blocks[0]):
+            # Single tile: no last tile to process, pass through
+            y_pass = [row_max, row_sum_e] + oaccu
+            y_pass = [_raw(v) if not isinstance(v, ir.Value) else v for v in y_pass]
+            scf.YieldOp(y_pass)
+
+        row_max = if_has_last.results[0]
+        row_sum_e = if_has_last.results[1]
+        oaccu = [if_has_last.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
 
         # ---- Normalize output: oaccu *= 1/row_sum_e ----
         reci_sum = _std_arith.DivFOp(
