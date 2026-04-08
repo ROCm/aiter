@@ -1,6 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import triton
+
 import triton.language as tl
 import torch
 from triton.experimental import gluon
