@@ -196,12 +196,18 @@ def build_tune_dict(
         key = (int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
         if use_name:
             kname = str(row["kernelName"])
-            if kname in kernels_by_name:
-                tune_dict[key] = kernels_by_name[kname]
+            kernel = kernels_by_name.get(kname)
+            if kernel is not None:
+                tune_dict[key] = kernel
             else:
                 print(f"[Warning]: kernelName '{kname}' not found, skip it")
         else:
-            tune_dict[key] = kernels_list[int(row["kernelId"])]
+            kid = int(row["kernelId"])
+            kernel = kernels_list.get(kid)
+            if kernel is not None:
+                tune_dict[key] = kernel
+            else:
+                print(f"[Warning]: kernelId {kid} not in kernels_list, skip it")
     return tune_dict
 
 
@@ -236,7 +242,12 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
             int(row["N"]),
             int(row["K"]),
         )
-        tune_dict[key] = kernels_list[int(row["kernelId"])]
+        kid = int(row["kernelId"])
+        kernel = kernels_list.get(kid)
+        if kernel is not None:
+            tune_dict[key] = kernel
+        else:
+            print(f"[Warning]: kernelId {kid} not in kernels_list, skip it")
     return tune_dict
 
 
