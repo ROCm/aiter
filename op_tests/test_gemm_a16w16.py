@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes, hipb_create_extension, hipb_mm
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.tuned_gemm import tgemm, triton_gemm

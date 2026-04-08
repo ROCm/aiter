@@ -10,7 +10,7 @@ from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import hipb_mm, hipb_create_extension
-from aiter.jit.utils.chip_info import get_gfx, get_cu_num
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx, get_cu_num
 import pandas as pd
 import argparse
 from functools import lru_cache
