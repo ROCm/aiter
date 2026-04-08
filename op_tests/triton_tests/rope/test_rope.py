@@ -454,7 +454,6 @@ def test_rope_thd_fwd(
 )
 @pytest.mark.parametrize("reuse_freqs_front_part", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("inplace", [True, False])
 def test_rope_thd_bwd(
     B: int,
     T: int,
