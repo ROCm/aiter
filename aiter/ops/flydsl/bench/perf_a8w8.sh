@@ -46,24 +46,41 @@ EXTRA_ARGS=("$@")
 
 TAG="${M}_${N}_${K}"
 LAUNCHER="$SCRIPT_DIR/gemm_a8w8_launch.py"
+FLYDSL_DEBUG_DIR="$HOME/.flydsl/debug"
 
 echo "=== FlyDSL A8W8 GEMM Benchmark ==="
 echo "M=$M  N=$N  K=$K"
 echo "Extra args: ${EXTRA_ARGS[*]:-<none>}"
 echo ""
 
+# --- 0) Clear stale debug dumps ---
+if [[ -d "$FLYDSL_DEBUG_DIR" ]]; then
+  read -rp "Clear existing debug dumps at $FLYDSL_DEBUG_DIR? [y/N] " answer
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    rm -rf "$FLYDSL_DEBUG_DIR"
+    echo "Debug dumps cleared."
+  else
+    echo "Debug dumps kept."
+  fi
+fi
+
 # --- 1) Capture: run the kernel under roccap ---
+echo ""
 echo "=== Step 1: Capture kernel dispatch ==="
 source "$TRITON_GFX1250_MODEL_PATH/ffmlite_env.sh"
 
 # roccap capture segfaults on exit (expected FFM behavior) — ignore exit code
 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+FLYDSL_DUMP_IR=1 \
+FLYDSL_DEBUG_DUMP_ASM=1 \
 PYTHONPATH="$AITER_ROOT" \
 "$TRITON_GFX1250_MODEL_PATH/tools/roccap/bin/roccap" capture \
   --loglevel error \
   --disp "kernel_gemm_a8w8/0" \
   --file gemm_a8w8.cap \
   python3 "$LAUNCHER" "$M" "$N" "$K" "${EXTRA_ARGS[@]}" || true
+
+echo "MLIR/ASM dumps written to $FLYDSL_DEBUG_DIR"
 
 # --- 2) Play: replay on the model ---
 echo ""
@@ -190,6 +207,9 @@ echo "=== Packing traces ==="
 PACK_LIST=("rcv_flydsl_a8w8_${TAG}/" "$STATS_FILE")
 if [[ -f "itrace_flydsl_a8w8_${TAG}.json" ]]; then
   PACK_LIST+=("itrace_flydsl_a8w8_${TAG}.json")
+fi
+if [[ -d "$FLYDSL_DEBUG_DIR" ]]; then
+  PACK_LIST+=("$FLYDSL_DEBUG_DIR")
 fi
 
 tar czf "traces_flydsl_a8w8_${TAG}.tar.gz" "${PACK_LIST[@]}"
