@@ -22,6 +22,7 @@
 #include "attention.h"
 
 #include <algorithm>
+#include <cfloat>
 #include "dtype_fp8.cuh"
 #include "quant_utils.cuh"
 

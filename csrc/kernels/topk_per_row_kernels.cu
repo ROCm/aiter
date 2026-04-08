@@ -4,6 +4,7 @@
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
+#include <cfloat>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 

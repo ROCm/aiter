@@ -26,6 +26,7 @@
 #include "aiter_opus_plus.h"
 #include "py_itfs_common.h"
 
+#include <cfloat>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
