@@ -65,6 +65,11 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
+    # Ensure weight dtype matches input dtype. The underlying HIP/CK kernels
+    # read weight memory using input's dtype stride, so a dtype mismatch
+    # (e.g. float32 weight with bfloat16 input) causes silent data corruption.
+    if weight.dtype != input.dtype:
+        weight = weight.to(input.dtype)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
     else:
@@ -82,6 +87,8 @@ def rmsnorm2d_fwd_with_add(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    if weight.dtype != input.dtype:
+        weight = weight.to(input.dtype)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         rmsnorm2d_fwd_with_add_ck(
             out,
