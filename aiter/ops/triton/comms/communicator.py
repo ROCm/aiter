@@ -170,16 +170,15 @@ class AiterCommunicator:
         return self._input_buf, self._output_buf
 
     def _all_reduce_copy(self, inp: torch.Tensor) -> torch.Tensor:
-        input_buf, output_buf = self._get_buffers(inp.shape, inp.dtype)
+        input_buf, _ = self._get_buffers(inp.shape, inp.dtype)
         input_buf.copy_(inp)
 
         self._workspace = self._shmem.ccl.all_reduce(
-            output_buf, input_buf, workspace=self._workspace
+            input_buf, input_buf, workspace=self._workspace
         )
 
-        out = torch.empty_like(inp)
-        out.copy_(output_buf)
-        return out
+        inp.copy_(input_buf)
+        return inp
 
     # ------------------------------------------------------------------
     # Public API
