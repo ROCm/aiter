@@ -18,7 +18,6 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
-from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 
