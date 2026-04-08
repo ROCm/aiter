@@ -18,20 +18,13 @@
 #include <type_traits>
 
 #include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include "hip_reduce.h"
 #include "quant_utils.cuh"
 #include "rope/rope_common.h"
 #include "vec_convert.h"
-#include <torch/cuda.h>
- 
- #define CHECK_TYPE(x, st) \
-     TORCH_CHECK(          \
-         x.scalar_type() == st, #x " dtype is ", x.scalar_type(), ", while ", st, " is expected")
- #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
- #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
- #define CHECK_INPUT(x) \
-     CHECK_TH_CUDA(x);  \
-     CHECK_CONTIGUOUS(x)
  
  namespace {
  using mrope_utils::vec_t;
@@ -845,7 +838,7 @@
      }                                                                   \
      else                                                                \
      {                                                                   \
-         TORCH_CHECK(false, "Unsupported num_kv_heads: ", num_kv_heads); \
+         AITER_CHECK(false, "Unsupported num_kv_heads: ", num_kv_heads); \
      }
  
  #define DISPATCH_INTERLEAVE(interleave, INTERLEAVE, ...) \
@@ -974,7 +967,7 @@
                                                     x);
          });
          break;
-     default: TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
+     default: AITER_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
      }
  }
 template <typename scalar_t, typename kv_cache_scalar_t, vllm::Fp8KVCacheDataType kv_dt>
@@ -1051,7 +1044,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
     if(x_val == 16) { constexpr int X_VAL = 16; __VA_ARGS__ }                  \
     else if(x_val == 8) { constexpr int X_VAL = 8; __VA_ARGS__ }               \
     else if(x_val == 4) { constexpr int X_VAL = 4; __VA_ARGS__ }               \
-    else { TORCH_CHECK(false, "Unsupported x: ", x_val); }
+    else { AITER_CHECK(false, "Unsupported x: ", x_val); }
 
 #define DISPATCH_INTERLEAVE_BQ(interleave, ...)                                 \
     if(interleave) { const bool INTERLEAVE = true; __VA_ARGS__ }                \
@@ -1092,7 +1085,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
     if(blockSize == 64) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 64) }             \
     else if(blockSize == 128) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 128) }      \
     else if(blockSize == 256) { LAUNCH_BLOCK_QUANT_KERNEL(HEAD_DIM, 256) }      \
-    else { TORCH_CHECK(false, "Unsupported blockSize: ", blockSize); }
+    else { AITER_CHECK(false, "Unsupported blockSize: ", blockSize); }
 
     switch(head_dim)
     {
@@ -1104,7 +1097,7 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
 #undef DISPATCH_BLOCK_SIZE
 #undef DISPATCH_X_VALUE
 #undef DISPATCH_INTERLEAVE_BQ
-    default: TORCH_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
+    default: AITER_CHECK(false, "Unsupported head dimension for fusedQKNormRope: ", head_dim);
     }
 }
  } // namespace
@@ -1121,12 +1114,12 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
          reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                \
          reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),           \
          !is_neox,                                                     \
-         position_ids.data_ptr<int64_t>(),                             \
+         reinterpret_cast<int64_t*>(position_ids.data_ptr()),          \
          reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),               \
          reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),               \
-         slot_mapping.data_ptr<int64_t>(),                             \
-         k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,   \
-         v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,   \
+         reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),          \
+         k_scale.has_value() ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,   \
+         v_scale.has_value() ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr,   \
          page_size,                                                    \
          x,                                                            \
          stream);
@@ -1143,41 +1136,18 @@ void launchFusedQKNormRopeBlockQuantCacheShuffle(scalar_t* qkv,
              reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                \
              reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),           \
              !is_neox,                                                     \
-             position_ids.data_ptr<int64_t>(),                             \
+             reinterpret_cast<int64_t*>(position_ids.data_ptr()),          \
              reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),               \
              reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),               \
-             slot_mapping.data_ptr<int64_t>(),                             \
-             cu_q_len.data_ptr<int64_t>(),                                 \
-             k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,   \
-             v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,   \
+             reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),          \
+             reinterpret_cast<int64_t*>(cu_q_len.data_ptr()),              \
+             k_scale.has_value() ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr,   \
+             v_scale.has_value() ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr,   \
              page_size,                                                    \
              x,                                                            \
              batch_size,                                                   \
              max_tokens_per_batch,                                         \
              stream);
-
-#define CALL_QK_NORM_ROPE_CACHE_QUANT(SRC_T, CACHE_T, KV_DTYPE)       \
-    launchFusedQKNormRopeQuantCacheShuffle<SRC_T, CACHE_T, KV_DTYPE>( \
-        reinterpret_cast<SRC_T*>(qkv.data_ptr()),                     \
-        num_tokens,                                                   \
-        num_heads_q,                                                  \
-        num_heads_k,                                                  \
-        num_heads_v,                                                  \
-        head_dim,                                                     \
-        eps,                                                          \
-        reinterpret_cast<SRC_T*>(q_weight.data_ptr()),                \
-        reinterpret_cast<SRC_T*>(k_weight.data_ptr()),                \
-        reinterpret_cast<SRC_T*>(cos_sin_cache.data_ptr()),           \
-        !is_neox,                                                     \
-        position_ids.data_ptr<int64_t>(),                             \
-        reinterpret_cast<CACHE_T*>(k_cache.data_ptr()),               \
-        reinterpret_cast<CACHE_T*>(v_cache.data_ptr()),               \
-        slot_mapping.data_ptr<int64_t>(),                             \
-        k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr,   \
-        v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr,   \
-        page_size,                                                    \
-        x,                                                            \
-        stream);
 
 template <typename T, int HEAD_SIZE, bool IS_NEOX>
 __global__ void fused_rope_rms_2way_kernel(const T* q0_,
@@ -1399,7 +1369,7 @@ void fused_rope_rms_2way(const T* q0,
                          hipStream_t stream)
 {
     using mrope_utils::WARP_SIZE;
-    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int block_size = 256;
     auto total_warps         = (num_tokens0 + num_tokens1) * (num_heads_q + num_heads_k);
     auto num_warps_per_block = block_size / WARP_SIZE;
@@ -1463,91 +1433,107 @@ void fused_rope_rms_2way(const T* q0,
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
-    at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
+    const aiter_tensor_t& qkv,                   // Combined QKV tensor [num_tokens,
                                        // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
     int64_t num_heads_q,               // Number of query heads
     int64_t num_heads_k,               // Number of key heads
     int64_t num_heads_v,               // Number of value heads
     int64_t head_dim,                  // Dimension per head
     double eps,                        // Epsilon for RMS normalization
-    at::Tensor& q_weight,              // RMSNorm weights for query [head_dim]
-    at::Tensor& k_weight,              // RMSNorm weights for key [head_dim]
-    at::Tensor& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
+    const aiter_tensor_t& q_weight,              // RMSNorm weights for query [head_dim]
+    const aiter_tensor_t& k_weight,              // RMSNorm weights for key [head_dim]
+    const aiter_tensor_t& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
     bool is_neox,                      // Whether RoPE is applied in Neox style
-    at::Tensor& position_ids,          // Position IDs for RoPE [num_tokens]
-    at::Tensor& k_cache,               // k cache
-    at::Tensor& v_cache,               // v cache
-    at::Tensor& slot_mapping,          // slot mapping
+    const aiter_tensor_t& position_ids,          // Position IDs for RoPE [num_tokens]
+    const aiter_tensor_t& k_cache,               // k cache
+    const aiter_tensor_t& v_cache,               // v cache
+    const aiter_tensor_t& slot_mapping,          // slot mapping
     const std::string& kv_cache_dtype, // kv cache data type
-    std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale  // v scale tensor for quantized v cache
+    std::optional<aiter_tensor_t> k_scale, // k scale tensor for quantized k cache
+    std::optional<aiter_tensor_t> v_scale  // v scale tensor for quantized v cache
 )
 {
-    // Input validation
-    CHECK_INPUT(qkv);
-    CHECK_INPUT(position_ids);
-    CHECK_INPUT(q_weight);
-    CHECK_INPUT(k_weight);
-    CHECK_INPUT(cos_sin_cache);
-    CHECK_TYPE(position_ids, torch::kInt64);
-
-    TORCH_CHECK(qkv.dim() == 2,
+    AITER_CHECK(qkv.dim() == 2,
                 "QKV tensor must be 2D: [num_tokens, "
                 "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
-    TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
-    TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
-    TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
-    TORCH_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
-    TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
-    TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
-    TORCH_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
-    TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
-                    qkv.scalar_type() == k_weight.scalar_type(),
+    AITER_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
+    AITER_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
+    AITER_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
+    AITER_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
+    AITER_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
+    AITER_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
+    AITER_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
+    AITER_CHECK(qkv.dtype() == q_weight.dtype() &&
+                    qkv.dtype() == k_weight.dtype(),
                 "qkv, q_weight and k_weight must have the same dtype");
-    TORCH_CHECK(head_dim % 32 == 0,
+    AITER_CHECK(head_dim % 32 == 0,
                 "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
-    TORCH_CHECK(
+    AITER_CHECK(
         num_heads_k <= 32,
         "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
 
     int64_t num_tokens = qkv.size(0);
     int64_t page_size  = v_cache.size(-1);
     int64_t x          = k_cache.size(-1);
-    TORCH_CHECK(position_ids.size(0) == num_tokens,
+    AITER_CHECK(position_ids.size(0) == num_tokens,
                 "Number of tokens in position_ids must match QKV");
 
     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-    TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
+    AITER_CHECK(qkv.size(1) == total_heads * head_dim,
                 "QKV tensor size must match total number of heads and head dimension");
 
-    auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
+    HipDeviceGuard device_guard(qkv.device_id);
+    auto stream = aiter::getCurrentHIPStream();
 
-    DISPATCH_BY_KV_CACHE_DTYPE(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_QUANT);
+    if(kv_cache_dtype == "auto")
+    {
+        if(qkv.dtype() == AITER_DTYPE_fp32)
+        {
+            CALL_QK_NORM_ROPE_CACHE_QUANT(float, float, vllm::Fp8KVCacheDataType::kAuto);
+        }
+        else if(qkv.dtype() == AITER_DTYPE_fp16)
+        {
+            CALL_QK_NORM_ROPE_CACHE_QUANT(ck_tile::fp16_t, ck_tile::fp16_t, vllm::Fp8KVCacheDataType::kAuto);
+        }
+        else if(qkv.dtype() == AITER_DTYPE_bf16)
+        {
+            CALL_QK_NORM_ROPE_CACHE_QUANT(ck_tile::bf16_t, ck_tile::bf16_t, vllm::Fp8KVCacheDataType::kAuto);
+        }
+        else
+        {
+            AITER_CHECK(false, "Unsupported input type of kv cache: ", AiterDtype_to_str(qkv.dtype()));
+        }
+    }
+    else if(kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3")
+    {
+        if(qkv.dtype() == AITER_DTYPE_fp32)
+        {
+            CALL_QK_NORM_ROPE_CACHE_QUANT(float, ck_tile::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+        }
+        else if(qkv.dtype() == AITER_DTYPE_fp16)
+        {
+            CALL_QK_NORM_ROPE_CACHE_QUANT(ck_tile::fp16_t, ck_tile::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+        }
+        else if(qkv.dtype() == AITER_DTYPE_bf16)
+        {
+            CALL_QK_NORM_ROPE_CACHE_QUANT(ck_tile::bf16_t, ck_tile::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+        }
+        else
+        {
+            AITER_CHECK(false, "Unsupported input type of kv cache: ", AiterDtype_to_str(qkv.dtype()));
+        }
+    }
+    else
+    {
+        AITER_CHECK(false, "Unsupported data type of kv cache: ", kv_cache_dtype);
+    }
 }
 
-template <typename T>
-struct KernelElementType
-{
-    using type = T;
-};
-
-template <>
-struct KernelElementType<c10::Half>
-{
-    using type = __half;
-};
-
-template <>
-struct KernelElementType<c10::BFloat16>
-{
-    using type = hip_bfloat16;
-};
-
-void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
-                                                at::Tensor& qw,
-                                                at::Tensor& kw,
-                                                at::Tensor& cos_sin,
-                                                at::Tensor& positions,
+void fused_qk_norm_rope_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
+                                                const aiter_tensor_t& qw,
+                                                const aiter_tensor_t& kw,
+                                                const aiter_tensor_t& cos_sin,
+                                                const aiter_tensor_t& positions,
                                                 int64_t num_tokens,
                                                 int64_t num_heads_q,
                                                 int64_t num_heads_k,
@@ -1555,47 +1541,43 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                 int64_t head_size,
                                                 bool is_neox_style,
                                                 double eps,
-                                                at::Tensor& q_out,
-                                                at::Tensor& k_cache,
-                                                at::Tensor& v_cache,
-                                                at::Tensor& slot_mapping,
-                                                at::Tensor& per_tensor_k_scale,
-                                                at::Tensor& per_tensor_v_scale,
-                                                std::optional<at::Tensor> k_out,
-                                                std::optional<at::Tensor> v_out,
+                                                const aiter_tensor_t& q_out,
+                                                const aiter_tensor_t& k_cache,
+                                                const aiter_tensor_t& v_cache,
+                                                const aiter_tensor_t& slot_mapping,
+                                                const aiter_tensor_t& per_tensor_k_scale,
+                                                const aiter_tensor_t& per_tensor_v_scale,
+                                                std::optional<aiter_tensor_t> k_out,
+                                                std::optional<aiter_tensor_t> v_out,
                                                 bool return_kv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
                                                 int64_t rotary_dim)
 {
-    TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
-                cos_sin.is_contiguous());
-    TORCH_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && slot_mapping.is_contiguous());
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(qkv));
-    auto stream         = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    HipDeviceGuard device_guard(qkv.device_id);
+    auto stream         = aiter::getCurrentHIPStream();
     auto pos_strides    = positions.strides();
-    auto kv_cache_dtype = k_cache.scalar_type();
-    auto qkv_dtype      = qkv.scalar_type();
-    TORCH_CHECK(pos_strides.size() == 1);
-    float per_tensor_k_scale_ = per_tensor_k_scale.item<float>();
-    float per_tensor_v_scale_ = per_tensor_v_scale.item<float>();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kBFloat16, at::kHalf, qkv_dtype, "fused_qk_norm_rope_cache_pts_quant_shuffle", [&] {
-            using T = KernelElementType<scalar_t>::type;
+    auto kv_cache_dtype = k_cache.dtype();
+    auto qkv_dtype      = qkv.dtype();
+    AITER_CHECK(pos_strides.size() == 1);
+    float per_tensor_k_scale_ = reinterpret_cast<float*>(per_tensor_k_scale.data_ptr())[0];
+    float per_tensor_v_scale_ = reinterpret_cast<float*>(per_tensor_v_scale.data_ptr())[0];
+    AITER_DISPATCH_FLOATING(qkv_dtype, "fused_qk_norm_rope_cache_pts_quant_shuffle", [&] {
+            using T = scalar_t;
             if(kv_cache_dtype == qkv_dtype)
             {
                 T* k_out_ptr = (return_kv && k_out.has_value())
-                                   ? (T*)k_out.value().data_ptr<scalar_t>()
+                                   ? reinterpret_cast<T*>(k_out.value().data_ptr())
                                    : nullptr;
                 T* v_out_ptr = (return_kv && v_out.has_value())
-                                   ? (T*)v_out.value().data_ptr<scalar_t>()
+                                   ? reinterpret_cast<T*>(v_out.value().data_ptr())
                                    : nullptr;
-                mrope_utils::fused_rope_rms_set_kv<T, T>((T*)qkv.data_ptr<scalar_t>(),
-                                                         (T*)qw.data_ptr<scalar_t>(),
-                                                         (T*)kw.data_ptr<scalar_t>(),
-                                                         (T*)cos_sin.data_ptr<scalar_t>(),
-                                                         positions.data_ptr<int64_t>(),
+                mrope_utils::fused_rope_rms_set_kv<T, T>(reinterpret_cast<T*>(qkv.data_ptr()),
+                                                         reinterpret_cast<T*>(qw.data_ptr()),
+                                                         reinterpret_cast<T*>(kw.data_ptr()),
+                                                         reinterpret_cast<T*>(cos_sin.data_ptr()),
+                                                         reinterpret_cast<int64_t*>(positions.data_ptr()),
                                                          0,
                                                          pos_strides[0],
                                                          num_tokens,
@@ -1605,10 +1587,10 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                          head_size,
                                                          is_neox_style,
                                                          eps,
-                                                         (T*)q_out.data_ptr<scalar_t>(),
-                                                         (T*)k_cache.data_ptr<scalar_t>(),
-                                                         (T*)v_cache.data_ptr<scalar_t>(),
-                                                         slot_mapping.data_ptr<int64_t>(),
+                                                         reinterpret_cast<T*>(q_out.data_ptr()),
+                                                         reinterpret_cast<T*>(k_cache.data_ptr()),
+                                                         reinterpret_cast<T*>(v_cache.data_ptr()),
+                                                         reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
                                                          stream,
                                                          per_tensor_k_scale_,
                                                          per_tensor_v_scale_,
@@ -1619,25 +1601,22 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                                                          x,
                                                          rotary_dim);
             }
-            else
+            else if(kv_cache_dtype == AITER_DTYPE_fp8)
             {
-                // Check if kv_cache_dtype is fp8e4m3fnuz or fp8e4m3fn
-                if(kv_cache_dtype == at::ScalarType::Float8_e4m3fnuz)
-                {
                     mrope_utils::fp8e4m3fnuz* k_out_fp8_ptr =
                         (return_kv && k_out.has_value())
-                            ? (mrope_utils::fp8e4m3fnuz*)k_out.value().data_ptr()
+                            ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(k_out.value().data_ptr())
                             : nullptr;
                     mrope_utils::fp8e4m3fnuz* v_out_fp8_ptr =
                         (return_kv && v_out.has_value())
-                            ? (mrope_utils::fp8e4m3fnuz*)v_out.value().data_ptr()
+                            ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_out.value().data_ptr())
                             : nullptr;
                     mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fnuz>(
-                        (T*)qkv.data_ptr<scalar_t>(),
-                        (T*)qw.data_ptr<scalar_t>(),
-                        (T*)kw.data_ptr<scalar_t>(),
-                        (T*)cos_sin.data_ptr<scalar_t>(),
-                        positions.data_ptr<int64_t>(),
+                        reinterpret_cast<T*>(qkv.data_ptr()),
+                        reinterpret_cast<T*>(qw.data_ptr()),
+                        reinterpret_cast<T*>(kw.data_ptr()),
+                        reinterpret_cast<T*>(cos_sin.data_ptr()),
+                        reinterpret_cast<int64_t*>(positions.data_ptr()),
                         0,
                         pos_strides[0],
                         num_tokens,
@@ -1647,10 +1626,10 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                         head_size,
                         is_neox_style,
                         eps,
-                        (T*)q_out.data_ptr<scalar_t>(),
-                        (mrope_utils::fp8e4m3fnuz*)k_cache.data_ptr(),
-                        (mrope_utils::fp8e4m3fnuz*)v_cache.data_ptr(),
-                        slot_mapping.data_ptr<int64_t>(),
+                        reinterpret_cast<T*>(q_out.data_ptr()),
+                        reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(k_cache.data_ptr()),
+                        reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_cache.data_ptr()),
+                        reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
                         stream,
                         per_tensor_k_scale_,
                         per_tensor_v_scale_,
@@ -1660,64 +1639,24 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(at::Tensor& qkv,
                         block_size,
                         x,
                         rotary_dim);
-                }
-                else if(kv_cache_dtype == at::ScalarType::Float8_e4m3fn)
-                {
-                    mrope_utils::fp8e4m3fn* k_out_fp8_ptr =
-                        (return_kv && k_out.has_value())
-                            ? (mrope_utils::fp8e4m3fn*)k_out.value().data_ptr()
-                            : nullptr;
-                    mrope_utils::fp8e4m3fn* v_out_fp8_ptr =
-                        (return_kv && v_out.has_value())
-                            ? (mrope_utils::fp8e4m3fn*)v_out.value().data_ptr()
-                            : nullptr;
-                    mrope_utils::fused_rope_rms_set_kv<T, mrope_utils::fp8e4m3fn>(
-                        (T*)qkv.data_ptr<scalar_t>(),
-                        (T*)qw.data_ptr<scalar_t>(),
-                        (T*)kw.data_ptr<scalar_t>(),
-                        (T*)cos_sin.data_ptr<scalar_t>(),
-                        positions.data_ptr<int64_t>(),
-                        0,
-                        pos_strides[0],
-                        num_tokens,
-                        num_heads_q,
-                        num_heads_k,
-                        num_heads_v,
-                        head_size,
-                        is_neox_style,
-                        eps,
-                        (T*)q_out.data_ptr<scalar_t>(),
-                        (mrope_utils::fp8e4m3fn*)k_cache.data_ptr(),
-                        (mrope_utils::fp8e4m3fn*)v_cache.data_ptr(),
-                        slot_mapping.data_ptr<int64_t>(),
-                        stream,
-                        per_tensor_k_scale_,
-                        per_tensor_v_scale_,
-                        k_out_fp8_ptr,
-                        v_out_fp8_ptr,
-                        use_shuffle_layout,
-                        block_size,
-                        x,
-                        rotary_dim);
-                }
-                else
-                {
-                    TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
-                }
+            }
+            else
+            {
+                AITER_CHECK(false, "Unsupported KV cache dtype: ", AiterDtype_to_str(kv_cache_dtype));
             }
         });
 }
 
-void fused_qk_norm_rope_2way(at::Tensor& q0,
-                             at::Tensor& k0,
-                             at::Tensor& q1,
-                             at::Tensor& k1,
-                             at::Tensor& w_q0,
-                             at::Tensor& w_k0,
-                             at::Tensor& w_q1,
-                             at::Tensor& w_k1,
-                             at::Tensor& cos_sin0,
-                             at::Tensor& cos_sin1,
+void fused_qk_norm_rope_2way(const aiter_tensor_t& q0,
+                             const aiter_tensor_t& k0,
+                             const aiter_tensor_t& q1,
+                             const aiter_tensor_t& k1,
+                             const aiter_tensor_t& w_q0,
+                             const aiter_tensor_t& w_k0,
+                             const aiter_tensor_t& w_q1,
+                             const aiter_tensor_t& w_k1,
+                             const aiter_tensor_t& cos_sin0,
+                             const aiter_tensor_t& cos_sin1,
                              int64_t batch_size,
                              int64_t num_tokens0,
                              int64_t num_tokens1,
@@ -1726,29 +1665,23 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                              int64_t head_size,
                              bool is_interleaved,
                              double eps,
-                             at::Tensor& out_q01,
-                             at::Tensor& out_k01)
+                             const aiter_tensor_t& out_q01,
+                             const aiter_tensor_t& out_k01)
 {
-    TORCH_CHECK(q0.is_contiguous() && k0.is_contiguous() && q1.is_contiguous() &&
-                k1.is_contiguous());
-    TORCH_CHECK(w_q0.is_contiguous() && w_k0.is_contiguous() && w_q1.is_contiguous() &&
-                w_k1.is_contiguous());
-    TORCH_CHECK(cos_sin0.is_contiguous() && cos_sin1.is_contiguous());
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q0));
-    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::kBFloat16, at::kHalf, q0.scalar_type(), "fused_qk_norm_rope_2way", [&] {
-            using T = KernelElementType<scalar_t>::type;
-            fused_rope_rms_2way<T>((T*)q0.data_ptr<scalar_t>(),
-                                   (T*)k0.data_ptr<scalar_t>(),
-                                   (T*)q1.data_ptr<scalar_t>(),
-                                   (T*)k1.data_ptr<scalar_t>(),
-                                   (T*)w_q0.data_ptr<scalar_t>(),
-                                   (T*)w_k0.data_ptr<scalar_t>(),
-                                   (T*)w_q1.data_ptr<scalar_t>(),
-                                   (T*)w_k1.data_ptr<scalar_t>(),
-                                   (T*)cos_sin0.data_ptr<scalar_t>(),
-                                   (T*)cos_sin1.data_ptr<scalar_t>(),
+    HipDeviceGuard device_guard(q0.device_id);
+    auto stream = aiter::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING(q0.dtype(), "fused_qk_norm_rope_2way", [&] {
+            using T = scalar_t;
+            fused_rope_rms_2way<T>(reinterpret_cast<T*>(q0.data_ptr()),
+                                   reinterpret_cast<T*>(k0.data_ptr()),
+                                   reinterpret_cast<T*>(q1.data_ptr()),
+                                   reinterpret_cast<T*>(k1.data_ptr()),
+                                   reinterpret_cast<T*>(w_q0.data_ptr()),
+                                   reinterpret_cast<T*>(w_k0.data_ptr()),
+                                   reinterpret_cast<T*>(w_q1.data_ptr()),
+                                   reinterpret_cast<T*>(w_k1.data_ptr()),
+                                   reinterpret_cast<T*>(cos_sin0.data_ptr()),
+                                   reinterpret_cast<T*>(cos_sin1.data_ptr()),
                                    batch_size,
                                    num_tokens0,
                                    num_tokens1,
@@ -1757,86 +1690,119 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                                    head_size,
                                    is_interleaved,
                                    eps,
-                                   (T*)out_q01.data_ptr<scalar_t>(),
-                                   (T*)out_k01.data_ptr<scalar_t>(),
+                                   reinterpret_cast<T*>(out_q01.data_ptr()),
+                                   reinterpret_cast<T*>(out_k01.data_ptr()),
                                    stream);
         });
 }
 void fused_qk_norm_rope_cache_block_quant_shuffle(
-    at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
+    const aiter_tensor_t& qkv,                   // Combined QKV tensor [num_tokens,
                                        // (num_heads_q+num_heads_k+num_heads_v)*head_dim]
     int64_t num_heads_q,               // Number of query heads
     int64_t num_heads_k,               // Number of key heads
     int64_t num_heads_v,               // Number of value heads
     int64_t head_dim,                  // Dimension per head
     double eps,                        // Epsilon for RMS normalization
-    at::Tensor& q_weight,              // RMSNorm weights for query [head_dim]
-    at::Tensor& k_weight,              // RMSNorm weights for key [head_dim]
-    at::Tensor& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
+    const aiter_tensor_t& q_weight,              // RMSNorm weights for query [head_dim]
+    const aiter_tensor_t& k_weight,              // RMSNorm weights for key [head_dim]
+    const aiter_tensor_t& cos_sin_cache,         // Cos/sin cache [max_position, head_dim]
     bool is_neox,                      // Whether RoPE is applied in Neox style
-    at::Tensor& position_ids,          // Position IDs for RoPE [num_tokens]
-    at::Tensor& k_cache,               // k cache
-    at::Tensor& v_cache,               // v cache
-    at::Tensor& slot_mapping,          // slot mapping
-    at::Tensor& cu_q_len,              // cu q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
+    const aiter_tensor_t& position_ids,          // Position IDs for RoPE [num_tokens]
+    const aiter_tensor_t& k_cache,               // k cache
+    const aiter_tensor_t& v_cache,               // v cache
+    const aiter_tensor_t& slot_mapping,          // slot mapping
+    const aiter_tensor_t& cu_q_len,              // cu q len tensor [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
     const std::string& kv_cache_dtype, // kv cache data type
-    std::optional<at::Tensor> k_scale, // k scale tensor for quantized k cache
-    std::optional<at::Tensor> v_scale, // v scale tensor for quantized v cache
+    std::optional<aiter_tensor_t> k_scale, // k scale tensor for quantized k cache
+    std::optional<aiter_tensor_t> v_scale, // v scale tensor for quantized v cache
     int64_t max_tokens_per_batch       // max tokens in any single batch (0 = use avg, safe for uniform distributions)
 )
  {
-     // Input validation
-     CHECK_INPUT(qkv);
-     CHECK_INPUT(cu_q_len);
-     CHECK_INPUT(position_ids);
-     CHECK_INPUT(q_weight);
-     CHECK_INPUT(k_weight);
-     CHECK_INPUT(cos_sin_cache);
-     CHECK_TYPE(position_ids, torch::kInt64);
- 
-     TORCH_CHECK(qkv.dim() == 2,
+     AITER_CHECK(qkv.dim() == 2,
                  "QKV tensor must be 2D: [num_tokens, "
                  "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
-     TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
-     TORCH_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
-     TORCH_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
-     TORCH_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
-     TORCH_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
-     TORCH_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
-     TORCH_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
-     TORCH_CHECK(qkv.scalar_type() == q_weight.scalar_type() &&
-                     qkv.scalar_type() == k_weight.scalar_type(),
+     AITER_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
+     AITER_CHECK(q_weight.dim() == 1, "Query weights must be 1D: [head_dim]");
+     AITER_CHECK(k_weight.dim() == 1, "Key weights must be 1D: [head_dim]");
+     AITER_CHECK(cos_sin_cache.dim() == 2, "Cos/sin cache must be 2D: [max_position, head_dim]");
+     AITER_CHECK(q_weight.size(0) == head_dim, "Query weights size must match head dimension");
+     AITER_CHECK(k_weight.size(0) == head_dim, "Key weights size must match head dimension");
+     AITER_CHECK(cos_sin_cache.size(1) == head_dim, "Cos/sin cache dimension must match head_dim");
+     AITER_CHECK(qkv.dtype() == q_weight.dtype() &&
+                     qkv.dtype() == k_weight.dtype(),
                  "qkv, q_weight and k_weight must have the same dtype");
-     TORCH_CHECK(head_dim % 32 == 0,
+     AITER_CHECK(head_dim % 32 == 0,
                  "Head dimension must be multiple of 32 for fused QK Norm RoPE kernel");
-     TORCH_CHECK(
+     AITER_CHECK(
          num_heads_k <= 32,
          "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
 
      // cu_q_len format: [0, batch0_seq_len, batch0_seq_len + batch1_seq_len, ...]
      // batch_size = cu_q_len.size(0) - 1
-     TORCH_CHECK(cu_q_len.dim() == 1, "Cu Q len tensor must be 1D");
+     AITER_CHECK(cu_q_len.dim() == 1, "Cu Q len tensor must be 1D");
      int64_t batch_size = cu_q_len.size(0) - 1;
-     TORCH_CHECK(batch_size > 0, "Batch size must be greater than 0");
-     
+     AITER_CHECK(batch_size > 0, "Batch size must be greater than 0");
+
      int64_t num_tokens = qkv.size(0);
      int64_t page_size  = k_cache.size(-2);
      int64_t x          = k_cache.size(-1);
-     TORCH_CHECK(x > 0 && (x & (x - 1)) == 0,
+     AITER_CHECK(x > 0 && (x & (x - 1)) == 0,
                  "KV cache tiling size (x) must be a power of two, got ", x);
-     // vec_size is 8 for bf16/fp16, 4 for fp32; vec_per_x = x/vec_size requires x >= vec_size
-     TORCH_CHECK(x >= 4,
+     AITER_CHECK(x >= 4,
                  "KV cache tiling size (x) must be >= 4 for vectorized access, got ", x);
-     TORCH_CHECK(position_ids.size(0) == num_tokens,
+     AITER_CHECK(position_ids.size(0) == num_tokens,
                  "Number of tokens in position_ids must match QKV");
 
- 
+
      int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
-     TORCH_CHECK(qkv.size(1) == total_heads * head_dim,
+     AITER_CHECK(qkv.size(1) == total_heads * head_dim,
                  "QKV tensor size must match total number of heads and head dimension");
- 
-     auto stream = at::hip::getCurrentHIPStream(qkv.get_device());
-     DISPATCH_BY_KV_CACHE_DTYPE_OPUS(qkv.scalar_type(), kv_cache_dtype, CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT);
+
+     HipDeviceGuard device_guard(qkv.device_id);
+     auto stream = aiter::getCurrentHIPStream();
+
+     if(kv_cache_dtype == "auto")
+     {
+         if(qkv.dtype() == AITER_DTYPE_fp32)
+         {
+             CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(float, float, vllm::Fp8KVCacheDataType::kAuto);
+         }
+         else if(qkv.dtype() == AITER_DTYPE_fp16)
+         {
+             CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(opus::fp16_t, opus::fp16_t, vllm::Fp8KVCacheDataType::kAuto);
+         }
+         else if(qkv.dtype() == AITER_DTYPE_bf16)
+         {
+             CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(opus::bf16_t, opus::bf16_t, vllm::Fp8KVCacheDataType::kAuto);
+         }
+         else
+         {
+             AITER_CHECK(false, "Unsupported input type of kv cache: ", AiterDtype_to_str(qkv.dtype()));
+         }
+     }
+     else if(kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3")
+     {
+         if(qkv.dtype() == AITER_DTYPE_fp32)
+         {
+             CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(float, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+         }
+         else if(qkv.dtype() == AITER_DTYPE_fp16)
+         {
+             CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(opus::fp16_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+         }
+         else if(qkv.dtype() == AITER_DTYPE_bf16)
+         {
+             CALL_QK_NORM_ROPE_CACHE_BLOCK_QUANT(opus::bf16_t, opus::fp8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+         }
+         else
+         {
+             AITER_CHECK(false, "Unsupported input type of kv cache: ", AiterDtype_to_str(qkv.dtype()));
+         }
+     }
+     else
+     {
+         AITER_CHECK(false, "Unsupported data type of kv cache: ", kv_cache_dtype);
+     }
  }
 
 } // namespace aiter

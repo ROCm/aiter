@@ -14,20 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-
-#include "dispatch_utils.h"
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
-using __nv_bfloat16 = __hip_bfloat16;
-using __nv_bfloat162 = __hip_bfloat162;
-
-namespace vllm
+namespace aiter
 {
 
   template <typename scalar_t>
@@ -171,7 +167,7 @@ namespace vllm
 #if defined(USE_ROCM) || (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000))
   // CUDA < 12.0 runs into issues with packed type conversion
   template <>
-  struct _typeConvert<c10::Half>
+  struct _typeConvert<__half>
   {
     static constexpr bool exists = true;
     using hip_type = __half;
@@ -196,11 +192,11 @@ namespace vllm
   // CUDA_ARCH < 800 does not have BF16 support
   // TODO: Add in ROCm support once public headers handle bf16 maturely
   template <>
-  struct _typeConvert<c10::BFloat16>
+  struct _typeConvert<hip_bfloat16>
   {
     static constexpr bool exists = true;
-    using hip_type = __nv_bfloat16;
-    using packed_hip_type = __nv_bfloat162;
+    using hip_type = __hip_bfloat16;
+    using packed_hip_type = __hip_bfloat162;
 
     __device__ static inline float convert(hip_type x)
     {
@@ -552,11 +548,11 @@ namespace vllm
   //   }
   // }
 
-} // namespace vllm
+} // namespace aiter
 
-void rms_norm(torch::Tensor &out,    // [..., hidden_size]
-              torch::Tensor &input,  // [..., hidden_size]
-              torch::Tensor &weight, // [hidden_size]
+void rms_norm(const aiter_tensor_t &out,    // [..., hidden_size]
+              const aiter_tensor_t &input,  // [..., hidden_size]
+              const aiter_tensor_t &weight, // [hidden_size]
               double epsilon)
 {
   int hidden_size = input.size(-1);
@@ -564,12 +560,12 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
 
   dim3 grid(num_tokens);
   dim3 block(std::min(hidden_size, 1024));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
-  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
-                               { vllm::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
-                                     out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                                     weight.data_ptr<scalar_t>(), epsilon, num_tokens, hidden_size); });
+  HipDeviceGuard device_guard(input.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
+  AITER_DISPATCH_FLOATING(input.dtype(), "rms_norm_kernel", [&]
+                               { aiter::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                                     reinterpret_cast<scalar_t*>(out.data_ptr()), reinterpret_cast<scalar_t*>(input.data_ptr()),
+                                     reinterpret_cast<scalar_t*>(weight.data_ptr()), epsilon, num_tokens, hidden_size); });
 }
 
 // void scaled_rms_norm(torch::Tensor& out,     // [..., hidden_size]
@@ -593,16 +589,16 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
 // }
 
 #define LAUNCH_FUSED_ADD_RMS_NORM(width)                                                                                             \
-  VLLM_DISPATCH_FLOATING_TYPES(                                                                                                      \
-      input.scalar_type(), "fused_add_rms_norm_kernel", [&] { vllm::fused_add_rms_norm_kernel<scalar_t, width>                       \
-                                                                  <<<grid, block, 0, stream>>>(input.data_ptr<scalar_t>(),           \
-                                                                                               residual.data_ptr<scalar_t>(),        \
-                                                                                               weight.data_ptr<scalar_t>(), epsilon, \
+  AITER_DISPATCH_FLOATING(                                                                                                           \
+      input.dtype(), "fused_add_rms_norm_kernel", [&] { aiter::fused_add_rms_norm_kernel<scalar_t, width>                            \
+                                                                  <<<grid, block, 0, stream>>>(reinterpret_cast<scalar_t*>(input.data_ptr()),           \
+                                                                                               reinterpret_cast<scalar_t*>(residual.data_ptr()),        \
+                                                                                               reinterpret_cast<scalar_t*>(weight.data_ptr()), epsilon, \
                                                                                                num_tokens, hidden_size); });
 
-void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
-                        torch::Tensor &residual, // [..., hidden_size]
-                        torch::Tensor &weight,   // [hidden_size]
+void fused_add_rms_norm(const aiter_tensor_t &input,    // [..., hidden_size]
+                        const aiter_tensor_t &residual, // [..., hidden_size]
+                        const aiter_tensor_t &weight,   // [hidden_size]
                         double epsilon)
 {
   int hidden_size = input.size(-1);
@@ -615,8 +611,8 @@ void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
      hiding on global mem ops. */
   const int max_block_size = (num_tokens < 256) ? 1024 : 256;
   dim3 block(std::min(hidden_size, max_block_size));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  HipDeviceGuard device_guard(input.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
   /*If the tensor types are FP16/BF16, try to use the optimized kernel
     with packed + vectorized ops.
     Max optimization is achieved with a width-8 vector of FP16/BF16s

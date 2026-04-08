@@ -12,7 +12,7 @@ import functools
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", develop=True)
 def topk_softmax(
     topk_weights: Tensor,
     topk_indices: Tensor,
@@ -36,17 +36,17 @@ def topk_softmax_asm(
 ) -> None: ...
 
 
-@compile_ops("module_moe_topk")
+@compile_ops("module_moe_topk", develop=True)
 def topk_sigmoid(
     topk_weights: Tensor, topk_indices: Tensor, gating_output: Tensor
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", develop=True)
 def moe_sum(input: Tensor, output: Tensor) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", develop=True)
 def moe_align_block_size(
     topk_ids: Tensor,
     num_experts: int,

@@ -9,7 +9,7 @@ from ..jit.core import (
 )
 
 
-@compile_ops("module_topk_plain")
+@compile_ops("module_topk_plain", develop=True)
 def topk_plain(
     x: torch.Tensor,
     topk_ids: torch.Tensor,

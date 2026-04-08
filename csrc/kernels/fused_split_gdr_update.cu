@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/extension.h>
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
@@ -370,14 +371,14 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
         LAUNCH_KS(BK_CT, false, false);                              \
     }
 
-torch::Tensor fused_split_gdr_update(
-    torch::Tensor mixed_qkv,
-    torch::Tensor A_log,
-    torch::Tensor a,
-    torch::Tensor dt_bias,
-    torch::Tensor b_gate,
-    torch::Tensor initial_state_source,
-    torch::Tensor initial_state_indices,
+AiterTensor fused_split_gdr_update(
+    const aiter_tensor_t& mixed_qkv,
+    const aiter_tensor_t& A_log,
+    const aiter_tensor_t& a,
+    const aiter_tensor_t& dt_bias,
+    const aiter_tensor_t& b_gate,
+    const aiter_tensor_t& initial_state_source,
+    const aiter_tensor_t& initial_state_indices,
     int key_dim,
     int value_dim,
     int num_heads_qk,
@@ -387,18 +388,13 @@ torch::Tensor fused_split_gdr_update(
     float softplus_threshold,
     float scale,
     bool use_qk_l2norm_in_kernel,
-    c10::optional<torch::Tensor> output) {
-    TORCH_CHECK(mixed_qkv.is_cuda(), "mixed_qkv must be CUDA/HIP tensor");
-    TORCH_CHECK(A_log.is_cuda(), "A_log must be CUDA/HIP tensor");
-    TORCH_CHECK(a.is_cuda(), "a must be CUDA/HIP tensor");
-    TORCH_CHECK(dt_bias.is_cuda(), "dt_bias must be CUDA/HIP tensor");
-    TORCH_CHECK(b_gate.is_cuda(), "b_gate must be CUDA/HIP tensor");
-    TORCH_CHECK(mixed_qkv.scalar_type() == torch::kBFloat16, "mixed_qkv must be bfloat16");
-    TORCH_CHECK(A_log.scalar_type() == torch::kFloat32, "A_log must be float32");
-    TORCH_CHECK(a.scalar_type() == torch::kBFloat16, "a must be bfloat16");
-    TORCH_CHECK(dt_bias.scalar_type() == torch::kBFloat16, "dt_bias must be bfloat16");
-    TORCH_CHECK(b_gate.scalar_type() == torch::kBFloat16, "b_gate must be bfloat16");
-    TORCH_CHECK(mixed_qkv.dim() == 3, "mixed_qkv must be 3-D (B, dim, T)");
+    std::optional<aiter_tensor_t> output) {
+    AITER_CHECK(mixed_qkv.dtype() == AITER_DTYPE_bf16, "mixed_qkv must be bfloat16");
+    AITER_CHECK(A_log.dtype() == AITER_DTYPE_fp32, "A_log must be float32");
+    AITER_CHECK(a.dtype() == AITER_DTYPE_bf16, "a must be bfloat16");
+    AITER_CHECK(dt_bias.dtype() == AITER_DTYPE_bf16, "dt_bias must be bfloat16");
+    AITER_CHECK(b_gate.dtype() == AITER_DTYPE_bf16, "b_gate must be bfloat16");
+    AITER_CHECK(mixed_qkv.dim() == 3, "mixed_qkv must be 3-D (B, dim, T)");
 
     const int B = mixed_qkv.size(0);
     const int dim = mixed_qkv.size(1);
@@ -408,60 +404,61 @@ torch::Tensor fused_split_gdr_update(
     const int K = head_dim;
     const int V = head_dim;
 
-    TORCH_CHECK(H > 0 && HV > 0, "num_heads_qk/num_heads_v must be > 0");
-    TORCH_CHECK(HV >= H, "num_heads_v must be >= num_heads_qk");
-    TORCH_CHECK(HV % H == 0, "num_heads_v must be divisible by num_heads_qk");
-    TORCH_CHECK(dim == 2 * key_dim + value_dim, "mixed_qkv dim mismatch");
-    TORCH_CHECK(K % 4 == 0, "head_dim must be divisible by 4");
-    TORCH_CHECK(A_log.numel() == HV, "A_log shape mismatch");
-    TORCH_CHECK(dt_bias.numel() == HV, "dt_bias shape mismatch");
-    TORCH_CHECK(a.numel() == static_cast<int64_t>(B) * T * HV, "a shape mismatch");
-    TORCH_CHECK(
+    AITER_CHECK(H > 0 && HV > 0, "num_heads_qk/num_heads_v must be > 0");
+    AITER_CHECK(HV >= H, "num_heads_v must be >= num_heads_qk");
+    AITER_CHECK(HV % H == 0, "num_heads_v must be divisible by num_heads_qk");
+    AITER_CHECK(dim == 2 * key_dim + value_dim, "mixed_qkv dim mismatch");
+    AITER_CHECK(K % 4 == 0, "head_dim must be divisible by 4");
+    AITER_CHECK(A_log.numel() == HV, "A_log shape mismatch");
+    AITER_CHECK(dt_bias.numel() == HV, "dt_bias shape mismatch");
+    AITER_CHECK(a.numel() == static_cast<int64_t>(B) * T * HV, "a shape mismatch");
+    AITER_CHECK(
         b_gate.numel() == static_cast<int64_t>(B) * T * HV,
         "b_gate shape mismatch");
 
-    bool use_initial_state = initial_state_source.defined() && initial_state_source.numel() > 0;
+    bool use_initial_state = initial_state_source.data_ptr() != nullptr && initial_state_source.numel() > 0;
     if (use_initial_state) {
-        TORCH_CHECK(initial_state_source.is_cuda(), "initial_state_source must be CUDA/HIP tensor");
-        TORCH_CHECK(initial_state_source.scalar_type() == torch::kFloat32, "initial_state_source must be float32");
-        TORCH_CHECK(initial_state_source.dim() == 5, "initial_state_source must be 5-D swizzled tensor");
-        TORCH_CHECK(initial_state_source.size(1) == HV, "initial_state_source HV mismatch");
-        TORCH_CHECK(initial_state_source.size(2) * 4 == K, "initial_state_source K/4 mismatch");
-        TORCH_CHECK(initial_state_source.size(3) == V, "initial_state_source V mismatch");
-        TORCH_CHECK(initial_state_source.size(4) == 4, "initial_state_source last dim must be 4");
-        TORCH_CHECK(
-            initial_state_indices.defined() && initial_state_indices.numel() == B,
+        AITER_CHECK(initial_state_source.dtype() == AITER_DTYPE_fp32, "initial_state_source must be float32");
+        AITER_CHECK(initial_state_source.dim() == 5, "initial_state_source must be 5-D swizzled tensor");
+        AITER_CHECK(initial_state_source.size(1) == HV, "initial_state_source HV mismatch");
+        AITER_CHECK(initial_state_source.size(2) * 4 == K, "initial_state_source K/4 mismatch");
+        AITER_CHECK(initial_state_source.size(3) == V, "initial_state_source V mismatch");
+        AITER_CHECK(initial_state_source.size(4) == 4, "initial_state_source last dim must be 4");
+        AITER_CHECK(
+            initial_state_indices.data_ptr() != nullptr && initial_state_indices.numel() == B,
             "initial_state_indices must be provided with shape [B]");
-        TORCH_CHECK(initial_state_indices.is_cuda(), "initial_state_indices must be CUDA/HIP tensor");
-        TORCH_CHECK(initial_state_indices.scalar_type() == torch::kInt32, "initial_state_indices must be int32");
+        AITER_CHECK(initial_state_indices.dtype() == AITER_DTYPE_i32, "initial_state_indices must be int32");
     }
 
     if (scale <= 0.0f) {
         scale = 1.0f / std::sqrt(static_cast<float>(K));
     }
 
-    torch::Tensor o;
+    AiterTensor o_storage;
+    aiter_tensor_t o;
     if (output.has_value()) {
         o = output.value();
-        TORCH_CHECK(o.is_cuda(), "output must be CUDA/HIP tensor");
-        TORCH_CHECK(o.scalar_type() == torch::kBFloat16, "output must be bfloat16");
-        TORCH_CHECK(
+        AITER_CHECK(o.dtype() == AITER_DTYPE_bf16, "output must be bfloat16");
+        AITER_CHECK(
             o.size(0) == B && o.size(1) == T && o.size(2) == HV && o.size(3) == V,
             "output shape mismatch");
     } else {
-        o = torch::empty({B, T, HV, V}, mixed_qkv.options());
+        o_storage = AiterTensor::empty({B, T, HV, V}, mixed_qkv.dtype(), mixed_qkv.device_id);
+        o = o_storage;
     }
 
-    torch::Tensor initial_state_indices_ptr = initial_state_indices;
-    if (!initial_state_indices_ptr.defined() || initial_state_indices_ptr.numel() == 0) {
-        initial_state_indices_ptr = torch::zeros({B}, mixed_qkv.options().dtype(torch::kInt32));
+    AiterTensor initial_state_indices_storage;
+    aiter_tensor_t initial_state_indices_ptr = initial_state_indices;
+    if (initial_state_indices.data_ptr() == nullptr || initial_state_indices.numel() == 0) {
+        initial_state_indices_storage = AiterTensor::zeros({B}, AITER_DTYPE_i32, mixed_qkv.device_id);
+        initial_state_indices_ptr = initial_state_indices_storage;
     }
 
     int bk_runtime = 1;
     while (bk_runtime < K) {
         bk_runtime <<= 1;
     }
-    TORCH_CHECK((K + bk_runtime - 1) / bk_runtime == 1, "NK > 1 unsupported");
+    AITER_CHECK((K + bk_runtime - 1) / bk_runtime == 1, "NK > 1 unsupported");
 
     constexpr int BV_VAL = 64;
     constexpr int BV_OUT = BV_VAL / 4;
@@ -475,7 +472,8 @@ torch::Tensor fused_split_gdr_update(
     const int64_t stride_o_seq = o.stride(1);
     const int64_t stride_o_head = o.stride(2);
     const int64_t stride_o_dim = o.stride(3);
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
+    HipDeviceGuard device_guard(mixed_qkv.device_id);
+    auto stream = aiter::getCurrentHIPStream();
 
     if (bk_runtime == 128) {
         DISPATCH_KS_BOOL(128);
@@ -486,10 +484,10 @@ torch::Tensor fused_split_gdr_update(
     } else if (bk_runtime == 32) {
         DISPATCH_KS_BOOL(32);
     } else {
-        TORCH_CHECK(false, "Unsupported BK: ", bk_runtime);
+        AITER_CHECK(false, "Unsupported BK: ", bk_runtime);
     }
 
-    return o;
+    return o_storage.numel() > 0 ? std::move(o_storage) : AiterTensor(o);
 }
 
 #undef DISPATCH_KS_BOOL

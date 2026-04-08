@@ -18,14 +18,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "dispatch_utils.h"
 #include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
 #include "py_itfs_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
 
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
@@ -615,12 +614,12 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
             case 8: LAUNCH_SOFTMAX_WITH_SHARED(NUM_EXPERTS, WARPS_PER_TB, 8,               \
                                               SharedExpertScoringFunc::SIGMOID); break;     \
             default:                                                                        \
-                TORCH_CHECK(false, "Unsupported num_shared_experts: " +                    \
+                AITER_CHECK(false, "Unsupported num_shared_experts: " +                    \
                             std::to_string(num_shared_experts) +                            \
                             ". Supported values: 1, 2, 4, 8");                              \
             }                                                                               \
         } else {                                                                            \
-            TORCH_CHECK(false, "Unsupported scoring function");                             \
+            AITER_CHECK(false, "Unsupported scoring function");                             \
         }                                                                                   \
     } while(0)
 
@@ -678,7 +677,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported shared expert scoring function: " + shared_experts_scoring_func);
+            AITER_CHECK(false, "Unsupported shared expert scoring function: " + shared_experts_scoring_func);
         }
     }
 
@@ -698,7 +697,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
     case 256: LAUNCH_SOFTMAX(256, WARPS_PER_TB); break;
     case 512: LAUNCH_SOFTMAX(512, 2); break;
     default: {
-        TORCH_CHECK(
+        AITER_CHECK(
             softmax_workspace != nullptr,
             "softmax_workspace must be provided for num_experts that are not a power of 2.");
         static constexpr int TPB = 256;
@@ -757,10 +756,10 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
 
 namespace aiter {
 
-void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + num_shared_experts]
-                  torch::Tensor& topk_indices,         // [num_tokens, topk]
-                  torch::Tensor& token_expert_indices, // [num_tokens, topk]
-                  torch::Tensor& gating_output,        // [num_tokens, num_experts + num_shared_experts]
+void topk_softmax(const aiter_tensor_t& topk_weights,         // [num_tokens, topk + num_shared_experts]
+                  const aiter_tensor_t& topk_indices,         // [num_tokens, topk]
+                  const aiter_tensor_t& token_expert_indices, // [num_tokens, topk]
+                  const aiter_tensor_t& gating_output,        // [num_tokens, num_experts + num_shared_experts]
                   bool need_renorm,
                   int num_shared_experts,
                   const std::string& shared_expert_scoring_func)
@@ -778,7 +777,7 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + nu
     // Validate shared expert scoring function
     if(num_shared_experts > 0 && !shared_expert_scoring_func.empty())
     {
-        TORCH_CHECK(shared_expert_scoring_func == "sigmoid",
+        AITER_CHECK(shared_expert_scoring_func == "sigmoid",
                    "Only 'sigmoid' scoring function is supported for shared experts, got: " +
                    shared_expert_scoring_func);
     }
@@ -787,20 +786,20 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + nu
     const bool needs_workspace   = !is_pow_2 || num_routing_experts > 256;
     const int64_t workspace_size = needs_workspace ? num_tokens * num_routing_experts : 0;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    torch::Tensor softmax_workspace =
-        torch::empty({workspace_size}, gating_output.options().dtype(torch::kFloat32));
+    HipDeviceGuard device_guard(gating_output.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    auto softmax_workspace =
+        AiterTensor::empty({workspace_size}, AITER_DTYPE_fp32, gating_output.device_id);
 
     // Process routing experts with softmax + topk, and shared experts with sigmoid in one kernel
-    VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "topk_softmax", [&] {
+    AITER_DISPATCH_FLOATING(gating_output.dtype(), "topk_softmax", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
         vllm::moe::topkGatingSoftmaxKernelLauncher(
             reinterpret_cast<input_dtype*>(gating_output.data_ptr()),
-            topk_weights.data_ptr<float>(),
-            topk_indices.data_ptr<int>(),
-            token_expert_indices.data_ptr<int>(),
-            softmax_workspace.data_ptr<float>(),
+            reinterpret_cast<float*>(topk_weights.data_ptr()),
+            reinterpret_cast<int*>(topk_indices.data_ptr()),
+            reinterpret_cast<int*>(token_expert_indices.data_ptr()),
+            reinterpret_cast<float*>(softmax_workspace.data_ptr()),
             num_tokens,
             num_routing_experts,  // Only routing experts for softmax
             num_shared_experts,   // Number of shared experts to process with sigmoid
@@ -814,8 +813,8 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + nu
     });
 }
 
-void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
-             torch::Tensor& output) // [num_tokens, hidden_size]
+void moe_sum(const aiter_tensor_t& input,  // [num_tokens, topk, hidden_size]
+             const aiter_tensor_t& output) // [num_tokens, hidden_size]
 {
     const int hidden_size = input.size(-1);
     const int num_tokens  = output.numel() / hidden_size;
@@ -824,32 +823,32 @@ void moe_sum(torch::Tensor& input,  // [num_tokens, topk, hidden_size]
     dim3 grid(num_tokens);
     dim3 block(std::min(hidden_size, 1024));
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(output));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(output.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     switch(topk)
     {
     case 2:
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
+        AITER_DISPATCH_FLOATING(input.dtype(), "moe_sum_kernel", [&] {
             vllm::moe::moe_sum_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(
-                output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
+                reinterpret_cast<scalar_t*>(output.data_ptr()), reinterpret_cast<scalar_t*>(input.data_ptr()), hidden_size);
         });
         break;
 
     case 4:
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
+        AITER_DISPATCH_FLOATING(input.dtype(), "moe_sum_kernel", [&] {
             vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block, 0, stream>>>(
-                output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
+                reinterpret_cast<scalar_t*>(output.data_ptr()), reinterpret_cast<scalar_t*>(input.data_ptr()), hidden_size);
         });
         break;
 
     case 5:
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "moe_sum_kernel", [&] {
+        AITER_DISPATCH_FLOATING(input.dtype(), "moe_sum_kernel", [&] {
             vllm::moe::moe_sum_kernel<scalar_t, 5><<<grid, block, 0, stream>>>(
-                output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
+                reinterpret_cast<scalar_t*>(output.data_ptr()), reinterpret_cast<scalar_t*>(input.data_ptr()), hidden_size);
         });
         break;
-    default: at::sum_out(output, input, 1); break;
+    default: AITER_CHECK(false, "moe_sum: unsupported topk=", topk, ", supported: 2, 4, 5"); break;
     }
 }
 

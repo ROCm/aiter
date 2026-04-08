@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-
-#include "dispatch_utils.h"
 #include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 
@@ -22,48 +20,49 @@
 
 namespace aiter {
 
-void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& block_mapping)
+void swap_blocks(const aiter_tensor_t& src, const aiter_tensor_t& dst, const aiter_tensor_t& block_mapping)
 {
-    torch::Device src_device = src.device();
-    torch::Device dst_device = dst.device();
+    const bool src_is_gpu = (src.device_id >= 0);
+    const bool dst_is_gpu = (dst.device_id >= 0);
     hipMemcpyKind memcpy_type;
-    if(src_device.is_cuda() && dst_device.is_cuda())
+    if(src_is_gpu && dst_is_gpu)
     {
-        TORCH_CHECK(src_device.index() == dst_device.index(),
+        AITER_CHECK(src.device_id == dst.device_id,
                     "src and dst must be on the same GPU");
         memcpy_type = hipMemcpyDeviceToDevice;
     }
-    else if(src_device.is_cuda() && dst_device.is_cpu())
+    else if(src_is_gpu && !dst_is_gpu)
     {
         memcpy_type = hipMemcpyDeviceToHost;
     }
-    else if(src_device.is_cpu() && dst_device.is_cuda())
+    else if(!src_is_gpu && dst_is_gpu)
     {
         memcpy_type = hipMemcpyHostToDevice;
     }
     else
     {
-        TORCH_CHECK(false, "Invalid device combination");
+        AITER_CHECK(false, "Invalid device combination");
     }
 
     // NOTE(youkaichao): keep in mind that `block_mapping` should be
     // a cpu tensor, otherwise every `item` call will require a gpu-cpu
     // synchronization.
-    TORCH_CHECK(block_mapping.device().is_cpu(), "block_mapping must be on CPU");
+    AITER_CHECK(block_mapping.device_id < 0, "block_mapping must be on CPU");
 
     char* src_ptr = static_cast<char*>(src.data_ptr());
     char* dst_ptr = static_cast<char*>(dst.data_ptr());
 
-    const int64_t block_size_in_bytes = src.element_size() * src[0].numel();
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
-        src_device.is_cuda() ? src_device : dst_device);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const int64_t block_size_in_bytes = src.element_size() * (src.numel() / src.size(0));
+    const int gpu_device_id = src_is_gpu ? src.device_id : dst.device_id;
+    HipDeviceGuard device_guard(gpu_device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     // NOTE(woosuk): This can be slow if the number of blocks is large.
     const int64_t num_blocks = block_mapping.size(0);
+    const int64_t* mapping_ptr = reinterpret_cast<const int64_t*>(block_mapping.data_ptr());
     for(size_t i = 0; i < num_blocks; i++)
     {
-        int64_t src_block_number = block_mapping[i][0].item<int64_t>();
-        int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
+        int64_t src_block_number = mapping_ptr[i * 2];
+        int64_t dst_block_number = mapping_ptr[i * 2 + 1];
         int64_t src_offset       = src_block_number * block_size_in_bytes;
         int64_t dst_offset       = dst_block_number * block_size_in_bytes;
         hipMemcpyAsync(
@@ -110,21 +109,18 @@ __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
 
 namespace aiter {
 
-// Note: the key_caches and value_caches vectors are constant but
-// not the Tensors they contain. The vectors need to be const refs
-// in order to satisfy pytorch's C++ operator registration code.
-void copy_blocks(std::vector<torch::Tensor> const& key_caches,
-                 std::vector<torch::Tensor> const& value_caches,
-                 const torch::Tensor& block_mapping)
+void copy_blocks(std::vector<aiter_tensor_t> const& key_caches,
+                 std::vector<aiter_tensor_t> const& value_caches,
+                 const aiter_tensor_t& block_mapping)
 {
     int num_layers = key_caches.size();
-    TORCH_CHECK(num_layers == value_caches.size());
+    AITER_CHECK(num_layers == (int)value_caches.size(), "key_caches and value_caches size mismatch");
     if(num_layers == 0)
     {
         return;
     }
-    torch::Device cache_device = key_caches[0].device();
-    TORCH_CHECK(cache_device.is_cuda());
+    const int cache_device_id = key_caches[0].device_id;
+    AITER_CHECK(cache_device_id >= 0, "cache must be on GPU");
 
     // Create data structures for the kernel.
     // Create an array of pointers to the key and value caches.
@@ -141,25 +137,31 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
 
     // Move the data structures to the GPU.
     // NOTE: This synchronizes the CPU and GPU.
-    torch::Tensor key_cache_ptrs_tensor =
-        torch::from_blob(key_cache_ptrs, {num_layers}, torch::kInt64).to(cache_device);
-    torch::Tensor value_cache_ptrs_tensor =
-        torch::from_blob(value_cache_ptrs, {num_layers}, torch::kInt64).to(cache_device);
+    int64_t* d_key_cache_ptrs = nullptr;
+    int64_t* d_value_cache_ptrs = nullptr;
+    HIP_CALL(hipMalloc(&d_key_cache_ptrs, num_layers * sizeof(int64_t)));
+    HIP_CALL(hipMalloc(&d_value_cache_ptrs, num_layers * sizeof(int64_t)));
+    HIP_CALL(hipMemcpy(d_key_cache_ptrs, key_cache_ptrs,
+                       num_layers * sizeof(int64_t), hipMemcpyHostToDevice));
+    HIP_CALL(hipMemcpy(d_value_cache_ptrs, value_cache_ptrs,
+                       num_layers * sizeof(int64_t), hipMemcpyHostToDevice));
 
     // Launch the kernel.
-    const int numel_per_block = key_caches[0][0].numel();
+    const int numel_per_block = key_caches[0].numel() / key_caches[0].size(0);
     dim3 grid(num_layers, num_pairs);
     dim3 block(std::min(1024, numel_per_block));
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(cache_device);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(key_caches[0].scalar_type(), "copy_blocks_kernel", ([&] {
+    HipDeviceGuard device_guard(cache_device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING_AND_BYTE(key_caches[0].dtype(), "copy_blocks_kernel", ([&] {
                                               aiter::copy_blocks_kernel<scalar_t>
                                                   <<<grid, block, 0, stream>>>(
-                                                      key_cache_ptrs_tensor.data_ptr<int64_t>(),
-                                                      value_cache_ptrs_tensor.data_ptr<int64_t>(),
-                                                      block_mapping.data_ptr<int64_t>(),
+                                                      d_key_cache_ptrs,
+                                                      d_value_cache_ptrs,
+                                                      reinterpret_cast<int64_t*>(block_mapping.data_ptr()),
                                                       numel_per_block);
                                           }));
+    HIP_CALL(hipFree(d_key_cache_ptrs));
+    HIP_CALL(hipFree(d_value_cache_ptrs));
 }
 
 } // namespace aiter
@@ -2597,15 +2599,15 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
                                      reinterpret_cast<KV_T*>(value.data_ptr()),                  \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),         \
-                                     slot_mapping.data_ptr<int64_t>(),                           \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                           \
                                      key_stride,                                                 \
                                      value_stride,                                               \
                                      num_heads,                                                  \
                                      head_size,                                                  \
                                      block_size,                                                 \
                                      x,                                                          \
-                                     k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr, \
-                                     v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr);
+                                     k_scale.has_value() ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr, \
+                                     v_scale.has_value() ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr);
 
 #define CALL_RESHAPE_AND_CACHE_ASM(KV_T, CACHE_T, KV_DTYPE)                                      \
     aiter::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, true>                               \
@@ -2613,27 +2615,27 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
                                      reinterpret_cast<KV_T*>(value.data_ptr()),                  \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),         \
-                                     slot_mapping.data_ptr<int64_t>(),                           \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                           \
                                      key_stride,                                                 \
                                      value_stride,                                               \
                                      num_heads,                                                  \
                                      head_size,                                                  \
                                      block_size,                                                 \
                                      x,                                                          \
-                                     k_scale.has_value() ? k_scale->data_ptr<float>() : nullptr, \
-                                     v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr);
+                                     k_scale.has_value() ? reinterpret_cast<float*>(k_scale->data_ptr()) : nullptr, \
+                                     v_scale.has_value() ? reinterpret_cast<float*>(v_scale->data_ptr()) : nullptr);
 
 namespace aiter {
 
 void reshape_and_cache(
-    torch::Tensor& key,          // [num_tokens, num_heads, head_size]
-    torch::Tensor& value,        // [num_tokens, num_heads, head_size]
-    torch::Tensor& key_cache,    // [num_blocks, num_heads, head_size/x, block_size, x]
-    torch::Tensor& value_cache,  // [num_blocks, num_heads, head_size, block_size]
-    torch::Tensor& slot_mapping, // [num_tokens]
+    const aiter_tensor_t& key,          // [num_tokens, num_heads, head_size]
+    const aiter_tensor_t& value,        // [num_tokens, num_heads, head_size]
+    const aiter_tensor_t& key_cache,    // [num_blocks, num_heads, head_size/x, block_size, x]
+    const aiter_tensor_t& value_cache,  // [num_blocks, num_heads, head_size, block_size]
+    const aiter_tensor_t& slot_mapping, // [num_tokens]
     const std::string& kv_cache_dtype,
-    std::optional<torch::Tensor> k_scale,
-    std::optional<torch::Tensor> v_scale,
+    std::optional<aiter_tensor_t> k_scale,
+    std::optional<aiter_tensor_t> v_scale,
     const bool asm_layout)
 {
     int num_tokens = key.size(0);
@@ -2647,8 +2649,8 @@ void reshape_and_cache(
 
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(key.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     if(asm_layout)
     {
@@ -2671,27 +2673,27 @@ void reshape_and_cache(
                                      reinterpret_cast<KV_T*>(value.data_ptr()),          \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),   \
                                      reinterpret_cast<CACHE_T*>(value_cache.data_ptr()), \
-                                     slot_mapping.data_ptr<int64_t>(),                   \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                   \
                                      block_stride,                                       \
                                      key_stride,                                         \
                                      value_stride,                                       \
                                      num_heads,                                          \
                                      head_size,                                          \
                                      block_size,                                         \
-                                     k_scale.data_ptr<float>(),                          \
-                                     v_scale.data_ptr<float>());
+                                     reinterpret_cast<float*>(k_scale.data_ptr()),                          \
+                                     reinterpret_cast<float*>(v_scale.data_ptr()));
 
 namespace aiter {
 
 void reshape_and_cache_flash(
-    torch::Tensor& key,          // [num_tokens, num_heads, head_size]
-    torch::Tensor& value,        // [num_tokens, num_heads, head_size]
-    torch::Tensor& key_cache,    // [num_blocks, block_size, num_heads, head_size]
-    torch::Tensor& value_cache,  // [num_blocks, block_size, num_heads, head_size]
-    torch::Tensor& slot_mapping, // [num_tokens]
+    const aiter_tensor_t& key,          // [num_tokens, num_heads, head_size]
+    const aiter_tensor_t& value,        // [num_tokens, num_heads, head_size]
+    const aiter_tensor_t& key_cache,    // [num_blocks, block_size, num_heads, head_size]
+    const aiter_tensor_t& value_cache,  // [num_blocks, block_size, num_heads, head_size]
+    const aiter_tensor_t& slot_mapping, // [num_tokens]
     const std::string& kv_cache_dtype,
-    torch::Tensor& k_scale,
-    torch::Tensor& v_scale)
+    const aiter_tensor_t& k_scale,
+    const aiter_tensor_t& v_scale)
 {
     int num_tokens = key.size(0);
     int num_heads  = key.size(1);
@@ -2701,12 +2703,12 @@ void reshape_and_cache_flash(
     int key_stride   = key.stride(0);
     int value_stride = value.stride(0);
     int block_stride = key_cache.stride(0);
-    TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
+    AITER_CHECK(key_cache.stride(0) == value_cache.stride(0));
 
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(key.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     DISPATCH_BY_KV_CACHE_DTYPE_OPUS(key.dtype(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE_FLASH);
 }
@@ -2726,7 +2728,7 @@ void reshape_and_cache_flash(
                 reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
                 reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
                 reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
-                slot_mapping.data_ptr<int64_t>(),                                                  \
+                reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                  \
                 key_stride,                                                                        \
                 value_stride,                                                                      \
                 num_heads,                                                                         \
@@ -2746,7 +2748,7 @@ void reshape_and_cache_flash(
                 reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
                 reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
                 reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
-                slot_mapping.data_ptr<int64_t>(),                                                  \
+                reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                  \
                 key_stride,                                                                        \
                 value_stride,                                                                      \
                 num_heads,                                                                         \
@@ -2768,7 +2770,7 @@ void reshape_and_cache_flash(
                 reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                            \
                 reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),               \
                 reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),               \
-                slot_mapping.data_ptr<int64_t>(),                                              \
+                reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                              \
                 key_stride,                                                                    \
                 value_stride,                                                                  \
                 num_heads,                                                                     \
@@ -2789,7 +2791,7 @@ void reshape_and_cache_flash(
                 reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                            \
                 reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),               \
                 reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),               \
-                slot_mapping.data_ptr<int64_t>(),                                              \
+                reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                              \
                 key_stride,                                                                    \
                 value_stride,                                                                  \
                 num_heads,                                                                     \
@@ -2815,7 +2817,7 @@ void reshape_and_cache_flash(
                 reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
                 reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
                 reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
-                slot_mapping.data_ptr<int64_t>(),                                                  \
+                reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                  \
                 key_stride,                                                                        \
                 value_stride,                                                                      \
                 num_heads,                                                                         \
@@ -2837,7 +2839,7 @@ void reshape_and_cache_flash(
                 reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
                 reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
                 reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
-                slot_mapping.data_ptr<int64_t>(),                                                  \
+                reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                  \
                 key_stride,                                                                        \
                 value_stride,                                                                      \
                 num_heads,                                                                         \
@@ -2858,7 +2860,7 @@ void reshape_and_cache_flash(
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(kv_c.data_ptr()),        \
                                      reinterpret_cast<KV_T*>(k_pe.data_ptr()),        \
                                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()), \
-                                     slot_mapping.data_ptr<int64_t>(),                \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                \
                                      block_stride,                                    \
                                      entry_stride,                                    \
                                      kv_c_stride,                                     \
@@ -2873,7 +2875,7 @@ void reshape_and_cache_flash(
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(kv_c.data_ptr()),        \
                                      reinterpret_cast<KV_T*>(k_pe.data_ptr()),        \
                                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()), \
-                                     slot_mapping.data_ptr<int64_t>(),                \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                \
                                      block_stride,                                    \
                                      entry_stride,                                    \
                                      kv_c_stride,                                     \
@@ -2889,7 +2891,7 @@ void reshape_and_cache_flash(
         indexer_k_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, blockDimx, blockDimy, vec_size> \
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(k.data_ptr()),                       \
                                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),             \
-                                     slot_mapping.data_ptr<int64_t>(),                            \
+                                     reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                            \
                                      num_tokens,                                                  \
                                      head_dim,                                                    \
                                      quant_block_size,                                            \
@@ -2907,8 +2909,8 @@ void reshape_and_cache_flash(
            stream>>>(reinterpret_cast<char*>(kv_cache.data_ptr()),  \
                      reinterpret_cast<char*>(dst_k.data_ptr()),     \
                      reinterpret_cast<char*>(dst_scale.data_ptr()), \
-                     block_table.data_ptr<int32_t>(),               \
-                     cu_seq_lens.data_ptr<int32_t>(),               \
+                     reinterpret_cast<int32_t*>(block_table.data_ptr()),               \
+                     reinterpret_cast<int32_t*>(cu_seq_lens.data_ptr()),               \
                      batch_size,                                    \
                      dst_k.stride(0),                               \
                      dst_k.size(1),                                 \
@@ -2928,8 +2930,8 @@ void reshape_and_cache_flash(
          reinterpret_cast<KV_T*>(k_pe.data_ptr()),                                               \
          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
          reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
-         slot_mapping.data_ptr<int64_t>(),                                                       \
-         positions.data_ptr<int64_t>(),                                                          \
+         reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                       \
+         reinterpret_cast<int64_t*>(positions.data_ptr()),                                                          \
          reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                                          \
          reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                                          \
          block_stride, entry_stride,                                                             \
@@ -2948,8 +2950,8 @@ void reshape_and_cache_flash(
          reinterpret_cast<KV_T*>(k_pe.data_ptr()),                                               \
          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
          reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
-         slot_mapping.data_ptr<int64_t>(),                                                       \
-         positions.data_ptr<int64_t>(),                                                          \
+         reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                       \
+         reinterpret_cast<int64_t*>(positions.data_ptr()),                                                          \
          reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                                          \
          reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                                          \
          block_stride, entry_stride,                                                             \
@@ -2968,8 +2970,8 @@ void reshape_and_cache_flash(
                  reinterpret_cast<KV_T*>(k_pe.data_ptr()),                                               \
                  reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
                  reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
-                 slot_mapping.data_ptr<int64_t>(),                                                       \
-                 positions.data_ptr<int64_t>(),                                                          \
+                 reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                       \
+                 reinterpret_cast<int64_t*>(positions.data_ptr()),                                                          \
                  reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                                          \
                  reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                                          \
                  block_stride, entry_stride, kv_cache_stride_h,                                             \
@@ -2989,8 +2991,8 @@ void reshape_and_cache_flash(
                          reinterpret_cast<KV_T*>(k_pe.data_ptr()),                                               \
                          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
                          reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
-                         slot_mapping.data_ptr<int64_t>(),                                                       \
-                         positions.data_ptr<int64_t>(),                                                          \
+                         reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),                                                       \
+                         reinterpret_cast<int64_t*>(positions.data_ptr()),                                                          \
                          reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                                          \
                          reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                                          \
                          block_stride, entry_stride, kv_cache_stride_h,                                             \
@@ -3004,13 +3006,13 @@ void reshape_and_cache_flash(
 namespace aiter {
 
 void reshape_and_cache_with_pertoken_quant(
-    torch::Tensor& key,              // [num_tokens, num_heads, head_size]
-    torch::Tensor& value,            // [num_tokens, num_heads, head_size]
-    torch::Tensor& key_cache,        // [num_blocks, num_heads, head_size/x, block_size, x]
-    torch::Tensor& value_cache,      // [num_blocks, num_heads, head_size, block_size]
-    torch::Tensor& k_dequant_scales, // [num_heads, max_kv_tokens]
-    torch::Tensor& v_dequant_scales, // [num_heads, max_kv_tokens]
-    torch::Tensor& slot_mapping,     // [num_tokens]
+    const aiter_tensor_t& key,              // [num_tokens, num_heads, head_size]
+    const aiter_tensor_t& value,            // [num_tokens, num_heads, head_size]
+    const aiter_tensor_t& key_cache,        // [num_blocks, num_heads, head_size/x, block_size, x]
+    const aiter_tensor_t& value_cache,      // [num_blocks, num_heads, head_size, block_size]
+    const aiter_tensor_t& k_dequant_scales, // [num_heads, max_kv_tokens]
+    const aiter_tensor_t& v_dequant_scales, // [num_heads, max_kv_tokens]
+    const aiter_tensor_t& slot_mapping,     // [num_tokens]
     const bool asm_layout)
 {
     int num_tokens    = key.size(0);
@@ -3019,57 +3021,57 @@ void reshape_and_cache_with_pertoken_quant(
     int block_size    = key_cache.size(3);
     int x             = key_cache.size(4);
     int max_kv_tokens = k_dequant_scales.size(1);
-    TORCH_CHECK(head_size <= 512, __func__, " Unsupported head_size: ", head_size);
+    AITER_CHECK(head_size <= 512, __func__, " Unsupported head_size: ", head_size);
 
     int key_stride   = key.stride(0);
     int value_stride = value.stride(0);
 
     dim3 grid(num_tokens, num_heads);
     dim3 block(WARP_SIZE);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(key.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 
     float dtypeMax;
-    if(key_cache.dtype() == torch_fp8)
+    if(key_cache.dtype() == AITER_DTYPE_fp8)
     {
-        if(key.dtype() == at::ScalarType::Float)
+        if(key.dtype() == AITER_DTYPE_fp32)
         {
             CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(float, opus::fp8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::Half)
+        else if(key.dtype() == AITER_DTYPE_fp16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(
                 opus::fp16_t, opus::fp8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::BFloat16)
+        else if(key.dtype() == AITER_DTYPE_bf16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(
                 opus::bf16_t, opus::fp8_t, dequant_scale_t);
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported input type of kv: ", key.dtype());
+            AITER_CHECK(false, "Unsupported input type of kv: ", key.dtype());
         }
     }
-    else if(key_cache.dtype() == at::ScalarType::Char)
+    else if(key_cache.dtype() == AITER_DTYPE_i8)
     {
-        if(key.dtype() == at::ScalarType::Float)
+        if(key.dtype() == AITER_DTYPE_fp32)
         {
             CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(float, opus::i8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::Half)
+        else if(key.dtype() == AITER_DTYPE_fp16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(opus::fp16_t, opus::i8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::BFloat16)
+        else if(key.dtype() == AITER_DTYPE_bf16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(opus::bf16_t, opus::i8_t, dequant_scale_t);
         }
         else
         {
-            TORCH_CHECK(false,
+            AITER_CHECK(false,
                         "Unsupported input type of kv: ",
                         key.dtype(),
                         " kv cache: ",
@@ -3078,18 +3080,18 @@ void reshape_and_cache_with_pertoken_quant(
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
+        AITER_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
     }
 }
 
 void reshape_and_cache_with_block_quant(
-    torch::Tensor& key,              // [batch_size, seq_len, num_heads, head_size]
-    torch::Tensor& value,            // [batch_size, seq_len, num_heads, head_size]
-    torch::Tensor& key_cache,        // [num_blocks, num_heads, head_size/x, block_size, x]
-    torch::Tensor& value_cache,      // [num_blocks, num_heads, head_size, block_size]
-    torch::Tensor& k_dequant_scales, // [num_heads, num_blocks]
-    torch::Tensor& v_dequant_scales, // [num_heads, num_blocks]
-    torch::Tensor& slot_mapping,     // [num_tokens]
+    const aiter_tensor_t& key,              // [batch_size, seq_len, num_heads, head_size]
+    const aiter_tensor_t& value,            // [batch_size, seq_len, num_heads, head_size]
+    const aiter_tensor_t& key_cache,        // [num_blocks, num_heads, head_size/x, block_size, x]
+    const aiter_tensor_t& value_cache,      // [num_blocks, num_heads, head_size, block_size]
+    const aiter_tensor_t& k_dequant_scales, // [num_heads, num_blocks]
+    const aiter_tensor_t& v_dequant_scales, // [num_heads, num_blocks]
+    const aiter_tensor_t& slot_mapping,     // [num_tokens]
     const bool asm_layout)
 {
     int batch_size = key.size(0);
@@ -3107,52 +3109,52 @@ void reshape_and_cache_with_block_quant(
 
     dim3 grid(batch_size, (seq_len + block_size - 1) / block_size + 1, num_heads);
     dim3 block(blockDimx);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(key.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 
     float dtypeMax;
-    if(key_cache.dtype() == torch_fp8)
+    if(key_cache.dtype() == AITER_DTYPE_fp8)
     {
-        if(key.dtype() == at::ScalarType::Float)
+        if(key.dtype() == AITER_DTYPE_fp32)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, opus::fp8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::Half)
+        else if(key.dtype() == AITER_DTYPE_fp16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
                 opus::fp16_t, opus::fp8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::BFloat16)
+        else if(key.dtype() == AITER_DTYPE_bf16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
                 opus::bf16_t, opus::fp8_t, dequant_scale_t);
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported input type of kv: ", key.dtype());
+            AITER_CHECK(false, "Unsupported input type of kv: ", key.dtype());
         }
     }
-    else if(key_cache.dtype() == at::ScalarType::Char)
+    else if(key_cache.dtype() == AITER_DTYPE_i8)
     {
-        if(key.dtype() == at::ScalarType::Float)
+        if(key.dtype() == AITER_DTYPE_fp32)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, opus::i8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::Half)
+        else if(key.dtype() == AITER_DTYPE_fp16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
                 opus::fp16_t, opus::i8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::BFloat16)
+        else if(key.dtype() == AITER_DTYPE_bf16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
                 opus::bf16_t, opus::i8_t, dequant_scale_t);
         }
         else
         {
-            TORCH_CHECK(false,
+            AITER_CHECK(false,
                         "Unsupported input type of kv: ",
                         key.dtype(),
                         " kv cache: ",
@@ -3161,25 +3163,25 @@ void reshape_and_cache_with_block_quant(
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
+        AITER_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
     }
 }
 
 void reshape_and_cache_with_block_quant_for_asm_pa(
-    torch::Tensor& key,              // [batch_size, seq_len, num_heads, head_size]
-    torch::Tensor& value,            // [batch_size, seq_len, num_heads, head_size]
-    torch::Tensor& key_cache,        // [num_blocks, num_heads, head_size/x, block_size:16, x]
-    torch::Tensor& value_cache,      // [num_blocks, num_heads, head_size, block_size:16]
-    torch::Tensor& k_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
-    torch::Tensor& v_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
-    torch::Tensor& slot_mapping,     // [num_tokens]
+    const aiter_tensor_t& key,              // [batch_size, seq_len, num_heads, head_size]
+    const aiter_tensor_t& value,            // [batch_size, seq_len, num_heads, head_size]
+    const aiter_tensor_t& key_cache,        // [num_blocks, num_heads, head_size/x, block_size:16, x]
+    const aiter_tensor_t& value_cache,      // [num_blocks, num_heads, head_size, block_size:16]
+    const aiter_tensor_t& k_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    const aiter_tensor_t& v_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    const aiter_tensor_t& slot_mapping,     // [num_tokens]
     const bool asm_layout,
     const int ori_block_size = 128)
 {
-    TORCH_CHECK(
+    AITER_CHECK(
         key.dim() == 4 && value.dim() == 4,
         "key/value must be a 4D tensor with shape [batch_size, seq_len, num_heads, head_size]");
-    TORCH_CHECK(ori_block_size == 128 || ori_block_size == 256,
+    AITER_CHECK(ori_block_size == 128 || ori_block_size == 256,
                 "ori_block_size only support 128/256");
 
     int batch_size   = key.size(0);
@@ -3196,53 +3198,53 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
     int blockDimx = (ori_block_size + 255) / 256 * 256;
     dim3 grid(batch_size, (seq_len + ori_block_size - 1) / ori_block_size + 1, num_heads);
     dim3 block(blockDimx);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(key.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 
-    if(key_cache.dtype() == torch_fp8)
+    if(key_cache.dtype() == AITER_DTYPE_fp8)
     {
-        if(key.dtype() == at::ScalarType::Float)
+        if(key.dtype() == AITER_DTYPE_fp32)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
                 float, opus::fp8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::Half)
+        else if(key.dtype() == AITER_DTYPE_fp16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
                 opus::fp16_t, opus::fp8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::BFloat16)
+        else if(key.dtype() == AITER_DTYPE_bf16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
                 opus::bf16_t, opus::fp8_t, dequant_scale_t);
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported input type of kv: ", key.dtype());
+            AITER_CHECK(false, "Unsupported input type of kv: ", key.dtype());
         }
     }
-    else if(key_cache.dtype() == at::ScalarType::Char)
+    else if(key_cache.dtype() == AITER_DTYPE_i8)
     {
-        if(key.dtype() == at::ScalarType::Float)
+        if(key.dtype() == AITER_DTYPE_fp32)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
                 float, opus::i8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::Half)
+        else if(key.dtype() == AITER_DTYPE_fp16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
                 opus::fp16_t, opus::i8_t, dequant_scale_t);
         }
-        else if(key.dtype() == at::ScalarType::BFloat16)
+        else if(key.dtype() == AITER_DTYPE_bf16)
         {
             CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
                 opus::bf16_t, opus::i8_t, dequant_scale_t);
         }
         else
         {
-            TORCH_CHECK(false,
+            AITER_CHECK(false,
                         "Unsupported input type of kv: ",
                         key.dtype(),
                         " kv cache: ",
@@ -3251,30 +3253,30 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
+        AITER_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
     }
 }
 
-void concat_and_cache_mla(torch::Tensor& kv_c,         // [num_tokens, kv_lora_rank]
-                          torch::Tensor& k_pe,         // [num_tokens, pe_dim]
-                          torch::Tensor& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
+void concat_and_cache_mla(const aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_rank]
+                          const aiter_tensor_t& k_pe,         // [num_tokens, pe_dim]
+                          const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
                                                        // pe_dim)]
-                          torch::Tensor& slot_mapping, // [num_tokens] or [num_actual_tokens]
+                          const aiter_tensor_t& slot_mapping, // [num_tokens] or [num_actual_tokens]
                           const std::string& kv_cache_dtype,
-                          torch::Tensor& scale)
+                          const aiter_tensor_t& scale)
 {
     int num_tokens   = slot_mapping.size(0);
     int kv_lora_rank = kv_c.size(1);
     int pe_dim       = k_pe.size(1);
     int block_size   = kv_cache.size(1);
 
-    TORCH_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
+    AITER_CHECK(kv_cache.size(2) == kv_lora_rank + pe_dim);
     int kv_c_stride  = kv_c.stride(0);
     int k_pe_stride  = k_pe.stride(0);
     int block_stride = kv_cache.stride(0);
     int entry_stride = kv_cache.stride(1);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_c));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(kv_c.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     if((pe_dim & 0x7) == 0 && (kv_lora_rank & 0x7) == 0)
     {
@@ -3291,9 +3293,9 @@ void concat_and_cache_mla(torch::Tensor& kv_c,         // [num_tokens, kv_lora_r
 }
 
 // copy from vllm: https://github.com/vllm-project/vllm/blob/main/csrc/cache_kernels.cu
-void indexer_k_quant_and_cache(torch::Tensor& k,        // [num_tokens, head_dim]
-                               torch::Tensor& kv_cache, // [num_blocks, block_size, cache_stride]
-                               torch::Tensor& slot_mapping, // [num_tokens]
+void indexer_k_quant_and_cache(const aiter_tensor_t& k,        // [num_tokens, head_dim]
+                               const aiter_tensor_t& kv_cache, // [num_blocks, block_size, cache_stride]
+                               const aiter_tensor_t& slot_mapping, // [num_tokens]
                                int64_t quant_block_size,    // quantization block size
                                const std::string& scale_fmt)
 {
@@ -3303,10 +3305,10 @@ void indexer_k_quant_and_cache(torch::Tensor& k,        // [num_tokens, head_dim
     int cache_stride     = kv_cache.size(2);
     bool use_ue8m0       = scale_fmt == "ue8m0";
 
-    TORCH_CHECK(k.device() == kv_cache.device(), "k and kv_cache must be on the same device");
-    TORCH_CHECK(k.device() == slot_mapping.device(),
+    AITER_CHECK(k.device_id == kv_cache.device_id, "k and kv_cache must be on the same device");
+    AITER_CHECK(k.device_id == slot_mapping.device_id,
                 "k and slot_mapping must be on the same device");
-    TORCH_CHECK(head_dim % quant_block_size == 0, "head_dim must be divisible by quant_block_size");
+    AITER_CHECK(head_dim % quant_block_size == 0, "head_dim must be divisible by quant_block_size");
 
     int quant_blocks    = num_tokens * head_dim / quant_block_size;
     const int vec_size  = 16;
@@ -3314,19 +3316,19 @@ void indexer_k_quant_and_cache(torch::Tensor& k,        // [num_tokens, head_dim
     const int blockDimy = opus::get_warp_size() / blockDimx;
     dim3 grid((quant_blocks + blockDimy - 1) / (blockDimy));
     dim3 block(blockDimx, blockDimy);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(k));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(k.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     DISPATCH_BY_KV_CACHE_DTYPE_OPUS(k.dtype(), "fp8_e4m3", CALL_INDEXER_K_QUANT_AND_CACHE);
 }
 
 // copy from vllm: https://github.com/vllm-project/vllm/blob/main/csrc/cache_kernels.cu
 void cp_gather_indexer_k_quant_cache(
-    const torch::Tensor& kv_cache,    // [num_blocks, block_size, cache_stride]
-    torch::Tensor& dst_k,             // [num_tokens, head_dim]
-    torch::Tensor& dst_scale,         // [num_tokens, head_dim / quant_block_size] float
-    const torch::Tensor& block_table, // [batch_size, num_blocks]
-    const torch::Tensor& cu_seq_lens  // [batch_size + 1]
+    const aiter_tensor_t& kv_cache,    // [num_blocks, block_size, cache_stride]
+    const aiter_tensor_t& dst_k,             // [num_tokens, head_dim]
+    const aiter_tensor_t& dst_scale,         // [num_tokens, head_dim / quant_block_size] float
+    const aiter_tensor_t& block_table, // [batch_size, num_blocks]
+    const aiter_tensor_t& cu_seq_lens  // [batch_size + 1]
 )
 {
     int batch_size       = block_table.size(0);
@@ -3334,19 +3336,19 @@ void cp_gather_indexer_k_quant_cache(
     int head_dim         = dst_k.size(1);
     int quant_block_size = head_dim / (dst_scale.size(1) * dst_scale.itemsize() / 4);
 
-    TORCH_CHECK(kv_cache.device() == dst_k.device(),
+    AITER_CHECK(kv_cache.device_id == dst_k.device_id,
                 "kv_cache and dst_k must be on the same device");
-    TORCH_CHECK(kv_cache.device() == dst_scale.device(),
+    AITER_CHECK(kv_cache.device_id == dst_scale.device_id,
                 "kv_cache and dst_scale must be on the same device");
-    TORCH_CHECK(kv_cache.device() == block_table.device(),
+    AITER_CHECK(kv_cache.device_id == block_table.device_id,
                 "kv_cache and block_table must be on the same device");
-    TORCH_CHECK(kv_cache.device() == cu_seq_lens.device(),
+    AITER_CHECK(kv_cache.device_id == cu_seq_lens.device_id,
                 "kv_cache and cu_seq_lens must be on the same device");
-    TORCH_CHECK(head_dim % quant_block_size == 0, "head_dim must be divisible by quant_block_size");
+    AITER_CHECK(head_dim % quant_block_size == 0, "head_dim must be divisible by quant_block_size");
 
     constexpr int vec_size = 16;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_cache));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(kv_cache.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     if(num_tokens < 32)
     {
@@ -3375,19 +3377,19 @@ void cp_gather_indexer_k_quant_cache(
 }
 
 void fused_qk_rope_concat_and_cache_mla(
-    torch::Tensor& q_nope,        // [num_tokens, num_heads, qk_lora_rank]
-    torch::Tensor& q_pe,          // [num_tokens, num_heads, pe_dim]
-    torch::Tensor& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank] or [num_tokens, kv_lora_rank]
-    torch::Tensor& k_pe,          // [num_tokens, k_num_heads, pe_dim] or [num_tokens, pe_dim]
-    torch::Tensor& kv_cache,      // [num_blocks, block_size, (kv_lora_rank +
+    const aiter_tensor_t& q_nope,        // [num_tokens, num_heads, qk_lora_rank]
+    const aiter_tensor_t& q_pe,          // [num_tokens, num_heads, pe_dim]
+    const aiter_tensor_t& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank] or [num_tokens, kv_lora_rank]
+    const aiter_tensor_t& k_pe,          // [num_tokens, k_num_heads, pe_dim] or [num_tokens, pe_dim]
+    const aiter_tensor_t& kv_cache,      // [num_blocks, block_size, (kv_lora_rank +
                                   // pe_dim)] or [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
-    torch::Tensor& q_out,        // [num_tokens, num_heads, qk_lora_rank+pe_dim]
-    torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    torch::Tensor& k_scale,   // scale for k
-    torch::Tensor& q_scale,   // scale for q
-    torch::Tensor& positions, // [num_tokens]
-    torch::Tensor &cos_cache, // [max_position, rot_dim//2]
-    torch::Tensor &sin_cache, // [max_position, rot_dim//2]
+    const aiter_tensor_t& q_out,        // [num_tokens, num_heads, qk_lora_rank+pe_dim]
+    const aiter_tensor_t& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    const aiter_tensor_t& k_scale,   // scale for k
+    const aiter_tensor_t& q_scale,   // scale for q
+    const aiter_tensor_t& positions, // [num_tokens]
+    const aiter_tensor_t& cos_cache, // [max_position, rot_dim//2]
+    const aiter_tensor_t& sin_cache, // [max_position, rot_dim//2]
     bool is_neox, bool is_nope_first
 ) {
   int num_tokens = slot_mapping.size(0);
@@ -3401,11 +3403,11 @@ void fused_qk_rope_concat_and_cache_mla(
   int num_actual_tokens = slot_mapping.size(0);
   int num_slots = slot_mapping.size(0);
 
-  TORCH_CHECK(q_nope.dim() == q_pe.dim());
-  TORCH_CHECK(q_nope.size(1) == q_pe.size(1));
+  AITER_CHECK(q_nope.dim() == q_pe.dim());
+  AITER_CHECK(q_nope.size(1) == q_pe.size(1));
 
-  TORCH_CHECK(q_out.size(2) == qk_lora_rank + pe_dim);
-  TORCH_CHECK(kv_lora_rank == qk_lora_rank, "kv_lora_rank and qk_lora_rank must be the same");
+  AITER_CHECK(q_out.size(2) == qk_lora_rank + pe_dim);
+  AITER_CHECK(kv_lora_rank == qk_lora_rank, "kv_lora_rank and qk_lora_rank must be the same");
   int kv_c_stride = kv_c.stride(0);
   int k_pe_stride = k_pe.stride(0);
   int q_nope_stride_0 = q_nope.stride(0);
@@ -3416,41 +3418,41 @@ void fused_qk_rope_concat_and_cache_mla(
   int q_out_stride_1 = q_out.stride(1);
   int block_stride = kv_cache.stride(0);
   int entry_stride = kv_cache.stride(1);
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(kv_c));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard1(device_of(q_out));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  HipDeviceGuard device_guard(kv_c.device_id);
+  (void)q_out; // device_guard already set above
+  const hipStream_t stream = aiter::getCurrentHIPStream();
 
   std::string q_out_type = "auto";
   std::string kv_cache_dtype = "auto";
-  if (kv_cache.scalar_type() == torch::kFloat ||
-             kv_cache.scalar_type() == torch::kFloat16  ||
-             kv_cache.scalar_type() == torch::kBFloat16) {
+  if (kv_cache.dtype() == AITER_DTYPE_fp32 ||
+             kv_cache.dtype() == AITER_DTYPE_fp16  ||
+             kv_cache.dtype() == AITER_DTYPE_bf16) {
     kv_cache_dtype = "auto";
-  } else if(kv_cache.scalar_type() == torch::kFloat8_e4m3fn || 
-              kv_cache.scalar_type() == torch::kFloat8_e5m2 || 
-              kv_cache.scalar_type() ==torch::kFloat8_e4m3fnuz) {
+  } else if(kv_cache.dtype() == AITER_DTYPE_fp8 || 
+              kv_cache.dtype() == AITER_DTYPE_fp8 || 
+              kv_cache.dtype() ==AITER_DTYPE_fp8) {
     kv_cache_dtype = "fp8";
   } else{
-    TORCH_CHECK(false, "kv cache data type is not supported");
+    AITER_CHECK(false, "kv cache data type is not supported");
   }
-  if (q_out.scalar_type() == kv_cache.scalar_type()) {
+  if (q_out.dtype() == kv_cache.dtype()) {
     q_out_type = kv_cache_dtype;
-  } else if (q_out.scalar_type() == torch::kFloat ||
-             q_out.scalar_type() == torch::kFloat16  ||
-             q_out.scalar_type() == torch::kBFloat16) {
+  } else if (q_out.dtype() == AITER_DTYPE_fp32 ||
+             q_out.dtype() == AITER_DTYPE_fp16  ||
+             q_out.dtype() == AITER_DTYPE_bf16) {
     q_out_type = "auto";
-  } else if(q_out.scalar_type() == torch::kFloat8_e4m3fn || 
-            q_out.scalar_type() == torch::kFloat8_e5m2 || 
-            q_out.scalar_type() ==torch::kFloat8_e4m3fnuz) {
+  } else if(q_out.dtype() == AITER_DTYPE_fp8 || 
+            q_out.dtype() == AITER_DTYPE_fp8 || 
+            q_out.dtype() ==AITER_DTYPE_fp8) {
     q_out_type = "fp8";
   } else{
-    TORCH_CHECK(false, "kv cache data type is not supported");
+    AITER_CHECK(false, "kv cache data type is not supported");
   }
   if (kv_cache_dtype == "auto" && q_out_type == "fp8") {
-    TORCH_CHECK(false, "kv cache data type is auto and q_out data type is fp8, which is not supported");
+    AITER_CHECK(false, "kv cache data type is auto and q_out data type is fp8, which is not supported");
   }
-  TORCH_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
-  TORCH_CHECK(k_pe.stride(-1) == 1, "k_pe stride(-1) must be equal to 1");
+  AITER_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
+  AITER_CHECK(k_pe.stride(-1) == 1, "k_pe stride(-1) must be equal to 1");
   // ============================================================================
   // Kernel Dispatch Logic
   // ============================================================================
@@ -3499,7 +3501,7 @@ void fused_qk_rope_concat_and_cache_mla(
       dim3 grid(num_tokens * num_heads);
       
       // Determine vec_size: float must use 4, half/bfloat16 can use 8 for large tensors
-      const bool is_float = (kv_c.dtype() == torch::kFloat);
+      const bool is_float = (kv_c.dtype() == AITER_DTYPE_fp32);
       const bool use_vec4 = is_float || (kv_lora_rank >= 64 && kv_lora_rank <= 128);
       
       if (use_vec4) {
@@ -3561,7 +3563,7 @@ void fused_qk_rope_concat_and_cache_mla(
     const int k_pe_stride_0 = k_pe.stride(0);
     const int k_pe_stride_1 = k_pe.stride(1);
     const int num_kv_heads = kv_c.size(1);
-    TORCH_CHECK(num_kv_heads <= num_heads, "num_kv_heads must be less than or equal to num_heads");
+    AITER_CHECK(num_kv_heads <= num_heads, "num_kv_heads must be less than or equal to num_heads");
     const int kv_cache_stride_h = kv_cache.stride(2);
     
     // Option 1: Optimized prefill kernel for standard config
@@ -3588,7 +3590,7 @@ void fused_qk_rope_concat_and_cache_mla(
     }
   }
   else {
-    TORCH_CHECK(false, 
+    AITER_CHECK(false, 
                 "Unsupported tensor dimensions: kv_c.dim()=", kv_c.dim(), 
                 ", k_pe.dim()=", k_pe.dim(),
                 ". Expected either decode (dim=2) or prefill with GQA (dim=3).");

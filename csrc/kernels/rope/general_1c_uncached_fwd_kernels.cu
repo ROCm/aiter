@@ -5,9 +5,9 @@
 using namespace aiter;
 
 void rope_fwd_impl(
-    torch::Tensor&       output,        // [s, b, h, d]
-    const torch::Tensor& input,         // [s, b, h, d]
-    const torch::Tensor& freqs,         // [s, 1, 1, d]
+    aiter_tensor_t&       output,        // [s, b, h, d]
+    const aiter_tensor_t& input,         // [s, b, h, d]
+    const aiter_tensor_t& freqs,         // [s, 1, 1, d]
     const int32_t        rotate_style,
     const bool           reuse_freqs_front_part,
     const bool           nope_first)
@@ -26,21 +26,21 @@ void rope_fwd_impl(
     const int32_t stride_o_h = output.stride(2);
     const int32_t stride_o_d = output.stride(3);
 
-    TORCH_CHECK(stride_i_d == 1 && stride_o_d == 1,
+    AITER_CHECK(stride_i_d == 1 && stride_o_d == 1,
                 "rope_fwd_impl requires all stride_d to be 1");
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    HipDeviceGuard device_guard(input.device_id);
     DISPATCH_ROPE_TYPES_PARAMS(
-        input.scalar_type(),
-        freqs.scalar_type(),
+        input.dtype(),
+        freqs.dtype(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
         "dispatch_1c_sbhd_uncached<OpUncachedFwd, ...>",
         dispatch_1c_sbhd_uncached<OpUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-            output.data_ptr<scalar_t_0>(),
-            input.data_ptr<scalar_t_0>(),
-            freqs.data_ptr<scalar_t_1>(),
+            reinterpret_cast<scalar_t_0*>(output.data_ptr()),
+            reinterpret_cast<scalar_t_0*>(input.data_ptr()),
+            reinterpret_cast<scalar_t_1*>(freqs.data_ptr()),
             size_s, size_b, size_h, size_d,
             size_f,
             stride_i_s, stride_i_b, stride_i_h, stride_i_d,

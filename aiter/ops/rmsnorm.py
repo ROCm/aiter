@@ -9,7 +9,7 @@ from typing import Optional
 MD_NAME = "module_rmsnorm"
 
 
-@compile_ops("module_rmsnorm")
+@compile_ops("module_rmsnorm", develop=True)
 def rms_norm_cu(
     out: Tensor,
     input: Tensor,
@@ -22,7 +22,7 @@ def rms_norm_cu(
     ...
 
 
-@compile_ops("module_rmsnorm")
+@compile_ops("module_rmsnorm", develop=True)
 def fused_add_rms_norm_cu(
     input: Tensor,  # input/out
     residual_in: Tensor,  # residual_in/out
@@ -45,7 +45,10 @@ def gen_rms_norm_fake_tensor(
 
 
 @compile_ops(
-    "module_rmsnorm", fc_name="rmsnorm2d_fwd", gen_fake=gen_rms_norm_fake_tensor
+    "module_rmsnorm",
+    fc_name="rmsnorm2d_fwd",
+    gen_fake=gen_rms_norm_fake_tensor,
+    develop=True,
 )
 def rms_norm(
     input: Tensor,
@@ -96,7 +99,7 @@ def rmsnorm2d_fwd_with_add(
         add_rmsnorm(out, input, residual_in, residual_out, weight, epsilon)
 
 
-@compile_ops("module_rmsnorm")
+@compile_ops("module_rmsnorm", develop=True)
 def rmsnorm2d_fwd_with_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -108,7 +111,7 @@ def rmsnorm2d_fwd_with_smoothquant(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm")
+@compile_ops("module_rmsnorm", develop=True)
 def rmsnorm2d_fwd_with_add_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -183,7 +186,10 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
 
 
 @compile_ops(
-    "module_rmsnorm", gen_fake=gen_rms_norm_fake_tensor, fc_name="rmsnorm2d_fwd"
+    "module_rmsnorm",
+    gen_fake=gen_rms_norm_fake_tensor,
+    fc_name="rmsnorm2d_fwd",
+    develop=True,
 )
 def rmsnorm2d_fwd_ck(
     input: torch.Tensor,
@@ -193,7 +199,7 @@ def rmsnorm2d_fwd_ck(
 ) -> Tensor: ...
 
 
-@compile_ops("module_rmsnorm", fc_name="rmsnorm2d_fwd_with_add")
+@compile_ops("module_rmsnorm", fc_name="rmsnorm2d_fwd_with_add", develop=True)
 def rmsnorm2d_fwd_with_add_ck(
     out: Tensor,
     input: Tensor,
@@ -205,7 +211,7 @@ def rmsnorm2d_fwd_with_add_ck(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm", fc_name="rmsnorm2d_fwd_with_dynamicquant")
+@compile_ops("module_rmsnorm", fc_name="rmsnorm2d_fwd_with_dynamicquant", develop=True)
 def rmsnorm2d_fwd_with_dynamicquant_ck(
     out: Tensor,
     input: Tensor,
@@ -216,7 +222,9 @@ def rmsnorm2d_fwd_with_dynamicquant_ck(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm", fc_name="rmsnorm2d_fwd_with_add_dynamicquant")
+@compile_ops(
+    "module_rmsnorm", fc_name="rmsnorm2d_fwd_with_add_dynamicquant", develop=True
+)
 def rmsnorm2d_fwd_with_add_dynamicquant_ck(
     out: Tensor,
     input: Tensor,
@@ -229,7 +237,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant_ck(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def add_rmsnorm_quant(
     out: Tensor,
     input: Tensor,
@@ -243,7 +251,7 @@ def add_rmsnorm_quant(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def add_rmsnorm(
     out: Tensor,
     input: Tensor,
@@ -254,7 +262,7 @@ def add_rmsnorm(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def rmsnorm_quant(
     out: Tensor,
     input: Tensor,
@@ -266,7 +274,7 @@ def rmsnorm_quant(
 ) -> None: ...
 
 
-@compile_ops("module_rmsnorm_quant")
+@compile_ops("module_rmsnorm_quant", develop=True)
 def rmsnorm(
     out: Tensor,
     input: Tensor,

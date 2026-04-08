@@ -17,17 +17,14 @@
 // - Supports fp16, bf16, and fp32 data types
 // - Convolution widths: 2, 3, 4
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/extension.h>
-
 #include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
 #include "ck_tile/core.hpp"
-#include "dispatch_utils.h"
 #include "py_itfs_common.h"
 
 // Helper macros
-#define CHECK_INPUT(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA/HIP tensor")
+#define CHECK_INPUT(x) ((void)0)
 
 #define HIP_CHECK(err)                                                      \
     do {                                                                    \
@@ -39,32 +36,32 @@
         }                                                                   \
     } while (0)
 
-#define DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(ITYPE, NAME, ...)                    \
-    if (ITYPE == at::ScalarType::Half) {                                            \
-        using input_t = at::Half;                                                   \
-        __VA_ARGS__();                                                              \
-    } else if (ITYPE == at::ScalarType::BFloat16) {                                 \
-        using input_t = at::BFloat16;                                               \
-        __VA_ARGS__();                                                              \
-    } else if (ITYPE == at::ScalarType::Float)  {                                   \
-        using input_t = float;                                                      \
-        __VA_ARGS__();                                                              \
-    } else {                                                                        \
-        AT_ERROR(#NAME, " not implemented for input type '", toString(ITYPE), "'"); \
+#define DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(ITYPE, NAME, ...)                         \
+    if (ITYPE == AITER_DTYPE_fp16) {                                                    \
+        using input_t = __half;                                                         \
+        __VA_ARGS__();                                                                  \
+    } else if (ITYPE == AITER_DTYPE_bf16) {                                             \
+        using input_t = hip_bfloat16;                                                   \
+        __VA_ARGS__();                                                                  \
+    } else if (ITYPE == AITER_DTYPE_fp32)  {                                            \
+        using input_t = float;                                                          \
+        __VA_ARGS__();                                                                  \
+    } else {                                                                            \
+        AITER_CHECK(false, #NAME, " not implemented for input type");                   \
     }
 
-#define DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(WTYPE, NAME, ...)                     \
-    if (WTYPE == at::ScalarType::Half) {                                             \
-        using weight_t = at::Half;                                                   \
-        __VA_ARGS__();                                                               \
-    } else if (WTYPE == at::ScalarType::BFloat16) {                                  \
-        using weight_t = at::BFloat16;                                               \
-        __VA_ARGS__();                                                               \
-    } else if (WTYPE == at::ScalarType::Float)  {                                    \
-        using weight_t = float;                                                      \
-        __VA_ARGS__();                                                               \
-    } else {                                                                         \
-        AT_ERROR(#NAME, " not implemented for weight type '", toString(WTYPE), "'"); \
+#define DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(WTYPE, NAME, ...)                       \
+    if (WTYPE == AITER_DTYPE_fp16) {                                                    \
+        using weight_t = __half;                                                        \
+        __VA_ARGS__();                                                                  \
+    } else if (WTYPE == AITER_DTYPE_bf16) {                                             \
+        using weight_t = hip_bfloat16;                                                  \
+        __VA_ARGS__();                                                                  \
+    } else if (WTYPE == AITER_DTYPE_fp32)  {                                            \
+        using weight_t = float;                                                         \
+        __VA_ARGS__();                                                                  \
+    } else {                                                                            \
+        AITER_CHECK(false, #NAME, " not implemented for weight type");                  \
     }
 
 namespace aiter {
@@ -301,21 +298,16 @@ void causal_conv1d_update_dispatch(ConvParamsBaseUpdate &params, hipStream_t str
 // Handles tensor validation, parameter setup, and kernel dispatch
 
 void causal_conv1d_update(
-    torch::Tensor& x,                          // [batch, dim, seqlen] - new input (typically seqlen=1 for decoding)
-    torch::Tensor& conv_state,                 // [batch, dim, state_len] - state buffer (updated in-place)
-    const torch::Tensor& weight,               // [dim, width] - convolution weights
-    const torch::Tensor& bias,                 // [dim] - bias (or empty)
-    torch::Tensor& out,                        // [batch, dim, seqlen] - output
+    const aiter_tensor_t& x,                   // [batch, dim, seqlen] - new input (typically seqlen=1 for decoding)
+    const aiter_tensor_t& conv_state,          // [batch, dim, state_len] - state buffer (updated in-place)
+    const aiter_tensor_t& weight,              // [dim, width] - convolution weights
+    const aiter_tensor_t* bias,                // [dim] - bias (or null)
+    const aiter_tensor_t& out,                 // [batch, dim, seqlen] - output
     bool use_silu,                             // Whether to apply SiLU activation
-    const torch::Tensor& cache_seqlens,        // [batch] - for circular buffer mode (or empty)
-    const torch::Tensor& conv_state_indices,   // [batch] - for continuous batching (or empty)
+    const aiter_tensor_t* cache_seqlens,       // [batch] - for circular buffer mode (or null)
+    const aiter_tensor_t* conv_state_indices,  // [batch] - for continuous batching (or null)
     int pad_slot_id)                           // Padding slot ID (-1 = no padding)
 {
-    CHECK_INPUT(x);
-    CHECK_INPUT(conv_state);
-    CHECK_INPUT(weight);
-    CHECK_INPUT(out);
-
     // Extract dimensions
     const int32_t batch = x.size(0);
     const int32_t dim = x.size(1);
@@ -324,14 +316,13 @@ void causal_conv1d_update(
     const int32_t conv_state_len = conv_state.size(2);
 
     // Validate tensor shapes
-    TORCH_CHECK(conv_state.size(0) == batch || conv_state_indices.defined(), "conv_state batch mismatch");
-    TORCH_CHECK(conv_state.size(1) == dim, "conv_state dim mismatch");
-    TORCH_CHECK(conv_state_len >= width - 1, "conv_state_len must be >= width - 1");
-    TORCH_CHECK(out.size(0) == batch && out.size(1) == dim && out.size(2) == seqlen, "Output shape mismatch");
-    TORCH_CHECK(weight.size(0) == dim, "Weight shape mismatch");
-    TORCH_CHECK(width >= 2 && width <= 4, "Width must be 2, 3, or 4");
+    AITER_CHECK(conv_state.size(0) == batch || conv_state_indices != nullptr, "conv_state batch mismatch");
+    AITER_CHECK(conv_state.size(1) == dim, "conv_state dim mismatch");
+    AITER_CHECK(conv_state_len >= width - 1, "conv_state_len must be >= width - 1");
+    AITER_CHECK(out.size(0) == batch && out.size(1) == dim && out.size(2) == seqlen, "Output shape mismatch");
+    AITER_CHECK(weight.size(0) == dim, "Weight shape mismatch");
+    AITER_CHECK(width >= 2 && width <= 4, "Width must be 2, 3, or 4");
 
-    // Setup kernel parameters
     // Setup kernel parameters
     ConvParamsBaseUpdate params;
     params.batch = batch;
@@ -367,11 +358,10 @@ void causal_conv1d_update(
     params.conv_state_ptr = conv_state.data_ptr();
 
     // Optional bias
-    if(bias.defined() && bias.numel() > 0)
+    if(bias != nullptr && bias->numel() > 0)
     {
-        CHECK_INPUT(bias);
-        TORCH_CHECK(bias.size(0) == dim, "Bias shape mismatch");
-        params.bias_ptr = bias.data_ptr();
+        AITER_CHECK(bias->size(0) == dim, "Bias shape mismatch");
+        params.bias_ptr = bias->data_ptr();
     } else {
         params.bias_ptr = nullptr;
     }
@@ -380,32 +370,30 @@ void causal_conv1d_update(
     params.pad_slot_id = pad_slot_id;
 
     // Optional: cache_seqlens for circular buffer mode
-    if (cache_seqlens.defined() && cache_seqlens.numel() > 0) {
-        CHECK_INPUT(cache_seqlens);
-        TORCH_CHECK(cache_seqlens.scalar_type() == torch::kInt32, "cache_seqlens must be int32");
-        TORCH_CHECK(cache_seqlens.size(0) == batch, "cache_seqlens batch mismatch");
-        params.cache_seqlens = cache_seqlens.data_ptr<int32_t>();
+    if (cache_seqlens != nullptr && cache_seqlens->numel() > 0) {
+        AITER_CHECK(cache_seqlens->dtype() == AITER_DTYPE_i32, "cache_seqlens must be int32");
+        AITER_CHECK(cache_seqlens->size(0) == batch, "cache_seqlens batch mismatch");
+        params.cache_seqlens = reinterpret_cast<int32_t*>(cache_seqlens->data_ptr());
     } else {
         params.cache_seqlens = nullptr;
     }
 
     // Optional: conv_state_indices for continuous batching
-    if (conv_state_indices.defined() && conv_state_indices.numel() > 0) {
-        CHECK_INPUT(conv_state_indices);
-        TORCH_CHECK(conv_state_indices.scalar_type() == torch::kInt32, "conv_state_indices must be int32");
-        TORCH_CHECK(conv_state_indices.size(0) == batch, "conv_state_indices batch mismatch");
-        params.conv_state_indices_ptr = conv_state_indices.data_ptr<int32_t>();
+    if (conv_state_indices != nullptr && conv_state_indices->numel() > 0) {
+        AITER_CHECK(conv_state_indices->dtype() == AITER_DTYPE_i32, "conv_state_indices must be int32");
+        AITER_CHECK(conv_state_indices->size(0) == batch, "conv_state_indices batch mismatch");
+        params.conv_state_indices_ptr = reinterpret_cast<int32_t*>(conv_state_indices->data_ptr());
     } else {
         params.conv_state_indices_ptr = nullptr;
     }
 
     // Get HIP device and stream
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(x));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(x.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     // Dispatch to appropriate kernel based on data types
-    DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(x.scalar_type(), "causal_conv1d_update", [&] {
-        DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(weight.scalar_type(), "causal_conv1d_update", [&] {
+    DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(x.dtype(), "causal_conv1d_update", [&] {
+        DISPATCH_WTYPE_FLOAT_AND_HALF_AND_BF16(weight.dtype(), "causal_conv1d_update", [&] {
             causal_conv1d_update_dispatch<input_t, weight_t>(params, stream);
         });
     });

@@ -10,7 +10,7 @@ from ..jit.core import compile_ops
 MD_NAME = "module_fused_split_gdr_update"
 
 
-@compile_ops("module_fused_split_gdr_update")
+@compile_ops("module_fused_split_gdr_update", develop=True)
 def fused_split_gdr_update(
     mixed_qkv: Tensor,
     A_log: Tensor,

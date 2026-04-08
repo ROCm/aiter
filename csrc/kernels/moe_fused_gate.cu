@@ -16,17 +16,17 @@
  * limitations under the License.
  */
 #include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
-#include <ATen/hip/HIPContext.h>
 #include <cfloat>
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 #include <stdio.h>
-#include <torch/all.h>
 #include <type_traits>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 /// Aligned array type
 template <typename T,
@@ -469,8 +469,8 @@ __global__ void moe_fused_gate_kernel(void* input,
                               WARPS_PER_CTA>                                                  \
             <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),            \
                                                                  bias.data_ptr(),             \
-                                                                 output.data_ptr<float>(),    \
-                                                                 indices.data_ptr<int32_t>(), \
+                                                                 reinterpret_cast<float*>(output.data_ptr()),    \
+                                                                 reinterpret_cast<int32_t*>(indices.data_ptr()), \
                                                                  num_rows,                    \
                                                                  topk_group,                  \
                                                                  topk,                        \
@@ -533,23 +533,22 @@ __global__ void moe_fused_gate_kernel_dynamic(void* input,
 //------------------------------------------------------------------------------
 // Host Launcher Function
 //------------------------------------------------------------------------------
-std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
-                                       at::Tensor& bias,
-                                       at::Tensor& topk_weights,
-                                       at::Tensor& topk_ids,
-                                       int64_t num_expert_group,
-                                       int64_t topk_group,
-                                       int64_t topk,
-                                       int64_t num_fused_shared_experts,
-                                       double routed_scaling_factor)
+void moe_fused_gate(const aiter_tensor_t& input,
+                    const aiter_tensor_t& bias,
+                    const aiter_tensor_t& topk_weights,
+                    const aiter_tensor_t& topk_ids,
+                    int64_t num_expert_group,
+                    int64_t topk_group,
+                    int64_t topk,
+                    int64_t num_fused_shared_experts,
+                    double routed_scaling_factor)
 {
     int64_t num_rows     = input.size(0);
     int32_t num_experts  = input.size(1);
-    auto options         = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto output          = topk_weights;
-    auto indices         = topk_ids;
+    const auto& output   = topk_weights;
+    const auto& indices  = topk_ids;
     const int out_stride = topk_ids.stride(0);
-    TORCH_CHECK(topk_weights.stride(0) == out_stride,
+    AITER_CHECK(topk_weights.stride(0) == out_stride,
                 "topk_weights and topk_ids must have the same stride in dim 0");
 
     // Compute grid dimensions based on runtime value for num_expert_group.
@@ -559,18 +558,18 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     int ROWS_PER_WARP     = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
     size_t shared_mem_size =
         ((topk * sizeof(float) + topk * sizeof(int)) * ROWS_PER_WARP + 255) & ~255;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
     // // Check 1: Ensure that num_experts is a power of 2.
-    // TORCH_CHECK((num_experts & (num_experts - 1)) == 0,
+    // AITER_CHECK((num_experts & (num_experts - 1)) == 0,
     //             "num_experts must be a power of 2, but got ",
     //             num_experts);
 
     // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means
     // num_expert_group is power of 2)
-    TORCH_CHECK(num_experts % num_expert_group == 0,
+    AITER_CHECK(num_experts % num_expert_group == 0,
                 "num_experts must be divisible by num_expert_group, but got ",
                 num_experts,
                 " / ",
@@ -579,7 +578,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     int computed_vpt = num_experts / num_expert_group;
     // Check 3: Ensure that num_experts/num_expert_group does not exceed MAX_VPT=32. Maximum VPT
     // indicate max value per threads we can process.
-    TORCH_CHECK(computed_vpt <= MAX_VPT,
+    AITER_CHECK(computed_vpt <= MAX_VPT,
                 "Per group experts: num_experts / num_expert_group = (",
                 computed_vpt,
                 ") exceeds the maximum supported (",
@@ -599,15 +598,15 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         {
             // This is deepseek v3 case. Here VPT = 256/8 = 32, ROWS_PER_WARP = 32/8 = 4,
             // ROWS_PER_CTA = 6 * 4 = 24.
-            if(input.scalar_type() == at::kBFloat16)
+            if(input.dtype() == AITER_DTYPE_bf16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 8);
             }
-            else if(input.scalar_type() == at::kHalf)
+            else if(input.dtype() == AITER_DTYPE_fp16)
             {
                 LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 8);
             }
-            else if(input.scalar_type() == at::kFloat)
+            else if(input.dtype() == AITER_DTYPE_fp32)
             {
                 LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 8);
             }
@@ -615,15 +614,15 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         else if(num_expert_group == 16)
         {
             // Here VPT = 256/16 = 16, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
-            if(input.scalar_type() == at::kBFloat16)
+            if(input.dtype() == AITER_DTYPE_bf16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 256, 16);
             }
-            else if(input.scalar_type() == at::kHalf)
+            else if(input.dtype() == AITER_DTYPE_fp16)
             {
                 LAUNCH_MOE_GATE_CONFIG(float16_t, 256, 16);
             }
-            else if(input.scalar_type() == at::kFloat)
+            else if(input.dtype() == AITER_DTYPE_fp32)
             {
                 LAUNCH_MOE_GATE_CONFIG(float32_t, 256, 16);
             }
@@ -634,15 +633,15 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         {
             // This is deepseek v3 case. Here VPT = 192/8 = 24, ROWS_PER_WARP = 32/8 = 4,
             // ROWS_PER_CTA = 6 * 4 = 24.
-            if(input.scalar_type() == at::kBFloat16)
+            if(input.dtype() == AITER_DTYPE_bf16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 192, 8);
             }
-            else if(input.scalar_type() == at::kHalf)
+            else if(input.dtype() == AITER_DTYPE_fp16)
             {
                 LAUNCH_MOE_GATE_CONFIG(float16_t, 192, 8);
             }
-            else if(input.scalar_type() == at::kFloat)
+            else if(input.dtype() == AITER_DTYPE_fp32)
             {
                 LAUNCH_MOE_GATE_CONFIG(float32_t, 192, 8);
             }
@@ -652,15 +651,15 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         if(num_expert_group == 4)
         {
             // VPT = 128/4 = 32, ROWS_PER_WARP = 32/16 = 2, ROWS_PER_CTA = 6 * 2 = 12.
-            if(input.scalar_type() == at::kBFloat16)
+            if(input.dtype() == AITER_DTYPE_bf16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 4);
             }
-            else if(input.scalar_type() == at::kHalf)
+            else if(input.dtype() == AITER_DTYPE_fp16)
             {
                 LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 4);
             }
-            else if(input.scalar_type() == at::kFloat)
+            else if(input.dtype() == AITER_DTYPE_fp32)
             {
                 LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 4);
             }
@@ -668,15 +667,15 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         else if(num_expert_group == 8)
         {
             // VPT = 128/8 = 16, ROWS_PER_WARP = 32/8 = 4, ROWS_PER_CTA = 6 * 4 = 24.
-            if(input.scalar_type() == at::kBFloat16)
+            if(input.dtype() == AITER_DTYPE_bf16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 128, 8);
             }
-            else if(input.scalar_type() == at::kHalf)
+            else if(input.dtype() == AITER_DTYPE_fp16)
             {
                 LAUNCH_MOE_GATE_CONFIG(float16_t, 128, 8);
             }
-            else if(input.scalar_type() == at::kFloat)
+            else if(input.dtype() == AITER_DTYPE_fp32)
             {
                 LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8);
             }
@@ -687,15 +686,15 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         {
             // This is deepseek v3 case. Here VPT = 96/8 = 12, ROWS_PER_WARP = 32/8 = 4,
             // ROWS_PER_CTA = 6 * 4 = 24.
-            if(input.scalar_type() == at::kBFloat16)
+            if(input.dtype() == AITER_DTYPE_bf16)
             {
                 LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 96, 8);
             }
-            else if(input.scalar_type() == at::kHalf)
+            else if(input.dtype() == AITER_DTYPE_fp16)
             {
                 LAUNCH_MOE_GATE_CONFIG(float16_t, 96, 8);
             }
-            else if(input.scalar_type() == at::kFloat)
+            else if(input.dtype() == AITER_DTYPE_fp32)
             {
                 LAUNCH_MOE_GATE_CONFIG(float32_t, 96, 8);
             }
@@ -707,13 +706,13 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     {
         // Fallback to the dynamic kernel if none of the supported combinations match.
         // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
-        if(input.scalar_type() == at::kBFloat16)
+        if(input.dtype() == AITER_DTYPE_bf16)
         {
             moe_fused_gate_kernel_dynamic<bfloat16_t>
                 <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),
                                                                      bias.data_ptr(),
-                                                                     output.data_ptr<float>(),
-                                                                     indices.data_ptr<int32_t>(),
+                                                                     reinterpret_cast<float*>(output.data_ptr()),
+                                                                     reinterpret_cast<int32_t*>(indices.data_ptr()),
                                                                      num_rows,
                                                                      num_experts,
                                                                      num_expert_group,
@@ -723,13 +722,13 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                                                      routed_scaling_factor,
                                                                      out_stride);
         }
-        else if(input.scalar_type() == at::kHalf)
+        else if(input.dtype() == AITER_DTYPE_fp16)
         {
             moe_fused_gate_kernel_dynamic<float16_t>
                 <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),
                                                                      bias.data_ptr(),
-                                                                     output.data_ptr<float>(),
-                                                                     indices.data_ptr<int32_t>(),
+                                                                     reinterpret_cast<float*>(output.data_ptr()),
+                                                                     reinterpret_cast<int32_t*>(indices.data_ptr()),
                                                                      num_rows,
                                                                      num_experts,
                                                                      num_expert_group,
@@ -739,13 +738,13 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
                                                                      routed_scaling_factor,
                                                                      out_stride);
         }
-        else if(input.scalar_type() == at::kFloat)
+        else if(input.dtype() == AITER_DTYPE_fp32)
         {
             moe_fused_gate_kernel_dynamic<float32_t>
                 <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),
                                                                      bias.data_ptr(),
-                                                                     output.data_ptr<float>(),
-                                                                     indices.data_ptr<int32_t>(),
+                                                                     reinterpret_cast<float*>(output.data_ptr()),
+                                                                     reinterpret_cast<int32_t*>(indices.data_ptr()),
                                                                      num_rows,
                                                                      num_experts,
                                                                      num_expert_group,
@@ -757,8 +756,7 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported data type for moe_fused_gate");
+            AITER_CHECK(false, "Unsupported data type for moe_fused_gate");
         }
     }
-    return {output, indices};
 }

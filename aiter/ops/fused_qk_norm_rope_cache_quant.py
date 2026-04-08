@@ -7,7 +7,7 @@ from ..jit.core import compile_ops
 from typing import Optional
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_cache_quant_shuffle(
     qkv: Tensor,
     num_heads_q: int,
@@ -48,6 +48,7 @@ def gen_fused_qk_rmsnorm_fake_tensor(
 
 @compile_ops(
     "module_fused_qk_norm_rope_cache_quant_shuffle",
+    develop=True,
     fc_name="fused_qk_rmsnorm",
     gen_fake=gen_fused_qk_rmsnorm_fake_tensor,
 )
@@ -85,7 +86,7 @@ def fused_qk_rmsnorm(
         )
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_cache_block_quant_shuffle(
     qkv: Tensor,
     num_heads_q: int,
@@ -109,7 +110,7 @@ def fused_qk_norm_rope_cache_block_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_cache_pts_quant_shuffle(
     qkv: Tensor,
     qw: Tensor,
@@ -139,7 +140,7 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
 def fused_qk_norm_rope_2way(
     q0: Tensor,
     k0: Tensor,

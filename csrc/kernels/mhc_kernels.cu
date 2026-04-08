@@ -6,9 +6,10 @@
 #include "opus/opus.hpp"
 // #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
-#include "dispatch_utils.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include "rocprim/rocprim.hpp"
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
 
 
@@ -210,9 +211,9 @@ namespace aiter {
     AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_pre_gemm_sqrsum", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
         const int tile_m = m_per_block; \
-        TORCH_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
-        TORCH_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
-        TORCH_CHECK(hc_mult3 <= tile_n, "hc_mult3 must be less than or equal to tile_n"); \
+        AITER_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
+        AITER_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
+        AITER_CHECK(hc_mult3 <= tile_n, "hc_mult3 must be less than or equal to tile_n"); \
         mhc_pre_gemm_sqrsum_kernel<DTYPE_I, block_size, tile_m, tile_n, tile_k><<<grid, block, 0, stream>>>( \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
@@ -234,18 +235,18 @@ namespace aiter {
     } else if (tile_k == 128) { \
         MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(256, 32, 128); \
     } else { \
-        TORCH_CHECK(false, "tile_k must be 64 or 128"); \
+        AITER_CHECK(false, "tile_k must be 64 or 128"); \
     }
 
     void mhc_pre_gemm_sqrsum(
-        torch::Tensor& out, // (split_k, m, hc_mult3) / (m, hc_mult3)
-        torch::Tensor& sqrsum, // (split_k, m) / (m)
-        torch::Tensor& x, // (m, hc_hidden_size)
-        torch::Tensor& fn, // (hc_mult3, hc_hidden_size)
+        const aiter_tensor_t& out, // (split_k, m, hc_mult3) / (m, hc_mult3)
+        const aiter_tensor_t& sqrsum, // (split_k, m) / (m)
+        const aiter_tensor_t& x, // (m, hc_hidden_size)
+        const aiter_tensor_t& fn, // (hc_mult3, hc_hidden_size)
         int tile_k = 128
     )
     {
-        TORCH_CHECK(out.size(0) == sqrsum.size(0), "out and sqrsum must have the same number of split_k or m");
+        AITER_CHECK(out.size(0) == sqrsum.size(0), "out and sqrsum must have the same number of split_k or m");
         int m = x.size(0);
         int hc_mult3 = fn.size(0);
         int hc_hidden_size = fn.size(1);
@@ -258,8 +259,8 @@ namespace aiter {
         const int m_per_block = block_size / warp_size * 16;
         int n_blocks = (m + m_per_block - 1) / m_per_block;
 
-        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(x));
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        HipDeviceGuard device_guard(x.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
 
         dim3 grid(n_blocks, split_k);
         dim3 block(block_size);
@@ -499,8 +500,8 @@ namespace aiter {
 #define MHC_PRE_BIG_FUSE_KERNEL_IMPL(block_size, hc_mult, num_rows, residual_block) \
     dim3 grid((m + num_rows - 1) / num_rows); \
     dim3 block(block_size); \
-    TORCH_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
-    TORCH_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
+    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
+    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
     AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse", [&] { \
         using DTYPE_I = typename t2opus<scalar_t>::type; \
         mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block><<<grid, block, 0, stream>>>( \
@@ -533,14 +534,14 @@ namespace aiter {
     }
 
     void mhc_pre_big_fuse(
-        torch::Tensor& post_mix, // (m, hc_mult)
-        torch::Tensor& comb_mix, // (m, hc_mult * hc_mult)
-        torch::Tensor& layer_input, // (m, hidden_size)
-        torch::Tensor& gemm_out_mul, // (split_k, m, hc_mult3)
-        torch::Tensor& gemm_out_sqrsum, // (split_k, m)
-        torch::Tensor& hc_scale, // (3)
-        torch::Tensor& hc_base, // (hc_mult3)
-        torch::Tensor& residual, // (m, hc_mult, hidden_size)
+        const aiter_tensor_t& post_mix, // (m, hc_mult)
+        const aiter_tensor_t& comb_mix, // (m, hc_mult * hc_mult)
+        const aiter_tensor_t& layer_input, // (m, hidden_size)
+        const aiter_tensor_t& gemm_out_mul, // (split_k, m, hc_mult3)
+        const aiter_tensor_t& gemm_out_sqrsum, // (split_k, m)
+        const aiter_tensor_t& hc_scale, // (3)
+        const aiter_tensor_t& hc_base, // (hc_mult3)
+        const aiter_tensor_t& residual, // (m, hc_mult, hidden_size)
         float rms_eps = 1e-6,
         float hc_pre_eps = 1e-6,
         float hc_sinkhorn_eps = 1e-6,
@@ -554,10 +555,10 @@ namespace aiter {
         int gemm_out_mul_stride = gemm_out_mul.stride(1);
         int hc_mult = residual.size(1);
         int n_splits = gemm_out_mul.dim() > 2 ? gemm_out_mul.size(0) : 1;
-        TORCH_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
 
-        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(layer_input));
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        HipDeviceGuard device_guard(layer_input.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         
         MHC_PRE_BIG_FUSE_KERNEL_DISPATCH(m);
@@ -842,11 +843,11 @@ namespace aiter {
     }
     
     void mhc_post(
-        torch::Tensor& out,
-        torch::Tensor& x, // (m, hc_mult, h)
-        torch::Tensor& residual, // (m, hc_mult, hidden_size)
-        torch::Tensor& post_layer_mix, // (m, hc_mult)
-        torch::Tensor& comb_res_mix // (m, hc_mult, hc_mult)
+        const aiter_tensor_t& out,
+        const aiter_tensor_t& x, // (m, hc_mult, h)
+        const aiter_tensor_t& residual, // (m, hc_mult, hidden_size)
+        const aiter_tensor_t& post_layer_mix, // (m, hc_mult)
+        const aiter_tensor_t& comb_res_mix // (m, hc_mult, hc_mult)
     )
     {
         int m = residual.size(0);
@@ -854,10 +855,10 @@ namespace aiter {
         int hidden_size = residual.size(2);
         int x_stride = x.stride(0);
         int residual_stride = residual.stride(0);
-        TORCH_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
 
-        const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(residual));
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
+        HipDeviceGuard device_guard(residual.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
         

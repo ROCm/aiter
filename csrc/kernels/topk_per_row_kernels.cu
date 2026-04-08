@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
@@ -2470,11 +2468,11 @@ int64_t invokeComputeTopkLastDimWorkspaceSize(int32_t numRows, int32_t stride0)
 // Explicit template instantiation to ensure the symbol is available for linking
 template int64_t invokeComputeTopkLastDimWorkspaceSize<float>(int32_t numRows, int32_t stride0);
 
-void top_k_per_row_prefill(const torch::Tensor& logits,
-                           const torch::Tensor& rowStarts,
-                           const torch::Tensor& rowEnds,
-                           torch::Tensor& indices,
-                           std::optional<torch::Tensor> values,
+void top_k_per_row_prefill(const aiter_tensor_t& logits,
+                           const aiter_tensor_t& rowStarts,
+                           const aiter_tensor_t& rowEnds,
+                           const aiter_tensor_t& indices,
+                           const aiter_tensor_t* values,
                            int64_t numRows,
                            int64_t stride0,
                            int64_t stride1)
@@ -2484,41 +2482,39 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     static constexpr int kTopK       = 2048;
     static constexpr bool is_largest = true;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     int64_t workspace_size   = invokeComputeTopkLastDimWorkspaceSize<float>(numRows, stride0);
-    // int64_t workspace_size   = int64_t(1024)*1024*1024*2;
-    auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
-    torch::Tensor workspace = torch::empty({workspace_size}, options);
+    auto workspace = AiterTensor::empty({workspace_size}, AITER_DTYPE_u8, logits.device_id);
 
-    if(values.has_value())
+    if(values != nullptr)
     {
         aiter::standalone_stable_radix_11bits<float, int, true, true>(
-            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            workspace.data_ptr(),
             buf_size,
-            logits.data_ptr<float>(),
+            reinterpret_cast<float*>(logits.data_ptr()),
             static_cast<int>(numRows),
             stride0,
-            rowStarts.data_ptr<int>(),
-            rowEnds.data_ptr<int>(),
+            reinterpret_cast<int*>(rowStarts.data_ptr()),
+            reinterpret_cast<int*>(rowEnds.data_ptr()),
             kTopK,
-            values->data_ptr<float>(),
-            indices.data_ptr<int>(),
+            reinterpret_cast<float*>(values->data_ptr()),
+            reinterpret_cast<int*>(indices.data_ptr()),
             is_largest,
             stream);
     }
     else
     {
         aiter::standalone_stable_radix_11bits<float, int, false, true>(
-            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            workspace.data_ptr(),
             buf_size,
-            logits.data_ptr<float>(),
+            reinterpret_cast<float*>(logits.data_ptr()),
             static_cast<int>(numRows),
             stride0,
-            rowStarts.data_ptr<int>(),
-            rowEnds.data_ptr<int>(),
+            reinterpret_cast<int*>(rowStarts.data_ptr()),
+            reinterpret_cast<int*>(rowEnds.data_ptr()),
             kTopK,
             nullptr,
-            indices.data_ptr<int>(),
+            reinterpret_cast<int*>(indices.data_ptr()),
             is_largest,
             stream);
     }
@@ -2595,10 +2591,10 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
 //     }
 // }
 
-void top_k_per_row_decode(const torch::Tensor& logits,
+void top_k_per_row_decode(const aiter_tensor_t& logits,
                           int64_t next_n,
-                          const torch::Tensor& seqLens,
-                          torch::Tensor& indices,
+                          const aiter_tensor_t& seqLens,
+                          const aiter_tensor_t& indices,
                           int64_t numRows,
                           int64_t stride0,
                           int64_t stride1)
@@ -2608,23 +2604,22 @@ void top_k_per_row_decode(const torch::Tensor& logits,
     static constexpr int kTopK       = 2048;
     static constexpr bool is_largest = true;
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
     int64_t workspace_size =
         invokeComputeTopkLastDimWorkspaceSize<float, aiter::Phase::Decode>(numRows, stride0);
-    auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(logits.device());
-    torch::Tensor workspace = torch::empty({workspace_size}, options);
+    auto workspace = AiterTensor::empty({workspace_size}, AITER_DTYPE_u8, logits.device_id);
 
     aiter::standalone_stable_radix_11bits<float, int, false, true, aiter::Phase::Decode>(
-        static_cast<void*>(workspace.data_ptr<uint8_t>()),
+        workspace.data_ptr(),
         buf_size,
-        logits.data_ptr<float>(),
+        reinterpret_cast<float*>(logits.data_ptr()),
         static_cast<int>(numRows),
         stride0,
         nullptr,
-        seqLens.data_ptr<int>(),
+        reinterpret_cast<int*>(seqLens.data_ptr()),
         kTopK,
         nullptr,
-        indices.data_ptr<int>(),
+        reinterpret_cast<int*>(indices.data_ptr()),
         is_largest,
         stream,
         static_cast<int>(next_n));

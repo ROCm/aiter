@@ -7,23 +7,23 @@ from ..jit.core import compile_ops
 MD_NAME = "module_custom"
 
 
-@compile_ops("module_custom")
+@compile_ops("module_custom", develop=True)
 def wvSpltK(
     in_a: Tensor, in_b: Tensor, out_c: Tensor, N_in: int, CuCount: int
 ) -> None: ...
 
 
-@compile_ops("module_custom")
+@compile_ops("module_custom", develop=True)
 def wv_splitk_small_fp16_bf16(
     in_a: Tensor, in_b: Tensor, out_c: Tensor, N_in: int, CuCount: int
 ) -> None: ...
 
 
-@compile_ops("module_custom")
+@compile_ops("module_custom", develop=True)
 def LLMM1(in_a: Tensor, in_b: Tensor, out_c: Tensor, rows_per_block: int) -> None: ...
 
 
-@compile_ops("module_custom")
+@compile_ops("module_custom", develop=True)
 def wvSplitKQ(
     in_a: Tensor,
     in_b: Tensor,

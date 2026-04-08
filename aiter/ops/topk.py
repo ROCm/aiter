@@ -12,7 +12,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
-@compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
+@compile_ops("module_moe_asm", develop=True, fc_name="biased_grouped_topk")
 def biased_grouped_topk_hip(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -25,7 +25,7 @@ def biased_grouped_topk_hip(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", develop=True)
 def grouped_topk(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -58,7 +58,7 @@ def gen_moe_fused_gate_fake_tensor(
     return [output, indices]
 
 
-@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
+@compile_ops("module_moe_asm", develop=True, gen_fake=gen_moe_fused_gate_fake_tensor)
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -197,7 +197,7 @@ def grouped_topk_torch(
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", develop=True)
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -210,7 +210,7 @@ def top_k_per_row_prefill(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row", ffi_type="ctypes")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes", develop=True)
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -223,7 +223,7 @@ def top_k_per_row_prefill_fast(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", develop=True)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -235,7 +235,7 @@ def top_k_per_row_decode(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row", ffi_type="ctypes")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes", develop=True)
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
     next_n: int,

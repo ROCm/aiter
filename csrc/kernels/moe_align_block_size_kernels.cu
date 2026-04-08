@@ -14,18 +14,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-
-#include <ATen/ATen.h>
-
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-namespace vllm {
+namespace aiter {
 
 namespace {
 __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t col)
@@ -124,37 +120,37 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
         sorted_token_ids[rank_post_pad] = i;
     }
 }
-} // namespace vllm
+} // namespace aiter
 
 namespace aiter {
 
-#define VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
+#define AITER_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
     hipFuncSetAttribute(FUNC, hipFuncAttributeMaxDynamicSharedMemorySize, VAL)
 
-void moe_align_block_size(torch::Tensor topk_ids,
+void moe_align_block_size(const aiter_tensor_t& topk_ids,
                           int64_t num_experts,
                           int64_t block_size,
-                          torch::Tensor sorted_token_ids,
-                          torch::Tensor experts_ids,
-                          torch::Tensor token_nums,
-                          torch::Tensor num_tokens_post_pad)
+                          const aiter_tensor_t& sorted_token_ids,
+                          const aiter_tensor_t& experts_ids,
+                          const aiter_tensor_t& token_nums,
+                          const aiter_tensor_t& num_tokens_post_pad)
 {
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(topk_ids));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    VLLM_DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
+    HipDeviceGuard device_guard(topk_ids.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    AITER_DISPATCH_INTEGRAL(topk_ids.dtype(), "moe_align_block_size_kernel", [&] {
         // Optimized shared memory: O(num_experts) instead of O(num_experts^2)
         // expert_token_counts[num_experts] + cumsum[num_experts + 1] + write_positions[num_experts]
         const int32_t shared_mem = (3 * num_experts + 1) * sizeof(int32_t);
 
         // set dynamic shared mem
-        auto kernel = vllm::moe_align_block_size_kernel<scalar_t>;
+        auto kernel = aiter::moe_align_block_size_kernel<scalar_t>;
         HIP_CALL(
-            VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
-        kernel<<<1, num_experts, shared_mem, stream>>>(topk_ids.data_ptr<scalar_t>(),
-                                                       sorted_token_ids.data_ptr<int32_t>(),
-                                                       experts_ids.data_ptr<int32_t>(),
-                                                       token_nums.data_ptr<int32_t>(),
-                                                       num_tokens_post_pad.data_ptr<int32_t>(),
+            AITER_DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
+        kernel<<<1, num_experts, shared_mem, stream>>>(reinterpret_cast<scalar_t*>(topk_ids.data_ptr()),
+                                                       reinterpret_cast<int32_t*>(sorted_token_ids.data_ptr()),
+                                                       reinterpret_cast<int32_t*>(experts_ids.data_ptr()),
+                                                       reinterpret_cast<int32_t*>(token_nums.data_ptr()),
+                                                       reinterpret_cast<int32_t*>(num_tokens_post_pad.data_ptr()),
                                                        num_experts,
                                                        block_size,
                                                        topk_ids.numel());

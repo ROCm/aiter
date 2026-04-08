@@ -17,13 +17,13 @@ from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num
 
 
-@compile_ops("module_smoothquant")
+@compile_ops("module_smoothquant", develop=True)
 def smoothquant_fwd(
     out: Tensor, input: Tensor, x_scale: Tensor, y_scale: Tensor
 ) -> None: ...
 
 
-@compile_ops("module_smoothquant")
+@compile_ops("module_smoothquant", develop=True)
 def moe_smoothquant_fwd(
     out: Tensor, input: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
 ) -> None: ...
@@ -461,15 +461,15 @@ def moe_smooth_per_token_scaled_quant(
         )
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -481,7 +481,7 @@ def dynamic_per_token_scaled_quant(
 ) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_group_scaled_quant_fp4(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -497,7 +497,7 @@ def dynamic_per_group_scaled_quant_fp4(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def smooth_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -512,7 +512,7 @@ def smooth_per_token_scaled_quant(
 ) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def moe_smooth_per_token_scaled_quant_v1(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -529,7 +529,7 @@ def moe_smooth_per_token_scaled_quant_v1(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def moe_smooth_per_token_scaled_quant_v2(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -548,7 +548,7 @@ def moe_smooth_per_token_scaled_quant_v2(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def partial_transpose(
     out: Tensor,
     input: Tensor,

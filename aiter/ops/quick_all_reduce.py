@@ -10,17 +10,17 @@ from ..jit.core import (
 MD_NAME = "module_quick_all_reduce"
 
 
-@compile_ops("module_quick_all_reduce")
+@compile_ops("module_quick_all_reduce", develop=True)
 def init_custom_qr(
     rank: int, world_size: int, qr_max_size: Optional[int] = None
 ) -> int: ...
 
 
-@compile_ops("module_quick_all_reduce")
+@compile_ops("module_quick_all_reduce", develop=True)
 def qr_destroy(fa: int) -> None: ...
 
 
-@compile_ops("module_quick_all_reduce")
+@compile_ops("module_quick_all_reduce", develop=True)
 def qr_all_reduce(
     fa: int,
     inp: torch.Tensor,
@@ -30,13 +30,13 @@ def qr_all_reduce(
 ) -> None: ...
 
 
-@compile_ops("module_quick_all_reduce")
+@compile_ops("module_quick_all_reduce", develop=True)
 def qr_get_handle(fa: int) -> torch.Tensor: ...
 
 
-@compile_ops("module_quick_all_reduce")
+@compile_ops("module_quick_all_reduce", develop=True)
 def qr_open_handles(fa: int, handles: list[torch.Tensor]) -> None: ...
 
 
-@compile_ops("module_quick_all_reduce")
+@compile_ops("module_quick_all_reduce", develop=True)
 def qr_max_size() -> int: ...

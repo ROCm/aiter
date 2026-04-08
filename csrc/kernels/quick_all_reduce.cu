@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
-#include <torch/all.h>
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 
 #ifdef USE_ROCM
 
@@ -32,24 +33,21 @@ void qr_destroy(fptr_t _fa) {
   }
 }
 
-torch::Tensor qr_get_handle(fptr_t _fa) {
+AiterTensor qr_get_handle(fptr_t _fa) {
   auto fa = reinterpret_cast<DeviceComms*>(_fa);
   hipIpcMemHandle_t handle = fa->get_handle();
-  auto options =
-      torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
   auto data_handle =
-      torch::empty({static_cast<int64_t>(sizeof(hipIpcMemHandle_t))}, options);
+      AiterTensor::empty({static_cast<int64_t>(sizeof(hipIpcMemHandle_t))}, AITER_DTYPE_u8, -1);
   std::memcpy(data_handle.data_ptr(), &handle, sizeof(hipIpcMemHandle_t));
   return data_handle;
 }
 
 void qr_open_handles(fptr_t _fa,
-                     const std::vector<torch::Tensor>& handles) {
+                     const std::vector<aiter_tensor_t>& handles) {
   auto fa = reinterpret_cast<DeviceComms*>(_fa);
   std::vector<hipIpcMemHandle_t> ipc_handles;
   ipc_handles.reserve(handles.size());
   for (auto& handle : handles) {
-    // Ensure the tensor is on the same device as the current device.
     hipIpcMemHandle_t ipc_handle;
     std::memcpy(&ipc_handle, handle.data_ptr(), sizeof(hipIpcMemHandle_t));
     ipc_handles.push_back(ipc_handle);
@@ -57,20 +55,20 @@ void qr_open_handles(fptr_t _fa,
   fa->open_ipc_handles(ipc_handles);
 }
 
-void qr_all_reduce(fptr_t _fa, torch::Tensor& inp,
-                   torch::Tensor& out, int64_t quant_level, bool cast_bf2half) {
+void qr_all_reduce(fptr_t _fa, const aiter_tensor_t& inp,
+                   const aiter_tensor_t& out, int64_t quant_level, bool cast_bf2half) {
   auto fa = reinterpret_cast<DeviceComms*>(_fa);
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-  auto stream = at::hip::getCurrentHIPStream();
+  HipDeviceGuard device_guard(inp.device_id);
+  auto stream = aiter::getCurrentHIPStream();
 
-  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
-  TORCH_CHECK_EQ(inp.numel(), out.numel());
-  TORCH_CHECK_LE(out.numel(), fa->kMaxProblemSize);
-  if (out.scalar_type() == at::ScalarType::Half) {
+  AITER_CHECK(inp.dtype() == out.dtype(), "inp and out must have same dtype");
+  AITER_CHECK(inp.numel() == out.numel(), "inp and out must have same numel");
+  AITER_CHECK(out.numel() <= fa->kMaxProblemSize, "out.numel() exceeds kMaxProblemSize");
+  if (out.dtype() == AITER_DTYPE_fp16) {
     fa->allreduce<half, false>(reinterpret_cast<half*>(inp.data_ptr()),
                                reinterpret_cast<half*>(out.data_ptr()),
                                out.numel(), quant_level, stream);
-  } else if (out.scalar_type() == at::ScalarType::BFloat16) {
+  } else if (out.dtype() == AITER_DTYPE_bf16) {
     if (cast_bf2half) {
       fa->allreduce<half, true>(reinterpret_cast<half*>(inp.data_ptr()),
                                 reinterpret_cast<half*>(out.data_ptr()),

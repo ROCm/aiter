@@ -14,14 +14,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 
-namespace vllm
+namespace aiter
 {
 
   template <typename scalar_t, bool IS_NEOX>
@@ -157,17 +155,17 @@ namespace vllm
         token_idx, query_stride, key_stride);
   }
 
-} // namespace vllm
+} // namespace aiter
 
 void rotary_embedding(
-    torch::Tensor &positions, // [batch_size, seq_len] or [num_tokens]
-    torch::Tensor &query,     // [batch_size, seq_len, num_heads * head_size] or
+    const aiter_tensor_t &positions, // [batch_size, seq_len] or [num_tokens]
+    const aiter_tensor_t &query,     // [batch_size, seq_len, num_heads * head_size] or
                               // [num_tokens, num_heads * head_size]
-    torch::Tensor &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
+    const aiter_tensor_t &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
                               // [num_tokens, num_kv_heads * head_size]
     int64_t head_size,
-    torch::Tensor &cos_cache, // [max_position, rot_dim//2]
-    torch::Tensor &sin_cache, // [max_position, rot_dim//2]
+    const aiter_tensor_t &cos_cache, // [max_position, rot_dim//2]
+    const aiter_tensor_t &sin_cache, // [max_position, rot_dim//2]
     bool is_neox, bool is_nope_first)
 {
   int64_t num_tokens = query.numel() / query.size(-1);
@@ -179,41 +177,41 @@ void rotary_embedding(
 
   dim3 grid(num_tokens);
   dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
-  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&]
+  HipDeviceGuard device_guard(query.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
+  AITER_DISPATCH_FLOATING(query.dtype(), "rotary_embedding", [&]
                                {
     if (is_neox) {
       if (is_nope_first)
       {
-        vllm::rotary_embedding_kernel<scalar_t, true, true><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+        aiter::rotary_embedding_kernel<scalar_t, true, true><<<grid, block, 0, stream>>>(
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
-        vllm::rotary_embedding_kernel<scalar_t, true, false><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+        aiter::rotary_embedding_kernel<scalar_t, true, false><<<grid, block, 0, stream>>>(
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
     } else {
       if (is_nope_first)
       {
-        vllm::rotary_embedding_kernel<scalar_t, false, true><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+        aiter::rotary_embedding_kernel<scalar_t, false, true><<<grid, block, 0, stream>>>(
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
-        vllm::rotary_embedding_kernel<scalar_t, false, false><<<grid, block, 0, stream>>>(
-            positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(), rot_dim,
+        aiter::rotary_embedding_kernel<scalar_t, false, false><<<grid, block, 0, stream>>>(
+            reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+            reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
-      
+
     } });
 }
 
@@ -222,16 +220,16 @@ Batched version of rotary embedding, pack multiple LoRAs together
 and process in batched manner.
 */
 void batched_rotary_embedding(
-    torch::Tensor &positions, // [batch_size, seq_len] or [num_tokens]
-    torch::Tensor &query,     // [batch_size, seq_len, num_heads * head_size] or
+    const aiter_tensor_t &positions, // [batch_size, seq_len] or [num_tokens]
+    const aiter_tensor_t &query,     // [batch_size, seq_len, num_heads * head_size] or
                               // [num_tokens, num_heads * head_size]
-    torch::Tensor &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
+    const aiter_tensor_t &key,       // [batch_size, seq_len, num_kv_heads * head_size] or
                               // [num_tokens, num_kv_heads * head_size]
     int64_t head_size,
-    torch::Tensor &cos_cache, // [max_position, rot_dim//2]
-    torch::Tensor &sin_cache, // [max_position, rot_dim//2]
+    const aiter_tensor_t &cos_cache, // [max_position, rot_dim//2]
+    const aiter_tensor_t &sin_cache, // [max_position, rot_dim//2]
     bool is_neox, bool is_nope_first, int64_t rot_dim,
-    torch::Tensor &cos_sin_cache_offsets // [num_tokens]
+    const aiter_tensor_t &cos_sin_cache_offsets // [num_tokens]
 )
 {
   int64_t num_tokens = cos_sin_cache_offsets.size(0);
@@ -242,46 +240,46 @@ void batched_rotary_embedding(
 
   dim3 grid(num_tokens);
   dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
-  VLLM_DISPATCH_FLOATING_TYPES(query.scalar_type(), "rotary_embedding", [&]
+  HipDeviceGuard device_guard(query.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
+  AITER_DISPATCH_FLOATING(query.dtype(), "rotary_embedding", [&]
                                {
     if (is_neox) {
       if (is_nope_first)
       {
-        vllm::batched_rotary_embedding_kernel<scalar_t, true, true>
+        aiter::batched_rotary_embedding_kernel<scalar_t, true, true>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
-        vllm::batched_rotary_embedding_kernel<scalar_t, true, false>
+        aiter::batched_rotary_embedding_kernel<scalar_t, true, false>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
     } else {
       if (is_nope_first)
       {
-        vllm::batched_rotary_embedding_kernel<scalar_t, false, true>
+        aiter::batched_rotary_embedding_kernel<scalar_t, false, true>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
-        vllm::batched_rotary_embedding_kernel<scalar_t, false, false>
+        aiter::batched_rotary_embedding_kernel<scalar_t, false, false>
             <<<grid, block, 0, stream>>>(
-                positions.data_ptr<int64_t>(), query.data_ptr<scalar_t>(),
-                key.data_ptr<scalar_t>(), cos_cache.data_ptr<scalar_t>(), sin_cache.data_ptr<scalar_t>(),
-                cos_sin_cache_offsets.data_ptr<int64_t>(), rot_dim, query_stride,
+                reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
+                reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
+                reinterpret_cast<int64_t*>(cos_sin_cache_offsets.data_ptr()), rot_dim, query_stride,
                 key_stride, num_heads, num_kv_heads, head_size);
       }
     } });

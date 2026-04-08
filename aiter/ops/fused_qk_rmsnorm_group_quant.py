@@ -10,7 +10,9 @@ from ..utility import dtypes
 
 
 @compile_ops(
-    "module_fused_qk_rmsnorm_group_quant", fc_name="fused_qk_rmsnorm_group_quant"
+    "module_fused_qk_rmsnorm_group_quant",
+    develop=True,
+    fc_name="fused_qk_rmsnorm_group_quant",
 )
 def _fused_qk_rmsnorm_group_quant_kernel(
     q_out_quantized: Tensor,

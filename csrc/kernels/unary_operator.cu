@@ -14,12 +14,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
-#include <torch/torch.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include <cmath>
 
 #include <hip/hip_bf16.h>
@@ -69,10 +67,6 @@ namespace aiter
             // return static_cast<T>(y);
         }
 
-        static torch::Tensor compute(torch::Tensor &input)
-        {
-            return torch::tanh(input);
-        }
     };
 
     struct SigmoidOp
@@ -94,11 +88,6 @@ namespace aiter
             float result = __builtin_amdgcn_rcpf(denom);
 
             return static_cast<T>(result);
-        }
-
-        static torch::Tensor compute(torch::Tensor &input)
-        {
-            return torch::sigmoid(input);
         }
     };
 
@@ -131,51 +120,43 @@ namespace aiter
 }
 
 template <typename Operation>
-torch::Tensor unary_operation(torch::Tensor &input)
+AiterTensor unary_operation(const aiter_tensor_t &input)
 {
     int dim = input.dim();
-    bool is_support = true;
-    is_support &= input.is_contiguous() == true;
     int M = dim == 2 ? 1 : input.size(0);
     int N = dim == 2 ? input.size(0) : input.size(1);
     int K = dim == 2 ? input.size(1) : input.size(2);
     const uint32_t rows = 8;
     const uint32_t vec = 16 / sizeof(input.dtype());
-    is_support &= N % rows == 0;
-    is_support &= K % vec == 0;
-    if (is_support)
-    {
-        auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
-        auto output = torch::empty(input.sizes(), options);
-        void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+    AITER_CHECK(N % rows == 0, "N must be divisible by rows");
+    AITER_CHECK(K % vec == 0, "K must be divisible by vec");
 
-        void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-        const hipStream_t stream = at::hip::getCurrentHIPStream();
-        int elements = N * K;
+    auto output = AiterTensor::empty(input.sizes_vec(), input.dtype(), input.device_id);
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
-        constexpr uint32_t wg = 256;
-        int grid_x = (elements / (rows * vec) + wg - 1) / wg;
-        const dim3 grid_dim(grid_x, 1, 1);
-        const dim3 block_dim(wg, 1, 1);
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    int elements = N * K;
 
-        VLLM_DISPATCH_FLOATING_TYPES(
-            input.scalar_type(), "unary_operator_tile_kernel", [&]
-            { aiter::unary_operator_tile_kernel<scalar_t, rows, vec, Operation>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_c, M, N, K); });
-        return output;
-    }
-    else
-    {
-        return Operation::compute(input);
-    }
+    constexpr uint32_t wg = 256;
+    int grid_x = (elements / (rows * vec) + wg - 1) / wg;
+    const dim3 grid_dim(grid_x, 1, 1);
+    const dim3 block_dim(wg, 1, 1);
+
+    AITER_DISPATCH_FLOATING(
+        input.dtype(), "unary_operator_tile_kernel", [&]
+        { aiter::unary_operator_tile_kernel<scalar_t, rows, vec, Operation>
+              <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_c, M, N, K); });
+    return output;
 }
 
-torch::Tensor aiter_sigmoid(torch::Tensor &input)
+AiterTensor aiter_sigmoid(const aiter_tensor_t &input)
 {
     return unary_operation<aiter::SigmoidOp>(input);
 }
 
-torch::Tensor aiter_tanh(torch::Tensor &input)
+AiterTensor aiter_tanh(const aiter_tensor_t &input)
 {
     return unary_operation<aiter::TanhOp>(input);
 }
