@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 
 from setuptools import Distribution, setup
@@ -10,6 +11,9 @@ from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
+
+FLYDSL_VERSION = "flydsl==0.1.2"
+
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
@@ -46,6 +50,24 @@ def is_develop_mode():
         elif "editable" in arg:
             return True
     return False
+
+
+if not IS_WINDOWS and is_develop_mode():
+    try:
+        from importlib.metadata import version as pkg_version
+
+        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+            raise ImportError("version mismatch")
+    except Exception:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                FLYDSL_VERSION,
+            ]
+        )
 
 
 def write_install_mode():
@@ -156,7 +178,7 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
                 "module_fmha_v3_fwd",
@@ -164,24 +186,16 @@ def get_exclude_ops():
             ]:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
-            # Exclude _bwd, _tune, and specific module
-            if (
-                "_bwd" in module
-                or "_tune" in module
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            # Exclude _bwd and _tune
+            if "_bwd" in module or "_tune" in module:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 3:
-            # Keep only module_fmha_v3* and module_aiter_enum
-            if not (
-                module.startswith("module_fmha_v3")
-                or module == "module_aiter_enum"
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            # Keep only module_fmha_v3*
+            if not module.startswith("module_fmha_v3"):
                 exclude_ops.append(module)
         else:
-            # Default behavior: exclude tunes and specific mi350 module
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            # Default behavior: exclude tunes
+            if "_tune" in module:
                 exclude_ops.append(module)
 
     return exclude_ops
@@ -323,7 +337,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        "flydsl==0.1.1.dev409",
+        FLYDSL_VERSION,
     ]
 
 setup(
