@@ -1,9 +1,7 @@
 import torch
 import triton
-import triton.language as tl
 import triton.experimental.gluon as gluon
 import triton.experimental.gluon.language as gl
-import sys
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 import argparse
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
