@@ -21,42 +21,6 @@ from einops import repeat as eirp
 block_shape = (128, 128)
 
 
-def load_asm_tuned_configs():
-    """Load tuned ASM configs from CSV files, return dict keyed by (M,N,K)."""
-    config_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "aiter", "configs"
-    )
-    csv_files = [os.path.join(config_dir, "a8w8_blockscale_bpreshuffle_tuned_gemm.csv")]
-    model_dir = os.path.join(config_dir, "model_configs")
-    if os.path.isdir(model_dir):
-        for f in os.listdir(model_dir):
-            if f.startswith("a8w8_blockscale_bpreshuffle_tuned_gemm") and f.endswith(
-                ".csv"
-            ):
-                csv_files.append(os.path.join(model_dir, f))
-
-    lookup = {}
-    for fpath in csv_files:
-        if not os.path.exists(fpath):
-            continue
-        df = pd.read_csv(fpath)
-        if df.empty:
-            continue
-        asm_rows = df[df["libtype"] == "asm"]
-        for _, row in asm_rows.iterrows():
-            key = (int(row["M"]), int(row["N"]), int(row["K"]))
-            if key not in lookup or row["us"] < lookup[key]["us"]:
-                lookup[key] = {
-                    "splitK": int(row["splitK"]),
-                    "kernelName": row["kernelName"],
-                    "us": row["us"],
-                }
-    return lookup
-
-
-asm_tuned_configs = load_asm_tuned_configs()
-
-
 @perftest(num_iters=5)
 def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     block_shape_n, block_shape_k = block_shape
@@ -122,26 +86,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
 
     tag = "asm"
     weight_asm = shuffle_weight(weight, layout=(16, 16))
-    asm_cfg = asm_tuned_configs.get((m, n, k))
-    asm_splitK = asm_cfg["splitK"] if asm_cfg else None
-    asm_kernel = asm_cfg["kernelName"] if asm_cfg else None
-    if asm_cfg:
-        aiter.logger.info(
-            f"asm tuned config hit: M={m}, N={n}, K={k}, splitK={asm_splitK}, kernel={asm_kernel}"
-        )
-    else:
-        aiter.logger.info(
-            f"asm tuned config miss: M={m}, N={n}, K={k}, using heuristic"
-        )
-    c, avg_c = run_asm(
-        x,
-        weight_asm,
-        x_scale_t,
-        w_scale,
-        dtype,
-        splitK=asm_splitK,
-        kernel_name=asm_kernel,
-    )
+    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
     err_asm = checkAllclose(a, c, msg=f"{tag}")
     ret[f"{tag} us"] = avg_c
@@ -174,23 +119,11 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_asm(
-    x, weight, x_scale, w_scale, dtype=dtypes.bf16, splitK=None, kernel_name=None
-):
+def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     m, k = x.shape
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
-    zero_bias_buf = torch.zeros(1, n, dtype=torch.float32, device=x.device)
-    return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(
-        x,
-        weight,
-        out,
-        x_scale,
-        w_scale,
-        splitK=splitK,
-        kernelName=kernel_name,
-        zero_bias_buf=zero_bias_buf,
-    )
+    return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)
 
 
 parser = argparse.ArgumentParser(
