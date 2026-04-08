@@ -208,14 +208,24 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                print(f"[Warning]: kernelName '{kname}' not found, skip it")
+                gfx = row.get("gfx", "unknown")
+                print(
+                    f"[Warning]: kernelName '{kname}' not found in kernels_by_name "
+                    f"(gfx={gfx}, cu_num={key[0]}, M={key[1]}, N={key[2]}, K={key[3]}); "
+                    f"falling back to heuristic default."
+                )
         else:
             kid = int(row["kernelId"])
             kernel = kernels_list.get(kid)
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                print(f"[Warning]: kernelId {kid} not in kernels_list, skip it")
+                gfx = row.get("gfx", "unknown")
+                print(
+                    f"[Warning]: kernelId {kid} not in kernels_list "
+                    f"(gfx={gfx}, cu_num={key[0]}, M={key[1]}, N={key[2]}, K={key[3]}, "
+                    f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+                )
     return tune_dict
 
 
@@ -255,7 +265,12 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
         if kernel is not None:
             tune_dict[key] = kernel
         else:
-            print(f"[Warning]: kernelId {kid} not in kernels_list, skip it")
+            gfx = row.get("gfx", "unknown")
+            print(
+                f"[Warning]: kernelId {kid} not in kernels_list "
+                f"(gfx={gfx}, cu_num={key[0]}, B={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}, "
+                f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
+            )
     return tune_dict
 
 
