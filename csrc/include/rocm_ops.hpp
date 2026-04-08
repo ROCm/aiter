@@ -36,33 +36,32 @@ namespace py = pybind11;
     AITER_SET_STREAM_PYBIND                                                                    \
     pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                      \
         .def(pybind11::init<>())                                                               \
+        .def(pybind11::init([](int64_t data_ptr, size_t numel, int ndim,                       \
+                               const std::vector<int64_t>& shape,                              \
+                               const std::vector<int64_t>& strides,                            \
+                               int dtype, int device_id) {                                     \
+                 aiter_tensor_t at{};                                                          \
+                 at.ptr = (void*)data_ptr;                                                     \
+                 at.numel_ = numel;                                                            \
+                 at.ndim = ndim;                                                               \
+                 for(int i = 0; i < ndim && i < 8; i++) {                                      \
+                     at.shape[i] = shape[i];                                                   \
+                     at.strides[i] = strides[i];                                               \
+                 }                                                                             \
+                 at.dtype_ = (AiterDtype)dtype;                                                \
+                 at.device_id = device_id;                                                     \
+                 return at;                                                                    \
+             }),                                                                               \
+             pybind11::arg("data_ptr"),                                                        \
+             pybind11::arg("numel"),                                                           \
+             pybind11::arg("ndim"),                                                            \
+             pybind11::arg("shape"),                                                           \
+             pybind11::arg("strides"),                                                         \
+             pybind11::arg("dtype"),                                                           \
+             pybind11::arg("device_id"))                                                       \
         .def_readwrite("numel_", &aiter_tensor_t::numel_)                                      \
         .def_readwrite("ndim", &aiter_tensor_t::ndim)                                          \
-        .def_readwrite("device_id", &aiter_tensor_t::device_id);                               \
-    m.def("make_aiter_tensor",                                                                 \
-          [](int64_t data_ptr, size_t numel, int ndim,                                         \
-             const std::vector<int64_t>& shape,                                                \
-             const std::vector<int64_t>& strides,                                              \
-             int dtype, int device_id) {                                                       \
-              aiter_tensor_t at{};                                                             \
-              at.ptr = (void*)data_ptr;                                                        \
-              at.numel_ = numel;                                                               \
-              at.ndim = ndim;                                                                  \
-              for(int i = 0; i < ndim && i < 8; i++) {                                         \
-                  at.shape[i] = shape[i];                                                      \
-                  at.strides[i] = strides[i];                                                  \
-              }                                                                                \
-              at.dtype_ = (AiterDtype)dtype;                                                   \
-              at.device_id = device_id;                                                        \
-              return at;                                                                       \
-          },                                                                                   \
-          pybind11::arg("data_ptr"),                                                           \
-          pybind11::arg("numel"),                                                              \
-          pybind11::arg("ndim"),                                                               \
-          pybind11::arg("shape"),                                                              \
-          pybind11::arg("strides"),                                                            \
-          pybind11::arg("dtype"),                                                              \
-          pybind11::arg("device_id"));
+        .def_readwrite("device_id", &aiter_tensor_t::device_id);
 
 #define ACTIVATION_PYBIND                               \
     m.def("silu_and_mul",                               \
