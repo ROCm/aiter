@@ -6,6 +6,8 @@
 
 #include <hip/hip_runtime.h>
 #include <functional>
+#include <stdexcept>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 
@@ -44,13 +46,24 @@ struct GemmDispatchHash
 // multiProcessorCounts are not a supported inference scenario; the cached value
 // reflects whichever device is current at the time of the first dispatch call.
 // ---------------------------------------------------------------------------
+// Note: HIP_CALL from aiter_hip_common.h is not used here to keep this header
+// self-contained — aiter_hip_common.h pulls in CK and logger headers that may
+// not be available in all build configurations.
 inline int get_device_cu_num()
 {
     static const int cu_num = []() {
-        hipDeviceProp_t prop{};
         int device = 0;
-        hipGetDevice(&device);
-        hipGetDeviceProperties(&prop, device);
+        hipError_t err = hipGetDevice(&device);
+        if(err != hipSuccess)
+            throw std::runtime_error(
+                std::string("get_device_cu_num: hipGetDevice failed: ") +
+                hipGetErrorString(err));
+        hipDeviceProp_t prop{};
+        err = hipGetDeviceProperties(&prop, device);
+        if(err != hipSuccess)
+            throw std::runtime_error(
+                std::string("get_device_cu_num: hipGetDeviceProperties failed: ") +
+                hipGetErrorString(err));
         return prop.multiProcessorCount;
     }();
     return cu_num;
