@@ -29,6 +29,22 @@ from gemm_a8w8_blockscale_cktile_instance import (
     BLOCK_PER_CU_MAX,
 )
 
+# flydsl
+try:
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        kernels_list as kernels_list_flydsl,
+    )
+except ImportError:
+    print(
+        "[FlyDSL] flydsl_gemm_a8w8_blockscale_bpreshuffle_common.py not found, flydsl tuning disabled"
+    )
+    kernels_list_flydsl = {}
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+if is_flydsl_available():
+    from aiter.ops.flydsl.gemm_kernels import flydsl_blockscale_preshuffle_gemm
+
 block_shape = (128, 128)
 
 
@@ -103,6 +119,16 @@ def run_gemm_a8w8_blockscale(
         )
 
 
+def run_gemm_flydsl_blockscale(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    ki = kernels_list_flydsl[kernel_id]
+    flydsl_blockscale_preshuffle_gemm(
+        x, weight_shuffle, x_scale, w_scale, out,
+        ki.tile_m, ki.tile_n, ki.tile_k,
+        ki.scale_block_k, ki.use_cshuffle_epilog, ki.use_async_copy, ki.waves_per_eu,
+    )
+    return out
+
+
 def generate_data(m, n, k, seed, device="cuda"):
     """
     Generate random data for testing the gemm a8w8 blockscale kernel.
@@ -148,9 +174,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="both",
-            choices=["ck", "cktile", "both", "all"],
+            choices=["ck", "cktile", "both", "all", "flydsl"],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck, cktile, both or all (covers (ck, cktile) x (standard, preshuffleB))",
+            help="CK gemm a8w8 blockscale type to tune: ck, cktile, both, flydsl, or all (covers (ck, cktile, flydsl) x (standard, preshuffleB))",
         )
 
         self.parser.add_argument(
@@ -187,6 +213,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         elif libType == "cktile":
             # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
             kernel_list = candidate_kernels_cktile_dict
+        elif libType == "flydsl":
+            if kernelId not in kernels_list_flydsl:
+                return None
+            return kernels_list_flydsl[kernelId].name
         else:
             return None
 
@@ -320,6 +350,57 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                 )
         return tasks_ck
 
+    def get_flydsl_gemm_a8w8_blockscale_bpreshuffle_tune_task(
+        self,
+        info_keys,
+        seed,
+    ):
+        cu_num, M, N, K = info_keys
+        if not kernels_list_flydsl:
+            return []
+
+        gemm_flydsl_data_idx = [0, 5, 2, 3, 4]
+        ref_data_idx = [0, 1, 2, 3]
+        tasks = []
+        for i in sorted(kernels_list_flydsl.keys()):
+            ki = kernels_list_flydsl[i]
+            if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+                continue
+            if K % ki.scale_block_k != 0:
+                continue
+            if ki.tile_k % ki.scale_block_k != 0:
+                continue
+            if M >= 8192 and ki.tile_m < 64:
+                continue
+            if M >= 4096 and ki.tile_m < 32:
+                continue
+            kernel_name = ki.name
+            info = (info_keys, i, 0, kernel_name, "flydsl", True)
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed),
+                    run_gemm_flydsl_blockscale,
+                    (
+                        gemm_flydsl_data_idx,
+                        i,
+                    ),
+                    {},
+                    run_torch,
+                    (
+                        ref_data_idx,
+                        None,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                )
+            )
+        return tasks
+
     def tune(
         self,
         untunedf,
@@ -343,16 +424,23 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             total_kernel_nums = 0
             # kernels_num = len(candidate_kernels_dict)
             info_keys = (cu_num, M, N, K)
-            if args.libtype == "ck" or args.libtype == "both":
+            if args.libtype in ("ck", "both"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_tune_task(
                         info_keys, useSplitK, seed, isPreshuffleB
                     )
                 )
-            if args.libtype == "cktile" or args.libtype == "both":
+            if args.libtype in ("cktile", "both"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_cktile_tune_task(
                         info_keys, useSplitK, seed, isPreshuffleB
+                    )
+                )
+            if args.libtype in ("flydsl", "both") and isPreshuffleB:
+                task.extend(
+                    self.get_flydsl_gemm_a8w8_blockscale_bpreshuffle_tune_task(
+                        info_keys,
+                        seed,
                     )
                 )
             if args.libtype == "all":
@@ -367,6 +455,12 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             info_keys, useSplitK, seed, preshuffleB
                         )
                     )
+                task.extend(
+                    self.get_flydsl_gemm_a8w8_blockscale_bpreshuffle_tune_task(
+                        info_keys,
+                        seed,
+                    )
+                )
             total_kernel_nums = len(task)
 
             tasks_data.append((total_kernel_nums, ()))

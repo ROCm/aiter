@@ -697,7 +697,41 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "flydsl" and is_flydsl_available():
+            return gemm_a8w8_blockscale_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+
+
+def gemm_a8w8_blockscale_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    from .flydsl.gemm_kernels import flydsl_blockscale_preshuffle_gemm
+    from .flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        kernels_list as kernels_list_flydsl,
+    )
+
+    kernel_id = config.get("kernelId")
+    if kernel_id is not None and kernel_id in kernels_list_flydsl:
+        ki = kernels_list_flydsl[kernel_id]
+        tm, tn, tk = ki.tile_m, ki.tile_n, ki.tile_k
+        sbk = ki.scale_block_k
+        csh, acp, wpe = (
+            ki.use_cshuffle_epilog, ki.use_async_copy, ki.waves_per_eu,
+        )
+    else:
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+
+    flydsl_blockscale_preshuffle_gemm(
+        XQ.contiguous(), WQ.contiguous(),
+        x_scale, w_scale, Out,
+        tm, tn, tk, sbk, csh, acp, wpe,
+    )
+    return Out
 
 
 def gfx950_a8w8_blockscale_ASM(

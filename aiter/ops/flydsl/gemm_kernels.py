@@ -481,6 +481,128 @@ def flydsl_hgemm(
 # FlyDSL preshuffle GEMM kernel management
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# FlyDSL blockscale preshuffle GEMM kernel management
+# ---------------------------------------------------------------------------
+
+_flydsl_blockscale_compile_fn = None
+_flydsl_blockscale_import_done = False
+_flydsl_blockscale_kernel_cache: dict = {}
+
+
+def _get_blockscale_compile_fn():
+    """Lazy-import compile_blockscale_preshuffle_gemm so the module loads even without FlyDSL."""
+    global _flydsl_blockscale_compile_fn, _flydsl_blockscale_import_done
+    if _flydsl_blockscale_import_done:
+        return _flydsl_blockscale_compile_fn
+    _flydsl_blockscale_import_done = True
+    if not is_flydsl_available():
+        logger.info("[FlyDSL] not available, will fall back to CK/CKTile for blockscale")
+        return None
+    try:
+        from .kernels.blockscale_preshuffle_gemm import compile_blockscale_preshuffle_gemm
+
+        _flydsl_blockscale_compile_fn = compile_blockscale_preshuffle_gemm
+        logger.info("[FlyDSL] loaded blockscale preshuffle GEMM compiler")
+    except Exception as e:
+        logger.info(
+            f"[FlyDSL] blockscale preshuffle GEMM not available, will fall back to CK/CKTile: {e}"
+        )
+    return _flydsl_blockscale_compile_fn
+
+
+def flydsl_blockscale_preshuffle_gemm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    scale_block_k: int = 128,
+    use_cshuffle_epilog: int = 0,
+    use_async_copy: int = 0,
+    waves_per_eu: int = 0,
+) -> Tensor:
+    """Compile (cached) and run a FlyDSL blockscale preshuffle GEMM kernel.
+
+    x_scale: (M, scale_k) in original layout -- transposed internally.
+    w_scale: (scale_n, scale_k) row-major.
+    """
+    compile_fn = _get_blockscale_compile_fn()
+    if compile_fn is None:
+        raise RuntimeError("[FlyDSL] blockscale compile function not available")
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0]
+
+    if n % tile_n != 0:
+        raise RuntimeError(
+            f"[FlyDSL] N ({n}) is not a multiple of tile_n ({tile_n}). "
+            f"Arguments not supported! Skipping gemm!"
+        )
+    if k % tile_k != 0:
+        raise RuntimeError(
+            f"[FlyDSL] K ({k}) is not a multiple of tile_k ({tile_k}). "
+            f"Arguments not supported! Skipping gemm!"
+        )
+
+    wpe = None if waves_per_eu <= 0 else waves_per_eu
+
+    if Out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    else:
+        out_dtype = "fp16"
+
+    cache_key = (
+        m, n, k, out_dtype,
+        tile_m, tile_n, tile_k,
+        scale_block_k, use_cshuffle_epilog, use_async_copy, wpe,
+    )
+    if cache_key not in _flydsl_blockscale_kernel_cache:
+        try:
+            exe = compile_fn(
+                M=m, N=n, K=k,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                scale_block_k=scale_block_k,
+                out_dtype=out_dtype,
+                use_cshuffle_epilog=bool(use_cshuffle_epilog),
+                waves_per_eu=wpe,
+                use_async_copy=bool(use_async_copy),
+            )
+            _flydsl_blockscale_kernel_cache[cache_key] = exe
+            logger.info(
+                f"[FlyDSL] compiled blockscale preshuffle GEMM ({m},{n},{k} "
+                f"tile={tile_m}x{tile_n}x{tile_k} sbk={scale_block_k} "
+                f"csh={use_cshuffle_epilog} acp={use_async_copy} wpe={waves_per_eu})"
+            )
+        except Exception as e:
+            logger.warning(f"[FlyDSL] blockscale compile failed ({m},{n},{k}): {e}")
+            _flydsl_blockscale_kernel_cache[cache_key] = None
+
+    exe = _flydsl_blockscale_kernel_cache[cache_key]
+    if exe is None:
+        raise RuntimeError(f"[FlyDSL] blockscale kernel compile returned None for ({m},{n},{k})")
+
+    def _as_i8(t):
+        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(-1)
+    w_scale_flat = w_scale.contiguous().view(-1)
+
+    exe(
+        Out.contiguous().view(-1),
+        _as_i8(XQ.contiguous()).view(-1),
+        _as_i8(WQ.contiguous()).view(-1),
+        x_scale_t,
+        w_scale_flat,
+        m, n,
+        torch.cuda.current_stream(),
+    )
+
+    return Out
+
 _flydsl_compile_fn = None
 _flydsl_import_done = False
 _flydsl_kernel_cache: dict = {}
