@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import functools
+import logging
 import os
 import re
 import subprocess
+
+logger = logging.getLogger("aiter")
 
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
@@ -197,8 +200,8 @@ def build_tune_dict(
         filtered = filtered[filtered["libtype"] == libtype]
     use_name = kernels_by_name is not None and "kernelName" in tune_df.columns
     if kernels_by_name is not None and not use_name:
-        print(
-            "[Warning]: kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
+        logger.warning(
+            "kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
         )
     for _, row in filtered.iterrows():
         key = (int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
@@ -209,8 +212,8 @@ def build_tune_dict(
                 tune_dict[key] = kernel
             else:
                 gfx = row.get("gfx", "unknown")
-                print(
-                    f"[Warning]: kernelName '{kname}' not found in kernels_by_name "
+                logger.warning(
+                    f"kernelName '{kname}' not found in kernels_by_name "
                     f"(gfx={gfx}, cu_num={key[0]}, M={key[1]}, N={key[2]}, K={key[3]}); "
                     f"falling back to heuristic default."
                 )
@@ -221,8 +224,8 @@ def build_tune_dict(
                 tune_dict[key] = kernel
             else:
                 gfx = row.get("gfx", "unknown")
-                print(
-                    f"[Warning]: kernelId {kid} not in kernels_list "
+                logger.warning(
+                    f"kernelId {kid} not in kernels_list "
                     f"(gfx={gfx}, cu_num={key[0]}, M={key[1]}, N={key[2]}, K={key[3]}, "
                     f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
                 )
@@ -266,8 +269,8 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
             tune_dict[key] = kernel
         else:
             gfx = row.get("gfx", "unknown")
-            print(
-                f"[Warning]: kernelId {kid} not in kernels_list "
+            logger.warning(
+                f"kernelId {kid} not in kernels_list "
                 f"(gfx={gfx}, cu_num={key[0]}, B={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}, "
                 f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
             )
