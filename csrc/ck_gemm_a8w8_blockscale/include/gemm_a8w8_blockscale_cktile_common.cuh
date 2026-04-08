@@ -364,12 +364,11 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_cktile_impl(torch::Tensor& XQ
     args.stride_BQ = stride_BQ;
 
     // Split-K uses atomic_add into C; zero the output buffer first.
+    // Use zero_() so all rows are cleared regardless of the leading-dimension
+    // stride (e.g. padded tensors produced by vLLM's _maybe_pad_fp8_weight).
     if(k_batch > 1)
     {
-        hipMemsetAsync(Y.data_ptr(),
-                       0,
-                       M * N * sizeof(OutDataType),
-                       at::hip::getCurrentHIPStream());
+        Y.zero_();
     }
 
     // do tile GEMM

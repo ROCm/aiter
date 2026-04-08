@@ -161,6 +161,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(torch::Tensor& XQ,
                                              b_element_op,
                                              cde_element_op);
 
+    TORCH_CHECK(KBatch >= 1, "KBatch must be >= 1, got ", KBatch);
+
     if(KBatch > 1)
     {
         device_gemm.SetKBatch(&argument, KBatch);

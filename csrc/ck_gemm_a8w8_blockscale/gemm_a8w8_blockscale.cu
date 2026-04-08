@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <cmath>
 #include <functional>
 #include <unordered_map>
 
@@ -98,10 +97,14 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 
-    int M = XQ.size(0);
-    int N = WQ.size(0);
-    int K = XQ.size(1);
-    int KBatch = static_cast<int>(std::pow(2, splitK));
+    TORCH_CHECK(splitK >= 0 && splitK <= 30,
+                "splitK must be in the range [0, 30], got ",
+                splitK);
+
+    int M      = XQ.size(0);
+    int N      = WQ.size(0);
+    int K      = XQ.size(1);
+    int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
