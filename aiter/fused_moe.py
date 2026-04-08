@@ -270,6 +270,14 @@ def fused_moe_(
                 q_dtype_a = dtypes.bf16
             elif M >= bf16_fp8_bound:
                 q_dtype_a = dtypes.fp8
+        elif a1_scale is not None and get_gfx() == "gfx950":
+            # a8w4 model with static scales:
+            # decode (small M) -> bf16 activations -> F16xMXF4 (faster)
+            # prefill (large M) -> fp8 activations -> F8xMXF4
+            if M < bf16_fp8_bound:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -998,7 +1006,7 @@ def get_2stage_cfgs(
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        and (activation == ActivationType.Swiglu or q_dtype_a in [dtypes.fp8, dtypes.bf16])
     ):
         return MOEMetadata(
             functools.partial(
@@ -1171,7 +1179,6 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -1182,7 +1189,6 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
@@ -1281,7 +1287,6 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -1291,7 +1296,6 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
     ):
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
@@ -1777,11 +1781,20 @@ def cktile_moe_stage1(
     # valid_out = tmp_out[:token_num * topk, :] before silu_and_mul/gelu_and_mul.
     tmp_out = (
         torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
+            (token_num, topk, w1.shape[1]), dtype=dtype, device=out.device
         )
         if split_k > 1
         else out
     )
+
+    # CK-Tile Swiglu kernels require HasBias=true in the dispatch template.
+    # When the model has no expert bias, pass a dummy zero bias tensor so the
+    # C++ dispatch finds the correct Swiglu+HasBias kernel specialization.
+    if activation == ActivationType.Swiglu and bias1 is None:
+        E, N = w1.shape[0], w1.shape[1]
+        if not hasattr(cktile_moe_stage1, '_dummy_bias1') or cktile_moe_stage1._dummy_bias1.shape != (E, N) or cktile_moe_stage1._dummy_bias1.device != hidden_states.device:
+            cktile_moe_stage1._dummy_bias1 = torch.zeros([E, N], dtype=torch.float32, device=hidden_states.device)
+        bias1 = cktile_moe_stage1._dummy_bias1
 
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
@@ -1841,6 +1854,13 @@ def cktile_moe_stage2(
     # )
     # if zeros_out:
     #     out.fill_(0)
+    # CK-Tile Swiglu kernels require HasBias=true in the dispatch template.
+    if activation == ActivationType.Swiglu and bias2 is None:
+        E, N = w2.shape[0], w2.shape[1]
+        if not hasattr(cktile_moe_stage2, '_dummy_bias2') or cktile_moe_stage2._dummy_bias2.shape != (E, N) or cktile_moe_stage2._dummy_bias2.device != w2.device:
+            cktile_moe_stage2._dummy_bias2 = torch.zeros([E, N], dtype=torch.float32, device=w2.device)
+        bias2 = cktile_moe_stage2._dummy_bias2
+
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
         a2,
