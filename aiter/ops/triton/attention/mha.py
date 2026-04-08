@@ -244,28 +244,6 @@ def _flash_attn_forward(
         if config is None:
             config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
-        """
-        # Tuned for gfx942
-        config = {
-            "BLOCK_M": 128,
-            "BLOCK_N": 64,
-            "waves_per_eu": 2,
-            "num_warps": 4,
-            "num_ctas": 1,
-            "num_stages": 1,
-        }
-        # Dropout significantly increases VGPR usage so use small tiles
-        if enable_dropout or q.dtype == torch.float32:
-            config = {
-                "BLOCK_M": 32,
-                "BLOCK_N": 32,
-                "waves_per_eu": 1,
-                "num_warps": 2,
-                "num_ctas": 1,
-                "num_stages": 1,
-            }
-    """
-
         grid = lambda META: (  # noqa: E731
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
