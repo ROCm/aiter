@@ -766,8 +766,13 @@ OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss.
     using src_t = remove_cvref_t<V>;
     using scalar = typename vector_traits<dst_t>::dtype;
     constexpr index_t len = sizeof...(Ds);
-    // Copy at dword granularity for sub-dword scalar types (bf16, fp16, fp8, etc.) with dword-aligned contiguous slices
-    if constexpr ((is_vector_v<dst_t> || is_array_v<dst_t>) && (is_vector_v<src_t> || is_array_v<src_t>) && sizeof(scalar) < 4 && len > 1) {
+    constexpr auto is_unit_stride = []<index_t... Is>(seq<Is...>) {
+        if constexpr (sizeof...(Is) < 2) return true;
+        else { return []<index_t... I>(seq<I...>) { return ((seq<Is...>::at(number<I + 1>{}) == seq<Is...>::at(number<I>{}) + 1) && ...); }(make_index_seq<sizeof...(Is) - 1>{}); }
+    };
+    // Copy at dword granularity for sub-dword scalar types (bf16, fp16, fp8, etc.) with dword-aligned unit-stride slices.
+    if constexpr ((is_vector_v<dst_t> || is_array_v<dst_t>) && (is_vector_v<src_t> || is_array_v<src_t>) &&
+                  is_unit_stride(seq<Ds...>{}) && is_unit_stride(seq<Ss...>{}) && sizeof(scalar) < 4 && len > 1) {
         constexpr index_t epd = 4 / sizeof(scalar); // elements per dword
         constexpr index_t dst_start = seq<Ds...>::at(number<0>{});
         constexpr index_t src_start = seq<Ss...>::at(number<0>{});
