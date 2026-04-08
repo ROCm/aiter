@@ -10,7 +10,6 @@ import triton.language as tl
 
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-import aiter.ops.triton.gluon.triton_version as tv
 
 GLUON_JIT_KERNEL_ENABLED = True
 try:
@@ -47,10 +46,6 @@ def get_recommended_splits(num_sequences, num_kv_heads):
         16, triton.cdiv(num_sm, num_sequences * num_kv_heads)
     )
     return max_context_partition_num
-
-
-# Pre-compute version check as constexpr for use in JIT kernels
-TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 
 @gluon.jit
@@ -163,10 +158,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         MFMA_INSTR_K: gl.constexpr = 32
     else:
         MFMA_INSTR_K: gl.constexpr = 16
-    if TRITON_VERSION_GE_3_6_0:
-        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
-    else:
-        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
+
+    QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
 
     if KV_QUANT_MODE >= 0:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
@@ -882,10 +875,8 @@ def paged_attention_decode_sliding_window(
         MFMA_INSTR_K: gl.constexpr = 32
     else:
         MFMA_INSTR_K: gl.constexpr = 16
-    if TRITON_VERSION_GE_3_6_0:
-        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
-    else:
-        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
+
+    QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
 
     if KV_QUANT_MODE >= 0:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
@@ -1765,10 +1756,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         MFMA_INSTR_K: gl.constexpr = 32
     else:
         MFMA_INSTR_K: gl.constexpr = 16
-    if TRITON_VERSION_GE_3_6_0:
-        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
-    else:
-        QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
+
+    QK_PV_MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_INSTR_K]
 
     if KV_QUANT_MODE >= 0:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
@@ -2833,37 +2822,21 @@ def paged_attention_decode_v2_reduce_kernel(
         )
 
         # Calculate offsets and mask for loading partial logits
-        if TRITON_VERSION_GE_3_6_0:
-            logits_offsets = (
-                sequence_idx * stride_logits_seq
-                + kv_head_idx * stride_logits_head
-                + partition_offsets[:, None, None] * stride_logits_part
-                + query_group_offsets[None, :, None] * stride_logits_group
-                + head_size_offsets[None, None, :]
-            )
-            logits_mask = (
-                partition_offsets[:, None] < context_partition_num
-            ) & query_group_mask[None, :]
-        else:
-            logits_offsets = (
-                sequence_idx * stride_logits_seq
-                + kv_head_idx * stride_logits_head
-                + partition_offsets[None, :, None] * stride_logits_part
-                + query_group_offsets[:, None, None] * stride_logits_group
-                + head_size_offsets[None, None, :]
-            )
-            logits_mask = (
-                partition_offsets[None, :] < context_partition_num
-            ) & query_group_mask[:, None]
+        logits_offsets = (
+            sequence_idx * stride_logits_seq
+            + kv_head_idx * stride_logits_head
+            + partition_offsets[:, None, None] * stride_logits_part
+            + query_group_offsets[None, :, None] * stride_logits_group
+            + head_size_offsets[None, None, :]
+        )
+        logits_mask = (
+            partition_offsets[:, None] < context_partition_num
+        ) & query_group_mask[None, :]
 
         # Load partial logits from current chunk of partitions
         partial_logits = tl.load(
             logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
         )
-
-        # Permute to match the expected dimension order
-        if not TRITON_VERSION_GE_3_6_0:
-            partial_logits = tl.permute(partial_logits, (1, 0, 2)).to(tl.float32)
 
         updated_output = partial_logits * attention_probs
 
