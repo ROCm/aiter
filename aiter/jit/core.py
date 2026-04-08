@@ -265,12 +265,16 @@ class AITER_CONFIG(object):
                 saved_info = (
                     "\n".join(saved_files) if saved_files else "  (no files updated)"
                 )
-                raise RuntimeError(
+                logger.warning(
                     f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
                     f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
+                    f"and saved back to source config files.\n"
                     f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
                     f"Updated files:\n{saved_info}"
+                )
+                # Also filter merge_df in memory so the /tmp/ merged file is clean.
+                merge_df = merge_df[merge_df.index.isin(best_row_index)].reset_index(
+                    drop=True
                 )
         else:
             logger.warning(
