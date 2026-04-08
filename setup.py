@@ -65,8 +65,6 @@ if not IS_WINDOWS and is_develop_mode():
                 "-m",
                 "pip",
                 "install",
-                "--find-links",
-                FLYDSL_FIND_LINKS,
                 FLYDSL_VERSION,
             ]
         )
