@@ -1495,6 +1495,25 @@ def compile_ops(
                             )
                     return True
 
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, …).
+                if develop:
+                    import torch
+
+                    from ..utility.dtypes import torch_to_aiter_pybind
+
+                    args = tuple(
+                        torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a
+                        for a in args
+                    )
+                    kwargs = {
+                        k: (
+                            torch_to_aiter_pybind(v)
+                            if isinstance(v, torch.Tensor)
+                            else v
+                        )
+                        for k, v in kwargs.items()
+                    }
+
                 if not func.arg_checked:
                     func.arg_checked = check_args()
 
@@ -1504,8 +1523,6 @@ def compile_ops(
                     log_args(func, *args, **kwargs)
 
                 if develop:
-                    import torch
-
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
                     )

@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/extension.h>
-
 #include <cmath>
 
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
-#include "dispatch_utils.h"
-#include "py_itfs_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include <hip/hip_bf16.h>
 
 using fp8_type = opus::fp8_t;
@@ -214,8 +211,8 @@ static constexpr int nextPow2(unsigned int num)
     num_wave           = num_wave > max_wave_num ? max_wave_num : num_wave;           \
     dim3 grid(num_tokens);                                                            \
     dim3 block(num_wave * warp_size);                                                 \
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input)); \
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);                                     \
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
 // Helper macro for fp32 vec_size dispatch (VEC_SIZE <= 16 for fp32 path)
 #define DISPATCH_FP32_VEC_SIZE_CASE(VS, KERNEL_NAME, KERNEL, ...)              \
@@ -242,15 +239,13 @@ static constexpr int nextPow2(unsigned int num)
 
 // Helper macro to dispatch scaled kernel with restricted output types (fp8 or int8)
 #define DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                      \
-    if(out.scalar_type() == at::ScalarType::Float8_e4m3fn ||                        \
-       out.scalar_type() == at::ScalarType::Float8_e4m3fnuz ||                      \
-       out.scalar_type() == at::ScalarType::Float8_e5m2)                            \
+    if(out.dtype() == AITER_DTYPE_fp8)                                              \
     {                                                                               \
         using output_dtype = fp8_type;                                              \
         auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
         DISPATCH_FP32_SCALED_ACT_KERNEL(KERNEL, out_ptr, in_ptr, inv_scale)         \
     }                                                                               \
-    else if(out.scalar_type() == at::ScalarType::Char)                              \
+    else if(out.dtype() == AITER_DTYPE_i8)                                          \
     {                                                                               \
         using output_dtype = opus::i8_t;                                            \
         auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());       \
@@ -258,31 +253,31 @@ static constexpr int nextPow2(unsigned int num)
     }                                                                               \
     else                                                                            \
     {                                                                               \
-        TORCH_CHECK(false, "scaled_act_and_mul only supports fp8 or int8 outputs"); \
+        AITER_CHECK(false, "scaled_act_and_mul only supports fp8 or int8 outputs"); \
     }
 
 // Launch activation and gating kernel with flexible input/output types
 // Input and output types are determined by the tensor dtypes passed from Python
 #define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                                                    \
     COMPUTE_ACTIVATION_KERNEL_PARAMS                                                             \
-    if(input.scalar_type() == at::ScalarType::Float)                                             \
+    if(input.dtype() == AITER_DTYPE_fp32)                                                        \
     {                                                                                            \
         /* fp32 input: dispatch based on output type */                                          \
         using input_dtype = opus::fp32_t;                                                        \
         auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                    \
-        if(out.scalar_type() == at::ScalarType::BFloat16)                                        \
+        if(out.dtype() == AITER_DTYPE_bf16)                                                      \
         {                                                                                        \
             using output_dtype = opus::bf16_t;                                                   \
             auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
             DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
         }                                                                                        \
-        else if(out.scalar_type() == at::ScalarType::Half)                                       \
+        else if(out.dtype() == AITER_DTYPE_fp16)                                                 \
         {                                                                                        \
             using output_dtype = opus::fp16_t;                                                   \
             auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
             DISPATCH_FP32_ACT_KERNEL(KERNEL, out_ptr, in_ptr)                                    \
         }                                                                                        \
-        else if(out.scalar_type() == at::ScalarType::Float)                                      \
+        else if(out.dtype() == AITER_DTYPE_fp32)                                                 \
         {                                                                                        \
             using output_dtype = opus::fp32_t;                                                   \
             auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());                \
@@ -290,16 +285,16 @@ static constexpr int nextPow2(unsigned int num)
         }                                                                                        \
         else                                                                                     \
         {                                                                                        \
-            TORCH_CHECK(false, "Unsupported output type for fp32 input");                        \
+            AITER_CHECK(false, "Unsupported output type for fp32 input");                        \
         }                                                                                        \
     }                                                                                            \
     else                                                                                         \
     {                                                                                            \
         /* bf16/fp16 input: output must match input type */                                      \
-        TORCH_CHECK(input.scalar_type() == out.scalar_type(),                                    \
+        AITER_CHECK(input.dtype() == out.dtype(),                                                \
                     "For bf16/fp16 input, output type must match input type");                   \
-        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "act_and_mul_kernel", [&] {         \
-            using input_dtype  = typename aiter::t2opus<scalar_t>::type;                         \
+        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "act_and_mul_kernel", [&] {               \
+            using input_dtype  = typename aiter::hip2opus<scalar_t>::type;                       \
             using output_dtype = input_dtype;                                                    \
             AITER_DISPATCH_CASE_VEC_SIZE(                                                        \
                 vec_size,                                                                        \
@@ -314,21 +309,21 @@ static constexpr int nextPow2(unsigned int num)
 // Launch scaled activation and gating kernel with flexible input/output types
 #define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                                            \
     COMPUTE_ACTIVATION_KERNEL_PARAMS                                                            \
-    if(input.scalar_type() == at::ScalarType::Float)                                            \
+    if(input.dtype() == AITER_DTYPE_fp32)                                                       \
     {                                                                                           \
         /* fp32 input: dispatch based on output type (fp8/bf16/fp16/fp32) */                    \
         using input_dtype = opus::fp32_t;                                                       \
         auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());                   \
-        float inv_scale   = 1.0f / (*scale.data_ptr<float>());                                  \
+        float inv_scale   = 1.0f / (*reinterpret_cast<float*>(scale.data_ptr()));               \
         DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                                  \
     }                                                                                           \
     else                                                                                        \
     {                                                                                           \
         /* bf16/fp16 input: dispatch based on output type (fp8/bf16/fp16/fp32) */               \
-        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_act_and_mul_kernel", [&] { \
-            using input_dtype = typename aiter::t2opus<scalar_t>::type;                         \
+        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "scaled_act_and_mul_kernel", [&] {       \
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;                       \
             auto* in_ptr      = reinterpret_cast<input_dtype*>(input.data_ptr());               \
-            float inv_scale   = 1.0f / (*scale.data_ptr<float>());                              \
+            float inv_scale   = 1.0f / (*reinterpret_cast<float*>(scale.data_ptr()));           \
             DISPATCH_OUTPUT_TYPE_SCALED(KERNEL, in_ptr, inv_scale)                              \
         });                                                                                     \
     }
@@ -339,27 +334,27 @@ namespace aiter {
 // - fp32 input can output as fp32/bf16/fp16 (determined by out.dtype)
 // - bf16 input must output as bf16
 // - fp16 input must output as fp16
-void silu_and_mul(torch::Tensor& out,   // [..., d]
-                  torch::Tensor& input) // [..., 2 * d]
+void silu_and_mul(const aiter_tensor_t& out,   // [..., d]
+                  const aiter_tensor_t& input) // [..., 2 * d]
 {
     LAUNCH_ACTIVATION_GATE_KERNEL(aiter::silu_kernel);
 }
 
-void scaled_silu_and_mul(torch::Tensor& out,   // [..., d]
-                         torch::Tensor& input, // [..., 2 * d]
-                         torch::Tensor& scale)
+void scaled_silu_and_mul(const aiter_tensor_t& out,   // [..., d]
+                         const aiter_tensor_t& input, // [..., 2 * d]
+                         const aiter_tensor_t& scale)
 {
     LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(aiter::silu_kernel);
 }
 
-void gelu_and_mul(torch::Tensor& out,   // [..., d]
-                  torch::Tensor& input) // [..., 2 * d]
+void gelu_and_mul(const aiter_tensor_t& out,   // [..., d]
+                  const aiter_tensor_t& input) // [..., 2 * d]
 {
     LAUNCH_ACTIVATION_GATE_KERNEL(aiter::gelu_kernel);
 }
 
-void gelu_tanh_and_mul(torch::Tensor& out,   // [..., d]
-                       torch::Tensor& input) // [..., 2 * d]
+void gelu_tanh_and_mul(const aiter_tensor_t& out,   // [..., d]
+                       const aiter_tensor_t& input) // [..., 2 * d]
 {
     LAUNCH_ACTIVATION_GATE_KERNEL(aiter::gelu_tanh_kernel);
 }
@@ -447,13 +442,13 @@ __global__ void activation_kernel_vec(DTYPE_I* __restrict__ out,
     num_blocks         = num_blocks > 2048 ? 2048 : num_blocks;                                    \
     dim3 grid(num_blocks);                                                                         \
     dim3 block(block_size);                                                                        \
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));              \
-    const hipStream_t stream = at::hip::getCurrentHIPStream();                                     \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "activation_kernel_vec", [&] {     \
-        using input_dtype = typename aiter::t2opus<scalar_t>::type;                              \
+    HipDeviceGuard device_guard(input.device_id);                                                  \
+    const hipStream_t stream = aiter::getCurrentHIPStream();                                       \
+    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "activation_kernel_vec", [&] {                  \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                              \
         AITER_DISPATCH_CASE_VEC_SIZE(                                                              \
             vec_size,                                                                              \
-            aiter::activation_kernel_vec<input_dtype, KERNEL<input_dtype>, VEC_SIZE>        \
+            aiter::activation_kernel_vec<input_dtype, KERNEL<input_dtype>, VEC_SIZE>               \
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),           \
                                          reinterpret_cast<input_dtype*>(input.data_ptr()),         \
                                          numel);)                                                  \
@@ -472,8 +467,8 @@ __device__ __forceinline__ float gelu_fast_kernel(const T& x)
     return 0.5f * fmaf(f, t, f);
 }
 
-void gelu_fast(torch::Tensor& out,   // [..., d]
-               torch::Tensor& input) // [..., d]
+void gelu_fast(const aiter_tensor_t& out,   // [..., d]
+               const aiter_tensor_t& input) // [..., d]
 {
     LAUNCH_ACTIVATION_KERNEL_VEC(aiter::gelu_fast_kernel);
 }
