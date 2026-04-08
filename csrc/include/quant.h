@@ -72,7 +72,7 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(torch::Tensor& out,         // [toke
                                             torch::Tensor const& input, // [token_num * topk, d]
                                             torch::Tensor const& sorted_ids,
                                             torch::Tensor const& num_valid_ids,
-                                            int topk,
+                                            int token_num,
                                             int block_m,
                                             int group_size = 32);
 
@@ -81,7 +81,5 @@ void mxfp4_moe_sort_hip(torch::Tensor& out_scale,
                          torch::Tensor const& sorted_ids,
                          torch::Tensor const& num_valid_ids,
                          int token_num,
-                         int cols,
-                         int topk,
-                         int block_m);
+                         int cols);
 } // namespace aiter

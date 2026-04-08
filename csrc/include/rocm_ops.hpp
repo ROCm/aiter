@@ -1329,7 +1329,7 @@ namespace py = pybind11;
           py::arg("input"),                                              \
           py::arg("sorted_ids"),                                         \
           py::arg("num_valid_ids"),                                      \
-          py::arg("topk"),                                               \
+          py::arg("token_num"),                                          \
           py::arg("block_m"),                                            \
           py::arg("group_size") = 32);                                   \
     m.def("mxfp4_moe_sort_hip",                                          \
@@ -1339,9 +1339,7 @@ namespace py = pybind11;
           py::arg("sorted_ids"),                                         \
           py::arg("num_valid_ids"),                                      \
           py::arg("token_num"),                                          \
-          py::arg("cols"),                                               \
-          py::arg("topk"),                                               \
-          py::arg("block_m"));                                           \
+          py::arg("cols"));                                              \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \

@@ -17,7 +17,7 @@ from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter import fused_dynamic_mxfp4_quant_moe_sort
+from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
@@ -454,12 +454,12 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
-                sorted_ids,
-                num_valid_ids,
-                token_num,
-                block_size_M,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                cols=model_dim,
             )
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
@@ -1195,12 +1195,12 @@ def fused_moe_2stages(
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
             # skip re-quantization, only sort the scale
             a1 = hidden_states
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                block_size=block_size_M,
+                cols=model_dim,
             )
         else:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -1210,6 +1210,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -1304,6 +1305,7 @@ def fused_moe_2stages(
             token_num=token_num,
             topk=topk,
             block_size=block_size_M,
+            num_rows=num_local_tokens,
         )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:

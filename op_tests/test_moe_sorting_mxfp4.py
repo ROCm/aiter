@@ -44,18 +44,16 @@ def run_torch(scale, sorted_ids, num_valid_ids, token_num):
     return ref
 
 
-def run_split_quant_sort(scale, input, sorted_ids, num_valid_ids, topk, block_size):
+def run_split_quant_sort(scale, input, sorted_ids, num_valid_ids, token_num):
+    model_dim = input.shape[-1]
     out, scale_ = aiter.per_1x32_f4_quant_hip(input, None, dtypes.fp4x2)
-    token_num = input.numel() // (input.shape[-1] * topk)
     aiter.mxfp4_moe_sort_hip(
         scale,
         scale_,
         sorted_ids,
         num_valid_ids,
         token_num,
-        input.shape[-1],
-        topk,
-        block_size,
+        model_dim,
     )
     return out, scale
 
@@ -104,8 +102,6 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
         num_valid_ids,
         token_num,
         model_dim,
-        topk,
-        block_size,
     )
 
     num_valid_ids = num_valid_ids.item()
@@ -166,8 +162,7 @@ def test_moe_mxfp4_quant_sort(dtype, token_num, model_dim, E, topk, block_size, 
         input,
         sorted_ids,
         num_valid_ids,
-        topk,
-        block_size,
+        token_num,
     )
 
     hip_scale = torch.zeros(
@@ -187,7 +182,7 @@ def test_moe_mxfp4_quant_sort(dtype, token_num, model_dim, E, topk, block_size, 
         input,
         sorted_ids,
         num_valid_ids,
-        topk,
+        token_num,
         block_size,
     )
 
@@ -275,7 +270,7 @@ parser.add_argument(
     nargs="*",
     default=[[32, 5], [256, 8], [512, 8]],
     help="""Number of experts.
-    e.g.: -e 32,5""",
+    e.g.: -ek 32,5""",
 )
 parser.add_argument(
     "-m",

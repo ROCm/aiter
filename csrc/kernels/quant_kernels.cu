@@ -1794,13 +1794,13 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
     torch::Tensor const& input,
     torch::Tensor const& sorted_ids,
     torch::Tensor const& num_valid_ids,
-    int topk,
+    int token_num,
     int block_m,
     int group_size = 32
 )
 {
     int cols = input.size(-1);
-    int token_num = input.numel() / (cols * topk);
+    int topk = input.numel() / (cols * token_num);
     int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
     
     const int num_cu = get_num_cu_func();
@@ -1957,14 +1957,13 @@ void mxfp4_moe_sort_hip(
     torch::Tensor const& sorted_ids,
     torch::Tensor const& num_valid_ids,
     int token_num,
-    int cols,
-    int topk,
-    int block_m
+    int cols
 )
 {
     const int num_cu = get_num_cu_func();
     const bool persistent_mode = false;
-
+    int topk = scale.numel() / ((cols + 31) / 32 * token_num);
+ 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(scale));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 
