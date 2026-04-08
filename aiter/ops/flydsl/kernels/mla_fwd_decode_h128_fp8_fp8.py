@@ -249,6 +249,21 @@ def _lds_load(byte_addr_index, vec_type, static_byte_offset=0):
     return llvm.LoadOp(vec_type, lds_ptr, alignment=16, nontemporal=True).result
 
 
+def _lds_load_volatile(base_i32, vec_type, byte_offset=0):
+    """Volatile LDS load forcing ds_read_b64/b32 with immediate offset.
+
+    Unlike _lds_load, uses volatile to prevent LLVM from merging adjacent
+    loads into ds_read2 variants (which have limited 8-bit offsets).
+    LLVM still tracks these as LDS loads for lgkmcnt.
+    Input: base_i32 must be an i32 ir.Value (LDS byte address).
+    """
+    addr_i64 = _std_arith.ExtUIOp(T.i64, base_i32).result
+    lds_ptr = _inttoptr_lds(addr_i64)
+    if byte_offset != 0:
+        lds_ptr = _get_element_ptr(lds_ptr, static_byte_offset=byte_offset)
+    return llvm.LoadOp(vec_type, lds_ptr, alignment=8, volatile_=True).result
+
+
 def _index_cast_to_i32(value):
     """Cast index/ArithValue to i32.  No-op if already i32."""
     raw = _raw(value) if not isinstance(value, ir.Value) else value
@@ -672,8 +687,21 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         + (_k_col_in_lane % arith.index(KV_NUM_COLS))
     )
 
+    # ---- Vt LDS lane base offset (computed once, shared across all Vt loads) ----
+    _vt_row_blk = lane_idx / arith.index(16)
+    _vt_col_blk = (lane_idx % arith.index(16)) / arith.index(VT_COLS_PER_THR)
+    _vt_row_inblk = lane_idx % arith.index(VT_ROWS_PER_THR)
+    _vt_col_inblk = (
+        (lane_idx % arith.index(8)) / arith.index(VT_ROWS_PER_THR)
+    ) * arith.index(VT_ROWS_PER_THR)
+    _vt_block_offset = (
+        _vt_row_blk * arith.index(VT_BLKS_PER_ROW_PAD) + _vt_col_blk
+    ) * arith.index(VT_ELEMS_PER_BLK)
+    _vt_inblock_offset = _vt_row_inblk * arith.index(VT_COLS_PER_THR) + _vt_col_inblk
+    _vt_lds_lane_offset = _vt_block_offset + _vt_inblock_offset
+
     # ---- Helper: load K sub-tile from LDS (16x32 for MFMA) ----
-    def _load_k_from_lds(p_lds_kv_base_idx, row_offset, col_offset):
+    def _load_k_from_lds(k_base_i32, row_offset, col_offset):
         """Read 16x32 K sub-tile from LDS -> i64 for MFMA.
 
         row_offset: 0 or 16 (which half of BLOCK_N=32)
@@ -692,18 +720,15 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         lowers this to ds_read2_b64 due to inttoptr; a proper fix needs
         FlyDSL infrastructure changes to emit ds_read_b64 with large offsets.
         """
-        # Fixed part: compile-time constant
+        # Fixed part: compile-time constant byte offset
         fixed_offset = (
             (row_offset // 16) * 2 * KV_BYTES_PER_ROW
             + (col_offset % KV_NUM_COLS)
             + (col_offset // KV_NUM_COLS) * KV_BLOCK_BYTES
         )
 
-        # Dynamic base: p_lds_kv_base + lane_offset (one VGPR)
-        lds_addr = p_lds_kv_base_idx + _k_lds_lane_offset
-
-        # ds_read_b64 -> 8 bytes = 1 i64 for MFMA input
-        data = _lds_load(lds_addr, T.i64, static_byte_offset=fixed_offset)
+        # ds_read_b64 with immediate offset (volatile prevents ds_read2 merge)
+        data = _lds_load_volatile(k_base_i32, T.i64, byte_offset=fixed_offset)
         return data
 
     # ---- Helper: load V from KV LDS (un-transposed) ----
@@ -824,41 +849,25 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         vector.store(hi_i8, lds_buffer, [_raw(lds_vt_addr + arith.index(16))])
 
     # ---- Helper: load transposed V from Vt LDS ----
-    def _load_vt_from_lds(vt_lds_base_idx, lane_idx_val, col_offset):
+    def _load_vt_from_lds(vt_base_i32, col_offset):
         """VtManagerV1::load_transposed_v_to_gpr.
 
-        Each warp reads 32x16 block from Vt LDS. Returns 2 i32 via ds_read_b32x2.
+        Each warp reads 32x16 block from Vt LDS. Returns 2 i32 via ds_read_b32.
+        vt_base_i32: i32 LDS byte address with lane offset pre-baked.
         col_offset: Python int, multiple of 16, in [0, 512).
 
-        LDS address formula:
-          row_blk = lane/16
-          col_blk = (lane%16) / VT_COLS_PER_THR
-          row_inblk = lane % VT_ROWS_PER_THR
-          col_inblk = ((lane%8) / VT_ROWS_PER_THR) * VT_ROWS_PER_THR
-          fixed_col_blk = col_offset / VT_COLS_PER_THR
-          offset_tl_bl = 4 * VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK = 8448
+        Lane offset pre-computed in _vt_lds_lane_offset (top level).
+        Only col_offset contributes a fixed immediate offset here.
+        offset_tl_bl = 4 * VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK = 8448
         """
         fixed_col_blk = col_offset // VT_COLS_PER_THR
         fixed_block_offset = fixed_col_blk * VT_ELEMS_PER_BLK
         offset_tl_bl = 4 * VT_BLKS_PER_ROW_PAD * VT_ELEMS_PER_BLK  # 8448
 
-        row_blk = lane_idx_val / arith.index(16)
-        col_blk = (lane_idx_val % arith.index(16)) / arith.index(VT_COLS_PER_THR)
-        row_inblk = lane_idx_val % arith.index(VT_ROWS_PER_THR)
-        col_inblk = (
-            (lane_idx_val % arith.index(8)) / arith.index(VT_ROWS_PER_THR)
-        ) * arith.index(VT_ROWS_PER_THR)
-        block_offset = (
-            row_blk * arith.index(VT_BLKS_PER_ROW_PAD) + col_blk
-        ) * arith.index(VT_ELEMS_PER_BLK)
-        inblock_offset = row_inblk * arith.index(VT_COLS_PER_THR) + col_inblk
-
-        lds_addr = vt_lds_base_idx + block_offset + inblock_offset
-
-        # ds_read_b32 x 2
-        v0 = _lds_load(lds_addr, T.i32, static_byte_offset=fixed_block_offset)
-        v1 = _lds_load(
-            lds_addr, T.i32, static_byte_offset=fixed_block_offset + offset_tl_bl
+        # ds_read_b32 x 2 with immediate offsets (volatile prevents ds_read2 merge)
+        v0 = _lds_load_volatile(vt_base_i32, T.i32, byte_offset=fixed_block_offset)
+        v1 = _lds_load_volatile(
+            vt_base_i32, T.i32, byte_offset=fixed_block_offset + offset_tl_bl
         )
         return v0, v1
 
@@ -1341,6 +1350,17 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
         Returns (row_max, row_sum_e, oaccu).
         """
+        # ---- K/Vt base VGPRs (one each, baked-in lane offsets) ----
+        k_base_i32 = _std_arith.AddIOp(
+            _raw(_index_cast_to_i32(p_lds_kv_base)),
+            _raw(_index_cast_to_i32(_k_lds_lane_offset)),
+        ).result
+
+        vt_base_i32 = _std_arith.AddIOp(
+            _raw(_index_cast_to_i32(lds_base_idx + arith.index(P_LDS_VT))),
+            _raw(_index_cast_to_i32(_vt_lds_lane_offset)),
+        ).result
+
         do_prefetch = p_lds_kv_next_warp_i32 is not None
 
         def _maybe_prefetch(block_idx):
@@ -1365,10 +1385,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             tile_0 = nope_pair * 2
             tile_1 = nope_pair * 2 + 1
 
-            k0_lo = _load_k_from_lds(p_lds_kv_base, 0, tile_0 * BLOCK_K)
-            k0_hi = _load_k_from_lds(p_lds_kv_base, 16, tile_0 * BLOCK_K)
-            k1_lo = _load_k_from_lds(p_lds_kv_base, 0, tile_1 * BLOCK_K)
-            k1_hi = _load_k_from_lds(p_lds_kv_base, 16, tile_1 * BLOCK_K)
+            k0_lo = _load_k_from_lds(k_base_i32, 0, tile_0 * BLOCK_K)
+            k0_hi = _load_k_from_lds(k_base_i32, 16, tile_0 * BLOCK_K)
+            k1_lo = _load_k_from_lds(k_base_i32, 0, tile_1 * BLOCK_K)
+            k1_hi = _load_k_from_lds(k_base_i32, 16, tile_1 * BLOCK_K)
 
             # Prefetch block nope_pair+1 of next tile (inline asm)
             _maybe_prefetch(nope_pair + 1)
@@ -1398,10 +1418,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             tile_0 = rope_pair * 2
             tile_1 = rope_pair * 2 + 1
 
-            k0_lo = _load_k_from_lds(p_lds_kv_base, 0, (tile_0 + 16) * BLOCK_K)
-            k0_hi = _load_k_from_lds(p_lds_kv_base, 16, (tile_0 + 16) * BLOCK_K)
-            k1_lo = _load_k_from_lds(p_lds_kv_base, 0, (tile_1 + 16) * BLOCK_K)
-            k1_hi = _load_k_from_lds(p_lds_kv_base, 16, (tile_1 + 16) * BLOCK_K)
+            k0_lo = _load_k_from_lds(k_base_i32, 0, (tile_0 + 16) * BLOCK_K)
+            k0_hi = _load_k_from_lds(k_base_i32, 16, (tile_0 + 16) * BLOCK_K)
+            k1_lo = _load_k_from_lds(k_base_i32, 0, (tile_1 + 16) * BLOCK_K)
+            k1_hi = _load_k_from_lds(k_base_i32, 16, (tile_1 + 16) * BLOCK_K)
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
@@ -1462,8 +1482,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             col_offset_0 = pv_iter * MFMA_N * 2
             col_offset_1 = col_offset_0 + MFMA_N
 
-            vt0_lo, vt0_hi = _load_vt_from_lds(vt_lds_base, lane_idx, col_offset_0)
-            vt1_lo, vt1_hi = _load_vt_from_lds(vt_lds_base, lane_idx, col_offset_1)
+            vt0_lo, vt0_hi = _load_vt_from_lds(vt_base_i32, col_offset_0)
+            vt1_lo, vt1_hi = _load_vt_from_lds(vt_base_i32, col_offset_1)
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
