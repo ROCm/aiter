@@ -157,9 +157,7 @@ class FmoeTuner(TunerCommon):
         token_num = a1_qt.shape[0]
         is_splitk = q_type == QuantType.per_1x128 and splitk > 1
         if is_splitk:
-            sorted_size = min(
-                token_num * topk * blockM, sorted_ids.shape[0]
-            )
+            sorted_size = min(token_num * topk * blockM, sorted_ids.shape[0])
             tmp_out = torch.empty(
                 (sorted_size, w1_qt_shffle_ck.shape[1]),
                 dtype=dtypes.fp32,
@@ -2288,6 +2286,7 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
             ) = key
             import re
+
             profileDF = []
             for (stage, kernelName, block_m), us, err in rets:
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))

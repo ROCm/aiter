@@ -409,8 +409,7 @@ def mp_tuner(
 
     while remaining_tasks:
         completed_this_round = []
-        dummy_failed_tasks = []
-        timeout_count_this_round = 0  # Track timeouts in this round
+        timeout_count_this_round = 0
 
         for k, async_result in remaining_tasks:
             try:
