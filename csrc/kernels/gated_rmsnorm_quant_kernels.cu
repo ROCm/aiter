@@ -5,10 +5,7 @@
 #include "py_itfs_common.h"
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
-#include "quant_utils.cuh"
-#include "rocprim/rocprim.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <hipcub/hipcub.hpp>
 
 namespace aiter {
 
