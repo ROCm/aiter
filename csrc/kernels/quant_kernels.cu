@@ -1508,9 +1508,9 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
 
 #define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)  \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                            \
-        using input_dtype = typename t2opus<scalar_t>::type;                                                \
-        int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE;                                                    \
-        int num_tg = persistent_mode? num_cu * warps_per_cu : num_blocks;                                 \
+        using input_dtype = typename t2opus<scalar_t>::type;                                              \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                             \
+        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                               \
         dim3 const grid(num_tg);                                                                          \
         aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>                                \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                      \
@@ -1740,7 +1740,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "mxfp4_quant_moe_sort_kernel", [&] { \
         AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
         using input_dtype = typename t2opus<scalar_t>::type;                                   \
-        int blocks_per_cu = 8 * (BLOCK_SIZE / WARP_SIZE);                                      \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                  \
         int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                     \
         dim3 const grid(num_tg);                                                               \
         mxfp4_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>             \
@@ -1901,7 +1901,7 @@ __global__ void mxfp4_moe_sort_kernel(
     constexpr int NUM_ROWS = BLOCK_SIZE / (MAX_COL /(GROUP_SIZE * THREAD_DATA));        \
     TORCH_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
     int num_blocks = (sorted_ids.size(0) + NUM_ROWS - 1) / NUM_ROWS;                    \
-    int blocks_per_cu = 8 * (BLOCK_SIZE / WARP_SIZE);                                   \
+    int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                               \
     int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
     dim3 const grid(num_tg);                                                            \
     mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE>                \
