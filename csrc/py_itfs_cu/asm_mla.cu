@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 #include "asm_mla_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -324,6 +324,13 @@ void mla_decode_stage1_asm_fwd(
             if(!persistent){
                 config_max_seqlen_q = 0;
                 sub_Q = 64;
+            }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if (persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+            } else {
+                AITER_CHECK(false, __func__,
+                    ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
             }
         }
     }

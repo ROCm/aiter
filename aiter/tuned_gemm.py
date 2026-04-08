@@ -19,6 +19,7 @@ import functools
 import os
 from typing import Optional
 
+import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,7 @@ from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logge
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
 
@@ -104,6 +106,17 @@ def get_GEMM_A16W16_config(
             None,
         )
         if config is not None:
+            if config["libtype"] == "flydsl":
+                if is_flydsl_available():
+                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                        config["kernelName"]
+                    )
+                    if flydsl_config is None:
+                        config = None
+                else:
+                    config = None
+            if config is None:
+                continue
             if AITER_LOG_TUNED_CONFIG:
                 kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
                 logger.info(
@@ -113,11 +126,8 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} , not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
-        )
         if bpreshuffle:
-            default_config["bpreshuflle"] = True
+            default_config["bpreshuffle"] = True
             if get_gfx() == "gfx942":
                 default_config["libtype"] = "hipblaslt"
                 default_config["solidx"] = -1
@@ -153,7 +163,7 @@ def get_GEMM_A16W16_config(
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
         logger.info(
-            f"using {default_config['libtype']} solution:{default_config['solidx']} for {M=} {N=} {K=} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
+            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
         return default_config
 
@@ -246,6 +256,23 @@ def gemm_a16w16(
         scaleAB=scale_a is not None or scale_b is not None,
         bpreshuffle=bpreshuffle,
     )
+    if config is not None and config["libtype"] == "flydsl":
+        flydsl_config = (
+            aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                config["kernelName"]
+            )
+        )
+        return flydsl_gemm(
+            inp_view,
+            B,
+            bias,
+            otype,
+            scale_a,
+            scale_b,
+            scale_c,
+            config=flydsl_config,
+        )
+
     if config is not None and config["libtype"] == "asm":
         kernelName = config["kernelName"]
         splitK = config["splitK"]
@@ -266,7 +293,7 @@ def gemm_a16w16(
         )
     if batched:
         out = out.view(*A.shape[:-1], B.shape[0])
-    if otype is not None:
+    if otype is not None and out.dtype != otype:
         out = out.to(otype)
     save_shapes(
         m,
@@ -329,7 +356,7 @@ def hipb_gemm(
     if otype is None:
         otype = inp.dtype
     global extensions_created
-    if extensions_created == False:
+    if not extensions_created:
         hipb_create_extension()
         extensions_created = True
     return hipb_mm(
@@ -372,8 +399,6 @@ def torch_gemm(
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
     out = F.linear(inp, weights, bias)
-    if otype is not None:
-        out = out.to(otype)
     return out
 
 
@@ -391,6 +416,38 @@ def asm_gemm(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
+
+
+def flydsl_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    scale_a: Optional[Tensor] = None,
+    scale_b: Optional[Tensor] = None,
+    scale_c: Optional[Tensor] = None,
+    config: dict = None,
+):
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "FlyDSL hgemm does not support scaling yet."
+    out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
+        inp,
+        weights,
+        tile_m=config["tile_m"],
+        tile_n=config["tile_n"],
+        tile_k=config["tile_k"],
+        split_k=config["split_k"],
+        block_m_warps=config["block_m_warps"],
+        block_n_warps=config["block_n_warps"],
+        b_to_lds=config["b_to_lds"],
+        b_preshuffle=config["b_preshuffle"],
+    )
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
+    if bias is not None:
+        out = out + bias
+    return out
 
 
 def triton_gemm(
