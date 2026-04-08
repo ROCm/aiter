@@ -1573,7 +1573,7 @@ def _unified_attention_gluon_kernel_3d(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
         )
 
-    # physical_block_idx: gl.int32 = j_hbm_start + seq_idx * block_table_stride
+    # physical_block_idx: gl.int32 = j_hbm_start + seq_idx * block_table_stride # no-paging expt
     j_hbm, physical_block_idx = pgm.load_physical_block_idx(
         j_hbm, block_tables_ptr_shifted, j_hbm_start
     )
@@ -1585,7 +1585,7 @@ def _unified_attention_gluon_kernel_3d(
 
     # Main attention loop over KV tiles (staged, num_stages=2)
     for j in range(pgm.tile_start, pgm.tile_end - 1):
-        # physical_block_idx = physical_block_idx + 1
+        # physical_block_idx = physical_block_idx + 1 # no-paging expt
         physical_block_idx = next_physical_block_idx
         j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
             j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
