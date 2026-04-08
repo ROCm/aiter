@@ -103,6 +103,9 @@ def compile_gemm_a8w8(
 
     effective_waves_per_eu = waves_per_eu
     if use_cluster and effective_waves_per_eu is None:
+        # Cluster mode can deadlock if a workgroup is split and only a subset
+        # of its waves are resident while hitting early workgroup barriers.
+        # Use conservative occupancy by default for cluster-enabled kernels.
         effective_waves_per_eu = 1
 
     num_warps = m_warp * n_warp

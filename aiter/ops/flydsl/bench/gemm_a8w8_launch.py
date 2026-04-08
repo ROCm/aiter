@@ -83,11 +83,19 @@ def main():
     npad = (N + tile_n - 1) // tile_n * tile_n
     kpad = (K + tile_k - 1) // tile_k * tile_k
 
-    a_gpu = torch.zeros((mpad, kpad), dtype=fp8_dtype, device="cuda")
-    b_gpu = torch.zeros((npad, kpad), dtype=fp8_dtype, device="cuda")
-    a_scale_gpu = torch.ones(mpad, dtype=torch.float32, device="cuda")
-    b_scale_gpu = torch.ones(npad, dtype=torch.float32, device="cuda")
-    bias_gpu = torch.zeros(npad, dtype=torch.float32, device="cuda")
+    fp8_max = torch.finfo(fp8_dtype).max
+
+    a_f32 = torch.randn((mpad, kpad), dtype=torch.float32, device="cuda")
+    max_a = a_f32.abs().float().amax(dim=1, keepdim=True)
+    a_scale_gpu = (max_a / fp8_max).squeeze(1)
+    a_gpu = (a_f32 / a_scale_gpu.unsqueeze(1)).to(fp8_dtype)
+
+    b_f32 = torch.randn((npad, kpad), dtype=torch.float32, device="cuda")
+    max_b = b_f32.abs().float().amax(dim=1, keepdim=True)
+    b_scale_gpu = (max_b / fp8_max).squeeze(1)
+    b_gpu = (b_f32 / b_scale_gpu.unsqueeze(1)).to(fp8_dtype)
+
+    bias_gpu = torch.rand([npad], dtype=torch.float32, device="cuda") * 10 if has_bias else torch.zeros(npad, dtype=torch.float32, device="cuda")
     c_gpu = torch.zeros((mpad, npad), dtype=_out_torch, device="cuda")
 
     print(f"Compiling A8W8 GEMM: M={M}({mpad}), N={N}({npad}), K={K}({kpad}), "
