@@ -109,13 +109,19 @@ def all_reduce_fake(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
 # There is same name all_reduce in aiter.op, use Alias
 @torch_compile_guard(gen_fake=all_reduce_fake)
 def all_reduce_(
-    tensor: torch.Tensor, group_name: str, ca_use_new: bool, ca_fp8_quant: bool
+    tensor: torch.Tensor,
+    group_name: str,
+    ca_use_new: bool,
+    ca_fp8_quant: bool,
+    prefill_support: bool = False,
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_reduce_out_place(tensor, ca_use_new, ca_fp8_quant)
+    return group._all_reduce_out_place(
+        tensor, ca_use_new, ca_fp8_quant, prefill_support
+    )
 
 
 def fused_allreduce_rmsnorm_fake(
@@ -135,12 +141,15 @@ def fused_allreduce_rmsnorm_(
     w: torch.Tensor,
     eps: float,
     group_name: str,
+    prefill_support: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._fused_allreduce_rmsnorm_out_place(inp, res_inp, w, eps)
+    return group._fused_allreduce_rmsnorm_out_place(
+        inp, res_inp, w, eps, prefill_support
+    )
 
 
 def fused_allreduce_rmsnorm_quant_fake(
@@ -164,12 +173,15 @@ def fused_allreduce_rmsnorm_quant_(
     w: torch.Tensor,
     eps: float,
     group_name: str,
+    prefill_support: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._fused_allreduce_rmsnorm_quant_out_place(inp, res_inp, w, eps)
+    return group._fused_allreduce_rmsnorm_quant_out_place(
+        inp, res_inp, w, eps, prefill_support
+    )
 
 
 if supports_custom_op():
@@ -362,7 +374,11 @@ class GroupCoordinator:
             yield graph_capture_context
 
     def all_reduce(
-        self, input_: torch.Tensor, ca_use_new: bool = True, ca_fp8_quant: bool = False
+        self,
+        input_: torch.Tensor,
+        ca_use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
     ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -387,14 +403,21 @@ class GroupCoordinator:
             group_name=self.unique_name,
             ca_use_new=ca_use_new,
             ca_fp8_quant=ca_fp8_quant,
+            prefill_support=prefill_support,
         )
 
     def _all_reduce_out_place(
-        self, input_: torch.Tensor, ca_use_new: bool, ca_fp8_quant: bool
+        self,
+        input_: torch.Tensor,
+        ca_use_new: bool,
+        ca_fp8_quant: bool,
+        prefill_support: bool = False,
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_, ca_use_new, ca_fp8_quant)
+        return self.device_communicator.all_reduce(
+            input_, ca_use_new, ca_fp8_quant, prefill_support
+        )
 
     def fused_allreduce_rmsnorm(
         self,
@@ -402,9 +425,15 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_(
-            input_, residual_inp_, weight_, eps, group_name=self.unique_name
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            prefill_support=prefill_support,
         )
 
     def fused_allreduce_rmsnorm_quant(
@@ -413,9 +442,15 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return fused_allreduce_rmsnorm_quant_(
-            input_, residual_inp_, weight_, eps, group_name=self.unique_name
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            prefill_support=prefill_support,
         )
 
     def _fused_allreduce_rmsnorm_out_place(
@@ -424,11 +459,16 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm(
-            input_, residual_inp_, weight_, eps
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
         )
 
     def _fused_allreduce_rmsnorm_quant_out_place(
@@ -437,11 +477,16 @@ class GroupCoordinator:
         residual_inp_: torch.Tensor,
         weight_: torch.Tensor,
         eps: float,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm_quant(
-            input_, residual_inp_, weight_, eps
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
         )
 
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -464,7 +509,10 @@ class GroupCoordinator:
         return self.device_communicator.reduce_scatter(input_, output_, dim)
 
     def reduce_scatter_tensor(
-        self, input_: torch.Tensor, use_custom: bool = True, dim: int = 0
+        self,
+        input_: torch.Tensor,
+        use_custom: bool = True,
+        dim: int = 0,
     ):
         # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
         world_size = self.world_size
@@ -490,7 +538,10 @@ class GroupCoordinator:
         return output_
 
     def all_gather(
-        self, input_: torch.Tensor, use_custom: bool = False, dim: int = -1
+        self,
+        input_: torch.Tensor,
+        use_custom: bool = False,
+        dim: int = -1,
     ) -> torch.Tensor:
         world_size = self.world_size
         if world_size == 1:
