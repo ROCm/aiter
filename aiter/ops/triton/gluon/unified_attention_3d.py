@@ -175,8 +175,7 @@ class AttentionConfig:
                 transposed=True,
                 warp_bases=warp_bases_pv,
                 reg_bases=[],
-                # instr_shape=[16, 16, 32 if not (self.IS_Q_FP8 and self.IS_KV_FP8) else 64],
-                instr_shape=[16, 16, 32],
+                instr_shape=[16, 16, 64 if (self.IS_Q_FP8 and self.IS_KV_FP8) else 32],
             )
         )
         k_width = 16 if self.IS_KV_FP8 and self.SHUFFLED_KV_CACHE else 8
@@ -989,9 +988,7 @@ class AttentionProgram:
             dtype=gl.float32,
             layout=self.cfg.QK_WMMA_LAYOUT,
         )
-        if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
-            k = k.to(self.q.dtype)
-        elif self.cfg.IS_KV_FP8:
+        if not self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
             k = k.to(self.q.dtype)
         return gl.amd.gfx1250.wmma(self.q, k, S)
 
@@ -1063,8 +1060,7 @@ class AttentionProgram:
     @gluon.jit
     def compute_pv(self, p, v, acc):
         if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
-            p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
-            v = v.to(gl.bfloat16)
+            p = p.to(v.dtype)
         elif self.cfg.IS_KV_FP8:
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
             v = v.to(gl.bfloat16)

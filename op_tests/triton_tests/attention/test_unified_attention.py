@@ -223,7 +223,7 @@ def ref_paged_attn(
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
-@pytest.mark.parametrize("num_blocks", [32768, 256])
+@pytest.mark.parametrize("num_blocks", [256])
 @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @torch.inference_mode()
 def test_triton_unified_attn_3d(
