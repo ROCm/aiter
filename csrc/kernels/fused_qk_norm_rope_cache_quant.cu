@@ -25,7 +25,16 @@
 #include "quant_utils.cuh"
 #include "rope/rope_common.h"
 #include "vec_convert.h"
- 
+
+#define CHECK_TYPE(x, st) \
+    AITER_CHECK((x).dtype() == (st), #x " dtype is ", AiterDtype_to_str((x).dtype()), ", while ", AiterDtype_to_str(st), " is expected")
+#define CHECK_TH_CUDA(x) ((void)0)
+#define CHECK_CONTIGUOUS(x) \
+    AITER_CHECK((x).is_contiguous(), #x " must be contiguous")
+#define CHECK_INPUT(x)   \
+    CHECK_TH_CUDA(x);   \
+    CHECK_CONTIGUOUS(x)
+
  namespace {
  using mrope_utils::vec_t;
  
