@@ -114,13 +114,15 @@ def kv_load(
 def qk_dot(
     Q,
     K,
-    qk_scale,  #
+    qk_scale,
     q_descale,
     k_descale,
     SAGE_MXFP4: tl.constexpr = False,
 ):
     if SAGE_MXFP4:
-        return tl.dot_scaled(Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True)
+        return qk_scale * tl.dot_scaled(
+            Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True
+        )
     else:
         return qk_scale * tl.dot(Q, K)
 
@@ -282,7 +284,7 @@ def _tile_loop_mask(
                     BLOCK_SIZE,
                     "",
                 )
-                S += tl.dot_scaled(
+                S += qk_scale * tl.dot_scaled(
                     Q_rope,
                     q_rope_scale_loaded,
                     "e2m1",
@@ -530,7 +532,7 @@ def _tile_loop_no_mask(
                     BLOCK_SIZE,
                     "",
                 )
-                S += tl.dot_scaled(
+                S += qk_scale * tl.dot_scaled(
                     Q_rope,
                     q_rope_scale_loaded,
                     "e2m1",
@@ -683,14 +685,14 @@ def kernel_unified_attention_2d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
+    sm_scale = scale if scale is not None else 1.0
 
     if not SAGE_MXFP4:
         _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
         _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
-        sm_scale = scale if scale is not None else 1.0
         qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
     else:
-        qk_scale = None
+        qk_scale = sm_scale * RCP_LN2
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -878,10 +880,6 @@ def kernel_unified_attention_2d(
     else:
         max_seq_prefix_len = seq_len
 
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
-    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
@@ -915,18 +913,6 @@ def kernel_unified_attention_2d(
     # -------------------------------------------------------------
 
     USE_SLIDING_WINDOW: tl.constexpr = SLIDING_WINDOW > 0
-    # compute_block_masking assumes BLOCK_M == BLOCK_N (i.e. the Q-block and KV-tile have the same width).
-    # In unified_attention, BLOCK_Q (query block) can be smaller than
-    # TILE_SIZE (KV tile).  When IS_CAUSAL and no sliding window, this
-    # mismatch causes an off-by-one in the causal diagonal boundary.
-    # This leads to the last tile with diagonal boundary being classified as "full" instead of "back_masked".
-    #
-    # The fix: when BLOCK_Q < TILE_SIZE under pure causal (no sliding
-    # window), conservatively demote the last "full" tile to "back_masked"
-    # so it goes through _tile_loop_mask which applies the causal check.
-    NEEDS_BACK_CORRECTION: tl.constexpr = (
-        IS_CAUSAL and (not USE_SLIDING_WINDOW) and (BLOCK_Q < TILE_SIZE)
-    )
 
     (
         n_front_skip,
@@ -945,11 +931,6 @@ def kernel_unified_attention_2d(
         BLOCK_Q,
         TILE_SIZE,
     )
-
-    if NEEDS_BACK_CORRECTION:
-        extra = tl.minimum(n_full, 1)
-        n_full = n_full - extra
-        n_back_masked = n_back_masked + extra
 
     front_start = n_front_skip
     full_start = front_start + n_front_masked
@@ -1129,13 +1110,14 @@ def kernel_unified_attention_3d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
+    sm_scale = scale if scale is not None else 1.0
+
     if not SAGE_MXFP4:
         _q_ds = tl.load(q_scale) if q_scale is not None else 1.0
         _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
-        sm_scale = scale if scale is not None else 1.0
         qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
     else:
-        qk_scale = None
+        qk_scale = sm_scale * RCP_LN2
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -1360,18 +1342,6 @@ def kernel_unified_attention_3d(
         qq_bias_row_ptrs = query_ptr
 
     USE_SLIDING_WINDOW: tl.constexpr = SLIDING_WINDOW > 0
-    # compute_block_masking assumes BLOCK_M == BLOCK_N (i.e. the Q-block and KV-tile have the same width).
-    # In unified_attention, BLOCK_Q (query block) can be smaller than
-    # TILE_SIZE (KV tile).  When IS_CAUSAL and no sliding window, this
-    # mismatch causes an off-by-one in the causal diagonal boundary.
-    # This leads to the last tile with diagonal boundary being classified as "full" instead of "back_masked".
-    #
-    # The fix: when BLOCK_Q < TILE_SIZE under pure causal (no sliding
-    # window), conservatively demote the last "full" tile to "back_masked"
-    # so it goes through _tile_loop_mask which applies the causal check.
-    NEEDS_BACK_CORRECTION: tl.constexpr = (
-        IS_CAUSAL and (not USE_SLIDING_WINDOW) and (BLOCK_Q < TILE_SIZE)
-    )
 
     (
         n_front_skip,
@@ -1390,11 +1360,6 @@ def kernel_unified_attention_3d(
         BLOCK_Q,
         TILE_SIZE,
     )
-
-    if NEEDS_BACK_CORRECTION:
-        extra = tl.minimum(n_full, 1)
-        n_full = n_full - extra
-        n_back_masked = n_back_masked + extra
 
     front_start = n_front_skip
     full_start = front_start + n_front_masked

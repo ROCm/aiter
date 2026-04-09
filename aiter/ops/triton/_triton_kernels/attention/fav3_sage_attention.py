@@ -814,7 +814,7 @@ def compute_block_masking(
             padded_last_k = n_extra_tokens != 0
             is_modulo_mn = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
 
-            n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
+            n_back_masked_blocks = (BLOCK_M + BLOCK_N - 1) // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
             n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
 
             n_front_skip_blocks = 0  # causal never skips the left side
