@@ -132,7 +132,10 @@ class AiterCommunicator:
             return entry
 
         sym_tensor = self._shmem.as_symmetric(inp)
-        entry = (sym_tensor, None)
+        workspace = self._shmem.ccl.all_reduce_preamble(
+            sym_tensor, sym_tensor,
+        )
+        entry = (sym_tensor, workspace)
         self._sym_cache[ptr] = entry
         logger.debug(
             "Imported tensor ptr=%#x shape=%s dtype=%s into symmetric heap",
@@ -173,6 +176,10 @@ class AiterCommunicator:
         input_buf, _ = self._get_buffers(inp.shape, inp.dtype)
         input_buf.copy_(inp)
 
+        if self._workspace is None:
+            self._workspace = self._shmem.ccl.all_reduce_preamble(
+                input_buf, input_buf,
+            )
         self._workspace = self._shmem.ccl.all_reduce(
             input_buf, input_buf, workspace=self._workspace
         )
