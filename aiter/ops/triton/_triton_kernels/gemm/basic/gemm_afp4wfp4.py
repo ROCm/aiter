@@ -150,9 +150,16 @@ def _gemm_afp4wfp4_kernel(
                 a_scales = tl.load(a_scale_ptrs)
                 b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
             else:
-                scale_mask = offs_scale_k[None, :] < (2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE))
+                scale_mask = offs_scale_k[None, :] < (
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
                 a_scales = tl.load(a_scale_ptrs, mask=scale_mask, other=127)
-                b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127, cache_modifier=cache_modifier)
+                b_scales = tl.load(
+                    b_scale_ptrs,
+                    mask=scale_mask,
+                    other=127,
+                    cache_modifier=cache_modifier,
+                )
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -386,9 +393,14 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
                     .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
             else:
-                shuffled_scale_mask = offs_shuffled_scale_k[None, :] < (2 * K - k * BLOCK_SIZE_K)
+                shuffled_scale_mask = offs_shuffled_scale_k[None, :] < (
+                    2 * K - k * BLOCK_SIZE_K
+                )
                 if BLOCK_SIZE_M < 32:
-                    a_scale_mask = offs_scale_k[None, :] < (2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE))
+                    a_scale_mask = offs_scale_k[None, :] < (
+                        2 * K // SCALE_GROUP_SIZE
+                        - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                    )
                     a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask, other=127)
                 else:
                     a_scales = (
@@ -406,7 +418,12 @@ def _gemm_afp4wfp4_kernel_preshuffle_scales(
                         .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                     )
                 b_scales = (
-                    tl.load(b_scale_ptrs, mask=shuffled_scale_mask, other=127, cache_modifier=cache_modifier)
+                    tl.load(
+                        b_scale_ptrs,
+                        mask=shuffled_scale_mask,
+                        other=127,
+                        cache_modifier=cache_modifier,
+                    )
                     .reshape(
                         BLOCK_SIZE_N // 32,
                         BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
