@@ -817,13 +817,20 @@ def build_module(
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
+        targets_arg = f"--targets {','.join(archs)}"
+
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
                 blob_dir = f"{op_dir}/blob/"
                 os.makedirs(blob_dir, exist_ok=True)
+                # Inject --targets so CK codegen only produces instances
+                # for the requested architectures.
+                cmd = blob_gen_cmd
+                if "generate.py" in cmd and "--targets" not in cmd:
+                    cmd = cmd.replace("generate.py ", f"generate.py {targets_arg} ", 1)
                 if AITER_LOG_MORE:
-                    logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
-                os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
+                    logger.info(f"exec_blob ---> {PY} {cmd.format(blob_dir)}")
+                os.system(f"{PY} {cmd.format(blob_dir)}")
                 sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
