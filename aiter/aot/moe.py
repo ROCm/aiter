@@ -82,15 +82,17 @@ def parse_csv(csv_path: str):
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
 
-                jobs.append({
-                    "kernel_name": name,
-                    "model_dim": model_dim,
-                    "inter_dim": inter_dim,
-                    "experts": experts,
-                    "topk": topk,
-                    "doweight_stage1": doweight_stage1,
-                    **params,
-                })
+                jobs.append(
+                    {
+                        "kernel_name": name,
+                        "model_dim": model_dim,
+                        "inter_dim": inter_dim,
+                        "experts": experts,
+                        "topk": topk,
+                        "doweight_stage1": doweight_stage1,
+                        **params,
+                    }
+                )
 
     return jobs
 
@@ -157,13 +159,13 @@ def _run_kernel(
     # Reference uses per-token per-expert matmul on fp32 inputs (before quantization).
     def _stage1_ref(x, w1):
         """Reference: per-token silu(x @ W_gate.T) * (x @ W_up.T)."""
-        w_gate = w1[:, :inter_dim, :]       # (E, inter_dim, model_dim)
-        w_up = w1[:, inter_dim:, :]          # (E, inter_dim, model_dim)
+        w_gate = w1[:, :inter_dim, :]  # (E, inter_dim, model_dim)
+        w_up = w1[:, inter_dim:, :]  # (E, inter_dim, model_dim)
         out = torch.zeros(tokens, topk, inter_dim, device=device, dtype=torch.float32)
         for t in range(tokens):
             for k in range(topk):
                 eid = topk_ids[t, k].item()
-                g = x[t] @ w_gate[eid].T     # (inter_dim,)
+                g = x[t] @ w_gate[eid].T  # (inter_dim,)
                 u = x[t] @ w_up[eid].T
                 out[t, k] = torch.nn.functional.silu(g) * u
         return out
@@ -185,8 +187,7 @@ def _run_kernel(
         # fuse_fp4_quant output is fp4-packed (half elements) — skip diff
         if c_raw.numel() != c_ref.numel():
             print(
-                f"    output shape={tuple(c_raw.shape)} "
-                f"(quantized, skip ref diff)"
+                f"    output shape={tuple(c_raw.shape)} " f"(quantized, skip ref diff)"
             )
             return
         c_check = c_raw.to(torch.float32).view(c_ref.shape)
@@ -203,7 +204,9 @@ def _run_kernel(
 
     if stage == 1:
         x_fp32 = torch.randn(tokens, model_dim, device=device, dtype=torch.float32)
-        w1_fp32 = torch.randn(E, 2 * inter_dim, model_dim, device=device, dtype=torch.float32)
+        w1_fp32 = torch.randn(
+            E, 2 * inter_dim, model_dim, device=device, dtype=torch.float32
+        )
         c_ref = _stage1_ref(x_fp32, w1_fp32)
 
         if is_fp4:
@@ -213,18 +216,26 @@ def _run_kernel(
             del w1_fp32, w1_flat
 
             # Preshuffle weights
-            w1_shuffled = shuffle_weight(w1_fp4.view(E, 2 * inter_dim, model_dim // 2).view(torch.float4_e2m1fn_x2))
+            w1_shuffled = shuffle_weight(
+                w1_fp4.view(E, 2 * inter_dim, model_dim // 2).view(
+                    torch.float4_e2m1fn_x2
+                )
+            )
             w1_kernel = w1_shuffled.view(torch.uint8).contiguous()
 
             # Prepare scales (e8m0_shuffle expects 2D)
             w1_scale_1d = e8m0_shuffle(w1_scale_raw).view(torch.uint8).contiguous()
-            a1_scale_1d = moe_mxfp4_sort(
-                x_scale[:tokens, :].view(tokens, 1, -1),
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=tokens,
-                block_size=_sort_block_m,
-            ).view(torch.uint8).contiguous()
+            a1_scale_1d = (
+                moe_mxfp4_sort(
+                    x_scale[:tokens, :].view(tokens, 1, -1),
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=tokens,
+                    block_size=_sort_block_m,
+                )
+                .view(torch.uint8)
+                .contiguous()
+            )
             x_q = x_fp4.view(torch.uint8).contiguous().view(tokens, -1)
 
             _fuse_fq = fuse_fp4_quant
@@ -287,8 +298,12 @@ def _run_kernel(
         del c_ref
 
     elif stage == 2:
-        a2_fp32 = torch.randn(tokens * topk, inter_dim, device=device, dtype=torch.float32)
-        w2_fp32 = torch.randn(E, model_dim, inter_dim, device=device, dtype=torch.float32)
+        a2_fp32 = torch.randn(
+            tokens * topk, inter_dim, device=device, dtype=torch.float32
+        )
+        w2_fp32 = torch.randn(
+            E, model_dim, inter_dim, device=device, dtype=torch.float32
+        )
         c_ref = _stage2_ref(a2_fp32, w2_fp32)
 
         if is_fp4:
@@ -298,19 +313,27 @@ def _run_kernel(
             del w2_fp32, w2_flat
 
             # Preshuffle weights
-            w2_shuffled = shuffle_weight(w2_fp4.view(E, model_dim, inter_dim // 2).view(torch.float4_e2m1fn_x2))
+            w2_shuffled = shuffle_weight(
+                w2_fp4.view(E, model_dim, inter_dim // 2).view(torch.float4_e2m1fn_x2)
+            )
             w2_kernel = w2_shuffled.view(torch.uint8).contiguous()
 
             # Prepare scales (e8m0_shuffle expects 2D)
             w2_scale_1d = e8m0_shuffle(w2_scale_raw).view(torch.uint8).contiguous()
-            a2_scale_1d = moe_mxfp4_sort(
-                a2_scale.view(tokens, topk, -1),
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=tokens,
-                block_size=_sort_block_m,
-            ).view(torch.uint8).contiguous()
-            a2_q = a2_fp4.view(torch.uint8).contiguous().view(tokens, topk, inter_dim // 2)
+            a2_scale_1d = (
+                moe_mxfp4_sort(
+                    a2_scale.view(tokens, topk, -1),
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=tokens,
+                    block_size=_sort_block_m,
+                )
+                .view(torch.uint8)
+                .contiguous()
+            )
+            a2_q = (
+                a2_fp4.view(torch.uint8).contiguous().view(tokens, topk, inter_dim // 2)
+            )
 
             c_out = flydsl_moe_stage2(
                 a2_q,
