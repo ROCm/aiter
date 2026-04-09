@@ -286,10 +286,21 @@ def test_runtime_dispatch_key():
         print(f"  SKIP  could not import get_CKGEMM_config ({e})")
         return
 
-    # Use GPU_ARCHS so the test is deterministic even without a live GPU.
-    orig_archs = os.environ.get("GPU_ARCHS")
-    os.environ["GPU_ARCHS"] = TARGET_A[0]
-    gfx, cu_num = TARGET_A
+    # get_CKGEMM_config() uses get_gfx_runtime() which always detects the live GPU
+    # via rocminfo — GPU_ARCHS is intentionally ignored at runtime.  Derive the
+    # test CSV rows from the actual live GPU so the test is correct on any runner.
+    try:
+        from aiter.jit.utils.chip_info import get_gfx_runtime, get_cu_num
+
+        gfx = get_gfx_runtime()
+        cu_num = get_cu_num()
+    except Exception as e:
+        print(f"  SKIP  runtime dispatch tests require a live GPU ({e})")
+        return
+
+    # Pick a "wrong" target that is guaranteed to differ from the live GPU.
+    wrong_target = TARGET_B if gfx != TARGET_B[0] else TARGET_A
+    wrong_gfx, wrong_cu_num = wrong_target
 
     csv_with_gfx = wrong_gfx_csv = old_csv = None
     try:
@@ -297,7 +308,7 @@ def test_runtime_dispatch_key():
         csv_with_gfx = _make_temp_csv(f"""
             gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {gfx},{cu_num},128,1280,8192,42,0,10.0,correct_kernel,100.0,500.0,0.0
-            gfx950,256,128,1280,8192,99,0,10.0,wrong_kernel,100.0,500.0,0.0
+            {wrong_gfx},{wrong_cu_num},128,1280,8192,99,0,10.0,wrong_kernel,100.0,500.0,0.0
         """)
         _mod._CKGEMM_CONFIG_CACHE = {}
         cfg = get_CKGEMM_config(128, 1280, 8192, tuned_file=csv_with_gfx)
@@ -314,14 +325,14 @@ def test_runtime_dispatch_key():
             )
 
         # 3.2 Shape tuned only for a different gfx returns None on this target
-        wrong_gfx_csv = _make_temp_csv("""
+        wrong_gfx_csv = _make_temp_csv(f"""
             gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-            gfx950,256,128,1280,8192,99,0,10.0,wrong_kernel,100.0,500.0,0.0
+            {wrong_gfx},{wrong_cu_num},128,1280,8192,99,0,10.0,wrong_kernel,100.0,500.0,0.0
         """)
         _mod._CKGEMM_CONFIG_CACHE = {}
         cfg = get_CKGEMM_config(128, 1280, 8192, tuned_file=wrong_gfx_csv)
         _check(
-            "new CSV: shape tuned only for gfx950 returns None on gfx942",
+            f"new CSV: shape tuned only for {wrong_gfx} returns None on {gfx}",
             cfg is None,
             f"expected None, got {cfg}",
         )
@@ -354,10 +365,7 @@ def test_runtime_dispatch_key():
 
     finally:
         _mod._CKGEMM_CONFIG_CACHE = {}
-        if orig_archs is not None:
-            os.environ["GPU_ARCHS"] = orig_archs
-        elif "GPU_ARCHS" in os.environ:
-            del os.environ["GPU_ARCHS"]
+        _mod._CKGEMM_HAS_GFX = {}
         for path in [csv_with_gfx, wrong_gfx_csv, old_csv]:
             if path:
                 try:
