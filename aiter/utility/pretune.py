@@ -237,8 +237,11 @@ def run_pretune(
     # are written back to the repo CSV, not the ephemeral /tmp merge.
     tune_file = getattr(core.AITER_CONFIGS, config_attr)
     if build_one_module is None:
+        # The source CSV paths are module-level variables in core (e.g.
+        # AITER_CONFIG_GEMM_A8W8_BLOCKSCALE), not instance attributes on
+        # AITER_CONFIGS. Strip the _FILE suffix to derive the variable name.
         source_attr = config_attr.removesuffix("_FILE")
-        source_paths_str = getattr(core.AITER_CONFIGS, source_attr, None)
+        source_paths_str = getattr(core, source_attr, None)
         write_tune_file = (
             source_paths_str.split(os.pathsep)[0] if source_paths_str else tune_file
         )

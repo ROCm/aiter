@@ -267,6 +267,54 @@ def test_make_untune_csv_missing_raises():
     check("raises FileNotFoundError for missing path", raised)
 
 
+def test_write_tune_file_resolution():
+    """In standalone mode, write_tune_file must resolve to the source CSV (in aiter/configs/),
+    not the ephemeral /tmp merged path.
+
+    The logic in run_pretune() strips the _FILE suffix from config_attr to derive a
+    module-level variable name in core (e.g. AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE →
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE), then calls getattr(core, source_attr).
+    This test verifies that all supported modules have a matching module-level variable
+    in core.py whose value points inside aiter/configs/ (not /tmp/).
+    """
+    print("\n=== test_write_tune_file_resolution ===")
+    core_py = os.path.join(REPO_DIR, "aiter", "jit", "core.py")
+    with open(core_py, encoding="utf-8") as f:
+        core_src = f.read()
+
+    for module, _, config_attr, expect_skip in EXPECTED:
+        if expect_skip or config_attr is None:
+            continue
+        source_attr = config_attr.removesuffix("_FILE")
+        if source_attr == config_attr:
+            check(
+                f"{module} config_attr has _FILE suffix",
+                False,
+                f"config_attr {config_attr!r} has no _FILE suffix — cannot derive source_attr",
+            )
+            continue
+        # Verify the module-level variable exists in core.py
+        check(
+            f"{module} source_attr '{source_attr}' defined in core.py",
+            f"{source_attr} " in core_src or f"{source_attr}=" in core_src,
+            f"not found in core.py — getattr(core, {source_attr!r}) would return None",
+        )
+        # Verify it maps to aiter/configs/ (not /tmp/)
+        import re
+
+        m = re.search(
+            rf'{source_attr}\s*=\s*os\.getenv\(\s*["\'][\w]+["\'],\s*([^\)]+)\)',
+            core_src,
+        )
+        if m:
+            default_val = m.group(1).strip().strip('"').strip("'")
+            check(
+                f"{module} default write_tune_file is in aiter/configs/",
+                "aiter/configs" in default_val or "aiter_meta/configs" in default_val,
+                f"default points to: {default_val!r}",
+            )
+
+
 def test_parse_pretune_modules():
     """PRETUNE_MODULES env values parse to the correct module lists."""
     print("\n=== test_parse_pretune_modules ===")
@@ -303,6 +351,7 @@ if __name__ == "__main__":
     test_make_untune_csv()
     test_make_untune_csv_multi_path()
     test_make_untune_csv_missing_raises()
+    test_write_tune_file_resolution()
     test_parse_pretune_modules()
 
     print(f"\n{'='*50}")
