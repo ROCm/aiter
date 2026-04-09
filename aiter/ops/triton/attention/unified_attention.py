@@ -204,8 +204,6 @@ def unified_attention(
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
-    if not IS_DEVICE_ARCH_GFX12:
-        assert q_descale is None, "Q scales not supported for Triton kernel on gfx950"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
