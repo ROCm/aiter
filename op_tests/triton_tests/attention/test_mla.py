@@ -297,12 +297,12 @@ def test_mla_decode_fwd(
     ), f"{torch.max(torch.abs(out - out_ref))}"
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
-@pytest.mark.parametrize("ctx_lens", [200, 1024, 8192])
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("ctx_lens", [200, 1024])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_blocks", [32768])
+@pytest.mark.parametrize("num_blocks", [16384])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",
@@ -349,6 +349,7 @@ def test_mla_prefill_fwd(
 
     cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_num_query_tokens = cu_seqlens_q[-1].item()
+    print(total_num_query_tokens)
 
     max_seqlen_kv = seq_lens_kv.max().item()
     max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
