@@ -11,21 +11,26 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
 )
 from aiter.ops.triton._triton_kernels.attention.mla import _mla_decode_fwd_reduce_kernel
-
-from aiter.ops.triton.gluon.mla import (
-    _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
-)
-from aiter.ops.triton.gluon.mla import (
-    _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
-)
-from aiter.ops.triton.gluon.mla import (
-    _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
-)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+if IS_DEVICE_ARCH_GFX12:
+    from aiter.ops.triton.gluon.mla import (
+        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
+    )
+    from aiter.ops.triton.gluon.mla import (
+        _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
+    )
+    from aiter.ops.triton.gluon.mla import (
+        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
+    )
+else:
+    gluon_mla_prefill_fwd_kernel_non_pipelined = None
+    gluon_mla_decode_fwd_kernel_non_pipelined = None
+    gluon_mla_decode_fwd_kernel = None
+from aiter.ops.triton.utils.types import e4m3_dtype
+
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
