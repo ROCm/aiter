@@ -1,28 +1,38 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
-pretune.py — run GEMM tuners for all CSV shapes on the live GPU during the build.
+pretune.py — run GEMM tuners for all CSV shapes on the live GPU.
 
-Triggered by the PRETUNE_MODULES env var from setup.py:
+Two entry points:
 
-    PREBUILD_KERNELS=1 PRETUNE_MODULES=module_gemm_a8w8_blockscale_tune \\
+1. Via PRETUNE_MODULES during setup.py build (full build + retune + .so rebuild):
+
+    PREBUILD_KERNELS=1 PRETUNE_MODULES=module_gemm_a8w8_blockscale_tune \
     python setup.py develop
 
-PRETUNE_MODULES accepts:
-  - A single module name:   PRETUNE_MODULES=module_gemm_a8w8_blockscale_tune
-  - A comma-separated list: PRETUNE_MODULES=module_gemm_a8w8_tune,module_gemm_a8w8_blockscale_tune
-  - The special value "all": PRETUNE_MODULES=all  (every _tune module with a resolvable script)
+2. As a standalone script on an already-installed aiter (tune only, no full rebuild):
 
-Requires a live GPU matching the target architecture.  Both the tune .so and
-the tuner subprocess use the live GPU — cross-architecture pretuning is not
-supported.
+    python3 aiter/utility/pretune.py module_gemm_a8w8_blockscale_tune
+    python3 aiter/utility/pretune.py module_gemm_a8w8_tune,module_gemm_a8w8_blockscale_tune
+    python3 aiter/utility/pretune.py all
+    python3 aiter/utility/pretune.py --list          # show available tune modules
 
+   After standalone tuning, rebuild the inference .so with:
+    AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py
+
+Both modes accept a single module name, a comma-separated list, or "all".
+Requires a live GPU matching the target architecture.
 All shapes in the merged tune CSV are (re-)tuned for the live GPU.
 
-Flow per module:
+Flow per module (PRETUNE_MODULES / setup.py path):
   gen_instances.py --tune       →  build tune .so  (all candidate kernels)
   <tune_script>.py --all        →  benchmark on live GPU, update CSV
   gen_instances.py --tune_file  →  rebuild inference .so  (winners only)
+
+Flow per module (standalone / direct path):
+  <tune_script>.py --all        →  JIT-builds tune .so on first run, then
+                                   benchmarks all shapes and writes winners
+                                   back to the primary source CSV
 """
 
 import json
@@ -301,3 +311,182 @@ def run_pretune_modules(
             logger.warning(
                 f"[pretune] {mod} failed: {exc}. Continuing with remaining modules."
             )
+
+
+def run_tune_direct(
+    module_name: str,
+    cfg: dict,
+    csrc_dir: str,
+    repo_dir: str,
+    libtype: str = "all",
+) -> None:
+    """
+    Run the GEMM tuner directly for a single module without a full setup.py build.
+
+    Suitable for interactive retuning on an already-installed aiter.  The tune
+    .so is JIT-built on the first run if not already present.  Results are
+    written back to the primary source CSV (e.g. aiter/configs/a8w8_blockscale_tuned_gemm.csv).
+
+    After this call, rebuild the inference .so with:
+        AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py
+
+    Args:
+        module_name: tune module name from optCompilerConfig.json
+        cfg:         parsed optCompilerConfig.json dict
+        csrc_dir:    absolute path to aiter/csrc/
+        repo_dir:    absolute path to aiter repo root
+        libtype:     kernel families to tune — "ck", "cktile", or "all"
+    """
+    # Deferred import: core requires torch, not available during CI metadata phase
+    sys.path.insert(0, os.path.join(repo_dir, "aiter"))
+    from jit import core  # noqa: PLC0415
+
+    tune_script, config_attr = _resolve(module_name, cfg, csrc_dir)
+
+    if not tune_script:
+        print(f"[pretune] {module_name}: no tune script available. Skipping.")
+        return
+    if not config_attr:
+        print(f"[pretune] {module_name}: cannot determine CSV config attr. Skipping.")
+        return
+
+    # Merged temp path — used as shape source (includes model_config CSVs)
+    merged_tune_file = getattr(core.AITER_CONFIGS, config_attr)
+
+    # Primary source CSV — strip _FILE to get the module-level env var name,
+    # then read the first colon-separated path as the write-back target.
+    source_attr = config_attr.removesuffix("_FILE")
+    source_paths_str = getattr(core.AITER_CONFIGS, source_attr, None)
+    if source_paths_str:
+        write_tune_file = source_paths_str.split(os.pathsep)[0]
+    else:
+        write_tune_file = merged_tune_file
+
+    print(
+        f"[pretune] {module_name}\n"
+        f"  script : {os.path.relpath(tune_script, repo_dir)}\n"
+        f"  shapes : {merged_tune_file}\n"
+        f"  output : {write_tune_file}\n"
+        f"  libtype: {libtype}",
+        flush=True,
+    )
+
+    shape_keys = ["B", "M", "N", "K"]
+    untune_csv = _make_untune_csv(merged_tune_file, shape_keys)
+
+    try:
+        env = {
+            **os.environ,
+            "PYTHONPATH": f"{repo_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        }
+        cmd = [
+            sys.executable,
+            tune_script,
+            "--untune_file",
+            untune_csv,
+            "--tune_file",
+            write_tune_file,
+            "--libtype",
+            libtype,
+            "--all",
+        ]
+        print(f"[pretune] running: {' '.join(cmd)}", flush=True)
+        result = subprocess.run(cmd, env=env)
+        if result.returncode != 0:
+            print(
+                f"[pretune] tuner exited {result.returncode} for {module_name}.",
+                flush=True,
+            )
+    finally:
+        try:
+            os.unlink(untune_csv)
+        except OSError:
+            pass
+
+    print(
+        f"[pretune] done. Rebuild inference .so with:\n"
+        f"  AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py",
+        flush=True,
+    )
+
+
+def _main() -> None:
+    import argparse
+
+    # Auto-detect repo root from this file's location: utility/pretune.py → repo root
+    _this_dir = os.path.dirname(os.path.abspath(__file__))
+    _default_repo_dir = os.path.dirname(os.path.dirname(_this_dir))
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Tune GEMM shapes for the live GPU on an already-installed aiter.\n\n"
+            "Examples:\n"
+            "  python3 aiter/utility/pretune.py module_gemm_a8w8_blockscale_tune\n"
+            "  python3 aiter/utility/pretune.py module_gemm_a8w8_tune,module_gemm_a8w8_blockscale_tune\n"
+            "  python3 aiter/utility/pretune.py all\n"
+            "  python3 aiter/utility/pretune.py --list"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "modules",
+        nargs="?",
+        help="Module name, comma-separated list, or 'all'.",
+    )
+    parser.add_argument(
+        "--libtype",
+        default="all",
+        choices=["ck", "cktile", "all"],
+        help="Kernel families to tune (default: all).",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Print available tune modules and exit.",
+    )
+    parser.add_argument(
+        "--repo_dir",
+        default=_default_repo_dir,
+        help="Path to aiter repo root (auto-detected by default).",
+    )
+    args = parser.parse_args()
+
+    repo_dir = os.path.abspath(args.repo_dir)
+    csrc_dir = os.path.join(repo_dir, "csrc")
+    cfg_path = os.path.join(repo_dir, "aiter", "jit", "optCompilerConfig.json")
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if args.list:
+        modules = _all_tune_modules(cfg)
+        print(f"Available tune modules ({len(modules)}):")
+        for m in sorted(modules):
+            _, config_attr = _resolve(m, cfg, csrc_dir)
+            skip = m in _SCRIPT_FALLBACK and _SCRIPT_FALLBACK[m] is None
+            status = (
+                "skip (no tune script)" if skip else config_attr or "unknown config"
+            )
+            print(f"  {m:<55} {status}")
+        return
+
+    if not args.modules:
+        parser.print_help()
+        return
+
+    value = args.modules.strip()
+    if value.lower() == "all":
+        modules = _all_tune_modules(cfg)
+        print(f"[pretune] tuning all {len(modules)} tune modules")
+    else:
+        modules = [m.strip() for m in value.split(",") if m.strip()]
+
+    for mod in modules:
+        try:
+            run_tune_direct(mod, cfg, csrc_dir, repo_dir, libtype=args.libtype)
+        except Exception as exc:
+            print(f"[pretune] {mod} failed: {exc}. Continuing.")
+
+
+if __name__ == "__main__":
+    _main()
