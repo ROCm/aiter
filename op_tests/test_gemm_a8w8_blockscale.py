@@ -148,15 +148,25 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     Y_split = torch.empty((m, n), dtype=dtype, device="cuda")
     gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_base, splitK=0)
     gemm_a8w8_blockscale_ck(x, weight, x_scale, w_scale, Y_split, splitK=splitK)
-    ck_err = checkAllclose(Y_base, Y_split, msg=f"ck splitK={splitK} vs splitK=0", rtol=1e-2, atol=1e-2)
+    ck_err = checkAllclose(
+        Y_base, Y_split, msg=f"ck splitK={splitK} vs splitK=0", rtol=1e-2, atol=1e-2
+    )
 
     # CKTile path (no preshuffle): compare splitK=0 vs splitK>0
     Y_base_tile = torch.empty((m, n), dtype=dtype, device="cuda")
     Y_split_tile = torch.empty((m, n), dtype=dtype, device="cuda")
-    gemm_a8w8_blockscale_cktile(x, weight, x_scale, w_scale, Y_base_tile, False, splitK=0)
-    gemm_a8w8_blockscale_cktile(x, weight, x_scale, w_scale, Y_split_tile, False, splitK=splitK)
+    gemm_a8w8_blockscale_cktile(
+        x, weight, x_scale, w_scale, Y_base_tile, False, splitK=0
+    )
+    gemm_a8w8_blockscale_cktile(
+        x, weight, x_scale, w_scale, Y_split_tile, False, splitK=splitK
+    )
     cktile_err = checkAllclose(
-        Y_base_tile, Y_split_tile, msg=f"cktile splitK={splitK} vs splitK=0", rtol=1e-2, atol=1e-2
+        Y_base_tile,
+        Y_split_tile,
+        msg=f"cktile splitK={splitK} vs splitK=0",
+        rtol=1e-2,
+        atol=1e-2,
     )
 
     print(
