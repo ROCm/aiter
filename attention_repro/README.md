@@ -16,3 +16,6 @@ Note, maximum issue is fixed by using a vibe coded llir modifier, it might be bu
 Page index loading is deactivated by default (controlled by `remove_indirect_access`).
 Causes perf. issues, related to https://github.com/ROCm/triton-internal/issues/1748
 
+## MIR Basic Block Analysis
+https://excalidraw.com/#json=uZp7cvP3TuMx9pJFpAGcx,hXMntmsu3TkRgPESFpnczA
+
