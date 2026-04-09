@@ -174,14 +174,20 @@ jobs:
       - name: Download Models
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.model_name == 'DeepSeek-R1-0528'
         run: |
-          if [ -d "/run" ]; then
-            echo "/run directory found, downloading model to /run/${{ matrix.model_path }}"
-            if ! docker exec atom_aiter_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /run/${{ matrix.model_path }}"; then
+          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+            model_cache_dir="/models"
+          else
+            model_cache_dir="/run"
+          fi
+
+          if docker exec atom_aiter_test bash -lc "[ -d '${model_cache_dir}' ]"; then
+            echo "${model_cache_dir} directory found, downloading model to ${model_cache_dir}/${{ matrix.model_path }}"
+            if ! docker exec atom_aiter_test bash -lc "hf download ${{ matrix.model_path }} --local-dir '${model_cache_dir}/${{ matrix.model_path }}'"; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
           else
-            echo "/run directory not found, skipping model download"
+            echo "${model_cache_dir} directory not found in container, skipping model download"
           fi
 
       - name: Run ATOM accuracy test
@@ -191,8 +197,14 @@ jobs:
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ -d "/run/${{ matrix.model_path }}" ]; then
-            model_path="/run/${{ matrix.model_path }}"
+          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+            model_cache_dir="/models"
+          else
+            model_cache_dir="/run"
+          fi
+
+          if docker exec atom_aiter_test bash -lc "[ -d '${model_cache_dir}/${{ matrix.model_path }}' ]"; then
+            model_path="${model_cache_dir}/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
           fi
@@ -238,7 +250,7 @@ jobs:
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.model_name }}_atom_accuracy_output.txt
+          name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_accuracy_output.txt
           path: atom_accuracy_output.txt
 
       - name: Clean Up
