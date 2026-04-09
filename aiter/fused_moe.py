@@ -902,7 +902,10 @@ def get_2stage_cfgs(
         )
     else:
         block_m = cfg["block_m"]
-        ksplit = cfg["ksplit"]
+        if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
+            ksplit = cfg["ksplit"]
+        else:
+            ksplit = 0
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
