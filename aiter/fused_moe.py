@@ -17,8 +17,7 @@ from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
-from aiter.utility import fp4_utils
+from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
 BLOCK_SIZE_M = 32
 
@@ -454,12 +453,12 @@ def fused_moe_1stage(
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
-                sorted_ids,
-                num_valid_ids,
-                token_num,
-                block_size_M,
+                sorted_ids=sorted_ids,
+                num_valid_ids=num_valid_ids,
+                token_num=token_num,
+                cols=model_dim,
             )
             w1_scale = w1_scale.view(E, -1)
             w2_scale = w2_scale.view(E, -1)
@@ -1144,7 +1143,6 @@ def fused_moe_2stages(
     bias2=None,
 ):
     quant_func = get_quant(quant_type)
-    token_num_quant_moe_sort_switch = 1024
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
@@ -1196,35 +1194,22 @@ def fused_moe_2stages(
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
             # skip re-quantization, only sort the scale
             a1 = hidden_states
-            a1_scale = fp4_utils.moe_mxfp4_sort(
+            a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                block_size=block_size_M,
+                cols=model_dim,
             )
-        elif token_num <= token_num_quant_moe_sort_switch:
+        else:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
                 hidden_states,
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                topk=1,
+                topk=topk,
                 block_size=block_size_M,
-            )
-        else:
-            a1, a1_scale = quant_func(
-                hidden_states,
-                scale=a1_scale,
-                quant_dtype=q_dtype_a,
                 num_rows=num_local_tokens,
-            )
-            a1_scale = fp4_utils.moe_mxfp4_sort(
-                a1_scale,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                block_size=block_size_M,
             )
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
@@ -1312,30 +1297,15 @@ def fused_moe_2stages(
         a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
-        if token_num <= token_num_quant_moe_sort_switch:
-            a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
-                a2,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                topk=topk,
-                block_size=block_size_M,
-            )
-        else:
-            a2, a2_scale = quant_func(
-                a2,
-                scale=a2_scale,
-                quant_dtype=q_dtype_a,
-                num_rows=num_local_tokens,
-                num_rows_factor=topk,
-            )
-            a2_scale = fp4_utils.moe_mxfp4_sort(
-                a2_scale[: token_num * topk, :].view(token_num, topk, -1),
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                block_size=block_size_M,
-            )
+        a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+            a2,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            topk=topk,
+            block_size=block_size_M,
+            num_rows=num_local_tokens,
+        )
         a2 = a2.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]

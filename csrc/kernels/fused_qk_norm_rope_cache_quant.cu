@@ -37,6 +37,10 @@
 
  namespace {
  using mrope_utils::vec_t;
+
+ // Minimum absmax used when computing FP8 KV scales to avoid division by zero when
+ // activations are all zero (e.g. CUDA graph warmup, invalid slots, or padding).
+ static constexpr float kFp8KvQuantAbsmaxFloorF32 = 1e-8f;
  
  template <typename Func, typename T>
  __inline__ __device__ T warpReduceSum(Func func, T val)
@@ -272,7 +276,8 @@
          float k_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
-             k_scale_val = warp_max / dtype_max;
+             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+             k_scale_val                 = warp_max_safe / dtype_max;
              int64_t scale_offset =
                  block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
              k_scale[scale_offset] = k_scale_val;
@@ -300,7 +305,8 @@
          float v_scale_val = 1.0f;
          if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
          {
-             v_scale_val = warp_max / dtype_max;
+             float const warp_max_safe = fmaxf(warp_max, kFp8KvQuantAbsmaxFloorF32);
+             v_scale_val                 = warp_max_safe / dtype_max;
              int64_t scale_offset =
                  block_idx * page_size * num_kv_heads + headIdx * page_size + block_offset;
              v_scale[scale_offset] = v_scale_val;
@@ -639,8 +645,9 @@
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            k_scale_val = block_max / dtype_max;
-            inv_scale_val = dtype_max / block_max;
+            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            k_scale_val                  = block_max_safe / dtype_max;
+            inv_scale_val                = dtype_max / block_max_safe;
             int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
@@ -677,7 +684,7 @@
                 else
                 {
                     k_scale_val   = k_scale_global;
-                    inv_scale_val = 1.0f / k_scale_global;
+                    inv_scale_val = 1.0f / fmaxf(k_scale_global, kFp8KvQuantAbsmaxFloorF32);
                 }
             }
             else
@@ -717,8 +724,9 @@
         float inv_scale_val = 1.0f;
         if constexpr(kv_dt != vllm::Fp8KVCacheDataType::kAuto)
         {
-            v_scale_val = block_max / dtype_max;
-            inv_scale_val = dtype_max / block_max;
+            float const block_max_safe = fmaxf(block_max, kFp8KvQuantAbsmaxFloorF32);
+            v_scale_val                  = block_max_safe / dtype_max;
+            inv_scale_val                = dtype_max / block_max_safe;
             int64_t scale_offset = block_idx * num_heads_k + headIdx;
             if(block_offset > 0)
             {
@@ -778,7 +786,7 @@
                 else
                 {
                     v_scale_val   = v_scale_global;
-                    inv_scale_val = 1.0f / v_scale_global;
+                    inv_scale_val = 1.0f / fmaxf(v_scale_global, kFp8KvQuantAbsmaxFloorF32);
                 }
             }
             else
@@ -1462,7 +1470,19 @@ void fused_qk_norm_rope_cache_quant_shuffle(
     std::optional<aiter_tensor_t> v_scale  // v scale tensor for quantized v cache
 )
 {
-    AITER_CHECK(qkv.dim() == 2,
+    // Input validation
+    CHECK_INPUT(qkv);
+    CHECK_INPUT(position_ids);
+    CHECK_INPUT(q_weight);
+    CHECK_INPUT(k_weight);
+    CHECK_INPUT(cos_sin_cache);
+    CHECK_INPUT(k_cache);
+    CHECK_INPUT(v_cache);
+    CHECK_INPUT(slot_mapping);
+    CHECK_TYPE(position_ids, torch::kInt64);
+    CHECK_TYPE(slot_mapping, torch::kInt64);
+
+    TORCH_CHECK(qkv.dim() == 2,
                 "QKV tensor must be 2D: [num_tokens, "
                 "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
     AITER_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");
@@ -1482,10 +1502,83 @@ void fused_qk_norm_rope_cache_quant_shuffle(
         "Number of key heads must be less than or equal to 32 for fused QK Norm RoPE kernel");
 
     int64_t num_tokens = qkv.size(0);
-    int64_t page_size  = v_cache.size(-1);
-    int64_t x          = k_cache.size(-1);
     AITER_CHECK(position_ids.size(0) == num_tokens,
                 "Number of tokens in position_ids must match QKV");
+
+    TORCH_CHECK(k_cache.dim() == 5,
+                "k_cache must be 5D [num_blocks, num_kv_heads, head_dim//x, page_size, x], got dim ",
+                k_cache.dim());
+    int64_t x            = k_cache.size(-1);
+    int64_t page_size_k  = k_cache.size(-2);
+    TORCH_CHECK(x > 0 && head_dim % x == 0,
+                "head_dim (",
+                head_dim,
+                ") must be divisible by k_cache x (",
+                x,
+                ")");
+    TORCH_CHECK(k_cache.size(2) == head_dim / x,
+                "k_cache dim 2 must equal head_dim//x, got ",
+                k_cache.size(2),
+                " expected ",
+                head_dim / x);
+    TORCH_CHECK(k_cache.size(1) == num_heads_k,
+                "k_cache dim 1 must equal num_heads_k, got ",
+                k_cache.size(1));
+
+    int64_t page_size;
+    if(v_cache.dim() == 5)
+    {
+        // Shuffle layout: [num_blocks, num_heads_v, page_size//x, head_dim, x]
+        TORCH_CHECK(v_cache.size(0) == k_cache.size(0),
+                    "v_cache and k_cache num_blocks must match");
+        TORCH_CHECK(v_cache.size(1) == num_heads_v,
+                    "v_cache dim 1 must equal num_heads_v, got ",
+                    v_cache.size(1));
+        TORCH_CHECK(v_cache.size(-1) == x && v_cache.size(-2) == head_dim,
+                    "v_cache trailing dims must be [head_dim, x], got [",
+                    v_cache.size(-2),
+                    ", ",
+                    v_cache.size(-1),
+                    "]");
+        TORCH_CHECK(v_cache.size(-3) * x == page_size_k,
+                    "v_cache shuffle: size(-3)*x must equal k_cache page_size; got ",
+                    v_cache.size(-3),
+                    "*",
+                    x,
+                    " vs ",
+                    page_size_k);
+        page_size = page_size_k;
+    }
+    else if(v_cache.dim() == 4)
+    {
+        // [num_blocks, num_heads_v, head_dim, page_size]
+        TORCH_CHECK(v_cache.size(0) == k_cache.size(0),
+                    "v_cache and k_cache num_blocks must match");
+        TORCH_CHECK(v_cache.size(1) == num_heads_v,
+                    "v_cache dim 1 must equal num_heads_v, got ",
+                    v_cache.size(1));
+        TORCH_CHECK(v_cache.size(2) == head_dim,
+                    "v_cache dim 2 must equal head_dim, got ",
+                    v_cache.size(2));
+        page_size = v_cache.size(-1);
+        TORCH_CHECK(page_size == page_size_k,
+                    "v_cache page_size (last dim) must match k_cache page_size; got ",
+                    page_size,
+                    " vs ",
+                    page_size_k);
+        TORCH_CHECK(page_size % x == 0,
+                    "page_size must be divisible by x for V cache layout; got page_size=",
+                    page_size,
+                    " x=",
+                    x);
+    }
+    else
+    {
+        TORCH_CHECK(false,
+                    "v_cache must be 4D [num_blocks, num_heads_v, head_dim, page_size] or 5D shuffle "
+                    "[num_blocks, num_heads_v, page_size//x, head_dim, x], got dim ",
+                    v_cache.dim());
+    }
 
     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
     AITER_CHECK(qkv.size(1) == total_heads * head_dim,
