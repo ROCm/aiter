@@ -10,12 +10,14 @@ from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
 FLYDSL_VERSION = "flydsl==0.1.2"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
@@ -156,7 +158,7 @@ if not _is_metadata_only() and not IS_WINDOWS:
 
 
 def _load_modules_from_config():
-    cfg_path = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
+    cfg_path = OPT_COMPILER_CONFIG
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -289,6 +291,21 @@ if PREBUILD_KERNELS != 0:
 
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
+
+        if PRETUNE_MODULES:
+            from aiter.utility.pretune import run_pretune_modules
+
+            cfg_path = OPT_COMPILER_CONFIG
+            with open(cfg_path, "r", encoding="utf-8") as _f:
+                _cfg = json.load(_f)
+            run_pretune_modules(
+                PRETUNE_MODULES,
+                _cfg,
+                core,
+                build_one_module,
+                csrc_dir=f"{this_dir}/csrc",
+                repo_dir=this_dir,
+            )
 
 
 class NinjaBuildExtension(build_ext):
