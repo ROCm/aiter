@@ -52,7 +52,7 @@ struct GemmDispatchHash
 inline int get_device_cu_num()
 {
     static const int cu_num = []() {
-        int device = 0;
+        int device = -1;
         hipError_t err = hipGetDevice(&device);
         if(err != hipSuccess)
             throw std::runtime_error(
