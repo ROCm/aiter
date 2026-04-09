@@ -1375,7 +1375,6 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
     extra_ldflags.append("-ffunction-sections")
     extra_ldflags.append("-fdata-sections ")
     extra_ldflags.append("-Wl,--gc-sections")
-    extra_ldflags.append("-Wl,--cref")
     if not torch_exclude:
         import torch
 
