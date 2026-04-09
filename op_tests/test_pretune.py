@@ -21,7 +21,7 @@ CFG_PATH = os.path.join(REPO_DIR, "aiter", "jit", "optCompilerConfig.json")
 
 sys.path.insert(0, os.path.join(REPO_DIR, "aiter"))
 
-from utility.pretune import (
+from utility.pretune import (  # noqa: E402
     _all_tune_modules,
     _make_untune_csv,
     _resolve,
