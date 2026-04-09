@@ -33,6 +33,7 @@ Flow per module (standalone / direct path):
   <tune_script>.py --all        →  JIT-builds tune .so on first run, then
                                    benchmarks all shapes and writes winners
                                    back to the primary source CSV
+  gen_instances.py --tune_file  →  rebuild inference .so  (winners only)
 """
 
 import json
@@ -183,49 +184,70 @@ def run_pretune(
     module_name: str,
     cfg: dict,
     core,
-    build_one_module,
     csrc_dir: str,
     repo_dir: str,
+    build_one_module=None,
+    libtype: str = "all",
 ) -> None:
     """
-    Full pretune cycle for one tune module:
+    Pretune cycle for one tune module.
 
-      1. Resolve tune script and CSV config attr from optCompilerConfig.json.
-      2. Build the tune .so  (gen_instances.py --tune → all candidate kernels).
-      3. Write a temp untune CSV: all unique shape keys from the merged tune CSV,
+    When build_one_module is provided (setup.py / PRETUNE_MODULES path):
+      1. Build the tune .so  (gen_instances.py --tune → all candidate kernels).
+      2. Write a temp untune CSV with all unique shape keys from the merged tune CSV,
          no gfx/cu_num — the tuner auto-fills those from the live GPU.
-      4. Run the tune script with --all so every shape, including those already
-         tuned for the live GPU, is re-benchmarked with the current kernel set.
-      5. Rebuild the inference .so  (gen_instances.py --tune_file → winners only).
+      3. Run the tune script with --all so every shape is re-benchmarked.
+      4. Rebuild the inference .so  (gen_instances.py --tune_file → winners only).
+
+    When build_one_module is None (standalone / direct path):
+      Steps 2-3 run as above.  Step 1 is skipped — the tune script JIT-builds
+      the tune .so on first invocation.  Step 4 uses core.build_module() directly
+      (no PREBUILD_KERNELS flag injection).  Results are written back to the
+      primary source CSV rather than the ephemeral /tmp merged path.
     """
+    _log = print if build_one_module is None else logger.info
+    _warn = print if build_one_module is None else logger.warning
+
     tune_script, config_attr = _resolve(module_name, cfg, csrc_dir)
 
     if not tune_script:
-        logger.warning(f"[pretune] {module_name}: no tune script available. Skipping.")
+        _warn(f"[pretune] {module_name}: no tune script available. Skipping.")
         return
     if not config_attr:
-        logger.warning(
-            f"[pretune] {module_name}: cannot determine CSV config attr. Skipping."
-        )
+        _warn(f"[pretune] {module_name}: cannot determine CSV config attr. Skipping.")
         return
 
+    # Merged tune file: used as shape source (includes model_config CSVs).
+    # In setup.py mode write_tune_file == tune_file (merged /tmp path).
+    # In direct mode write_tune_file is the primary source CSV so that new rows
+    # are written back to the repo CSV, not the ephemeral /tmp merge.
     tune_file = getattr(core.AITER_CONFIGS, config_attr)
-    logger.info(
+    if build_one_module is None:
+        source_attr = config_attr.removesuffix("_FILE")
+        source_paths_str = getattr(core.AITER_CONFIGS, source_attr, None)
+        write_tune_file = (
+            source_paths_str.split(os.pathsep)[0] if source_paths_str else tune_file
+        )
+    else:
+        write_tune_file = tune_file
+
+    _log(
         f"[pretune] {module_name}: "
         f"script={os.path.relpath(tune_script, repo_dir)}, "
         f"tune_file={tune_file}"
     )
 
-    # ── 1. Build tune .so ──────────────────────────────────────────────────
-    tune_args = core.get_args_of_build(ops_name=module_name)
-    if isinstance(tune_args, dict) and tune_args.get("srcs"):
-        logger.info(f"[pretune] building {module_name}")
-        build_one_module(tune_args)
-    else:
-        logger.warning(
-            f"[pretune] get_args_of_build({module_name!r}) returned no srcs. "
-            "Tune .so may already exist or module is unknown."
-        )
+    # ── 1. Build tune .so (setup.py path only) ────────────────────────────
+    if build_one_module is not None:
+        tune_args = core.get_args_of_build(ops_name=module_name)
+        if isinstance(tune_args, dict) and tune_args.get("srcs"):
+            logger.info(f"[pretune] building {module_name}")
+            build_one_module(tune_args)
+        else:
+            logger.warning(
+                f"[pretune] get_args_of_build({module_name!r}) returned no srcs. "
+                "Tune .so may already exist or module is unknown."
+            )
 
     # ── 2. Write untune CSV ────────────────────────────────────────────────
     # Shape key columns only (no gfx/cu_num).  B included for batched GEMM;
@@ -248,15 +270,15 @@ def run_pretune(
             "--untune_file",
             untune_csv,
             "--tune_file",
-            tune_file,
+            write_tune_file,
             "--libtype",
-            "all",
+            libtype,
             "--all",
         ]
-        logger.info(f"[pretune] {' '.join(cmd)}")
+        _log(f"[pretune] running: {' '.join(cmd)}")
         result = subprocess.run(cmd, env=env)
         if result.returncode != 0:
-            logger.warning(
+            _warn(
                 f"[pretune] tuner exited {result.returncode} for {module_name}. "
                 "Inference module will still be rebuilt with whatever was written."
             )
@@ -268,14 +290,30 @@ def run_pretune(
 
     # ── 4. Rebuild inference .so ───────────────────────────────────────────
     inf_module = re.sub(r"_cktile_tune$|_tune$", "", module_name)
-    logger.info(f"[pretune] rebuilding inference module {inf_module}")
+    _log(f"[pretune] rebuilding inference module {inf_module}")
     core.rm_module(inf_module)
     core.clear_build(inf_module)
     inf_args = core.get_args_of_build(ops_name=inf_module)
     if isinstance(inf_args, dict) and inf_args.get("srcs"):
-        build_one_module(inf_args)
+        if build_one_module is not None:
+            build_one_module(inf_args)
+        else:
+            core.build_module(
+                md_name=inf_args["md_name"],
+                srcs=inf_args["srcs"],
+                flags_extra_cc=inf_args["flags_extra_cc"],
+                flags_extra_hip=inf_args["flags_extra_hip"],
+                blob_gen_cmd=inf_args["blob_gen_cmd"],
+                extra_include=inf_args["extra_include"],
+                extra_ldflags=None,
+                verbose=False,
+                is_python_module=True,
+                is_standalone=False,
+                torch_exclude=False,
+                third_party=inf_args["third_party"],
+            )
     else:
-        logger.warning(
+        _warn(
             f"[pretune] get_args_of_build({inf_module!r}) returned no srcs. "
             "Inference module not rebuilt."
         )
@@ -306,108 +344,13 @@ def run_pretune_modules(
 
     for mod in modules:
         try:
-            run_pretune(mod, cfg, core, build_one_module, csrc_dir, repo_dir)
+            run_pretune(
+                mod, cfg, core, csrc_dir, repo_dir, build_one_module=build_one_module
+            )
         except Exception as exc:
             logger.warning(
                 f"[pretune] {mod} failed: {exc}. Continuing with remaining modules."
             )
-
-
-def run_tune_direct(
-    module_name: str,
-    cfg: dict,
-    csrc_dir: str,
-    repo_dir: str,
-    libtype: str = "all",
-) -> None:
-    """
-    Run the GEMM tuner directly for a single module without a full setup.py build.
-
-    Suitable for interactive retuning on an already-installed aiter.  The tune
-    .so is JIT-built on the first run if not already present.  Results are
-    written back to the primary source CSV (e.g. aiter/configs/a8w8_blockscale_tuned_gemm.csv).
-
-    After this call, rebuild the inference .so with:
-        AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py
-
-    Args:
-        module_name: tune module name from optCompilerConfig.json
-        cfg:         parsed optCompilerConfig.json dict
-        csrc_dir:    absolute path to aiter/csrc/
-        repo_dir:    absolute path to aiter repo root
-        libtype:     kernel families to tune — "ck", "cktile", or "all"
-    """
-    # Deferred import: core requires torch, not available during CI metadata phase
-    sys.path.insert(0, os.path.join(repo_dir, "aiter"))
-    from jit import core  # noqa: PLC0415
-
-    tune_script, config_attr = _resolve(module_name, cfg, csrc_dir)
-
-    if not tune_script:
-        print(f"[pretune] {module_name}: no tune script available. Skipping.")
-        return
-    if not config_attr:
-        print(f"[pretune] {module_name}: cannot determine CSV config attr. Skipping.")
-        return
-
-    # Merged temp path — used as shape source (includes model_config CSVs)
-    merged_tune_file = getattr(core.AITER_CONFIGS, config_attr)
-
-    # Primary source CSV — strip _FILE to get the module-level env var name,
-    # then read the first colon-separated path as the write-back target.
-    source_attr = config_attr.removesuffix("_FILE")
-    source_paths_str = getattr(core.AITER_CONFIGS, source_attr, None)
-    if source_paths_str:
-        write_tune_file = source_paths_str.split(os.pathsep)[0]
-    else:
-        write_tune_file = merged_tune_file
-
-    print(
-        f"[pretune] {module_name}\n"
-        f"  script : {os.path.relpath(tune_script, repo_dir)}\n"
-        f"  shapes : {merged_tune_file}\n"
-        f"  output : {write_tune_file}\n"
-        f"  libtype: {libtype}",
-        flush=True,
-    )
-
-    shape_keys = ["B", "M", "N", "K"]
-    untune_csv = _make_untune_csv(merged_tune_file, shape_keys)
-
-    try:
-        env = {
-            **os.environ,
-            "PYTHONPATH": f"{repo_dir}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-        }
-        cmd = [
-            sys.executable,
-            tune_script,
-            "--untune_file",
-            untune_csv,
-            "--tune_file",
-            write_tune_file,
-            "--libtype",
-            libtype,
-            "--all",
-        ]
-        print(f"[pretune] running: {' '.join(cmd)}", flush=True)
-        result = subprocess.run(cmd, env=env)
-        if result.returncode != 0:
-            print(
-                f"[pretune] tuner exited {result.returncode} for {module_name}.",
-                flush=True,
-            )
-    finally:
-        try:
-            os.unlink(untune_csv)
-        except OSError:
-            pass
-
-    print(
-        f"[pretune] done. Rebuild inference .so with:\n"
-        f"  AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py",
-        flush=True,
-    )
 
 
 def _main() -> None:
@@ -458,32 +401,57 @@ def _main() -> None:
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
+    _unsupported = {m for m, v in _SCRIPT_FALLBACK.items() if v is None}
+
     if args.list:
-        modules = _all_tune_modules(cfg)
-        print(f"Available tune modules ({len(modules)}):")
-        for m in sorted(modules):
+        all_modules = _all_tune_modules(cfg)
+        supported = [m for m in all_modules if m not in _unsupported]
+        print(f"Available tune modules ({len(supported)}):")
+        for m in sorted(supported):
             _, config_attr = _resolve(m, cfg, csrc_dir)
-            skip = m in _SCRIPT_FALLBACK and _SCRIPT_FALLBACK[m] is None
-            status = (
-                "skip (no tune script)" if skip else config_attr or "unknown config"
-            )
-            print(f"  {m:<55} {status}")
+            print(f"  {m:<55} {config_attr or 'unknown config'}")
         return
 
     if not args.modules:
         parser.print_help()
         return
 
+    all_known = set(_all_tune_modules(cfg))
     value = args.modules.strip()
     if value.lower() == "all":
-        modules = _all_tune_modules(cfg)
-        print(f"[pretune] tuning all {len(modules)} tune modules")
+        modules = [m for m in _all_tune_modules(cfg) if m not in _unsupported]
+        print(f"[pretune] tuning all {len(modules)} supported tune modules")
     else:
         modules = [m.strip() for m in value.split(",") if m.strip()]
 
+    # Deferred import: core requires torch, not available during CI metadata phase
+    sys.path.insert(0, os.path.join(repo_dir, "aiter"))
+    from jit import core  # noqa: PLC0415
+
+    seen_keys: set = set()
     for mod in modules:
+        if mod in _unsupported:
+            print(
+                f"[pretune] {mod}: not supported (no tune script writes to this CSV). "
+                "Skipping."
+            )
+            continue
+        if mod not in all_known:
+            print(
+                f"[pretune] {mod}: unknown module. Run --list to see available modules."
+            )
+            continue
+        script, attr = _resolve(mod, cfg, csrc_dir)
+        key = (script, attr)
+        if key in seen_keys:
+            print(
+                f"[pretune] {mod}: same script+CSV already queued by an earlier module. "
+                "Skipping duplicate."
+            )
+            continue
+        seen_keys.add(key)
         try:
-            run_tune_direct(mod, cfg, csrc_dir, repo_dir, libtype=args.libtype)
+            run_pretune(mod, cfg, core, csrc_dir, repo_dir, libtype=args.libtype)
         except Exception as exc:
             print(f"[pretune] {mod} failed: {exc}. Continuing.")
 
