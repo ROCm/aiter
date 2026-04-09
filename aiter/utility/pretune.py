@@ -17,11 +17,11 @@ Two entry points:
     python3 aiter/utility/pretune.py all
     python3 aiter/utility/pretune.py --list          # show available tune modules
 
-   After standalone tuning, rebuild the inference .so with:
-    AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py
+   After tuning completes, the inference .so is rebuilt automatically.
+   Verify with: python3 op_tests/test_gemm_a8w8_blockscale.py
 
 Both modes accept a single module name, a comma-separated list, or "all".
-Requires a live GPU matching the target architecture.
+Requires a live GPU — the GPU's architecture and cu_num are auto-detected and used to tag the tuned results.
 All shapes in the merged tune CSV are (re-)tuned for the live GPU.
 
 Flow per module (PRETUNE_MODULES / setup.py path):

@@ -180,6 +180,7 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
+            # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
             if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
@@ -292,6 +293,10 @@ if PREBUILD_KERNELS != 0:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
+        # Retune GEMM shapes on the live GPU after the main build phase.
+        # Each requested module's tune script benchmarks all CSV shapes and
+        # writes results tagged with the live GPU's (gfx, cu_num) back to
+        # the source CSV, then rebuilds the inference .so.
         if PRETUNE_MODULES:
             from aiter.utility.pretune import run_pretune_modules
 

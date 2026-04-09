@@ -2,21 +2,22 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-test_gemm_codegen.py — unit tests for the gfx-aware GEMM codegen fix.
+test_gemm_codegen.py — unit tests for gfx-aware GEMM build targeting and dispatch.
 
-Tests the fix in fix/gemm_codegen_gfx_build_targets that adds gfx to:
-  - gen_instances.py build-time filter (get_build_targets in chip_info.py)
-  - Python runtime dispatch keys in gemm_op_a8w8.py et al.
-  - C++ static dispatch key (gfx, cu_num, M, N, K) and write_lookup_header output
+Covers:
+  - get_build_targets() build-time target selection (chip_info.py)
+  - gen_instances filter: CSV row selection per (gfx, cu_num) target
+  - write_lookup_header: C++ key format in generated lookup headers
+  - Runtime dispatch key selection in gemm_op_a8w8.py et al.
 
 No GPU kernel execution or .so compilation required.  All tests run on CPU
 using only pandas and the chip_info / gemm_op_a8w8 Python layers.
 
 Scenarios:
   1. get_build_targets() — env-driven target selection
-  2. gen_instances filter simulation — CSV row selection matches target GPU
-  2.5. write_lookup_header — C++ key format in generated lookup header
-  3. Runtime dispatch key selection — (gfx, cu_num, M, N, K) lookup
+  2. gen_instances filter — CSV row selection per target GPU
+  3. write_lookup_header — C++ key format in generated lookup header
+  4. Runtime dispatch key selection — (gfx, cu_num, M, N, K) lookup
 
 Usage:
     python op_tests/test_gemm_codegen.py
@@ -279,7 +280,7 @@ def _make_temp_csv(content: str) -> str:
 
 
 def test_runtime_dispatch_key():
-    _section("3. Runtime dispatch — (gfx, cu_num, M, N, K) lookup key")
+    _section("4. Runtime dispatch — (gfx, cu_num, M, N, K) lookup key")
 
     try:
         from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
@@ -377,7 +378,7 @@ def test_runtime_dispatch_key():
 
 
 def test_write_lookup_header():
-    _section("2.5. write_lookup_header — C++ key format")
+    _section("3. write_lookup_header — C++ key format")
 
     from chip_info import write_lookup_header
 
