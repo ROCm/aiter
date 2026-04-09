@@ -16,26 +16,6 @@ from aiter.ops.triton._gluon_kernels.utils.prefetch import (
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-try:
-    from triton.experimental.gluon.language.amd.cdna3 import (
-        sched_barrier as _sched_barrier,
-        sched_group_barrier as _sched_group_barrier,
-    )
-except ImportError:
-
-    @gluon.jit
-    def _sched_barrier(inst_mask):
-        pass
-
-    @gluon.jit
-    def _sched_group_barrier(inst_mask, cnt, _):
-        pass
-
-
-# Scheduling instruction group masks
-_DS_READ: gl.constexpr = 0x100
-_MFMA: gl.constexpr = 0x008
-
 _LOGGER = AiterTritonLogger()
 
 _GLUON_REPR_KEYS = [
@@ -1315,9 +1295,6 @@ def _gemm_a16w16_interleaved_kernel(
                 not PHYSICAL_MK,
                 not PHYSICAL_KN,
             )
-
-        # ── barrier: TDM issued, now ds_read half1 ──
-        _sched_barrier(0x0)
 
         # 5. ds_load second half (k = HALF_K .. BLOCK_K-1)
         if PHYSICAL_MK:
