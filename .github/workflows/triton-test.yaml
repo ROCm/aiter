@@ -2,10 +2,10 @@ name: Triton Test
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
-    branches: [main]
+    branches: [main, 'release/**']
     paths:
       - "aiter/ops/triton/**"
       - "op_tests/triton_tests/**"
