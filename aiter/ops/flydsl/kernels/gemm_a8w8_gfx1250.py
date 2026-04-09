@@ -369,47 +369,44 @@ def compile_gemm_a8w8(
             """Load one 128x16 FP8 B-fragment from LDS. Same layout as A."""
             return load_a_frag(lds_buffer, b_lane_base, ks)
 
-        # --- K-subtile compute (A-streaming with identity scales) ---
-        def _load_b_frags(b_buf, b_bases, ks): # load all B frags upfront
-            return [load_b_frag(b_buf, b_bases[wn], ks)
-                    for wn in range_constexpr(wmma_n_rep)]
+        # --- K-subtile compute (B-streaming with identity scales) ---
+        def _load_a_frags(a_buf, a_bases, ks):  # load all A frags upfront
+            return [load_a_frag(a_buf, a_bases[wm], ks)
+                    for wm in range_constexpr(wmma_m_rep)]
 
-        # we loaded all B frags upfront then A frags are loaded one at a time
-        def _a_streaming_compute(accs, a_buf, a_bases, b_frags, ks,
-                                 emit_filler=None, next_b_info=None):
-            """Stream A fragments per-wm, interleaved with WMMA"""
-            next_b_frags = None
-            a_frag = load_a_frag(a_buf, a_bases[0], ks)
-            for wm in range_constexpr(wmma_m_rep):
-                is_last = (wm == wmma_m_rep - 1)
+        # we load all A frags upfront then B frags are streamed one at a time
+        def _b_streaming_compute(accs, a_frags, b_buf, b_bases, ks,
+                                 emit_filler=None, next_a_info=None):
+            """Stream B fragments per-wn, interleaved with WMMA."""
+            next_a_frags = None
+            b_frag = load_b_frag(b_buf, b_bases[0], ks)
+            for wn in range_constexpr(wmma_n_rep):
+                is_last = (wn == wmma_n_rep - 1)
                 if not is_last:
-                    a_next = load_a_frag(a_buf, a_bases[wm + 1], ks)
+                    b_next = load_b_frag(b_buf, b_bases[wn + 1], ks)
                 if is_last:
                     rocdl.s_wait_dscnt(0)
-                    
-                    # this basically lets us compute the output addresses using the ALU while the last WMMA is going on
                     if emit_filler is not None:
-                        rocdl.sched_barrier(0) # tells the compiler that all instructions before this point must be issued before any instrucntions after thsi point
-                        emit_filler() # calls epilogue_prepare_addrs() and computes the output addresses for the final store
-                    if next_b_info is not None: # prefetching for next K-subtile
-                        nb_buf, nb_bases, nb_ks = next_b_info
-                        next_b_frags = _load_b_frags(nb_buf, nb_bases, nb_ks)
+                        rocdl.sched_barrier(0)
+                        emit_filler()
+                    if next_a_info is not None:
+                        na_buf, na_bases, na_ks = next_a_info
+                        next_a_frags = _load_a_frags(na_buf, na_bases, na_ks)
                 else:
                     rocdl.s_wait_dscnt(DS_LOADS_PER_FRAG)
-                for wn in range_constexpr(wmma_n_rep):
+                for wm in range_constexpr(wmma_m_rep):
                     idx = wm * wmma_n_rep + wn
-                    # Use wmma_scale with identity E8M0 scales (1.0)
                     accs[idx] = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
                         T.vec(8, T.f32),
-                        b_frags[wn], a_frag, accs[idx],
+                        b_frag, a_frags[wm], accs[idx],
                         identity_scale, identity_scale,
-                        fmtA=0, fmtB=0,        # FP8 format
-                        scaleAType=0, scaleBType=0,  # E8M0 scales
+                        fmtA=0, fmtB=0,
+                        scaleAType=0, scaleBType=0,
                     )
                 if not is_last:
-                    a_frag = a_next
-            if next_b_info is not None:
-                return accs, next_b_frags
+                    b_frag = b_next
+            if next_a_info is not None:
+                return accs, next_a_frags
             return accs
 
         # --- Compute one K-tile ---
@@ -419,18 +416,18 @@ def compile_gemm_a8w8(
             b_buf, b_bases = _precompute_b_lane_bases(lds_b_ptr)
 
             if k_wmma_steps == 1:
-                b_frags = _load_b_frags(b_buf, b_bases, 0)
-                current_accs = _a_streaming_compute(
-                    current_accs, a_buf, a_bases, b_frags, 0,
+                a_frags = _load_a_frags(a_buf, a_bases, 0)
+                current_accs = _b_streaming_compute(
+                    current_accs, a_frags, b_buf, b_bases, 0,
                     emit_filler=emit_filler)
             else:
-                prev_b = _load_b_frags(b_buf, b_bases, 0)
+                prev_a = _load_a_frags(a_buf, a_bases, 0)
                 for ks in range_constexpr(k_wmma_steps - 1):
-                    current_accs, prev_b = _a_streaming_compute(
-                        current_accs, a_buf, a_bases, prev_b, ks,
-                        next_b_info=(b_buf, b_bases, ks + 1))
-                current_accs = _a_streaming_compute(
-                    current_accs, a_buf, a_bases, prev_b,
+                    current_accs, prev_a = _b_streaming_compute(
+                        current_accs, prev_a, b_buf, b_bases, ks,
+                        next_a_info=(a_buf, a_bases, ks + 1))
+                current_accs = _b_streaming_compute(
+                    current_accs, prev_a, b_buf, b_bases,
                     k_wmma_steps - 1, emit_filler=emit_filler)
 
             return current_accs
