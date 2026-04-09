@@ -141,6 +141,20 @@ def _all_tune_modules(cfg: dict) -> list:
     return [k for k in cfg if k.endswith("_tune")]
 
 
+def _parse_module_list(value: str, cfg: dict) -> list[str]:
+    """Parse a PRETUNE_MODULES value into a list of module names.
+
+    Expands "all" to every supported tune module (unsupported variants with no
+    tune script are excluded).  Comma-separated values are split and stripped.
+    No further validation is performed — callers are responsible for checking
+    whether returned names are known and handling duplicates.
+    """
+    _unsupported = {m for m, v in _SCRIPT_FALLBACK.items() if v is None}
+    if value.strip().lower() == "all":
+        return [m for m in _all_tune_modules(cfg) if m not in _unsupported]
+    return [m.strip() for m in value.split(",") if m.strip()]
+
+
 def _make_untune_csv(tune_file: str, shape_keys: list) -> str:
     """
     Read all paths in tune_file (colon-separated AITER multi-config format),
@@ -331,18 +345,24 @@ def run_pretune_modules(
     Parse PRETUNE_MODULES and dispatch run_pretune() for each requested module.
 
     pretune_env values:
-      "all"                                          → every _tune module in config
+      "all"                                          → every supported _tune module in config
       "module_gemm_a8w8_blockscale_tune"             → single module
       "module_gemm_a8w8_tune,module_gemm_a8w8_blockscale_tune"  → comma list
     """
-    value = pretune_env.strip()
-    if value.lower() == "all":
-        modules = _all_tune_modules(cfg)
-        logger.info(f"[pretune] PRETUNE_MODULES=all → {len(modules)} tune modules")
-    else:
-        modules = [m.strip() for m in value.split(",") if m.strip()]
+    modules = _parse_module_list(pretune_env, cfg)
+    logger.info(f"[pretune] PRETUNE_MODULES → {len(modules)} modules to tune")
 
+    seen_keys: set = set()
     for mod in modules:
+        script, attr = _resolve(mod, cfg, csrc_dir)
+        key = (script, attr)
+        if key in seen_keys:
+            logger.warning(
+                f"[pretune] {mod}: same script+CSV already queued by an earlier module. "
+                "Skipping duplicate."
+            )
+            continue
+        seen_keys.add(key)
         try:
             run_pretune(
                 mod, cfg, core, csrc_dir, repo_dir, build_one_module=build_one_module
@@ -417,12 +437,9 @@ def _main() -> None:
         return
 
     all_known = set(_all_tune_modules(cfg))
-    value = args.modules.strip()
-    if value.lower() == "all":
-        modules = [m for m in _all_tune_modules(cfg) if m not in _unsupported]
+    modules = _parse_module_list(args.modules, cfg)
+    if args.modules.strip().lower() == "all":
         print(f"[pretune] tuning all {len(modules)} supported tune modules")
-    else:
-        modules = [m.strip() for m in value.split(",") if m.strip()]
 
     # Deferred import: core requires torch, not available during CI metadata phase
     sys.path.insert(0, os.path.join(repo_dir, "aiter"))
