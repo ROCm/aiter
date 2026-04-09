@@ -13,8 +13,8 @@
     "NUM_BUFFERS": 2
   },
   "any": {
-    "BLOCK_SIZE_M": 32,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_M": 256,
+    "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 512,
     "GROUP_SIZE_M": 4,
     "num_warps": 4,
@@ -23,6 +23,6 @@
     "waves_per_eu": 1,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": null,
-    "NUM_BUFFERS": 3
+    "NUM_BUFFERS": 2
   }
 }

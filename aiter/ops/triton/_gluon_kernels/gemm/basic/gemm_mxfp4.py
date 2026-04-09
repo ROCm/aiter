@@ -12,6 +12,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     BLOCK_K: int,
 ):
     K_GROUPS = BLOCK_K // SCALE_GROUP_ELEMS
+    BLOCK_K_BYTES = BLOCK_K // 2
 
     if num_warps == 2:
         warp_bases= [[0, 1]]
@@ -42,8 +43,9 @@ def get_gemm_afp4wfp4_preshuffle_layouts(
     )
 
     # LDS layouts (shared memory layouts). These must be SharedLayout types.
-    shared_A = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=1, order=[1, 0])
-    shared_B = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=1, order=[1, 0])
+    PAD_INTERVAL_A = 256 if BLOCK_K_BYTES <= 256 else BLOCK_K_BYTES
+    shared_A = gl.PaddedSharedLayout.with_identity_for([[PAD_INTERVAL_A, 16]], [BLOCK_M, BLOCK_K_BYTES], [1, 0])
+    shared_B = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
     shared_S = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
 
     # Dot operand layouts (register layouts expected by WMMA)
