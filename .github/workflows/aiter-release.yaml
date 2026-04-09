@@ -3,6 +3,8 @@ name: Aiter Release Package
 description: This workflow builds the Aiter Python package as .whl files for Python 3.10 and 3.12, and uploads them as artifacts.
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       commit:
@@ -51,30 +53,34 @@ on:
           - aiter-mi325-1gpu
           - linux-aiter-mi355-1
           - aiter-1gpu-runner
+      skip_github_release:
+        description: 'Skip creating GitHub Release (for test builds)'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build_whl_package:
-    runs-on: ${{ github.event.inputs.runner }}
+    runs-on: ${{ github.event.inputs.runner || 'aiter-k8s-build' }}
 
     strategy:
       fail-fast: false
       matrix:
         include:
           - python_version: "3.10"
-            docker_image: ${{ github.event.inputs.docker_image_py310 }}
-            build_enabled: ${{ github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true }}
+            docker_image: ${{ github.event.inputs.docker_image_py310 || 'rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta' }}
+            build_enabled: ${{ github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true || github.event_name == 'push' }}
           - python_version: "3.12"
-            docker_image: ${{ github.event.inputs.docker_image_py312 }}
-            build_enabled: ${{ github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true }}
+            docker_image: ${{ github.event.inputs.docker_image_py312 || 'rocm/vllm-dev:nightly' }}
+            build_enabled: ${{ github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true || github.event_name == 'push' }}
 
     env:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
-      GPU_ARCHS: ${{ github.event.inputs.gpu_archs }}
+      GPU_ARCHS: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
 
     steps:
       - name: Checkout aiter repo
@@ -105,7 +111,7 @@ jobs:
         if: ${{ matrix.build_enabled }}
         run: |
           set -ex
-          echo "${{ secrets[github.event.inputs.docker_password_secret] }}" | docker login -u "${{ github.event.inputs.docker_username }}" --password-stdin
+          echo "${{ secrets[github.event.inputs.docker_password_secret || 'DOCKER_PASSWORD'] }}" | docker login -u "${{ github.event.inputs.docker_username || 'rocmshard' }}" --password-stdin
 
       - name: Run the container
         if: ${{ matrix.build_enabled }}
@@ -129,7 +135,7 @@ jobs:
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 -r requirements.txt
-      
+
       - name: Install ninja
         if: ${{ matrix.build_enabled }}
         run: |
@@ -150,6 +156,21 @@ jobs:
           aiter_build_${{ matrix.python_version }} \
           bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls dist/*.whl'
 
+      - name: Smoke test - install and import
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -e
+          echo "Validating wheel installation and import..."
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          bash -c '
+            pip install dist/*.whl --force-reinstall &&
+            python3 -c "import aiter; print(f\"aiter version: {aiter.__version__}\")" &&
+            python3 -c "from aiter.ops.triton import gemm_afp4wfp4; print(\"triton gemm import OK\")" &&
+            echo "Smoke test PASSED"
+          '
+
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
@@ -161,3 +182,66 @@ jobs:
         if: always()
         run: |
           docker rm -f aiter_build_${{ matrix.python_version }} || true
+
+  # Generate changelog and create GitHub Release on tag push
+  create_release:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event.inputs.skip_github_release != 'true' }}
+    needs: build_whl_package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          set -e
+          TAG="${GITHUB_REF#refs/tags/}"
+          # Find previous tag
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "$TAG" | head -1)
+          echo "Generating changelog: ${PREV_TAG}..${TAG}"
+
+          if [ -f "scripts/generate_changelog.sh" ]; then
+            bash scripts/generate_changelog.sh "$PREV_TAG" "$TAG" /tmp/release_notes.md
+          else
+            # Fallback: use git log
+            echo "# ${TAG} Release Notes" > /tmp/release_notes.md
+            echo "" >> /tmp/release_notes.md
+            git log "${PREV_TAG}..${TAG}" --format="- %s" >> /tmp/release_notes.md
+          fi
+
+          # If a hand-written RELEASE_NOTES file exists, prefer it
+          if [ -f "RELEASE_NOTES_${TAG}.md" ]; then
+            cp "RELEASE_NOTES_${TAG}.md" /tmp/release_notes.md
+            echo "Using hand-written release notes: RELEASE_NOTES_${TAG}.md"
+          fi
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/whl-artifacts
+          pattern: aiter-whl-packages-*
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          # Collect all .whl files
+          WHL_FILES=$(find /tmp/whl-artifacts -name "*.whl" -type f)
+          echo "Found wheels:"
+          echo "$WHL_FILES"
+
+          # Create release with notes and attach wheels
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/release_notes.md \
+            $WHL_FILES
+          echo "GitHub Release created: $TAG"
