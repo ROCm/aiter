@@ -151,5 +151,5 @@ See `scripts/release_checklist.md` for the full pre/post-release validation chec
 - Build: ~1h (prebuild kernels)
 - Standard tests: ~40min
 - Total per PR: ~1h40m minimum
-- Release branch CI runs on push (not per-PR), reducing contention
+- Release branch CI runs on push and on PRs targeting `release/**` branches
 - Runner fleet analytics: tracked via CI monitor workflow (#2606)

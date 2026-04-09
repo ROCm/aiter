@@ -169,12 +169,17 @@ jobs:
         run: |
           set -e
           echo "=== Prebuilt kernel validation ==="
-          # Install the wheel and check kernel .so count
+          # Install the wheel and validate from /tmp to avoid importing the source tree
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           bash -c '
             pip install dist/*.whl --force-reinstall
+          '
+          docker exec \
+          -w /tmp \
+          aiter_build_${{ matrix.python_version }} \
+          bash -c '
             SITE_PKG=$(python3 -c "import aiter, os; print(os.path.dirname(aiter.__file__))")
             KERNEL_COUNT=$(find "$SITE_PKG/jit" -name "*.so" 2>/dev/null | wc -l)
             echo "Prebuilt kernel .so files: $KERNEL_COUNT"
@@ -185,7 +190,7 @@ jobs:
             else
               echo "::notice::Prebuild OK: $KERNEL_COUNT kernels compiled"
             fi
-            WHL_SIZE=$(du -sh dist/*.whl | cut -f1)
+            WHL_SIZE=$(du -sh /workspace/dist/*.whl | cut -f1)
             echo "Wheel size: $WHL_SIZE (prebuilt wheels are typically >100MB)"
           '
 
@@ -194,8 +199,9 @@ jobs:
         run: |
           set -e
           echo "Validating wheel installation and import..."
+          # Run from /tmp so Python imports from site-packages, not the source tree
           docker exec \
-          -w /workspace \
+          -w /tmp \
           aiter_build_${{ matrix.python_version }} \
           bash -c '
             python3 -c "
@@ -258,13 +264,15 @@ print(\"triton gemm import OK\")
         if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
+          # Derive S3 arch prefix from GPU_ARCHS (e.g. "gfx942;gfx950" -> "gfx942-gfx950")
+          ARCH_PREFIX=$(echo "${{ env.GPU_ARCHS }}" | tr ';' '-')
           for WHL in dist/*.whl; do
             WHL_NAME=$(basename ${WHL})
-            echo "Uploading ${WHL_NAME} to S3..."
+            echo "Uploading ${WHL_NAME} to S3 (arch: ${ARCH_PREFIX})..."
             # Upload to release-specific path
-            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-releases/gfx942-gfx950/${TAG}/${WHL_NAME}
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-releases/${ARCH_PREFIX}/${TAG}/${WHL_NAME}
             # Also upload to staging for downstream CI compatibility
-            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/${ARCH_PREFIX}/${WHL_NAME}
           done
           echo "Wheels uploaded to S3 (releases + staging)"
 
@@ -292,23 +300,30 @@ print(\"triton gemm import OK\")
         run: |
           set -e
           TAG="${GITHUB_REF#refs/tags/}"
-          # Find previous tag
-          PREV_TAG=$(git tag --sort=-version:refname | grep -v "$TAG" | head -1)
-          echo "Generating changelog: ${PREV_TAG}..${TAG}"
 
-          if [ -f "scripts/generate_changelog.sh" ]; then
-            bash scripts/generate_changelog.sh "$PREV_TAG" "$TAG" /tmp/release_notes.md
-          else
-            # Fallback: use git log
-            echo "# ${TAG} Release Notes" > /tmp/release_notes.md
-            echo "" >> /tmp/release_notes.md
-            git log "${PREV_TAG}..${TAG}" --format="- %s" >> /tmp/release_notes.md
-          fi
-
-          # If a hand-written RELEASE_NOTES file exists, prefer it
+          # If a hand-written RELEASE_NOTES file exists, use it and skip generation
           if [ -f "RELEASE_NOTES_${TAG}.md" ]; then
             cp "RELEASE_NOTES_${TAG}.md" /tmp/release_notes.md
             echo "Using hand-written release notes: RELEASE_NOTES_${TAG}.md"
+            exit 0
+          fi
+
+          # Find previous tag (may be empty on first release)
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "$TAG" | head -1 || true)
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found. Generating notes from full history."
+            echo "# ${TAG} Release Notes" > /tmp/release_notes.md
+            echo "" >> /tmp/release_notes.md
+            echo "Initial release." >> /tmp/release_notes.md
+          elif [ -f "scripts/generate_changelog.sh" ]; then
+            echo "Generating changelog: ${PREV_TAG}..${TAG}"
+            bash scripts/generate_changelog.sh "$PREV_TAG" "$TAG" /tmp/release_notes.md
+          else
+            echo "Generating changelog: ${PREV_TAG}..${TAG}"
+            echo "# ${TAG} Release Notes" > /tmp/release_notes.md
+            echo "" >> /tmp/release_notes.md
+            git log "${PREV_TAG}..${TAG}" --format="- %s" >> /tmp/release_notes.md
           fi
 
       - name: Download all wheel artifacts
