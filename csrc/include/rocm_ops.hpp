@@ -374,13 +374,13 @@ namespace py = pybind11;
           &aiter::fused_qk_norm_rope_group_quant_cache_mla,                         \
           "fused_qk_norm_rope_group_quant_cache_mla("                               \
           "                     Tensor q_nope, Tensor q_pe,"                        \
-          "                     Tensor kv_c, Tensor! k_pe,"                         \
+          "                     Tensor kv_c, Tensor k_pe,"                          \
+          "                     Tensor! k_pe_out,"                                  \
           "                     Tensor k_weight,"                                   \
-          "                     Tensor? q_weight,"                                  \
           "                     Tensor! kv_cache,"                                  \
           "                     Tensor! q_out,"                                     \
+          "                     Tensor! q_scale_out,"                               \
           "                     Tensor slot_mapping,"                               \
-          "                     Tensor q_scale,"                                    \
           "                     Tensor positions,"                                  \
           "                     Tensor cos_cache,"                                  \
           "                     Tensor sin_cache,"                                  \
@@ -392,12 +392,12 @@ namespace py = pybind11;
           py::arg("q_pe"),                                                          \
           py::arg("kv_c"),                                                          \
           py::arg("k_pe"),                                                          \
+          py::arg("k_pe_out"),                                                      \
           py::arg("k_weight"),                                                      \
-          py::arg("q_weight"),                                                      \
           py::arg("kv_cache"),                                                      \
           py::arg("q_out"),                                                         \
+          py::arg("q_scale_out"),                                                   \
           py::arg("slot_mapping"),                                                  \
-          py::arg("q_scale"),                                                       \
           py::arg("positions"),                                                     \
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \

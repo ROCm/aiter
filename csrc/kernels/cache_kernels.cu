@@ -2201,30 +2201,33 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         int q_nope_stride_0, q_nope_stride_1;
         int q_pe_stride_0, q_pe_stride_1;
         int q_out_stride_0, q_out_stride_1;
+        int q_scale_stride_0, q_scale_stride_1; // strides for q_scale [N, H, num_groups] uint8
         int kv_c_stride_0, kv_c_stride_1;
         int k_pe_stride_0, k_pe_stride_1;
-        int block_size_log2;  // log2(block_size), block_size must be power of 2
-        int num_tokens;       // total number of tokens (for v2 multi-token kernel bounds)
-        int num_kv_heads;     // needed for restructured grid: blockIdx.y splits K vs Q
+        int block_size_log2;
+        int num_tokens;
+        int num_kv_heads;
+        int num_heads;
     };
 
-    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox, bool is_nope_first, bool do_q_norm = false, int KV_LORA_DIM = 512, int TOKENS_PER_BLOCK = 1>
+    template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, 
+              bool is_neox, bool is_nope_first, int KV_LORA_DIM = 512, int TOKENS_PER_BLOCK = 1>
     __device__ void fuse_qk_norm_rope_group_quant_cache_mla_kernel_impl(
         const scalar_t* __restrict__ q_nope,
-        scalar_t* __restrict__ q_pe,
+        const scalar_t* __restrict__ q_pe,
         const scalar_t* __restrict__ kv_c,
-        scalar_t* __restrict__ k_pe,
+        const scalar_t* __restrict__ k_pe,
+        scalar_t* __restrict__ k_pe_out,
         const scalar_t* __restrict__ k_weight,
-        const scalar_t* __restrict__ q_weight,
         cache_t* __restrict__ kv_cache,
         query_t* __restrict__ q_out,
+        uint8_t* __restrict__ q_scale,  // [N, H, num_groups] e8m0 scales (fp8 path only)
         const int64_t* __restrict__ slot_mapping,
         const int64_t* __restrict__ positions,
         const scalar_t *__restrict__ cos_cache,
         const scalar_t *__restrict__ sin_cache,
         float eps,
-        const MlaKernelParams& __restrict__ params,
-        const float* q_scale
+        const MlaKernelParams& __restrict__ params
     ) {
       // ---- All compile-time constants ----
       constexpr int32_t kv_lora_dim = KV_LORA_DIM;
@@ -2310,7 +2313,8 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
         uint32_t x_idx, y_idx;
         float f32_cos, f32_sin;
         scalar_t kx, ky;
-        scalar_t* k_in = k_pe + token_kpe_base + kv_head_idx * params.k_pe_stride_1;
+        const scalar_t* k_in = k_pe + token_kpe_base + kv_head_idx * params.k_pe_stride_1;
+        scalar_t* k_out_rope = k_pe_out + token_kpe_base + kv_head_idx * params.k_pe_stride_1;
         if (tid < embed_dim) {
           if constexpr (is_neox) {
             x_idx = tid;
@@ -2398,7 +2402,7 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           }
         }
 
-        // Inplace K RoPE
+        // K RoPE (non-in-place: read from k_pe, write to k_pe_out)
         if (tid < embed_dim) {
           float fkx = static_cast<float>(kx);
           float fky = static_cast<float>(ky);
@@ -2408,104 +2412,88 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
             uint32_t packed;
             reinterpret_cast<scalar_t*>(&packed)[0] = rot_x;
             reinterpret_cast<scalar_t*>(&packed)[1] = rot_y;
-            *reinterpret_cast<uint32_t*>(&k_in[x_idx]) = packed;
+            *reinterpret_cast<uint32_t*>(&k_out_rope[x_idx]) = packed;
           } else {
-            k_in[x_idx] = rot_x;
-            k_in[y_idx] = rot_y;
+            k_out_rope[x_idx] = rot_x;
+            k_out_rope[y_idx] = rot_y;
           }
         }
-      } else { // Q processing
-      // ============ Q_nope Processing ============
-      const int32_t q_head_idx = combined_head_idx - params.num_kv_heads;
+      } else { // Q processing — multi-head loop
+      // ============ Q Processing: multi-head per wave ============
+      const int32_t q_wave_idx = combined_head_idx - params.num_kv_heads;
+      const int32_t num_q_waves = static_cast<int32_t>(gridDim.y) - params.num_kv_heads;
+      const int32_t q_heads_per_wave = (params.num_heads + num_q_waves - 1) / num_q_waves;
+      const int32_t q_head_start = q_wave_idx * q_heads_per_wave;
+      const int32_t q_head_end = min(q_head_start + q_heads_per_wave, params.num_heads);
 
-      // Q-specific pointer setup
       const int32_t token_qnope_base = token_idx * params.q_nope_stride_0;
       const int32_t token_qpe_base = token_idx * params.q_pe_stride_0;
       const int32_t token_qout_base = token_idx * params.q_out_stride_0;
 
-      const float inverted_qscale = 1.0f / *q_scale;
-
-      auto q_buffer_i = opus::make_gmem<scalar_t>(q_nope + token_qnope_base + q_head_idx * params.q_nope_stride_1, q_oob_i * sizeof(scalar_t));
-      auto q_buffer_o = opus::make_gmem<query_t>(q_out + token_qout_base + q_head_idx * params.q_out_stride_1 + nope_offset, q_oob_o * sizeof(query_t));
-      scalar_t* q_pe_ptr = q_pe + token_qpe_base + q_head_idx * params.q_pe_stride_1;
-
-      // Q RoPE prefetch: cos/sin + pe values only (indexes recomputed to save VGPRs)
+      // cos/sin loaded once, shared across all Q heads for this token
       float qr_cos = 0.f, qr_sin = 0.f;
-      scalar_t qr_px{}, qr_py{};
+      if (tid < embed_dim) {
+        qr_cos = static_cast<float>(cos_ptr[tid]);
+        qr_sin = static_cast<float>(sin_ptr[tid]);
+      }
 
-      if constexpr (do_q_norm) {
-        float q_sum_sq = 0.0f;
-        opus_vec_i vec_q;
-        const bool has_q_data = (tid < kv_lora_vec);
+      const int32_t token_qscale_base = token_idx * params.q_scale_stride_0;
+      constexpr int32_t nope_num_groups = kv_lora_dim / GROUP_SIZE;
+      constexpr int32_t pe_group_idx = nope_num_groups; // pe is the last group
 
-        if (has_q_data) {
-          vec_q = q_buffer_i.template load<vec_size_i>(tid * vec_size_i);
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; ++i) {
-            float val = static_cast<float>(vec_q[i]);
-            q_sum_sq += val * val;
-          }
-        }
+      for (int32_t q_head_idx = q_head_start; q_head_idx < q_head_end; q_head_idx++) {
+        auto q_buffer_i = opus::make_gmem<scalar_t>(q_nope + token_qnope_base + q_head_idx * params.q_nope_stride_1, q_oob_i * sizeof(scalar_t));
+        auto q_buffer_o = opus::make_gmem<query_t>(q_out + token_qout_base + q_head_idx * params.q_out_stride_1 + nope_offset, q_oob_o * sizeof(query_t));
+        const scalar_t* q_pe_ptr = q_pe + token_qpe_base + q_head_idx * params.q_pe_stride_1;
+        uint8_t* q_scale_head = q_scale + token_qscale_base + q_head_idx * params.q_scale_stride_1;
 
-        // Prefetch Q RoPE data while nope sum_sq is being reduced
+        // Prefetch Q RoPE pe values (per-head; cos/sin already loaded above)
+        scalar_t qr_px{}, qr_py{};
         if (tid < embed_dim) {
           if constexpr (is_neox) {
-            qr_cos = static_cast<float>(cos_ptr[tid]);
-            qr_sin = static_cast<float>(sin_ptr[tid]);
             qr_px = q_pe_ptr[tid];
             qr_py = q_pe_ptr[embed_dim + tid];
           } else {
-            qr_cos = static_cast<float>(cos_ptr[tid]);
-            qr_sin = static_cast<float>(sin_ptr[tid]);
             uint32_t qpe_packed = *reinterpret_cast<const uint32_t*>(&q_pe_ptr[tid << 1]);
             qr_px = reinterpret_cast<const scalar_t*>(&qpe_packed)[0];
             qr_py = reinterpret_cast<const scalar_t*>(&qpe_packed)[1];
           }
         }
 
-        auto sum_func = [](float a, float b) { return a + b; };
-        q_sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(q_sum_sq, sum_func);
-        const float q_rms_scale = rsqrtf(q_sum_sq / static_cast<float>(kv_lora_dim) + eps);
+        // ============ Q_nope: per-group fp8 quant, scales → q_scale ============
+        if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
+          const bool has_q_data = (tid < kv_lora_vec);
+          float q_fp32[vec_size_i];
+          float thread_max = 0.0f;
 
-        // Fused: apply RMS norm * weight + compute group max_abs
-        float q_fp32[vec_size_i];
-        float thread_max = 0.0f;
-        if (has_q_data) {
-          opus_vec_i vec_q_weight = *reinterpret_cast<const opus_vec_i*>(&q_weight[tid * vec_size_i]);
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i++) {
-            float val = static_cast<float>(vec_q[i]);
-            float weight = static_cast<float>(vec_q_weight[i]);
-            q_fp32[i] = val * q_rms_scale * weight;
-            if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
+          if (has_q_data) {
+            opus_vec_i vec_q = q_buffer_i.template load<vec_size_i>(tid * vec_size_i);
+            #pragma unroll
+            for (int i = 0; i < vec_size_i; i++) {
+              q_fp32[i] = static_cast<float>(vec_q[i]);
               thread_max = fmaxf(thread_max, fabsf(q_fp32[i]));
             }
+          } else {
+            #pragma unroll
+            for (int i = 0; i < vec_size_i; i++) q_fp32[i] = 0.0f;
           }
-        } else {
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i++) q_fp32[i] = 0.0f;
-        }
 
-        if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
           thread_max = multithread_reduce_max_dpp<reduce_thread_size>(thread_max);
-          const float inverted_DTYPE_MAX = 1.f / opus::finfo<cache_t>::max();
-          const float q_group_scale = thread_max * inverted_DTYPE_MAX;
-
-          query_t* q_nope_out_base = reinterpret_cast<query_t*>(
-              q_out + token_qout_base + q_head_idx * params.q_out_stride_1 + (is_nope_first ? 0 : pe_dim));
+          const float q_inverted_DTYPE_MAX = 1.f / opus::finfo<query_t>::max();
+          const float q_group_scale = thread_max * q_inverted_DTYPE_MAX;
 
           float q_inv_scale;
           if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
             uint32_t u32 = __builtin_bit_cast(uint32_t, q_group_scale);
             uint32_t exponent = (u32 >> 23) & 0xFF;
             if (u32 & 0x7FFFFF) exponent += 1;
+            // Write nope group scales to separate q_scale tensor
             if (tid % reduce_thread_size == 0) {
               const int group_id = (tid * vec_size_i) >> 6;
-              auto* tmp = reinterpret_cast<uint8_t*>(q_nope_out_base + kv_lora_dim);
               if (tid < kv_lora_vec) {
-                tmp[group_id] = static_cast<uint8_t>(exponent);
+                q_scale_head[group_id] = static_cast<uint8_t>(exponent);
               } else {
-                tmp[group_id] = 0;
+                q_scale_head[group_id] = 0;
               }
             }
             uint32_t e8m0_u32 = exponent << 23;
@@ -2514,98 +2502,84 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
             q_inv_scale = has_q_data ? (1.0f / q_group_scale) : 0.0f;
           }
 
-          // Store quantized Q data
           if (has_q_data) {
-            const uint32_t q_offset = tid * vec_size_i;
             opus_vec_q vec_out;
             #pragma unroll
             for (int i = 0; i < vec_size_i; i++) {
-              vec_out[i] = opus::cast<cache_t>(q_fp32[i] * q_inv_scale);
+              vec_out[i] = opus::cast<query_t>(q_fp32[i] * q_inv_scale);
             }
-            q_buffer_o.template store<vec_size_o>(vec_out, q_offset);
+            q_buffer_o.template store<vec_size_o>(vec_out, tid * vec_size_i);
           }
         } else {
-          // Store Q data without quantization
-          if (has_q_data) {
-            const uint32_t q_offset = tid * vec_size_i;
-            opus_vec_i vec_out_bf16;
-            #pragma unroll
-            for (int i = 0; i < vec_size_i; i++) {
-              vec_out_bf16[i] = static_cast<scalar_t>(q_fp32[i]);
-            }
-            q_buffer_o.template store<vec_size_o>(vec_out_bf16, q_offset);
-          }
-        }
-
-      } else {
-        // Prefetch Q RoPE data for non-norm path (before quantization loop)
-        if (tid < embed_dim) {
-          if constexpr (is_neox) {
-            qr_cos = static_cast<float>(cos_ptr[tid]);
-            qr_sin = static_cast<float>(sin_ptr[tid]);
-            qr_px = q_pe_ptr[tid];
-            qr_py = q_pe_ptr[embed_dim + tid];
-          } else {
-            qr_cos = static_cast<float>(cos_ptr[tid]);
-            qr_sin = static_cast<float>(sin_ptr[tid]);
-            uint32_t qpe_packed = *reinterpret_cast<const uint32_t*>(&q_pe_ptr[tid << 1]);
-            qr_px = reinterpret_cast<const scalar_t*>(&qpe_packed)[0];
-            qr_py = reinterpret_cast<const scalar_t*>(&qpe_packed)[1];
-          }
-        }
-        // Q_nope: direct quantization with global scale
-        for (uint32_t vec_idx = tid; vec_idx < kv_lora_vec; vec_idx += vec_stride) {
-          const uint32_t offset = vec_idx * vec_size_i;
-          opus_vec_i vec_in = q_buffer_i.template load<vec_size_i>(offset);
-          if constexpr (q_dt == vllm::Fp8KVCacheDataType::kAuto) {
+          // bf16: direct copy nope to q_out
+          for (uint32_t vec_idx = tid; vec_idx < kv_lora_vec; vec_idx += vec_stride) {
+            const uint32_t offset = vec_idx * vec_size_i;
+            opus_vec_i vec_in = q_buffer_i.template load<vec_size_i>(offset);
             q_buffer_o.template store<vec_size_o>(vec_in, offset);
-          } else {
-            opus_vec_q vec_out = aiter::scaled_cast<query_t>(vec_in, inverted_qscale);
-            q_buffer_o.template store<vec_size_o>(vec_out, offset);
           }
-        }
-      } // end Q_nope
+        } // end Q_nope
 
-      // ============ Q RoPE Phase (using prefetched cos/sin/pe data) ============
-      if (tid < embed_dim) {
-        float fqx = static_cast<float>(qr_px);
-        float fqy = static_cast<float>(qr_py);
-        float q_rot_x = fqx * qr_cos - fqy * qr_sin;
-        float q_rot_y = fqy * qr_cos + fqx * qr_sin;
-        if constexpr (do_q_norm) {
-          if constexpr (!is_neox) {
-            uint32_t packed;
-            reinterpret_cast<scalar_t*>(&packed)[0] = static_cast<scalar_t>(q_rot_x);
-            reinterpret_cast<scalar_t*>(&packed)[1] = static_cast<scalar_t>(q_rot_y);
-            *reinterpret_cast<uint32_t*>(&q_pe_ptr[tid << 1]) = packed;
-          } else {
-            q_pe_ptr[tid] = static_cast<scalar_t>(q_rot_x);
-            q_pe_ptr[embed_dim + tid] = static_cast<scalar_t>(q_rot_y);
+        // ============ Q RoPE → q_out pe section (both paths) ============
+        // Compute RoPE (only tid < embed_dim has data)
+        float q_rot_x = 0.f, q_rot_y = 0.f;
+        if (tid < embed_dim) {
+          float fqx = static_cast<float>(qr_px);
+          float fqy = static_cast<float>(qr_py);
+          q_rot_x = fqx * qr_cos - fqy * qr_sin;
+          q_rot_y = fqy * qr_cos + fqx * qr_sin;
+        }
+
+        // pe output base in q_out
+        query_t* q_pe_out_base = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
+        if constexpr (is_nope_first) { q_pe_out_base += kv_lora_dim; }
+
+        if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
+          // fp8: per-group quant the 64 pe elements (1 group)
+          // All 64 threads participate in reduce; threads 32-63 contribute 0
+          float pe_thread_max = (tid < embed_dim) ? fmaxf(fabsf(q_rot_x), fabsf(q_rot_y)) : 0.f;
+          auto max_func = [](float a, float b) { return fmaxf(a, b); };
+          pe_thread_max = wave_reduce<float, decltype(max_func), vec_stride, true>(pe_thread_max, max_func);
+
+          const float pe_inverted_DTYPE_MAX = 1.f / opus::finfo<query_t>::max();
+          const float pe_group_scale = pe_thread_max * pe_inverted_DTYPE_MAX;
+
+          if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
+            uint32_t u32 = __builtin_bit_cast(uint32_t, pe_group_scale);
+            uint32_t exponent = (u32 >> 23) & 0xFF;
+            if (u32 & 0x7FFFFF) exponent += 1;
+            if (tid == 0) {
+              q_scale_head[pe_group_idx] = static_cast<uint8_t>(exponent);
+            }
+            uint32_t e8m0_u32 = exponent << 23;
+            float pe_inv_scale = 1.0f / __builtin_bit_cast(float, e8m0_u32);
+
+            if (tid < embed_dim) {
+              if constexpr (!is_neox) {
+                uint32_t packed;
+                reinterpret_cast<query_t*>(&packed)[0] = opus::cast<query_t>(q_rot_x * pe_inv_scale);
+                reinterpret_cast<query_t*>(&packed)[1] = opus::cast<query_t>(q_rot_y * pe_inv_scale);
+                *reinterpret_cast<uint32_t*>(&q_pe_out_base[tid << 1]) = packed;
+              } else {
+                q_pe_out_base[tid] = opus::cast<query_t>(q_rot_x * pe_inv_scale);
+                q_pe_out_base[embed_dim + tid] = opus::cast<query_t>(q_rot_y * pe_inv_scale);
+              }
+            }
           }
         } else {
-          query_t* q_rope_out = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
-          if constexpr (is_nope_first) { q_rope_out += kv_lora_dim; }
-          if constexpr (std::is_same_v<query_t, opus::fp8_t>) {
-            if constexpr (is_neox) {
-              q_rope_out[tid] = opus::cast<opus::fp8_t>(q_rot_x * inverted_qscale);
-              q_rope_out[embed_dim + tid] = opus::cast<opus::fp8_t>(q_rot_y * inverted_qscale);
-            } else {
-              q_rope_out[tid << 1] = opus::cast<opus::fp8_t>(q_rot_x * inverted_qscale);
-              q_rope_out[(tid << 1) + 1] = opus::cast<opus::fp8_t>(q_rot_y * inverted_qscale);
-            }
-          } else {
+          // bf16: write RoPE'd pe directly to q_out pe section
+          if (tid < embed_dim) {
             if constexpr (!is_neox) {
               uint32_t packed;
               reinterpret_cast<query_t*>(&packed)[0] = static_cast<query_t>(q_rot_x);
               reinterpret_cast<query_t*>(&packed)[1] = static_cast<query_t>(q_rot_y);
-              *reinterpret_cast<uint32_t*>(&q_rope_out[tid << 1]) = packed;
+              *reinterpret_cast<uint32_t*>(&q_pe_out_base[tid << 1]) = packed;
             } else {
-              q_rope_out[tid] = static_cast<query_t>(q_rot_x);
-              q_rope_out[embed_dim + tid] = static_cast<query_t>(q_rot_y);
+              q_pe_out_base[tid] = static_cast<query_t>(q_rot_x);
+              q_pe_out_base[embed_dim + tid] = static_cast<query_t>(q_rot_y);
             }
           }
         }
-      }
+      } // end multi-head Q loop
       } // end Q processing (else branch of is_k_wave)
     }
 
@@ -2963,39 +2937,32 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
     __global__ __launch_bounds__(TOKENS_PER_BLOCK * 64, 512 / (TOKENS_PER_BLOCK * 64))
     void fuse_qk_norm_rope_group_quant_cache_mla_kernel(
         const scalar_t* __restrict__ q_nope,
-        scalar_t* __restrict__ q_pe,
+        const scalar_t* __restrict__ q_pe,
         const scalar_t* __restrict__ kv_c,
-        scalar_t* __restrict__ k_pe,
+        const scalar_t* __restrict__ k_pe,
+        scalar_t* __restrict__ k_pe_out,
         const scalar_t* __restrict__ k_weight,
-        const scalar_t* __restrict__ q_weight,
         cache_t* __restrict__ kv_cache,
         query_t* __restrict__ q_out,
+        uint8_t* __restrict__ q_scale,
         const int64_t* __restrict__ slot_mapping,
         const int64_t* __restrict__ positions,
         const scalar_t *__restrict__ cos_cache,
         const scalar_t *__restrict__ sin_cache,
         float eps,
         const MlaKernelParams params,
-        const float* q_scale,
         bool is_neox, bool is_nope_first
     ) {
-      #define DISPATCH_QK_NORM(NEOX, NOPE_FIRST, DO_Q_NORM) \
-        fuse_qk_norm_rope_group_quant_cache_mla_kernel_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, NOPE_FIRST, DO_Q_NORM, KV_LORA_DIM, TOKENS_PER_BLOCK>( \
-            q_nope, q_pe, kv_c, k_pe, k_weight, q_weight, kv_cache, q_out, slot_mapping, positions, \
-            cos_cache, sin_cache, eps, params, q_scale)
+      #define DISPATCH_NEOX_NOPE(NEOX, NOPE_FIRST) \
+        fuse_qk_norm_rope_group_quant_cache_mla_kernel_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, NOPE_FIRST, KV_LORA_DIM, TOKENS_PER_BLOCK>( \
+            q_nope, q_pe, kv_c, k_pe, k_pe_out, k_weight, kv_cache, q_out, q_scale, slot_mapping, positions, \
+            cos_cache, sin_cache, eps, params)
 
-      if (q_weight != nullptr) {
-        if (is_neox && is_nope_first)        { DISPATCH_QK_NORM(true, true, true); }
-        else if (is_neox && !is_nope_first)  { DISPATCH_QK_NORM(true, false, true); }
-        else if (!is_neox && is_nope_first)  { DISPATCH_QK_NORM(false, true, true); }
-        else                                 { DISPATCH_QK_NORM(false, false, true); }
-      } else {
-        if (is_neox && is_nope_first)        { DISPATCH_QK_NORM(true, true, false); }
-        else if (is_neox && !is_nope_first)  { DISPATCH_QK_NORM(true, false, false); }
-        else if (!is_neox && is_nope_first)  { DISPATCH_QK_NORM(false, true, false); }
-        else                                 { DISPATCH_QK_NORM(false, false, false); }
-      }
-      #undef DISPATCH_QK_NORM
+      if (is_neox && is_nope_first)        { DISPATCH_NEOX_NOPE(true, true); }
+      else if (is_neox && !is_nope_first)  { DISPATCH_NEOX_NOPE(true, false); }
+      else if (!is_neox && is_nope_first)  { DISPATCH_NEOX_NOPE(false, true); }
+      else                                 { DISPATCH_NEOX_NOPE(false, false); }
+      #undef DISPATCH_NEOX_NOPE
     }
 
     // General version kernel wrapper with rope_dim parameter
@@ -3443,21 +3410,21 @@ void reshape_and_cache_flash(
 #define CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE_MLA(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
          aiter::fuse_qk_norm_rope_group_quant_cache_mla_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, kv_lora_rank_val, tokens_per_block_val> \
                <<<grid, block, 0, stream>>>(                                                             \
-                 reinterpret_cast<KV_T*>(q_nope.data_ptr()),                                             \
-                 reinterpret_cast<KV_T*>(q_pe.data_ptr()),                                               \
-                 reinterpret_cast<KV_T*>(kv_c.data_ptr()),                                               \
-                 reinterpret_cast<KV_T*>(k_pe.data_ptr()),                                               \
-                 reinterpret_cast<KV_T*>(k_weight.data_ptr()),                                           \
-                 reinterpret_cast<const KV_T*>(q_weight_ptr),                                              \
+                 reinterpret_cast<const KV_T*>(q_nope.data_ptr()),                                       \
+                 reinterpret_cast<const KV_T*>(q_pe.data_ptr()),                                         \
+                 reinterpret_cast<const KV_T*>(kv_c.data_ptr()),                                         \
+                 reinterpret_cast<const KV_T*>(k_pe.data_ptr()),                                         \
+                 reinterpret_cast<KV_T*>(k_pe_out.data_ptr()),                                           \
+                 reinterpret_cast<const KV_T*>(k_weight.data_ptr()),                                     \
                  reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                                        \
                  reinterpret_cast<QUERY_T*>(q_out.data_ptr()),                                           \
+                 reinterpret_cast<uint8_t*>(q_scale_out.data_ptr()),                                     \
                  slot_mapping.data_ptr<int64_t>(),                                                       \
                  positions.data_ptr<int64_t>(),                                                          \
-                 reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                                          \
-                 reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                                          \
-                 static_cast<float>(eps),                                                                    \
+                 reinterpret_cast<const KV_T*>(cos_cache.data_ptr()),                                    \
+                 reinterpret_cast<const KV_T*>(sin_cache.data_ptr()),                                    \
+                 static_cast<float>(eps),                                                                \
                  mla_params,                                                                             \
-                 reinterpret_cast<const float*>(q_scale.data_ptr()),                                     \
                  is_neox, is_nope_first);
 
 #define CALL_FUSED_QK_ROPE_CONCAT_AND_CACHE_MLA_GENERAL(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
@@ -4078,15 +4045,15 @@ void fused_qk_rope_concat_and_cache_mla(
 // NEW: Interface function with RMS Norm and Group Quantization for K
 void fused_qk_norm_rope_group_quant_cache_mla(
     torch::Tensor& q_nope,        // [num_tokens, num_heads, qk_lora_rank]
-    torch::Tensor& q_pe,          // [num_tokens, num_heads, pe_dim]
+    torch::Tensor& q_pe,          // [num_tokens, num_heads, pe_dim] (read-only input)
     torch::Tensor& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank]
-    torch::Tensor& k_pe,          // [num_tokens, k_num_heads, pe_dim]
+    torch::Tensor& k_pe,          // [num_tokens, k_num_heads, pe_dim] (read-only input)
+    torch::Tensor& k_pe_out,      // [num_tokens, k_num_heads, pe_dim] (RoPE'd output)
     torch::Tensor& k_weight,      // [kv_lora_rank] RMSNorm weights for K
-    std::optional<torch::Tensor> q_weight_opt,  // [kv_lora_rank] RMSNorm weights for Q (optional, nullptr = no Q norm)
-    torch::Tensor& kv_cache,      // [num_blocks, block_size, k_num_heads, 512)]
-    torch::Tensor& q_out,         // do_q_norm: [num_tokens, num_heads, qk_lora_rank+num_tiles], else: [num_tokens, num_heads, qk_lora_rank+pe_dim]
+    torch::Tensor& kv_cache,      // [num_blocks, block_size, k_num_heads, kv_lora_rank+pe_dim)]
+    torch::Tensor& q_out,         // [num_tokens, num_heads, qk_lora_rank+pe_dim] output (fp8: nope+pe quant data; bf16: nope+RoPE'd pe)
+    torch::Tensor& q_scale_out,   // [num_tokens, num_heads, num_groups] uint8 e8m0 scales (fp8 path only)
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    torch::Tensor& q_scale,       // scale for q
     torch::Tensor& positions,     // [num_tokens]
     torch::Tensor &cos_cache,     // [max_position, rot_dim//2]
     torch::Tensor &sin_cache,     // [max_position, rot_dim//2]
@@ -4177,9 +4144,6 @@ void fused_qk_norm_rope_group_quant_cache_mla(
     kv_lora_rank <= OPTIMIZED_KV_LORA_RANK
   );
   
-  // Resolve q_weight pointer (nullptr if not provided)
-  const void* q_weight_ptr = q_weight_opt.has_value() ? q_weight_opt->data_ptr() : nullptr;
-
   // Pack stride/size params into struct to reduce kernel SGPR usage
   aiter::MlaKernelParams mla_params;
   mla_params.block_stride = block_stride;
@@ -4191,6 +4155,8 @@ void fused_qk_norm_rope_group_quant_cache_mla(
   mla_params.q_pe_stride_1 = q_pe_stride_1;
   mla_params.q_out_stride_0 = q_out_stride_0;
   mla_params.q_out_stride_1 = q_out_stride_1;
+  mla_params.q_scale_stride_0 = q_scale_out.stride(0);
+  mla_params.q_scale_stride_1 = q_scale_out.stride(1);
   mla_params.kv_c_stride_0 = kv_c_stride_0;
   mla_params.kv_c_stride_1 = kv_c_stride_1;
   mla_params.k_pe_stride_0 = k_pe_stride_0;
@@ -4201,28 +4167,70 @@ void fused_qk_norm_rope_group_quant_cache_mla(
   mla_params.block_size_log2 = __builtin_ctz(block_size);
   mla_params.num_tokens = num_tokens;
   mla_params.num_kv_heads = num_kv_heads;
+  mla_params.num_heads = num_heads;
 
-  if (use_optimized_prefill) {
-    constexpr int tokens_per_block_val = 4;
-    dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, num_kv_heads + num_heads);
-    dim3 block(tokens_per_block_val * 64);
-    if (kv_lora_rank == 448) {
-      constexpr int kv_lora_rank_val = 448;
-      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS(kv_c.dtype(), kv_cache_dtype, q_out_type,
-                                        CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE_MLA);
-    } else if (kv_lora_rank == 512) {
-      constexpr int kv_lora_rank_val = 512;
+  // Three-tier adaptive launch config based on GPU CU count:
+  //   Decode  (TOKENS_PER_BLOCK=1, Q_HEADS_PER_WAVE=1): max parallelism for tiny batches.
+  //   Prefill (TOKENS_PER_BLOCK=4, Q_HEADS_PER_WAVE=4): balanced for medium batches.
+  //   Large   (TOKENS_PER_BLOCK=4, Q_HEADS_PER_WAVE=8): reduces block scheduling overhead
+  //           for very large batches where per-wave efficiency matters more.
+  int device;
+  hipGetDevice(&device);
+  int num_CUs;
+  hipDeviceGetAttribute(&num_CUs, hipDeviceAttributeMultiprocessorCount, device);
+
+  constexpr int PREFILL_TOKENS_PER_BLOCK = 4;
+  constexpr int PREFILL_Q_HEADS_PER_WAVE_MED = 4;
+  constexpr int PREFILL_Q_HEADS_PER_WAVE_LRG = 8;
+  const int prefill_q_waves_med = (num_heads + PREFILL_Q_HEADS_PER_WAVE_MED - 1) / PREFILL_Q_HEADS_PER_WAVE_MED;
+  const int prefill_blocks_med = ((num_tokens + PREFILL_TOKENS_PER_BLOCK - 1) / PREFILL_TOKENS_PER_BLOCK)
+                                 * (num_kv_heads + prefill_q_waves_med);
+  constexpr int MIN_OVERSUBSCRIPTION = 4;
+  const bool use_decode_path = (prefill_blocks_med < MIN_OVERSUBSCRIPTION * num_CUs);
+
+  // Large prefill: use QHPW=8 when block scheduling overhead dominates (>48x CU oversubscription)
+  constexpr int LARGE_PREFILL_THRESHOLD = 48;
+  const bool use_large_prefill = !use_decode_path && (prefill_blocks_med > LARGE_PREFILL_THRESHOLD * num_CUs);
+
+  int q_heads_per_wave;
+  if (use_decode_path) {
+    q_heads_per_wave = 1;
+  } else if (use_large_prefill) {
+    q_heads_per_wave = PREFILL_Q_HEADS_PER_WAVE_LRG;
+  } else {
+    q_heads_per_wave = PREFILL_Q_HEADS_PER_WAVE_MED;
+  }
+  const int num_q_waves = (num_heads + q_heads_per_wave - 1) / q_heads_per_wave;
+
+  TORCH_CHECK(use_optimized_prefill,
+              "fused_qk_norm_rope_concat_and_cache_mla currently only supports "
+              "kv_lora_rank<=512 and rot_dim=64. Got kv_lora_rank=", kv_lora_rank,
+              " and rot_dim=", rot_dim);
+
+  auto launch_kernel = [&](auto kv_lora_rank_tag) {
+    constexpr int kv_lora_rank_val = decltype(kv_lora_rank_tag)::value;
+    if (use_decode_path) {
+      constexpr int tokens_per_block_val = 1;
+      dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, num_kv_heads + num_q_waves);
+      dim3 block(tokens_per_block_val * 64);
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS(kv_c.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE_MLA);
     } else {
-      TORCH_CHECK(false, "Unsupported kv_lora_rank=", kv_lora_rank,
-                  ". Supported: kv_lora_rank <= 512");
+      constexpr int tokens_per_block_val = 4;
+      dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, num_kv_heads + num_q_waves);
+      dim3 block(tokens_per_block_val * 64);
+      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS(kv_c.dtype(), kv_cache_dtype, q_out_type,
+                                        CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE_MLA);
     }
+  };
+
+  if (kv_lora_rank == 448) {
+    launch_kernel(std::integral_constant<int, 448>{});
+  } else if (kv_lora_rank == 512) {
+    launch_kernel(std::integral_constant<int, 512>{});
   } else {
-    TORCH_CHECK(false, 
-                "fused_qk_norm_rope_concat_and_cache_mla currently only supports "
-                "kv_lora_rank<=512 and rot_dim=64. Got kv_lora_rank=", kv_lora_rank, 
-                " and rot_dim=", rot_dim);
+    TORCH_CHECK(false, "Unsupported kv_lora_rank=", kv_lora_rank,
+                ". Supported: 448, 512");
   }
 }
 
