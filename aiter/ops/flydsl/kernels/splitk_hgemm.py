@@ -909,4 +909,27 @@ def compile_hgemm_kernel(
             stream=stream,
         )
 
-    return launch_hgemm_kernel
+    _compile_hints = {
+        "llvm_options": {
+            "enable-post-misched": False,
+            "lsr-drop-solution": True,
+        },
+    }
+
+    def _launch(*args, **kwargs):
+        with CompilationContext.compile_hints(_compile_hints):
+            return launch_hgemm_kernel(*args, **kwargs)
+
+    _compile_cache = {}
+
+    def _compile(C, A, B, m, COUNTER, signal_state, stream):
+        with CompilationContext.compile_hints(_compile_hints):
+            if _compile_cache.get(m, None) is None:
+                _compile_cache[m] = flyc.compile(
+                    launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream
+                )
+            return _compile_cache[m]
+
+    _launch.compile = _compile
+
+    return _launch
