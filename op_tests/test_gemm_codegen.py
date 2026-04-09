@@ -400,7 +400,9 @@ def test_write_lookup_header():
         f = tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False)
         path = f.name
         f.close()
-        write_lookup_header(path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end)
+        write_lookup_header(
+            path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end
+        )
         content = open(path).read()
 
         _check(

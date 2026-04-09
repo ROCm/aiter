@@ -208,7 +208,13 @@ def build_tune_dict(
             "kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
         )
     for _, row in filtered.iterrows():
-        key = (str(row["gfx"]), int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
+        key = (
+            str(row["gfx"]),
+            int(row["cu_num"]),
+            int(row["M"]),
+            int(row["N"]),
+            int(row["K"]),
+        )
         if use_name:
             kname = str(row["kernelName"])
             kernel = kernels_by_name.get(kname)
@@ -310,7 +316,9 @@ def write_lookup_header(
                 # 5-tuple key: (gfx, cu_num, M, N, K)
                 # 6-tuple key: (gfx, cu_num, B, M, N, K)
                 # key[0] is the gfx arch string; the remaining elements are ints.
-                cpp_key = '{"' + key[0] + '", ' + ", ".join(str(x) for x in key[1:]) + "}"
+                cpp_key = (
+                    '{"' + key[0] + '", ' + ", ".join(str(x) for x in key[1:]) + "}"
+                )
                 f.write(
                     lookup_template.format(
                         MNK=cpp_key,
