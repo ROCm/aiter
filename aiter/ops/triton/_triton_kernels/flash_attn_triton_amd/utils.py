@@ -21,11 +21,14 @@ import triton
 
 logger = logging.getLogger(__name__)
 
+AutotuneMode = Literal["off", "on", "sweep"]
+
 __all__ = [
     # Runtime info
     "get_arch",
     "is_hip",
     # Global config
+    "AutotuneMode",
     "AUTOTUNE",
     "DEBUG",
     "USE_TRITON_ROCM",
@@ -115,10 +118,11 @@ class GpuArch:
 # Global Variables
 # -------------------------------
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
-AUTOTUNE = os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0").lower() in (
-    "1",
-    "true",
-    "yes",
+AUTOTUNE: AutotuneMode = (
+    "on"
+    if os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "1").lower()
+    in ("1", "true", "yes", "on")
+    else "off"
 )
 
 # User override config json for attn_fwd.
@@ -145,7 +149,7 @@ except Exception as e:
 #
 # Set via: FLASH_ATTENTION_TRITON_AMD_DEBUG=0|1|2
 DEBUG: int = int(os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0"))
-if AUTOTUNE or DEBUG > 0:
+if AUTOTUNE != "off" or DEBUG > 0:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 if DEBUG >= 2:
     os.environ["TRITON_INTERPRET"] = "1"
