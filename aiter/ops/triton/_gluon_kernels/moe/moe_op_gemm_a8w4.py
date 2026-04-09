@@ -293,7 +293,7 @@ def _moe_gemm_a8w4(
         X += start_m * stride_x_m
     else:
         IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-            1, gl.BlockedLayout([BLOCK_M, 1], [1, 32], [1, num_warps], [1, 0])
+            0, gl.BlockedLayout([1, 8], [32, 1], [1, num_warps], [0, 1])
         )
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
         GatherIndx += start_m
