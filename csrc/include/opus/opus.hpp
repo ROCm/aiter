@@ -1727,7 +1727,7 @@ struct gmem {
 
 template<typename T_> OPUS_D decltype(auto) make_gmem(const T_* ptr, unsigned int size = 0xffffffff, unsigned int config = buffer_default_config()) { return gmem<T_>{ptr, size, config}; }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// smem load/store related. TODO: tr_load
+// smem load/store related
 template<typename T_>
 struct smem {
     using T = remove_cvref_t<T_>;
@@ -1739,6 +1739,42 @@ struct smem {
 
     template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<OPUS_LDS_ADDR type*>(ptr + v_os); }
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
+    template<index_t vec = 1> OPUS_D auto _tr_load(int v_os/* in unit of byte*/) {
+        using type = vector_type<vec>;
+        constexpr index_t elems = vec * vector_size;
+
+        if constexpr ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && elems == 3) {
+            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr6_b96_v3i32(reinterpret_cast<OPUS_LDS_ADDR vector_t<int, 3>*>(ptr + v_os)));
+        } else if constexpr ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && elems == 2) {
+            if constexpr (vec <= 1)
+                return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr4_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(ptr + v_os)));
+            else
+                return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr8_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(ptr + v_os)));
+        } else if constexpr (std::is_same_v<scalar_type, i16_t> && elems == 4) {
+            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4i16(reinterpret_cast<OPUS_LDS_ADDR vector_t<short, 4>*>(ptr + v_os)));
+#if __clang_major__ >= 20
+        } else if constexpr (std::is_same_v<scalar_type, u16_t> && elems == 4) {
+            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4i16(reinterpret_cast<OPUS_LDS_ADDR vector_t<short, 4>*>(ptr + v_os)));
+#endif
+        } else if constexpr (std::is_same_v<scalar_type, fp16_t> && elems == 4) {
+            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4f16(reinterpret_cast<OPUS_LDS_ADDR vector_t<fp16_t, 4>*>(ptr + v_os)));
+        } else if constexpr (std::is_same_v<scalar_type, bf16_t> && elems == 4) {
+            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4bf16(reinterpret_cast<OPUS_LDS_ADDR vector_t<bf16_t, 4>*>(ptr + v_os)));
+        } else {
+            static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar/vec");
+            return type{};
+        }
+    }
+#else
+    template<index_t vec = 1> OPUS_D auto _tr_load(int v_os/* in unit of byte*/) {
+#if defined(__HIP_DEVICE_COMPILE__)
+        static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__");
+#endif
+        return _load<vec>(v_os);
+    }
+#endif
+
     template<index_t vec = 1, typename V>
     OPUS_D void _store(const V& x, int v_os/* in unit of byte*/) {
         static_assert((vec * vector_size) == vector_traits<V>::size(), "vector size need to be same, please check");
@@ -1747,6 +1783,8 @@ struct smem {
     }
 
     template<index_t vec = 1> OPUS_D auto load(int v_os) { return _load<vec>(v_os * sizeof(T)); }
+
+    template<index_t vec = 1> OPUS_D auto tr_load(int v_os) { return _tr_load<vec>(v_os * sizeof(T)); }
 
     template<index_t vec = 1, typename V, std::enable_if_t<(is_vector_v<V> || is_dtype_v<V> || is_array_v<V>), bool> = true>
     OPUS_D void store(const V& x, int v_os) {
@@ -1780,6 +1818,30 @@ struct smem {
         constexpr auto u_r = make_layout<-1>(issue_space_vec);                      // we use this layout to describe the register layout
         array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
         static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...)); }); // issue the loading instruction multiple times
+        return r;
+#endif
+    }
+
+    template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto tr_load(const Layout& u)
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+
+#if OPUS_TILE_CONTAINER == 0
+        constexpr auto u_r = make_layout<-1>(issue_space);
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){
+            auto tmp = tr_load<vec>(u(ids...));
+            constexpr index_t u_rs = u_r(ids...);
+            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        });
+        return r;
+#elif OPUS_TILE_CONTAINER == 1
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
+        array<vector_type<vec>, r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = tr_load<vec>(u(ids...)); });
         return r;
 #endif
     }
@@ -1824,6 +1886,30 @@ struct smem {
         constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
         static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(u(ids...)) : vector_type<vec>{0}; });
+        return r;
+#endif
+    }
+
+    template<index_t vec = 1, typename Predicate, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
+    OPUS_D auto tr_load_if(const Predicate& pred, const Layout& u)
+    {
+        constexpr auto issue_space = layout_to_issue_space<Layout>();
+        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+
+#if OPUS_TILE_CONTAINER == 0
+        constexpr auto u_r = make_layout<-1>(issue_space);
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){
+            auto tmp = pred(ids...) ? tr_load<vec>(u(ids...)) : vector_type<vec>{0};
+            constexpr index_t u_rs = u_r(ids...);
+            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        });
+        return r;
+#elif OPUS_TILE_CONTAINER == 1
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
+        array<vector_type<vec>, r_elem.value> r;
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? tr_load<vec>(u(ids...)) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1876,6 +1962,10 @@ OPUS_D void async_load(Mem& mem, Args&&... args) { mem.template async_load<vec>(
 
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
 OPUS_D auto load_if(Mem& mem, Args&&... args) { return mem.template load_if<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_smem_v<Mem>, bool> = true>
+OPUS_D auto tr_load(Mem& mem, Args&&... args) { return mem.template tr_load<vec>(std::forward<Args>(args)...); }
+template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_smem_v<Mem>, bool> = true>
+OPUS_D auto tr_load_if(Mem& mem, Args&&... args) { return mem.template tr_load_if<vec>(std::forward<Args>(args)...); }
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_mem_v<Mem>, bool> = true>
 OPUS_D void store_if(Mem& mem, Args&&... args) { mem.template store_if<vec>(std::forward<Args>(args)...); }
 template<index_t vec = 1, typename Mem, typename... Args, std::enable_if_t<is_gmem_v<Mem>, bool> = true>
