@@ -60,6 +60,7 @@ def select_3d_config(
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 1
+    num_segments = 0
     if shuffled_kv_cache:
         if kv_dtype == torch.bfloat16:
             if num_2d_prgms >= 64:
@@ -74,12 +75,14 @@ def select_3d_config(
 
     TILE_SIZE = block_size
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
-    num_segments = min(num_segments, MAX_SEGMENTS)
-    num_segments = triton.next_power_of_2(num_segments)
-    num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = max(8, num_segments)
-    num_segments = max(num_segments, MIN_SEGMENTS)
+    if num_segments == 0:
+        num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
+        num_segments = min(num_segments, MAX_SEGMENTS)
+        num_segments = triton.next_power_of_2(num_segments)
+        num_segments = min(num_segments, 128)
+        MIN_SEGMENTS = max(8, num_segments)
+        num_segments = max(num_segments, MIN_SEGMENTS)
+
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
     attn_config = {
