@@ -566,14 +566,17 @@ def _compile_flydsl_hgemm(
         _check_split_k_counter_capacity(runtime_m, n, tile_m, tile_n, split_k)
         launch_stream = _normalize_launch_stream(a.device, stream)
         semaphore = _get_split_k_global_semaphore(launch_stream)
-        return kernel(
+        exe_compiled = kernel.compile(
+            out, a, b, runtime_m, semaphore, signal_state, stream
+        )
+        return exe_compiled(
             out,
             a,
             b,
             runtime_m,
             semaphore,
             signal_state,
-            stream=launch_stream,
+            launch_stream,
         )
 
     return launcher
