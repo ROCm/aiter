@@ -350,10 +350,23 @@ class BenchArgs:
         effective_dv: int
         effective_dqk, effective_dv = m.effective_d_qk_v(self.kernel)
 
+        # Map (kernel, layout) to bench_mha.py's -fn argument:
+        # bshd (batch-seq-head-dim): non-varlen functions
+        # thd  (token-head-dim): varlen functions with equal sequence lengths
+        is_varlen: bool = self.layout == "thd"
+        fn_map: dict[tuple[str, bool], str] = {
+            ("fwd", False): "fwd",
+            ("fwd", True): "fwd_varlen",
+            ("bwdo", False): "bwd",
+            ("bwdo", True): "bwd_varlen",
+            ("bwdf", False): "bwd",
+            ("bwdf", True): "bwd_varlen",
+        }
+        fn: str = fn_map[(self.kernel, is_varlen)]
+
         args_dict: dict[str, str] = {
-            "-mode": self.kernel[:3],
+            "-fn": fn,
             "-causal": "true",
-            "--layout": self.layout,
             "--dtype": "bf16",
             "-b": str(self.b),
             "-hq": str(m.hq),
@@ -366,6 +379,8 @@ class BenchArgs:
         }
 
         args_list: list[str] = [kv for k, v in args_dict.items() for kv in (k, v)]
+        if is_varlen:
+            args_list.append("-equal_seqlens")
         if m.use_sink:
             args_list.append("-sink")
         if m.sliding_window_left > 0:
@@ -478,49 +493,61 @@ def get_stdout(out: str, err: str, num_out_lines: int) -> Optional[list[list[str
 def get_mha_bench_result(
     args: BenchArgs, metric: Metric, out: str, err: str
 ) -> Optional[float]:
-    """Get result from `bench_mha.py`."""
-    # Get preprocessed stdout:
-    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=3)
+    """Get result from `bench_mha.py`.
+
+    Expected stdout (4 lines):
+    Line 1 - progress: "[1/1] <model> B=... HQ=... ..."
+    Line 2 - plot name: "bench_mha:"
+    Line 3 - header: "model  BATCH  HQ  HK  N_CTX_Q  N_CTX_K  D_HEAD  D_HEAD_V  causal  function  dtype  impl  fused  <unit>"
+    Line 4 - data: "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  <d>  <dv>  <causal>  <fn>  <dtype>  <impl>  <fused>  <value>"
+    """
+    # Get preprocessed stdout (4 lines: progress + plot name + header + data):
+    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=4)
     if out_lines is None:
         return None
     l0: list[str]
     l1: list[str]
     l2: list[str]
-    l0, l1, l2 = out_lines
-    # Check stdout line #1 (benchmark name):
-    if not (len(l0) == 1 and l0[0].startswith("bench_mha") and l0[0].endswith(":")):
-        logging.error("Benchmark name doesn't match: %s", l0)
+    l3: list[str]
+    l0, l1, l2, l3 = out_lines
+    # Check stdout line #1 (progress line "[counter/total] <model> B=... ..."):
+    if not (len(l0) >= 2 and l0[0].startswith("[") and l0[0].endswith("]")):
+        logging.error("Progress line doesn't match: %s", l0)
         return None
-    # Check stdout line #2 (table header):
-    kernel_header: str = {"fwd": "fwd", "bwdo": "bwd", "bwdf": "fused-bwd"}[args.kernel]
-    expected_metric_header = f"BF16-{kernel_header}({metric.user_unit})"
+    # Check stdout line #2 (benchmark name):
+    if not (len(l1) == 1 and l1[0].startswith("bench_mha") and l1[0].endswith(":")):
+        logging.error("Benchmark name doesn't match: %s", l1)
+        return None
+    # Check stdout line #3 (table header):
+    # x_names: model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, causal, function, dtype, impl, fused
+    # Metric column is at index 13; triton sometimes appends an extra "(unit)" annotation at index 14.
     if not (
-        l1[:5] == ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
-        and l1[5:]
-        in (
-            [expected_metric_header],
-            [expected_metric_header, f"({metric.user_unit})"],
-        )
+        l2[:6] == ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
+        and len(l2) in (14, 15)
+        and l2[13] == metric.user_unit
+        and (len(l2) == 14 or l2[14] == f"({metric.user_unit})")
     ):
-        logging.error("Table header doesn't match: %s", l1)
+        logging.error("Table header doesn't match: %s", l2)
         return None
-    # Check stdout line #3 (table data):
+    # Check stdout line #4 (table data):
+    # Columns: row_idx, model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
+    #          causal, function, dtype, impl, fused, <metric> (15 tokens total).
     m: Model = args.tp_model.model
     try:
         if not all(
             [
-                len(l2) == 7,
-                l2[0] == "0",
-                int(float(l2[1])) == args.b,
-                int(float(l2[2])) == m.hq,
-                int(float(l2[3])) == m.hkv,
-                int(float(l2[4])) == args.s,
-                int(float(l2[5])) == args.s,
+                len(l3) == 15,
+                l3[0] == "0",
+                int(float(l3[2])) == args.b,
+                int(float(l3[3])) == m.hq,
+                int(float(l3[4])) == m.hkv,
+                int(float(l3[5])) == args.s,
+                int(float(l3[6])) == args.s,
             ]
         ):
-            logging.error("Table data doesn't match: %s", l2)
+            logging.error("Table data doesn't match: %s", l3)
             return None
-        return float(l2[6])
+        return float(l3[-1])
     except ValueError as e:
         logging.error(
             "Unexpected numeric conversion error. %s: %s", type(e).__name__, e
@@ -622,7 +649,7 @@ def run_bench(args: BenchArgs, metric: Metric) -> Optional[float]:
                 "Out of resources while benchmarking %s. %s", args.to_log_str(), e
             )
 
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         logging.error(
             "Unexpected error while benchmarking %s. %s: %s",
             args.to_log_str(),
