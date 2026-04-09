@@ -2,13 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
 Test that CKTile blockscale 8-warp kernels produce correct results with
-both AQLayout options (ColumnMajor = default, RowMajor = skip transpose).
+both AQLayout options (ColumnMajor = default, RowMajor).
 
 Verifies:
   1. Both AQ layout variants produce output matching a PyTorch reference.
-  2. RowMajor variant does NOT transpose x_scale (no extra allocation).
-  3. TileKernelInstance name encodes AQRowMajor correctly.
-  4. Non-8-warp kernels ignore the AQRowMajor flag (always RowMajor).
+  2. TileKernelInstance name encodes AQRowMajor correctly.
+  3. Padded weight stride handling remains correct for these kernels.
 """
 
 import argparse
