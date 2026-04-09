@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import sys
 from typing import Optional, Union
 
 import torch
@@ -9,6 +10,12 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
+
+
+def _dbg(msg: str) -> None:
+    """Debug print to stderr with flush for crash debugging."""
+    rank = dist.get_rank() if dist.is_initialized() else "?"
+    print(f"[aiter rank={rank}] {msg}", file=sys.stderr, flush=True)
 
 
 def _iris_available() -> bool:
@@ -83,6 +90,7 @@ class AiterCommunicator:
 
         try:
             import iris
+            _dbg(f"iris.iris(heap_size={self._HEAP_SIZE}, allocator_type={self._allocator_type!r}, coord_backend='gloo')")
             self._shmem = iris.iris(
                 heap_size=self._HEAP_SIZE,
                 allocator_type=self._allocator_type,
@@ -90,11 +98,9 @@ class AiterCommunicator:
             )
             self.disabled = False
             rank = dist.get_rank(group)
-            logger.info(
-                "Allreduce initialized: rank %d/%d allocator=%s",
-                rank, world_size, self._allocator_type,
-            )
+            _dbg(f"iris init OK: rank={rank}/{world_size}")
         except Exception as e:
+            _dbg(f"iris init FAILED: {e}")
             logger.warning("Failed to initialize Allreduce: %s", e)
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
@@ -131,29 +137,27 @@ class AiterCommunicator:
         if entry is not None:
             return entry
 
+        _dbg(f"as_symmetric: ptr={ptr:#x} shape={tuple(inp.shape)} dtype={inp.dtype} numel={inp.numel()} device={inp.device}")
         sym_tensor = self._shmem.as_symmetric(inp)
+        _dbg(f"as_symmetric OK: sym_ptr={sym_tensor.data_ptr():#x} on_heap={self._shmem.is_symmetric(sym_tensor)}")
+        _dbg(f"all_reduce_preamble: sym shape={tuple(sym_tensor.shape)} dtype={sym_tensor.dtype}")
         workspace = self._shmem.ccl.all_reduce_preamble(
             sym_tensor, sym_tensor,
         )
+        _dbg(f"all_reduce_preamble OK")
         entry = (sym_tensor, workspace)
         self._sym_cache[ptr] = entry
-        logger.debug(
-            "Imported tensor ptr=%#x shape=%s dtype=%s into symmetric heap",
-            ptr, inp.shape, inp.dtype,
-        )
         return entry
 
     def _all_reduce_zerocopy(self, inp: torch.Tensor) -> torch.Tensor:
         sym_tensor, workspace = self._get_or_import(inp)
 
-        # In-place allreduce: output == input. Safe with the default
-        # two_shot variant which processes tiles atomically
-        # (gather → write → broadcast, no interleaving).
+        _dbg(f"all_reduce zerocopy: shape={tuple(sym_tensor.shape)} dtype={sym_tensor.dtype} ptr={sym_tensor.data_ptr():#x}")
         workspace = self._shmem.ccl.all_reduce(
             sym_tensor, sym_tensor, workspace=workspace
         )
+        _dbg(f"all_reduce zerocopy OK")
 
-        # Update cached workspace for next call
         self._sym_cache[inp.data_ptr()] = (sym_tensor, workspace)
         return inp
 
@@ -165,8 +169,10 @@ class AiterCommunicator:
         """Get or allocate symmetric heap buffers. Reuses if shape/dtype match."""
         if self._buf_shape != shape or self._buf_dtype != dtype:
             shmem = self._shmem
+            _dbg(f"_get_buffers: allocating shape={shape} dtype={dtype}")
             self._input_buf = shmem.empty(shape, dtype=dtype)
             self._output_buf = shmem.empty(shape, dtype=dtype)
+            _dbg(f"_get_buffers OK: inp_ptr={self._input_buf.data_ptr():#x} out_ptr={self._output_buf.data_ptr():#x}")
             self._buf_shape = shape
             self._buf_dtype = dtype
             self._workspace = None
@@ -177,12 +183,16 @@ class AiterCommunicator:
         input_buf.copy_(inp)
 
         if self._workspace is None:
+            _dbg(f"all_reduce_preamble copy: shape={tuple(input_buf.shape)} dtype={input_buf.dtype}")
             self._workspace = self._shmem.ccl.all_reduce_preamble(
                 input_buf, input_buf,
             )
+            _dbg(f"all_reduce_preamble copy OK")
+        _dbg(f"all_reduce copy: shape={tuple(input_buf.shape)} ptr={input_buf.data_ptr():#x}")
         self._workspace = self._shmem.ccl.all_reduce(
             input_buf, input_buf, workspace=self._workspace
         )
+        _dbg(f"all_reduce copy OK")
 
         inp.copy_(input_buf)
         return inp
@@ -194,6 +204,7 @@ class AiterCommunicator:
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         assert self._shmem is not None
 
+        _dbg(f"all_reduce: path={self._allocator_type} inp shape={tuple(inp.shape)} dtype={inp.dtype} ptr={inp.data_ptr():#x} contiguous={inp.is_contiguous()}")
         if self._allocator_type == "vmem":
             return self._all_reduce_zerocopy(inp)
         return self._all_reduce_copy(inp)
