@@ -2,10 +2,10 @@ name: vLLM Benchmark
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
     types: [labeled]
-    branches: [main]
+    branches: [main, 'release/**']
   workflow_dispatch:
 
 concurrency:
