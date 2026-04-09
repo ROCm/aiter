@@ -1323,7 +1323,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     # ---- Helper: process one KV tile (GEMM1 + softmax + V + GEMM2) ----
     # Interleaves async prefetch of the NEXT tile's KV data
     # into the GEMM1 NoPE loop (1 block per iteration, 9 total).
-    def _process_tile(
+    def _process_tile_gemm1(
         p_lds_kv_base,
         kv_tile_start_i32,
         kv_end_i32,
@@ -1331,7 +1331,6 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         q_rope,
         row_max_in,
         row_sum_e_in,
-        oaccu_in,
         is_first_iter,
         check_boundary,
         p_lds_kv_next_warp_i32=None,
@@ -1339,26 +1338,17 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         kv_ld_col_base_i32_arg=None,
         check_boundary_next=True,
     ):
-        """Process one KV tile: QK GEMM -> softmax -> V transpose -> PV GEMM.
+        """Process one KV tile: QK GEMM -> softmax -> V transpose -> pack P.
 
-        When p_lds_kv_next_warp_i32 is provided, interleaves prefetch
-        of the next tile's KV data during GEMM1 NoPE loop.
+        GEMM2 (PV accumulation) is NOT included -- call _gemm2_with_rescale
+        after the branch merge to keep oaccu out of phi nodes.
 
-        check_boundary_next: controls whether prefetch checks row==-1 (OOB).
-        When False, prefetch skips the OOB branch -- caller guarantees the
-        next tile is full.
-
-        Returns (row_max, row_sum_e, oaccu).
+        Returns (row_max, row_sum_e, p_pack, rescale).
         """
-        # ---- K/Vt base VGPRs (one each, baked-in lane offsets) ----
+        # ---- K base VGPR (baked-in lane offset) ----
         k_base_i32 = _std_arith.AddIOp(
             _raw(_index_cast_to_i32(p_lds_kv_base)),
             _raw(_index_cast_to_i32(_k_lds_lane_offset)),
-        ).result
-
-        vt_base_i32 = _std_arith.AddIOp(
-            _raw(_index_cast_to_i32(lds_base_idx + arith.index(P_LDS_VT))),
-            _raw(_index_cast_to_i32(_vt_lds_lane_offset)),
         ).result
 
         do_prefetch = p_lds_kv_next_warp_i32 is not None
@@ -1464,20 +1454,14 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         vt_lds_base = lds_base_idx + arith.index(P_LDS_VT)
         _store_vt_to_lds(vt_lds_base, warp_idx, lane_idx, vt8)
 
-        # ---- Rescale oaccu (not first iter) ----
-        if not is_first_iter:
-            oaccu_in = _rescale_oaccu(oaccu_in, rescale)
-
         # ---- Pack P to fp8 ----
         p_pack = _pack_p_to_fp8(p_exp_vals)
 
-        # ---- Barrier: wait for Vt store ----
-        _barrier(lgkmcnt=0)
-        rocdl.sched_barrier(0)
+        return row_max_new, row_sum_e_new, p_pack, rescale
 
-        # ---- GEMM2: PV accumulation ----
+    def _gemm2_core(p_pack, oaccu, vt_base_i32):
+        """GEMM2 PV accumulation loop (shared by first-iter and rescale paths)."""
         c32_i64_pv = _std_arith.ConstantOp(T.i64, ir.IntegerAttr.get(T.i64, 32)).result
-        oaccu_out = list(oaccu_in)
         for pv_iter in range_constexpr(NUM_PV_ITERS):
             col_offset_0 = pv_iter * MFMA_N * 2
             col_offset_1 = col_offset_0 + MFMA_N
@@ -1492,8 +1476,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             vt0_hi_shifted = _std_arith.ShLIOp(vt0_hi_i64, c32_i64_pv).result
             kv_mfma_0 = _std_arith.OrIOp(vt0_lo_i64, vt0_hi_shifted).result
 
-            oaccu_out[pv_iter * 2] = _mfma_fp8(
-                T.f32x4, [kv_mfma_0, p_pack, oaccu_out[pv_iter * 2], 0, 0, 0]
+            oaccu[pv_iter * 2] = _mfma_fp8(
+                T.f32x4, [kv_mfma_0, p_pack, oaccu[pv_iter * 2], 0, 0, 0]
             )
 
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
@@ -1503,11 +1487,32 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             vt1_hi_shifted = _std_arith.ShLIOp(vt1_hi_i64, c32_i64_pv).result
             kv_mfma_1 = _std_arith.OrIOp(vt1_lo_i64, vt1_hi_shifted).result
 
-            oaccu_out[pv_iter * 2 + 1] = _mfma_fp8(
-                T.f32x4, [kv_mfma_1, p_pack, oaccu_out[pv_iter * 2 + 1], 0, 0, 0]
+            oaccu[pv_iter * 2 + 1] = _mfma_fp8(
+                T.f32x4, [kv_mfma_1, p_pack, oaccu[pv_iter * 2 + 1], 0, 0, 0]
             )
 
-        return row_max_new, row_sum_e_new, oaccu_out
+        return oaccu
+
+    def _gemm2_first_iter(p_pack, vt_base_i32):
+        """GEMM2 for first iteration: C=0 (hardcoded), no rescale.
+
+        The MFMA C input is literal c_zero_v4f32, so LLVM doesn't need
+        oaccu registers live -- results go to fresh registers.
+        """
+        _barrier(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        oaccu = [_raw(c_zero_v4f32)] * (NUM_PV_ITERS * 2)
+        return _gemm2_core(p_pack, oaccu, vt_base_i32)
+
+    def _gemm2_with_rescale(p_pack, rescale, oaccu_in, vt_base_i32):
+        """Rescale oaccu, barrier, then GEMM2 PV accumulation.
+
+        This runs after the branch merge so oaccu never enters phi nodes.
+        """
+        oaccu = _rescale_oaccu(oaccu_in, rescale)
+        _barrier(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        return _gemm2_core(p_pack, oaccu, vt_base_i32)
 
     # ==================================================================
     # KV LDS buffer pointers -- computed once, persist across work items
@@ -1527,6 +1532,14 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     p_lds_kv_1_warp_i32 = _std_arith.AddIOp(
         _raw(_index_cast_to_i32(p_lds_kv_1_base)),
         kv_warp_offset_i32,
+    ).result
+
+    # Vt base pointer (invariant across all tiles -- only depends on
+    # lds_base_idx + P_LDS_VT + lane offset).  Computed once here so
+    # _gemm2_with_rescale can use it outside branches.
+    vt_base_i32 = _std_arith.AddIOp(
+        _raw(_index_cast_to_i32(lds_base_idx + arith.index(P_LDS_VT))),
+        _raw(_index_cast_to_i32(_vt_lds_lane_offset)),
     ).result
 
     # ==================================================================
@@ -1666,39 +1679,71 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         ).result
 
         # --- Process first tile ---
-        result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
+        # Only 4 lightweight values through phi (rm, rse, p_pack, rescale).
+        # oaccu stays outside branches -- GEMM2 runs after the merge.
+        first_result_types = [T.f32, T.f32, T.i64, T.f32]
 
         # Branch on has_multi_tiles: multi-tile gets prefetch, single doesn't
-        if_first = scf.IfOp(has_multi_tiles, result_types, has_else=True)
+        if_first = scf.IfOp(has_multi_tiles, first_result_types, has_else=True)
         with ir.InsertionPoint(if_first.regions[0].blocks[0]):
-            # Multi-tile: first tile is always full, prefetch tile 1
-            # check_boundary_next is runtime i1 (first_tile_cbn)
-            _barrier(vmcnt=0, lgkmcnt=0)
-            rocdl.sched_barrier(0)
-            rm1, rse1, oa1 = _process_tile(
-                p_lds_kv_0_base,
-                kv_start,
-                kv_end,
-                q_nope_packs,
-                q_rope_packs,
-                row_max,
-                row_sum_e,
-                oaccu,
-                is_first_iter=True,
-                check_boundary=False,
-                p_lds_kv_next_warp_i32=p_lds_kv_1_warp_i32,
-                row_kv_ld_next=row_kv_ld_tile1,
-                kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
-                check_boundary_next=first_tile_cbn,
-            )
-            y1 = [rm1, rse1] + oa1
-            y1 = [_raw(v) if not isinstance(v, ir.Value) else v for v in y1]
+            # Multi-tile: first tile is always full, prefetch tile 1.
+            # Sub-branch on first_tile_cbn for compile-time check_boundary_next.
+            if_first_cbn = scf.IfOp(first_tile_cbn, first_result_types, has_else=True)
+            with ir.InsertionPoint(if_first_cbn.regions[0].blocks[0]):
+                # cbn=True: next tile needs boundary check (num_tiles==2, partial)
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm1a, rse1a, pp1a, rs1a = _process_tile_gemm1(
+                    p_lds_kv_0_base,
+                    kv_start,
+                    kv_end,
+                    q_nope_packs,
+                    q_rope_packs,
+                    row_max,
+                    row_sum_e,
+                    is_first_iter=True,
+                    check_boundary=False,
+                    p_lds_kv_next_warp_i32=p_lds_kv_1_warp_i32,
+                    row_kv_ld_next=row_kv_ld_tile1,
+                    kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                    check_boundary_next=True,
+                )
+                y1a = [
+                    _raw(v) if not isinstance(v, ir.Value) else v
+                    for v in [rm1a, rse1a, pp1a, rs1a]
+                ]
+                scf.YieldOp(y1a)
+            with ir.InsertionPoint(if_first_cbn.regions[1].blocks[0]):
+                # cbn=False: next tile is full, no boundary check
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm1b, rse1b, pp1b, rs1b = _process_tile_gemm1(
+                    p_lds_kv_0_base,
+                    kv_start,
+                    kv_end,
+                    q_nope_packs,
+                    q_rope_packs,
+                    row_max,
+                    row_sum_e,
+                    is_first_iter=True,
+                    check_boundary=False,
+                    p_lds_kv_next_warp_i32=p_lds_kv_1_warp_i32,
+                    row_kv_ld_next=row_kv_ld_tile1,
+                    kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                    check_boundary_next=False,
+                )
+                y1b = [
+                    _raw(v) if not isinstance(v, ir.Value) else v
+                    for v in [rm1b, rse1b, pp1b, rs1b]
+                ]
+                scf.YieldOp(y1b)
+            y1 = list(if_first_cbn.results)
             scf.YieldOp(y1)
         with ir.InsertionPoint(if_first.regions[1].blocks[0]):
             # Single tile: no prefetch, boundary check is runtime i1
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
-            rm2, rse2, oa2 = _process_tile(
+            rm2, rse2, pp2, rs2 = _process_tile_gemm1(
                 p_lds_kv_0_base,
                 kv_start,
                 kv_end,
@@ -1706,17 +1751,22 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 q_rope_packs,
                 row_max,
                 row_sum_e,
-                oaccu,
                 is_first_iter=True,
                 check_boundary=first_tile_needs_boundary,
             )
-            y2 = [rm2, rse2] + oa2
-            y2 = [_raw(v) if not isinstance(v, ir.Value) else v for v in y2]
+            y2 = [
+                _raw(v) if not isinstance(v, ir.Value) else v
+                for v in [rm2, rse2, pp2, rs2]
+            ]
             scf.YieldOp(y2)
 
         row_max = if_first.results[0]
         row_sum_e = if_first.results[1]
-        oaccu = [if_first.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
+        p_pack_first = if_first.results[2]
+        rescale_first = if_first.results[3]
+
+        # GEMM2 for first tile: C=0 hardcoded, no rescale needed
+        oaccu = _gemm2_first_iter(p_pack_first, vt_base_i32)
 
         # --- Middle tiles [1, num_tiles-1) via scf.ForOp ---
         # These tiles are never the last tile. check_boundary=False always.
@@ -1806,25 +1856,62 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 scf.YieldOp([row_mid_nc])
             row_kv_ld_next = if_mid_cbn.results[0]
 
-            # Process tile: cb=False always, cbn is runtime i1 (mid_cbn)
-            _barrier(vmcnt=0, lgkmcnt=0)
-            rocdl.sched_barrier(0)
-            rm_m, rse_m, oa_m = _process_tile(
-                curr_base_idx,
-                kv_tile_start_i32,
-                _raw(kv_end),
-                q_nope_packs,
-                q_rope_packs,
-                rm_carried,
-                rse_carried,
-                oaccu_carried,
-                is_first_iter=False,
-                check_boundary=False,
-                p_lds_kv_next_warp_i32=next_warp,
-                row_kv_ld_next=row_kv_ld_next,
-                kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
-                check_boundary_next=mid_cbn,
-            )
+            # Process tile: cb=False always, cbn is compile-time via sub-branch
+            mid_gemm1_types = [T.f32, T.f32, T.i64, T.f32]
+            if_mid_tile = scf.IfOp(mid_cbn, mid_gemm1_types, has_else=True)
+            with ir.InsertionPoint(if_mid_tile.regions[0].blocks[0]):
+                # cbn=True: next tile needs boundary check
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm_ma, rse_ma, pp_ma, rs_ma = _process_tile_gemm1(
+                    curr_base_idx,
+                    kv_tile_start_i32,
+                    _raw(kv_end),
+                    q_nope_packs,
+                    q_rope_packs,
+                    rm_carried,
+                    rse_carried,
+                    is_first_iter=False,
+                    check_boundary=False,
+                    p_lds_kv_next_warp_i32=next_warp,
+                    row_kv_ld_next=row_kv_ld_next,
+                    kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                    check_boundary_next=True,
+                )
+                y_ma = [
+                    _raw(v) if not isinstance(v, ir.Value) else v
+                    for v in [rm_ma, rse_ma, pp_ma, rs_ma]
+                ]
+                scf.YieldOp(y_ma)
+            with ir.InsertionPoint(if_mid_tile.regions[1].blocks[0]):
+                # cbn=False: next tile is full, no boundary check
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm_mb, rse_mb, pp_mb, rs_mb = _process_tile_gemm1(
+                    curr_base_idx,
+                    kv_tile_start_i32,
+                    _raw(kv_end),
+                    q_nope_packs,
+                    q_rope_packs,
+                    rm_carried,
+                    rse_carried,
+                    is_first_iter=False,
+                    check_boundary=False,
+                    p_lds_kv_next_warp_i32=next_warp,
+                    row_kv_ld_next=row_kv_ld_next,
+                    kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                    check_boundary_next=False,
+                )
+                y_mb = [
+                    _raw(v) if not isinstance(v, ir.Value) else v
+                    for v in [rm_mb, rse_mb, pp_mb, rs_mb]
+                ]
+                scf.YieldOp(y_mb)
+            rm_m = if_mid_tile.results[0]
+            rse_m = if_mid_tile.results[1]
+            pp_m = if_mid_tile.results[2]
+            rs_m = if_mid_tile.results[3]
+            oa_m = _gemm2_with_rescale(pp_m, rs_m, oaccu_carried, vt_base_i32)
             yield_vals = [rm_m, rse_m] + oa_m
             yield_vals = [
                 _raw(v) if not isinstance(v, ir.Value) else v for v in yield_vals
@@ -1837,8 +1924,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         oaccu = [for_op.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
 
         # --- Last tile (when num_tiles > 1): no prefetch ---
-        # Branch on last_tile_partial for check_boundary.
-        if_has_last = scf.IfOp(has_multi_tiles, result_types, has_else=True)
+        # Only 1 _process_tile instance here (not 2 competing branches),
+        # so oaccu in the phi is fine -- else branch just passes through.
+        last_result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
+        if_has_last = scf.IfOp(has_multi_tiles, last_result_types, has_else=True)
         with ir.InsertionPoint(if_has_last.regions[0].blocks[0]):
             # Compute last tile's buffer parity and start
             last_tile_iv_i32 = _raw(num_tiles_m1)
@@ -1864,7 +1953,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             # Last tile: cb is runtime i1 (last_tile_partial), no prefetch
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
-            rm_l, rse_l, oa_l = _process_tile(
+            rm_l, rse_l, pp_l, rs_l = _process_tile_gemm1(
                 last_curr_base,
                 kv_last_start,
                 _raw(kv_end),
@@ -1872,10 +1961,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 q_rope_packs,
                 row_max,
                 row_sum_e,
-                oaccu,
                 is_first_iter=False,
                 check_boundary=last_tile_partial,
             )
+            oa_l = _gemm2_with_rescale(pp_l, rs_l, oaccu, vt_base_i32)
             yl = [rm_l, rse_l] + oa_l
             yl = [_raw(v) if not isinstance(v, ir.Value) else v for v in yl]
             scf.YieldOp(yl)
