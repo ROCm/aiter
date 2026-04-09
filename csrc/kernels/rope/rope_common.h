@@ -6417,7 +6417,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
     default:                                                                      \
         TORCH_CHECK(false,                                                        \
                     NAME,                                                         \
-                    " does't support positions dtype ",                           \
+                    " doesn't support positions dtype ",                          \
                     toString((POSITIONS_ST)),                                     \
                     ".");                                                         \
     }
