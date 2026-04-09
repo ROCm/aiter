@@ -15,14 +15,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include "aiter_tensor.h"
 
-void rotary_embedding(torch::Tensor &positions, torch::Tensor &query,
-                      torch::Tensor &key, int64_t head_size,
-                      torch::Tensor &cos_cache, torch::Tensor &sin_cache, bool is_neox, bool is_nope_first);
+void rotary_embedding(const aiter_tensor_t &positions, const aiter_tensor_t &query,
+                      const aiter_tensor_t &key, int64_t head_size,
+                      const aiter_tensor_t &cos_cache, const aiter_tensor_t &sin_cache, bool is_neox, bool is_nope_first);
 
-void batched_rotary_embedding(torch::Tensor &positions, torch::Tensor &query,
-                              torch::Tensor &key, int64_t head_size,
-                              torch::Tensor &cos_cache, torch::Tensor &sin_cache, bool is_neox, bool is_nope_first,
+void batched_rotary_embedding(const aiter_tensor_t &positions, const aiter_tensor_t &query,
+                              const aiter_tensor_t &key, int64_t head_size,
+                              const aiter_tensor_t &cos_cache, const aiter_tensor_t &sin_cache, bool is_neox, bool is_nope_first,
                               int64_t rot_dim,
-                              torch::Tensor &cos_sin_cache_offsets);
+                              const aiter_tensor_t &cos_sin_cache_offsets);

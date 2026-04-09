@@ -3,31 +3,31 @@
 
 #pragma once
 
-#include <torch/extension.h>
+#include "aiter_tensor.h"
 
 namespace aiter {
-void mhc_pre_gemm_sqrsum(torch::Tensor& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
-                         torch::Tensor& sqrsum, // (split_k, m) / (m)
-                         torch::Tensor& x,      // (m, hc_hidden_size)
-                         torch::Tensor& fn,     // (hc_mult3, hc_hidden_size)
+void mhc_pre_gemm_sqrsum(const aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
+                         const aiter_tensor_t& sqrsum, // (split_k, m) / (m)
+                         const aiter_tensor_t& x,      // (m, hc_hidden_size)
+                         const aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size)
                          int tile_k = 128);
-void mhc_pre_big_fuse(torch::Tensor& post_mix,        // (m, hc_mult)
-                      torch::Tensor& comb_mix,        // (m, hc_mult * hc_mult)
-                      torch::Tensor& layer_input,     // (m, hidden_size)
-                      torch::Tensor& gemm_out_mul,    // (split_k, m, hc_mult3)
-                      torch::Tensor& gemm_out_sqrsum, // (split_k, m)
-                      torch::Tensor& hc_scale,        // (3)
-                      torch::Tensor& hc_base,         // (hc_mult3)
-                      torch::Tensor& residual,        // (m, hc_mult, hidden_size)
+void mhc_pre_big_fuse(const aiter_tensor_t& post_mix,        // (m, hc_mult)
+                      const aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
+                      const aiter_tensor_t& layer_input,     // (m, hidden_size)
+                      const aiter_tensor_t& gemm_out_mul,    // (split_k, m, hc_mult3)
+                      const aiter_tensor_t& gemm_out_sqrsum, // (split_k, m)
+                      const aiter_tensor_t& hc_scale,        // (3)
+                      const aiter_tensor_t& hc_base,         // (hc_mult3)
+                      const aiter_tensor_t& residual,        // (m, hc_mult, hidden_size)
                       float rms_eps            = 1e-6,
                       float hc_pre_eps         = 1e-6,
                       float hc_sinkhorn_eps    = 1e-6,
                       float hc_post_mult_value = 1.0,
                       int sinkhorn_repeat      = 20);
-void mhc_post(torch::Tensor& out,            // (m, hc_mult, hidden_size)
-              torch::Tensor& x,              // (m, hidden_size)
-              torch::Tensor& residual,       // (m, hc_mult, hidden_size)
-              torch::Tensor& post_layer_mix, // (m, hc_mult)
-              torch::Tensor& comb_res_mix    // (m, hc_mult, hc_mult)
+void mhc_post(const aiter_tensor_t& out,            // (m, hc_mult, hidden_size)
+              const aiter_tensor_t& x,              // (m, hidden_size)
+              const aiter_tensor_t& residual,       // (m, hc_mult, hidden_size)
+              const aiter_tensor_t& post_layer_mix, // (m, hc_mult)
+              const aiter_tensor_t& comb_res_mix    // (m, hc_mult, hc_mult)
 );
 } // namespace aiter

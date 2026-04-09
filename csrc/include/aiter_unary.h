@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+#include "aiter_tensor.h"
 
-torch::Tensor aiter_sigmoid(torch::Tensor &input);
-torch::Tensor aiter_tanh(torch::Tensor &input);
+AiterTensor aiter_sigmoid(const aiter_tensor_t &input);
+AiterTensor aiter_tanh(const aiter_tensor_t &input);
