@@ -21,7 +21,7 @@
 
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-namespace aiter {
+namespace vllm {
 
 namespace {
 __device__ __forceinline__ int32_t index(int32_t total_col, int32_t row, int32_t col)
@@ -120,11 +120,11 @@ __global__ void moe_align_block_size_kernel(scalar_t* __restrict__ topk_ids,
         sorted_token_ids[rank_post_pad] = i;
     }
 }
-} // namespace aiter
+} // namespace vllm
 
 namespace aiter {
 
-#define AITER_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
+#define VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize(FUNC, VAL) \
     hipFuncSetAttribute(FUNC, hipFuncAttributeMaxDynamicSharedMemorySize, VAL)
 
 void moe_align_block_size(const aiter_tensor_t& topk_ids,
@@ -143,9 +143,9 @@ void moe_align_block_size(const aiter_tensor_t& topk_ids,
         const int32_t shared_mem = (3 * num_experts + 1) * sizeof(int32_t);
 
         // set dynamic shared mem
-        auto kernel = aiter::moe_align_block_size_kernel<scalar_t>;
+        auto kernel = vllm::moe_align_block_size_kernel<scalar_t>;
         HIP_CALL(
-            AITER_DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
+            VLLM_DevFuncAttribute_SET_MaxDynamicSharedMemorySize((void*)kernel, shared_mem));
         kernel<<<1, num_experts, shared_mem, stream>>>(reinterpret_cast<scalar_t*>(topk_ids.data_ptr()),
                                                        reinterpret_cast<int32_t*>(sorted_token_ids.data_ptr()),
                                                        reinterpret_cast<int32_t*>(experts_ids.data_ptr()),
