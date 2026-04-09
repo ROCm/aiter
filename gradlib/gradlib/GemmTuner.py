@@ -78,8 +78,22 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
 
 
-def run_tgemm_baseline(input, weight):
-    return tgemm.mm(input, weight, None, otype=input.dtype)
+def run_tgemm_baseline(
+    input,
+    weight,
+    bias=None,
+    otype=None,
+    scale_a=None,
+    scale_b=None,
+):
+    return tgemm.mm(
+        input,
+        weight,
+        bias,
+        otype=otype,
+        scale_a=scale_a,
+        scale_b=scale_b,
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -335,19 +349,17 @@ class Gemm:
         )
 
     def should_apply_tgemm_baseline_filter(self):
-        return (
-            not self.is_shuffle
-            and self.indtype == dtypes.bf16
-            and not self.scaleAB
-            and not self.has_bias
-            and self.outdtype == self.indtype
-        )
+        return self.indtype == dtypes.bf16
 
     def measure_tgemm_baseline(self):
         if not self.should_apply_tgemm_baseline_filter():
             return None
 
         from aiter.test_common import run_perftest
+
+        baseline_weight = self.shuffleweights if self.is_shuffle else self.weights
+        baseline_scale_a = self.x_scale if self.scaleAB else None
+        baseline_scale_b = self.w_scale if self.scaleAB else None
 
         old_save_gemm = os.environ.get("AITER_TUNE_GEMM")
         try:
@@ -358,7 +370,11 @@ class Gemm:
             _, us = run_perftest(
                 run_tgemm_baseline,
                 self.inp,
-                self.weights,
+                baseline_weight,
+                self.bias,
+                self.outdtype,
+                baseline_scale_a,
+                baseline_scale_b,
                 num_warmup=self.num_warmup,
                 num_iters=101,
             )
@@ -808,7 +824,7 @@ class GemmTuner(GemmCommonTuner):
             "--save_if_better_than_tgemm",
             dest="save_if_better_than_tgemm",
             action="store_true",
-            help="only save tuned kernels when they are faster than aiter.tuned_gemm.mm(a, b, None, otype=a.dtype); applied only to non-shuffle bf16 no-bias shapes with otype == a.dtype",
+            help="only save tuned kernels when they are faster than an equivalent aiter.tuned_gemm.mm invocation for the current bf16 shape",
         )
 
     def __init__(
