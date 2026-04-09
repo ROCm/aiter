@@ -1,9 +1,7 @@
 name: Aiter Release Package
-
-description: >
-  Build Aiter precompiled kernel wheels (.whl) for Python 3.10/3.12,
-  push a Docker image with prebaked kernels, upload wheels to S3 and
-  GitHub Release.
+# Build Aiter precompiled kernel wheels (.whl) for Python 3.10/3.12,
+# push a Docker image with prebaked kernels, upload wheels to S3 and
+# GitHub Release.
 
 on:
   push:
