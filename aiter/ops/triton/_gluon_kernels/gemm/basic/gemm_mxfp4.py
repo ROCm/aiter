@@ -154,6 +154,7 @@ _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
         "matrix_instr_nonkdim",
         "cache_modifier",
         "NUM_KSPLIT",
+        "NUM_BUFFERS",
     ],
 )
 

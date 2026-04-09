@@ -507,7 +507,7 @@ def gemm_afp4wfp4_preshuffle(
     if use_gluon:
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
-        config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]  
+        config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
         x_fp4,
         w_preshuf,
