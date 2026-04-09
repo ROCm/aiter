@@ -11,7 +11,7 @@ waves_per_eu=1
 num_warps=4
 block_m=128
 remove_indirect_access=1
-num_buffers=3
+num_buffers=2
 export PRINT_IRS=1
 # maxnum: v_max_num_f32_e32
 # maximum: v_maximum -> nan propagating, hence no self max

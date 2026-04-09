@@ -823,8 +823,8 @@ def kernel_unified_attention_2d(
     cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
-        return
+    # if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
+    #     return
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
     offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
@@ -932,6 +932,12 @@ def kernel_unified_attention_2d(
                 other=float("-inf"),
             ).to(dtype=gl.float32) / SCALE
         )
+        M = gl.amd.cdna4.buffer_load(
+            ptr=sink_ptr,
+            offsets=query_offset_1_pv,
+            mask=query_mask_1_pv,
+            other=float("-inf")
+        ) / SCALE
 
     L = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
@@ -1275,8 +1281,12 @@ def unified_attention(
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
+    # upper bound
     total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
-
+    # exact
+    q_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    q_lens_cpu = q_lens.cpu()
+    exact_total_query_blocks = sum((q_lens_cpu[i].item() + BLOCK_Q - 1) // BLOCK_Q for i in range(NUM_SEQS))
     assert num_kv_blocks & (num_kv_blocks - 1) == 0, "num_kv_blocks must be a power of 2"
     TILE_SIZE = num_kv_blocks * BLOCK_SIZE
     ARCH_NAME = arch_info.get_arch()
@@ -1289,7 +1299,7 @@ def unified_attention(
     KV_FP8 = k.element_size() == 1
     #waves_per_eu = 2 if HEAD_SIZE < 128 else 2
     
-    grid = (NUM_KV_HEADS, total_query_blocks)
+    grid = (NUM_KV_HEADS, exact_total_query_blocks)
     attn_kernel = kernel_unified_attention_2d[grid](
         query_ptr=q,
         key_cache_ptr=k,
