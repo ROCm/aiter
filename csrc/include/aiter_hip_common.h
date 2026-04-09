@@ -77,25 +77,16 @@ inline void load_asm_kernel(const char* name,
                             hipModule_t& module,
                             hipFunction_t& kernel_func)
 {
-    const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-    std::string arch_name     = get_gpu_arch();
-    if(AITER_ASM_DIR != nullptr)
-    {
-        std::string hsa_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco;
-        AITER_LOG_INFO("hipModuleLoad: " << hsa_path << " GetFunction: " << name);
-        HIP_CALL(hipModuleLoad(&module, hsa_path.c_str()));
-    }
-    else
-    {
-#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
-        std::string fname = "hsa/" + arch_name + "/" + hsaco;
-        auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
-        CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
-        CHECK_COND(hasco_obj->second.data() != nullptr);
-        AITER_LOG_INFO("hipModuleLoad: " << fname << " GetFunction: " << name);
-        HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
+#if !defined(AITER_EMBEDDED_HSA_HEADER) || !defined(AITER_EMBEDDED_HSA_MAP)
+#error "QoLA requires embedded HSA blobs. Build with --embed-hsa (or the default)."
 #endif
-    }
+    std::string arch_name = get_gpu_arch();
+    std::string fname = "hsa/" + arch_name + "/" + hsaco;
+    auto it = AITER_EMBEDDED_HSA_MAP.find(fname);
+    CHECK_COND(it != AITER_EMBEDDED_HSA_MAP.end());
+    CHECK_COND(it->second.data() != nullptr);
+    AITER_LOG_INFO("hipModuleLoad (embedded): " << fname << " GetFunction: " << name);
+    HIP_CALL(hipModuleLoadData(&module, it->second.data()));
     HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
     AITER_LOG_INFO("hipModuleGetFunction: " << name << " Success");
 }
