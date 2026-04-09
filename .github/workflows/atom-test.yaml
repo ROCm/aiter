@@ -63,6 +63,14 @@ jobs:
             accuracy_test_threshold: "0.94"
             runner: aiter-8gpu-runner
             run_on_pr: true
+          - model_name: "DeepSeek-R1-0528"
+            label: MI35X
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8"
+            env_vars: ""
+            accuracy_test_threshold: "0.94"
+            runner: linux-aiter-mi35x-8
+            run_on_pr: true
           - model_name: "gpt-oss-120b"
             label: MI35X
             model_path: "openai/gpt-oss-120b"
