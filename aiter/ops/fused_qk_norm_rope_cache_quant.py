@@ -21,7 +21,7 @@ def fused_qk_norm_rope_cache_quant_shuffle(
     is_neox_style: bool,
     pos_ids: Tensor,
     k_cache: Tensor,
-    v_cache: Tensor,
+    v_cache: Tensor,  # 4D [B,Hv,D,page] or 5D shuffle [B,Hv,page//x,D,x], x=16//elem_size
     slot_mapping: Tensor,
     kv_cache_dtype: str,
     k_scale: Tensor,
