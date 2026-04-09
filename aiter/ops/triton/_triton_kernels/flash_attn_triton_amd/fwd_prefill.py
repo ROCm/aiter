@@ -6,6 +6,7 @@ from typing import Literal, Optional
 from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
 from .utils import (
     AUTOTUNE,
+    AutotuneMode,
     DEBUG,
     FWD_CONF_OVERRIDE,
     get_arch,
@@ -26,16 +27,73 @@ FWD_PREFILL_AUTOTUNE_KEYS = [
 ]
 
 
-def get_fwd_prefill_configs(autotune: bool):
-    # Get best config for the architecture.
+def get_fwd_prefill_configs(mode: AutotuneMode):
     # NOTE: Tests expect specific BLOCK_N sizes for attention score renormalization:
     #   - CDNA: BLOCK_N=64
     #   - RDNA: BLOCK_N=32
     # See _get_block_size_n_triton() in test_flash_attn_triton_amd.py
-    if not autotune:
+
+    if mode == "off":
         if FWD_CONF_OVERRIDE:
             return [FWD_CONF_OVERRIDE]
+        arch = get_arch()
+        if arch.name == "gfx950":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+        elif arch.name == "gfx942":
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+        elif arch.is_rdna:
+            BLOCK_N = 64 if arch.name == "gfx1100" else 32
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": 128,
+                        "BLOCK_N": BLOCK_N,
+                        "PRE_LOAD_V": False,
+                        "waves_per_eu": 6,
+                    },
+                    num_stages=1,
+                    num_warps=8,
+                ),
+            ]
+        else:
+            return [
+                triton.Config(
+                    {
+                        "BLOCK_M": 64,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 2,
+                        "PRE_LOAD_V": False,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                )
+            ]
 
+    elif mode == "on":
+        if FWD_CONF_OVERRIDE:
+            return [FWD_CONF_OVERRIDE]
         arch = get_arch()
         if arch.name == "gfx950":
             return [
@@ -135,34 +193,33 @@ def get_fwd_prefill_configs(autotune: bool):
                 )
             ]
 
-    # ===================== Autotune Sweep =====================
-    configs = []
-    BLOCK_M_OPTIONS = [128, 64, 32, 16]
-    BLOCK_N_OPTIONS = [128, 64, 32, 16]
-    NUM_WARPS_OPTIONS = [2, 4, 8]
-    NUM_STAGES_OPTIONS = [1, 2]
-    WAVES_PER_EU_OPTIONS = [4, 2, 1]
-    PRE_LOAD_V_OPTIONS = [False]
-    for bm in BLOCK_M_OPTIONS:
-        for bn in BLOCK_N_OPTIONS:
-            for waves in WAVES_PER_EU_OPTIONS:
-                for nw in NUM_WARPS_OPTIONS:
-                    for ns in NUM_STAGES_OPTIONS:
-                        for preload_v in PRE_LOAD_V_OPTIONS:
-                            configs.append(
-                                triton.Config(
-                                    {
-                                        "BLOCK_M": bm,
-                                        "BLOCK_N": bn,
-                                        "waves_per_eu": waves,
-                                        "PRE_LOAD_V": preload_v,
-                                    },
-                                    num_stages=ns,
-                                    num_warps=nw,
+    else:  # sweep
+        configs = []
+        BLOCK_M_OPTIONS = [128, 64, 32, 16]
+        BLOCK_N_OPTIONS = [128, 64, 32, 16]
+        NUM_WARPS_OPTIONS = [2, 4, 8]
+        NUM_STAGES_OPTIONS = [1, 2]
+        WAVES_PER_EU_OPTIONS = [4, 2, 1]
+        PRE_LOAD_V_OPTIONS = [False]
+        for bm in BLOCK_M_OPTIONS:
+            for bn in BLOCK_N_OPTIONS:
+                for waves in WAVES_PER_EU_OPTIONS:
+                    for nw in NUM_WARPS_OPTIONS:
+                        for ns in NUM_STAGES_OPTIONS:
+                            for preload_v in PRE_LOAD_V_OPTIONS:
+                                configs.append(
+                                    triton.Config(
+                                        {
+                                            "BLOCK_M": bm,
+                                            "BLOCK_N": bn,
+                                            "waves_per_eu": waves,
+                                            "PRE_LOAD_V": preload_v,
+                                        },
+                                        num_stages=ns,
+                                        num_warps=nw,
+                                    )
                                 )
-                            )
-
-    return configs
+        return configs
 
 
 fwd_prefill_autotune_configs = get_fwd_prefill_configs(AUTOTUNE)
