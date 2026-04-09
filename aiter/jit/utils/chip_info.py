@@ -186,8 +186,12 @@ def build_tune_dict(
                           If None, no libtype filtering is applied.
         kernels_by_name:  Optional dict mapping kernelName string → kernelInstance.
                           When provided and the CSV has a "kernelName" column, kernel
-                          lookup uses the name instead of kernelId. Falls back to
-                          kernelId if the name is not found or the column is absent.
+                          lookup uses the name instead of kernelId. If the name is not
+                          found in kernels_by_name, the entry is skipped (heuristic
+                          default used) and a warning is logged — no kernelId fallback
+                          is attempted, because kernelIds are not stable across kernel
+                          list reorderings. Falls back to kernelId if the kernelName
+                          column is absent from the CSV.
 
     Returns:
         dict with mixed keys: negative ints (from default_dict) and
