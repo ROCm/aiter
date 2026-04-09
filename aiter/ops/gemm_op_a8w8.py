@@ -20,6 +20,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+from ..ops.flydsl.utils import is_flydsl_available
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -100,6 +101,49 @@ def gemm_a8w8_bpreshuffle_cktile(
     out: Tensor,
     splitK: int = 0,
 ) -> Tensor: ...
+
+
+def gemm_a8w8_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from .flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        kernels_list as kernels_list_flydsl,
+    )
+
+    kernel_id = config.get("kernelId")
+    if kernel_id is not None and kernel_id in kernels_list_flydsl:
+        ki = kernels_list_flydsl[kernel_id]
+        tm, tn, tk = ki.tile_m, ki.tile_n, ki.tile_k
+        lds, csh, acp, wpe = (
+            ki.lds_stage,
+            ki.use_cshuffle_epilog,
+            ki.use_async_copy,
+            ki.waves_per_eu,
+        )
+    else:
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+
+    flydsl_preshuffle_gemm_a8(
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale,
+        w_scale,
+        Out,
+        tm,
+        tn,
+        tk,
+        lds,
+        csh,
+        acp,
+        wpe,
+    )
+    return Out
 
 
 @compile_ops(
@@ -544,6 +588,8 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
+        elif libtype == "flydsl" and is_flydsl_available():
+            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     else:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
 
