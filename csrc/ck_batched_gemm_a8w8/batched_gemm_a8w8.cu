@@ -99,10 +99,11 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
     }
   }();
 
-  const int cu_num = get_device_cu_num();
+  const int cu_num         = get_device_cu_num();
+  const std::string& gfx   = get_device_gfx();
 
   // First check if this shape(B,M,N,K) is available in the direct lookup.
-  auto it = lookup.find({cu_num, B, M, N, K});
+  auto it = lookup.find({gfx, cu_num, B, M, N, K});
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
   {
@@ -123,7 +124,7 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
     padded_m = 20480;
   }
   // Second check if this shape(B,padded_m,N,K) is available in the direct lookup.
-  it = lookup.find({cu_num, B, padded_m, N, K});
+  it = lookup.find({gfx, cu_num, B, padded_m, N, K});
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
   {

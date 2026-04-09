@@ -170,7 +170,7 @@ def build_tune_dict(
     tune_df, default_dict, kernels_list, libtype=None, kernels_by_name=None
 ):
     """Filter tune_df to rows matching the current build targets and return a
-    (cu_num, M, N, K)-keyed dispatch dict, starting from a copy of default_dict.
+    (gfx, cu_num, M, N, K)-keyed dispatch dict, starting from a copy of default_dict.
 
     Replaces the duplicated get_tune_dict filtering loop in each gen_instances.py.
     Modules keep their own default_dict and kernels_list; only the CSV filtering
@@ -195,7 +195,7 @@ def build_tune_dict(
 
     Returns:
         dict with mixed keys: negative ints (from default_dict) and
-        (cu_num, M, N, K) 4-tuples (from the filtered CSV rows).
+        (gfx, cu_num, M, N, K) 5-tuples (from the filtered CSV rows).
     """
     tune_dict = dict(default_dict)
     targets = get_build_targets()
@@ -208,17 +208,16 @@ def build_tune_dict(
             "kernels_by_name provided but CSV has no kernelName column, falling back to kernelId."
         )
     for _, row in filtered.iterrows():
-        key = (int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
+        key = (str(row["gfx"]), int(row["cu_num"]), int(row["M"]), int(row["N"]), int(row["K"]))
         if use_name:
             kname = str(row["kernelName"])
             kernel = kernels_by_name.get(kname)
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                gfx = row.get("gfx", "unknown")
                 logger.warning(
                     f"kernelName '{kname}' not found in kernels_by_name "
-                    f"(gfx={gfx}, cu_num={key[0]}, M={key[1]}, N={key[2]}, K={key[3]}); "
+                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}); "
                     f"falling back to heuristic default."
                 )
         else:
@@ -227,10 +226,9 @@ def build_tune_dict(
             if kernel is not None:
                 tune_dict[key] = kernel
             else:
-                gfx = row.get("gfx", "unknown")
                 logger.warning(
                     f"kernelId {kid} not in kernels_list "
-                    f"(gfx={gfx}, cu_num={key[0]}, M={key[1]}, N={key[2]}, K={key[3]}, "
+                    f"(gfx={key[0]}, cu_num={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}, "
                     f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
                 )
     return tune_dict
@@ -240,7 +238,7 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
     """Like build_tune_dict, but for batched GEMM modules whose dispatch key
     includes the batch dimension B.
 
-    Builds a (cu_num, B, M, N, K) 5-tuple keyed dict suitable for use with
+    Builds a (gfx, cu_num, B, M, N, K) 6-tuple keyed dict suitable for use with
     BatchedGemmDispatchMap in the C++ dispatch layer.
 
     Args:
@@ -252,7 +250,7 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
 
     Returns:
         dict with mixed keys: negative ints (from default_dict) and
-        (cu_num, B, M, N, K) 5-tuples (from the filtered CSV rows).
+        (gfx, cu_num, B, M, N, K) 6-tuples (from the filtered CSV rows).
     """
     tune_dict = dict(default_dict)
     targets = get_build_targets()
@@ -261,6 +259,7 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
         filtered = filtered[filtered["libtype"] == libtype]
     for _, row in filtered.iterrows():
         key = (
+            str(row["gfx"]),
             int(row["cu_num"]),
             int(row["B"]),
             int(row["M"]),
@@ -272,10 +271,9 @@ def build_tune_dict_batched(tune_df, default_dict, kernels_list, libtype=None):
         if kernel is not None:
             tune_dict[key] = kernel
         else:
-            gfx = row.get("gfx", "unknown")
             logger.warning(
                 f"kernelId {kid} not in kernels_list "
-                f"(gfx={gfx}, cu_num={key[0]}, B={key[1]}, M={key[2]}, N={key[3]}, K={key[4]}, "
+                f"(gfx={key[0]}, cu_num={key[1]}, B={key[2]}, M={key[3]}, N={key[4]}, K={key[5]}, "
                 f"kernels_list size={len(kernels_list)}); falling back to heuristic default."
             )
     return tune_dict
@@ -292,10 +290,10 @@ def write_lookup_header(
     type parameters), but the iteration and key-formatting logic is shared here.
 
     Key layout in kernels_dict:
-      - Negative ints   (default_dict entries)  → skipped in non-tune mode.
-      - (cu_num,M,N,K) 4-tuples (tuned entries) → written as {cu_num,M,N,K} C++ key.
-      - (cu_num,B,M,N,K) 5-tuples (batched)     → written as {cu_num,B,M,N,K} C++ key.
-      - Non-negative ints (tune mode only)       → written as plain integer kernel ID.
+      - Negative ints          (default_dict entries) → skipped in non-tune mode.
+      - (gfx,cu_num,M,N,K) 5-tuples (tuned entries)  → written as {"gfx",cu_num,M,N,K} C++ key.
+      - (gfx,cu_num,B,M,N,K) 6-tuples (batched)      → written as {"gfx",cu_num,B,M,N,K} C++ key.
+      - Non-negative ints (tune mode only)            → written as plain integer kernel ID.
 
     Args:
         output_path:     Full path of the .h file to write.
@@ -308,12 +306,14 @@ def write_lookup_header(
     with open(output_path, "w") as f:
         f.write(lookup_head)
         for key, k in kernels_dict.items():
-            if not istune and (isinstance(key, tuple) and key[1] > 0):
-                # 4-tuple key: (cu_num, M, N, K) — key[1] = M > 0 for real shapes
-                # 5-tuple key: (cu_num, B, M, N, K) — key[1] = B >= 1 for batched shapes
+            if not istune and (isinstance(key, tuple) and isinstance(key[0], str)):
+                # 5-tuple key: (gfx, cu_num, M, N, K)
+                # 6-tuple key: (gfx, cu_num, B, M, N, K)
+                # key[0] is the gfx arch string; the remaining elements are ints.
+                cpp_key = '{"' + key[0] + '", ' + ", ".join(str(x) for x in key[1:]) + "}"
                 f.write(
                     lookup_template.format(
-                        MNK="{" + ", ".join(str(x) for x in key) + "}",
+                        MNK=cpp_key,
                         kernel_name=k.name,
                     )
                 )

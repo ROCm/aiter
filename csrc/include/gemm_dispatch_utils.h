@@ -4,7 +4,7 @@
 
 #ifdef USE_ROCM
 
-#include <hip/hip_runtime.h>
+#include "aiter_hip_common.h"
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -14,19 +14,22 @@
 // ---------------------------------------------------------------------------
 // GemmDispatchHash
 //
-// Hash for the (cu_num, M, N, K) 4-tuple used as the C++ runtime dispatch key
-// in all CK GEMM modules.  Replaces the per-module IntTupleHash that used plain
-// XOR (commutative — shape permutations collide).  Uses boost-style mixing with
-// the golden-ratio constant (0x9e3779b9) for a non-commutative, low-collision hash.
+// Hash for the (gfx, cu_num, M, N, K) 5-tuple used as the C++ runtime
+// dispatch key in all CK GEMM modules.  The gfx arch string (e.g. "gfx942")
+// is included so that multi-arch .so files containing kernels for two
+// architectures that share the same cu_num do not collide.  Uses boost-style
+// mixing with the golden-ratio constant (0x9e3779b9) for a non-commutative,
+// low-collision hash.
 // ---------------------------------------------------------------------------
 struct GemmDispatchHash
 {
-    size_t operator()(const std::tuple<int, int, int, int>& t) const
+    size_t operator()(const std::tuple<std::string, int, int, int, int>& t) const
     {
-        size_t h = std::hash<int>{}(std::get<0>(t));
+        size_t h = std::hash<std::string>{}(std::get<0>(t));
         h ^= std::hash<int>{}(std::get<1>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(std::get<2>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(std::get<3>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(std::get<4>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -38,41 +41,39 @@ struct GemmDispatchHash
 // lifetime of the process.  Safe to call at first dispatch: the GPU device and
 // its CU count are fixed once the process starts.
 //
-// Used as the first element of the (cu_num, M, N, K) dispatch key so that a
-// multi-arch .so (built for e.g. gfx942 and gfx950) can select the correct
-// tuned kernel at runtime without recompilation.
-//
 // Note: multi-GPU processes where different devices have different
 // multiProcessorCounts are not a supported inference scenario; the cached value
 // reflects whichever device is current at the time of the first dispatch call.
 // ---------------------------------------------------------------------------
-// Note: HIP_CALL from aiter_hip_common.h is not used here to keep this header
-// self-contained — aiter_hip_common.h pulls in CK and logger headers that may
-// not be available in all build configurations.
 inline int get_device_cu_num()
 {
     static const int cu_num = []() {
         int device = -1;
-        hipError_t err = hipGetDevice(&device);
-        if(err != hipSuccess)
-            throw std::runtime_error(
-                std::string("get_device_cu_num: hipGetDevice failed: ") +
-                hipGetErrorString(err));
+        HIP_CALL(hipGetDevice(&device));
         hipDeviceProp_t prop{};
-        err = hipGetDeviceProperties(&prop, device);
-        if(err != hipSuccess)
-            throw std::runtime_error(
-                std::string("get_device_cu_num: hipGetDeviceProperties failed: ") +
-                hipGetErrorString(err));
+        HIP_CALL(hipGetDeviceProperties(&prop, device));
         return prop.multiProcessorCount;
     }();
     return cu_num;
 }
 
 // ---------------------------------------------------------------------------
+// get_device_gfx
+//
+// Returns the GCN arch name of the current HIP device (e.g. "gfx942"),
+// cached for the lifetime of the process.  Delegates to get_gpu_arch() from
+// aiter_hip_common.h which strips any :sramecc+:xnack- suffix from gcnArchName.
+// ---------------------------------------------------------------------------
+inline const std::string& get_device_gfx()
+{
+    static const std::string gfx = get_gpu_arch();
+    return gfx;
+}
+
+// ---------------------------------------------------------------------------
 // GemmDispatchMap
 //
-// Convenience alias for the (cu_num, M, N, K)-keyed dispatch map type.
+// Convenience alias for the (gfx, cu_num, M, N, K)-keyed dispatch map type.
 // Each module instantiates this with its own RowwiseKernel / BlockwiseKernel
 // function type:
 //
@@ -80,24 +81,25 @@ inline int get_device_cu_num()
 // ---------------------------------------------------------------------------
 template <typename KernelFn>
 using GemmDispatchMap =
-    std::unordered_map<std::tuple<int, int, int, int>, KernelFn, GemmDispatchHash>;
+    std::unordered_map<std::tuple<std::string, int, int, int, int>, KernelFn, GemmDispatchHash>;
 
 // ---------------------------------------------------------------------------
 // BatchedGemmDispatchHash
 //
-// Hash for the (cu_num, B, M, N, K) 5-tuple used as the C++ runtime dispatch
-// key in batched CK GEMM modules.  Same boost-style mixing as GemmDispatchHash
-// (fixes the commutative plain-XOR bug in the old IntTupleHash).
+// Hash for the (gfx, cu_num, B, M, N, K) 6-tuple used as the C++ runtime
+// dispatch key in batched CK GEMM modules.  Same boost-style mixing as
+// GemmDispatchHash.
 // ---------------------------------------------------------------------------
 struct BatchedGemmDispatchHash
 {
-    size_t operator()(const std::tuple<int, int, int, int, int>& t) const
+    size_t operator()(const std::tuple<std::string, int, int, int, int, int>& t) const
     {
-        size_t h = std::hash<int>{}(std::get<0>(t));
+        size_t h = std::hash<std::string>{}(std::get<0>(t));
         h ^= std::hash<int>{}(std::get<1>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(std::get<2>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(std::get<3>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(std::get<4>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(std::get<5>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -105,13 +107,15 @@ struct BatchedGemmDispatchHash
 // ---------------------------------------------------------------------------
 // BatchedGemmDispatchMap
 //
-// Convenience alias for the (cu_num, B, M, N, K)-keyed dispatch map type.
+// Convenience alias for the (gfx, cu_num, B, M, N, K)-keyed dispatch map type.
 // Used by batched GEMM modules:
 //
 //   using BatchedRowwiseKernelMap = BatchedGemmDispatchMap<BatchedRowwiseKernel>;
 // ---------------------------------------------------------------------------
 template <typename KernelFn>
 using BatchedGemmDispatchMap =
-    std::unordered_map<std::tuple<int, int, int, int, int>, KernelFn, BatchedGemmDispatchHash>;
+    std::unordered_map<std::tuple<std::string, int, int, int, int, int>,
+                       KernelFn,
+                       BatchedGemmDispatchHash>;
 
 #endif // USE_ROCM

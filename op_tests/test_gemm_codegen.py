@@ -7,6 +7,7 @@ test_gemm_codegen.py — unit tests for the gfx-aware GEMM codegen fix.
 Tests the fix in fix/gemm_codegen_gfx_build_targets that adds gfx to:
   - gen_instances.py build-time filter (get_build_targets in chip_info.py)
   - Python runtime dispatch keys in gemm_op_a8w8.py et al.
+  - C++ static dispatch key (gfx, cu_num, M, N, K) and write_lookup_header output
 
 No GPU kernel execution or .so compilation required.  All tests run on CPU
 using only pandas and the chip_info / gemm_op_a8w8 Python layers.
@@ -14,6 +15,7 @@ using only pandas and the chip_info / gemm_op_a8w8 Python layers.
 Scenarios:
   1. get_build_targets() — env-driven target selection
   2. gen_instances filter simulation — CSV row selection matches target GPU
+  2.5. write_lookup_header — C++ key format in generated lookup header
   3. Runtime dispatch key selection — (gfx, cu_num, M, N, K) lookup
 
 Usage:
@@ -374,6 +376,61 @@ def test_runtime_dispatch_key():
                     pass
 
 
+def test_write_lookup_header():
+    _section("2.5. write_lookup_header — C++ key format")
+
+    from chip_info import write_lookup_header
+
+    class _FakeKernel:
+        def __init__(self, name):
+            self.name = name
+
+    kernels_dict = {
+        ("gfx942", 304, 128, 4096, 4096): _FakeKernel("kernel_non_batched"),
+        ("gfx942", 304, 2, 128, 4096, 4096): _FakeKernel("kernel_batched"),
+        -1: _FakeKernel("default_kernel"),  # default_dict entry — must be skipped
+    }
+
+    LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
+    LOOKUP_template = "   {{{MNK}, {kernel_name}<DTYPE, ETYPE>}},\\\n"
+    LOOKUP_end = "}\n#endif\n"
+
+    path = None
+    try:
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False)
+        path = f.name
+        f.close()
+        write_lookup_header(path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end)
+        content = open(path).read()
+
+        _check(
+            "non-batched key: gfx string quoted in C++ initializer",
+            '{"gfx942", 304, 128, 4096, 4096}' in content,
+            f"not found in output:\n{content}",
+        )
+        _check(
+            "batched key: 6-tuple with gfx string quoted",
+            '{"gfx942", 304, 2, 128, 4096, 4096}' in content,
+            f"not found in output:\n{content}",
+        )
+        _check(
+            "default_dict (-1) entry is skipped",
+            "default_kernel" not in content,
+            f"default_kernel unexpectedly in output:\n{content}",
+        )
+        _check(
+            "old-style key without gfx (regression guard): {304, 128, ...} absent",
+            "{304, 128, 4096, 4096}" not in content,
+            f"old-style key found in output:\n{content}",
+        )
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -392,6 +449,7 @@ if __name__ == "__main__":
         target_b=TARGET_B,
         label="module_gemm_a8w8_bpreshuffle",
     )
+    test_write_lookup_header()
     test_runtime_dispatch_key()
 
     print(f"\n{'='*60}")

@@ -51,10 +51,11 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
         }
     }();
 
-    const int cu_num = get_device_cu_num();
+    const int cu_num         = get_device_cu_num();
+    const std::string& gfx   = get_device_gfx();
 
     // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({cu_num, M, N, K});
+    auto it = lookup.find({gfx, cu_num, M, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
@@ -66,7 +67,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     // Fine-grained search
     padded_m = getPaddedM(M, N, K, 0);
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({cu_num, padded_m, N, K});
+    it = lookup.find({gfx, cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
@@ -76,7 +77,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
     // Third check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({cu_num, padded_m, N, K});
+    it = lookup.find({gfx, cu_num, padded_m, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
     {
