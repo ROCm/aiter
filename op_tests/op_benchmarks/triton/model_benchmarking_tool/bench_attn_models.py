@@ -570,17 +570,23 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]
         logging.error("Benchmark name doesn't match: %s", l0)
         return None
     # Check stdout line #2 (table header):
-    if l1 != [
-        "model",
-        "B",
-        "H",
-        "S",
-        "kv_lora_rank",
-        "qk_rope_head_dim",
-        "rotary_dim",
-        "num_kv_splits",
-        "mla_decode_fwd",
-    ]:
+    # Triton sometimes appends a "(ms)" annotation token after the last column name.
+    if not (
+        l1[:9]
+        == [
+            "model",
+            "B",
+            "H",
+            "S",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "rotary_dim",
+            "num_kv_splits",
+            "mla_decode_fwd",
+        ]
+        and len(l1) in (9, 10)
+        and (len(l1) == 9 or l1[9] == "(ms)")
+    ):
         logging.error("Table header doesn't match: %s", l1)
         return None
     # Check stdout line #3 (table data):
