@@ -28,7 +28,9 @@ def ref_gather_kv_b_proj(
 
     num_block, block_size, hidden_dim = k_buffer.shape
     weight_n, weight_k = kv_proj_weight.shape
-    per_row_scale = kv_proj_scale.dim() == 1
+    per_row_scale = kv_proj_scale.dim() == 1 or (
+        kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
+    )
 
     assert hidden_dim == kv_c_dim + kv_pe_dim
     assert weight_k == kv_c_dim
@@ -95,7 +97,7 @@ def ref_gather_kv_b_proj(
         if per_row_scale:
             kv_proj = (
                 k_data.to(torch.float32) @ kv_proj_weight.to(torch.float32).T
-            ) * (kv_proj_scale.to(torch.float32).unsqueeze(0))
+            ) * (kv_proj_scale.to(torch.float32).reshape(1, -1))
         else:
             kv_proj = torch.zeros(
                 (context_end - context_start, weight_n),
@@ -350,7 +352,9 @@ def test_gather_kv_b_proj_per_row_scale(
         device=device,
         dtype=torch.float32,
     ).to(weight_dtype)
-    kv_proj_scale = torch.randn((weight_n,), device=device, dtype=torch.bfloat16).abs()
+    kv_proj_scale = torch.randn(
+        (weight_n, 1), device=device, dtype=torch.bfloat16
+    ).abs()
 
     k_ref, v_ref = ref_gather_kv_b_proj(
         k_buffer,

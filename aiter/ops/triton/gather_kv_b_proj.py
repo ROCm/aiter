@@ -31,7 +31,7 @@ def gather_kv_b_proj(
     )
     if per_row_scale:
         assert kv_proj_scale.numel() == weight_n, (
-            f"per-row kv_proj_scale must have shape ({weight_n},), "
+            f"per-row kv_proj_scale must have shape ({weight_n},) or ({weight_n}, 1), "
             f"got {tuple(kv_proj_scale.shape)}"
         )
     else:
