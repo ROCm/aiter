@@ -83,8 +83,9 @@ def select_3d_config(
         MIN_SEGMENTS = max(8, num_segments)
         num_segments = max(num_segments, MIN_SEGMENTS)
 
-    if num_segments == MIN_SEGMENTS:
-        reduce_num_warps = 1
+        if num_segments == MIN_SEGMENTS:
+            reduce_num_warps = 1
+
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
