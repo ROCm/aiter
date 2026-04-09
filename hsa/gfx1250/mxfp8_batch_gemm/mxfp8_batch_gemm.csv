@@ -1,0 +1,5 @@
+tile_m,tile_n,knl_name,co_name
+64,512,MXFP8_GEMM_1TG_4W_64mx1_128nx4_KERNEL_FUNC,mxfp8_batch_gemm_64x512.co
+64,512,MXFP8_GEMM_1TG_4W_64mx1_128nx4_APRESHUFFLE_KERNEL_FUNC,mxfp8_batch_gemm_64x512_apreshuffle.co
+256,256,MXFP8_GEMM_1TG_4W_128mx2_128nx2_KERNEL_FUNC,mxfp8_batch_gemm_256x256.co
+256,256,MXFP8FP4_GEMM_1TG_4W_128mx2_128nx2_KERNEL_FUNC,mxfp8fp4_batch_gemm_256x256.co

@@ -125,6 +125,58 @@ def batched_gemm_a8w8_CK(
     return batched_gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
+@compile_ops(
+    "module_mxfp8_batch_gemm_asm",
+    fc_name="mxfp8_batch_gemm_asm",
+    ffi_type="ctypes",
+)
+def _mxfp8_batch_gemm_asm(
+    A: Tensor,              # A:[B, M, K] fp8 (preshuffled)
+    B: Tensor,              # B:[B, N, K] fp8 (preshuffled)
+    ScaleA: Tensor,         # ScaleA:[B, M, K/32] uint8 e8m0 (shuffled)
+    ScaleB: Tensor,         # ScaleB:[B, N, K/32] uint8 e8m0 (shuffled)
+    Out: Tensor,            # Out:[B, M, N] bf16
+    kernelName: Optional[str] = None,
+) -> None: ...
+
+
+def batched_gemm_a8w8_ASM(
+    A: Tensor,
+    B: Tensor,
+    ScaleA: Tensor,
+    ScaleB: Tensor,
+    dtype=dtypes.bf16,
+    kernelName: str = "",
+):
+    """MXFP8 batched GEMM via ASM kernel (gfx1250).
+
+    Args:
+        A: [B, M, K] fp8 input (preshuffled: m/2, k/128, 2, 128)
+        B: [B, N, K] fp8 weight (preshuffled: n/16, k/16, 16, 16)
+        ScaleA: [B, M, K/32] uint8 e8m0 block-wise scale (shuffled: m/32, k/4, 32, 4)
+        ScaleB: [B, N, K/32] uint8 e8m0 block-wise scale (shuffled: n/32, k/4, 32, 4)
+        dtype: output dtype, only bf16 supported
+        kernelName: optional kernel name to force a specific kernel
+
+    Returns:
+        Out: [B, M, N] bf16 result
+    """
+    assert dtype in [
+        dtypes.bf16,
+    ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8_ASM"
+
+    b = A.shape[0]
+    m = A.shape[1]
+    n = B.shape[1]
+
+    Y = torch.empty(b, m, n, dtype=dtype, device=A.device)
+    _mxfp8_batch_gemm_asm(
+        A, B, ScaleA, ScaleB, Y,
+        kernelName if kernelName else None,
+    )
+    return Y    
+
+
 def gen_batched_gemm_a8w8_tune_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
