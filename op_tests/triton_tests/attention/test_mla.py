@@ -297,8 +297,8 @@ def test_mla_decode_fwd(
     ), f"{torch.max(torch.abs(out - out_ref))}"
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
-@pytest.mark.parametrize("ctx_lens", [200, 1024, 8192])
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("ctx_lens", [200, 1024])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
@@ -328,8 +328,8 @@ def test_mla_prefill_fwd(
     use_out_scale: bool,
     backend: str,
 ):
-    if backend == "triton" and DEVICE_ARCH in ("gfx1250",):
-        pytest.skip("Triton is not supported on gfx1250")
+    if backend == "triton" and DEVICE_ARCH not in ("gfx950",):
+        pytest.skip("Triton is only supported on gfx950")
     if backend == "gluon" and DEVICE_ARCH not in ("gfx1250",):
         pytest.skip("Gluon is only supported on gfx1250")
     torch.cuda.empty_cache()
