@@ -62,7 +62,7 @@ def _moe_sorting_impl(
         int(block_size),
         expert_mask,
         num_local_tokens,
-        dispatch_policy,
+        int(os.environ.get("AITER_DISPATCH_POLICY", dispatch_policy)),
     )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
