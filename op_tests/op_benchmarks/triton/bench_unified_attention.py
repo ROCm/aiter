@@ -118,7 +118,13 @@ def create_benchmark_configs(custom, args):
     }
 
     if custom:
-        x_vals_list = [(args.b, args.hq, hk, args.sq, sk, head_size, head_size_v)]
+        sq_vals = args.sq if isinstance(args.sq, list) else [args.sq]
+        sk_vals = sk if isinstance(sk, list) else [sk]
+        x_vals_list = [
+            (args.b, args.hq, hk, sq_val, sk_val, head_size, head_size_v)
+            for sq_val in sq_vals
+            for sk_val in sk_vals
+        ]
     else:
         if varlen:
             x_vals_list = varlen_benchmark_configs()
@@ -144,16 +150,24 @@ def create_benchmark_configs(custom, args):
     for i in range(len(x_vals_list)):
         x_vals_list[i] = (*x_vals_list[i], decode_p)
 
-    if args.metric == "time":
-        unit = "ms"
+    all_metrics = {
+        "time": ("time(ms)", "ms"),
+        "throughput": ("throughput(TFLOPS)", "TFLOPS"),
+        "bandwidth": ("bandwidth(GB/s)", "GB/s"),
+        "tok/s": ("throughput(tok/s)", "tok/s"),
+    }
+
+    if args.metric == "all":
+        line_vals = [v[0] for v in all_metrics.values()]
+        ylabel = ""
     elif args.metric == "throughput":
-        unit = "TFLOPS"
-    elif args.metric == "bandwidth":
-        unit = "GB/s"
+        line_vals = [all_metrics["throughput"][0], all_metrics["tok/s"][0]]
+        ylabel = ""
+    elif args.metric in all_metrics:
+        line_vals = [all_metrics[args.metric][0]]
+        ylabel = all_metrics[args.metric][1]
     else:
         raise ValueError("Unknown metric: " + args.metric)
-
-    line_vals = [f"fwd({unit})"]
 
     configs.append(
         triton.testing.Benchmark(
@@ -162,8 +176,8 @@ def create_benchmark_configs(custom, args):
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_vals,
-            styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
-            ylabel=unit,
+            styles=[("red", "-"), ("green", "-"), ("blue", "-"), ("orange", "-")],
+            ylabel=ylabel,
             plot_name=plot_name,
             args=extra_args,
         )
@@ -317,6 +331,7 @@ def run_benchmark(custom, args):
         )
 
         ms = triton.testing.do_bench(fn)
+        # ms *= 80 // simulate 80 layers for GLM5
 
         run_correctness = args.test
         if run_correctness:
@@ -339,8 +354,6 @@ def run_benchmark(custom, args):
                 atol, rtol = 1.5e-1, 1.5e-1
             elif args.sagev2:
                 atol, rtol = 3.5e-1, 2.5e-1
-                # mae = (output - ref_output).abs().mean().item()
-                # assert mae < 0.1, f"MXFP4 mean absolute error too high: {mae}"
             else:
                 atol, rtol = 1.5e-2, 1e-2
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
@@ -381,8 +394,11 @@ def run_benchmark(custom, args):
             return ms
         elif "TFLOPS" in provider:
             return total_flops / ms * 1e-9
-        else:  # GB/s
+        elif "GB/s" in provider:
             return mem / ms * 1e-6
+        elif "tok/s" in provider:
+            return total_num_tokens_q / (ms * 1e-3)
+        return ms
 
     bench_mha.run(None, print_data=True)
 
@@ -531,7 +547,7 @@ def parse_args():
         "-metric",
         nargs="?",
         const="throughput",
-        choices=["time", "throughput", "bandwidth"],
+        choices=["time", "throughput", "bandwidth", "tok/s", "all"],
         default=None,
         help="Metrics for the kernel benchmark.",
     )
