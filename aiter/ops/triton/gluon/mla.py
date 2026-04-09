@@ -143,8 +143,7 @@ class MLAConfig:
                 transposed=True,
                 warp_bases=warp_bases_pv,
                 reg_bases=[],
-                # instr_shape=[16, 16, 32 if not self.IS_KV_FP8 else 64],
-                instr_shape=[16, 16, 32],
+                instr_shape=[16, 16, 64 if (self.IS_Q_FP8 and self.IS_KV_FP8) else 32],
             )
         )
         k_width = 16 if self.IS_KV_FP8 and self.SHUFFLED_KV_CACHE else 8
@@ -623,13 +622,13 @@ class MLAProgram:
 
     @gluon.jit
     def compute_qk_lora(self, k_lora, S):
-        if self.cfg.IS_KV_FP8:
+        if not self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
             k_lora = k_lora.to(self.q_lora.dtype)
         return gl.amd.gfx1250.wmma(self.q_lora, k_lora, S)
 
     @gluon.jit
     def compute_qk_rope(self, k_rope, S):
-        if self.cfg.IS_KV_FP8:
+        if not self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
             k_rope = k_rope.to(self.q_rope.dtype)
         return gl.amd.gfx1250.wmma(self.q_rope, k_rope, S)
 
@@ -651,13 +650,13 @@ class MLAProgram:
 
     @gluon.jit
     def compute_pkv_lora_trans(self, p, kv_lora_trans, acc):
-        p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
-        if self.cfg.IS_KV_FP8:
+        if self.cfg.IS_Q_FP8 and self.cfg.IS_KV_FP8:
+            p = p.to(kv_lora_trans.dtype)
+        elif self.cfg.IS_KV_FP8:
+            p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
             kv_lora_trans = kv_lora_trans.to(gl.bfloat16)
-        # if self.cfg.IS_KV_FP8:
-        #     p = p.to(kv_lora_trans.dtype)
-        # else:
-        #     p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
+        else:
+            p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         acc = gl.amd.gfx1250.wmma(p, kv_lora_trans, acc)
         return acc

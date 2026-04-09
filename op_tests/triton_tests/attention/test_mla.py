@@ -178,7 +178,7 @@ def torch_mla_extend(
         # ("gluon", False),
     ],
 )
-# @torch.inference_mode()
+@torch.inference_mode()
 def test_mla_decode_fwd(
     batch_size: int,
     decode_qlen: int,
@@ -196,8 +196,8 @@ def test_mla_decode_fwd(
     backend: str,
     shuffled_kv_cache: bool,
 ):
-    if backend == "triton" and DEVICE_ARCH in ("gfx1250",):
-        pytest.skip("Triton is not supported on gfx1250")
+    if backend == "triton" and DEVICE_ARCH not in ("gfx950",):
+        pytest.skip("Triton is only supported on gfx950")
     if backend == "gluon" and DEVICE_ARCH not in ("gfx1250",):
         pytest.skip("Gluon is only supported on gfx1250")
     torch.cuda.empty_cache()

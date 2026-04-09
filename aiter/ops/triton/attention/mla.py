@@ -49,10 +49,28 @@ def select_2d_config(
 
 
 def select_3d_config(
-    block_size, max_seqlen_k, target_num_prgms, num_2d_prgms, q_dtype, kv_dtype
+    block_size,
+    max_seqlen_k,
+    target_num_prgms,
+    num_2d_prgms,
+    q_dtype,
+    kv_dtype,
+    shuffled_kv_cache,
 ):
     reduce_num_warps = 2
     attn_warps = 2
+    waves_per_eu = 1
+    if shuffled_kv_cache:
+        if kv_dtype == torch.bfloat16:
+            if num_2d_prgms >= 64:
+                num_segments = 1
+            else:
+                num_segments = 2
+        else:
+            if num_2d_prgms >= 64:
+                num_segments = 1
+            else:
+                num_segments = 2
 
     TILE_SIZE = block_size
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
@@ -68,7 +86,7 @@ def select_3d_config(
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "waves_per_eu": 1,
+        "waves_per_eu": waves_per_eu,
         "num_stages": 2,
     }
     reduce_config = {
@@ -225,10 +243,6 @@ def mla_decode_fwd(
     out_scale,
     use_gluon: bool,
     shuffled_kv_cache: bool,
-    num_warps: int = None,
-    waves_per_eu: int = None,
-    num_stages: int = None,
-    num_segments: int = None,
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
@@ -286,17 +300,8 @@ def mla_decode_fwd(
         num_2d_prgms,
         q_dtype,
         kv_buffer_dtype,
+        shuffled_kv_cache,
     )
-
-    if num_warps is not None:
-        attn_config["num_warps"] = num_warps
-    if waves_per_eu is not None:
-        attn_config["waves_per_eu"] = waves_per_eu
-    if num_stages is not None:
-        attn_config["num_stages"] = num_stages
-    if num_segments is not None:
-        attn_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
-        reduce_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
     segm_output = torch.empty(
