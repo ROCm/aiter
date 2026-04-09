@@ -45,22 +45,22 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
     # TN is default layout
     if layout[0] == "T":
-        x = torch.randn((M, K), dtype=dtype, device="cuda")
+        x = torch.randn((M, K), dtype=dtype).cuda()
     else:
-        x = torch.randn((K, M), dtype=dtype, device="cuda").T
+        x = torch.randn((K, M), dtype=dtype).T.cuda()
 
     if layout[1] == "T":
-        weight = torch.randn((K, N), dtype=dtype, device="cuda").T
+        weight = torch.randn((K, N), dtype=dtype).T.cuda()
     else:
-        weight = torch.randn((N, K), dtype=dtype, device="cuda")
+        weight = torch.randn((N, K), dtype=dtype).cuda()
 
     bias_tensor = None
     if bias:
-        bias_tensor = torch.empty((N), dtype=dtype, device="cuda")
+        bias_tensor = torch.empty((N), dtype=dtype).cuda()
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda")
+        y = torch.empty((M, N), dtype=dtype).cuda()
         out_dtype = (None,)
     else:
         out_dtype = dtype
