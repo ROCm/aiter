@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Quick correctness test for the interleaved gluon GEMM kernel."""
+"""Quick correctness tests for interleaved, basic_pipelined, and basic_pipelined_unrolled gluon GEMM kernels."""
 
 import torch
 import torch.nn.functional as F
@@ -13,7 +13,7 @@ requires_gluon = pytest.mark.skipif(
     not _is_gluon_available(), reason="Gluon not supported on this architecture"
 )
 
-# Shapes that exercise the interleaved kernel (BLOCK_K=64 requires K >= 64)
+# Shapes that exercise the kernels (BLOCK_K=64 requires K >= 64)
 SHAPES = [
     (256, 256, 64),       # minimal: one K tile
     (256, 256, 128),      # two K tiles
@@ -23,7 +23,15 @@ SHAPES = [
     (128, 256, 640),      # smaller M
 ]
 
-INTERLEAVED_CONFIG = {
+# Extra shapes to test even/odd K-tile counts for unrolled kernel
+UNROLLED_SHAPES = SHAPES + [
+    (256, 256, 256),      # 4 tiles → main_iters=2 (even)
+    (256, 256, 320),      # 5 tiles → main_iters=3 (odd)
+    (256, 256, 384),      # 6 tiles → main_iters=4 (even)
+    (256, 256, 448),      # 7 tiles → main_iters=5 (odd)
+]
+
+CONFIG_3BUF = {
     "BLOCK_M": 256,
     "BLOCK_N": 256,
     "BLOCK_K": 64,
@@ -31,6 +39,9 @@ INTERLEAVED_CONFIG = {
     "num_warps": 4,
     "L2_PREFETCH_DISTANCE": 0,
 }
+
+
+# ── interleaved kernel tests ──
 
 
 @requires_gluon
@@ -42,7 +53,7 @@ def test_interleaved_correctness(M, N, K, dtype):
 
     ref = F.linear(x, w)
     out = gemm_a16w16(
-        x, w, dtype=dtype, config=INTERLEAVED_CONFIG,
+        x, w, dtype=dtype, config=CONFIG_3BUF,
         backend="gluon", kernel_type="interleaved",
     )
 
@@ -59,7 +70,7 @@ def test_interleaved_with_bias():
 
     ref = F.linear(x, w, bias=bias)
     out = gemm_a16w16(
-        x, w, bias=bias, dtype=dtype, config=INTERLEAVED_CONFIG,
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
         backend="gluon", kernel_type="interleaved",
     )
 
@@ -75,11 +86,191 @@ def test_interleaved_num_buffers(num_buffers):
     x = torch.randn((M, K), dtype=dtype, device="cuda")
     w = torch.randn((N, K), dtype=dtype, device="cuda")
 
-    config = {**INTERLEAVED_CONFIG, "NUM_BUFFERS": num_buffers}
+    config = {**CONFIG_3BUF, "NUM_BUFFERS": num_buffers}
     ref = F.linear(x, w)
     out = gemm_a16w16(
         x, w, dtype=dtype, config=config,
         backend="gluon", kernel_type="interleaved",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+# ── basic_pipelined kernel tests ──
+
+
+@requires_gluon
+@pytest.mark.parametrize("M,N,K", SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_basic_pipelined_correctness(M, N, K, dtype):
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w)
+    out = gemm_a16w16(
+        x, w, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="basic_pipelined",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+@requires_gluon
+def test_basic_pipelined_with_bias():
+    M, N, K = 1024, 2048, 2880
+    dtype = torch.bfloat16
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+    bias = torch.randn((N,), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w, bias=bias)
+    out = gemm_a16w16(
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="basic_pipelined",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+# ── basic_pipelined_unrolled kernel tests ──
+
+
+@requires_gluon
+@pytest.mark.parametrize("M,N,K", UNROLLED_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_basic_pipelined_unrolled_correctness(M, N, K, dtype):
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w)
+    out = gemm_a16w16(
+        x, w, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="basic_pipelined_unrolled",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+@requires_gluon
+def test_basic_pipelined_unrolled_with_bias():
+    M, N, K = 1024, 2048, 2880
+    dtype = torch.bfloat16
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+    bias = torch.randn((N,), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w, bias=bias)
+    out = gemm_a16w16(
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="basic_pipelined_unrolled",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+# ── interleaved_pipelined kernel tests ──
+
+
+@requires_gluon
+@pytest.mark.parametrize("M,N,K", SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_interleaved_pipelined_correctness(M, N, K, dtype):
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w)
+    out = gemm_a16w16(
+        x, w, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="interleaved_pipelined",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+@requires_gluon
+def test_interleaved_pipelined_with_bias():
+    M, N, K = 1024, 2048, 2880
+    dtype = torch.bfloat16
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+    bias = torch.randn((N,), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w, bias=bias)
+    out = gemm_a16w16(
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="interleaved_pipelined",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+# ── interleaved_pipelined_unrolled kernel tests ──
+
+
+@requires_gluon
+@pytest.mark.parametrize("M,N,K", UNROLLED_SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_interleaved_pipelined_unrolled_correctness(M, N, K, dtype):
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w)
+    out = gemm_a16w16(
+        x, w, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="interleaved_pipelined_unrolled",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+@requires_gluon
+def test_interleaved_pipelined_unrolled_with_bias():
+    M, N, K = 1024, 2048, 2880
+    dtype = torch.bfloat16
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+    bias = torch.randn((N,), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w, bias=bias)
+    out = gemm_a16w16(
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="interleaved_pipelined_unrolled",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+# ── finer_interleaved_pipelined kernel tests ──
+
+
+@requires_gluon
+@pytest.mark.parametrize("M,N,K", SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_finer_interleaved_pipelined_correctness(M, N, K, dtype):
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w)
+    out = gemm_a16w16(
+        x, w, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="finer_interleaved_pipelined",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+@requires_gluon
+def test_finer_interleaved_pipelined_with_bias():
+    M, N, K = 1024, 2048, 2880
+    dtype = torch.bfloat16
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+    bias = torch.randn((N,), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w, bias=bias)
+    out = gemm_a16w16(
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="finer_interleaved_pipelined",
     )
 
     torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
