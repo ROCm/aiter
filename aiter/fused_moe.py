@@ -827,11 +827,16 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+    def use_cfg():
+        return True
+
+    # cfg = cfg_2stages.get(keys, None)
+    cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
         cfg_2stages = get_cfg_2stages(tune_file)
+        # cfg = cfg_2stages.get(keys, None)
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
@@ -902,19 +907,10 @@ def get_2stage_cfgs(
         )
     else:
         block_m = cfg["block_m"]
-        if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
-            ksplit = cfg["ksplit"]
-        else:
-            ksplit = 0
+        ksplit = cfg["ksplit"]
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
-        if not is_shuffled and not run_1stage:
-            logger.warning(
-                f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
-                "Tuned kernels are optimized for preshuffled weights (preshuffle_on). "
-                "Running with preshuffle_off may produce incorrect results."
-            )
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
