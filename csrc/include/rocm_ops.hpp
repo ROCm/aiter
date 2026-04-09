@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#include "aiter_tensor.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -1322,6 +1323,24 @@ namespace py = pybind11;
           py::arg("block_m"),                                            \
           py::arg("shuffle_scale") = false,                              \
           py::arg("transpose_out") = false);                             \
+    m.def("fused_dynamic_mxfp4_quant_moe_sort_hip",                      \
+          &aiter::fused_dynamic_mxfp4_quant_moe_sort_hip,                \
+          py::arg("out"),                                                \
+          py::arg("scales"),                                             \
+          py::arg("input"),                                              \
+          py::arg("sorted_ids"),                                         \
+          py::arg("num_valid_ids"),                                      \
+          py::arg("token_num"),                                          \
+          py::arg("block_m"),                                            \
+          py::arg("group_size") = 32);                                   \
+    m.def("mxfp4_moe_sort_hip",                                          \
+          &aiter::mxfp4_moe_sort_hip,                                    \
+          py::arg("out_scale"),                                          \
+          py::arg("scale"),                                              \
+          py::arg("sorted_ids"),                                         \
+          py::arg("num_valid_ids"),                                      \
+          py::arg("token_num"),                                          \
+          py::arg("cols"));                                              \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
@@ -1413,37 +1432,39 @@ namespace py = pybind11;
           py::arg("epsilon"),                                                                      \
           py::arg("use_model_sensitive_rmsnorm") = 0);
 
-#define ROPE_1C_UNCACHED_FWD_PYBIND  m.def("rope_fwd_impl", &rope_fwd_impl);
-#define ROPE_2C_UNCACHED_FWD_PYBIND  m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
-#define ROPE_1C_CACHED_FWD_PYBIND    m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
-#define ROPE_2C_CACHED_FWD_PYBIND    m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
-#define ROPE_1C_THD_FWD_PYBIND       m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
-#define ROPE_1C_2D_FWD_PYBIND        m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
+#define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
+#define ROPE_2C_UNCACHED_FWD_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
+#define ROPE_1C_CACHED_FWD_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
+#define ROPE_2C_CACHED_FWD_PYBIND m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
+#define ROPE_1C_THD_FWD_PYBIND m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
+#define ROPE_1C_2D_FWD_PYBIND m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
 
-#define ROPE_1C_UNCACHED_BWD_PYBIND  m.def("rope_bwd_impl", &rope_bwd_impl);
-#define ROPE_2C_UNCACHED_BWD_PYBIND  m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
-#define ROPE_1C_CACHED_BWD_PYBIND    m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
-#define ROPE_2C_CACHED_BWD_PYBIND    m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
-#define ROPE_1C_THD_BWD_PYBIND       m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
-#define ROPE_1C_2D_BWD_PYBIND        m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+#define ROPE_1C_UNCACHED_BWD_PYBIND m.def("rope_bwd_impl", &rope_bwd_impl);
+#define ROPE_2C_UNCACHED_BWD_PYBIND m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
+#define ROPE_1C_CACHED_BWD_PYBIND m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
+#define ROPE_2C_CACHED_BWD_PYBIND m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
+#define ROPE_1C_THD_BWD_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
+#define ROPE_1C_2D_BWD_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
-
-#define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND          m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl)
-#define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND                                                   \
-    m.def("rope_cached_positions_2c_fwd_impl",                                                \
-          &rope_cached_positions_2c_fwd_impl,                                                 \
-          py::arg("output_x"),                                                                \
-          py::arg("output_y"),                                                                \
-          py::arg("input_x"),                                                                 \
-          py::arg("input_y"),                                                                 \
-          py::arg("cos"),                                                                     \
-          py::arg("sin"),                                                                     \
-          py::arg("positions"),                                                               \
-          py::arg("rotate_style"),                                                            \
-          py::arg("reuse_freqs_front_part"),                                                  \
+#define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND \
+    m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl)
+#define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND    \
+    m.def("rope_cached_positions_2c_fwd_impl", \
+          &rope_cached_positions_2c_fwd_impl,  \
+          py::arg("output_x"),                 \
+          py::arg("output_y"),                 \
+          py::arg("input_x"),                  \
+          py::arg("input_y"),                  \
+          py::arg("cos"),                      \
+          py::arg("sin"),                      \
+          py::arg("positions"),                \
+          py::arg("rotate_style"),             \
+          py::arg("reuse_freqs_front_part"),   \
           py::arg("nope_first"))
-#define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND  m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl)
-#define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND  m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl)
+#define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl)
+#define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl)
 
 #define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
