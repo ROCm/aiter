@@ -30,6 +30,7 @@ from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
+from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_, tgemm
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -77,6 +78,10 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
 
 
+def run_tgemm_baseline(input, weight):
+    return tgemm.mm(input, weight, None, otype=input.dtype)
+
+
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
@@ -88,6 +93,13 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     else:
         splitK = 4
     return splitK
+
+
+@functools.lru_cache(maxsize=1024)
+def asm_splitk_grid_product(M: int, N: int):
+    # gemm_a16w16_asm uses a fixed split-K launch grid:
+    #   gdx = ceil(N / 64), gdy = ceil(M / 32)
+    return ((N + 64 - 1) // 64) * ((M + 32 - 1) // 32)
 
 
 def generate_data(
@@ -310,6 +322,64 @@ class Gemm:
             ref = F.linear(self.inp, self.weights, self.bias).to(self.outdtype)
         return ref
 
+    def get_shape_key(self):
+        return (
+            self.m,
+            self.n,
+            self.k,
+            self.has_bias,
+            str(self.indtype),
+            str(self.outdtype),
+            self.scaleAB,
+            self.is_shuffle,
+        )
+
+    def should_apply_tgemm_baseline_filter(self):
+        return (
+            not self.is_shuffle
+            and self.indtype == dtypes.bf16
+            and not self.scaleAB
+            and not self.has_bias
+            and self.outdtype == self.indtype
+        )
+
+    def measure_tgemm_baseline(self):
+        if not self.should_apply_tgemm_baseline_filter():
+            return None
+
+        from aiter.test_common import run_perftest
+
+        old_save_gemm = os.environ.get("AITER_TUNE_GEMM")
+        try:
+            os.environ["AITER_TUNE_GEMM"] = "0"
+            get_GEMM_A16W16_config.cache_clear()
+            get_GEMM_A16W16_config_.cache_clear()
+            self.warmup()
+            _, us = run_perftest(
+                run_tgemm_baseline,
+                self.inp,
+                self.weights,
+                num_warmup=self.num_warmup,
+                num_iters=101,
+            )
+        except Exception as err:
+            logger.warning(
+                f"Failed to measure tuned_gemm.mm baseline for {self.get_shape_key()}: {err}"
+            )
+            return None
+        finally:
+            if old_save_gemm is None:
+                os.environ.pop("AITER_TUNE_GEMM", None)
+            else:
+                os.environ["AITER_TUNE_GEMM"] = old_save_gemm
+
+        baseline_us = round(us, 4)
+        print(
+            f">>> tuned_gemm.mm baseline for {self.get_shape_key()} is {baseline_us}us",
+            flush=True,
+        )
+        return baseline_us
+
     def get_asm_kernels(self, file, is_shuffle=False):
         if not os.path.exists(file):
             print(f"ASM kernel list file not exist: {file}")
@@ -351,6 +421,7 @@ class Gemm:
         asm_tiles = [key for key in asm_kernels.keys()]
         solidx = 0
         task_asm = []
+        splitk_grid_product = asm_splitk_grid_product(self.m, self.n)
 
         solutions = 0
         for key in asm_tiles:
@@ -361,6 +432,17 @@ class Gemm:
             kernelName = asm_kernels[key][0]
             start = 1
             if splitK:
+                if splitk_grid_product > 1024:
+                    if self.verbose:
+                        logger.warning(
+                            "skip ASM split-K kernel %s for M=%s N=%s because "
+                            "ceil(N/64)*ceil(M/32)=%s exceeds 1024",
+                            kernelName,
+                            self.m,
+                            self.n,
+                            splitk_grid_product,
+                        )
+                    continue
                 maxSplitK = compute_gemm_SplitK(
                     self.m, self.n, self.k, tile_m, tile_n, 256
                 )  # if self.splitK else 1
@@ -722,6 +804,12 @@ class GemmTuner(GemmCommonTuner):
             required=False,
             help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton']",
         )
+        self.parser.add_argument(
+            "--save_if_better_than_tgemm",
+            dest="save_if_better_than_tgemm",
+            action="store_true",
+            help="only save tuned kernels when they are faster than aiter.tuned_gemm.mm(a, b, None, otype=a.dtype); applied only to non-shuffle bf16 no-bias shapes with otype == a.dtype",
+        )
 
     def __init__(
         self,
@@ -759,6 +847,8 @@ class GemmTuner(GemmCommonTuner):
         self.cu_num = self.get_cu_num()
         self.gemmobj = None
         self.num_warmup = 10
+        self.tgemm_baselines = {}
+        self.tgemm_filter_keys = set()
 
     def calculate_perf(
         self,
@@ -907,6 +997,14 @@ class GemmTuner(GemmCommonTuner):
                 verbose=args.verbose,
             )
 
+            if args.save_if_better_than_tgemm:
+                shape_key = gemmobj.get_shape_key()
+                if gemmobj.should_apply_tgemm_baseline_filter():
+                    self.tgemm_filter_keys.add(shape_key)
+                    baseline_us = gemmobj.measure_tgemm_baseline()
+                    if baseline_us is not None:
+                        self.tgemm_baselines[shape_key] = baseline_us
+
             ret.extend(gemmobj.run_solutions())
             gemmobj.cleanup()
             torch.cuda.synchronize()
@@ -998,6 +1096,22 @@ class GemmTuner(GemmCommonTuner):
                 else resultdf1.iloc[0]["kernelName"]
             )
             resultdf1.loc[0, "kernelName"] = kernal_name
+            if args.save_if_better_than_tgemm and key in self.tgemm_filter_keys:
+                baseline_us = self.tgemm_baselines.get(key)
+                best_us = float(resultdf1.iloc[0]["us"])
+                if baseline_us is None:
+                    logger.warning(
+                        f"tuned_gemm.mm baseline unavailable for {key}, keeping fastest tuned kernel"
+                    )
+                elif best_us >= baseline_us:
+                    print(
+                        f"{key} >>> Skip saving tuned kernel because best kernel {best_us}us is not faster than tuned_gemm.mm baseline {baseline_us}us",
+                        flush=True,
+                    )
+                    self.skipped = pd.concat(
+                        [self.skipped, resultdf1], ignore_index=True
+                    )
+                    continue
             if best_gtimedfs.empty:
                 best_gtimedfs = resultdf1
             else:

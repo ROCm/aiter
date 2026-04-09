@@ -62,6 +62,7 @@ class TunerCommon:
         self.topk = 1
         self.success = pd.DataFrame(columns=self.columns)
         self.failed = pd.DataFrame(columns=self.columns)
+        self.skipped = pd.DataFrame(columns=self.columns)
 
         self.remain_untuned = pd.DataFrame(columns=self.keys)
         self.sort_keys = key
@@ -400,7 +401,7 @@ class TunerCommon:
         """Summary of tuning results"""
         logger.info("============= Tuning results Summary: ==============")
         tuning_time = round(time.time() - self.tune_start_time, 4)
-        tunedf = pd.concat([self.success, self.failed])
+        tunedf = pd.concat([self.success, self.failed, self.skipped], ignore_index=True)
         logger.info(
             f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
         )
@@ -409,6 +410,9 @@ class TunerCommon:
             print(self.success, flush=True)
         logger.info("Failed shapes:")
         print(self.failed, flush=True)
+        logger.info("Skipped shapes:")
+        if not self.skipped.empty:
+            print(self.skipped, flush=True)
 
         tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
         mask = self.untunedf.apply(tuple, axis=1).isin(
