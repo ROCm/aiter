@@ -320,10 +320,26 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           set -ex
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Nightly build: syncing latest CK from develop branch in the prebuild image..."
+          else
+            echo "Using pinned CK commit from the prebuild image..."
+          fi
+
           rm -rf "${{ github.workspace }}/3rdparty/composable_kernel"
+          rm -rf "${{ github.workspace }}/.git/modules/3rdparty/composable_kernel"
           mkdir -p "${{ github.workspace }}/3rdparty"
+          mkdir -p "${{ github.workspace }}/.git/modules/3rdparty"
+          docker cp aiter_test:/aiter/.git/modules/3rdparty/composable_kernel \
+            "${{ github.workspace }}/.git/modules/3rdparty/composable_kernel"
           docker cp aiter_test:/aiter/3rdparty/composable_kernel \
             "${{ github.workspace }}/3rdparty/composable_kernel"
+
+          IMAGE_CK_COMMIT=$(docker exec aiter_test git -C /aiter/3rdparty/composable_kernel rev-parse HEAD)
+          WORKSPACE_CK_COMMIT=$(git -C "${{ github.workspace }}/3rdparty/composable_kernel" rev-parse HEAD)
+          echo "Image CK commit: ${IMAGE_CK_COMMIT}"
+          echo "Workspace CK commit: ${WORKSPACE_CK_COMMIT}"
+          test "${IMAGE_CK_COMMIT}" = "${WORKSPACE_CK_COMMIT}"
 
       - name: Show Aiter version
         run: |
