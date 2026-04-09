@@ -1,6 +1,9 @@
 name: Aiter Release Package
 
-description: This workflow builds the Aiter Python package as .whl files for Python 3.10 and 3.12, and uploads them as artifacts.
+description: >
+  Build Aiter precompiled kernel wheels (.whl) for Python 3.10/3.12,
+  push a Docker image with prebaked kernels, upload wheels to S3 and
+  GitHub Release.
 
 on:
   push:
@@ -53,6 +56,7 @@ on:
           - aiter-mi325-1gpu
           - linux-aiter-mi355-1
           - aiter-1gpu-runner
+          - aiter-k8s-build
       skip_github_release:
         description: 'Skip creating GitHub Release (for test builds)'
         type: boolean
@@ -62,9 +66,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
+env:
+  GPU_ARCHS: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
+  DOCKER_USERNAME: ${{ github.event.inputs.docker_username || 'rocmshard' }}
+  DOCKER_PASSWORD_SECRET: ${{ github.event.inputs.docker_password_secret || 'DOCKER_PASSWORD' }}
+
 jobs:
   build_whl_package:
     runs-on: ${{ github.event.inputs.runner || 'aiter-k8s-build' }}
+    permissions:
+      id-token: write
+      contents: read
 
     strategy:
       fail-fast: false
@@ -80,7 +92,6 @@ jobs:
     env:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
-      GPU_ARCHS: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
 
     steps:
       - name: Checkout aiter repo
@@ -111,7 +122,7 @@ jobs:
         if: ${{ matrix.build_enabled }}
         run: |
           set -ex
-          echo "${{ secrets[github.event.inputs.docker_password_secret || 'DOCKER_PASSWORD'] }}" | docker login -u "${{ github.event.inputs.docker_username || 'rocmshard' }}" --password-stdin
+          echo "${{ secrets[env.DOCKER_PASSWORD_SECRET] }}" | docker login -u "${{ env.DOCKER_USERNAME }}" --password-stdin
 
       - name: Run the container
         if: ${{ matrix.build_enabled }}
@@ -140,23 +151,47 @@ jobs:
         if: ${{ matrix.build_enabled }}
         run: |
           set -e
-          echo "Install ninja"
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 ninja
 
-      - name: Build Aiter
+      - name: Build Aiter with precompiled kernels
         if: ${{ matrix.build_enabled }}
         run: |
           set -e
-          echo "Building aiter whl packages for Python ${{ matrix.python_version }}..."
+          echo "Building aiter whl with PREBUILD_KERNELS=1 for Python ${{ matrix.python_version }}..."
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls dist/*.whl'
+          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls -lh dist/*.whl'
 
-      - name: Smoke test - install and import
+      - name: Verify prebuilt kernels in wheel
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -e
+          echo "=== Prebuilt kernel validation ==="
+          # Install the wheel and check kernel .so count
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          bash -c '
+            pip install dist/*.whl --force-reinstall
+            SITE_PKG=$(python3 -c "import aiter, os; print(os.path.dirname(aiter.__file__))")
+            KERNEL_COUNT=$(find "$SITE_PKG/jit" -name "*.so" 2>/dev/null | wc -l)
+            echo "Prebuilt kernel .so files: $KERNEL_COUNT"
+            if [ "$KERNEL_COUNT" -lt 10 ]; then
+              echo "::error::Prebuild FAILED: expected >= 10 kernel .so files, found $KERNEL_COUNT"
+              echo "This wheel will require JIT compilation at runtime and may cause OOM."
+              exit 1
+            else
+              echo "::notice::Prebuild OK: $KERNEL_COUNT kernels compiled"
+            fi
+            WHL_SIZE=$(du -sh dist/*.whl | cut -f1)
+            echo "Wheel size: $WHL_SIZE (prebuilt wheels are typically >100MB)"
+          '
+
+      - name: Smoke test - import and version
         if: ${{ matrix.build_enabled }}
         run: |
           set -e
@@ -165,9 +200,12 @@ jobs:
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           bash -c '
-            pip install dist/*.whl --force-reinstall &&
-            python3 -c "import aiter; print(f\"aiter version: {aiter.__version__}\")" &&
-            python3 -c "from aiter.ops.triton import gemm_afp4wfp4; print(\"triton gemm import OK\")" &&
+            python3 -c "
+import aiter
+print(f\"aiter version: {aiter.__version__}\")
+from aiter.ops.triton import gemm_afp4wfp4
+print(\"triton gemm import OK\")
+" &&
             echo "Smoke test PASSED"
           '
 
@@ -177,6 +215,60 @@ jobs:
         with:
           name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
+
+      # Push a tagged Docker image for release builds (matches CI nightly pattern)
+      - name: Commit and push release Docker image
+        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -ex
+          TAG="${GITHUB_REF#refs/tags/}"
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          IMAGE_BASE="rocm/aiter-ci"
+
+          # Commit the container with installed wheel as a new image
+          docker commit aiter_build_${{ matrix.python_version }} \
+            ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }}
+
+          # Also tag with commit SHA for traceability
+          docker tag \
+            ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }} \
+            ${IMAGE_BASE}:pre-build-${COMMIT_SHA}-py${{ matrix.python_version }}
+
+          docker push ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }}
+          docker push ${IMAGE_BASE}:pre-build-${COMMIT_SHA}-py${{ matrix.python_version }}
+          echo "Pushed: ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }}"
+
+      # Upload wheel to S3 (same path as nightly, with release subfolder)
+      - name: Configure AWS credentials
+        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
+
+      - name: Install AWS CLI
+        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Upload wheels to S3
+        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          for WHL in dist/*.whl; do
+            WHL_NAME=$(basename ${WHL})
+            echo "Uploading ${WHL_NAME} to S3..."
+            # Upload to release-specific path
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-releases/gfx942-gfx950/${TAG}/${WHL_NAME}
+            # Also upload to staging for downstream CI compatibility
+            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
+          done
+          echo "Wheels uploaded to S3 (releases + staging)"
 
       - name: Cleanup container
         if: always()
