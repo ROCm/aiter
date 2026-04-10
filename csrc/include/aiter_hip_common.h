@@ -6,20 +6,26 @@
 
 #include "aiter_enum.h"
 #include "aiter_logger.h"
-#include "aiter_tensor.h"
 #if !ENABLE_CK
 #include "ck_tile_shim.h"
 #else
 #include "ck_tile/core.hpp"
 #endif
 #include <cstdint>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
 
-namespace detail {
+namespace aiter_detail {
+
+inline thread_local bool g_aiter_can_throw = false;
+
 template <typename... Args>
 [[noreturn, noinline]] inline void aiter_check_fatal(const char* file, size_t line, Args&&... args)
 {
@@ -27,15 +33,30 @@ template <typename... Args>
     (std::cerr << ... << std::forward<Args>(args)) << std::endl;
     std::abort();
 }
-} // namespace detail
 
-#define AITER_CHECK(x, ...)                                             \
-    do                                                                  \
-    {                                                                   \
-        if(!(x)) [[unlikely]]                                           \
-        {                                                               \
-            detail::aiter_check_fatal(__FILE__, __LINE__, __VA_ARGS__); \
-        }                                                               \
+template <typename... Args>
+[[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
+{
+    std::ostringstream oss;
+    oss << "[AITER] " << file << ":" << line << " ";
+    (oss << ... << std::forward<Args>(args));
+    std::string msg = oss.str();
+    std::cerr << msg << std::endl;
+    if(g_aiter_can_throw)
+    {
+        throw std::runtime_error(std::move(msg));
+    }
+    std::abort();
+}
+} // namespace aiter_detail
+
+#define AITER_CHECK(x, ...)                                            \
+    do                                                                 \
+    {                                                                  \
+        if(!(x)) [[unlikely]]                                          \
+        {                                                              \
+            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__); \
+        }                                                              \
     } while(0)
 
 #define HIP_CALL(call)                                                            \
@@ -44,11 +65,11 @@ template <typename... Args>
         hipError_t err = call;                                                    \
         if(err != hipSuccess) [[unlikely]]                                        \
         {                                                                         \
-            detail::aiter_check_fatal(__FILE__,                                   \
-                                      __LINE__,                                   \
-                                      "fail to call " #call " ---> [HIP error](", \
-                                      hipGetErrorString(err),                     \
-                                      ')');                                       \
+            aiter_detail::aiter_check_fatal(__FILE__,                                 \
+                                        __LINE__,                                 \
+                                        "fail to call " #call " ---> [HIP error](", \
+                                        hipGetErrorString(err),                   \
+                                        ')');                                       \
         }                                                                         \
     } while(0)
 
@@ -256,6 +277,8 @@ struct WarpSizeValue
     }
 };
 
+// WARNING: Do not use WARP_SIZE as const/constexpr in host code;
+// it will take the host-pass fallback path and cause a compile error.
 inline constexpr WarpSizeValue WARP_SIZE{};
 
 static int get_pci_chip_id()
