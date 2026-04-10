@@ -174,6 +174,7 @@ def _validate_hgemm_inputs(
     a: torch.Tensor,
     b: torch.Tensor,
     out: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
 ) -> tuple[int, int, int]:
     if a.dim() != 2 or b.dim() != 2:
         raise ValueError(
@@ -208,6 +209,18 @@ def _validate_hgemm_inputs(
             raise ValueError(f"`out` must be on {a.device}, got {out.device}")
         if not out.is_contiguous():
             raise ValueError("`out` must be contiguous")
+
+    if bias is not None:
+        if bias.dim() != 1:
+            raise ValueError(f"`bias` must be 1D, got bias.dim={bias.dim()}")
+        if bias.shape != (n,):
+            raise ValueError(f"`bias` must have shape {(n,)}, got {tuple(bias.shape)}")
+        if bias.dtype != a.dtype:
+            raise ValueError(
+                f"`bias` dtype must match input dtype, got {bias.dtype=} {a.dtype=}"
+            )
+        if bias.device != a.device:
+            raise ValueError(f"`bias` must be on {a.device}, got {bias.device}")
 
     return m, n, k
 
@@ -519,6 +532,7 @@ def _compile_flydsl_hgemm(
     b_preshuffle: bool = True,
     split_k: int = 1,
     c_to_lds: bool = False,
+    has_bias: bool = False,
 ):
     if dtype not in {"f16", "bf16"}:
         raise ValueError(f"`dtype` must be 'f16' or 'bf16', got {dtype!r}")
@@ -558,6 +572,7 @@ def _compile_flydsl_hgemm(
         BLOCK_N_WARPS=block_n_warps,
         B_PRE_SHUFFLE=b_preshuffle,
         B_TO_LDS=b_to_lds,
+        HAS_BIAS=has_bias,
     )
 
     def launcher(
@@ -565,19 +580,32 @@ def _compile_flydsl_hgemm(
         a: torch.Tensor,
         b: torch.Tensor,
         signal_state: int,
+        bias: Optional[torch.Tensor] = None,
         stream: Optional[torch.cuda.Stream] = None,
     ):
+        if has_bias and bias is None:
+            raise ValueError(
+                "This launcher was compiled with bias support and requires `bias`."
+            )
+        if not has_bias and bias is not None:
+            raise ValueError(
+                "This launcher was compiled without bias support; recompile with `has_bias=True`."
+            )
         runtime_m = int(a.shape[0])
         _check_split_k_counter_capacity(runtime_m, n, tile_m, tile_n, split_k)
         launch_stream = _normalize_launch_stream(a.device, stream)
         semaphore = _get_split_k_global_semaphore(launch_stream)
+        # `compile_hgemm_kernel()` always takes a BIAS argument; when bias is
+        # disabled, reuse `b` as a live placeholder instead of allocating zeros.
+        bias_arg = bias if bias is not None else b
         exe_compiled = kernel.compile(
-            out, a, b, runtime_m, semaphore, signal_state, stream
+            out, a, b, bias_arg, runtime_m, semaphore, signal_state, launch_stream
         )
         return exe_compiled(
             out,
             a,
             b,
+            bias_arg,
             runtime_m,
             semaphore,
             signal_state,
@@ -592,6 +620,7 @@ def flydsl_hgemm(
     b: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     *,
+    bias: Optional[torch.Tensor] = None,
     tile_m: int = 128,
     tile_n: int = 128,
     tile_k: int = 64,
@@ -609,13 +638,15 @@ def flydsl_hgemm(
 ) -> torch.Tensor:
     """Run FlyDSL HGEMM."""
 
-    m, n, k = _validate_hgemm_inputs(a, b, out)
+    m, n, k = _validate_hgemm_inputs(a, b, out, bias)
     kernel_dtype = _to_kernel_dtype(a.dtype)
 
     if not a.is_contiguous():
         a = a.contiguous()
     if not b.is_contiguous():
         b = b.contiguous()
+    if bias is not None and not bias.is_contiguous():
+        bias = bias.contiguous()
 
     if b_preshuffle and not getattr(b, "is_shuffled", False):
         if auto_shuffle_b:
@@ -650,9 +681,10 @@ def flydsl_hgemm(
         b_preshuffle=b_preshuffle,
         split_k=split_k,
         c_to_lds=c_to_lds,
+        has_bias=bias is not None,
     )
 
-    launcher(out, a, b, signal_state=signal_state, stream=launch_stream)
+    launcher(out, a, b, signal_state=signal_state, bias=bias, stream=launch_stream)
     if split_k > 1:
         _advance_split_k_signal_state(launch_stream)
     return out

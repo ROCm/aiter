@@ -434,6 +434,7 @@ def flydsl_gemm(
     out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
         inp,
         weights,
+        bias=bias,
         tile_m=config["tile_m"],
         tile_n=config["tile_n"],
         tile_k=config["tile_k"],
@@ -445,8 +446,6 @@ def flydsl_gemm(
     )
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
-    if bias is not None:
-        out = out + bias
     return out
 
 
