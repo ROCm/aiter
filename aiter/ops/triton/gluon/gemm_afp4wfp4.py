@@ -4,7 +4,6 @@ import json
 
 import torch
 import triton
-import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -12,15 +11,11 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-import aiter.ops.triton.gluon.triton_version as tv
 
 _LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
-
-# Pre-compute version check as constexpr for use in JIT kernels
-TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 
 @triton.heuristics(
@@ -151,9 +146,7 @@ def _gemm_afp4wfp4_kernel(
         vec=1, per_phase=1, max_phase=1, order=[0, 1]
     )
 
-    MFMA_INSTR_SHAPE: gl.constexpr = (
-        [32, 32, 64] if TRITON_VERSION_GE_3_6_0 else [32, 32]
-    )
+    MFMA_INSTR_SHAPE: gl.constexpr = [32, 32, 64]
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=MFMA_INSTR_SHAPE,
