@@ -40,6 +40,10 @@
 #define ROTATE_STYLE_NEOX 0
 #define ROTATE_STYLE_GPTJ 1
 
+// When ENABLE_ROPE_POSITIONS_INT32 is non-zero at compile time (e.g. -DENABLE_ROPE_POSITIONS_INT32=1),
+// RoPE cached-indirect kernels are also built for int32 positions tensors; dispatch switches on
+// positions.scalar_type() at runtime. When zero, only int64 (torch.long) positions are accepted.
+
 namespace aiter {
 // =====================================================================================================================
 // Kernel Helper Functions
@@ -5499,10 +5503,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                          Stride0Eq1,
                                                          Stride1Eq1,
                                                          VP,
-                                                         DB,
-                                                         scalar_t,
-                                                         scalar_f_t,
-                                                         pos_t>
+                                                         DB>
                 <<<grid, block, 0, stream>>>(p_output_x,
                                              p_output_y,
                                              p_cos,
@@ -5538,10 +5539,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                              Stride0Eq1,
                                                              Stride1Eq1,
                                                              VP,
-                                                             DB,
-                                                             scalar_t,
-                                                             scalar_f_t,
-                                                             pos_t>
+                                                             DB>
                     <<<grid, block, 0, stream>>>(p_output_x,
                                                  p_output_y,
                                                  p_cos,
@@ -5580,10 +5578,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                  Stride2Eq1,
                                                  Stride3Eq1,
                                                  VP,
-                                                 DB,
-                                                 scalar_t,
-                                                 scalar_f_t,
-                                                 pos_t><<<grid, block, 0, stream>>>(p_output_x,
+                                                 DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                                  p_output_y,
                                                                                  p_input_x,
                                                                                  p_input_y,
@@ -5632,10 +5627,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                      Stride2Eq1,
                                                      Stride3Eq1,
                                                      VP,
-                                                     DB,
-                                                     scalar_t,
-                                                     scalar_f_t,
-                                                     pos_t><<<grid, block, 0, stream>>>(p_output_x,
+                                                     DB><<<grid, block, 0, stream>>>(p_output_x,
                                                                                      p_output_y,
                                                                                      p_input_x,
                                                                                      p_input_y,
@@ -6385,24 +6377,12 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 }
 } // namespace aiter
 
-/* POSITIONS_ST -> pos_t (int32_t / int64_t). Use positions.scalar_type() when a positions tensor exists. */
+// Call sites use positions.data_ptr<pos_t>() inside __VA_ARGS__; pos_t is a local alias.
+#if ENABLE_ROPE_POSITIONS_INT32
 #define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
     TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
-    switch((POSITIONS_ST))                                                        \
+    if((POSITIONS_ST) == at::ScalarType::Int)                                      \
     {                                                                             \
-    case at::ScalarType::Long: {                                                  \
-        using pos_t = int64_t;                                                    \
-        DISPATCH_ROPE_TYPES_PARAMS(                                               \
-            TYPE0,                                                                \
-            TYPE1,                                                                \
-            ROTATE_STYLE,                                                         \
-            REUSE_FREQS_FRONT_PART,                                               \
-            NOPE_FIRST,                                                           \
-            NAME,                                                                 \
-            __VA_ARGS__);                                                         \
-        break;                                                                    \
-    }                                                                             \
-    case at::ScalarType::Int: {                                                   \
         using pos_t = int32_t;                                                    \
         DISPATCH_ROPE_TYPES_PARAMS(                                               \
             TYPE0,                                                                \
@@ -6412,15 +6392,41 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             NOPE_FIRST,                                                           \
             NAME,                                                                 \
             __VA_ARGS__);                                                         \
-        break;                                                                    \
     }                                                                             \
-    default:                                                                      \
+    else                                                                          \
+    {                                                                             \
         TORCH_CHECK(false,                                                        \
                     NAME,                                                         \
-                    " doesn't support positions dtype ",                          \
+                    " does not support positions dtype ",                         \
                     toString((POSITIONS_ST)),                                     \
-                    ".");                                                         \
+                    " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
+                    " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
     }
+#else
+#define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
+    TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
+    if((POSITIONS_ST) == at::ScalarType::Long)                                    \
+    {                                                                             \
+        using pos_t = int64_t;                                                    \
+        DISPATCH_ROPE_TYPES_PARAMS(                                               \
+            TYPE0,                                                                \
+            TYPE1,                                                                \
+            ROTATE_STYLE,                                                         \
+            REUSE_FREQS_FRONT_PART,                                               \
+            NOPE_FIRST,                                                           \
+            NAME,                                                                 \
+            __VA_ARGS__);                                                         \
+    }                                                                             \
+    else                                                                          \
+    {                                                                             \
+        TORCH_CHECK(false,                                                        \
+                    NAME,                                                         \
+                    " does not support positions dtype ",                         \
+                    toString((POSITIONS_ST)),                                     \
+                    " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
+                    " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
+    }
+#endif
 
 #define DISPATCH_ROPE_TYPES_PARAMS(                                               \
     TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
