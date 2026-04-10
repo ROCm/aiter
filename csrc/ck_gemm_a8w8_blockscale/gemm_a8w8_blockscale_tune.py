@@ -262,8 +262,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         seed,
         preshuffleB,
         block_per_cu,
-        num_warmup,
-        num_iters,
+        run_kwargs,
     ):
         cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
@@ -309,10 +308,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             splitK,
                             preshuffleB,
                         ),
-                        {
-                            "num_warmup": num_warmup,
-                            "num_iters": num_iters,
-                        },
+                        dict(run_kwargs),
                         run_torch,
                         (
                             ref_data_idx,
@@ -333,8 +329,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         useSplitK,
         seed,
         preshuffleB,
-        num_warmup,
-        num_iters,
+        run_kwargs,
     ):
         cu_num, M, N, K = info_keys
         kernel_list = (
@@ -374,10 +369,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                             splitK,
                             preshuffleB,
                         ),
-                        {
-                            "num_warmup": num_warmup,
-                            "num_iters": num_iters,
-                        },
+                        dict(run_kwargs),
                         run_torch,
                         (
                             ref_data_idx,
@@ -401,6 +393,10 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
         is_preshuffle = args.preshuffle
         untunedf = self.untunedf
+        run_kwargs = {
+            "num_warmup": args.warmup,
+            "num_iters": args.iters,
+        }
         results = []
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
@@ -408,7 +404,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             K = int(untunedf.loc[i, "K"])
             shape_str = f"({M}, {N}, {K})"
             try:
-                x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t = (
+                x, weight, x_scale, w_scale, out, weight_shuffle, x_scale_t, _ = (
                     generate_data(M, N, K, 0)
                 )
                 if is_preshuffle:
@@ -418,8 +414,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         weight_shuffle,
                         x_scale_t,
                         w_scale,
-                        num_warmup=args.warmup,
-                        num_iters=args.iters,
+                        **run_kwargs,
                     )
                 else:
                     out, us = run_perftest(
@@ -428,8 +423,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         weight,
                         x_scale,
                         w_scale,
-                        num_warmup=args.warmup,
-                        num_iters=args.iters,
+                        **run_kwargs,
                     )
                 ref = run_torch(x, weight, x_scale, w_scale)
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
@@ -438,14 +432,14 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             except Exception as e:
                 results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
         return results
+
     def get_gemm_a8w8_blockscale_asm_tune_task(
         self,
         info_keys,
         useSplitK,
         seed,
         preshuffleB,
-        num_warmup,
-        num_iters,
+        run_kwargs,
     ):
         cu_num, M, N, K = info_keys
         asm_kernel_list_csv = (
@@ -489,10 +483,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                                 splitK,
                                 preshuffleB,
                             ),
-                            {
-                                "num_warmup": num_warmup,
-                                "num_iters": num_iters,
-                            },
+                            dict(run_kwargs),
                             run_torch,
                             (
                                 ref_data_idx,
@@ -519,8 +510,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         isPreshuffleB = args.preshuffle
         shape_grouped = False
         errRatio = args.errRatio
-        num_warmup = args.warmup
-        num_iters = args.iters
         block_per_cu = args.blockPerCu
         cu_num = self.get_cu_num()
         run_kwargs = {
@@ -545,8 +534,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         useSplitK,
                         seed,
                         isPreshuffleB,
-                        num_warmup,
-                        num_iters,
+                        run_kwargs,
                     )
                 )
             if lib in ("cktile", "both", "all"):
@@ -557,8 +545,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         seed,
                         isPreshuffleB,
                         block_per_cu,
-                        num_warmup,
-                        num_iters,
+                        run_kwargs,
                     )
                 )
             if lib in ("asm", "all"):
@@ -568,8 +555,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         useSplitK,
                         seed,
                         isPreshuffleB,
-                        num_warmup,
-                        num_iters,
+                        run_kwargs,
                     )
                 )
             total_kernel_nums = len(task)
