@@ -1550,6 +1550,9 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             )
             rocdl.sched_barrier(0)
 
+            if pv_pair < NUM_PV_ITERS // 2 - 1:
+                rocdl.s_nop(1)
+
         rocdl.s_setprio(0)
         return oaccu
 
