@@ -133,6 +133,16 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          MODEL_MOUNT=""
+          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+            if [ -d "/models" ]; then
+              MODEL_MOUNT="-v /models:/models"
+              echo "Using host model cache mount: /models"
+            else
+              echo "Warning: /models directory not found on runner; MI35X model cache will stay container-local."
+            fi
+          fi
+
           cat > /tmp/env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
           EOF
@@ -142,6 +152,7 @@ jobs:
           cat /tmp/env_file.txt
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          $MODEL_MOUNT \
           --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
