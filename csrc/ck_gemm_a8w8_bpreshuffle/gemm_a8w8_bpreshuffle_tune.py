@@ -16,18 +16,6 @@ import argparse
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
 
-
-def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
-    """Filter splitK values to only those that produce valid TileK-aligned partitions."""
-    valid = []
-    for sk in range(1, max_splitK + 1):
-        k_per_split = (K + sk - 1) // sk
-        k_per_split_aligned = ((k_per_split + tile_k - 1) // tile_k) * tile_k
-        actual_ksplit = (K + k_per_split_aligned - 1) // k_per_split_aligned
-        if actual_ksplit == sk:
-            valid.append(sk)
-    return valid if valid else [1]
-
 sys.path.insert(0, f"{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/")
 from gemm_a8w8_bpreshuffle_cktile_common import (
     kernels_list as kernels_list_cktile,
@@ -57,6 +45,18 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 
 if is_flydsl_available():
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+
+def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
+    """Filter splitK values to only those that produce valid TileK-aligned partitions."""
+    valid = []
+    for sk in range(1, max_splitK + 1):
+        k_per_split = (K + sk - 1) // sk
+        k_per_split_aligned = ((k_per_split + tile_k - 1) // tile_k) * tile_k
+        actual_ksplit = (K + k_per_split_aligned - 1) // k_per_split_aligned
+        if actual_ksplit == sk:
+            valid.append(sk)
+    return valid if valid else [1]
 
 
 def _get_padded_m(M: int) -> int:
