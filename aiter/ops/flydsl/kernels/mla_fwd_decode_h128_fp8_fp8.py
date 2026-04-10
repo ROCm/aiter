@@ -1175,17 +1175,16 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
     # ---- Helper: rescale oaccu ----
     def _rescale_oaccu(oaccu, rescale):
         """Multiply all oaccu accumulators by rescale factor.
-        Descending s_setprio 8->0 matches HK lines 462-502."""
+        Descending s_setprio 3->0 across 4 groups of 8 muls."""
         rescale_vec = vector.broadcast(T.f32x4, rescale)
         result = [None] * len(oaccu)
-        for group in range_constexpr(8):
-            rocdl.s_setprio(8 - group)
-            for j in range_constexpr(4):
-                i = group * 4 + j
+        for group in range_constexpr(4):
+            rocdl.s_setprio(3 - group)
+            for j in range_constexpr(8):
+                i = group * 8 + j
                 result[i] = _std_arith.MulFOp(
                     _raw(oaccu[i]), _raw(rescale_vec), fastmath=fm_fast
                 ).result
-        rocdl.s_setprio(0)
         return result
 
     # ---- Helper: output bf16 (simplified direct write, no LDS reshape) ----
