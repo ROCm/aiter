@@ -203,17 +203,19 @@ def run_pretune(
     build_one_module=None,
     libtype: str = "all",
     retune_all: bool = True,
+    target_shapes: list | None = None,
 ) -> None:
     """
     Pretune cycle for one tune module.
 
     When build_one_module is provided (setup.py / PRETUNE_MODULES path):
       1. Build the tune .so  (gen_instances.py --tune → all candidate kernels).
-      2. Write a temp untune CSV with all unique shape keys from the merged tune CSV,
-         no gfx/cu_num — the tuner auto-fills those from the live GPU.
+      2. Write a temp untune CSV with shape keys to benchmark.  When target_shapes
+         is provided, only those shapes are written; otherwise all unique shapes
+         from the merged tune CSV are used.
       3. Run the tune script.  When retune_all=True (default) --all is passed so
-         every shape is re-benchmarked; when retune_all=False only untuned shapes
-         are benchmarked (used by warmup() to avoid redundant work).
+         every shape is re-benchmarked; when retune_all=False only shapes not yet
+         tuned for the live GPU are benchmarked.
       4. Rebuild the inference .so  (gen_instances.py --tune_file → winners only).
 
     When build_one_module is None (standalone / direct path):
@@ -276,7 +278,22 @@ def run_pretune(
     # auto-tags rows with live GPU's gfx/cu_num, re-benchmarks shapes already
     # in tune_file, and tunes shapes not yet present for this GPU.
     shape_keys = ["B", "M", "N", "K"]
-    untune_csv = _make_untune_csv(tune_file, shape_keys)
+    if target_shapes is not None:
+        import pandas as pd  # deferred: absent during CI metadata-only phase
+
+        shape_cols = (
+            ["M", "N", "K"] if len(target_shapes[0]) == 3 else ["B", "M", "N", "K"]
+        )
+        df = pd.DataFrame(target_shapes, columns=shape_cols).drop_duplicates()
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", prefix="aiter_pretune_", delete=False
+        )
+        df.to_csv(tmp.name, index=False)
+        tmp.close()
+        _log(f"[pretune] {len(df)} targeted shapes → {tmp.name}")
+        untune_csv = tmp.name
+    else:
+        untune_csv = _make_untune_csv(tune_file, shape_keys)
 
     try:
         # ── 3. Run tuner ───────────────────────────────────────────────────
@@ -550,8 +567,16 @@ def warmup(
     try:
         cov = check_tuning_coverage(module_name, cfg, csrc_dir, repo_dir)
     except Exception as exc:
-        logger.warning(f"[pretune] warmup: coverage check failed for {module_name}: {exc}")
-        return {"module": module_name, "total": 0, "tuned": 0, "coverage": 0.0, "missing": len(shapes)}
+        logger.warning(
+            f"[pretune] warmup: coverage check failed for {module_name}: {exc}"
+        )
+        return {
+            "module": module_name,
+            "total": 0,
+            "tuned": 0,
+            "coverage": 0.0,
+            "missing": len(shapes),
+        }
 
     # Check which of the requested shapes are missing.
     import pandas as pd  # deferred
@@ -566,7 +591,9 @@ def warmup(
     dfs = [pd.read_csv(p) for p in paths if os.path.exists(p)]
     merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-    shape_cols = [c for c in ["B", "M", "N", "K"] if not merged.empty and c in merged.columns]
+    shape_cols = [
+        c for c in ["B", "M", "N", "K"] if not merged.empty and c in merged.columns
+    ]
 
     # Build a set of tuned shape keys for this GPU.
     tuned_set: set[tuple] = set()
@@ -592,7 +619,9 @@ def warmup(
 
     missing = len(missing_shapes)
     if missing == 0:
-        logger.info(f"[pretune] warmup: {module_name} — all {len(shapes)} shapes covered.")
+        logger.info(
+            f"[pretune] warmup: {module_name} — all {len(shapes)} shapes covered."
+        )
     elif auto_tune:
         logger.info(
             f"[pretune] warmup: {module_name} — {missing}/{len(shapes)} shapes missing. "
@@ -607,6 +636,7 @@ def warmup(
                 repo_dir,
                 build_one_module=None,
                 retune_all=False,
+                target_shapes=missing_shapes,
             )
         except Exception as exc:
             logger.warning(f"[pretune] warmup: tuner failed for {module_name}: {exc}")
