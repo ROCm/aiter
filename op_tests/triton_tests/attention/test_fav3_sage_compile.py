@@ -53,18 +53,32 @@ def test_sage_compile_fullgraph(
     torch.cuda.empty_cache()
 
     if layout == "bhsd":
-        q = torch.randn(BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ, device="cuda", dtype=dtype)
-        k = torch.randn(BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ, device="cuda", dtype=dtype)
-        v = torch.randn(BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ, device="cuda", dtype=dtype)
+        q = torch.randn(
+            BATCH, NUM_Q_HEADS, SEQLEN_Q, HEAD_SZ, device="cuda", dtype=dtype
+        )
+        k = torch.randn(
+            BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ, device="cuda", dtype=dtype
+        )
+        v = torch.randn(
+            BATCH, NUM_K_HEADS, SEQLEN_K, HEAD_SZ, device="cuda", dtype=dtype
+        )
     else:
-        q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
-        k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
-        v = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+        q = torch.randn(
+            BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype
+        )
+        k = torch.randn(
+            BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype
+        )
+        v = torch.randn(
+            BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype
+        )
 
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
 
     def fn(q, k, v):
-        return fav3_sage_wrapper_func(q, k, v, softmax_scale, causal=False, layout=layout)
+        return fav3_sage_wrapper_func(
+            q, k, v, softmax_scale, causal=False, layout=layout
+        )
 
     # Eager baseline
     out_eager = fn(q, k, v)
@@ -80,9 +94,9 @@ def test_sage_compile_fullgraph(
     torch.cuda.synchronize()
 
     assert not torch.isnan(out_compiled).any(), "torch.compile produced NaN"
-    assert out_eager.shape == out_compiled.shape, (
-        f"Shape mismatch: eager {out_eager.shape} vs compiled {out_compiled.shape}"
-    )
+    assert (
+        out_eager.shape == out_compiled.shape
+    ), f"Shape mismatch: eager {out_eager.shape} vs compiled {out_compiled.shape}"
 
     # Use the same fp8-friendly tolerances as the existing sage tests:
     # atol=0.3, rtol=0.25, and allow up to 0.5% of elements to exceed them.
@@ -110,7 +124,9 @@ def test_sage_compile_no_recompilation(layout: str, dtype=torch.bfloat16):
     softmax_scale = 1.0 / math.sqrt(D)
 
     def fn(q, k, v):
-        return fav3_sage_wrapper_func(q, k, v, softmax_scale, causal=False, layout=layout)
+        return fav3_sage_wrapper_func(
+            q, k, v, softmax_scale, causal=False, layout=layout
+        )
 
     compiled_fn = torch.compile(fn, fullgraph=True)
 
