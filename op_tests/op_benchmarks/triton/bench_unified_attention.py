@@ -1,6 +1,6 @@
 import itertools
 import sys
-
+import argparse
 import torch
 import triton
 
@@ -369,7 +369,7 @@ def parse_int_or_list(value):
     return int(value)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     parser = get_parser(kernel_name="Unified Attention")
 
     parser.add_argument("-b", type=int, default=0)
@@ -445,11 +445,11 @@ def parse_args():
         help="Sliding window size (default: disabled)",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
-def main():
-    args = parse_args()
+def main(args: list[str] | None = None) -> None:
+    args = parse_args(args=args)
 
     if args.fp8 and args.fp8_kv:
         raise ValueError(
