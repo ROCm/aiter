@@ -2,10 +2,10 @@ name: Sglang Downstream Test
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
-    branches: [main]  # Triggers on PRs targeting `main`
+    branches: [main, 'release/**']
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
