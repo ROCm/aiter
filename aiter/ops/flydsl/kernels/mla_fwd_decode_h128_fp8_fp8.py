@@ -1569,6 +1569,421 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         rocdl.sched_barrier(0)
         return _gemm2_core(p_pack, oaccu, vt_base_i32)
 
+    def _pack_f32x4_to_bf16_2dw(acc_val):
+        """Convert f32x4 accumulator to 2 packed bf16 dwords."""
+        bf16_vals = _std_arith.TruncFOp(T.bf16x4, acc_val).result
+        i16_vals = _std_arith.BitcastOp(T.i16x4, bf16_vals).result
+        i16_0 = vector.extract(i16_vals, static_position=[0], dynamic_position=[])
+        i16_1 = vector.extract(i16_vals, static_position=[1], dynamic_position=[])
+        i16_2 = vector.extract(i16_vals, static_position=[2], dynamic_position=[])
+        i16_3 = vector.extract(i16_vals, static_position=[3], dynamic_position=[])
+        lo_0 = _std_arith.ExtUIOp(T.i32, i16_0).result
+        hi_0 = _std_arith.ExtUIOp(T.i32, i16_1).result
+        c16 = _raw(arith.constant(16, type=T.i32))
+        dw0 = _std_arith.OrIOp(lo_0, _std_arith.ShLIOp(hi_0, c16).result).result
+        lo_1 = _std_arith.ExtUIOp(T.i32, i16_2).result
+        hi_1 = _std_arith.ExtUIOp(T.i32, i16_3).result
+        dw1 = _std_arith.OrIOp(lo_1, _std_arith.ShLIOp(hi_1, c16).result).result
+        return dw0, dw1
+
+    # ---- Pre-compute LDS reshape addresses (computed once, reused per store) ----
+    # bf16 LDS write address (MFMA layout): row_st = lane%16, col_st = (lane/16)*4
+    _o16_row_st = _std_arith.RemUIOp(
+        _raw(lane_idx_i32), _raw(arith.constant(16, type=T.i32))
+    ).result
+    _o16_col_st = _std_arith.MulIOp(
+        _std_arith.DivUIOp(
+            _raw(lane_idx_i32), _raw(arith.constant(16, type=T.i32))
+        ).result,
+        _raw(arith.constant(4, type=T.i32)),
+    ).result
+    # get_v_offset_lds(r,c) = ((r/2)*68 + (r%2)*32 + c) * 2  [bytes]
+    _o16_st_offset = _std_arith.MulIOp(
+        _std_arith.AddIOp(
+            _std_arith.AddIOp(
+                _std_arith.MulIOp(
+                    _std_arith.DivUIOp(
+                        _o16_row_st, _raw(arith.constant(2, type=T.i32))
+                    ).result,
+                    _raw(arith.constant(O16_ELEM_PER_PAD_2ROWS, type=T.i32)),
+                ).result,
+                _std_arith.MulIOp(
+                    _std_arith.RemUIOp(
+                        _o16_row_st, _raw(arith.constant(2, type=T.i32))
+                    ).result,
+                    _raw(arith.constant(O16_NUM_COLS, type=T.i32)),
+                ).result,
+            ).result,
+            _o16_col_st,
+        ).result,
+        _raw(arith.constant(2, type=T.i32)),  # sizeof(bf16)
+    ).result
+
+    # bf16 LDS read address (coalesced layout): row_ld = lane/4, col_ld = (lane%4)*8
+    _o16_row_ld = _std_arith.DivUIOp(
+        _raw(lane_idx_i32), _raw(arith.constant(4, type=T.i32))
+    ).result
+    _o16_col_ld = _std_arith.MulIOp(
+        _std_arith.RemUIOp(
+            _raw(lane_idx_i32), _raw(arith.constant(4, type=T.i32))
+        ).result,
+        _raw(arith.constant(8, type=T.i32)),
+    ).result
+    _o16_rd_offset = _std_arith.MulIOp(
+        _std_arith.AddIOp(
+            _std_arith.AddIOp(
+                _std_arith.MulIOp(
+                    _std_arith.DivUIOp(
+                        _o16_row_ld, _raw(arith.constant(2, type=T.i32))
+                    ).result,
+                    _raw(arith.constant(O16_ELEM_PER_PAD_2ROWS, type=T.i32)),
+                ).result,
+                _std_arith.MulIOp(
+                    _std_arith.RemUIOp(
+                        _o16_row_ld, _raw(arith.constant(2, type=T.i32))
+                    ).result,
+                    _raw(arith.constant(O16_NUM_COLS, type=T.i32)),
+                ).result,
+            ).result,
+            _o16_col_ld,
+        ).result,
+        _raw(arith.constant(2, type=T.i32)),  # sizeof(bf16)
+    ).result
+
+    # f32 LDS write address: same row_st/col_st but different padding
+    # get_v_offset_lds(r,c) = (r * 36 + c) * 4  [bytes]
+    _o32_st_offset = _std_arith.MulIOp(
+        _std_arith.AddIOp(
+            _std_arith.MulIOp(
+                _o16_row_st,  # reuse: lane%16
+                _raw(arith.constant(O32_ELEM_PER_PAD_ROW, type=T.i32)),
+            ).result,
+            _o16_col_st,  # reuse: (lane/16)*4
+        ).result,
+        _raw(arith.constant(4, type=T.i32)),  # sizeof(f32)
+    ).result
+
+    # f32 LDS read address: row_ld = lane/8, col_ld = (lane%8)*4
+    _o32_row_ld = _std_arith.DivUIOp(
+        _raw(lane_idx_i32), _raw(arith.constant(8, type=T.i32))
+    ).result
+    _o32_col_ld = _std_arith.MulIOp(
+        _std_arith.RemUIOp(
+            _raw(lane_idx_i32), _raw(arith.constant(8, type=T.i32))
+        ).result,
+        _raw(arith.constant(4, type=T.i32)),
+    ).result
+    _o32_rd_offset = _std_arith.MulIOp(
+        _std_arith.AddIOp(
+            _std_arith.MulIOp(
+                _o32_row_ld,
+                _raw(arith.constant(O32_ELEM_PER_PAD_ROW, type=T.i32)),
+            ).result,
+            _o32_col_ld,
+        ).result,
+        _raw(arith.constant(4, type=T.i32)),  # sizeof(f32)
+    ).result
+
+    def _store_oaccu_pair_bf16(oaccu_a, oaccu_b, tile_idx, p_lds_o_i32, row_base_i32):
+        """Store 2 oaccu groups (1 PV iter) as bf16 via LDS reshape.
+
+        Matches HK OManager16bitsV2: writes MFMA-layout data to LDS,
+        reads back in row-major coalesced layout, then buffer_store_dwordx4.
+        """
+        # Per-warp LDS base
+        lds_warp = _std_arith.AddIOp(
+            p_lds_o_i32,
+            _std_arith.MulIOp(
+                _raw(warp_idx_i32), _raw(arith.constant(O16_LDS_PER_WARP, type=T.i32))
+            ).result,
+        ).result
+        lds_st_addr = _std_arith.AddIOp(lds_warp, _o16_st_offset).result
+
+        # LDS write: 2 sub-blocks -> 2x ds_write_b64
+        for sub, acc_val in enumerate([oaccu_a, oaccu_b]):
+            dw0, dw1 = _pack_f32x4_to_bf16_2dw(acc_val)
+            vec_2dw = vector.from_elements(T.i32x2, [dw0, dw1])
+            sub_offset = sub * O16_NUM_COLS  # 0 or 32 bytes (16 bf16 cols x 2 bytes)
+            st_addr_sub = _std_arith.AddIOp(
+                lds_st_addr, _raw(arith.constant(sub_offset, type=T.i32))
+            ).result
+            st_i64 = _std_arith.ExtUIOp(T.i64, st_addr_sub).result
+            st_ptr = _inttoptr_lds(st_i64)
+            llvm.StoreOp(
+                vec_2dw,
+                st_ptr,
+                alignment=8,
+                volatile_=True,
+            )  # ds_write_b64
+
+        rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+        # LDS read: ds_read_b128 (4 dwords = 8 bf16 in coalesced layout)
+        lds_rd_addr = _std_arith.AddIOp(lds_warp, _o16_rd_offset).result
+        rd_i64 = _std_arith.ExtUIOp(T.i64, lds_rd_addr).result
+        rd_ptr = _inttoptr_lds(rd_i64)
+        data = llvm.LoadOp(T.i32x4, rd_ptr, alignment=16).result  # ds_read_b128
+
+        rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+        # Coalesced VRAM store: buffer_store_dwordx4
+        # row = row_ld + row_base, col = col_ld + tile_idx * MFMA_N * 2
+        col_offset_i32 = _raw(arith.constant(tile_idx * MFMA_N * 2, type=T.i32))
+        row_vram = _std_arith.AddIOp(row_base_i32, _o16_row_ld).result
+        col_vram = _std_arith.AddIOp(_o16_col_ld, col_offset_i32).result
+        vram_offset = _std_arith.MulIOp(
+            _std_arith.AddIOp(
+                _std_arith.MulIOp(
+                    row_vram, _raw(arith.constant(V_HEAD_DIM, type=T.i32))
+                ).result,
+                col_vram,
+            ).result,
+            _raw(arith.constant(2, type=T.i32)),  # sizeof(bf16)
+        ).result
+        buffer_ops.buffer_store(
+            data,
+            final_output_rsrc,
+            vram_offset,
+            offset_is_bytes=True,
+        )
+
+    def _store_oaccu_pair_split(oaccu_a, oaccu_b, tile_idx, p_lds_o_i32, row_base_i32):
+        """Store 2 oaccu groups (1 PV iter) as f32 via LDS reshape.
+
+        Matches HK OManager32bitsV2: writes MFMA-layout f32 data to LDS,
+        reads back in row-major coalesced layout, then buffer_store_dwordx4.
+        16 rows need 2 rounds (8 rows each) because 64 lanes / 8 lanes-per-row = 8.
+        """
+        # Per-warp LDS base
+        lds_warp = _std_arith.AddIOp(
+            p_lds_o_i32,
+            _std_arith.MulIOp(
+                _raw(warp_idx_i32), _raw(arith.constant(O32_LDS_PER_WARP, type=T.i32))
+            ).result,
+        ).result
+        lds_st_addr = _std_arith.AddIOp(lds_warp, _o32_st_offset).result
+
+        col_offset_i32 = _raw(arith.constant(tile_idx * MFMA_N * 2, type=T.i32))
+        O32_LD_DELTA = 8 * O32_ELEM_PER_PAD_ROW * 4  # 1152 bytes between round 0/1
+
+        # LDS write: 2 sub-blocks -> 2x ds_write_b128
+        rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))  # HK pattern: drain prior stores
+        for sub, acc_val in enumerate([oaccu_a, oaccu_b]):
+            sub_offset = sub * O32_NUM_COLS // 2 * 4  # 0 or 64 bytes
+            st_addr_sub = _std_arith.AddIOp(
+                lds_st_addr, _raw(arith.constant(sub_offset, type=T.i32))
+            ).result
+            st_i64 = _std_arith.ExtUIOp(T.i64, st_addr_sub).result
+            st_ptr = _inttoptr_lds(st_i64)
+            llvm.StoreOp(acc_val, st_ptr, alignment=16)  # ds_write_b128
+
+        rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+        # LDS read: 2x ds_read_b128 (round 0 = rows 0-7, round 1 = rows 8-15)
+        lds_rd_addr = _std_arith.AddIOp(lds_warp, _o32_rd_offset).result
+        rd_i64 = _std_arith.ExtUIOp(T.i64, lds_rd_addr).result
+        rd_ptr = _inttoptr_lds(rd_i64)
+        data_0 = llvm.LoadOp(T.f32x4, rd_ptr, alignment=16).result  # rows 0-7
+        rd_ptr_1 = _get_element_ptr(rd_ptr, static_byte_offset=O32_LD_DELTA)
+        data_1 = llvm.LoadOp(T.f32x4, rd_ptr_1, alignment=16).result  # rows 8-15
+
+        rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+        # 2x coalesced VRAM store
+        # Round 0: row = row_ld_base(0..7) + row_base
+        row_vram_0 = _std_arith.AddIOp(row_base_i32, _o32_row_ld).result
+        col_vram = _std_arith.AddIOp(_o32_col_ld, col_offset_i32).result
+        vram_off_0 = _std_arith.MulIOp(
+            _std_arith.AddIOp(
+                _std_arith.MulIOp(
+                    row_vram_0, _raw(arith.constant(V_HEAD_DIM, type=T.i32))
+                ).result,
+                col_vram,
+            ).result,
+            _raw(arith.constant(4, type=T.i32)),  # sizeof(f32)
+        ).result
+        # Bitcast f32x4 -> i32x4 for buffer_store
+        data_0_i32 = _std_arith.BitcastOp(T.i32x4, data_0).result
+        buffer_ops.buffer_store(
+            data_0_i32,
+            split_output_rsrc,
+            vram_off_0,
+            offset_is_bytes=True,
+        )
+
+        # Round 1: row = row_ld_base + 8 + row_base
+        row_vram_1 = _std_arith.AddIOp(
+            row_vram_0, _raw(arith.constant(8, type=T.i32))
+        ).result
+        vram_off_1 = _std_arith.MulIOp(
+            _std_arith.AddIOp(
+                _std_arith.MulIOp(
+                    row_vram_1, _raw(arith.constant(V_HEAD_DIM, type=T.i32))
+                ).result,
+                col_vram,
+            ).result,
+            _raw(arith.constant(4, type=T.i32)),
+        ).result
+        data_1_i32 = _std_arith.BitcastOp(T.i32x4, data_1).result
+        buffer_ops.buffer_store(
+            data_1_i32,
+            split_output_rsrc,
+            vram_off_1,
+            offset_is_bytes=True,
+        )
+
+    def _gemm2_last_with_store(
+        p_pack,
+        rescale,
+        oaccu_in,
+        vt_base_i32,
+        reci_sum,
+        is_split,
+        p_lds_o_i32,
+        row_base_i32,
+        is_first_iter_flag,
+    ):
+        """Last-tile GEMM2: interleave rescale + MFMA + normalize + store.
+
+        Matches HK's kIsLastIter pattern. For each of 8 PV pairs:
+        1. Rescale 2 oaccu groups (skip if first iter)
+        2. Load Vt from LDS (4x ds_read)
+        3. 2 MFMAs (accumulate or init)
+        4. Multiply by reci_sum
+        5. Store immediately (bf16 or f32 split)
+        """
+        rescale_vec = vector.broadcast(T.f32x4, rescale)
+        reci_vec = vector.broadcast(T.f32x4, reci_sum)
+        c32_i64_pv = _std_arith.ConstantOp(T.i64, ir.IntegerAttr.get(T.i64, 32)).result
+
+        _barrier(lgkmcnt=0)
+        rocdl.sched_barrier(0)
+        rocdl.s_setprio(15)
+        for pv_pair in range_constexpr(NUM_PV_ITERS // 2):
+            iter_a = pv_pair * 2
+            iter_b = pv_pair * 2 + 1
+            col_a0 = iter_a * MFMA_N * 2
+            col_a1 = col_a0 + MFMA_N
+            col_b0 = iter_b * MFMA_N * 2
+            col_b1 = col_b0 + MFMA_N
+
+            # Rescale 4 oaccu groups for this pair (skip if first iter)
+            if not is_first_iter_flag:
+                oaccu_in[iter_a * 2] = _std_arith.MulFOp(
+                    _raw(oaccu_in[iter_a * 2]),
+                    _raw(rescale_vec),
+                    fastmath=fm_fast,
+                ).result
+                oaccu_in[iter_a * 2 + 1] = _std_arith.MulFOp(
+                    _raw(oaccu_in[iter_a * 2 + 1]),
+                    _raw(rescale_vec),
+                    fastmath=fm_fast,
+                ).result
+                oaccu_in[iter_b * 2] = _std_arith.MulFOp(
+                    _raw(oaccu_in[iter_b * 2]),
+                    _raw(rescale_vec),
+                    fastmath=fm_fast,
+                ).result
+                oaccu_in[iter_b * 2 + 1] = _std_arith.MulFOp(
+                    _raw(oaccu_in[iter_b * 2 + 1]),
+                    _raw(rescale_vec),
+                    fastmath=fm_fast,
+                ).result
+
+            # 8x ds_read_b32 burst
+            vta0_lo, vta0_hi = _load_vt_from_lds(vt_base_i32, col_a0)
+            vta1_lo, vta1_hi = _load_vt_from_lds(vt_base_i32, col_a1)
+            vtb0_lo, vtb0_hi = _load_vt_from_lds(vt_base_i32, col_b0)
+            vtb1_lo, vtb1_hi = _load_vt_from_lds(vt_base_i32, col_b1)
+
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=4))
+
+            # MFMA pair A
+            vta0_lo_i64 = _std_arith.ExtUIOp(T.i64, vta0_lo).result
+            vta0_hi_i64 = _std_arith.ExtUIOp(T.i64, vta0_hi).result
+            vta0_hi_shifted = _std_arith.ShLIOp(vta0_hi_i64, c32_i64_pv).result
+            kv_mfma_a0 = _std_arith.OrIOp(vta0_lo_i64, vta0_hi_shifted).result
+            oaccu_in[iter_a * 2] = _mfma_fp8(
+                T.f32x4, [kv_mfma_a0, p_pack, oaccu_in[iter_a * 2], 0, 0, 0]
+            )
+
+            vta1_lo_i64 = _std_arith.ExtUIOp(T.i64, vta1_lo).result
+            vta1_hi_i64 = _std_arith.ExtUIOp(T.i64, vta1_hi).result
+            vta1_hi_shifted = _std_arith.ShLIOp(vta1_hi_i64, c32_i64_pv).result
+            kv_mfma_a1 = _std_arith.OrIOp(vta1_lo_i64, vta1_hi_shifted).result
+            oaccu_in[iter_a * 2 + 1] = _mfma_fp8(
+                T.f32x4, [kv_mfma_a1, p_pack, oaccu_in[iter_a * 2 + 1], 0, 0, 0]
+            )
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
+
+            # MFMA pair B
+            vtb0_lo_i64 = _std_arith.ExtUIOp(T.i64, vtb0_lo).result
+            vtb0_hi_i64 = _std_arith.ExtUIOp(T.i64, vtb0_hi).result
+            vtb0_hi_shifted = _std_arith.ShLIOp(vtb0_hi_i64, c32_i64_pv).result
+            kv_mfma_b0 = _std_arith.OrIOp(vtb0_lo_i64, vtb0_hi_shifted).result
+            oaccu_in[iter_b * 2] = _mfma_fp8(
+                T.f32x4, [kv_mfma_b0, p_pack, oaccu_in[iter_b * 2], 0, 0, 0]
+            )
+
+            vtb1_lo_i64 = _std_arith.ExtUIOp(T.i64, vtb1_lo).result
+            vtb1_hi_i64 = _std_arith.ExtUIOp(T.i64, vtb1_hi).result
+            vtb1_hi_shifted = _std_arith.ShLIOp(vtb1_hi_i64, c32_i64_pv).result
+            kv_mfma_b1 = _std_arith.OrIOp(vtb1_lo_i64, vtb1_hi_shifted).result
+            oaccu_in[iter_b * 2 + 1] = _mfma_fp8(
+                T.f32x4, [kv_mfma_b1, p_pack, oaccu_in[iter_b * 2 + 1], 0, 0, 0]
+            )
+            rocdl.sched_barrier(0)
+
+            # Normalize by reci_sum
+            oaccu_in[iter_a * 2] = _std_arith.MulFOp(
+                oaccu_in[iter_a * 2], _raw(reci_vec), fastmath=fm_fast
+            ).result
+            oaccu_in[iter_a * 2 + 1] = _std_arith.MulFOp(
+                oaccu_in[iter_a * 2 + 1], _raw(reci_vec), fastmath=fm_fast
+            ).result
+            oaccu_in[iter_b * 2] = _std_arith.MulFOp(
+                oaccu_in[iter_b * 2], _raw(reci_vec), fastmath=fm_fast
+            ).result
+            oaccu_in[iter_b * 2 + 1] = _std_arith.MulFOp(
+                oaccu_in[iter_b * 2 + 1], _raw(reci_vec), fastmath=fm_fast
+            ).result
+
+            # Store immediately via LDS reshape (coalesced)
+            if is_split:
+                _store_oaccu_pair_split(
+                    oaccu_in[iter_a * 2],
+                    oaccu_in[iter_a * 2 + 1],
+                    iter_a,
+                    p_lds_o_i32,
+                    row_base_i32,
+                )
+                _store_oaccu_pair_split(
+                    oaccu_in[iter_b * 2],
+                    oaccu_in[iter_b * 2 + 1],
+                    iter_b,
+                    p_lds_o_i32,
+                    row_base_i32,
+                )
+            else:
+                _store_oaccu_pair_bf16(
+                    oaccu_in[iter_a * 2],
+                    oaccu_in[iter_a * 2 + 1],
+                    iter_a,
+                    p_lds_o_i32,
+                    row_base_i32,
+                )
+                _store_oaccu_pair_bf16(
+                    oaccu_in[iter_b * 2],
+                    oaccu_in[iter_b * 2 + 1],
+                    iter_b,
+                    p_lds_o_i32,
+                    row_base_i32,
+                )
+
+        rocdl.s_setprio(0)
+
     # ==================================================================
     # KV LDS buffer pointers -- computed once, persist across work items
     # ==================================================================
@@ -1835,166 +2250,260 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         rescale_first = if_first.results[3]
         row_kv_ld_nn_first = if_first.results[4]
 
-        # GEMM2 for first tile: C=0 hardcoded, no rescale needed
-        oaccu = _gemm2_first_iter(p_pack_first, vt_base_i32)
+        def _write_lse(pqo_loc_i32, rm, rse):
+            """Write LSE for split output (first 16 lanes per warp)."""
+            if arith.cmpi(
+                CmpIPredicate.ult, lane_idx_i32, arith.constant(16, type=T.i32)
+            ):
+                log2_sum = _math.log2(_raw(rse))
+                ln_sum = _std_arith.MulFOp(
+                    log2_sum, _raw(c_inv_log2e), fastmath=fm_fast
+                ).result
+                lse = _std_arith.AddFOp(_raw(rm), ln_sum, fastmath=fm_fast).result
+                row_idx_i32 = _std_arith.AddIOp(
+                    _std_arith.AddIOp(
+                        _raw(lane_idx_i32),
+                        _std_arith.MulIOp(
+                            _raw(warp_idx_i32),
+                            _raw(arith.constant(16, type=T.i32)),
+                        ).result,
+                    ).result,
+                    _std_arith.MulIOp(
+                        pqo_loc_i32,
+                        _raw(arith.constant(NUM_QO_HEADS, type=T.i32)),
+                    ).result,
+                ).result
+                buffer_ops.buffer_store(lse, split_lse_rsrc, row_idx_i32)
 
-        # --- Middle tiles [1, num_tiles-1) via scf.ForOp ---
-        # These tiles are never the last tile. check_boundary=False always.
-        # check_boundary_next: True only when this is the second-to-last
-        # tile AND the last tile is partial.
-        c_one_idx = arith.index(1)
-        num_tiles_m1 = arith.subi(num_tiles, arith.constant(1, type=T.i32))
-        num_tiles_m1_idx = arith.index_cast(T.index, num_tiles_m1)
-        num_tiles_m2 = arith.subi(num_tiles, arith.constant(2, type=T.i32))
+        # LDS base for output reshape (reuse KV buffer 0 region)
+        p_lds_o_i32 = _index_cast_to_i32(p_lds_kv_0_base)
 
-        init_args = [row_max, row_sum_e] + oaccu + [row_kv_ld_nn_first]
-        init_args = [_raw(v) if not isinstance(v, ir.Value) else v for v in init_args]
+        def _do_last_gemm2_and_store(
+            pp,
+            rs,
+            oaccu_list,
+            rm,
+            rse,
+            is_first_iter_flag,
+        ):
+            """GEMM2 last tile with interleaved store + LSE write.
 
-        for_op = scf.ForOp(
-            _raw(c_one_idx),
-            _raw(num_tiles_m1_idx),
-            _raw(c_one_idx),
-            init_args,
-        )
-        with ir.InsertionPoint(for_op.body):
-            tile_iv = for_op.induction_variable  # index type
-            tile_iv_i32 = _index_cast_to_i32(tile_iv)
-            kv_tile_start_i32 = _std_arith.AddIOp(
-                _raw(kv_start),
-                _std_arith.MulIOp(tile_iv_i32, _raw(c_block_n)).result,
-            ).result
-
-            # Unpack carried state
-            rm_carried = for_op.inner_iter_args[0]
-            rse_carried = for_op.inner_iter_args[1]
-            oaccu_carried = [
-                for_op.inner_iter_args[2 + i] for i in range(NUM_PV_ITERS * 2)
-            ]
-            # 2-ahead: row resolved by previous iteration's _process_tile_gemm1
-            row_kv_ld_next = for_op.inner_iter_args[2 + NUM_PV_ITERS * 2]
-
-            # Buffer parity
-            tile_parity = _std_arith.AndIOp(
-                tile_iv_i32,
-                _raw(arith.constant(1, type=T.i32)),
-            ).result
-            is_odd = _std_arith.CmpIOp(
-                CmpIPredicate.ne,
-                tile_parity,
+            Branches on partial_qo_loc to select bf16 vs f32 split output.
+            """
+            reci = _std_arith.DivFOp(_raw(c_one_f32), rse, fastmath=fm_fast).result
+            is_not_split = _std_arith.CmpIOp(
+                CmpIPredicate.slt,
+                _raw(partial_qo_loc),
                 _raw(arith.constant(0, type=T.i32)),
             ).result
-            curr_base_idx = _std_arith.SelectOp(
-                is_odd,
-                _raw(p_lds_kv_1_base),
-                _raw(p_lds_kv_0_base),
-            ).result
-            next_warp = _std_arith.SelectOp(
-                is_odd,
-                p_lds_kv_0_warp_i32,
-                p_lds_kv_1_warp_i32,
-            ).result
-
-            # check_boundary_next: True when tile_idx == num_tiles-2 AND last_tile_partial
-            is_second_to_last = _std_arith.CmpIOp(
-                CmpIPredicate.eq,
-                tile_iv_i32,
-                _raw(num_tiles_m2),
-            ).result
-            mid_cbn = _std_arith.AndIOp(is_second_to_last, last_tile_partial).result
-
-            # 2-ahead resolve params for this iteration:
-            # Resolve tile at kv_tile_start + 2*BN (exists if < kv_end)
-            nn_start_mid = _std_arith.AddIOp(
-                kv_tile_start_i32,
-                _raw(c_2bn),
-            ).result
-            do_resolve_nn_mid = _std_arith.CmpIOp(
-                CmpIPredicate.slt,
-                nn_start_mid,
-                _raw(kv_end),
-            ).result
-
-            # Process tile: cb=False always, cbn is compile-time via sub-branch
-            mid_gemm1_types = [T.f32, T.f32, T.i64, T.f32, T.i32]
-            if_mid_tile = scf.IfOp(mid_cbn, mid_gemm1_types, has_else=True)
-            with ir.InsertionPoint(if_mid_tile.regions[0].blocks[0]):
-                # cbn=True: next tile needs boundary check
-                _barrier(vmcnt=0, lgkmcnt=0)
-                rocdl.sched_barrier(0)
-                rm_ma, rse_ma, pp_ma, rs_ma, nn_ma = _process_tile_gemm1(
-                    curr_base_idx,
-                    kv_tile_start_i32,
-                    _raw(kv_end),
-                    q_nope_packs,
-                    q_rope_packs,
-                    rm_carried,
-                    rse_carried,
-                    is_first_iter=False,
-                    check_boundary=False,
-                    p_lds_kv_next_warp_i32=next_warp,
-                    row_kv_ld_next=row_kv_ld_next,
-                    kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
-                    check_boundary_next=True,
-                    nn_resolve_start=nn_start_mid,
-                    nn_resolve_end=_raw(kv_end),
-                    do_resolve_nn=do_resolve_nn_mid,
+            if_out = scf.IfOp(is_not_split, [], has_else=True)
+            with ir.InsertionPoint(if_out.regions[0].blocks[0]):
+                # bf16 final output: row_base = qo_start * NUM_QO_HEADS + warp*16
+                rb_bf16 = _std_arith.AddIOp(
+                    _std_arith.MulIOp(
+                        _raw(qo_start),
+                        _raw(arith.constant(NUM_QO_HEADS, type=T.i32)),
+                    ).result,
+                    _std_arith.MulIOp(
+                        _raw(warp_idx_i32),
+                        _raw(arith.constant(16, type=T.i32)),
+                    ).result,
+                ).result
+                _gemm2_last_with_store(
+                    pp,
+                    rs,
+                    list(oaccu_list),
+                    vt_base_i32,
+                    reci,
+                    False,
+                    p_lds_o_i32,
+                    rb_bf16,
+                    is_first_iter_flag,
                 )
-                y_ma = [
-                    _raw(v) if not isinstance(v, ir.Value) else v
-                    for v in [rm_ma, rse_ma, pp_ma, rs_ma, nn_ma]
-                ]
-                scf.YieldOp(y_ma)
-            with ir.InsertionPoint(if_mid_tile.regions[1].blocks[0]):
-                # cbn=False: next tile is full, no boundary check
-                _barrier(vmcnt=0, lgkmcnt=0)
-                rocdl.sched_barrier(0)
-                rm_mb, rse_mb, pp_mb, rs_mb, nn_mb = _process_tile_gemm1(
-                    curr_base_idx,
-                    kv_tile_start_i32,
-                    _raw(kv_end),
-                    q_nope_packs,
-                    q_rope_packs,
-                    rm_carried,
-                    rse_carried,
-                    is_first_iter=False,
-                    check_boundary=False,
-                    p_lds_kv_next_warp_i32=next_warp,
-                    row_kv_ld_next=row_kv_ld_next,
-                    kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
-                    check_boundary_next=False,
-                    nn_resolve_start=nn_start_mid,
-                    nn_resolve_end=_raw(kv_end),
-                    do_resolve_nn=do_resolve_nn_mid,
+                scf.YieldOp([])
+            with ir.InsertionPoint(if_out.regions[1].blocks[0]):
+                # f32 split output: row_base = pqo_loc * NUM_QO_HEADS + warp*16
+                rb_split = _std_arith.AddIOp(
+                    _std_arith.MulIOp(
+                        _raw(partial_qo_loc),
+                        _raw(arith.constant(NUM_QO_HEADS, type=T.i32)),
+                    ).result,
+                    _std_arith.MulIOp(
+                        _raw(warp_idx_i32),
+                        _raw(arith.constant(16, type=T.i32)),
+                    ).result,
+                ).result
+                _gemm2_last_with_store(
+                    pp,
+                    rs,
+                    list(oaccu_list),
+                    vt_base_i32,
+                    reci,
+                    True,
+                    p_lds_o_i32,
+                    rb_split,
+                    is_first_iter_flag,
                 )
-                y_mb = [
-                    _raw(v) if not isinstance(v, ir.Value) else v
-                    for v in [rm_mb, rse_mb, pp_mb, rs_mb, nn_mb]
-                ]
-                scf.YieldOp(y_mb)
-            rm_m = if_mid_tile.results[0]
-            rse_m = if_mid_tile.results[1]
-            pp_m = if_mid_tile.results[2]
-            rs_m = if_mid_tile.results[3]
-            nn_m = if_mid_tile.results[4]
-            oa_m = _gemm2_with_rescale(pp_m, rs_m, oaccu_carried, vt_base_i32)
-            yield_vals = [rm_m, rse_m] + oa_m + [nn_m]
-            yield_vals = [
-                _raw(v) if not isinstance(v, ir.Value) else v for v in yield_vals
+                _write_lse(_raw(partial_qo_loc), rm, rse)
+                scf.YieldOp([])
+
+        # ---- Multi-tile vs single-tile dispatch ----
+        if_multi = scf.IfOp(has_multi_tiles, [], has_else=True)
+        with ir.InsertionPoint(if_multi.regions[0].blocks[0]):
+            # === Multi-tile path ===
+
+            # GEMM2 for first tile: C=0 hardcoded, no rescale needed
+            oaccu_mt = _gemm2_first_iter(p_pack_first, vt_base_i32)
+
+            # --- Middle tiles [1, num_tiles-1) via scf.ForOp ---
+            c_one_idx = arith.index(1)
+            num_tiles_m1 = arith.subi(num_tiles, arith.constant(1, type=T.i32))
+            num_tiles_m1_idx = arith.index_cast(T.index, num_tiles_m1)
+            num_tiles_m2 = arith.subi(num_tiles, arith.constant(2, type=T.i32))
+
+            init_args = [row_max, row_sum_e] + oaccu_mt + [row_kv_ld_nn_first]
+            init_args = [
+                _raw(v) if not isinstance(v, ir.Value) else v for v in init_args
             ]
-            scf.YieldOp(yield_vals)
 
-        # Unpack results from middle tiles loop
-        row_max = for_op.results[0]
-        row_sum_e = for_op.results[1]
-        oaccu = [for_op.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
+            for_op = scf.ForOp(
+                _raw(c_one_idx),
+                _raw(num_tiles_m1_idx),
+                _raw(c_one_idx),
+                init_args,
+            )
+            with ir.InsertionPoint(for_op.body):
+                tile_iv = for_op.induction_variable  # index type
+                tile_iv_i32 = _index_cast_to_i32(tile_iv)
+                kv_tile_start_i32 = _std_arith.AddIOp(
+                    _raw(kv_start),
+                    _std_arith.MulIOp(tile_iv_i32, _raw(c_block_n)).result,
+                ).result
 
-        # --- Last tile (when num_tiles > 1): no prefetch ---
-        # Only 1 _process_tile instance here (not 2 competing branches),
-        # so oaccu in the phi is fine -- else branch just passes through.
-        last_result_types = [T.f32, T.f32] + [T.f32x4] * (NUM_PV_ITERS * 2)
-        if_has_last = scf.IfOp(has_multi_tiles, last_result_types, has_else=True)
-        with ir.InsertionPoint(if_has_last.regions[0].blocks[0]):
-            # Compute last tile's buffer parity and start
+                # Unpack carried state
+                rm_carried = for_op.inner_iter_args[0]
+                rse_carried = for_op.inner_iter_args[1]
+                oaccu_carried = [
+                    for_op.inner_iter_args[2 + i] for i in range(NUM_PV_ITERS * 2)
+                ]
+                # 2-ahead: row resolved by previous iteration's _process_tile_gemm1
+                row_kv_ld_next = for_op.inner_iter_args[2 + NUM_PV_ITERS * 2]
+
+                # Buffer parity
+                tile_parity = _std_arith.AndIOp(
+                    tile_iv_i32,
+                    _raw(arith.constant(1, type=T.i32)),
+                ).result
+                is_odd = _std_arith.CmpIOp(
+                    CmpIPredicate.ne,
+                    tile_parity,
+                    _raw(arith.constant(0, type=T.i32)),
+                ).result
+                curr_base_idx = _std_arith.SelectOp(
+                    is_odd,
+                    _raw(p_lds_kv_1_base),
+                    _raw(p_lds_kv_0_base),
+                ).result
+                next_warp = _std_arith.SelectOp(
+                    is_odd,
+                    p_lds_kv_0_warp_i32,
+                    p_lds_kv_1_warp_i32,
+                ).result
+
+                # check_boundary_next: True when tile_idx == num_tiles-2 AND last_tile_partial
+                is_second_to_last = _std_arith.CmpIOp(
+                    CmpIPredicate.eq,
+                    tile_iv_i32,
+                    _raw(num_tiles_m2),
+                ).result
+                mid_cbn = _std_arith.AndIOp(is_second_to_last, last_tile_partial).result
+
+                # 2-ahead resolve params for this iteration:
+                nn_start_mid = _std_arith.AddIOp(
+                    kv_tile_start_i32,
+                    _raw(c_2bn),
+                ).result
+                do_resolve_nn_mid = _std_arith.CmpIOp(
+                    CmpIPredicate.slt,
+                    nn_start_mid,
+                    _raw(kv_end),
+                ).result
+
+                # Process tile: cb=False always, cbn is compile-time via sub-branch
+                mid_gemm1_types = [T.f32, T.f32, T.i64, T.f32, T.i32]
+                if_mid_tile = scf.IfOp(mid_cbn, mid_gemm1_types, has_else=True)
+                with ir.InsertionPoint(if_mid_tile.regions[0].blocks[0]):
+                    # cbn=True: next tile needs boundary check
+                    _barrier(vmcnt=0, lgkmcnt=0)
+                    rocdl.sched_barrier(0)
+                    rm_ma, rse_ma, pp_ma, rs_ma, nn_ma = _process_tile_gemm1(
+                        curr_base_idx,
+                        kv_tile_start_i32,
+                        _raw(kv_end),
+                        q_nope_packs,
+                        q_rope_packs,
+                        rm_carried,
+                        rse_carried,
+                        is_first_iter=False,
+                        check_boundary=False,
+                        p_lds_kv_next_warp_i32=next_warp,
+                        row_kv_ld_next=row_kv_ld_next,
+                        kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                        check_boundary_next=True,
+                        nn_resolve_start=nn_start_mid,
+                        nn_resolve_end=_raw(kv_end),
+                        do_resolve_nn=do_resolve_nn_mid,
+                    )
+                    y_ma = [
+                        _raw(v) if not isinstance(v, ir.Value) else v
+                        for v in [rm_ma, rse_ma, pp_ma, rs_ma, nn_ma]
+                    ]
+                    scf.YieldOp(y_ma)
+                with ir.InsertionPoint(if_mid_tile.regions[1].blocks[0]):
+                    # cbn=False: next tile is full, no boundary check
+                    _barrier(vmcnt=0, lgkmcnt=0)
+                    rocdl.sched_barrier(0)
+                    rm_mb, rse_mb, pp_mb, rs_mb, nn_mb = _process_tile_gemm1(
+                        curr_base_idx,
+                        kv_tile_start_i32,
+                        _raw(kv_end),
+                        q_nope_packs,
+                        q_rope_packs,
+                        rm_carried,
+                        rse_carried,
+                        is_first_iter=False,
+                        check_boundary=False,
+                        p_lds_kv_next_warp_i32=next_warp,
+                        row_kv_ld_next=row_kv_ld_next,
+                        kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
+                        check_boundary_next=False,
+                        nn_resolve_start=nn_start_mid,
+                        nn_resolve_end=_raw(kv_end),
+                        do_resolve_nn=do_resolve_nn_mid,
+                    )
+                    y_mb = [
+                        _raw(v) if not isinstance(v, ir.Value) else v
+                        for v in [rm_mb, rse_mb, pp_mb, rs_mb, nn_mb]
+                    ]
+                    scf.YieldOp(y_mb)
+                rm_m = if_mid_tile.results[0]
+                rse_m = if_mid_tile.results[1]
+                pp_m = if_mid_tile.results[2]
+                rs_m = if_mid_tile.results[3]
+                nn_m = if_mid_tile.results[4]
+                oa_m = _gemm2_with_rescale(pp_m, rs_m, oaccu_carried, vt_base_i32)
+                yield_vals = [rm_m, rse_m] + oa_m + [nn_m]
+                yield_vals = [
+                    _raw(v) if not isinstance(v, ir.Value) else v for v in yield_vals
+                ]
+                scf.YieldOp(yield_vals)
+
+            # Unpack results from middle tiles loop
+            row_max_mt = for_op.results[0]
+            row_sum_e_mt = for_op.results[1]
+            oaccu_mt = [for_op.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
+
+            # --- Last tile: GEMM1 + interleaved GEMM2 store ---
             last_tile_iv_i32 = _raw(num_tiles_m1)
             kv_last_start = _std_arith.AddIOp(
                 _raw(kv_start),
@@ -2015,7 +2524,6 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 _raw(p_lds_kv_0_base),
             ).result
 
-            # Last tile: cb is runtime i1 (last_tile_partial), no prefetch, no 2-ahead
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
             rm_l, rse_l, pp_l, rs_l, _nn_l = _process_tile_gemm1(
@@ -2024,60 +2532,33 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 _raw(kv_end),
                 q_nope_packs,
                 q_rope_packs,
-                row_max,
-                row_sum_e,
+                row_max_mt,
+                row_sum_e_mt,
                 is_first_iter=False,
                 check_boundary=last_tile_partial,
             )
-            oa_l = _gemm2_with_rescale(pp_l, rs_l, oaccu, vt_base_i32)
-            yl = [rm_l, rse_l] + oa_l
-            yl = [_raw(v) if not isinstance(v, ir.Value) else v for v in yl]
-            scf.YieldOp(yl)
-        with ir.InsertionPoint(if_has_last.regions[1].blocks[0]):
-            # Single tile: no last tile to process, pass through
-            y_pass = [row_max, row_sum_e] + oaccu
-            y_pass = [_raw(v) if not isinstance(v, ir.Value) else v for v in y_pass]
-            scf.YieldOp(y_pass)
+            _do_last_gemm2_and_store(
+                pp_l,
+                rs_l,
+                oaccu_mt,
+                rm_l,
+                rse_l,
+                is_first_iter_flag=False,
+            )
+            scf.YieldOp([])
 
-        row_max = if_has_last.results[0]
-        row_sum_e = if_has_last.results[1]
-        oaccu = [if_has_last.results[2 + i] for i in range(NUM_PV_ITERS * 2)]
-
-        # ---- Normalize output: oaccu *= 1/row_sum_e ----
-        reci_sum = _std_arith.DivFOp(
-            _raw(c_one_f32), row_sum_e, fastmath=fm_fast
-        ).result
-        reci_vec = vector.broadcast(T.f32x4, reci_sum)
-        for i in range_constexpr(len(oaccu)):
-            oaccu[i] = _std_arith.MulFOp(
-                oaccu[i], _raw(reci_vec), fastmath=fm_fast
-            ).result
-
-        # ---- Output dispatch: reuse the *current* KV buffer ----
-        # Tile 0 used KV_0. After num_tiles tiles, last tile_idx = num_tiles-1.
-        # Parity: (num_tiles-1) & 1 == 0 -> curr=KV_0, == 1 -> curr=KV_1.
-        last_tile_parity = _std_arith.AndIOp(
-            _std_arith.SubIOp(
-                _raw(num_tiles),
-                _raw(arith.constant(1, type=T.i32)),
-            ).result,
-            _raw(arith.constant(1, type=T.i32)),
-        ).result
-        last_is_odd = _std_arith.CmpIOp(
-            CmpIPredicate.ne,
-            last_tile_parity,
-            _raw(arith.constant(0, type=T.i32)),
-        ).result
-        p_lds_o = _std_arith.SelectOp(
-            last_is_odd,
-            _raw(p_lds_kv_1_base),
-            _raw(p_lds_kv_0_base),
-        ).result
-
-        if arith.cmpi(CmpIPredicate.slt, partial_qo_loc, arith.constant(0, type=T.i32)):
-            _write_output_bf16(oaccu, qo_start, p_lds_o)
-        else:
-            _write_output_split(oaccu, partial_qo_loc, row_max, row_sum_e, p_lds_o)
+        with ir.InsertionPoint(if_multi.regions[1].blocks[0]):
+            # === Single tile path: GEMM2 with interleaved store ===
+            oaccu_st = [_raw(c_zero_v4f32)] * (NUM_PV_ITERS * 2)
+            _do_last_gemm2_and_store(
+                p_pack_first,
+                rescale_first,
+                oaccu_st,
+                row_max,
+                row_sum_e,
+                is_first_iter_flag=True,
+            )
+            scf.YieldOp([])
 
 
 # ---------------------------------------------------------------------------
