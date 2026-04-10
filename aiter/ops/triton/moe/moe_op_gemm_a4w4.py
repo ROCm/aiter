@@ -353,9 +353,6 @@ def moe_gemm_a4w4(
         WMMA_LAYOUT_PACKED = get_wmma_layout(
             config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE"
         )
-        IDX_LAYOUT = gl.BlockedLayout(
-            [config["block_m"]], [32], [config["num_warps"]], [0]
-        )
         assert config["split_k"] == 1, "split_k is not currently supported for gfx1250"
         _moe_gemm_a4w4_gfx1250[(grid,)](
             y,
