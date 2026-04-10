@@ -533,14 +533,17 @@ def test_mla(
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
-    # Gluon MLA decode test (bf16 only, nhead=128, decode_qlen=1)
+    # Gluon MLA decode test (bf16 only, nhead multiple of 64, decode_qlen=1,
+    # head_dim_ckv=512, head_dim_kpe=64, seq_len > 192)
     us_gluon_decode = 1e12
     if (
         dtype == torch.bfloat16
         and kvtype == torch.bfloat16
-        and nhead == 128
+        and nhead % 64 == 0
         and decode_qlen == 1
         and ctx_lens > 192
+        and v_head_dim == 512
+        and (qk_head_dim - v_head_dim) == 64
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon()
         ret["decode:gluon_err"] = err_gluon

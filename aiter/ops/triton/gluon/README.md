@@ -24,8 +24,8 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 <tr>
   <td><code>mla_decode_gluon</code></td><td>MLA<br>Decode</td><td>CDNA4</td>
   <td nowrap>Q: bf16, KV: bf16, Out: bf16<br>PAGE_SIZE=1, BLOCK_H=64<br>seq_len &gt; 192<br>nhead % 64 == 0</td>
-  <td>python op_tests/test_mla.py \<br>-c 4096 -b 128 -n 128,1 \<br>-d bf16 -kvd bf16</td>
-  <td>~545<br>TFLOPS</td><td>~435<br>TFLOPS</td><td>—</td>
+  <td>python op_tests/test_mla.py \<br>-c 10000 -b 128 -n 128,1 \<br>-d bf16 -kvd bf16</td>
+  <td>~600<br>TFLOPS</td><td>~480<br>TFLOPS</td><td>—</td>
 </tr>
 <tr>
   <td><code>pa_decode_gluon</code></td><td>Paged Attn<br>Decode</td><td>CDNA3<br>CDNA4</td>
@@ -76,7 +76,7 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | Output | bf16 |
 | Page size | 1 only (static_assert) |
 | Block sizes | BLOCK_H=64 (heads), BLOCK_N=64 (KV seq) — fixed |
-| MFMA | v4, 32&times;32&times;16, warps=[2,2] |
+| MFMA | v4, 16&times;16&times;32, warps=[4,1] |
 | Seq constraint | seq_len > 192 (kernel assumes `num_iter > 3`) |
 | nhead | must be multiple of BLOCK_H=64 (tested: 128) |
 
@@ -86,9 +86,9 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 
 **Zero-copy KV path** (`kv_pe_offset > 0`): Pass the same `[N, 576]` buffer as both `kv_c` and `k_pe`. The kernel adds `kv_pe_offset` to k_pe column offsets. The kernel auto-selects `buffer_load_to_shared` (scalar base + 32-bit offsets, for KV caches &le; 2 GB) vs `global_load_to_shared` (64-bit pointer tensors, for KV caches > 2 GB).
 
-**Perf** (gfx950, batch=128, ctx=4096, nhead=128, bf16):
-- Gluon: ~545 TFLOPS
-- ASM baseline: ~335 us, ~435 TFLOPS
+**Perf** (MI350, batch=128, ctx=10000, nhead=128, bf16):
+- Gluon: ~600 TFLOPS
+- ASM baseline: ~480 TFLOPS
 
 ### `pa_decode_gluon.py` — Paged Attention Decode
 
