@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
 from dataclasses import dataclass
@@ -94,6 +94,7 @@ using fmha_bwd_dot_do_o_pipeline_problem_{F_idx} = ck_tile::BlockFmhaBwdOGradDot
     typename FmhaBwdTypeConfig<fmha_dtype_{F_idx}>::ODataType,
     typename FmhaBwdTypeConfig<fmha_dtype_{F_idx}>::OGradDataType,
     typename FmhaBwdTypeConfig<fmha_dtype_{F_idx}>::DDataType,
+    typename FmhaBwdTypeConfig<fmha_dtype_{F_idx}>::LSEDataType,
     /* BlockSize = */ 64,
     {F_hdim},
     {F_mode},

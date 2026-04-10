@@ -22,6 +22,41 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
     BLOCK_PER_CU_MAX,
 )
 
+try:
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        kernel_instance_estimated_lds_bytes,
+        kernels_list as kernels_list_flydsl,
+        max_lds_bytes_for_tune,
+    )
+except ImportError:
+    print(
+        "[FlyDSL] flydsl_gemm_a8w8_bpreshuffle_common.py not found, flydsl tuning disabled"
+    )
+    kernels_list_flydsl = {}
+
+    def kernel_instance_estimated_lds_bytes(_ki):
+        return 0
+
+    def max_lds_bytes_for_tune():
+        return 1 << 30
+
+
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+if is_flydsl_available():
+    from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+
+def _get_padded_m(M: int) -> int:
+    if M <= 256:
+        return (M + 15) // 16 * 16
+    elif M <= 1024:
+        return (M + 31) // 32 * 32
+    elif M <= 4096:
+        return (M + 63) // 64 * 64
+    else:
+        return (M + 127) // 128 * 128
+
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
@@ -87,6 +122,25 @@ def run_gemm_a8w8_asm(
     )
 
 
+def run_gemm_flydsl(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
+    ki = kernels_list_flydsl[kernel_id]
+    flydsl_preshuffle_gemm_a8(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out,
+        ki.tile_m,
+        ki.tile_n,
+        ki.tile_k,
+        ki.lds_stage,
+        ki.use_cshuffle_epilog,
+        ki.use_async_copy,
+        ki.waves_per_eu,
+    )
+    return out
+
+
 def generate_data(
     m, n, k, seed, dtype=dtypes.bf16, q_dtype_w=dtypes.fp8, is_asm=False, device="cuda"
 ):
@@ -116,7 +170,7 @@ def generate_data(
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "ck", "cktile"]:
+        if value not in ["all", "asm", "ck", "cktile", "flydsl"]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 
@@ -144,7 +198,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to be tuned, support ['all', 'asm', 'ck', 'cktile']",
+            help="choose libtype to be tuned, support ['all', 'asm', 'ck', 'cktile', 'flydsl']",
         )
 
         self.parser.add_argument(
@@ -168,6 +222,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             if kernelId < 0 or kernelId > len(kernels_list_cktile):
                 return None
             kernelList = kernels_list_cktile
+        elif libtype == "flydsl":
+            if kernelId not in kernels_list_flydsl:
+                return None
+            return kernels_list_flydsl[kernelId].name
         else:
             return None
         return kernelList[kernelId].name
@@ -367,13 +425,85 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 )
         return tasks_ck
 
+    def get_flydsl_gemm_a8w8_bpreshuffle_tune_task(
+        self,
+        info_keys,
+        seed,
+    ):
+        cu_num, M, N, K, q_dtype_w = info_keys
+        q_dtype_eval = eval(q_dtype_w)
+        if q_dtype_eval == dtypes.fp8:
+            pass
+        elif q_dtype_eval == dtypes.i8:
+            pass
+        else:
+            print(f"[FlyDSL] unsupported q_dtype_w {q_dtype_w}, skipping")
+            return []
+
+        # Guard FlyDSL task generation on both kernel metadata and actual FlyDSL kernel availability.
+        if (not kernels_list_flydsl) or ("flydsl_preshuffle_gemm_a8" not in globals()):
+            return []
+
+        gemm_flydsl_data_idx = [0, 1, 2, 3, 4]
+        ref_data_idx = [0, 5, 2, 3, 6]
+        tasks = []
+        lds_limit = max_lds_bytes_for_tune()
+        padded_m = _get_padded_m(M)
+        min_ctas = max(4, min(16, N // 64))
+        for i in sorted(kernels_list_flydsl.keys()):
+            ki = kernels_list_flydsl[i]
+            if kernel_instance_estimated_lds_bytes(ki) > lds_limit:
+                continue
+            if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+                continue
+            if padded_m % ki.tile_m != 0:
+                continue
+            num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+            if num_ctas < min_ctas:
+                continue
+            if ki.tile_m == 16 and ki.tile_n == 512:
+                continue
+            if M >= 8192 and ki.tile_m < 64:
+                continue
+            if M >= 4096 and ki.tile_m < 32:
+                continue
+            if M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128:
+                continue
+            kernel_name = ki.name
+            info = (info_keys, i, 0, kernel_name, "flydsl")
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed, dtypes.bf16, q_dtype_eval),
+                    run_gemm_flydsl,
+                    (
+                        gemm_flydsl_data_idx,
+                        i,
+                    ),
+                    {
+                        "num_warmup": args.warmup,
+                        "num_iters": args.iters,
+                    },
+                    run_torch,
+                    (
+                        ref_data_idx,
+                        dtypes.bf16,
+                    ),
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                )
+            )
+        return tasks
+
     def tune(
         self,
         untunedf,
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
         shape_grouped = False
@@ -409,6 +539,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 )
             if "all" in args.libtype or "asm" in args.libtype:
                 task.extend(self.get_asm_gemm_i8_tasks(info_keys, useSplitK, 0, seed))
+            if "all" in args.libtype or "flydsl" in args.libtype:
+                task.extend(
+                    self.get_flydsl_gemm_a8w8_bpreshuffle_tune_task(
+                        info_keys,
+                        seed,
+                    )
+                )
 
             total_kernel_nums = len(task)
 
