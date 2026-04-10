@@ -77,20 +77,16 @@ def test_sage_compile_fullgraph(
 
     def fn(q, k, v):
         return fav3_sage_wrapper_func(
-            q, k, v, softmax_scale, causal=False, layout=layout
+            q, k, v, softmax_scale, causal=False, return_lse=False, layout=layout
         )
 
     # Eager baseline
     out_eager = fn(q, k, v)
-    if isinstance(out_eager, (list, tuple)):
-        out_eager = out_eager[0]
     torch.cuda.synchronize()
 
     # Compiled — fullgraph=True will error on any graph break
     compiled_fn = torch.compile(fn, fullgraph=True)
-    out_compiled = compiled_fn(q, k, v)
-    if isinstance(out_compiled, (list, tuple)):
-        out_compiled = out_compiled[0]
+    out_compiled = compiled_fn(q.clone(), k.clone(), v.clone())
     torch.cuda.synchronize()
 
     assert not torch.isnan(out_compiled).any(), "torch.compile produced NaN"
@@ -125,7 +121,7 @@ def test_sage_compile_no_recompilation(layout: str, dtype=torch.bfloat16):
 
     def fn(q, k, v):
         return fav3_sage_wrapper_func(
-            q, k, v, softmax_scale, causal=False, layout=layout
+            q, k, v, softmax_scale, causal=False, return_lse=False, layout=layout
         )
 
     compiled_fn = torch.compile(fn, fullgraph=True)
@@ -135,8 +131,6 @@ def test_sage_compile_no_recompilation(layout: str, dtype=torch.bfloat16):
         k = torch.randn(BATCH, HK, SEQLEN, D, device="cuda", dtype=dtype)
         v = torch.randn(BATCH, HK, SEQLEN, D, device="cuda", dtype=dtype)
         out = compiled_fn(q, k, v)
-        if isinstance(out, (list, tuple)):
-            out = out[0]
         assert not torch.isnan(out).any()
 
     torch.cuda.synchronize()
