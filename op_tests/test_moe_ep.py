@@ -19,6 +19,7 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter import ActivationType
 from aiter import pertoken_quant
 from aiter import dtypes
+from aiter import get_gfx
 import argparse
 
 BLOCK_SIZE_M = 32
@@ -311,7 +312,7 @@ def test_fmoe_ep(
         ) / (1024 * 1024 * 1024 * 1024.0)
         bw = num_tb * 1e6 / avg_b
         print(
-            f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}TB/s"
+            f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, asm_bandwidth: {bw:>8.2f}TB/s"
         )
 
         if use_smooth and (
@@ -344,7 +345,7 @@ def test_fmoe_ep(
             msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
             checkAllclose(out_b, out_b2, atol=10, msg=msg)
 
-        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
+        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
@@ -374,7 +375,7 @@ parser.add_argument(
           or -t g1u1_no_quant
           or -t g1u1_int8quant
           or -t g1u1_fp8quant
-          or -t g1u0_int8smoothquant
+          or -t g1u0_int8smoothquant (only runs on gfx942)
           or -t g1u1_int8smoothquant
           or -t g1u1_fp8smoothquant""",
 )
@@ -443,6 +444,7 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+gpu_arch = get_gfx()
 
 for test in args.test:
     print(f"\nRunning test: {test}")
@@ -519,6 +521,9 @@ for test in args.test:
                                 ep=ep,
                             )
     elif test == "g1u0_int8smoothquant":
+        if gpu_arch != "gfx942":
+            print(f"skip {test} on {gpu_arch}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:

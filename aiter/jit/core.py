@@ -183,29 +183,35 @@ class AITER_CONFIG(object):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
-        df_list = []
+        source_pairs = []
         ## merge config files
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
         import pandas as pd
 
-        df_list.append(pd.read_csv(path_list[0]))
-        for i, path in enumerate(path_list[1:]):
-            if os.path.exists(path):
-                df = pd.read_csv(path)
-                base_cols = [c for c in df_list[0].columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                assert (
-                    base_cols == new_cols
-                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
-
-                df_list.append(df)
-            else:
+        for i, path in enumerate(path_list):
+            if not os.path.exists(path):
                 logger.info(f"path {i+1}: {path} (not exist)")
-        merge_df = (
-            pd.concat([df for df in df_list if not df.empty], ignore_index=True)
-            if df_list
-            else pd.DataFrame()
-        )
+                continue
+
+            df = pd.read_csv(path)
+            if source_pairs:
+                base_path, base_df = source_pairs[0]
+                base_cols = [c for c in base_df.columns if c != "_tag"]
+                new_cols = [c for c in df.columns if c != "_tag"]
+                if base_cols != new_cols:
+                    raise ValueError(
+                        f"Column mismatch between {base_path} and {path}, "
+                        f"{base_cols}, {new_cols}"
+                    )
+
+            source_pairs.append((path, df))
+
+        if not source_pairs:
+            raise FileNotFoundError(
+                f"No existing config files found in '{file_path}' when merging '{merge_name}'."
+            )
+
+        merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
@@ -223,17 +229,49 @@ class AITER_CONFIG(object):
             if "cu_num" not in keys:
                 keys.append("cu_num")
             dedup_keys = keys + ["_tag"] if has_tag else keys
-            sorted_df = merge_df.sort_values("us")
-            duplicated_mask = sorted_df.duplicated(subset=dedup_keys, keep="first")
+            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
-                dup_rows = sorted_df[duplicated_mask]
-                logger.warning(
-                    f"Dropping {len(dup_rows)} duplicate rows during merge of '{merge_name}':\n"
-                    f"{dup_rows.to_string(index=False)}"
+                dup_count = int(duplicated_mask.sum())
+                dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+                if "us" not in merge_df.columns:
+                    raise RuntimeError(
+                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                        f"No 'us' column to determine best performing entry. "
+                        f"Please remove duplicates manually.\n"
+                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+                    )
+
+                # Auto-dedup: globally determine best row (lowest 'us') per shape
+                best_row_index = set(
+                    merge_df.sort_values("us", kind="stable")
+                    .drop_duplicates(subset=dedup_keys, keep="first")
+                    .index
                 )
-            merge_df = sorted_df.drop_duplicates(
-                subset=dedup_keys, keep="first"
-            ).reset_index(drop=True)
+
+                saved_files = []
+                offset = 0
+                for src_path, src_df in source_pairs:
+                    start, end = offset, offset + len(src_df)
+                    offset = end
+                    file_rows = merge_df.iloc[start:end]
+                    new_src_df = file_rows[
+                        file_rows.index.isin(best_row_index)
+                    ].reset_index(drop=True)
+                    if len(new_src_df) < len(src_df):
+                        new_src_df.to_csv(src_path, index=False)
+                        saved_files.append(
+                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
+                        )
+                saved_info = (
+                    "\n".join(saved_files) if saved_files else "  (no files updated)"
+                )
+                raise RuntimeError(
+                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
+                    f"and saved back to source config files. Please re-run.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+                    f"Updated files:\n{saved_info}"
+                )
         else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
@@ -527,7 +565,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_enum", "module_aiter_tensor"]
+rebuilded_list = ["module_aiter_core"]
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -1106,10 +1144,26 @@ def _ctypes_call(func, fc_name, md_name):
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
 
-        hints = typing.get_type_hints(func)
+        def _opt_sym(name, argtypes=(), restype=None):
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.argtypes = list(argtypes)
+                fn.restype = restype
+            return fn
 
+        abi_fn = _opt_sym("aiter_ctypes_abi_version", restype=ctypes.c_int)
+        ctypes_abi_version = abi_fn() if abi_fn else 1
+        ctypes_status_mode = ctypes_abi_version >= 2
+        err_getter = _opt_sym("aiter_get_last_error", restype=ctypes.c_char_p)
+        err_clear = _opt_sym("aiter_clear_last_error")
+
+        hints = typing.get_type_hints(func)
         ret_hint = hints.get("return")
-        if ret_hint is int:
+        ctypes_data_return = ctypes_status_mode and ret_hint is int
+
+        if ctypes_status_mode:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is int:
             c_func.restype = ctypes.c_int
         elif ret_hint is float:
             c_func.restype = ctypes.c_float
@@ -1148,6 +1202,10 @@ def _ctypes_call(func, fc_name, md_name):
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
+        _cache["err_getter"] = err_getter
+        _cache["err_clear"] = err_clear
+        _cache["ctypes_status_mode"] = ctypes_status_mode
+        _cache["ctypes_data_return"] = ctypes_data_return
         _cache["has_tensor"] = has_tensor
 
     def _check_args_before_convert(bound_args, hints):
@@ -1209,6 +1267,10 @@ def _ctypes_call(func, fc_name, md_name):
         nonlocal _arg_checked
         _ensure_loaded()
         c_func = _cache["c_func"]
+        err_getter = _cache.get("err_getter")
+        err_clear = _cache.get("err_clear")
+        ctypes_status_mode = _cache.get("ctypes_status_mode", False)
+        ctypes_data_return = _cache.get("ctypes_data_return", False)
 
         if AITER_LOG_MORE == 2:
             from ..test_common import log_args
@@ -1262,11 +1324,30 @@ def _ctypes_call(func, fc_name, md_name):
             else:
                 c_args.append(value)
 
-        if _cache.get("has_tensor"):
-            c_args.append(
-                ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-            )
-        return c_func(*c_args)
+        c_args.append(
+            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+        )
+        if err_clear is not None:
+            err_clear()
+        ret = c_func(*c_args)
+
+        err_msg = None
+        if ctypes_status_mode and not ctypes_data_return and ret != 0:
+            err_msg = f"ctypes status={ret}"
+        if err_getter is not None:
+            raw = err_getter()
+            if raw:
+                err_msg = raw.decode(errors="replace")
+        if err_msg is not None:
+            if err_clear is not None:
+                err_clear()
+            raise RuntimeError(f"{fc_name} failed: {err_msg}")
+
+        if ctypes_data_return:
+            return ret
+        if ctypes_status_mode:
+            return None
+        return ret
 
     return caller
 
@@ -1277,6 +1358,7 @@ def compile_ops(
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
     ffi_type: str = "pybind",
+    develop: bool = False,
 ):
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
@@ -1398,7 +1480,7 @@ def compile_ops(
                         )
                         try:
                             aiter_tensor_t = get_module(
-                                "module_aiter_tensor"
+                                "module_aiter_core"
                             ).aiter_tensor_t
                         except Exception:
                             aiter_tensor_t = object
@@ -1456,6 +1538,25 @@ def compile_ops(
                             )
                     return True
 
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, …).
+                if develop:
+                    import torch
+
+                    from ..utility.dtypes import torch_to_aiter_pybind
+
+                    args = tuple(
+                        torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a
+                        for a in args
+                    )
+                    kwargs = {
+                        k: (
+                            torch_to_aiter_pybind(v)
+                            if isinstance(v, torch.Tensor)
+                            else v
+                        )
+                        for k, v in kwargs.items()
+                    }
+
                 if not func.arg_checked:
                     func.arg_checked = check_args()
 
@@ -1464,6 +1565,10 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
 
+                if develop:
+                    module._set_current_hip_stream(
+                        torch.cuda.current_stream().cuda_stream
+                    )
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)

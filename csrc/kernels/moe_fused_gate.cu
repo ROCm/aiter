@@ -15,9 +15,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
-#include "vec_convert.h"
+#include "opus/opus.hpp"
 #include <ATen/hip/HIPContext.h>
 #include <cfloat>
 #include <hip/hip_runtime.h>
@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <torch/all.h>
 #include <type_traits>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 /// Aligned array type
 template <typename T,
@@ -38,8 +39,8 @@ class alignas(Alignment) AlignedArray
     float data[N];
 };
 
-using bfloat16_t = ck_tile::bfloat16_t;
-using float16_t  = ck_tile::half_t;
+using bfloat16_t = opus::bf16_t;
+using float16_t  = opus::fp16_t;
 using float32_t  = float;
 
 // QQ NOTE: to handle the case for at::Half, error: more than one operator ">" matches these
@@ -51,7 +52,7 @@ __device__ inline bool cmp_gt(const T& a, const T& b)
     if constexpr(std::is_same<T, bfloat16_t>::value)
     {
         // at::Half (or float16_t in our native case) causes ambiguity, so we cast to float.
-        return ck_tile::type_convert<float>(a) > ck_tile::type_convert<float>(b);
+        return opus::cast<float>(a) > opus::cast<float>(b);
     }
     else
     {
@@ -66,7 +67,7 @@ __device__ inline bool cmp_eq(const T& a, const T& b)
 {
     if constexpr(std::is_same<T, float16_t>::value || std::is_same<T, bfloat16_t>::value)
     {
-        return ck_tile::type_convert<float>(a) == ck_tile::type_convert<float>(b);
+        return opus::cast<float>(a) == opus::cast<float>(b);
     }
     else
     {
@@ -136,18 +137,10 @@ __device__ void moe_fused_gate_impl(void* input,
     // Create local arrays for the row chunk and bias chunk and then reinterpret the address of
     // row_chunk as a pointer to AccessType.
 
-    // constexpr uint32_t vec_size = 16 / sizeof(T);
-    using AccessType = ck_tile::vec_t<T, MAX_VPT>;
-    using VecType    = ck_tile::vec_t<float, MAX_VPT>;
-
     T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
-    VecType row_chunk;
-    AccessType const* vec_thread_read_ptr = reinterpret_cast<AccessType const*>(thread_read_ptr);
-
     T* bias_thread_read_ptr = bias_ptr + first_elt_read_by_thread;
-    VecType bias_chunk;
-    AccessType const* vec_bias_thread_read_ptr =
-        reinterpret_cast<AccessType const*>(bias_thread_read_ptr);
+    float row_chunk[MAX_VPT]{};
+    float bias_chunk[MAX_VPT]{};
 
     // QQ NOTE: doing the follow will be slower than loop assign and more importantly
     // have misaligned address issue when params.VPT < 8 and mismatch with MAX_VPT
@@ -160,20 +153,35 @@ __device__ void moe_fused_gate_impl(void* input,
     //     bias_chunk_vec_ptr[ii] = vec_bias_thread_read_ptr[0][ii];
     //   }]
 
-    AccessType row_chunk_vec        = *vec_thread_read_ptr;
-    AccessType bias_thread_read_vec = *vec_bias_thread_read_ptr;
-    for(int jj = 0; jj < params.VPT; ++jj)
+    if constexpr(std::is_empty_v<Params>)
     {
-        row_chunk[jj]  = ck_tile::type_convert<float>(row_chunk_vec(jj));
-        bias_chunk[jj] = ck_tile::type_convert<float>(bias_thread_read_vec(jj));
+        using AccessType = opus::vector_t<T, Params::VPT>;
+        AccessType const* vec_thread_read_ptr = reinterpret_cast<AccessType const*>(thread_read_ptr);
+        AccessType const* vec_bias_thread_read_ptr =
+            reinterpret_cast<AccessType const*>(bias_thread_read_ptr);
+        AccessType row_chunk_vec        = *vec_thread_read_ptr;
+        AccessType bias_thread_read_vec = *vec_bias_thread_read_ptr;
+        for(int jj = 0; jj < Params::VPT; ++jj)
+        {
+            row_chunk[jj]  = opus::cast<float>(row_chunk_vec[jj]);
+            bias_chunk[jj] = opus::cast<float>(bias_thread_read_vec[jj]);
+        }
+    }
+    else
+    {
+        for(int jj = 0; jj < params.VPT; ++jj)
+        {
+            row_chunk[jj]  = opus::cast<float>(thread_read_ptr[jj]);
+            bias_chunk[jj] = opus::cast<float>(bias_thread_read_ptr[jj]);
+        }
     }
     // #pragma unroll
     // for (int ii = 0; ii < params.VPT / vec_size; ++ii) {
     //   AccessType row_chunk_vec = vec_thread_read_ptr[ii];
     //   AccessType bias_thread_read_vec = vec_bias_thread_read_ptr[ii];
     //   for (int jj = 0; jj < vec_size; ++jj) {
-    //     row_chunk[ii * vec_size + jj] = ck_tile::type_convert<float>(row_chunk_vec(jj));
-    //     bias_chunk[ii * vec_size + jj] = ck_tile::type_convert<float>(bias_thread_read_vec(jj));
+    //     row_chunk[ii * vec_size + jj] = opus::cast<float>(row_chunk_vec(jj));
+    //     bias_chunk[ii * vec_size + jj] = opus::cast<float>(bias_thread_read_vec(jj));
     //   }
     // }
 
@@ -344,7 +352,7 @@ __device__ void moe_fused_gate_impl(void* input,
             // bias_chunk[expert_to_clear_in_thread] = -FLT_MAX;
             //// store output
             // output_ptr[idx] = row_chunk[expert_to_clear_in_thread];
-            indices_ptr[idx] = ck_tile::type_convert<int32_t>(expert);
+            indices_ptr[idx] = static_cast<int32_t>(expert);
         }
         __syncthreads();
 
@@ -364,7 +372,7 @@ __device__ void moe_fused_gate_impl(void* input,
 
         // Use round-robin to select expert
         int64_t expert_offset = thread_row % num_fused_shared_experts;
-        indices_ptr[last_idx] = ck_tile::type_convert<int32_t>(params.NUM_EXPERTS + expert_offset);
+        indices_ptr[last_idx] = static_cast<int32_t>(params.NUM_EXPERTS + expert_offset);
 
         // Set the weight to the sum of all weights divided by routed_scaling_factor
         output_ptr[last_idx] = output_sum / routed_scaling_factor;
@@ -418,8 +426,6 @@ template <typename T,
           int VPT,
           int NUM_EXPERTS,
           int THREADS_PER_ROW,
-          int ROWS_PER_WARP,
-          int ROWS_PER_CTA,
           int WARPS_PER_CTA>
 __global__ void moe_fused_gate_kernel(void* input,
                                       void* bias,
@@ -432,6 +438,9 @@ __global__ void moe_fused_gate_kernel(void* input,
                                       double routed_scaling_factor,
                                       int32_t out_stride)
 {
+    constexpr int EXPERT_GROUP = THREADS_PER_ROW;
+    constexpr int ROWS_PER_WARP = ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;
+    constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;
     KernelParams<VPT, NUM_EXPERTS, THREADS_PER_ROW, ROWS_PER_WARP, ROWS_PER_CTA, WARPS_PER_CTA>
         params;
     moe_fused_gate_impl<T>(input,
@@ -453,15 +462,10 @@ __global__ void moe_fused_gate_kernel(void* input,
     {                                                                                         \
         constexpr int VPT = (EXPERTS) / (EXPERT_GROUP);                                       \
         /* If EXPERT_GROUP > WARP_SIZE, fall back to 1 row per warp */                        \
-        constexpr int ROWS_PER_WARP =                                                         \
-            ((EXPERT_GROUP) <= WARP_SIZE) ? (WARP_SIZE / (EXPERT_GROUP)) : 1;                 \
-        constexpr int ROWS_PER_CTA = WARPS_PER_CTA * ROWS_PER_WARP;                           \
         moe_fused_gate_kernel<T,                                                              \
                               VPT,                                                            \
                               (EXPERTS),                                                      \
                               (EXPERT_GROUP),                                                 \
-                              ROWS_PER_WARP,                                                  \
-                              ROWS_PER_CTA,                                                   \
                               WARPS_PER_CTA>                                                  \
             <<<num_blocks, block_dim, shared_mem_size, stream>>>(input.data_ptr(),            \
                                                                  bias.data_ptr(),             \
@@ -555,13 +559,14 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
     int ROWS_PER_WARP     = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
     size_t shared_mem_size =
         ((topk * sizeof(float) + topk * sizeof(int)) * ROWS_PER_WARP + 255) & ~255;
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     dim3 block_dim(WARP_SIZE, WARPS_PER_CTA);
 
-    // Check 1: Ensure that num_experts is a power of 2.
-    TORCH_CHECK((num_experts & (num_experts - 1)) == 0,
-                "num_experts must be a power of 2, but got ",
-                num_experts);
+    // // Check 1: Ensure that num_experts is a power of 2.
+    // TORCH_CHECK((num_experts & (num_experts - 1)) == 0,
+    //             "num_experts must be a power of 2, but got ",
+    //             num_experts);
 
     // Check 2: Ensure that num_experts is divisible by num_expert_group. (this also means
     // num_expert_group is power of 2)
@@ -624,6 +629,25 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
             }
         }
         break;
+    case 192:
+        if(num_expert_group == 8)
+        {
+            // This is deepseek v3 case. Here VPT = 192/8 = 24, ROWS_PER_WARP = 32/8 = 4,
+            // ROWS_PER_CTA = 6 * 4 = 24.
+            if(input.scalar_type() == at::kBFloat16)
+            {
+                LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 192, 8);
+            }
+            else if(input.scalar_type() == at::kHalf)
+            {
+                LAUNCH_MOE_GATE_CONFIG(float16_t, 192, 8);
+            }
+            else if(input.scalar_type() == at::kFloat)
+            {
+                LAUNCH_MOE_GATE_CONFIG(float32_t, 192, 8);
+            }
+        }
+        break;
     case 128:
         if(num_expert_group == 4)
         {
@@ -655,6 +679,25 @@ std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
             else if(input.scalar_type() == at::kFloat)
             {
                 LAUNCH_MOE_GATE_CONFIG(float32_t, 128, 8);
+            }
+        }
+        break;
+    case 96:
+        if(num_expert_group == 8)
+        {
+            // This is deepseek v3 case. Here VPT = 96/8 = 12, ROWS_PER_WARP = 32/8 = 4,
+            // ROWS_PER_CTA = 6 * 4 = 24.
+            if(input.scalar_type() == at::kBFloat16)
+            {
+                LAUNCH_MOE_GATE_CONFIG(bfloat16_t, 96, 8);
+            }
+            else if(input.scalar_type() == at::kHalf)
+            {
+                LAUNCH_MOE_GATE_CONFIG(float16_t, 96, 8);
+            }
+            else if(input.scalar_type() == at::kFloat)
+            {
+                LAUNCH_MOE_GATE_CONFIG(float32_t, 96, 8);
             }
         }
         break;

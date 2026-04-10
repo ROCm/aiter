@@ -1,0 +1,221 @@
+name: AMD CI Job Monitor
+
+permissions:
+  actions: read
+  contents: read
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  pull_request:
+    paths:
+      - ".github/workflows/amd-ci-job-monitor.yml"
+      - ".github/scripts/list_jobs.py"
+      - ".github/scripts/query_job_status.py"
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Time window in hours"
+        required: false
+        default: "24"
+        type: string
+      workflows:
+        description: "Comma-separated workflow files (optional, empty for auto-discovery)"
+        required: false
+        default: ""
+        type: string
+      exclude_jobs:
+        description: "Comma-separated job names to exclude"
+        required: false
+        default: "call-gate,check-changes,pr-test-amd-finish,cancel,check-all-jobs"
+        type: string
+      job_filter:
+        description: "Single job name filter (optional)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  parse-workflows:
+    name: Parse Workflow Jobs
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '' }}
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.parse.outputs.matrix }}
+      workflow_list: ${{ steps.parse.outputs.workflow_list }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Parse workflow files
+        id: parse
+        run: |
+          python .github/scripts/list_jobs.py \
+            --workflow-dir ".github/workflows" \
+            --workflows "${{ github.event.inputs.workflows || '' }}" \
+            --exclude-workflows "amd-ci-job-monitor.yml" \
+            --exclude-jobs "${{ github.event.inputs.exclude_jobs || 'call-gate,check-changes,pr-test-amd-finish,cancel,check-all-jobs' }}" \
+            --out-matrix matrix.json \
+            --out-workflow-map workflow_map.json
+
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import json
+          m = json.load(open("workflow_map.json", "r", encoding="utf-8"))
+          print(f"workflow_list={','.join(m.keys())}")
+          with open("workflow_list.txt", "w", encoding="utf-8") as f:
+              f.write(",".join(m.keys()))
+          PY
+          echo "workflow_list=$(cat workflow_list.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Show parsed workflows
+        run: |
+          echo "Workflow list: ${{ steps.parse.outputs.workflow_list }}"
+          echo "Matrix size: $(python - <<'PY'
+          import json
+          print(len(json.load(open("matrix.json", "r", encoding="utf-8"))))
+          PY
+          )"
+
+  custom-report:
+    name: Custom Job Report
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.job_filter != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install requests tabulate
+
+      - name: Generate custom report
+        run: |
+          if [ -z "${{ github.event.inputs.workflows || '' }}" ]; then
+            echo "Error: 'workflows' input is required when 'job_filter' is set."
+            exit 1
+          fi
+          python .github/scripts/query_job_status.py \
+            --repo "${{ github.repository }}" \
+            --workflows "${{ github.event.inputs.workflows }}" \
+            --job "${{ github.event.inputs.job_filter }}" \
+            --hours "${{ github.event.inputs.hours || '24' }}" \
+            --summary
+
+  fetch-actions-snapshot:
+    name: Fetch Actions Snapshot
+    needs: parse-workflows
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '') && needs.parse-workflows.outputs.workflow_list != '' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install requests tabulate
+
+      - name: Fetch snapshot
+        run: |
+          HOURS="${{ github.event_name == 'pull_request' && '1' || (github.event.inputs.hours || '24') }}"
+          python .github/scripts/query_job_status.py \
+            --repo "${{ github.repository }}" \
+            --workflows "${{ needs.parse-workflows.outputs.workflow_list }}" \
+            --hours "${HOURS}" \
+            --snapshot-out actions-snapshot.json
+
+      - name: Upload snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: actions-snapshot.json
+
+  matrix-reports:
+    name: ${{ matrix.workflow }} - ${{ matrix.job_name }}
+    needs: [parse-workflows, fetch-actions-snapshot]
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '') && needs.parse-workflows.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.parse-workflows.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install requests tabulate
+
+      - name: Download actions snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: .
+
+      - name: Generate report
+        run: |
+          python .github/scripts/query_job_status.py \
+            --repo "${{ github.repository }}" \
+            --snapshot-in "actions-snapshot.json" \
+            --workflows "${{ matrix.workflow }}" \
+            --job "${{ matrix.job_name }}" \
+            --summary
+
+  runner-fleet-report:
+    name: Runner Fleet Report
+    needs: [parse-workflows, fetch-actions-snapshot]
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.job_filter == '') && needs.parse-workflows.outputs.workflow_list != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install requests tabulate
+
+      - name: Download actions snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: actions-job-snapshot
+          path: .
+
+      - name: Generate runner fleet report
+        run: |
+          python .github/scripts/query_job_status.py \
+            --repo "${{ github.repository }}" \
+            --snapshot-in "actions-snapshot.json" \
+            --workflows "${{ needs.parse-workflows.outputs.workflow_list }}" \
+            --runner-report \
+            --summary | tee runner-fleet-report.md
+
+          cat runner-fleet-report.md >> "$GITHUB_STEP_SUMMARY"

@@ -3,7 +3,7 @@
 
 import torch
 from aiter.test_common import checkAllclose, perftest
-from aiter import dtypes
+from aiter import dtypes, get_gfx
 from aiter.fused_moe import torch_moe, fused_topk
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
@@ -189,6 +189,10 @@ def test_fmoe(
             out_b = ref2
             avg_b = 9999
             print("asm g1u1 only support quant/smoothquant Now")
+        elif get_gfx() != "gfx942":
+            out_b = ref2
+            avg_b = 9999
+            print(f"skip asm g1u0 no-quant on {get_gfx()}: only runs on gfx942")
         else:
             out_b, avg_b = asm_moe_test(
                 input, w1b, w2b, topk_weights, topk_ids, activation=activation
@@ -506,6 +510,9 @@ for test in args.test:
                         #   quant='fp8quant', use_g1u1=True)
 
     elif test == "g1u0_int8smoothquant":
+        if get_gfx() != "gfx942":
+            print(f"skip {test} on {get_gfx()}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:
@@ -562,6 +569,9 @@ for test in args.test:
                             activation=args.activation,
                         )
     elif test == "g1u1_int4":
+        if get_gfx() != "gfx942":
+            print(f"skip {test} on {get_gfx()}: only runs on gfx942")
+            continue
         for dtype in args.dtype:
             for m in args.token:
                 for hdim in args.hidden_dim:

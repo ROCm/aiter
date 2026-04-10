@@ -1563,6 +1563,15 @@ __global__ void __launch_bounds__(1024, 1)
             }
         }
 
+        // Round allreduce result to bf16 and back to f32 before adding residual,
+        // matching the numerical behavior of the unfused (allreduce -> bf16 -> add residual) path.
+        // Without this, the extra f32 mantissa bits cause 1-ULP divergence that compounds across layers.
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] = upcast_s(downcast_s<T>(acc[v]));
+        }
+
         P res = *reinterpret_cast<P*>(residual_inp + idx);
 
 #pragma unroll
@@ -2030,19 +2039,22 @@ class CustomAllreduce
     RankData* get_buffer_RD(hipStream_t stream, void* input)
     {
         RankData* ptrs;
-        auto it = input_buffer.find(input);
-        if(it != input_buffer.end())
+        // During graph capture, always record the buffer unconditionally.
+        // Skip the input_buffer cache to ensure all ranks record the same
+        // number of buffers, even if their allocators reuse different addresses.
+        hipStreamCaptureStatus status;
+        HIP_CALL(hipStreamIsCapturing(stream, &status));
+        if(status == hipStreamCaptureStatusActive)
         {
-            ptrs = it->second;
+            ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size();
+            graph_unreg_input_buffers_.push_back(input);
         }
         else
         {
-            hipStreamCaptureStatus status;
-            HIP_CALL(hipStreamIsCapturing(stream, &status));
-            if(status == hipStreamCaptureStatusActive)
+            auto it = input_buffer.find(input);
+            if(it != input_buffer.end())
             {
-                ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size();
-                graph_unreg_input_buffers_.push_back(input);
+                ptrs = it->second;
             }
             else
             {
@@ -2058,21 +2070,23 @@ class CustomAllreduce
     RankData* get_output_buffer_RD(hipStream_t stream, void* output)
     {
         RankData* ptrs;
-        auto it = output_buffers_.find(output);
-        if(it != output_buffers_.end())
+        // During graph capture, always record the buffer unconditionally.
+        // Skip the output_buffers_ cache to ensure all ranks record the same
+        // number of buffers, even if their allocators reuse different addresses.
+        hipStreamCaptureStatus status;
+        HIP_CALL(hipStreamIsCapturing(stream, &status));
+        if(status == hipStreamCaptureStatusActive)
         {
-            ptrs = it->second;
+            ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
+                   graph_unreg_output_buffers_.size();
+            graph_unreg_output_buffers_.push_back(output);
         }
         else
         {
-            hipStreamCaptureStatus status;
-            HIP_CALL(hipStreamIsCapturing(stream, &status));
-            if(status == hipStreamCaptureStatusActive)
+            auto it = output_buffers_.find(output);
+            if(it != output_buffers_.end())
             {
-                // For graph mode, collect output addresses
-                ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
-                       graph_unreg_output_buffers_.size();
-                graph_unreg_output_buffers_.push_back(output);
+                ptrs = it->second;
             }
             else
             {
