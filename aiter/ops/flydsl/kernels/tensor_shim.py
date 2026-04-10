@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import torch
 import numpy as np
 from itertools import product
 from abc import ABC, abstractmethod
@@ -20,6 +21,15 @@ def _to_raw(v):
     return ir.Value._CAPICreate(v._CAPIPtr)
 
 
+def get_dtype_str(dtype):
+    if dtype == torch.float:
+        return "f32"
+    elif dtype == torch.half:
+        return "f16"
+    elif dtype == torch.bfloat16:
+        return "bf16"
+
+
 def get_dtype_in_kernel(dtype: str):
     if dtype == "f32":
         return T.f32
@@ -27,6 +37,15 @@ def get_dtype_in_kernel(dtype: str):
         return T.f16
     elif dtype == "bf16":
         return T.bf16
+
+
+def get_dtype_vec_size(dtype: str):
+    if dtype == "f32":
+        return 4
+    elif dtype == "f16":
+        return 8
+    elif dtype == "bf16":
+        return 8
 
 
 class TensorView:
