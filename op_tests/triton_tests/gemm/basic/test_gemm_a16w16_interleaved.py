@@ -276,5 +276,79 @@ def test_finer_interleaved_pipelined_with_bias():
     torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
 
 
+# ── basic_pipelined_v2 kernel tests ──
+
+
+@requires_gluon
+@pytest.mark.parametrize("M,N,K", SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("num_buffers", [2, 3])
+def test_basic_pipelined_v2_correctness(M, N, K, dtype, num_buffers):
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    config = {**CONFIG_3BUF, "NUM_BUFFERS": num_buffers}
+    ref = F.linear(x, w)
+    out = gemm_a16w16(
+        x, w, dtype=dtype, config=config,
+        backend="gluon", kernel_type="basic_pipelined_v2",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+@requires_gluon
+def test_basic_pipelined_v2_with_bias():
+    M, N, K = 1024, 2048, 2880
+    dtype = torch.bfloat16
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+    bias = torch.randn((N,), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w, bias=bias)
+    out = gemm_a16w16(
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="basic_pipelined_v2",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+# ── finer_interleaved_pipelined_v2 kernel tests ──
+
+
+@requires_gluon
+@pytest.mark.parametrize("M,N,K", SHAPES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_finer_interleaved_pipelined_v2_correctness(M, N, K, dtype):
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w)
+    out = gemm_a16w16(
+        x, w, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="finer_interleaved_pipelined_v2",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
+@requires_gluon
+def test_finer_interleaved_pipelined_v2_with_bias():
+    M, N, K = 1024, 2048, 2880
+    dtype = torch.bfloat16
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda")
+    bias = torch.randn((N,), dtype=dtype, device="cuda")
+
+    ref = F.linear(x, w, bias=bias)
+    out = gemm_a16w16(
+        x, w, bias=bias, dtype=dtype, config=CONFIG_3BUF,
+        backend="gluon", kernel_type="finer_interleaved_pipelined_v2",
+    )
+
+    torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-1)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])

@@ -66,6 +66,14 @@ _gemm_a16w16_finer_interleaved_pipelined_repr = make_kernel_repr(
     "_gemm_a16w16_gfx1250_finer_interleaved_pipelined_kernel", _GLUON_REPR_KEYS
 )
 
+_gemm_a16w16_basic_pipelined_v2_repr = make_kernel_repr(
+    "_gemm_a16w16_gfx1250_basic_pipelined_v2_kernel", _GLUON_REPR_KEYS
+)
+
+_gemm_a16w16_finer_interleaved_pipelined_v2_repr = make_kernel_repr(
+    "_gemm_a16w16_gfx1250_finer_interleaved_pipelined_v2_kernel", _GLUON_REPR_KEYS
+)
+
 
 def _get_config(M: int, N: int, K: int):
     config, is_tuned = get_gemm_config("GEMM-A16W16", M, N, K)
@@ -3361,6 +3369,670 @@ def _gemm_a16w16_finer_interleaved_pipelined_kernel(
     )
 
 
+@gluon.jit(repr=_gemm_a16w16_basic_pipelined_v2_repr)
+def _gemm_a16w16_basic_pipelined_v2_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    PHYSICAL_MK: gl.constexpr,
+    PHYSICAL_KN: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    OPERAND_LAYOUT_A: gl.constexpr,
+    OPERAND_LAYOUT_B: gl.constexpr,
+    activation: gl.constexpr,
+    USE_ACTIVATION: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    L2_PREFETCH_DISTANCE: gl.constexpr,
+):
+    """Pipelined v2: mfma first, then TDM, then wait + ds_load.
+
+    Generalized for any NUM_BUFFERS >= 2.  Fills NUM_BUFFERS-1 tiles via TDM,
+    pre-loads tile 0 into registers, then runs:
+    loop { wmma n, TDM next, wait, ds_load next },
+    epilogue drains remaining tiles.
+    """
+    USE_L2_PREFETCH: gl.constexpr = L2_PREFETCH_DISTANCE > 0
+    gl.static_assert(NUM_BUFFERS >= 2, "basic_pipelined_v2 requires NUM_BUFFERS >= 2")
+
+    pid = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_pid_m
+    pid_n = pid // num_pid_m
+
+    # ── TDM descriptors ──
+    if PHYSICAL_MK:
+        a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(M, K),
+            strides=(stride_am, stride_ak),
+            block_shape=(BLOCK_M, BLOCK_K),
+            layout=SHARED_LAYOUT_A,
+        )
+    else:
+        a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(K, M),
+            strides=(stride_ak, stride_am),
+            block_shape=(BLOCK_K, BLOCK_M),
+            layout=SHARED_LAYOUT_A,
+        )
+
+    if PHYSICAL_KN:
+        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_ptr,
+            shape=(K, N),
+            strides=(stride_bk, stride_bn),
+            block_shape=(BLOCK_K, BLOCK_N),
+            layout=SHARED_LAYOUT_B,
+        )
+    else:
+        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_ptr,
+            shape=(N, K),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_N, BLOCK_K),
+            layout=SHARED_LAYOUT_B,
+        )
+
+    # ── Shared memory buffers ──
+    if PHYSICAL_MK:
+        a_buffer = gl.allocate_shared_memory(
+            a_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_M, BLOCK_K],
+            layout=SHARED_LAYOUT_A,
+        )
+    else:
+        a_buffer = gl.allocate_shared_memory(
+            a_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_K, BLOCK_M],
+            layout=SHARED_LAYOUT_A,
+        )
+
+    if PHYSICAL_KN:
+        b_buffer = gl.allocate_shared_memory(
+            b_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_K, BLOCK_N],
+            layout=SHARED_LAYOUT_B,
+        )
+    else:
+        b_buffer = gl.allocate_shared_memory(
+            b_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_N, BLOCK_K],
+            layout=SHARED_LAYOUT_B,
+        )
+
+    load_idx = 0
+    compute_idx = 0
+
+    accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+
+    off_am = pid_m * BLOCK_M
+    off_bn = pid_n * BLOCK_N
+
+    if USE_L2_PREFETCH:
+        gemm_l2_prefetch_prologue(
+            L2_PREFETCH_DISTANCE,
+            load_idx,
+            a_desc,
+            b_desc,
+            off_am,
+            off_bn,
+            BLOCK_K,
+            NUM_BUFFERS,
+            not PHYSICAL_MK,
+            not PHYSICAL_KN,
+        )
+
+    num_k_tiles = gl.cdiv(K, BLOCK_K)
+
+    # ── TDM prologue: fill pipeline with NUM_BUFFERS-1 tiles ──
+    for _ in gl.static_range(NUM_BUFFERS - 1):
+        if PHYSICAL_MK:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [pid_m * BLOCK_M, load_idx * BLOCK_K],
+                a_buffer.index(load_idx % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [load_idx * BLOCK_K, pid_m * BLOCK_M],
+                a_buffer.index(load_idx % NUM_BUFFERS),
+            )
+
+        if PHYSICAL_KN:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [load_idx * BLOCK_K, pid_n * BLOCK_N],
+                b_buffer.index(load_idx % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [pid_n * BLOCK_N, load_idx * BLOCK_K],
+                b_buffer.index(load_idx % NUM_BUFFERS),
+            )
+
+        load_idx += 1
+
+    # ── Wait tile 0, ds_load tile 0 into cur registers ──
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+
+    if PHYSICAL_MK:
+        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
+        )
+    else:
+        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_A,
+        )
+
+    if PHYSICAL_KN:
+        cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
+        )
+    else:
+        cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_B,
+        )
+
+    # ── Main loop ──
+    for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
+        # WMMA current tile
+        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+        # TDM next tile
+        if PHYSICAL_MK:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [pid_m * BLOCK_M, load_idx * BLOCK_K],
+                a_buffer.index(load_idx % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [load_idx * BLOCK_K, pid_m * BLOCK_M],
+                a_buffer.index(load_idx % NUM_BUFFERS),
+            )
+
+        if PHYSICAL_KN:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [load_idx * BLOCK_K, pid_n * BLOCK_N],
+                b_buffer.index(load_idx % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [pid_n * BLOCK_N, load_idx * BLOCK_K],
+                b_buffer.index(load_idx % NUM_BUFFERS),
+            )
+
+        # Wait for next compute tile
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+
+        load_idx += 1
+
+        if USE_L2_PREFETCH:
+            gemm_l2_prefetch(
+                L2_PREFETCH_DISTANCE - 1,
+                load_idx,
+                a_desc,
+                b_desc,
+                off_am,
+                off_bn,
+                BLOCK_K,
+                not PHYSICAL_MK,
+                not PHYSICAL_KN,
+            )
+
+        # ds_load next tile into registers
+        if PHYSICAL_MK:
+            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
+            )
+        else:
+            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                OPERAND_LAYOUT_A,
+            )
+
+        if PHYSICAL_KN:
+            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
+            )
+        else:
+            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                OPERAND_LAYOUT_B,
+            )
+
+        cur_a = next_a
+        cur_b = next_b
+        compute_idx += 1
+
+    # ── Epilogue: drain remaining NUM_BUFFERS-1 tiles ──
+    for i in gl.static_range(NUM_BUFFERS - 2):
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+
+        if PHYSICAL_MK:
+            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
+            )
+        else:
+            next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                OPERAND_LAYOUT_A,
+            )
+
+        if PHYSICAL_KN:
+            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
+            )
+        else:
+            next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                OPERAND_LAYOUT_B,
+            )
+
+        accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+        cur_a = next_a
+        cur_b = next_b
+        compute_idx += 1
+
+    # Final WMMA
+    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+    # ── Bias ──
+    if ADD_BIAS:
+        offs_bias = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
+        bias_vals = gl.load(bias_ptr + offs_bias)
+        accumulator = accumulator + bias_vals[None, :]
+
+    # ── Activation ──
+    if USE_ACTIVATION:
+        accumulator = activation(accumulator)
+
+    offs_cm = pid_m * BLOCK_M + gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+    )
+    offs_cn = pid_n * BLOCK_N + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+    )
+
+    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+
+    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    # ── Store ──
+    gl.amd.gfx1250.buffer_store(
+        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
+    )
+
+
+@gluon.jit(repr=_gemm_a16w16_finer_interleaved_pipelined_v2_repr)
+def _gemm_a16w16_finer_interleaved_pipelined_v2_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    PHYSICAL_MK: gl.constexpr,
+    PHYSICAL_KN: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    OPERAND_LAYOUT_A: gl.constexpr,
+    OPERAND_LAYOUT_B: gl.constexpr,
+    activation: gl.constexpr,
+    USE_ACTIVATION: gl.constexpr,
+    ADD_BIAS: gl.constexpr,
+    L2_PREFETCH_DISTANCE: gl.constexpr,
+):
+    """Finer interleaved pipelined v2: mfma issued before the independent ds_load.
+
+    TDM 0, TDM 1, wait 0, ds_load 0 half1,
+    loop { mfma n half1, ds_load n half2, TDM n+2,
+           wait n+1, mfma n half2, ds_load n+1 half1 },
+    epilogue.
+    Requires NUM_BUFFERS >= 3 and BLOCK_K >= 64.
+    """
+    USE_L2_PREFETCH: gl.constexpr = L2_PREFETCH_DISTANCE > 0
+    HALF_K: gl.constexpr = BLOCK_K // 2
+    gl.static_assert(NUM_BUFFERS >= 3, "finer_interleaved_pipelined_v2 requires NUM_BUFFERS >= 3")
+    gl.static_assert(HALF_K >= 32, "finer_interleaved_pipelined_v2 requires BLOCK_K >= 64")
+
+    pid = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    pid_m = pid % num_pid_m
+    pid_n = pid // num_pid_m
+
+    # ── TDM descriptors ──
+    if PHYSICAL_MK:
+        a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(M, K),
+            strides=(stride_am, stride_ak),
+            block_shape=(BLOCK_M, BLOCK_K),
+            layout=SHARED_LAYOUT_A,
+        )
+    else:
+        a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(K, M),
+            strides=(stride_ak, stride_am),
+            block_shape=(BLOCK_K, BLOCK_M),
+            layout=SHARED_LAYOUT_A,
+        )
+
+    if PHYSICAL_KN:
+        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_ptr,
+            shape=(K, N),
+            strides=(stride_bk, stride_bn),
+            block_shape=(BLOCK_K, BLOCK_N),
+            layout=SHARED_LAYOUT_B,
+        )
+    else:
+        b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=b_ptr,
+            shape=(N, K),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_N, BLOCK_K),
+            layout=SHARED_LAYOUT_B,
+        )
+
+    # ── Shared memory buffers ──
+    if PHYSICAL_MK:
+        a_buffer = gl.allocate_shared_memory(
+            a_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_M, BLOCK_K],
+            layout=SHARED_LAYOUT_A,
+        )
+    else:
+        a_buffer = gl.allocate_shared_memory(
+            a_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_K, BLOCK_M],
+            layout=SHARED_LAYOUT_A,
+        )
+
+    if PHYSICAL_KN:
+        b_buffer = gl.allocate_shared_memory(
+            b_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_K, BLOCK_N],
+            layout=SHARED_LAYOUT_B,
+        )
+    else:
+        b_buffer = gl.allocate_shared_memory(
+            b_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_N, BLOCK_K],
+            layout=SHARED_LAYOUT_B,
+        )
+
+    producer = 0
+    consumer = 0
+
+    accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+
+    off_am = pid_m * BLOCK_M
+    off_bn = pid_n * BLOCK_N
+
+    if USE_L2_PREFETCH:
+        gemm_l2_prefetch_prologue(
+            L2_PREFETCH_DISTANCE,
+            producer,
+            a_desc,
+            b_desc,
+            off_am,
+            off_bn,
+            BLOCK_K,
+            NUM_BUFFERS,
+            not PHYSICAL_MK,
+            not PHYSICAL_KN,
+        )
+
+    num_k_tiles = gl.cdiv(K, BLOCK_K)
+
+    # ── Prologue: TDM 0, TDM 1 ──
+    for _ in gl.static_range(2):
+        if PHYSICAL_MK:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [pid_m * BLOCK_M, producer * BLOCK_K],
+                a_buffer.index(producer % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [producer * BLOCK_K, pid_m * BLOCK_M],
+                a_buffer.index(producer % NUM_BUFFERS),
+            )
+
+        if PHYSICAL_KN:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [producer * BLOCK_K, pid_n * BLOCK_N],
+                b_buffer.index(producer % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [pid_n * BLOCK_N, producer * BLOCK_K],
+                b_buffer.index(producer % NUM_BUFFERS),
+            )
+
+        producer += 1
+
+    # ── Wait tile 0, ds_load tile 0 half1 only ──
+    gl.amd.gfx1250.tdm.async_wait(2)
+
+    idx = consumer % NUM_BUFFERS
+    if PHYSICAL_MK:
+        cur_h1_a = a_buffer.index(idx).slice(0, HALF_K, 1).load(layout=OPERAND_LAYOUT_A)
+    else:
+        cur_h1_a = a_buffer.index(idx).slice(0, HALF_K, 0).permute([1, 0]).load(layout=OPERAND_LAYOUT_A)
+
+    if PHYSICAL_KN:
+        cur_h1_b = b_buffer.index(idx).slice(0, HALF_K, 0).load(layout=OPERAND_LAYOUT_B)
+    else:
+        cur_h1_b = b_buffer.index(idx).slice(0, HALF_K, 1).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+
+    # ── Main loop: K - 2 iterations ──
+    for _ in range(num_k_tiles - 2):
+        idx = consumer % NUM_BUFFERS
+
+        # mfma n half1
+        accumulator = gl.amd.gfx1250.wmma(cur_h1_a, cur_h1_b, accumulator)
+
+        # ds_load n half2
+        if PHYSICAL_MK:
+            cur_h2_a = a_buffer.index(idx).slice(HALF_K, HALF_K, 1).load(layout=OPERAND_LAYOUT_A)
+        else:
+            cur_h2_a = a_buffer.index(idx).slice(HALF_K, HALF_K, 0).permute([1, 0]).load(layout=OPERAND_LAYOUT_A)
+
+        if PHYSICAL_KN:
+            cur_h2_b = b_buffer.index(idx).slice(HALF_K, HALF_K, 0).load(layout=OPERAND_LAYOUT_B)
+        else:
+            cur_h2_b = b_buffer.index(idx).slice(HALF_K, HALF_K, 1).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+
+        # TDM n+2
+        if PHYSICAL_MK:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [pid_m * BLOCK_M, producer * BLOCK_K],
+                a_buffer.index(producer % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [producer * BLOCK_K, pid_m * BLOCK_M],
+                a_buffer.index(producer % NUM_BUFFERS),
+            )
+
+        if PHYSICAL_KN:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [producer * BLOCK_K, pid_n * BLOCK_N],
+                b_buffer.index(producer % NUM_BUFFERS),
+            )
+        else:
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [pid_n * BLOCK_N, producer * BLOCK_K],
+                b_buffer.index(producer % NUM_BUFFERS),
+            )
+
+        producer += 1
+
+        if USE_L2_PREFETCH:
+            gemm_l2_prefetch(
+                L2_PREFETCH_DISTANCE - 1,
+                producer,
+                a_desc,
+                b_desc,
+                off_am,
+                off_bn,
+                BLOCK_K,
+                not PHYSICAL_MK,
+                not PHYSICAL_KN,
+            )
+
+        # wait n+1
+        gl.amd.gfx1250.tdm.async_wait(2)
+
+        # mfma n half2
+        accumulator = gl.amd.gfx1250.wmma(cur_h2_a, cur_h2_b, accumulator)
+
+        consumer += 1
+        nxt_idx = consumer % NUM_BUFFERS
+
+        # ds_load n+1 half1
+        if PHYSICAL_MK:
+            cur_h1_a = a_buffer.index(nxt_idx).slice(0, HALF_K, 1).load(layout=OPERAND_LAYOUT_A)
+        else:
+            cur_h1_a = a_buffer.index(nxt_idx).slice(0, HALF_K, 0).permute([1, 0]).load(layout=OPERAND_LAYOUT_A)
+
+        if PHYSICAL_KN:
+            cur_h1_b = b_buffer.index(nxt_idx).slice(0, HALF_K, 0).load(layout=OPERAND_LAYOUT_B)
+        else:
+            cur_h1_b = b_buffer.index(nxt_idx).slice(0, HALF_K, 1).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+
+    # ── Epilogue: 2 tiles remain (T-2 and T-1) ──
+    idx = consumer % NUM_BUFFERS
+
+    # mfma T-2 half1
+    accumulator = gl.amd.gfx1250.wmma(cur_h1_a, cur_h1_b, accumulator)
+
+    # ds_load T-2 half2
+    if PHYSICAL_MK:
+        cur_h2_a = a_buffer.index(idx).slice(HALF_K, HALF_K, 1).load(layout=OPERAND_LAYOUT_A)
+    else:
+        cur_h2_a = a_buffer.index(idx).slice(HALF_K, HALF_K, 0).permute([1, 0]).load(layout=OPERAND_LAYOUT_A)
+
+    if PHYSICAL_KN:
+        cur_h2_b = b_buffer.index(idx).slice(HALF_K, HALF_K, 0).load(layout=OPERAND_LAYOUT_B)
+    else:
+        cur_h2_b = b_buffer.index(idx).slice(HALF_K, HALF_K, 1).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+
+    # wait T-1
+    gl.amd.gfx1250.tdm.async_wait(0)
+
+    # mfma T-2 half2
+    accumulator = gl.amd.gfx1250.wmma(cur_h2_a, cur_h2_b, accumulator)
+
+    consumer += 1
+    nxt_idx = consumer % NUM_BUFFERS
+
+    # ds_load T-1 half1
+    if PHYSICAL_MK:
+        cur_h1_a = a_buffer.index(nxt_idx).slice(0, HALF_K, 1).load(layout=OPERAND_LAYOUT_A)
+    else:
+        cur_h1_a = a_buffer.index(nxt_idx).slice(0, HALF_K, 0).permute([1, 0]).load(layout=OPERAND_LAYOUT_A)
+
+    if PHYSICAL_KN:
+        cur_h1_b = b_buffer.index(nxt_idx).slice(0, HALF_K, 0).load(layout=OPERAND_LAYOUT_B)
+    else:
+        cur_h1_b = b_buffer.index(nxt_idx).slice(0, HALF_K, 1).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+
+    # mfma T-1 half1
+    accumulator = gl.amd.gfx1250.wmma(cur_h1_a, cur_h1_b, accumulator)
+
+    # ds_load T-1 half2
+    if PHYSICAL_MK:
+        cur_h2_a = a_buffer.index(nxt_idx).slice(HALF_K, HALF_K, 1).load(layout=OPERAND_LAYOUT_A)
+    else:
+        cur_h2_a = a_buffer.index(nxt_idx).slice(HALF_K, HALF_K, 0).permute([1, 0]).load(layout=OPERAND_LAYOUT_A)
+
+    if PHYSICAL_KN:
+        cur_h2_b = b_buffer.index(nxt_idx).slice(HALF_K, HALF_K, 0).load(layout=OPERAND_LAYOUT_B)
+    else:
+        cur_h2_b = b_buffer.index(nxt_idx).slice(HALF_K, HALF_K, 1).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+
+    # mfma T-1 half2
+    accumulator = gl.amd.gfx1250.wmma(cur_h2_a, cur_h2_b, accumulator)
+
+    # ── Bias ──
+    if ADD_BIAS:
+        offs_bias = pid_n * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
+        bias_vals = gl.load(bias_ptr + offs_bias)
+        accumulator = accumulator + bias_vals[None, :]
+
+    # ── Activation ──
+    if USE_ACTIVATION:
+        accumulator = activation(accumulator)
+
+    offs_cm = pid_m * BLOCK_M + gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+    )
+    offs_cn = pid_n * BLOCK_N + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+    )
+
+    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+
+    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    # ── Store ──
+    gl.amd.gfx1250.buffer_store(
+        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
+    )
+
+
 _KERNEL_MAP = {
     "basic": _gemm_a16w16_basic_kernel,
     "warp_priority": _gemm_a16w16_warp_priority_kernel,
@@ -3368,9 +4040,11 @@ _KERNEL_MAP = {
     "interleaved": _gemm_a16w16_interleaved_kernel,
     "basic_pipelined": _gemm_a16w16_basic_pipelined_kernel,
     "basic_pipelined_unrolled": _gemm_a16w16_basic_pipelined_unrolled_kernel,
+    "basic_pipelined_v2": _gemm_a16w16_basic_pipelined_v2_kernel,
     "interleaved_pipelined": _gemm_a16w16_interleaved_pipelined_kernel,
     "interleaved_pipelined_unrolled": _gemm_a16w16_interleaved_pipelined_unrolled_kernel,
     "finer_interleaved_pipelined": _gemm_a16w16_finer_interleaved_pipelined_kernel,
+    "finer_interleaved_pipelined_v2": _gemm_a16w16_finer_interleaved_pipelined_v2_kernel,
 }
 
 
@@ -3410,6 +4084,8 @@ def gemm_a16w16_gfx1250(
             - "interleaved_pipelined": ds_load ahead + TDM between halves (requires NUM_BUFFERS >= 3, BLOCK_K >= 64)
             - "interleaved_pipelined_unrolled": interleaved_pipelined with 2x unroll to eliminate vmov
             - "finer_interleaved_pipelined": ds_load/mfma on alternating halves with TDM between (requires NUM_BUFFERS >= 3, BLOCK_K >= 64)
+            - "basic_pipelined_v2": mfma first, then TDM + wait + ds_load (requires NUM_BUFFERS >= 2)
+            - "finer_interleaved_pipelined_v2": mfma before independent ds_load (requires NUM_BUFFERS >= 3, BLOCK_K >= 64)
 
     Returns:
         Output tensor of shape (M, N)
