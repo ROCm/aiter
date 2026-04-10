@@ -25,6 +25,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.device_info import get_num_xcds
 
 # fmt: off
 @gluon.jit
@@ -55,11 +56,12 @@ def _mla_decode_gluon(
     HEAD_DIM_KPE: gl.constexpr,
     KV_PE_OFFSET: gl.constexpr,
     USE_2D_VIEW: gl.constexpr,
-    USE_BUFFER_LOAD: gl.constexpr,
+    WITHIN_2GB: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
 ):
-    cur_batch = gl.program_id(0)
+    cur_batch = gl.program_id(0) + gl.program_id(2) * NUM_XCDS
     cur_head_id = gl.program_id(1)
-    split_kv_id = gl.program_id(2)
+    split_kv_id = 0
 
     # USE_2D_VIEW=True: fixed len or max padded VarLen
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
@@ -241,7 +243,7 @@ def _mla_decode_gluon(
     offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
     offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
     bufs_kv0 = bufs_kv.index(0).slice(0, 32, 1)
-    if USE_BUFFER_LOAD:
+    if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0)
     else:
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv0, Kv_c_cache + offs_k_c0)
@@ -250,7 +252,7 @@ def _mla_decode_gluon(
     # global load K_pe
     offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
     offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
-    if USE_BUFFER_LOAD:
+    if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(0), K_pe_cache, offs_k_pe)
     else:
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(0), K_pe_cache + offs_k_pe)
@@ -264,7 +266,7 @@ def _mla_decode_gluon(
     # global load K_nope slice 1
     bufs_kv1 = bufs_kv.index(0).slice(32, 32, 1)
     offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
-    if USE_BUFFER_LOAD:
+    if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1)
     else:
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv1, Kv_c_cache + offs_k_c1)
@@ -294,7 +296,7 @@ def _mla_decode_gluon(
         offs_n_nope0 = start_n + gl.arange(0, 32, layout=gl.SliceLayout(0, blocked_kv_slice))
         offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
         offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
-        if USE_BUFFER_LOAD:
+        if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0, mask=offs_n_nope0[None, :] < split_kv_end)
         else:
             # No mask needed on global_load path in the loop body: all
@@ -311,7 +313,7 @@ def _mla_decode_gluon(
         offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
         offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
         offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
-        if USE_BUFFER_LOAD:
+        if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
         else:
             # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
@@ -332,7 +334,7 @@ def _mla_decode_gluon(
         # global load K_nope slice 1
         offs_n1 = offs_n_nope0 + 32
         offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
-        if USE_BUFFER_LOAD:
+        if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n1[None, :] < split_kv_end)
         else:
             # No mask needed: loop iterations are in-bounds (see KV slice 0 comment).
@@ -374,7 +376,7 @@ def _mla_decode_gluon(
     offs_n_nope = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
     offs_d_ckv_1 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
     offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv_1[:, None]
-    if USE_BUFFER_LOAD:
+    if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache, offs_k_c, mask=offs_n_nope[None, :] < split_kv_end)
     else:
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kv.index(async_idx), Kv_c_cache + offs_k_c, mask=offs_n_nope[None, :] < split_kv_end, other=0)
@@ -383,7 +385,7 @@ def _mla_decode_gluon(
     offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
     offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
     offs_k_pe = kv_loc_pe[None, :] * stride_k_pe_bs + offs_d_kpe_1[:, None] + KV_PE_OFFSET
-    if USE_BUFFER_LOAD:
+    if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache, offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end)
     else:
         gl.amd.cdna4.async_copy.global_load_to_shared(bufs_kpe.index(async_idx), K_pe_cache + offs_k_pe, mask=offs_n_pe[None, :] < split_kv_end, other=0)
@@ -492,15 +494,16 @@ def mla_decode_gluon(
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB, fall back to global_load (64-bit pointer tensors).
     max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
-    use_buffer_load = max_kv_bytes <= 0x80000000  # 2 GB
+    within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
 
     NUM_KV_SPLITS = 1
     PAGE_SIZE = 1
     BLOCK_H = 64
     BLOCK_N = 64
+    NUM_XCDS = get_num_xcds()
 
     attn_logits = o.view(batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv)
-    grid = (batch_size, triton.cdiv(nhead, BLOCK_H), NUM_KV_SPLITS)
+    grid = (NUM_XCDS, triton.cdiv(nhead, BLOCK_H), batch_size // NUM_XCDS)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_decode_gluon[grid](
@@ -530,6 +533,7 @@ def mla_decode_gluon(
         HEAD_DIM_KPE=head_dim_kpe,
         KV_PE_OFFSET=kv_pe_offset,
         USE_2D_VIEW=use_2d_view,
-        USE_BUFFER_LOAD=use_buffer_load,
+        WITHIN_2GB=within_2gb,
+        NUM_XCDS=NUM_XCDS,
     )
     return attn_logits, None

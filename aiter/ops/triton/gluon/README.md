@@ -85,7 +85,7 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 - `True`: `page_table = block_table [batch, max_seqlen]`, `seq_info = cache_seqlens [batch]`. Use for fixed-length or pre-padded variable-length sequences.
 - `False`: `page_table = kv_indices [total_kv]`, `seq_info = kv_indptr [batch+1]`. Use for variable-length sequences without block_table construction.
 
-**Zero-copy KV path** (`kv_pe_offset > 0`): Pass the same `[N, 576]` buffer as both `kv_c` and `k_pe`. The kernel adds `kv_pe_offset` to k_pe column offsets. The kernel auto-selects `buffer_load_to_shared` (scalar base + 32-bit offsets, for KV caches &le; 2 GB) vs `global_load_to_shared` (64-bit pointer tensors, for KV caches > 2 GB).
+**Zero-copy KV path** (`kv_pe_offset > 0`): Pass the same `[N, 576]` buffer as both `kv_c` and `k_pe`. The kernel adds `kv_pe_offset` to k_pe column offsets. The kernel auto-selects the load path via `WITHIN_2GB`: `buffer_load_to_shared` (scalar base + 32-bit offsets) when KV caches &le; 2 GB, or `global_load_to_shared` (64-bit pointer tensors) when KV caches > 2 GB.
 
 **Perf** (MI350, batch=128, ctx=10000, nhead=128, bf16):
 - Gluon: ~600 TFLOPS
