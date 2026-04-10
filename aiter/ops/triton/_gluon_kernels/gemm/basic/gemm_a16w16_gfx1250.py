@@ -1054,7 +1054,7 @@ def _gemm_a16w16_k_subtiling_kernel(
     )
 
 
-@gluon.jit(repr=_gemm_a16w16_lds_pipeline_repr)
+@gluon.jit(repr=_gemm_a16w16_lds_pipeline_repr, loop_carried_load_percent=0)
 def _gemm_a16w16_lds_pipeline_kernel(
     a_ptr,
     b_ptr,
