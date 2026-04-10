@@ -93,7 +93,7 @@ jobs:
               fi \
            && pip install -r requirements.txt \
            && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: 64" \
-           && PREBUILD_KERNELS=1 MAX_JOBS=64 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
+           && PREBUILD_KERNELS=1 MAX_JOBS=128 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
            && pip install dist/*.whl \
            && echo "Prebuilding kernels completed"
 
