@@ -236,28 +236,32 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         gdy                 = (Mdim % SUBM == 0) ? Mdim / SUBM : Mdim / SUBM + 1;
         gdz                 = 1;
 
-        if(cfg.splitK == 1 && selectedksplit > 0 && !opt_splitK.has_value())
-        {
-            int k_per_split         = (Kdim + selectedksplit - 1) / selectedksplit;
-            int k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
-
-            int actual_splitK = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
-            if(actual_splitK != selectedksplit)
-            {
-                printf("warning: change splitK form %d to %d to make sure every block deals with "
-                       "128x k\n",
-                       selectedksplit,
-                       actual_splitK);
-                selectedksplit = actual_splitK;
-            }
-        }
         if(cfg.splitK == 1 && selectedksplit > 0)
         {
             int k_per_split         = (Kdim + selectedksplit - 1) / selectedksplit;
             int k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
-            AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
-                       (Kdim / k_per_split_aligned) == (selectedksplit - 1),
-                       __func__, " Kdim alignment check failed for splitK!");
+            int actual_splitK       = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
+            if(!opt_splitK.has_value())
+            {
+                if(actual_splitK != selectedksplit)
+                {
+                    printf("warning: change splitK form %d to %d to make sure every block deals "
+                           "with 128x k\n",
+                           selectedksplit,
+                           actual_splitK);
+                    selectedksplit = actual_splitK;
+                }
+            }
+            else
+            {
+                AITER_CHECK(
+                    selectedksplit == actual_splitK,
+                    __func__,
+                    " Kdim alignment check failed for splitK! Kdim=", Kdim,
+                    ", selectedksplit=", selectedksplit,
+                    ", k_per_split_aligned=", k_per_split_aligned,
+                    ", actual_splitK=", actual_splitK);
+            }
             args.ks = selectedksplit;
             if(selectedksplit > 1)
             {
