@@ -766,30 +766,20 @@ OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss.
     using src_t = remove_cvref_t<V>;
     using scalar = typename vector_traits<dst_t>::dtype;
     constexpr index_t len = sizeof...(Ds);
-    constexpr auto is_unit_stride = []<index_t... Is>(seq<Is...>) {
+    constexpr auto contiguous = []<index_t... Is>(seq<Is...>) {
         if constexpr (sizeof...(Is) < 2) return true;
-        else { return []<index_t... I>(seq<I...>) { return ((seq<Is...>::at(number<I + 1>{}) == seq<Is...>::at(number<I>{}) + 1) && ...); }(make_index_seq<sizeof...(Is) - 1>{}); }
+        else return []<index_t... I>(seq<I...>) { return ((seq<Is...>::at(number<I + 1>{}) == seq<Is...>::at(number<I>{}) + 1) && ...); }(make_index_seq<sizeof...(Is) - 1>{});
     };
-    // Copy at dword granularity for sub-dword scalar types (bf16, fp16, fp8, etc.) with dword-aligned unit-stride slices.
+    // Copy at dword granularity for sub-dword scalar types with dword-aligned contiguous slices
     if constexpr ((is_vector_v<dst_t> || is_array_v<dst_t>) && (is_vector_v<src_t> || is_array_v<src_t>) &&
-                  is_unit_stride(seq<Ds...>{}) && is_unit_stride(seq<Ss...>{}) && sizeof(scalar) < 4 && len > 1) {
-        constexpr index_t epd = 4 / sizeof(scalar); // elements per dword
-        constexpr index_t dst_start = seq<Ds...>::at(number<0>{});
-        constexpr index_t src_start = seq<Ss...>::at(number<0>{});
-        constexpr index_t dst_n = vector_traits<dst_t>::size();
-        constexpr index_t src_n = vector_traits<src_t>::size();
-        if constexpr (dst_start % epd == 0 && src_start % epd == 0 && len % epd == 0 &&
-                      dst_n % epd == 0 && src_n % epd == 0) {
-            using dst_i32_t = vector_t<int, dst_n / epd>;
-            using src_i32_t = vector_t<int, src_n / epd>;
-            auto dst_i32 = __builtin_bit_cast(dst_i32_t, dst_c);
-            const auto src_i32 = __builtin_bit_cast(src_i32_t, src_c);
-            constexpr index_t i32_dst = dst_start / epd;
-            constexpr index_t i32_src = src_start / epd;
-            constexpr index_t i32_len = len / epd;
-            static_for<i32_len>([&](auto i) {
-                dst_i32[i32_dst + i.value] = src_i32[i32_src + i.value];
-            });
+                  contiguous(seq<Ds...>{}) && contiguous(seq<Ss...>{}) && sizeof(scalar) < 4 && len > 1) {
+        constexpr index_t epd = 4 / sizeof(scalar);
+        constexpr index_t d0 = seq<Ds...>::at(number<0>{}), s0 = seq<Ss...>::at(number<0>{});
+        constexpr index_t dn = vector_traits<dst_t>::size(), sn = vector_traits<src_t>::size();
+        if constexpr (d0 % epd == 0 && s0 % epd == 0 && len % epd == 0 && dn % epd == 0 && sn % epd == 0) {
+            auto dst_i32 = __builtin_bit_cast(vector_t<int, dn / epd>, dst_c);
+            const auto src_i32 = __builtin_bit_cast(vector_t<int, sn / epd>, src_c);
+            static_for<len / epd>([&](auto i) { dst_i32[d0 / epd + i.value] = src_i32[s0 / epd + i.value]; });
             dst_c = __builtin_bit_cast(dst_t, dst_i32);
             return;
         }
@@ -1773,41 +1763,25 @@ struct smem {
 
     template<index_t vec = 1> OPUS_D auto _load(int v_os/* in unit of byte*/) { using type = vector_type<vec>; return *reinterpret_cast<OPUS_LDS_ADDR type*>(ptr + v_os); }
 
+    template<index_t vec = 1, int imm_offset = 0> OPUS_D auto _tr_load(int v_os/* in unit of byte*/) {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
-    template<index_t vec = 1> OPUS_D auto _tr_load(int v_os/* in unit of byte*/) {
         using type = vector_type<vec>;
-        constexpr index_t elems = vec * vector_size;
-
-        if constexpr ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && elems == 3) {
-            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr6_b96_v3i32(reinterpret_cast<OPUS_LDS_ADDR vector_t<int, 3>*>(ptr + v_os)));
-        } else if constexpr ((std::is_same_v<scalar_type, i32_t> || std::is_same_v<scalar_type, u32_t>) && elems == 2) {
-            if constexpr (vec <= 1)
-                return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr4_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(ptr + v_os)));
-            else
-                return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr8_b64_v2i32(reinterpret_cast<OPUS_LDS_ADDR i32x2_t*>(ptr + v_os)));
-        } else if constexpr (std::is_same_v<scalar_type, i16_t> && elems == 4) {
-            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4i16(reinterpret_cast<OPUS_LDS_ADDR vector_t<short, 4>*>(ptr + v_os)));
-#if __clang_major__ >= 20
-        } else if constexpr (std::is_same_v<scalar_type, u16_t> && elems == 4) {
-            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4i16(reinterpret_cast<OPUS_LDS_ADDR vector_t<short, 4>*>(ptr + v_os)));
-#endif
-        } else if constexpr (std::is_same_v<scalar_type, fp16_t> && elems == 4) {
-            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4f16(reinterpret_cast<OPUS_LDS_ADDR vector_t<fp16_t, 4>*>(ptr + v_os)));
-        } else if constexpr (std::is_same_v<scalar_type, bf16_t> && elems == 4) {
-            return __builtin_bit_cast(type, __builtin_amdgcn_ds_read_tr16_b64_v4bf16(reinterpret_cast<OPUS_LDS_ADDR vector_t<bf16_t, 4>*>(ptr + v_os)));
-        } else {
-            static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar/vec");
-            return type{};
-        }
-    }
-#else
-    template<index_t vec = 1> OPUS_D auto _tr_load(int v_os/* in unit of byte*/) {
-#if defined(__HIP_DEVICE_COMPILE__)
+        static_assert(sizeof(type) == 8, "DS_READ_B64_TR requires 8-byte (64-bit) load");
+        constexpr index_t elem_bits = sizeof_bits_v<scalar_type>;
+        i32x2_t raw;
+        const u32_t addr = static_cast<u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(ptr + v_os));
+        if      constexpr (elem_bits == 16) { asm volatile("ds_read_b64_tr_b16 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
+        else if constexpr (elem_bits == 8)  { asm volatile("ds_read_b64_tr_b8 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
+        else if constexpr (elem_bits == 4)  { asm volatile("ds_read_b64_tr_b4 %0, %1 offset:%2\n" : "=v"(raw) : "v"(addr), "i"(imm_offset) : "memory"); }
+        else { static_assert(sizeof(T_) == 0, "smem::_tr_load: unsupported scalar type"); }
+        return __builtin_bit_cast(type, raw);
+#elif defined(__HIP_DEVICE_COMPILE__)
         static_assert(sizeof(T_) == 0, "smem::_tr_load requires __gfx950__");
+        return _load<vec>(v_os + imm_offset);
+#else
+        return _load<vec>(v_os + imm_offset);
 #endif
-        return _load<vec>(v_os);
     }
-#endif
 
     template<index_t vec = 1, typename V>
     OPUS_D void _store(const V& x, int v_os/* in unit of byte*/) {
@@ -1862,20 +1836,29 @@ struct smem {
         constexpr auto issue_space = layout_to_issue_space<Layout>();
         constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
         constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using L = remove_cvref_t<Layout>;
+        constexpr auto u_linear = make_layout<-1>(issue_space_vec);
+        constexpr auto offsets = layout_to_offsets<vec>(L(typename L::Shape{}, typename L::Stride{}, typename L::Coord{}));
+        const int base = u(transform_tuple([](auto) { return number<0>{}; }, issue_space_vec)) * int(sizeof(T));
+
+        auto fn = [&](auto ... ids) {
+            constexpr int off = int(offsets[u_linear(ids...)] * index_t(sizeof(T)));
+            if constexpr (off >= 0 && off <= 65535) return _tr_load<vec, off>(base);
+            else                                    return tr_load<vec>(u(ids...));
+        };
 
 #if OPUS_TILE_CONTAINER == 0
         constexpr auto u_r = make_layout<-1>(issue_space);
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = tr_load<vec>(u(ids...));
             constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+            set_slice(r, fn(ids...), number<u_rs>{}, number<u_rs + vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = tr_load<vec>(u(ids...)); });
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = fn(ids...); });
         return r;
 #endif
     }
