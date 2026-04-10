@@ -8,9 +8,26 @@ from aiter.ops.triton.utils._triton import arch_info
 import os
 from aiter.ops.triton.utils.types import e4m3_dtype
 import triton.language as tl
+from triton.language.core import PropagateNan
 
 float8_info = torch.finfo(e4m3_dtype)
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
+
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
+
+
+@gluon.jit
+def elementwise_max_prop_nan(a, b):
+    return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
+
+
+@gluon.jit
+def reduce_max_prop_nan(input, axis=None, keep_dims=False):
+    """Returns the max of the input tensor along the provided axis.
+
+    We need this customized impl rather than ttgl.max in order to control NaN
+    behavior. Ignoring NaN would incur extra overhead on AMD GPUs."""
+    return gl.reduce(input, axis, elementwise_max_prop_nan, keep_dims=keep_dims)
 
 @aggregate
 class TDMSubtileKVLoaderConfig:
@@ -585,8 +602,9 @@ class AttentionProgram:
 
     @gluon.jit
     def softmax_part0(self, S, M):
-        m_ij = gl.maximum(M, gl.max(S, axis=1))
-        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        m = reduce_max_prop_nan(S, -1)
+        m_ij = elementwise_max_prop_nan(M, m)
+        #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
         p = gl.exp2(q_shifted)
@@ -965,6 +983,7 @@ def kernel_unified_attention_2d(
     # ---- pipeline prologue, iter -2 ----
     pred =  1 - pgm.tile_end
     pred = (pred >> 31) & 1
+    #pred = 1
     kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1, sub_idx=0, pred=pred)  # K(1,s0) → 3
     # TDm load queue: K(1,s0) K(0,s1) K(0,s0) 
     k0 = kv_loader.load_k_from_shared(wait_count=2, target_dtype=q.dtype,        # wait: K(0,s0) done
@@ -983,11 +1002,12 @@ def kernel_unified_attention_2d(
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=0, sub_idx=1)       # V(0,s1)
     # TDm load queue: V(0,s1) V(0,s0) K(1,s1) K(1,s0)
     qk = pgm.concat_subtile(qk0, qk1)  # .................................... iter 0
-    m = gl.max(qk, axis=1)
-    m_ij = gl.maximum(M, m)
+    m = reduce_max_prop_nan(qk, -1)
+    m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
     pred =  2 - pgm.tile_end
     pred = (pred >> 31) & 1
+    #pred = 1
     kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=2 % cfg.NUM_BUFFERS, sub_idx=0, pred=pred) # K(2,s0)
     # TDm load queue: K(2,s0) V(0,s1) V(0,s0) K(1,s1) K(1,s0)
     k0 = kv_loader.load_k_from_shared(wait_count=4, target_dtype=q.dtype,        # wait: K(1,s0) done
@@ -1003,7 +1023,9 @@ def kernel_unified_attention_2d(
     # after one iter:
     # TDm load queue: K(i+3,s1) K(i+3,s0) V(i+1,s1) V(i+1,s0), K(i+2,s1)
     next3_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 3)
-    for j in range(pgm.tile_start, pgm.tile_end - 2):
+    start = pgm.tile_start
+    end = pgm.tile_end - 2
+    for j in range(start, end):
         buf_cur = j % cfg.NUM_BUFFERS
         buf_next = (j + 1) % cfg.NUM_BUFFERS
         buf_next2 = (j + 2) % cfg.NUM_BUFFERS
@@ -1011,7 +1033,7 @@ def kernel_unified_attention_2d(
         # no load if j + 3 > tile_end
         pred =  j + 3 - pgm.tile_end
         pred = (pred >> 31) & 1
-        #pred = 1
+        # pred = 1
         next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
         v_blk = kv_loader.load_block_ids(j + 1)  # block ID for V(i+1)
         ##################################################################
@@ -1073,8 +1095,8 @@ def kernel_unified_attention_2d(
         # Concat QK(iter i+1), compute max ............................... iter i+1
         qk = pgm.concat_subtile(qk0, qk1)
 
-        m = gl.max(qk, axis=1)
-        m_ij = gl.maximum(M, m)
+        m = reduce_max_prop_nan(qk, -1)
+        m_ij = elementwise_max_prop_nan(M, m)
         m_ij_scaled = m_ij * QK_scale
         kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_next3, sub_idx=0, pred=pred)  # K(i+3,s0)
         # TDm load queue: K(i+3,s0) V(i+1,s1) V(i+1,s0), K(i+2,s1) K(i+2,s0)
@@ -1138,8 +1160,8 @@ def kernel_unified_attention_2d(
     qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_end - 1, 0)
     qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_end - 1, 1)
     qk = pgm.concat_subtile(qk0, qk1)
-    m = gl.max(qk, axis=1)
-    m_ij = gl.maximum(M, m)
+    m = reduce_max_prop_nan(qk, -1)
+    m_ij = elementwise_max_prop_nan(M, m)
     m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
 
     m_ij_scaled = m_ij * QK_scale

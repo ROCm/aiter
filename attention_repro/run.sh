@@ -18,6 +18,6 @@ export PRINT_IRS=1
 # requires using: https://github.amd.com/GFX-IP-Arch/triton/tree/cagri/fma_fix
 # for the pk_fma and maximum hacks
 # 1 means chain reduction to produce max3/maximum3
-export LLIR_TRANSFORM_MAX="maximum 1"
+#export LLIR_TRANSFORM_MAX="maximum 1"
 source $TRITON_GFX1250_MODEL_PATH/ffmlite_env.sh
 python3 run_kernel.py --num_buffers $num_buffers --remove_indirect_access $remove_indirect_access --block_m $block_m --num_warps $num_warps --waves_per_eu $waves_per_eu --head_size $head_size  --block_size $block_size --num_heads_q $num_heads_q --num_heads_k $num_heads_k --bs $bs --seq_q_l $seq_q_l --seq_kv_l $seq_kv_l
