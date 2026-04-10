@@ -926,6 +926,7 @@ def get_mla_metadata_info_v1(
         and q_dtype == dtypes.fp8
         and kv_dtype == dtypes.fp8
         and num_head_qo > 16
+        and not (num_head_qo == 32 and max_seqlen_qo == 2)
         and (
             (max_seqlen_qo * (num_head_qo // 16) == 4)
             or (num_head_qo == 64 and max_seqlen_qo == 2)
