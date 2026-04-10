@@ -230,10 +230,12 @@ def _moe_gemm_a4w4_gfx1250(
     MASK_K_LIMIT: gl.constexpr,
     SPLIT_K: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
+    UPCAST_INDICES: gl.constexpr,
+    # layouts
     WMMA_LAYOUT: gl.constexpr,
     WMMA_LAYOUT_PACKED: gl.constexpr,
-    IDX_LAYOUT: gl.constexpr,
-    UPCAST_INDICES: gl.constexpr = False,
+    # triton configs
+    NUM_WARPS: gl.constexpr,
 ):
     gl.assume(stride_y_k >= 0)
     gl.assume(stride_y_m >= 0)
@@ -344,6 +346,9 @@ def _moe_gemm_a4w4_gfx1250(
     if GatherIndx is None:
         X += start_m * stride_x_m
     else:
+        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
+            0, gl.BlockedLayout([1, 8], [32, 1], [1, NUM_WARPS], [0, 1])
+        )
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(
             0, PACKED_BLOCK_M_X, layout=IDX_LAYOUT
         )
