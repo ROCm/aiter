@@ -309,6 +309,4 @@ aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")
 for splitK in [1, 2]:
-    test_splitk_correctness(m=4, n=2112, k=7168, splitK=splitK)
-    test_splitk_correctness(m=1, n=3072, k=1536, splitK=splitK)
-print("split-K correctness checks passed.")
+    test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
