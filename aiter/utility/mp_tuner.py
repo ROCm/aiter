@@ -478,9 +478,35 @@ def mp_tuner(
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
                     # pool_restart_needed = True
+                elif error_type == "AcceleratorError":
+                    # GPU fault (e.g. illegal memory access): worker returns exception instead of
+                    # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
+                    # more tasks on the same bad GPU. Break immediately to trigger restart and
+                    # terminate the pool before that worker processes further tasks (same as when
+                    # fault used to hang and timeout would eventually break).
+                    error_msg = f"\033[1;31m[GPU Fault]\033[0m Task {k} failed with {error_type}: {e}"
+                    print(error_msg, flush=True)
+                    failed_tasks.append((k, "accelerator error"))
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
+                    completed_this_round.append((k, async_result))
+                    pool_restart_needed = True
+                    break
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
                     failed_tasks.append((k, "timeout"))
+                    failed_tasks.append((k, "unknown error"))
+
+                    # Always record a dummy result so reconstruction never sees an empty list
+                    # (previously only timeout path did this; async.get() failures left no result_dict[k]).
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
                     completed_this_round.append((k, async_result))
 
                 # Only log error once per error type
@@ -539,6 +565,11 @@ def mp_tuner(
     result = []
     for k in range(len(rets)):
         task_result = result_dict.get(k, [])
+        if not task_result:
+            # Defensive fallback: keep output cardinality stable even if a task result is missing.
+            dummy_results = []
+            add_dummy_result(k, dummy_results)
+            task_result = dummy_results if shape_grouped else [dummy_results[0]]
         if shape_grouped:
             result.extend(task_result)
         else:
