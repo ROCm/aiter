@@ -1092,7 +1092,7 @@ class AttentionProgram:
         )
         if self.cfg.USE_STORE_BUFFER_OP:
             gl.amd.cdna4.buffer_store(
-                stored_value=acc,
+                stored_value=acc.to(self.output_ptr.dtype.element_ty),
                 ptr=self.output_ptr,
                 offsets=segm_output_offset,
                 mask=dim_mask[None, :]
@@ -1102,7 +1102,7 @@ class AttentionProgram:
         else:
             gl.store(
                 self.output_ptr + segm_output_offset.to(gl.int64),
-                acc,
+                acc.to(self.output_ptr.dtype.element_ty),
                 mask=dim_mask[None, :]
                 & self.query_mask_0_pv[:, None]
                 & self.query_mask_1_pv[:, None],
@@ -1418,7 +1418,7 @@ def _unified_attention_gluon_kernel_3d(
         out_factor = gl.load(v_scale_ptr)
 
     if out_scale_ptr is not None:
-        out_factor = out_factor * tl.load(out_scale_ptr)
+        out_factor = out_factor / tl.load(out_scale_ptr)
 
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride

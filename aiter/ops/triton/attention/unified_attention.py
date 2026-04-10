@@ -92,7 +92,8 @@ def select_3d_config(
             if num_2d_prgms >= 256:
                 attn_warps = 1
                 waves_per_eu = 2
-                num_segments = 1
+                if IS_DEVICE_ARCH_GFX12:
+                    num_segments = 1
             else:
                 attn_warps = 1
                 waves_per_eu = 2
@@ -101,7 +102,8 @@ def select_3d_config(
             if num_2d_prgms >= 256:
                 attn_warps = 1
                 waves_per_eu = 2
-                num_segments = 1
+                if IS_DEVICE_ARCH_GFX12:
+                    num_segments = 1
             else:
                 attn_warps = 1
                 waves_per_eu = 2
@@ -219,7 +221,6 @@ def unified_attention(
         # key_cache: num_blocks, num_kv_heads, block_size, head_size
         # value_cache: num_blocks, num_kv_heads, head_size, block_size
         num_blocks, num_kv_heads, block_size, _ = k.shape
-        # block_size = block_size * 16
     else:
         # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
         num_blocks, block_size, num_kv_heads, _ = k.shape
@@ -366,7 +367,6 @@ def unified_attention(
             segm_expsum = out  # dummy ptr
 
         if IS_DEVICE_ARCH_GFX12:
-            # print(attn_config)
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -385,7 +385,7 @@ def unified_attention(
                 k_scale_ptr=k_descale,
                 v_scale_ptr=v_descale,
                 out_scale_ptr=(
-                    1 / output_scale
+                    output_scale
                     if (output_scale is not None and NUM_SEGMENTS == 1)
                     else None
                 ),

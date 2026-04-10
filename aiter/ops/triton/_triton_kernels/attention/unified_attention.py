@@ -438,21 +438,27 @@ def kernel_unified_attention_3d(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
-    )
+    if ALL_DECODE:
+        seq_idx = q_block_global_idx
+        q_block_local_idx: tl.int32 = 0
+        cur_batch_query_len: tl.int32 = 1
+        cur_batch_in_all_start_index: tl.int32 = q_block_global_idx
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        )
 
-    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+        q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
 
-    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
 
-    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
-        return
+        if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+            return
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -791,4 +797,6 @@ def reduce_segments(
         + query_head_idx * output_stride_1
         + tl.arange(0, HEAD_SIZE_PADDED)
     )
-    tl.store(output_ptr + output_offset, acc, mask=dim_mask)
+    tl.store(
+        output_ptr + output_offset, acc.to(output_ptr.type.element_ty), mask=dim_mask
+    )

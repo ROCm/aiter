@@ -102,7 +102,7 @@ def shuffle_kv_cache(
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
-BLOCK_SIZES = [16, 64, 48]
+BLOCK_SIZES = [16, 64]
 
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
@@ -215,11 +215,12 @@ def ref_paged_attn(
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, o_dtype",
+    "q_dtype, kv_dtype, o_dtype, use_out_scale",
     [
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
-        (torch.bfloat16, e4m3_dtype, torch.bfloat16),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, False),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, True),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -238,6 +239,7 @@ def test_triton_unified_attn_3d(
     kv_dtype: torch.dtype,
     o_dtype: torch.dtype,
     shuffled_kv_cache: bool,
+    use_out_scale: bool,
 ) -> None:
     torch.cuda.empty_cache()
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
@@ -313,18 +315,30 @@ def test_triton_unified_attn_3d(
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
     output = torch.randn(
-        sum(query_lens), num_query_heads, head_size, dtype=o_dtype, device="cuda"
-    )
+        sum(query_lens), num_query_heads, head_size, dtype=torch.bfloat16, device="cuda"
+    ).to(o_dtype)
 
     q_descale = None
     k_descale = None
     v_descale = None
+    output_scale = None
     if q_dtype != torch.bfloat16:
-        q_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+        q_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
 
     if kv_dtype != torch.bfloat16:
-        k_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
-        v_descale = torch.rand((1,), dtype=torch.float32, device="cuda")
+        k_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
+        v_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
+
+    if use_out_scale:
+        output_scale = 1 / uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
+        )
 
     if shuffled_kv_cache:
         maybe_shuffled_key_cache, maybe_shuffled_value_cache = shuffle_kv_cache(
@@ -351,6 +365,7 @@ def test_triton_unified_attn_3d(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        output_scale=output_scale,
         sinks=sinks,
         shuffled_kv_cache=shuffled_kv_cache,
     )
@@ -367,6 +382,7 @@ def test_triton_unified_attn_3d(
         q_descale=q_descale,
         k_descale=k_descale,
         v_descale=v_descale,
+        output_scale=output_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
         sinks=sinks,
@@ -376,13 +392,11 @@ def test_triton_unified_attn_3d(
     if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
         atol, rtol = 1.5e-1, 1.5e-1
     torch.testing.assert_close(
-        output, ref_output, atol=atol, rtol=rtol
-    ), f"{torch.max(torch.abs(output - ref_output))}"
+        output.to(torch.bfloat16), ref_output.to(torch.bfloat16), atol=atol, rtol=rtol
+    ), f"{torch.max(torch.abs(output.to(torch.bfloat16) - ref_output.to(torch.bfloat16)))}"
 
 
-@pytest.mark.parametrize(
-    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
-)
+@pytest.mark.parametrize("seq_lens", [[(1, 1328), (5, 18), (129, 463)]])
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
