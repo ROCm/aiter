@@ -11,7 +11,10 @@ Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 
 import torch
 
-from .chunk_delta_h import chunk_gated_delta_rule_fwd_h, chunk_gated_delta_rule_fwd_h_opt
+from .chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+    chunk_gated_delta_rule_fwd_h_opt,
+)
 from .chunk_o import chunk_fwd_o, chunk_fwd_o_opt
 from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
 from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
@@ -149,18 +152,29 @@ def chunk_gated_delta_rule_fwd_opt(
     """
     # Step 1: Compute fused local cumulative sum of gates and KKT
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g=g, cu_seqlens=cu_seqlens,
+        k=k,
+        beta=beta,
+        g=g,
+        cu_seqlens=cu_seqlens,
     )
 
     # Step 2: Compute fused triangular solve and recompute w, u
     # w, u are already in [B, H, T, K/V] head-major contiguous layout
     w, u = fused_solve_tril_recompute_w_u(
-        A_raw=A_raw, k=k, v=v, beta=beta, g_cumsum=g_cumsum, cu_seqlens=cu_seqlens,
+        A_raw=A_raw,
+        k=k,
+        v=v,
+        beta=beta,
+        g_cumsum=g_cumsum,
+        cu_seqlens=cu_seqlens,
     )
 
     # Step 3: Compute hidden states
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt(
-        k=k, w=w, u=u, g=g_cumsum,
+        k=k,
+        w=w,
+        u=u,
+        g=g_cumsum,
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
@@ -168,7 +182,13 @@ def chunk_gated_delta_rule_fwd_opt(
 
     # Step 4: Compute output (directly in [B, T, H, V] layout)
     o = chunk_fwd_o_opt(
-        q=q, k=k, v=v_new, h=h, g=g_cumsum, scale=scale, cu_seqlens=cu_seqlens,
+        q=q,
+        k=k,
+        v=v_new,
+        h=h,
+        g=g_cumsum,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
     )
 
     return g_cumsum, o, final_state

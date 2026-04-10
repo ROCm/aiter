@@ -183,9 +183,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
 
-    p_g = tl.make_block_ptr(
-        g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
+    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
     b_g_cumsum = tl.cumsum(b_g, axis=0)
 

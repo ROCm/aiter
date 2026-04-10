@@ -724,9 +724,7 @@ def chunk_fwd_kernel_o_opt(
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
 
-    p_v = tl.make_block_ptr(
-        v, (T, V), (V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
+    p_v = tl.make_block_ptr(v, (T, V), (V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     p_o = tl.make_block_ptr(
         o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
     )

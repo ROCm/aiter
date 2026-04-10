@@ -76,10 +76,18 @@ def fused_solve_tril_recompute_w_u_kernel(
     m_id = o_i[:, None] == o_i[None, :]
     A_base = A_raw + (bos * H + i_h) * BT
 
-    p11 = tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0))
-    p22 = tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0))
-    p33 = tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0))
-    p44 = tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0))
+    p11 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
+    )
+    p22 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
+    )
+    p33 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
+    )
+    p44 = tl.make_block_ptr(
+        A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
+    )
     b11 = -tl.where(m_lo, tl.load(p11, boundary_check=(0, 1)).to(tl.float32), 0)
     b22 = -tl.where(m_lo, tl.load(p22, boundary_check=(0, 1)).to(tl.float32), 0)
     b33 = -tl.where(m_lo, tl.load(p33, boundary_check=(0, 1)).to(tl.float32), 0)
@@ -106,25 +114,88 @@ def fused_solve_tril_recompute_w_u_kernel(
     b33 += m_id
     b44 += m_id
 
-    rA21 = tl.load(tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
-    rA31 = tl.load(tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
-    rA32 = tl.load(tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
-    rA41 = tl.load(tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
-    rA42 = tl.load(tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
-    rA43 = tl.load(tl.make_block_ptr(A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)), boundary_check=(0, 1)).to(tl.float32)
+    rA21 = tl.load(
+        tl.make_block_ptr(
+            A_base, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
+        ),
+        boundary_check=(0, 1),
+    ).to(tl.float32)
+    rA31 = tl.load(
+        tl.make_block_ptr(
+            A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
+        ),
+        boundary_check=(0, 1),
+    ).to(tl.float32)
+    rA32 = tl.load(
+        tl.make_block_ptr(
+            A_base, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
+        ),
+        boundary_check=(0, 1),
+    ).to(tl.float32)
+    rA41 = tl.load(
+        tl.make_block_ptr(
+            A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
+        ),
+        boundary_check=(0, 1),
+    ).to(tl.float32)
+    rA42 = tl.load(
+        tl.make_block_ptr(
+            A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
+        ),
+        boundary_check=(0, 1),
+    ).to(tl.float32)
+    rA43 = tl.load(
+        tl.make_block_ptr(
+            A_base, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
+        ),
+        boundary_check=(0, 1),
+    ).to(tl.float32)
 
-    b21 = -tl.dot(tl.dot(b22, rA21, input_precision=DOT_PRECISION), b11, input_precision=DOT_PRECISION)
-    b32 = -tl.dot(tl.dot(b33, rA32, input_precision=DOT_PRECISION), b22, input_precision=DOT_PRECISION)
-    b43 = -tl.dot(tl.dot(b44, rA43, input_precision=DOT_PRECISION), b33, input_precision=DOT_PRECISION)
-    b31 = -tl.dot(b33, tl.dot(rA31, b11, input_precision=DOT_PRECISION) + tl.dot(rA32, b21, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
-    b42 = -tl.dot(b44, tl.dot(rA42, b22, input_precision=DOT_PRECISION) + tl.dot(rA43, b32, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
-    b41 = -tl.dot(b44, tl.dot(rA41, b11, input_precision=DOT_PRECISION) + tl.dot(rA42, b21, input_precision=DOT_PRECISION) + tl.dot(rA43, b31, input_precision=DOT_PRECISION), input_precision=DOT_PRECISION)
+    b21 = -tl.dot(
+        tl.dot(b22, rA21, input_precision=DOT_PRECISION),
+        b11,
+        input_precision=DOT_PRECISION,
+    )
+    b32 = -tl.dot(
+        tl.dot(b33, rA32, input_precision=DOT_PRECISION),
+        b22,
+        input_precision=DOT_PRECISION,
+    )
+    b43 = -tl.dot(
+        tl.dot(b44, rA43, input_precision=DOT_PRECISION),
+        b33,
+        input_precision=DOT_PRECISION,
+    )
+    b31 = -tl.dot(
+        b33,
+        tl.dot(rA31, b11, input_precision=DOT_PRECISION)
+        + tl.dot(rA32, b21, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+    b42 = -tl.dot(
+        b44,
+        tl.dot(rA42, b22, input_precision=DOT_PRECISION)
+        + tl.dot(rA43, b32, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+    b41 = -tl.dot(
+        b44,
+        tl.dot(rA41, b11, input_precision=DOT_PRECISION)
+        + tl.dot(rA42, b21, input_precision=DOT_PRECISION)
+        + tl.dot(rA43, b31, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
 
-    h11 = b11.to(tl.bfloat16); h22 = b22.to(tl.bfloat16)
-    h33 = b33.to(tl.bfloat16); h44 = b44.to(tl.bfloat16)
-    h21 = b21.to(tl.bfloat16); h31 = b31.to(tl.bfloat16)
-    h32 = b32.to(tl.bfloat16); h41 = b41.to(tl.bfloat16)
-    h42 = b42.to(tl.bfloat16); h43 = b43.to(tl.bfloat16)
+    h11 = b11.to(tl.bfloat16)
+    h22 = b22.to(tl.bfloat16)
+    h33 = b33.to(tl.bfloat16)
+    h44 = b44.to(tl.bfloat16)
+    h21 = b21.to(tl.bfloat16)
+    h31 = b31.to(tl.bfloat16)
+    h32 = b32.to(tl.bfloat16)
+    h41 = b41.to(tl.bfloat16)
+    h42 = b42.to(tl.bfloat16)
+    h43 = b43.to(tl.bfloat16)
 
     # ================================================================
     # Phase 2: u = Ai @ (v * beta), w = Ai @ (k * beta * exp(g))
@@ -157,10 +228,18 @@ def fused_solve_tril_recompute_w_u_kernel(
         u_base = u + (((i_b * H + i_h) * T_flat) * V)
 
     for i_v in range(tl.cdiv(V, BV)):
-        pv0 = tl.make_block_ptr(v_base, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (16, BV), (1, 0))
-        pv1 = tl.make_block_ptr(v_base, (T, V), (H * V, 1), (i_t * BT + 16, i_v * BV), (16, BV), (1, 0))
-        pv2 = tl.make_block_ptr(v_base, (T, V), (H * V, 1), (i_t * BT + 32, i_v * BV), (16, BV), (1, 0))
-        pv3 = tl.make_block_ptr(v_base, (T, V), (H * V, 1), (i_t * BT + 48, i_v * BV), (16, BV), (1, 0))
+        pv0 = tl.make_block_ptr(
+            v_base, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (16, BV), (1, 0)
+        )
+        pv1 = tl.make_block_ptr(
+            v_base, (T, V), (H * V, 1), (i_t * BT + 16, i_v * BV), (16, BV), (1, 0)
+        )
+        pv2 = tl.make_block_ptr(
+            v_base, (T, V), (H * V, 1), (i_t * BT + 32, i_v * BV), (16, BV), (1, 0)
+        )
+        pv3 = tl.make_block_ptr(
+            v_base, (T, V), (H * V, 1), (i_t * BT + 48, i_v * BV), (16, BV), (1, 0)
+        )
         vb0 = (tl.load(pv0, boundary_check=(0, 1)) * bb0[:, None]).to(tl.bfloat16)
         vb1 = (tl.load(pv1, boundary_check=(0, 1)) * bb1[:, None]).to(tl.bfloat16)
         vb2 = (tl.load(pv2, boundary_check=(0, 1)) * bb2[:, None]).to(tl.bfloat16)
@@ -168,13 +247,30 @@ def fused_solve_tril_recompute_w_u_kernel(
 
         u0 = tl.dot(h11, vb0, allow_tf32=False)
         u1 = tl.dot(h21, vb0, allow_tf32=False) + tl.dot(h22, vb1, allow_tf32=False)
-        u2 = tl.dot(h31, vb0, allow_tf32=False) + tl.dot(h32, vb1, allow_tf32=False) + tl.dot(h33, vb2, allow_tf32=False)
-        u3 = tl.dot(h41, vb0, allow_tf32=False) + tl.dot(h42, vb1, allow_tf32=False) + tl.dot(h43, vb2, allow_tf32=False) + tl.dot(h44, vb3, allow_tf32=False)
+        u2 = (
+            tl.dot(h31, vb0, allow_tf32=False)
+            + tl.dot(h32, vb1, allow_tf32=False)
+            + tl.dot(h33, vb2, allow_tf32=False)
+        )
+        u3 = (
+            tl.dot(h41, vb0, allow_tf32=False)
+            + tl.dot(h42, vb1, allow_tf32=False)
+            + tl.dot(h43, vb2, allow_tf32=False)
+            + tl.dot(h44, vb3, allow_tf32=False)
+        )
 
-        pu0 = tl.make_block_ptr(u_base, (T, V), (V, 1), (i_t * BT, i_v * BV), (16, BV), (1, 0))
-        pu1 = tl.make_block_ptr(u_base, (T, V), (V, 1), (i_t * BT + 16, i_v * BV), (16, BV), (1, 0))
-        pu2 = tl.make_block_ptr(u_base, (T, V), (V, 1), (i_t * BT + 32, i_v * BV), (16, BV), (1, 0))
-        pu3 = tl.make_block_ptr(u_base, (T, V), (V, 1), (i_t * BT + 48, i_v * BV), (16, BV), (1, 0))
+        pu0 = tl.make_block_ptr(
+            u_base, (T, V), (V, 1), (i_t * BT, i_v * BV), (16, BV), (1, 0)
+        )
+        pu1 = tl.make_block_ptr(
+            u_base, (T, V), (V, 1), (i_t * BT + 16, i_v * BV), (16, BV), (1, 0)
+        )
+        pu2 = tl.make_block_ptr(
+            u_base, (T, V), (V, 1), (i_t * BT + 32, i_v * BV), (16, BV), (1, 0)
+        )
+        pu3 = tl.make_block_ptr(
+            u_base, (T, V), (V, 1), (i_t * BT + 48, i_v * BV), (16, BV), (1, 0)
+        )
         tl.store(pu0, u0.to(pu0.dtype.element_ty), boundary_check=(0, 1))
         tl.store(pu1, u1.to(pu1.dtype.element_ty), boundary_check=(0, 1))
         tl.store(pu2, u2.to(pu2.dtype.element_ty), boundary_check=(0, 1))
@@ -187,24 +283,48 @@ def fused_solve_tril_recompute_w_u_kernel(
         w_base = w + (((i_b * H + i_h) * T_flat) * K)
 
     for i_k in range(tl.cdiv(K, BK)):
-        pk0 = tl.make_block_ptr(k_base, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (16, BK), (1, 0))
-        pk1 = tl.make_block_ptr(k_base, (T, K), (Hg * K, 1), (i_t * BT + 16, i_k * BK), (16, BK), (1, 0))
-        pk2 = tl.make_block_ptr(k_base, (T, K), (Hg * K, 1), (i_t * BT + 32, i_k * BK), (16, BK), (1, 0))
-        pk3 = tl.make_block_ptr(k_base, (T, K), (Hg * K, 1), (i_t * BT + 48, i_k * BK), (16, BK), (1, 0))
-        kb0 = (tl.load(pk0, boundary_check=(0, 1)) * bb0[:, None] * eg0[:, None]).to(tl.bfloat16)
-        kb1 = (tl.load(pk1, boundary_check=(0, 1)) * bb1[:, None] * eg1[:, None]).to(tl.bfloat16)
-        kb2 = (tl.load(pk2, boundary_check=(0, 1)) * bb2[:, None] * eg2[:, None]).to(tl.bfloat16)
-        kb3 = (tl.load(pk3, boundary_check=(0, 1)) * bb3[:, None] * eg3[:, None]).to(tl.bfloat16)
+        pk0 = tl.make_block_ptr(
+            k_base, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (16, BK), (1, 0)
+        )
+        pk1 = tl.make_block_ptr(
+            k_base, (T, K), (Hg * K, 1), (i_t * BT + 16, i_k * BK), (16, BK), (1, 0)
+        )
+        pk2 = tl.make_block_ptr(
+            k_base, (T, K), (Hg * K, 1), (i_t * BT + 32, i_k * BK), (16, BK), (1, 0)
+        )
+        pk3 = tl.make_block_ptr(
+            k_base, (T, K), (Hg * K, 1), (i_t * BT + 48, i_k * BK), (16, BK), (1, 0)
+        )
+        kb0 = (tl.load(pk0, boundary_check=(0, 1)) * bb0[:, None] * eg0[:, None]).to(
+            tl.bfloat16
+        )
+        kb1 = (tl.load(pk1, boundary_check=(0, 1)) * bb1[:, None] * eg1[:, None]).to(
+            tl.bfloat16
+        )
+        kb2 = (tl.load(pk2, boundary_check=(0, 1)) * bb2[:, None] * eg2[:, None]).to(
+            tl.bfloat16
+        )
+        kb3 = (tl.load(pk3, boundary_check=(0, 1)) * bb3[:, None] * eg3[:, None]).to(
+            tl.bfloat16
+        )
 
         w0 = tl.dot(h11, kb0)
         w1 = tl.dot(h21, kb0) + tl.dot(h22, kb1)
         w2 = tl.dot(h31, kb0) + tl.dot(h32, kb1) + tl.dot(h33, kb2)
         w3 = tl.dot(h41, kb0) + tl.dot(h42, kb1) + tl.dot(h43, kb2) + tl.dot(h44, kb3)
 
-        pw0 = tl.make_block_ptr(w_base, (T, K), (K, 1), (i_t * BT, i_k * BK), (16, BK), (1, 0))
-        pw1 = tl.make_block_ptr(w_base, (T, K), (K, 1), (i_t * BT + 16, i_k * BK), (16, BK), (1, 0))
-        pw2 = tl.make_block_ptr(w_base, (T, K), (K, 1), (i_t * BT + 32, i_k * BK), (16, BK), (1, 0))
-        pw3 = tl.make_block_ptr(w_base, (T, K), (K, 1), (i_t * BT + 48, i_k * BK), (16, BK), (1, 0))
+        pw0 = tl.make_block_ptr(
+            w_base, (T, K), (K, 1), (i_t * BT, i_k * BK), (16, BK), (1, 0)
+        )
+        pw1 = tl.make_block_ptr(
+            w_base, (T, K), (K, 1), (i_t * BT + 16, i_k * BK), (16, BK), (1, 0)
+        )
+        pw2 = tl.make_block_ptr(
+            w_base, (T, K), (K, 1), (i_t * BT + 32, i_k * BK), (16, BK), (1, 0)
+        )
+        pw3 = tl.make_block_ptr(
+            w_base, (T, K), (K, 1), (i_t * BT + 48, i_k * BK), (16, BK), (1, 0)
+        )
         tl.store(pw0, w0.to(pw0.dtype.element_ty), boundary_check=(0, 1))
         tl.store(pw1, w1.to(pw1.dtype.element_ty), boundary_check=(0, 1))
         tl.store(pw2, w2.to(pw2.dtype.element_ty), boundary_check=(0, 1))
