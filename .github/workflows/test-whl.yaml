@@ -141,8 +141,8 @@ jobs:
           docker exec aiter_test bash -c "python3 -m pip install -U pip setuptools"
           docker exec aiter_test bash -c "pip uninstall -y aiter amd-aiter || true"
 
-          # Install from local file in container
-          if ! docker exec aiter_test bash -c "python3 -m pip install /tmp/${WHEEL_NAME} -v"; then
+          # Install from local file in container + tabulate (needed by test_activation.py's df.to_markdown())
+          if ! docker exec aiter_test bash -c "python3 -m pip install /tmp/${WHEEL_NAME} tabulate -v"; then
             echo "❌ Installation failed!"
             echo "Debug info:"
             echo "- Wheel: ${WHEEL_NAME}"
