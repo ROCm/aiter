@@ -959,5 +959,3 @@ def mla_prefill_reduce(
             )  # [tile_q, v_head_dim]
 
             output[qo_start:qo_end, head_idx, :] = final_output[:q_len, :]
-
-
