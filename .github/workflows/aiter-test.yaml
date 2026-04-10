@@ -173,7 +173,7 @@ jobs:
             rm -rf awscliv2.zip aws
           fi
 
-      - name: Upload wheels to S3
+      - name: Upload wheels and latest main manifest to S3
         if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         run: |
           for WHL in dist/*.whl; do
@@ -182,6 +182,25 @@ jobs:
             aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
           done
           echo "Wheels uploaded to S3 staging"
+
+          MANIFEST_WHL=$(ls -t dist/amd_aiter*.whl 2>/dev/null | head -1)
+          if [ -z "$MANIFEST_WHL" ]; then
+            echo "ERROR: No amd_aiter wheel found in dist/"
+            exit 1
+          fi
+
+          MANIFEST_WHL_NAME=$(basename "$MANIFEST_WHL")
+          MANIFEST_WHL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/${MANIFEST_WHL_NAME}"
+          MANIFEST_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          python3 -c "import json, pathlib, sys; pathlib.Path('latest-main-wheel.json').write_text(json.dumps({'branch': sys.argv[1], 'timestamp': sys.argv[2], 'commit': sys.argv[3], 'wheel_name': sys.argv[4], 'wheel_url': sys.argv[5]}, indent=2) + '\n', encoding='utf-8')" \
+            "$GITHUB_REF_NAME" "$MANIFEST_TIMESTAMP" "$GITHUB_SHA" "$MANIFEST_WHL_NAME" "$MANIFEST_WHL_URL"
+
+          aws s3 cp latest-main-wheel.json \
+            s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/main/latest.json \
+            --content-type application/json
+
+          echo "Uploaded latest main wheel manifest for ${MANIFEST_WHL_NAME}"
 
   split_aiter_tests:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
