@@ -10,6 +10,105 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 float8_info = torch.finfo(e4m3_dtype)
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
+@gluon.constexpr_function
+def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, WARP_SIZE, NUM_WARPS, FP8_DOT):
+    """Build DistributedLinearLayout and PaddedSharedLayout for CDNA4 async KV loading.
+
+    Parameters are derived from dtype (FP8_DOT) and head_size to match the TTGIR
+    layouts for {bf16, fp8} x {head_size 64, 128}.
+
+    Returns (blocked_k, blocked_v, shared_k_layout, shared_v_layout).
+    """
+    # 128-bit loads: 16 fp8 (1B) or 8 bf16 (2B) elements per vector load
+    CONTIGUITY = 16 if FP8_DOT else 8
+
+    # log2 for powers of 2
+    LG2_C = 4 if FP8_DOT else 3
+    LG2_HS = 7 if HEAD_SIZE > 64 else 6
+    LG2_TS = 7 if TILE_SIZE > 64 else 6
+    LG2_WS = 7 if WARP_SIZE > 64 else 6
+    LG2_NW = 3 if NUM_WARPS > 4 else 2
+
+    # Bit allocations: K [HEAD_SIZE, TILE_SIZE], V [TILE_SIZE, HEAD_SIZE]
+    # d0_lane = number of lane bits covering the contiguous dimension (HEAD_SIZE)
+    d0_lane = LG2_HS - LG2_C
+    k_d1_lane = LG2_WS - d0_lane
+    k_d1_reg = LG2_TS - LG2_NW - k_d1_lane
+    v_d0_lane = LG2_WS - d0_lane
+    v_d0_reg = LG2_TS - v_d0_lane - LG2_NW
+
+    # --- K DistributedLinearLayout [HEAD_SIZE, TILE_SIZE] ---
+    # dim0 (HEAD_SIZE): CONTIGUITY contiguous elements in regs, rest in lanes
+    # dim1 (TILE_SIZE): warps at lowest bits, then regs, then lanes
+    k_reg = ([[1 << i, 0] for i in range(LG2_C)]
+             + [[0, 1 << (LG2_NW + i)] for i in range(k_d1_reg)])
+    k_lane = ([[1 << (LG2_C + i), 0] for i in range(d0_lane)]
+              + [[0, 1 << (LG2_NW + k_d1_reg + i)] for i in range(k_d1_lane)])
+    k_warp = [[0, 1 << i] for i in range(LG2_NW)]
+    blocked_k = gl.DistributedLinearLayout(
+        reg_bases=k_reg, lane_bases=k_lane, warp_bases=k_warp,
+        block_bases=[], shape=[HEAD_SIZE, TILE_SIZE],
+    )
+
+    # --- V DistributedLinearLayout [TILE_SIZE, HEAD_SIZE] ---
+    # dim1 (HEAD_SIZE): CONTIGUITY contiguous elements in regs, rest in lanes
+    # dim0 (TILE_SIZE): warp placement depends on HEAD_SIZE vs TILE_SIZE
+    v_reg = [[0, 1 << i] for i in range(LG2_C)]
+    v_d1_lane_bases = [[0, 1 << (LG2_C + i)] for i in range(d0_lane)]
+    if HEAD_SIZE > TILE_SIZE:
+        # Consecutive warps at lowest dim0 bits
+        v_warp = [[1, 0], [2, 0]]
+        if v_d0_reg >= v_d0_lane:
+            v_reg += [[1 << (LG2_NW + i), 0] for i in range(v_d0_reg)]
+            v_d0_lane_bases = [[1 << (LG2_NW + v_d0_reg + i), 0]
+                               for i in range(v_d0_lane)]
+            v_N = LG2_NW + v_d0_reg
+        else:
+            v_d0_lane_bases = [[1 << (LG2_NW + i), 0]
+                               for i in range(v_d0_lane)]
+            v_reg += [[1 << (LG2_NW + v_d0_lane + i), 0]
+                      for i in range(v_d0_reg)]
+            v_N = LG2_NW
+    else:
+        # Split warps: bit 0 and bit above all lane bits
+        v_warp = [[1, 0], [1 << (1 + v_d0_lane), 0]]
+        v_d0_lane_bases = [[1 << (1 + i), 0] for i in range(v_d0_lane)]
+        v_d0_reg_start = 1 + v_d0_lane + 1
+        v_reg += [[1 << (v_d0_reg_start + i), 0] for i in range(v_d0_reg)]
+        v_N = 1
+    v_lane = v_d1_lane_bases + v_d0_lane_bases
+    blocked_v = gl.DistributedLinearLayout(
+        reg_bases=v_reg, lane_bases=v_lane, warp_bases=v_warp,
+        block_bases=[], shape=[TILE_SIZE, HEAD_SIZE],
+    )
+
+    # --- K PaddedSharedLayout [HEAD_SIZE, TILE_SIZE] ---
+    # XOR swizzle: dim1 offsets rotated by log2(HEAD_SIZE / CONTIGUITY)
+    R_K = LG2_HS - LG2_C
+    k_offset = ([[1 << i, 0] for i in range(LG2_HS)]
+                + [[0, 1 << ((i + R_K) % LG2_TS)] for i in range(LG2_TS)])
+    shared_k = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[TILE_SIZE * CONTIGUITY, CONTIGUITY]],
+        offset_bases=k_offset,
+        cga_layout=[],
+        shape=[HEAD_SIZE, TILE_SIZE],
+    )
+
+    # --- V PaddedSharedLayout [TILE_SIZE, HEAD_SIZE] ---
+    # XOR swizzle: dim0 offsets partially rotated (M bits swizzled, rest identity)
+    v_M = v_d0_lane + v_N
+    v_offset = ([[0, 1 << i] for i in range(LG2_HS)]
+                + [([1 << ((i + v_N) % v_M), 0] if i < v_M
+                    else [1 << i, 0]) for i in range(LG2_TS)])
+    shared_v = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[TILE_SIZE * CONTIGUITY, TILE_SIZE // 2]],
+        offset_bases=v_offset,
+        cga_layout=[],
+        shape=[TILE_SIZE, HEAD_SIZE],
+    )
+
+    return blocked_k, blocked_v, shared_k, shared_v
+
 
 @aggregate
 class AsyncKVLoaderConfig:
@@ -27,25 +126,12 @@ class AsyncKVLoaderConfig:
 
     @gluon.constexpr_function
     def __init__(self, cfg):
-        # Blocked layouts for global-to-shared memory loads
-        HEAD_SIZE_DIV = cfg.HEAD_SIZE // 8
-        # gl.static_assert(WARP_SIZE % HEAD_SIZE_DIV == 0, "WARP_SIZE must be divisible by HEAD_SIZE_DIV")
-        self.blocked_v = gl.constexpr(
-            gl.BlockedLayout(
-                size_per_thread=[1, 8],
-                threads_per_warp=[cfg.WARP_SIZE // HEAD_SIZE_DIV, HEAD_SIZE_DIV],
-                warps_per_cta=[cfg.NUM_WARPS, 1],
-                order=[1, 0],
-            )
-        )
-        self.blocked_k = gl.constexpr(
-            gl.BlockedLayout(
-                size_per_thread=[8, 1],
-                threads_per_warp=[HEAD_SIZE_DIV, cfg.WARP_SIZE // HEAD_SIZE_DIV],
-                warps_per_cta=[1, cfg.NUM_WARPS],
-                order=[0, 1],
-            )
-        )
+        blocked_k, blocked_v, shared_k, shared_v = _make_cdna4_kv_load_layouts(
+            cfg.HEAD_SIZE, cfg.TILE_SIZE, cfg.WARP_SIZE, cfg.NUM_WARPS, cfg.FP8_DOT)
+
+        self.blocked_k = gl.constexpr(blocked_k)
+        self.blocked_v = gl.constexpr(blocked_v)
+
         if cfg.SHUFFLED_KV_CACHE:
             self.shared_k_layout = gl.constexpr(
                 gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
@@ -54,12 +140,8 @@ class AsyncKVLoaderConfig:
                 gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
             )
         else:
-            self.shared_k_layout = gl.constexpr(
-                gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1])
-            )
-            self.shared_v_layout = gl.constexpr(
-                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-            )
+            self.shared_k_layout = gl.constexpr(shared_k)
+            self.shared_v_layout = gl.constexpr(shared_v)
 
         self.KV_CACHE_MODIFIER = cfg.KV_CACHE_MODIFIER
         self.USE_LOAD_BUFFER_OP = cfg.USE_LOAD_BUFFER_OP
@@ -733,6 +815,7 @@ class AttentionConfig:
 
     Q_FP8: gl.constexpr
     KV_FP8: gl.constexpr
+    FP8_DOT: gl.constexpr
     K_WIDTH: gl.constexpr
 
     @gluon.constexpr_function
@@ -781,8 +864,8 @@ class AttentionConfig:
         self.ARCH_NAME = gl.constexpr(ARCH_NAME)
         self.WARP_SIZE = gl.constexpr(32 if ARCH_NAME == "gfx1250" else 64)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        FP8_DOT = gl.constexpr(Q_FP8 and KV_FP8)
-        self.K_WIDTH = gl.constexpr(8)
+        self.FP8_DOT = gl.constexpr(Q_FP8 and KV_FP8)
+        self.K_WIDTH = gl.constexpr(16) if self.FP8_DOT else gl.constexpr(8)
         # Operator layouts (gfx1250 WMMA)
         if ARCH_NAME == "gfx1250":
             assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
@@ -799,7 +882,7 @@ class AttentionConfig:
                 gl.amd.AMDWMMALayout(
                     version=3,
                     transposed=True,
-                    instr_shape=[16, 16, 32] if not FP8_DOT else [16, 16, FP8_K_DIM_QK],
+                    instr_shape=[16, 16, 32] if not self.FP8_DOT else [16, 16, FP8_K_DIM_QK],
                     warp_bases=warp_bases,
                 )
             )
@@ -809,17 +892,18 @@ class AttentionConfig:
                 gl.amd.AMDWMMALayout(
                     version=3,
                     transposed=True,
-                    instr_shape=[16, 16, 32] if not FP8_DOT else [16, 16, FP8_K_DIM_PV],
+                    instr_shape=[16, 16, 32] if not self.FP8_DOT else [16, 16, FP8_K_DIM_PV],
                     warp_bases=warp_bases,
                 )
             )
+            K_WIDTH_PV = self.K_WIDTH
 
         else:
             self.qk_layout = gl.constexpr(
                 gl.amd.AMDMFMALayout(
                     version=4,
                     transposed=True,
-                    instr_shape=[32, 32, 16] if not FP8_DOT else [32, 32, 64],
+                    instr_shape=[32, 32, 16] if not self.FP8_DOT else [32, 32, 64],
                     warps_per_cta=[NUM_WARPS, 1],
                 )
             )
@@ -828,10 +912,13 @@ class AttentionConfig:
                 gl.amd.AMDMFMALayout(
                     version=4,
                     transposed=True,
-                    instr_shape=[32, 32, 16] if not FP8_DOT else [32, 32, 64],
+                    instr_shape=[32, 32, 16] if not self.FP8_DOT else [32, 32, 64],
                     warps_per_cta=[NUM_WARPS, 1],
                 )
             )
+            # CDNA4 bf16 MFMA [32,32,16] uses kWidth=4 for PV operands
+            K_WIDTH_PV = gl.constexpr(16) if self.FP8_DOT else gl.constexpr(4)
+
         # Dot operand layouts
         self.q_layout = gl.constexpr(
             gl.DotOperandLayout(0, self.qk_layout, self.K_WIDTH)
@@ -840,21 +927,21 @@ class AttentionConfig:
             gl.DotOperandLayout(1, self.qk_layout, self.K_WIDTH)
         )
         self.v_layout = gl.constexpr(
-            gl.DotOperandLayout(1, self.pv_layout, self.K_WIDTH)
+            gl.DotOperandLayout(1, self.pv_layout, K_WIDTH_PV)
         )
         self.p_layout = gl.constexpr(
-            gl.DotOperandLayout(0, self.pv_layout, self.K_WIDTH)
+            gl.DotOperandLayout(0, self.pv_layout, K_WIDTH_PV)
         )
 
         # Blocked layouts for global-to-shared memory loads
         ELEMENT_SIZE = 8 if Q_FP8 else 16
         MAX_LOAD = 128
         SIZE_PER_THREAD = MAX_LOAD // ELEMENT_SIZE
-        HEAD_SIZE_DIV = HEAD_SIZE // 8
+        HEAD_SIZE_DIV = HEAD_SIZE // SIZE_PER_THREAD
         self.blocked_q = gl.constexpr(
             gl.BlockedLayout(
                 size_per_thread=[1, SIZE_PER_THREAD],
-                threads_per_warp=[self.WARP_SIZE // 8, 8],
+                threads_per_warp=[self.WARP_SIZE // HEAD_SIZE_DIV, HEAD_SIZE_DIV],
                 warps_per_cta=[NUM_WARPS, 1],
                 order=[1, 0],
             )
@@ -1055,8 +1142,18 @@ class AttentionProgram:
         )
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(self.q, k, S) * self.QK_scale
-        else:
+        elif not self.cfg.FP8_DOT:
             return gl.amd.cdna4.mfma(self.q, k, S) * self.QK_scale
+        else:
+            return gl.amd.cdna4.mfma_scaled(
+                a=self.q,
+                a_scale=None,
+                a_format="e4m3",
+                b=k,
+                b_scale=None,
+                b_format="e4m3",
+                acc=S,
+            ) * self.QK_scale
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
@@ -1112,8 +1209,18 @@ class AttentionProgram:
         p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=assert_trivial)
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(p, v, acc)
-        else:
+        elif not self.cfg.FP8_DOT:
             return gl.amd.cdna4.mfma(p, v, acc)
+        else:
+            return gl.amd.cdna4.mfma_scaled(
+                a=p,
+                a_scale=None,
+                a_format="e4m3",
+                b=v,
+                b_scale=None,
+                b_format="e4m3",
+                acc=acc,
+            )
 
     @gluon.jit
     def store_output(
@@ -1390,14 +1497,13 @@ def kernel_unified_attention_2d(
         query_mask_1_pv = query_offset_1_pv < NUM_QUERY_HEADS
         # Using regular approach: Prescale with RCP_LN2, needed for exp2
         # FMA based approach: Prescale with / SCALE
-        M = (
-            gl.load(
-                sink_ptr + query_offset_1_pv,
-                mask=query_mask_1_pv,
-                other=float("-inf"),
-            ).to(dtype=gl.float32)
-            * cfg.RCP_LN2
-        )
+
+        M = gl.amd.cdna4.buffer_load(
+            ptr=sink_ptr,
+            offsets=query_offset_1_pv,
+            mask=query_mask_1_pv,
+            other=float("-inf"),
+        ).to(gl.float32) * cfg.RCP_LN2
 
     L = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
