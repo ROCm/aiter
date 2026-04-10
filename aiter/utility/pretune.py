@@ -644,8 +644,8 @@ def warmup(
         logger.warning(
             f"[pretune] warmup: {module_name} — {missing}/{len(shapes)} shapes NOT tuned "
             f"for {cov['gfx']}/cu_num={cov['cu_num']}. "
-            "Set VLLM_AITER_AUTO_TUNE=1 or run: python3 aiter/utility/pretune.py "
-            + module_name
+            "Call warmup(..., auto_tune=True) to tune missing shapes, or run: "
+            "python3 aiter/utility/pretune.py " + module_name
         )
 
     return {
