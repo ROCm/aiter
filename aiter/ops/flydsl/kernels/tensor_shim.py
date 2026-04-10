@@ -23,11 +23,11 @@ def _to_raw(v):
 
 def get_dtype_str(dtype):
     if dtype == torch.float:
-        return 'f32'
+        return "f32"
     elif dtype == torch.half:
-        return 'f16'
+        return "f16"
     elif dtype == torch.bfloat16:
-        return 'bf16'
+        return "bf16"
 
 
 def get_dtype_in_kernel(dtype: str):
@@ -40,11 +40,11 @@ def get_dtype_in_kernel(dtype: str):
 
 
 def get_dtype_vec_size(dtype: str):
-    if dtype == 'f32':
+    if dtype == "f32":
         return 4
-    elif dtype == 'f16':
+    elif dtype == "f16":
         return 8
-    elif dtype == 'bf16':
+    elif dtype == "bf16":
         return 8
 
 

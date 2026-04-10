@@ -16,20 +16,22 @@ import triton.language as tl
 
 from dataclasses import dataclass
 from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.shuffle import shuffle_weight
+from typing import Optional
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
 if not is_flydsl_available():
     pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL Linear Attention tests.", allow_module_level=True
+        "flydsl is not installed. Skipping FlyDSL Linear Attention tests.",
+        allow_module_level=True,
     )
 
 try:
     from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
 except ImportError as exc:
     pytest.skip(
-        f"Unable to import FlyDSL Linear Attention kernels: {exc}", allow_module_level=True
+        f"Unable to import FlyDSL Linear Attention kernels: {exc}",
+        allow_module_level=True,
     )
 
 torch.set_default_device("cuda")
@@ -48,22 +50,46 @@ class Args:
 
 
 def create_inputs(args):
-    query = torch.randn((args.b, args.sq, args.num_k_heads, args.head_k_dim), dtype=args.dtype, device='cuda')
-    key = torch.randn((args.b, args.sq, args.num_k_heads, args.head_k_dim), dtype=args.dtype, device='cuda')
-    value = torch.randn((args.b, args.sq, args.num_v_heads, args.head_v_dim), dtype=args.dtype, device='cuda')
-    a = torch.randn((args.b, args.sq, args.num_v_heads), dtype=args.dtype, device='cuda')
-    b = torch.randn((args.b, args.sq, args.num_v_heads), dtype=args.dtype, device='cuda')
-    dt_bias = torch.randn((args.num_v_heads), dtype=args.dtype, device='cuda')
+    query = torch.randn(
+        (args.b, args.sq, args.num_k_heads, args.head_k_dim),
+        dtype=args.dtype,
+        device="cuda",
+    )
+    key = torch.randn(
+        (args.b, args.sq, args.num_k_heads, args.head_k_dim),
+        dtype=args.dtype,
+        device="cuda",
+    )
+    value = torch.randn(
+        (args.b, args.sq, args.num_v_heads, args.head_v_dim),
+        dtype=args.dtype,
+        device="cuda",
+    )
+    a = torch.randn(
+        (args.b, args.sq, args.num_v_heads), dtype=args.dtype, device="cuda"
+    )
+    b = torch.randn(
+        (args.b, args.sq, args.num_v_heads), dtype=args.dtype, device="cuda"
+    )
+    dt_bias = torch.randn((args.num_v_heads), dtype=args.dtype, device="cuda")
     dt_bias.uniform_(1, 2)
     A_log = torch.randn((args.num_v_heads), dtype=torch.float32, device="cuda")
     A_log.uniform_(0, 16)
     indices = torch.arange(args.b - 1, -1, -1, dtype=torch.int32, device="cuda")
-    state = torch.randn((args.b, args.num_v_heads, args.head_k_dim, args.head_v_dim), dtype=torch.float32, device="cuda")
+    state = torch.randn(
+        (args.b, args.num_v_heads, args.head_k_dim, args.head_v_dim),
+        dtype=torch.float32,
+        device="cuda",
+    )
     return (args, query, key, value, a, b, dt_bias, A_log, indices, state)
 
 
 def create_outputs(args):
-    out = torch.zeros((args.b, args.sq, args.num_v_heads, args.head_v_dim), dtype=args.dtype, device='cuda')
+    out = torch.zeros(
+        (args.b, args.sq, args.num_v_heads, args.head_v_dim),
+        dtype=args.dtype,
+        device="cuda",
+    )
     return (out,)
 
 
@@ -295,7 +321,20 @@ def fused_sigmoid_gating_delta_rule_update(
     )
 
 
-def run_triton_kernel(out, A_log, dt_bias, q, k, v, a, b, initial_state, indices, scale, use_qk_l2norm_in_kernel):
+def run_triton_kernel(
+    out,
+    A_log,
+    dt_bias,
+    q,
+    k,
+    v,
+    a,
+    b,
+    initial_state,
+    indices,
+    scale,
+    use_qk_l2norm_in_kernel,
+):
     fused_sigmoid_gating_delta_rule_update(
         out,
         A_log=A_log,
@@ -316,13 +355,37 @@ def run_triton_kernel(out, A_log, dt_bias, q, k, v, a, b, initial_state, indices
 
 
 def func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    flydsl_gdr_decode(query, key, value, a, b, dt_bias, A_log, indices, state, out, 
-        use_qk_l2norm=args.use_qk_l2norm, need_shuffle_state=True)
+    flydsl_gdr_decode(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state,
+        out,
+        use_qk_l2norm=args.use_qk_l2norm,
+        need_shuffle_state=True,
+    )
 
 
 def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out):
-    run_triton_kernel(out, A_log, dt_bias, query, key, value, a, b, state, indices,
-        float(1.0 / (args.head_k_dim ** 0.5)), args.use_qk_l2norm)
+    run_triton_kernel(
+        out,
+        A_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        a,
+        b,
+        state,
+        indices,
+        float(1.0 / (args.head_k_dim**0.5)),
+        args.use_qk_l2norm,
+    )
 
 
 @pytest.mark.parametrize(
@@ -336,7 +399,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
             num_v_heads=8,
             head_k_dim=128,
             head_v_dim=128,
-            use_qk_l2norm=True
+            use_qk_l2norm=True,
         ),
         Args(
             dtype=torch.bfloat16,
@@ -346,7 +409,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
             num_v_heads=8,
             head_k_dim=128,
             head_v_dim=128,
-            use_qk_l2norm=True
+            use_qk_l2norm=True,
         ),
         Args(
             dtype=torch.bfloat16,
@@ -356,7 +419,7 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
             num_v_heads=32,
             head_k_dim=128,
             head_v_dim=128,
-            use_qk_l2norm=True
+            use_qk_l2norm=True,
         ),
         Args(
             dtype=torch.float16,
@@ -366,8 +429,8 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
             num_v_heads=32,
             head_k_dim=128,
             head_v_dim=128,
-            use_qk_l2norm=True
-        )
+            use_qk_l2norm=True,
+        ),
     ],
 )
 def test_flydsl_gdr_decode(args):
@@ -383,7 +446,9 @@ def test_flydsl_gdr_decode(args):
     for output, ref_output in zip(outputs, ref_outputs):
         is_allclose = torch.allclose(output, ref_output, atol=1e-3, rtol=1e-3)
         maxdiff_out = (output - ref_output).abs().max()
-        is_allclose = is_allclose and torch.allclose(inouts[-2], ref_inouts[-2], atol=1e-3, rtol=1e-3)
+        is_allclose = is_allclose and torch.allclose(
+            inouts[-2], ref_inouts[-2], atol=1e-3, rtol=1e-3
+        )
         maxdiff_state = (inouts[-2] - ref_inouts[-2]).abs().max()
         print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
-        assert is_allclose == True
+        assert is_allclose

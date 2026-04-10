@@ -5,20 +5,12 @@
 
 from __future__ import annotations
 
-from itertools import product
-from typing import Dict, Optional
 
 import torch
-from torch import Tensor
 
-from aiter import logger
-from aiter.utility import dtypes
-from flydsl.runtime.device import get_rocm_arch
 
-from aiter.jit.utils.chip_info import get_gfx
-
-from .kernels.gdr_decode import create_shuffle_gdr_decode_kernel, get_dtype_str
-from .utils import is_flydsl_available
+from .kernels.gdr_decode import create_shuffle_gdr_decode_kernel
+from .kernels.tensor_shim import get_dtype_str
 
 __all__ = [
     "flydsl_gdr_decode",
@@ -41,7 +33,7 @@ def get_default_kwargs(batch_size, seq_length):
         11: 1,
     }
     if b_to_vs.get(batch_size, None) is not None:
-        d['NUM_BLOCKS_PER_V_DIM'] = b_to_vs[batch_size]
+        d["NUM_BLOCKS_PER_V_DIM"] = b_to_vs[batch_size]
     return d
 
 
@@ -76,9 +68,36 @@ def flydsl_gdr_decode(
         head_k_dim,
         head_v_dim,
         use_qk_l2norm,
-        **kwargs)
-    exe_compiled = exe.compile(query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
-    exe_compiled(query, key, value, a, b, dt_bias, A_log, indices, state_, out, batch_size, stream)
+        **kwargs,
+    )
+    exe_compiled = exe.compile(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state_,
+        out,
+        batch_size,
+        stream,
+    )
+    exe_compiled(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state_,
+        out,
+        batch_size,
+        stream,
+    )
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
         state.copy_(state_)
