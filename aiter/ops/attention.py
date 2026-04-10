@@ -941,6 +941,13 @@ def get_mla_metadata_info_v1(
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
         )
+        or (
+            get_gfx() == "gfx950"
+            and num_head_qo == 64
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and max_seqlen_qo == 1
+        )
         or use_qseqlen_fold
         else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
