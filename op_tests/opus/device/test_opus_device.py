@@ -155,6 +155,20 @@ class OpusDeviceLib:
             int(scale_b),
         )
 
+    # -- MMA step_k --
+    def run_mma_step_k_bf16(self, A, B, C):
+        fn = self._lib.run_mma_step_k_bf16
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _VP, _I, _I, _I]
+        fn(
+            self._ptr(A),
+            self._ptr(B),
+            self._ptr(C),
+            int(A.stride(0)),
+            int(B.stride(0)),
+            int(C.stride(0)),
+        )
+
     # -- vector_add --
     def run_vector_add(self, A, B, Result):
         fn = self._lib.run_vector_add
@@ -398,7 +412,6 @@ def test_mfma_32x32x16_bf16(mod):
     return _test_mfma_variant(
         mod, "32x32x16_bf16", 32, 32, 16, torch.bfloat16, _MFMA_ARCHS_GFX942_GFX950
     )
-
 
 def test_mfma_16x16x32_f16(mod):
     """Test MFMA 16x16x32 fp16 kernel (gfx942 step_k + gfx950 native)."""
@@ -1073,6 +1086,43 @@ def test_wmma_scale_16x16x128_fp8_bx32_scaled(mod):
     return _test_wmma_scale_fp8_with_scaling(
         mod, "wmma_scale_16x16x128_fp8_bx32_perlane"
     )
+
+
+def test_mma_step_k_bf16(mod):
+    """Test tiled_mma_adaptor::step_k() for bf16 32x32x128."""
+    arch = _get_gpu_arch()
+    if arch not in _MFMA_ARCHS_GFX942_GFX950:
+        print(f"  SKIP: mma_step_k_32x32x128_bf16 requires {_MFMA_ARCHS_GFX942_GFX950}, got '{arch}'")
+        return 0
+
+    device = torch.device("cuda")
+    torch.manual_seed(12345)
+    A = torch.randint(-10, 11, (32, 128), device=device).to(torch.bfloat16)
+    B = torch.randint(-10, 11, (32, 128), device=device).to(torch.bfloat16)
+    C = torch.empty(32, 32, device=device, dtype=torch.bfloat16)
+
+    mod.run_mma_step_k_bf16(A, B, C)
+
+    C_ref = torch.mm(A.float(), B.float().t()).to(torch.bfloat16)
+
+    atol, rtol = 1e-3, 1e-3
+    ok = torch.allclose(C.float(), C_ref.float(), atol=atol, rtol=rtol)
+    max_diff = (C.float() - C_ref.float()).abs().max().item()
+    if not ok:
+        diff_count = (
+            (C.float() - C_ref.float())
+            .abs()
+            .gt(atol + rtol * C_ref.float().abs())
+            .sum()
+            .item()
+        )
+        print(
+            f"  FAIL: mma_step_k_bf16 max_diff={max_diff:.4f}, "
+            f"{diff_count} elements outside tol"
+        )
+        return 1
+    print(f"  PASS: mma_step_k_32x32x128_bf16, max_diff={max_diff:.4f}")
+    return 0
 
 
 def test_vector_add(mod):
@@ -2062,6 +2112,7 @@ def main():
     failures += test_tiled_wmma_scale_fp8_2x2(mod)
     failures += test_tiled_wmma_scale_fp8_4x1(mod)
     failures += test_wmma_scale_16x16x128_fp8_bx32_scaled(mod)
+    failures += test_mma_step_k_bf16(mod)
     failures += test_vector_add(mod)
     failures += test_async_load(mod)
     failures += test_tr_load_f16(mod)
