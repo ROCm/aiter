@@ -15,6 +15,7 @@ from aiter.jit.core import (
 )
 from aiter.fused_moe import (
     fused_topk,
+    fused_moe,
     moe_sorting,
     asm_stage1,
     torch_moe_stage1,
@@ -24,6 +25,8 @@ from aiter.fused_moe import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
+    shuffle_weight_a16w4,
+    shuffle_scale_a16w4,
 )
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
@@ -201,6 +204,150 @@ class FmoeTuner(TunerCommon):
         return out
 
     @staticmethod
+    def generate_data_fused_moe(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        act_type,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        q_type,
+        use_g1u1,
+        doweight_stage1,
+        blockM,
+        device="cuda",
+    ):
+        """Generate data in the format that fused_moe() expects.
+
+        Returns tuple:
+            0: input (bf16)
+            1: w1_qt_aiter (pre-shuffled for a16w4/a8w4)
+            2: w2_qt_aiter (pre-shuffled)
+            3: topk_weights
+            4: topk_ids
+            5: w1_scale_aiter (pre-shuffled)
+            6: w2_scale_aiter (pre-shuffled)
+            7: w1_qt (raw, for torch reference)
+            8: w2_qt (raw, for torch reference)
+            9: w1_scale (raw)
+            10: w2_scale (raw)
+        """
+        torch.manual_seed(0)
+        input_data = torch.randn((token, model_dim), dtype=dtype, device=device) / 10
+        if use_g1u1:
+            w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype, device=device) / 10
+        else:
+            w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype, device=device) / 10
+        w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype, device=device)
+
+        torch_quant = aiter.get_torch_quant(q_type)
+        w1_qt, w1_scale = torch_quant(w1, quant_dtype=q_dtype_w)
+        w2_qt, w2_scale = torch_quant(w2, quant_dtype=q_dtype_w)
+        w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+        w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+        del w1, w2
+
+        score = torch.zeros((token, expert), dtype=dtype, device=device)
+        start_col = 0
+        end_col = topk
+        for token_id in range(token):
+            score[token_id, start_col:end_col] = 1.0
+            start_col = end_col % expert
+            end_col = start_col + topk
+        topk_weights, topk_ids = fused_topk(input_data, score, topk, True)
+        del score
+
+        # Pre-shuffle weights and scales for a16w4/a8w4
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt, 16, use_g1u1)
+        w2_qt_aiter = shuffle_weight_a16w4(w2_qt, 16, False)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, use_g1u1)
+        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
+
+        return (
+            input_data,     # 0
+            w1_qt_aiter,    # 1
+            w2_qt_aiter,    # 2
+            topk_weights,   # 3
+            topk_ids,       # 4
+            w1_scale_aiter, # 5
+            w2_scale_aiter, # 6
+            w1_qt,          # 7 (raw, for torch ref)
+            w2_qt,          # 8 (raw)
+            w1_scale,       # 9 (raw)
+            w2_scale,       # 10 (raw)
+        )
+
+    @staticmethod
+    def run_fused_moe_out(
+        input_data,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        w1_scale_aiter,
+        w2_scale_aiter,
+        q_type,
+        act_type,
+        doweight_stage1,
+        blockM,
+    ):
+        """Forward function that calls fused_moe() directly."""
+        import os
+        os.environ["AITER_BYPASS_TUNE_CONFIG"] = "1"
+        # Pass dummy a1_scale so fused_moe selects bf16/fp8 activation
+        # for per_1x32 Silu (a8w4 path) instead of falling back to fp4x2.
+        # Inside fused_moe_2stages the actual a1_scale is recomputed.
+        a1_scale = torch.ones(1, device=input_data.device, dtype=torch.float32)
+        return fused_moe(
+            input_data,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale_aiter,
+            w2_scale=w2_scale_aiter,
+            a1_scale=a1_scale,
+            quant_type=q_type,
+            activation=act_type,
+            doweight_stage1=doweight_stage1,
+            block_size_M=blockM,
+        )
+
+    @staticmethod
+    def run_torch_moe_e2e(
+        input_data,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        w1_scale,
+        w2_scale,
+        dtype,
+        act_type,
+        q_type,
+        doweight_stage1,
+        topk,
+    ):
+        """End-to-end torch reference for both stages."""
+        ref1 = torch_moe_stage1(
+            input_data, w1_qt, w2_qt, topk_weights, topk_ids,
+            activation=act_type, quant_type=q_type, dtype=dtype,
+            a1_scale=None, w1_scale=w1_scale,
+            doweight=doweight_stage1,
+        )
+        token = input_data.shape[0]
+        a2_qt = ref1.view(token, topk, -1)
+        return torch_moe_stage2(
+            a2_qt, w1_qt, w2_qt, topk_weights, topk_ids,
+            dtype, q_type,
+            w2_scale=w2_scale, a2_scale=None,
+            doweight=not doweight_stage1,
+        )
+
+    @staticmethod
     def cktile_moe_stage1_fwd_out(
         a1_qt,
         w1_qt_shffle,
@@ -224,6 +371,17 @@ class FmoeTuner(TunerCommon):
             dtype=dtype,
             device=a1_qt.device,
         )
+        # Swiglu kernels are compiled with HasBias=true and unconditionally
+        # read the bias pointer on GPU.  Passing None would hand a nullptr
+        # to the kernel, causing a memory-access fault.  Allocate a zero
+        # bias so the pointer is valid (shape: [expert, N]).
+        bias = None
+        if act_type == ActivationType.Swiglu:
+            bias = torch.zeros(
+                (w1_qt_shffle.shape[0], w1_qt_shffle.shape[1]),
+                dtype=torch.float32,
+                device=a1_qt.device,
+            )
         aiter.moe_cktile2stages_gemm1(
             a1_qt,
             w1_qt_shffle,
@@ -237,7 +395,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             a1_scale,
             w1_scale,
-            None,  # bias
+            bias,
             act_type,
             blockM,
             1,  # split_k
@@ -269,6 +427,16 @@ class FmoeTuner(TunerCommon):
             dtype=dtype,
             device=a2_qt.device,
         )
+        # Swiglu implies HasBias=true for both stages.  Stage2 kernels
+        # compiled with HasBias still read the bias pointer, so provide
+        # a zero tensor to avoid a null-pointer GPU fault.
+        bias = None
+        if act_type == ActivationType.Swiglu:
+            bias = torch.zeros(
+                (w2_qt_shffle.shape[0], w2_qt_shffle.shape[1]),
+                dtype=torch.float32,
+                device=a2_qt.device,
+            )
         aiter.moe_cktile2stages_gemm2(
             a2_qt,
             w2_qt_shffle,
@@ -282,7 +450,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights,
             a2_scale,
             w2_scale,
-            None,  # bias
+            bias,
             0,  # activation (unused for stage2)
             blockM,
             1,  # split_k
@@ -687,10 +855,13 @@ class FmoeTuner(TunerCommon):
             q_type == aiter.QuantType.per_1x32
             and q_dtype_a == dtypes.fp8
             and q_dtype_w == dtypes.fp4x2
-        ):  # a8w4 mxfp4
-            from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
-
-            a1_qt, a1_scale = dynamic_mxfp4_quant(input)
+        ):  # a8w4: activation stays fp8 with trivial all-ones scale
+            a1_qt = input.to(dtypes.fp8)
+            a1_scale = torch.ones(
+                [token, model_dim // 32],
+                dtype=dtypes.fp8_e8m0,
+                device=input.device,
+            )
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
@@ -884,13 +1055,24 @@ class FmoeTuner(TunerCommon):
                 )
             )
         elif q_dtype_w == dtypes.fp4x2:
-            w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
-            w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
+            if q_dtype_a in [dtypes.fp8, dtypes.bf16, dtypes.fp16]:
+                # a16w4 / a8w4: use a16w4 shuffle format expected by CK tile kernels
+                w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, use_g1u1)
+                w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+            else:
+                # a4w4: use generic shuffle
+                w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
+                w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
-        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        if q_dtype_a in [dtypes.fp8, dtypes.bf16, dtypes.fp16] and q_dtype_w == dtypes.fp4x2:
+            # a16w4 / a8w4: use a16w4 scale shuffle format
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, use_g1u1)
+            w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
+        else:
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
         w1_qt_shffle_flydsl = w1_qt_shffle_ck
         w2_qt_shffle_flydsl = w2_qt_shffle_ck
@@ -899,7 +1081,7 @@ class FmoeTuner(TunerCommon):
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
-            if q_type == QuantType.per_1x32:
+            if q_type == QuantType.per_1x32 and a1_scale is not None:
                 a1_scale_fp4_sort = moe_mxfp4_sort(
                     a1_scale,  # a1_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
@@ -960,11 +1142,12 @@ class FmoeTuner(TunerCommon):
                 q_type == QuantType.per_1x32
                 and q_dtype_a == dtypes.fp8
                 and q_dtype_w == dtypes.fp4x2
-            ):  # a8w4 mxfp4
-                from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
-
-                a2_qt, a2_scale = dynamic_mxfp4_quant(
-                    ref1.view(ref1.shape[0] * topk, -1)
+            ):  # a8w4: activation stays fp8 with trivial all-ones scale
+                a2_qt = ref1.view(ref1.shape[0] * topk, -1).to(dtypes.fp8)
+                a2_scale = torch.ones(
+                    [token * topk, ref1.shape[-1] // 32],
+                    dtype=dtypes.fp8_e8m0,
+                    device=ref1.device,
                 )
                 a2_scale_mxfp4_sort = moe_mxfp4_sort(
                     a2_scale[: token * topk, :].view(token, topk, -1),
@@ -973,6 +1156,14 @@ class FmoeTuner(TunerCommon):
                     token_num=token,
                     block_size=blockM,
                 )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                and q_dtype_w == dtypes.fp4x2
+            ):  # a16w4: activation stays bf16/fp16, no activation scale
+                a2_qt = ref1.view(ref1.shape[0] * topk, -1).to(dtype)
+                a2_scale = None
+                a2_scale_mxfp4_sort = None
             elif q_type == QuantType.per_1x32:
                 torch_quant = aiter.get_torch_quant(q_type)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
@@ -1853,6 +2044,11 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
+        # CK codegen 2-stage kernels only support a4w4 (fp4x2 x fp4x2) for per_1x32;
+        # bf16/fp16/fp8 activation with fp4x2 weights should use CK tile instead.
+        if q_type == QuantType.per_1x32 and q_dtype_a != q_dtype_w and q_dtype_w == dtypes.fp4x2:
+            return tasks_ck
+
         _, ck_stage1_kernels = get_gemm1_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
@@ -2174,43 +2370,46 @@ class FmoeTuner(TunerCommon):
 
         if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
             return tasks_cktile
+        if q_dtype_a not in [dtypes.fp8, dtypes.bf16, dtypes.fp16]:
+            return tasks_cktile
 
-        act_str = str(act_type).split(".")[-1].lower()
-        has_bias = act_str == "swiglu"
+        # Map dtypes to CK tile string conventions (matching gen_instances.py)
+        a_dtype_str = dtype2str_dict[q_dtype_a]   # "f8" or "b16"
+        w_dtype_str = dtype2str_dict[q_dtype_w]   # "fp4x2"
+        quant_str = "1x32"
+        act_str = str(act_type).split(".")[-1].lower()  # "silu" or "swiglu"
+        has_bias = act_type == ActivationType.Swiglu
 
-        try:
-            _, cktile_stage1_kernels = cktile_get_gemm1_kernels_list(
-                dtype2str_dict[q_dtype_a],
-                dtype2str_dict[q_dtype_w],
-                "1x32",
-                act_str,
-                False,  # MulRoutedWeight
-                has_bias,
-                False,  # IsSplitK
+        # Get CK tile kernel variants for stage1 (non-SplitK)
+        _, cktile_s1_kernels = cktile_get_gemm1_kernels_list(
+            a_dtype_str, w_dtype_str, quant_str, act_str,
+            doweight_stage1, has_bias, False,
+        )
+        # For bf16 activation, also get SplitK variants (fp8 has no SplitK)
+        cktile_s1_splitk = {}
+        if q_dtype_a in [dtypes.bf16, dtypes.fp16]:
+            _, cktile_s1_splitk = cktile_get_gemm1_kernels_list(
+                a_dtype_str, w_dtype_str, quant_str, act_str,
+                doweight_stage1, has_bias, True,
             )
-        except ValueError:
-            cktile_stage1_kernels = {}
-
-        try:
-            _, cktile_stage2_kernels = cktile_get_gemm2_kernels_list(
-                dtype2str_dict[q_dtype_a],
-                dtype2str_dict[q_dtype_w],
-                "1x32",
-                "no",
-                True,  # MulRoutedWeight
-                has_bias,
-            )
-        except ValueError:
-            cktile_stage2_kernels = {}
+        # Get CK tile kernel variants for stage2
+        _, cktile_s2_kernels = cktile_get_gemm2_kernels_list(
+            a_dtype_str, w_dtype_str, quant_str, "no",
+            not doweight_stage1, has_bias,
+        )
 
         for blockM in blockMs:
-            if blockM not in [16, 32, 64, 128] or not use_g1u1:
+            if blockM not in [16, 32, 64, 128, 256] or not use_g1u1:
                 continue
 
-            for kernel in cktile_stage1_kernels.values():
+            # --- Stage1 kernels (non-SplitK) ---
+            for kernel in cktile_s1_kernels.values():
                 if kernel.MPerBlock != blockM:
                     continue
-                if kernel.Block_Per_CU not in args.blockPerCu:
+                if (
+                    hasattr(kernel, "Block_Per_CU")
+                    and kernel.Block_Per_CU not in args.blockPerCu
+                ):
                     continue
                 tasks_cktile.append(
                     (
@@ -2245,25 +2444,88 @@ class FmoeTuner(TunerCommon):
                         {},
                         FmoeTuner.run_torch_moe_stage1,
                         (
-                            [0, 10, 11, 12, 13, 3, 4],
+                            [0, 10, 11, 12, 13, 3, 4, 5, 8],
                             dtype,
                             act_type,
                             q_type,
                             doweight_stage1,
                             topk,
+                            blockM,
                         ),
                         {},
                         (None),
-                        0.01,
-                        0.01,
+                        0.1,
+                        0.1,
                         True,
                     )
                 )
 
-            for kernel in cktile_stage2_kernels.values():
+            # --- Stage1 SplitK kernels (bf16/fp16 activation only) ---
+            for kernel in cktile_s1_splitk.values():
                 if kernel.MPerBlock != blockM:
                     continue
-                if kernel.Block_Per_CU not in args.blockPerCu:
+                if (
+                    hasattr(kernel, "Block_Per_CU")
+                    and kernel.Block_Per_CU not in args.blockPerCu
+                ):
+                    continue
+                tasks_cktile.append(
+                    (
+                        (info, "stage1", kernel.name, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        (
+                            token,
+                            model_dim,
+                            inter_dim,
+                            expert,
+                            topk,
+                            act_type,
+                            dtype,
+                            q_dtype_a,
+                            q_dtype_w,
+                            q_type,
+                            use_g1u1,
+                            doweight_stage1,
+                            blockM,
+                            1,
+                        ),
+                        FmoeTuner.cktile_moe_stage1_fwd_out,
+                        (
+                            [0, 1, 5, 6, 7, 8, 15, 14],
+                            dtype,
+                            topk,
+                            kernel.name,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage1,
+                        (
+                            [0, 10, 11, 12, 13, 3, 4, 5, 8],
+                            dtype,
+                            act_type,
+                            q_type,
+                            doweight_stage1,
+                            topk,
+                            blockM,
+                        ),
+                        {},
+                        (None),
+                        0.1,
+                        0.1,
+                        True,
+                    )
+                )
+
+            # --- Stage2 kernels ---
+            for kernel in cktile_s2_kernels.values():
+                if kernel.MPerBlock != blockM:
+                    continue
+                if (
+                    hasattr(kernel, "Block_Per_CU")
+                    and kernel.Block_Per_CU not in args.blockPerCu
+                ):
                     continue
                 tasks_cktile.append(
                     (
@@ -2305,11 +2567,12 @@ class FmoeTuner(TunerCommon):
                         ),
                         {},
                         (None),
-                        0.01,
-                        0.01,
+                        0.1,
+                        0.1,
                         True,
                     )
                 )
+
         return tasks_cktile
 
     def tune(
@@ -2320,7 +2583,7 @@ class FmoeTuner(TunerCommon):
     ):
         self._flydsl_fallbacks = []
         mp_num = args.mp
-        blockMs = [32, 64, 128]
+        blockMs = [16, 32, 64, 128, 256]
         keys = self.keys
         tasks = []
         tasks_ck = []
@@ -2376,11 +2639,11 @@ class FmoeTuner(TunerCommon):
                 if q_type == QuantType.per_1x32
                 else blockMs
             )
-            tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
-            tasks_ck.extend(self.gen_flydsl_2stages_task(info, shape_blockMs))
+            # tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
+            # tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
+            # tasks_ck.extend(self.gen_flydsl_2stages_task(info, shape_blockMs))
             tasks_ck.extend(self.gen_cktile_2stages_task(info, shape_blockMs))
-            task_1stage.extend(self.gen_1stage_asm_task(info))
+            # task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue

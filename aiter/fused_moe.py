@@ -271,6 +271,14 @@ def fused_moe_(
                 q_dtype_a = dtypes.bf16
             elif M >= bf16_fp8_bound:
                 q_dtype_a = dtypes.fp8
+        elif a1_scale is not None and get_gfx() == "gfx950":
+            # a8w4 model with static scales:
+            # decode (small M) -> bf16 activations -> F16xMXF4 (faster)
+            # prefill (large M) -> fp8 activations -> F8xMXF4
+            if M < bf16_fp8_bound:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -999,7 +1007,7 @@ def get_2stage_cfgs(
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        and (activation == ActivationType.Swiglu or q_dtype_a in [dtypes.fp8, dtypes.bf16])
     ):
         return MOEMetadata(
             functools.partial(
@@ -1008,12 +1016,14 @@ def get_2stage_cfgs(
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
                 split_k=max(ksplit, 1),
+                kernel_name=kernelName1,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
+                kernel_name=kernelName2,
             ),
             get_block_m(),
             ksplit,
@@ -1034,12 +1044,14 @@ def get_2stage_cfgs(
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
                 split_k=ksplit,
+                kernel_name=kernelName1,
             ),
             functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
+                kernel_name=kernelName2,
             ),
             16 if token < 2048 else 32 if token < 16384 else 64,
             ksplit,
@@ -1173,7 +1185,6 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -1184,7 +1195,6 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
@@ -1296,7 +1306,6 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation == ActivationType.Swiglu
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -1306,7 +1315,6 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
     ):
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
@@ -1550,7 +1558,10 @@ def torch_moe_stage1(
         w1 = fp4_utils.mxfp4_to_f32(w1)
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
         if a1_scale is not None:  # skip a16w4
-            hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
+            if hidden_states.dtype in [torch.float8_e4m3fn, torch.float8_e4m3fnuz]:
+                hidden_states = hidden_states.to(ctype)  # fp8 → f32
+            else:
+                hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
         else:  # a16w4
             hidden_states = hidden_states.to(ctype)
@@ -1649,7 +1660,10 @@ def torch_moe_stage2(
         w2 = fp4_utils.mxfp4_to_f32(w2)
         w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
         if a2_scale is not None:
-            hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
+            if hidden_states.dtype in [torch.float8_e4m3fn, torch.float8_e4m3fnuz]:
+                hidden_states = hidden_states.to(ctype)  # fp8 → f32
+            else:
+                hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
         else:  # a16w4
             hidden_states = hidden_states.to(ctype)
@@ -1807,7 +1821,7 @@ def cktile_moe_stage1(
     # valid_out = tmp_out[:token_num * topk, :] before silu_and_mul/gelu_and_mul.
     tmp_out = (
         torch.zeros(
-            (token_num, topk, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
+            (token_num, topk, w1.shape[1]), dtype=dtype, device=out.device
         )
         if split_k > 1
         else out

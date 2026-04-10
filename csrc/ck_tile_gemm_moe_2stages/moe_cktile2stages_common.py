@@ -222,25 +222,33 @@ a16w4_gemm2_kernels_list_gfx950= {
 
 # gemm1 out:bf16/fp16 AB:fp8/fp4
 a8w4_gemm1_kernels_list_gfx950= {
-    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
-    # 0: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),
-    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
-    1: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),
-    3: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),
-    # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
-    # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
-    # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+    #  kernel:            stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    0: kernelInstance(       1,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),  # M=16 N=128
+    1: kernelInstance(       1,        256,       16,        256,       256,           16,         16,          128,          1,        4,            2,),  # M=16 N=256
+    2: kernelInstance(       1,        256,       32,        128,       256,           16,         16,          128,          1,        4,            2,),  # M=32 N=128
+    3: kernelInstance(       1,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),  # M=32 N=256
+    4: kernelInstance(       1,        256,       64,        128,       256,           16,         16,          128,          1,        4,            1,),  # M=64 N=128
+    5: kernelInstance(       1,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),  # M=64 N=256
+    6: kernelInstance(       1,        256,      128,        128,       128,           16,         16,          128,          1,        4,            1,),  # M=128 N=128 K=128
+    7: kernelInstance(       1,        256,      128,        128,       256,           16,         16,          128,          1,        4,            1,),  # M=128 N=128 K=256
+    8: kernelInstance(       1,        256,      128,        256,       256,           16,         16,          128,          1,        4,            1,),  # M=128 N=256
+    9: kernelInstance(       1,        256,      256,        128,       128,           16,         16,          128,          1,        4,            1,),  # M=256 N=128
+   10: kernelInstance(       1,        256,      256,        256,       128,           16,         16,          128,          1,        4,            1,),  # M=256 N=256
 }
 # gemm2 out:bf16/fp16 AB:fp8/fp4
 a8w4_gemm2_kernels_list_gfx950= {
-    #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
-    # 0: kernelInstance(       2,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),
-    # 5: kernelInstance(       2,        256,       16,        512,       256,           16,         16,          32,          1,        4,            4,),
-    1: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),
-    3: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),
-    # 4: kernelInstance(       2,        256,      128,        256,       128,           16,         16,          32,          1,        4,            1,),
-    # 4: kernelInstance(       2,        256,      256,        256,       256,           16,         16,          32,          1,        4,),
-    # 4: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          32,          1,        4,),
+    #  kernel:            stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N| BlockPerCU|
+    0: kernelInstance(       2,        256,       16,        128,       256,           16,         16,          128,          1,        4,            2,),  # M=16 N=128
+    1: kernelInstance(       2,        256,       16,        256,       256,           16,         16,          128,          1,        4,            2,),  # M=16 N=256
+    2: kernelInstance(       2,        256,       32,        128,       256,           16,         16,          128,          1,        4,            2,),  # M=32 N=128
+    3: kernelInstance(       2,        256,       32,        256,       256,           16,         16,          128,          1,        4,            2,),  # M=32 N=256
+    4: kernelInstance(       2,        256,       64,        128,       256,           16,         16,          128,          1,        4,            1,),  # M=64 N=128
+    5: kernelInstance(       2,        256,       64,        256,       256,           16,         16,          128,          1,        4,            1,),  # M=64 N=256
+    6: kernelInstance(       2,        256,      128,        128,       128,           16,         16,          128,          1,        4,            1,),  # M=128 N=128 K=128
+    7: kernelInstance(       2,        256,      128,        128,       256,           16,         16,          128,          1,        4,            1,),  # M=128 N=128 K=256
+    8: kernelInstance(       2,        256,      128,        256,       256,           16,         16,          128,          1,        4,            1,),  # M=128 N=256
+    9: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          128,          1,        4,            1,),  # M=256 N=128
+   10: kernelInstance(       2,        256,      256,        256,       128,           16,         16,          128,          1,        4,            1,),  # M=256 N=256
 }
 
 # fmt: on
@@ -476,13 +484,25 @@ struct moe_gemm1_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
         // Apply shape heuristics to find a suitable kernel implementation.
-        if (block_m == 32)
+        if (block_m == 16)
         {{
-            return {(1, 1)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            return {(1, 0)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(1, 2)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else if (block_m == 64)
         {{
-            return {(1, 3)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            return {(1, 4)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 128)
+        {{
+            return {(1, 7)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 256)
+        {{
+            return {(1, 9)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else
         {{
@@ -500,13 +520,25 @@ struct moe_gemm2_heuristic_dispatcher<{(a_data_type)}, {(b_data_type)}, {(acc_da
     static MoeKernel dispatch(int M, int N, int K, int block_m)
     {{
         // Apply shape heuristics to find a suitable kernel implementation.
-        if (block_m == 32)
+        if (block_m == 16)
         {{
-            return {(2, 1)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            return {(2, 0)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 32)
+        {{
+            return {(2, 2)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else if (block_m == 64)
         {{
-            return {(2, 3)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+            return {(2, 4)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 128)
+        {{
+            return {(2, 7)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
+        }}
+        else if (block_m == 256)
+        {{
+            return {(2, 9)}<{(a_data_type)}, {(b_data_type)}, {(acc_data_type)}, {(c_data_type)}>;
         }}
         else
         {{
@@ -564,6 +596,8 @@ def get_gemm1_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
+    # Copy to avoid mutating shared global kernel instances
+    kernels_list = {id: copy(kernel) for id, kernel in kernels_list.items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.ActOP = ActOP
@@ -613,6 +647,8 @@ def get_gemm2_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]
+    # Copy to avoid mutating shared global kernel instances
+    kernels_list = {id: copy(kernel) for id, kernel in kernels_list.items()}
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.ActOP = ActOP

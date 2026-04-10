@@ -406,6 +406,8 @@ def mp_tuner(
     logged_error_types = (
         set()
     )  # Track error types that already logged to avoid duplicates
+    task_retry_counts = {}  # Track retry counts per task
+    MAX_RETRIES = 3  # Maximum retries before giving up on a task
 
     while remaining_tasks:
         completed_this_round = []
@@ -475,12 +477,28 @@ def mp_tuner(
                 is_mapping_error = error_type == "KeyError"
 
                 if is_mapping_error:
-                    error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
-                    dummy_failed_tasks.append((k, "mapping error"))
-                    # pool_restart_needed = True
+                    task_retry_counts[k] = task_retry_counts.get(k, 0) + 1
+                    if task_retry_counts[k] >= MAX_RETRIES:
+                        error_msg = f"[Mapping Error] Task {k} exceeded {MAX_RETRIES} retries - marking as failed: {error_type} - {e}"
+                        failed_tasks.append((k, "mapping error (max retries)"))
+                        dummy_results = []
+                        add_dummy_result(k, dummy_results)
+                        result_dict[k] = (
+                            dummy_results if shape_grouped else [dummy_results[0]]
+                        )
+                        completed_this_round.append((k, async_result))
+                    else:
+                        error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (retry {task_retry_counts[k]}/{MAX_RETRIES}, triggering pool restart): {error_type} - {e}"
+                        dummy_failed_tasks.append((k, "mapping error"))
+                    pool_restart_needed = True
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
-                    failed_tasks.append((k, "timeout"))
+                    failed_tasks.append((k, str(error_type)))
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
                     completed_this_round.append((k, async_result))
 
                 # Only log error once per error type
@@ -539,6 +557,11 @@ def mp_tuner(
     result = []
     for k in range(len(rets)):
         task_result = result_dict.get(k, [])
+        if not task_result:
+            # Task had no result at all — add dummy
+            dummy_results = []
+            add_dummy_result(k, dummy_results)
+            task_result = dummy_results
         if shape_grouped:
             result.extend(task_result)
         else:
