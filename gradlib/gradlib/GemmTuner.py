@@ -28,7 +28,6 @@ import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -36,7 +35,9 @@ from aiter.utility.mp_tuner import mp_tuner
 
 FLYDSL_TUNE_ERROR = None
 try:
-    if is_flydsl_available():
+    import aiter.ops.flydsl as flydsl
+
+    if flydsl.is_flydsl_available():
         from aiter.ops.flydsl.gemm_kernels import (
             flydsl_hgemm,
             get_flydsl_splitk_hgemm_kernels,
@@ -113,10 +114,12 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         auto_shuffle_b=False,
         c_to_lds=config["c_to_lds"],
     )
-    if bias is not None:
-        out = out + bias
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
+    if bias is not None:
+        if bias.dtype != out.dtype:
+            bias = bias.to(out.dtype)
+        out = out + bias
     return out
 
 
