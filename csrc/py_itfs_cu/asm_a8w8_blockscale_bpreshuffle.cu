@@ -299,7 +299,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const auto& cfg = it->second;
     constexpr int TileK = 128;
 
-    if (cfg.splitK == 1 && selectedsplitK > 0) {
+    if (cfg.splitK == 1 && selectedsplitK > 0 && !opt_splitK.has_value()) {
         int k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
         int k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
         int actual_ksplit = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
@@ -310,8 +310,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                    actual_ksplit);
             selectedsplitK = actual_ksplit;
         }
-        k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
-        k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
+    }
+    if (cfg.splitK == 1 && selectedsplitK > 0) {
+        int k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
+        int k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
         AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
                    (Kdim / k_per_split_aligned) == (selectedsplitK - 1),
                    __func__, " Kdim alignment check failed for splitK!");
