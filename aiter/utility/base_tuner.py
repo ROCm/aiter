@@ -628,18 +628,15 @@ class TunerCommon:
     ):
         pre_df = self._benchmark_results_to_df(pre_results, shapes_df=shapes_df)
         post_df = self._benchmark_results_to_df(post_results, shapes_df=shapes_df)
-        columns = (
-            self.keys
-            + [
-                "shape",
-                "pre_us",
-                "post_us",
-                "pre_status",
-                "post_status",
-                "improvement_pct",
-                "update",
-            ]
-        )
+        columns = self.keys + [
+            "shape",
+            "pre_us",
+            "post_us",
+            "pre_status",
+            "post_status",
+            "improvement_pct",
+            "update",
+        ]
         if pre_df.empty or post_df.empty:
             return pd.DataFrame(columns=columns)
 
@@ -666,7 +663,9 @@ class TunerCommon:
             & (comparison["post_us"] > 0)
         )
         comparison["improvement_pct"] = (
-            (comparison["pre_us"] - comparison["post_us"]) / comparison["pre_us"] * 100.0
+            (comparison["pre_us"] - comparison["post_us"])
+            / comparison["pre_us"]
+            * 100.0
         )
         comparison.loc[~valid, "improvement_pct"] = float("nan")
         comparison["update"] = valid & (
@@ -693,7 +692,11 @@ class TunerCommon:
         lines.append(header)
         lines.append("-" * len(header))
         for row in comparison.itertuples(index=False):
-            pre_str = f"{row.pre_us:.2f}" if pd.notna(row.pre_us) and row.pre_us > 0 else "N/A"
+            pre_str = (
+                f"{row.pre_us:.2f}"
+                if pd.notna(row.pre_us) and row.pre_us > 0
+                else "N/A"
+            )
             post_str = (
                 f"{row.post_us:.2f}"
                 if pd.notna(row.post_us) and row.post_us > 0
@@ -833,9 +836,7 @@ class TunerCommon:
             args, results, output_file, processed_batches
         )
         try:
-            batch_header = (
-                f"=== Running post-tune benchmark (verification) for batch {processed_batches}/{total_batches} ==="
-            )
+            batch_header = f"=== Running post-tune benchmark (verification) for batch {processed_batches}/{total_batches} ==="
             batch_post_tune_results = self._run_compare_benchmark(
                 args,
                 batch,
@@ -1000,9 +1001,7 @@ class TunerCommon:
                 processed_batches += 1
                 batch_pre_tune_results = None
                 if args.compare:
-                    batch_header = (
-                        f"=== Running pre-tune benchmark (batch {processed_batches}/{total_batches}) ==="
-                    )
+                    batch_header = f"=== Running pre-tune benchmark (batch {processed_batches}/{total_batches}) ==="
                     batch_pre_tune_results = self._run_compare_benchmark(
                         args,
                         batch,
