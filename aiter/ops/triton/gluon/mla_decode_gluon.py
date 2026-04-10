@@ -24,6 +24,8 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
 # fmt: off
 @gluon.jit
 def _mla_decode_gluon(
@@ -81,6 +83,7 @@ def _mla_decode_gluon(
     shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0]],
+        cga_layout=[],
         shape=[64, 512]
     )
     # 64x64
@@ -94,6 +97,7 @@ def _mla_decode_gluon(
     shared_q_pe: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [4, 0], [8, 0], [16, 0], [1, 0], [2, 0], [32, 0]],
+        cga_layout=[],
         shape=[64, 64]
     )
     dtype = Q_nope.type.element_ty
@@ -114,6 +118,7 @@ def _mla_decode_gluon(
     shared_kv: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0], [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32]],
+        cga_layout=[],
         shape=[512, 64]
     )
 
@@ -128,6 +133,7 @@ def _mla_decode_gluon(
     shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 1], [0, 2], [0, 32]],
+        cga_layout=[],
         shape=[64, 64]
     )
     gl.static_assert(Kv_c_cache.type.element_ty == dtype)
@@ -459,6 +465,13 @@ def mla_decode_gluon(
     batch_size, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
 
+    assert (
+        arch_info.get_arch() == "gfx950"
+    ), f"mla_decode_gluon requires gfx950 (CDNA4), got {arch_info.get_arch()}"
+    assert batch_size in (
+        128,
+        256,
+    ), f"mla_decode_gluon requires batch_size in (128, 256), got {batch_size}"
     assert (
         head_dim_ckv == 512
     ), f"mla_decode_gluon requires head_dim_ckv=512, got {head_dim_ckv}"

@@ -1,6 +1,6 @@
 # Gluon Kernel Status
 
-All kernels in this directory are written in Gluon, a GPU programming language at the same level as Triton but with more explicit control over layouts, async copy, and MFMA intrinsics. 
+All kernels in this directory are written in Gluon, a GPU programming language at the same level as Triton but with more explicit control over layouts, async copy, and MFMA intrinsics.
 Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Gluon Extension](https://github.com/ROCm/triton/tree/gluon_ext).
 
 ## Quick Reference
@@ -23,7 +23,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 </tr>
 <tr>
   <td><code>mla_decode_gluon</code></td><td>MLA<br>Decode</td><td>CDNA4</td>
-  <td nowrap>Q: bf16, KV: bf16, Out: bf16<br>PAGE_SIZE=1, BLOCK_H=64<br>seq_len &gt; 192<br>nhead % 64 == 0</td>
+  <td nowrap>Q: bf16, KV: bf16, Out: bf16<br>batch_size: 128 or 256<br>PAGE_SIZE=1, BLOCK_H=64<br>seq_len &gt; 192<br>nhead % 64 == 0</td>
   <td>python op_tests/test_mla.py \<br>-c 10000 -b 128 -n 128,1 \<br>-d bf16 -kvd bf16</td>
   <td>~600<br>TFLOPS</td><td>~480<br>TFLOPS</td><td>—</td>
 </tr>
@@ -74,6 +74,7 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | Q dtype | bf16 only (static_assert) |
 | KV dtype | bf16 only (static_assert) |
 | Output | bf16 |
+| batch_size | 128 or 256 only |
 | Page size | 1 only (static_assert) |
 | Block sizes | BLOCK_H=64 (heads), BLOCK_N=64 (KV seq) — fixed |
 | MFMA | v4, 16&times;16&times;32, warps=[4,1] |
@@ -105,4 +106,3 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | KV block sizes | 16, 64, 1024 (selected by kernel variant) |
 | Context partition | 256 (static_assert) |
 | Constraint | `query_length * query_group_size` &le; 64 |
-

@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes
+from aiter import dtypes, get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -29,9 +29,9 @@ def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
     x, y = x.double(), y.double()
-    RMSE = ((x - y) * (x - y)).mean().sqrt().item()  # noqa: F841
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    amax_diff = (x - y).abs().max().item()  # noqa: F841
+    amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -534,16 +534,19 @@ def test_mla(
     ret["decode:asm_576"] = us_asm_decode
 
     # Gluon MLA decode test (bf16 only, nhead multiple of 64, decode_qlen=1,
-    # head_dim_ckv=512, head_dim_kpe=64, seq_len > 192)
+    # head_dim_ckv=512, head_dim_kpe=64, seq_len > 192, batch in (128,256), page_size=1)
     us_gluon_decode = 1e12
     if (
-        dtype == torch.bfloat16
+        get_gfx() == "gfx950"
+        and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
         and nhead % 64 == 0
         and decode_qlen == 1
         and ctx_lens > 192
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
+        and batch_size in (128, 256)
+        and page_size == 1
     ):
         err_gluon, us_gluon_decode = test_absorb_decode_gluon()
         ret["decode:gluon_err"] = err_gluon
