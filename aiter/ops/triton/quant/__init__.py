@@ -22,6 +22,12 @@ from .fused_mxfp4_quant import (
     fused_dynamic_mxfp4_quant_moe_sort,
 )
 
+from .rmsnorm_input_quant_fp8 import (
+    calc_rows_per_block,
+    get_fp8_min_max_bounds,
+    rmsnorm_input_quant_fp8,
+)
+
 __all__ = [
     # quant.py exports
     "static_per_tensor_quant_fp8_i8",
@@ -41,4 +47,8 @@ __all__ = [
     "fused_reduce_act_mul_and_mxfp4_quant",
     "fused_reduce_rms_mxfp4_quant",
     "fused_dynamic_mxfp4_quant_moe_sort",
+    # rmsnorm + FP8 input quant
+    "calc_rows_per_block",
+    "get_fp8_min_max_bounds",
+    "rmsnorm_input_quant_fp8",
 ]
