@@ -1242,6 +1242,17 @@ def _gemm_a16w16_lds_pipeline_kernel(
             OPERAND_LAYOUT_B,
         )
 
+
+    update_bounds: gl.constexpr = False
+    if PHYSICAL_MK:
+        a_desc = gl.amd.gfx1250.tdm.advance(a_desc, [0, BLOCK_K], update_bounds)
+    else:
+        a_desc = gl.amd.gfx1250.tdm.advance(a_desc, [BLOCK_K, 0], update_bounds)
+    if PHYSICAL_KN:
+        b_desc = gl.amd.gfx1250.tdm.advance(b_desc, [BLOCK_K, 0], update_bounds)
+    else:
+        b_desc = gl.amd.gfx1250.tdm.advance(b_desc, [0, BLOCK_K], update_bounds)
+
     # Main pipeline loop
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
 
@@ -1251,31 +1262,62 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
 
         # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
-        if PHYSICAL_MK:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [pid_m * BLOCK_M, load_idx * BLOCK_K],
-                a_buffer.index(load_idx % NUM_BUFFERS),
-            )
-        else:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [load_idx * BLOCK_K, pid_m * BLOCK_M],
-                a_buffer.index(load_idx % NUM_BUFFERS),
-            )
+        if True:
+            if PHYSICAL_MK:
+                gl.amd.gfx1250.tdm.async_load(
+                    a_desc,
+                    [0, 0],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
+                )
+                # a_desc = gl.amd.gfx1250.tdm.advance(a_desc, [0, BLOCK_K], update_bounds)
+            else:
+                gl.amd.gfx1250.tdm.async_load(
+                    a_desc,
+                    [0, 0],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
+                )
+                # a_desc = gl.amd.gfx1250.tdm.advance(a_desc, [BLOCK_K, 0], update_bounds)
+            if PHYSICAL_KN:
+                gl.amd.gfx1250.tdm.async_load(
+                    b_desc,
+                    [0, 0],
+                    b_buffer.index(load_idx % NUM_BUFFERS),
+                )
+                # b_desc = gl.amd.gfx1250.tdm.advance(b_desc, [BLOCK_K, 0], update_bounds)
+            else:
+                gl.amd.gfx1250.tdm.async_load(
+                    b_desc,
+                    [0, 0],
+                    b_buffer.index(load_idx % NUM_BUFFERS),
+                )
+                # b_desc = gl.amd.gfx1250.tdm.advance(b_desc, [0, BLOCK_K], update_bounds)
 
-        if PHYSICAL_KN:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc,
-                [load_idx * BLOCK_K, pid_n * BLOCK_N],
-                b_buffer.index(load_idx % NUM_BUFFERS),
-            )
         else:
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc,
-                [pid_n * BLOCK_N, load_idx * BLOCK_K],
-                b_buffer.index(load_idx % NUM_BUFFERS),
-            )
+            if PHYSICAL_MK:
+                gl.amd.gfx1250.tdm.async_load(
+                    a_desc,
+                    [pid_m * BLOCK_M, load_idx * BLOCK_K],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
+                )
+            else:
+                gl.amd.gfx1250.tdm.async_load(
+                    a_desc,
+                    [load_idx * BLOCK_K, pid_m * BLOCK_M],
+                    a_buffer.index(load_idx % NUM_BUFFERS),
+                )
+
+            if PHYSICAL_KN:
+                gl.amd.gfx1250.tdm.async_load(
+                    b_desc,
+                    [load_idx * BLOCK_K, pid_n * BLOCK_N],
+                    b_buffer.index(load_idx % NUM_BUFFERS),
+                )
+            else:
+                gl.amd.gfx1250.tdm.async_load(
+                    b_desc,
+                    [pid_n * BLOCK_N, load_idx * BLOCK_K],
+                    b_buffer.index(load_idx % NUM_BUFFERS),
+                )
         # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
         # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
         # compute_idx+1 has landed in LDS.
@@ -1318,6 +1360,16 @@ def _gemm_a16w16_lds_pipeline_kernel(
                 b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
                 OPERAND_LAYOUT_B,
             )
+
+        if PHYSICAL_MK:
+            a_desc = gl.amd.gfx1250.tdm.advance(a_desc, [0, BLOCK_K], update_bounds)
+        else:
+            a_desc = gl.amd.gfx1250.tdm.advance(a_desc, [BLOCK_K, 0], update_bounds)
+        if PHYSICAL_KN:
+            b_desc = gl.amd.gfx1250.tdm.advance(b_desc, [BLOCK_K, 0], update_bounds)
+        else:
+            b_desc = gl.amd.gfx1250.tdm.advance(b_desc, [0, BLOCK_K], update_bounds)
+
 
         cur_a = next_a
         cur_b = next_b
