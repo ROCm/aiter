@@ -5,6 +5,7 @@
 import triton
 import triton.language as tl
 
+
 @triton.heuristics(
     {
         "HAS_BIAS": lambda args: args["B"] is not None,
@@ -17,8 +18,8 @@ def rms_norm_input_quant_fp8_kernel(
     W,  # pointer to the weights
     B,  # pointer to the biases
     Z,  # pointer to the other branch
-    Y_quant, # pointer to the quantized output
-    Scales, # pointer to the scales
+    Y_quant,  # pointer to the quantized output
+    Scales,  # pointer to the scales
     stride_x_row,  # how much to increase the pointer when moving by 1 row
     stride_z_row,
     stride_y_row,
@@ -99,21 +100,23 @@ def rms_norm_input_quant_fp8_kernel(
     # Compute per-row absmax (only considering valid elements)
     abs_y = tl.where(mask, tl.abs(y), 0.0)
     absmax = tl.max(abs_y, axis=1)  # Shape: [ROWS_PER_BLOCK]
-    
+
     # Compute scales
     scales_raw = absmax / FP8_MAX
     # TODO: Add USE_UE8M0 as a constexpr parameter if needed:
     if USE_UE8M0:
         scales_raw = tl.exp2(tl.ceil(tl.log2(scales_raw)))
     scales = tl.maximum(scales_raw, FP8_MIN_SCALING_FACTOR)  # Shape: [ROWS_PER_BLOCK]
-    
+
     # Quantize: divide by scale (broadcast to match y shape) and clamp
-    y_scaled = y / scales[:, None]  # Broadcast scales from [ROWS_PER_BLOCK] to [ROWS_PER_BLOCK, BLOCK_N]
+    y_scaled = (
+        y / scales[:, None]
+    )  # Broadcast scales from [ROWS_PER_BLOCK] to [ROWS_PER_BLOCK, BLOCK_N]
     y_quant = tl.maximum(tl.minimum(y_scaled, FP8_MAX), FP8_MIN)
-    
+
     # Store quantized output
     tl.store(Y_base, y_quant.to(Y_quant.dtype.element_ty), mask=mask)
-    
+
     # Store scales (one per row)
     scales_row_mask = rows < M
     tl.store(S_base, scales, mask=scales_row_mask)

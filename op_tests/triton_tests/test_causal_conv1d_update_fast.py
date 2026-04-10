@@ -61,9 +61,13 @@ def test_fused_reshape_causal_conv1d_update_fast_smoke():
 
     x = torch.randn(num_tokens, qkvz_dim, seqlen, device=device, dtype=torch.bfloat16)
     ba = torch.randn(num_tokens, 2 * num_v_heads, device=device, dtype=torch.bfloat16)
-    z_out = torch.zeros(num_tokens, num_v_heads, head_v_dim, device=device, dtype=torch.bfloat16)
+    z_out = torch.zeros(
+        num_tokens, num_v_heads, head_v_dim, device=device, dtype=torch.bfloat16
+    )
     core = torch.zeros_like(z_out)
-    conv_state = torch.randn(num_actual_tokens, dim, width - 1, device=device, dtype=torch.bfloat16)
+    conv_state = torch.randn(
+        num_actual_tokens, dim, width - 1, device=device, dtype=torch.bfloat16
+    )
     weight = torch.randn(dim, width, device=device, dtype=torch.bfloat16)
     bias = torch.randn(dim, device=device, dtype=torch.bfloat16)
 

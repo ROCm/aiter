@@ -43,9 +43,9 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     See vLLM ``fused_rearrange_sigmoid_gated_delta_rule`` for argument semantics.
     """
     expected_shape = (qkv.shape[0], key_dim * 2 + value_dim)
-    assert qkv.shape == expected_shape, (
-        f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
-    )
+    assert (
+        qkv.shape == expected_shape
+    ), f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
     if scale is None:
         scale = head_k_dim**-0.5
     else:

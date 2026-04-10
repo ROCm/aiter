@@ -40,10 +40,12 @@ def causal_conv1d_update_fast(
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
 ) -> torch.Tensor:
-    assert num_accepted_tokens is None, (
-        f"num_accepted_tokens must be None, got {num_accepted_tokens}"
-    )
-    assert query_start_loc is None, f"query_start_loc must be None, got {query_start_loc}"
+    assert (
+        num_accepted_tokens is None
+    ), f"num_accepted_tokens must be None, got {num_accepted_tokens}"
+    assert (
+        query_start_loc is None
+    ), f"query_start_loc must be None, got {query_start_loc}"
     if validate_data:
         assert pad_slot_id is not None
         assert x.stride(1) == 1
@@ -168,10 +170,12 @@ def fused_reshape_causal_conv1d_update_fast(
     initial_state_idx: torch.Tensor | None = None,
     validate_data: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert num_accepted_tokens is None, (
-        f"num_accepted_tokens must be None, got {num_accepted_tokens}"
-    )
-    assert query_start_loc is None, f"query_start_loc must be None, got {query_start_loc}"
+    assert (
+        num_accepted_tokens is None
+    ), f"num_accepted_tokens must be None, got {num_accepted_tokens}"
+    assert (
+        query_start_loc is None
+    ), f"query_start_loc must be None, got {query_start_loc}"
     assert z_out.is_contiguous(), "z_out should be contiguous"
     assert core_attn_out.is_contiguous(), "core_attn_out should be contiguous"
     x = x.view(x.shape[0], -1)
@@ -197,15 +201,13 @@ def fused_reshape_causal_conv1d_update_fast(
     _, qkvz_dim, seqlen = x.shape
     batch = num_actual_tokens
     _, width = weight.shape
-    head_dim = (
-        head_k_dim + head_k_dim + head_v_dim * num_v_heads // num_k_heads
-    )
+    head_dim = head_k_dim + head_k_dim + head_v_dim * num_v_heads // num_k_heads
     head_qkvz_dim = head_dim + head_v_dim * num_v_heads // num_k_heads
     dim = num_k_heads * head_dim
     expected_qkvz_dim = num_k_heads * head_qkvz_dim
-    assert qkvz_dim == expected_qkvz_dim, (
-        f"ERROR: expect qkvz_dim to be {expected_qkvz_dim}, got {qkvz_dim}"
-    )
+    assert (
+        qkvz_dim == expected_qkvz_dim
+    ), f"ERROR: expect qkvz_dim to be {expected_qkvz_dim}, got {qkvz_dim}"
     num_cache_lines, _, state_len = conv_state.size()
 
     if conv_state_indices is None:
@@ -223,9 +225,7 @@ def fused_reshape_causal_conv1d_update_fast(
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1
 
-    out = torch.empty(
-        (num_actual_tokens, dim, seqlen), dtype=x.dtype, device=x.device
-    )
+    out = torch.empty((num_actual_tokens, dim, seqlen), dtype=x.dtype, device=x.device)
     b_out = torch.empty(
         (num_actual_tokens, num_v_heads), dtype=ba.dtype, device=ba.device
     )

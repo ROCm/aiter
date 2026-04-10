@@ -35,7 +35,9 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
         raise ValueError(
             "rmsnorm_input_quant_fp8 targets AMD ROCm (HIP); expected a CUDA/HIP device."
         )
-    device_id = device.index if device.index is not None else torch.cuda.current_device()
+    device_id = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     sm_count = max(int(_num_compute_units(device_id)), 1)
     rows_per_block = triton.next_power_of_2(triton.cdiv(M, 2 * sm_count))
     return min(int(rows_per_block), 4)

@@ -31,7 +31,6 @@ def ref_rmsnorm_quant(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     x32 = x.float()
     z32 = z.float()
-    n = x.shape[-1]
     var = x32.pow(2).mean(-1, keepdim=True)
     x_hat = x32 * torch.rsqrt(var + eps)
     y = x_hat * weight.float()
@@ -76,9 +75,7 @@ def test_rmsnorm_input_quant_fp8_matches_ref():
         fp8_max=fmax,
         fp8_min_scaling_factor=scale_floor,
     )
-    y_ref, scales_ref = ref_rmsnorm_quant(
-        x, w, bias, z, 1e-5, True, "silu", fmin, fmax
-    )
+    y_ref, scales_ref = ref_rmsnorm_quant(x, w, bias, z, 1e-5, True, "silu", fmin, fmax)
 
     torch.testing.assert_close(scales_t, scales_ref, rtol=1e-3, atol=1e-3)
     dq = y_q.float() * scales_t.unsqueeze(-1)

@@ -9,6 +9,7 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit()
 def _causal_conv1d_update_fast_kernel(
     # Pointers to matrices
@@ -116,9 +117,7 @@ def _causal_conv1d_update_fast_kernel(
         + (conv_states_input_coord * stride_conv_state_seq)
         + conv_state_token_offset * stride_conv_state_tok
         + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + seqlen) * stride_conv_state_tok)[
-            :, None
-        ]
+        + ((idx_tokens + seqlen) * stride_conv_state_tok)[:, None]
     )  # [BLOCK_M, BLOCK_N]
     mask = (
         (conv_states_input_coord < num_cache_lines)
@@ -153,60 +152,70 @@ def _causal_conv1d_update_fast_kernel(
         conv_state_ptr
         + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
         + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
+    )[
+        None, :
+    ] + (  # [BLOCK_N,]
         idx_tokens * stride_conv_state_tok
-    )[:, None]
+    )[
+        :, None
+    ]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator, not necessary
-    #if HAS_BIAS:
+    # if HAS_BIAS:
     #    bias = bias_ptr + idx_feats
     #    mask_bias = idx_feats < dim
     #    acc_preload = tl.load(bias, mask=mask_bias, other=0.0).to(
     #        tl.float32
     #    )  # [BLOCK_N]
-    #else:
+    # else:
     #    acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     # STEP 4:
     # LOAD WEIGHTS and compute
-    w_cols_ptrs = w_ptr + (idx_feats * stride_w_dim)[:, None] + (idx_cols * stride_w_width)[None, :]
+    w_cols_ptrs = (
+        w_ptr
+        + (idx_feats * stride_w_dim)[:, None]
+        + (idx_cols * stride_w_width)[None, :]
+    )
     mask_w_cols = (idx_feats < dim)[:, None] & (idx_cols < KERNEL_WIDTH - 1)[None, :]
     w_cols = tl.load(w_cols_ptrs, mask_w_cols, other=0.0)  # [BLOCK_N, NP2_STATELEN]
 
-    w_last_ptrs = w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
-    w_last = tl.load(w_last_ptrs, idx_feats < dim, other=0.0) # [BLOCK_N]
+    w_last_ptrs = (
+        w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
+    )
+    w_last = tl.load(w_last_ptrs, idx_feats < dim, other=0.0)  # [BLOCK_N]
 
     # For the convolution output: dot(weights, [state_cols | x])
     # cols is [BLOCK_N, NP2_STATELEN] = conv_state history
     # We need x as 1D [BLOCK_N] for the last weight column
     x_1d = tl.load(x_base, mask=(idx_feats < dim), other=0.0)  # [BLOCK_N], reload as 1D
-    acc = tl.sum((w_cols * cols).to(tl.float32), axis=1) + (w_last * x_1d).to(tl.float32)
+    acc = tl.sum((w_cols * cols).to(tl.float32), axis=1) + (w_last * x_1d).to(
+        tl.float32
+    )
 
     if HAS_BIAS:
         bias = bias_ptr + idx_feats
-        acc += tl.load(bias, idx_feats < dim, other=0.0).to(
-            tl.float32
-        )  # [BLOCK_N]
+        acc += tl.load(bias, idx_feats < dim, other=0.0).to(tl.float32)  # [BLOCK_N]
 
     if SILU_ACTIVATION:
         acc = acc / (1 + tl.exp(-acc))
     mask_1d = idx_feats < dim
-    o_ptrs = (
-        o_ptr + o_offset + (idx_feats * stride_o_dim)
-    )
+    o_ptrs = o_ptr + o_offset + (idx_feats * stride_o_dim)
 
     tl.store(o_ptrs, acc, mask=mask_1d)
+
+
 @triton.jit()
 def _reshape_causal_conv1d_update_fast_kernel(
     # Pointers to matrices
     x_ptr,  # (num_tokens, dim+z_dim, seqlen) where seqlen=1
     ba_ptr,
-    z_ptr, # (num_tokens, num_v_heads, head_v_dim)
-    core_attn_out_ptr, # (num_tokens, num_v_heads, head_v_dim)
-    b_ptr, # (num_accepted_tokens, num_v_heads)
-    a_ptr, # (num_accepted_tokens, num_v_heads)
+    z_ptr,  # (num_tokens, num_v_heads, head_v_dim)
+    core_attn_out_ptr,  # (num_tokens, num_v_heads, head_v_dim)
+    b_ptr,  # (num_accepted_tokens, num_v_heads)
+    a_ptr,  # (num_accepted_tokens, num_v_heads)
     w_ptr,  # (dim, width)
     bias_ptr,
     conv_state_ptr,
@@ -270,10 +279,18 @@ def _reshape_causal_conv1d_update_fast_kernel(
         idx_h = idx_hv // (num_v_heads // num_k_heads)
         idx_v = idx_hv % (num_v_heads // num_k_heads)
         b_source_offset = idx_h * (2 * num_v_heads // num_k_heads) + idx_v
-        a_source_offset = idx_h * (2 * num_v_heads // num_k_heads) + num_v_heads // num_k_heads + idx_v
+        a_source_offset = (
+            idx_h * (2 * num_v_heads // num_k_heads)
+            + num_v_heads // num_k_heads
+            + idx_v
+        )
 
-        b_source_ptrs = ba_ptr + idx_seq * stride_ba_seq + b_source_offset * stride_ba_token
-        a_source_ptrs = ba_ptr + idx_seq * stride_ba_seq + a_source_offset * stride_ba_token
+        b_source_ptrs = (
+            ba_ptr + idx_seq * stride_ba_seq + b_source_offset * stride_ba_token
+        )
+        a_source_ptrs = (
+            ba_ptr + idx_seq * stride_ba_seq + a_source_offset * stride_ba_token
+        )
         mask_ba = idx_hv < num_v_heads
         b = tl.load(b_source_ptrs, mask=mask_ba, other=0.0)
         a = tl.load(a_source_ptrs, mask=mask_ba, other=0.0)
@@ -284,9 +301,14 @@ def _reshape_causal_conv1d_update_fast_kernel(
         tl.store(a_ptrs, a, mask_ba)
     ## write z
     elif tl.program_id(1) < 1 + num_program_write_z:
-        idx_z = (tl.program_id(1) -  1) * BLOCK_Z + tl.arange(0, BLOCK_Z)
+        idx_z = (tl.program_id(1) - 1) * BLOCK_Z + tl.arange(0, BLOCK_Z)
         ## map idx_z to source idx
-        idx_z_x = idx_z // (num_v_heads // num_k_heads * head_v_dim) * head_qkvz_dim + 2 * head_k_dim + num_v_heads // num_k_heads * head_v_dim + idx_z % (num_v_heads // num_k_heads * head_v_dim)
+        idx_z_x = (
+            idx_z // (num_v_heads // num_k_heads * head_v_dim) * head_qkvz_dim
+            + 2 * head_k_dim
+            + num_v_heads // num_k_heads * head_v_dim
+            + idx_z % (num_v_heads // num_k_heads * head_v_dim)
+        )
         z_source_ptrs = x_ptr + idx_seq * stride_x_seq + idx_z_x * stride_x_dim
         mask_z = idx_z < num_v_heads * head_v_dim
         z = tl.load(z_source_ptrs, mask=mask_z, other=0.0)
@@ -302,19 +324,40 @@ def _reshape_causal_conv1d_update_fast_kernel(
         for idx_repeat in tl.range(n_repeat):
             idx_seq_remain = batch * (1 + idx_repeat) + idx_seq
             z_ptrs = z_ptr + idx_seq_remain * stride_z_seq + idx_z
-            core_attn_out_ptrs = core_attn_out_ptr + idx_seq_remain * stride_z_seq + idx_z
+            core_attn_out_ptrs = (
+                core_attn_out_ptr + idx_seq_remain * stride_z_seq + idx_z
+            )
             mask_remain = (idx_seq_remain < num_tokens) & mask_z
             tl.store(z_ptrs, 0.0, mask=mask_remain)
             tl.store(core_attn_out_ptrs, 0.0, mask=mask_remain)
     ## do regular causal conv1d udpate
     else:
         # [BLOCK_N,] elements along the feature-dimension (channel)
-        idx_feats = (tl.program_id(1) - 1 - num_program_write_z) * BLOCK_N + tl.arange(0, BLOCK_N)
+        idx_feats = (tl.program_id(1) - 1 - num_program_write_z) * BLOCK_N + tl.arange(
+            0, BLOCK_N
+        )
         ## map idx_feats to idx_feats_x
         idx_feats_x = (
-            (idx_feats < num_k_heads * head_k_dim).to(tl.int64) * (idx_feats // head_k_dim * head_qkvz_dim + idx_feats % head_k_dim)
-            + ((idx_feats >= num_k_heads * head_k_dim) & (idx_feats < num_k_heads * head_k_dim * 2)).to(tl.int64) * ((idx_feats - num_k_heads * head_k_dim) // head_k_dim * head_qkvz_dim + head_k_dim + (idx_feats - num_k_heads * head_k_dim) % head_k_dim)
-            + (idx_feats >= num_k_heads * head_k_dim * 2).to(tl.int64) * ((idx_feats - num_k_heads * head_k_dim * 2) // (num_v_heads // num_k_heads * head_v_dim) * head_qkvz_dim + 2 * head_k_dim + (idx_feats - num_k_heads * head_k_dim * 2) % (num_v_heads // num_k_heads * head_v_dim))
+            (idx_feats < num_k_heads * head_k_dim).to(tl.int64)
+            * (idx_feats // head_k_dim * head_qkvz_dim + idx_feats % head_k_dim)
+            + (
+                (idx_feats >= num_k_heads * head_k_dim)
+                & (idx_feats < num_k_heads * head_k_dim * 2)
+            ).to(tl.int64)
+            * (
+                (idx_feats - num_k_heads * head_k_dim) // head_k_dim * head_qkvz_dim
+                + head_k_dim
+                + (idx_feats - num_k_heads * head_k_dim) % head_k_dim
+            )
+            + (idx_feats >= num_k_heads * head_k_dim * 2).to(tl.int64)
+            * (
+                (idx_feats - num_k_heads * head_k_dim * 2)
+                // (num_v_heads // num_k_heads * head_v_dim)
+                * head_qkvz_dim
+                + 2 * head_k_dim
+                + (idx_feats - num_k_heads * head_k_dim * 2)
+                % (num_v_heads // num_k_heads * head_v_dim)
+            )
         )
 
         if IS_APC_ENABLED:
@@ -370,9 +413,7 @@ def _reshape_causal_conv1d_update_fast_kernel(
             conv_state_ptr
             + (conv_states_input_coord * stride_conv_state_seq)
             + (idx_feats * stride_conv_state_dim)[None, :]
-            + ((idx_tokens + seqlen) * stride_conv_state_tok)[
-                :, None
-            ]
+            + ((idx_tokens + seqlen) * stride_conv_state_tok)[:, None]
         )  # [BLOCK_M, BLOCK_N]
         mask = (
             (conv_states_input_coord < num_cache_lines)
@@ -407,48 +448,60 @@ def _reshape_causal_conv1d_update_fast_kernel(
             conv_state_ptr
             + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
             + (idx_feats * stride_conv_state_dim)
-        )[None, :] + (  # [BLOCK_N,]
+        )[
+            None, :
+        ] + (  # [BLOCK_N,]
             idx_tokens * stride_conv_state_tok
-        )[:, None]
+        )[
+            :, None
+        ]
         mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
         tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
         # STEP 3: init accumulator, not necessary
-        #if HAS_BIAS:
+        # if HAS_BIAS:
         #    bias = bias_ptr + idx_feats
         #    mask_bias = idx_feats < dim
         #    acc_preload = tl.load(bias, mask=mask_bias, other=0.0).to(
         #        tl.float32
         #    )  # [BLOCK_N]
-        #else:
+        # else:
         #    acc_preload = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
         # STEP 4:
         # LOAD WEIGHTS and compute
-        w_cols_ptrs = w_ptr + (idx_feats * stride_w_dim)[:, None] + (idx_cols * stride_w_width)[None, :]
-        mask_w_cols = (idx_feats < dim)[:, None] & (idx_cols < KERNEL_WIDTH - 1)[None, :]
+        w_cols_ptrs = (
+            w_ptr
+            + (idx_feats * stride_w_dim)[:, None]
+            + (idx_cols * stride_w_width)[None, :]
+        )
+        mask_w_cols = (idx_feats < dim)[:, None] & (idx_cols < KERNEL_WIDTH - 1)[
+            None, :
+        ]
         w_cols = tl.load(w_cols_ptrs, mask_w_cols, other=0.0)  # [BLOCK_N, NP2_STATELEN]
 
-        w_last_ptrs = w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
-        w_last = tl.load(w_last_ptrs, idx_feats < dim, other=0.0) # [BLOCK_N]
+        w_last_ptrs = (
+            w_ptr + (idx_feats * stride_w_dim) + (KERNEL_WIDTH - 1) * stride_w_width
+        )
+        w_last = tl.load(w_last_ptrs, idx_feats < dim, other=0.0)  # [BLOCK_N]
 
         # For the convolution output: dot(weights, [state_cols | x])
         # cols is [BLOCK_N, NP2_STATELEN] = conv_state history
         # We need x as 1D [BLOCK_N] for the last weight column
-        x_1d = tl.load(x_base, mask=(idx_feats < dim), other=0.0)  # [BLOCK_N], reload as 1D
-        acc = tl.sum((w_cols * cols).to(tl.float32), axis=1) + (w_last * x_1d).to(tl.float32)
+        x_1d = tl.load(
+            x_base, mask=(idx_feats < dim), other=0.0
+        )  # [BLOCK_N], reload as 1D
+        acc = tl.sum((w_cols * cols).to(tl.float32), axis=1) + (w_last * x_1d).to(
+            tl.float32
+        )
 
         if HAS_BIAS:
             bias = bias_ptr + idx_feats
-            acc += tl.load(bias, idx_feats < dim, other=0.0).to(
-                tl.float32
-            )  # [BLOCK_N]
+            acc += tl.load(bias, idx_feats < dim, other=0.0).to(tl.float32)  # [BLOCK_N]
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
         mask_1d = idx_feats < dim
-        o_ptrs = (
-            o_ptr + o_offset + (idx_feats * stride_o_dim)
-        )
+        o_ptrs = o_ptr + o_offset + (idx_feats * stride_o_dim)
 
         tl.store(o_ptrs, acc, mask=mask_1d)
