@@ -47,6 +47,18 @@ if is_flydsl_available():
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
 
+def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
+    """Filter splitK values to only those that produce valid TileK-aligned partitions."""
+    valid = []
+    for sk in range(1, max_splitK + 1):
+        k_per_split = (K + sk - 1) // sk
+        k_per_split_aligned = ((k_per_split + tile_k - 1) // tile_k) * tile_k
+        actual_ksplit = (K + k_per_split_aligned - 1) // k_per_split_aligned
+        if actual_ksplit == sk:
+            valid.append(sk)
+    return valid if valid else [1]
+
+
 def _get_padded_m(M: int) -> int:
     if M <= 256:
         return (M + 15) // 16 * 16
@@ -268,14 +280,15 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         asm_kernels_id = kernel_id_start
         for key in asm_tiles:
             tile_m, tile_n, splitk = key
-            maxsplitK = 8 if useSplitK else 1
             kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
             if len(kernelName) == 0:
                 print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
                 continue
-            if splitk == 0:
-                maxsplitK = 1
-            for splitK in range(1, maxsplitK + 1):
+            if useSplitK and splitk != 0:
+                splitK_list = get_valid_asm_splitK_list(K, 8)
+            else:
+                splitK_list = [1]
+            for splitK in splitK_list:
                 kernel_name = kernelName[0]
                 info = (info_keys, asm_kernels_id, splitK, kernel_name, "asm")
                 task.append(
