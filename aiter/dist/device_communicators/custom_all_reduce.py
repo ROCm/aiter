@@ -256,7 +256,7 @@ class CustomAllreduce:
         self,
         group: ProcessGroup,
         device: Union[int, str, torch.device],
-        max_size=1024 * 1024 * 1024,  # 2GB bf16/half
+        max_size=8192 * 1024 * 8 * 2,  # 128MB - match old e47cc0ec behavior
         enable_register_for_capturing: bool = True,
     ) -> None:
         """
