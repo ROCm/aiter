@@ -18,15 +18,22 @@ Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 """
 
 from .decode.fused_recurrent import _fused_recurrent_gated_delta_rule_fwd_kernel
-from .prefill.chunk import chunk_gated_delta_rule_fwd
-from .prefill.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from .prefill.chunk_o import chunk_fwd_o
+from .prefill.chunk import chunk_gated_delta_rule_fwd, chunk_gated_delta_rule_fwd_opt
+from .prefill.chunk_delta_h import chunk_gated_delta_rule_fwd_h, chunk_gated_delta_rule_fwd_h_opt
+from .prefill.chunk_o import chunk_fwd_o, chunk_fwd_o_opt
+from .prefill.fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
+from .prefill.fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
 from . import gated_delta_rule_utils
 
 __all__ = [
     "_fused_recurrent_gated_delta_rule_fwd_kernel",
     "chunk_gated_delta_rule_fwd",
+    "chunk_gated_delta_rule_fwd_opt",
     "chunk_gated_delta_rule_fwd_h",
+    "chunk_gated_delta_rule_fwd_h_opt",
     "chunk_fwd_o",
+    "chunk_fwd_o_opt",
+    "fused_chunk_local_cumsum_scaled_dot_kkt_fwd",
+    "fused_solve_tril_recompute_w_u",
     "gated_delta_rule_utils",
 ]
