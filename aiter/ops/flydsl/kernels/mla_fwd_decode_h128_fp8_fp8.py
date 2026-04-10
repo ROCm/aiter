@@ -1337,6 +1337,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         row_kv_ld_next=None,
         kv_ld_col_base_i32_arg=None,
         check_boundary_next=True,
+        # 2-ahead row resolution (match HK's row_kv_ld_next_next pattern)
+        nn_resolve_start=None,
+        nn_resolve_end=None,
+        do_resolve_nn=None,
     ):
         """Process one KV tile: QK GEMM -> softmax -> V transpose -> pack P.
 
@@ -1383,6 +1387,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             # Prefetch block nope_pair+1 of next tile (inline asm)
             _maybe_prefetch(nope_pair + 1)
 
+            rocdl.sched_barrier(0)
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
             q_0 = q_nope[tile_0]
@@ -1395,6 +1400,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 p_comp[1] = _mfma_fp8(
                     T.f32x4, [k0_hi, q_0, _raw(c_zero_v4f32), 0, 0, 0]
                 )
+                rocdl.s_setprio(15)
             else:
                 p_comp[0] = _mfma_fp8(T.f32x4, [k0_lo, q_0, p_comp[0], 0, 0, 0])
                 p_comp[1] = _mfma_fp8(T.f32x4, [k0_hi, q_0, p_comp[1], 0, 0, 0])
@@ -1413,6 +1419,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             k1_lo = _load_k_from_lds(k_base_i32, 0, (tile_1 + 16) * BLOCK_K)
             k1_hi = _load_k_from_lds(k_base_i32, 16, (tile_1 + 16) * BLOCK_K)
 
+            rocdl.sched_barrier(0)
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
 
             p_comp[0] = _mfma_fp8(T.f32x4, [k0_lo, q_rope[tile_0], p_comp[0], 0, 0, 0])
@@ -1422,6 +1429,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 
             p_comp[0] = _mfma_fp8(T.f32x4, [k1_lo, q_rope[tile_1], p_comp[0], 0, 0, 0])
             p_comp[1] = _mfma_fp8(T.f32x4, [k1_hi, q_rope[tile_1], p_comp[1], 0, 0, 0])
+
+        rocdl.s_setprio(0)
 
         # ---- Extract p_comp values for softmax ----
         p_vals = []
@@ -1437,6 +1446,20 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         v8_raw = _load_v_from_lds(p_lds_kv_base, warp_idx, lane_idx)
         rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
         rocdl.sched_barrier(0)
+
+        # ---- Resolve row for tile+2 (2-ahead, matches HK line 407-426) ----
+        # The buffer_load has softmax+V-transpose+GEMM2+barrier to complete.
+        if do_resolve_nn is not None:
+            neg_one_nn = _raw(arith.constant(-1, type=T.i32))
+            if_nn = scf.IfOp(do_resolve_nn, [T.i32], has_else=True)
+            with ir.InsertionPoint(if_nn.regions[0].blocks[0]):
+                row_nn_resolved = _get_kv_ld_row(nn_resolve_start, nn_resolve_end, True)
+                scf.YieldOp([row_nn_resolved])
+            with ir.InsertionPoint(if_nn.regions[1].blocks[0]):
+                scf.YieldOp([neg_one_nn])
+            row_kv_ld_nn = if_nn.results[0]
+        else:
+            row_kv_ld_nn = _raw(arith.constant(-1, type=T.i32))
 
         # ---- Softmax ----
         p_exp_vals, row_max_new, row_sum_e_new, rescale = _softmax(
@@ -1457,40 +1480,72 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         # ---- Pack P to fp8 ----
         p_pack = _pack_p_to_fp8(p_exp_vals)
 
-        return row_max_new, row_sum_e_new, p_pack, rescale
+        return row_max_new, row_sum_e_new, p_pack, rescale, row_kv_ld_nn
 
     def _gemm2_core(p_pack, oaccu, vt_base_i32):
-        """GEMM2 PV accumulation loop (shared by first-iter and rescale paths)."""
+        """GEMM2 PV accumulation loop (shared by first-iter and rescale paths).
+
+        Matches HK interleaving: 8x ds_read_b32 burst (2 PV iters),
+        lgkmcnt(4) -> 2 MFMA, lgkmcnt(0) -> 2 MFMA.
+        """
         c32_i64_pv = _std_arith.ConstantOp(T.i64, ir.IntegerAttr.get(T.i64, 32)).result
-        for pv_iter in range_constexpr(NUM_PV_ITERS):
-            col_offset_0 = pv_iter * MFMA_N * 2
-            col_offset_1 = col_offset_0 + MFMA_N
+        rocdl.s_setprio(15)
+        for pv_pair in range_constexpr(NUM_PV_ITERS // 2):
+            # Load 8 values: vt for 2 consecutive PV iterations
+            iter_a = pv_pair * 2
+            iter_b = pv_pair * 2 + 1
+            col_a0 = iter_a * MFMA_N * 2
+            col_a1 = col_a0 + MFMA_N
+            col_b0 = iter_b * MFMA_N * 2
+            col_b1 = col_b0 + MFMA_N
 
-            vt0_lo, vt0_hi = _load_vt_from_lds(vt_base_i32, col_offset_0)
-            vt1_lo, vt1_hi = _load_vt_from_lds(vt_base_i32, col_offset_1)
+            # 8x ds_read_b32 burst
+            vta0_lo, vta0_hi = _load_vt_from_lds(vt_base_i32, col_a0)
+            vta1_lo, vta1_hi = _load_vt_from_lds(vt_base_i32, col_a1)
+            vtb0_lo, vtb0_hi = _load_vt_from_lds(vt_base_i32, col_b0)
+            vtb1_lo, vtb1_hi = _load_vt_from_lds(vt_base_i32, col_b1)
 
-            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=2))
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=4))
 
-            vt0_lo_i64 = _std_arith.ExtUIOp(T.i64, vt0_lo).result
-            vt0_hi_i64 = _std_arith.ExtUIOp(T.i64, vt0_hi).result
-            vt0_hi_shifted = _std_arith.ShLIOp(vt0_hi_i64, c32_i64_pv).result
-            kv_mfma_0 = _std_arith.OrIOp(vt0_lo_i64, vt0_hi_shifted).result
-
-            oaccu[pv_iter * 2] = _mfma_fp8(
-                T.f32x4, [kv_mfma_0, p_pack, oaccu[pv_iter * 2], 0, 0, 0]
+            # MFMA pair A (first PV iter)
+            vta0_lo_i64 = _std_arith.ExtUIOp(T.i64, vta0_lo).result
+            vta0_hi_i64 = _std_arith.ExtUIOp(T.i64, vta0_hi).result
+            vta0_hi_shifted = _std_arith.ShLIOp(vta0_hi_i64, c32_i64_pv).result
+            kv_mfma_a0 = _std_arith.OrIOp(vta0_lo_i64, vta0_hi_shifted).result
+            oaccu[iter_a * 2] = _mfma_fp8(
+                T.f32x4, [kv_mfma_a0, p_pack, oaccu[iter_a * 2], 0, 0, 0]
             )
 
+            vta1_lo_i64 = _std_arith.ExtUIOp(T.i64, vta1_lo).result
+            vta1_hi_i64 = _std_arith.ExtUIOp(T.i64, vta1_hi).result
+            vta1_hi_shifted = _std_arith.ShLIOp(vta1_hi_i64, c32_i64_pv).result
+            kv_mfma_a1 = _std_arith.OrIOp(vta1_lo_i64, vta1_hi_shifted).result
+            oaccu[iter_a * 2 + 1] = _mfma_fp8(
+                T.f32x4, [kv_mfma_a1, p_pack, oaccu[iter_a * 2 + 1], 0, 0, 0]
+            )
+            rocdl.sched_barrier(0)
             rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))
 
-            vt1_lo_i64 = _std_arith.ExtUIOp(T.i64, vt1_lo).result
-            vt1_hi_i64 = _std_arith.ExtUIOp(T.i64, vt1_hi).result
-            vt1_hi_shifted = _std_arith.ShLIOp(vt1_hi_i64, c32_i64_pv).result
-            kv_mfma_1 = _std_arith.OrIOp(vt1_lo_i64, vt1_hi_shifted).result
-
-            oaccu[pv_iter * 2 + 1] = _mfma_fp8(
-                T.f32x4, [kv_mfma_1, p_pack, oaccu[pv_iter * 2 + 1], 0, 0, 0]
+            # MFMA pair B (second PV iter)
+            vtb0_lo_i64 = _std_arith.ExtUIOp(T.i64, vtb0_lo).result
+            vtb0_hi_i64 = _std_arith.ExtUIOp(T.i64, vtb0_hi).result
+            vtb0_hi_shifted = _std_arith.ShLIOp(vtb0_hi_i64, c32_i64_pv).result
+            kv_mfma_b0 = _std_arith.OrIOp(vtb0_lo_i64, vtb0_hi_shifted).result
+            oaccu[iter_b * 2] = _mfma_fp8(
+                T.f32x4, [kv_mfma_b0, p_pack, oaccu[iter_b * 2], 0, 0, 0]
             )
 
+            vtb1_lo_i64 = _std_arith.ExtUIOp(T.i64, vtb1_lo).result
+            vtb1_hi_i64 = _std_arith.ExtUIOp(T.i64, vtb1_hi).result
+            vtb1_hi_shifted = _std_arith.ShLIOp(vtb1_hi_i64, c32_i64_pv).result
+            kv_mfma_b1 = _std_arith.OrIOp(vtb1_lo_i64, vtb1_hi_shifted).result
+            oaccu[iter_b * 2 + 1] = _mfma_fp8(
+                T.f32x4, [kv_mfma_b1, p_pack, oaccu[iter_b * 2 + 1], 0, 0, 0]
+            )
+            rocdl.sched_barrier(0)
+
+        rocdl.s_setprio(0)
         return oaccu
 
     def _gemm2_first_iter(p_pack, vt_base_i32):
@@ -1679,9 +1734,17 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         ).result
 
         # --- Process first tile ---
-        # Only 4 lightweight values through phi (rm, rse, p_pack, rescale).
-        # oaccu stays outside branches -- GEMM2 runs after the merge.
-        first_result_types = [T.f32, T.f32, T.i64, T.f32]
+        # 5 values through phi: rm, rse, p_pack, rescale, row_kv_ld_nn
+        first_result_types = [T.f32, T.f32, T.i64, T.f32, T.i32]
+
+        # 2-ahead resolve params for first tile (tile 0 -> resolve tile 2)
+        # nn_start = kv_start + 2*BN, nn_end = kv_end (always boundary check)
+        # do_resolve: tile 2 exists iff kv_start + 2*BN < kv_end
+        do_resolve_nn_first = _std_arith.CmpIOp(
+            CmpIPredicate.slt,
+            kv_start_plus_2bn,
+            _raw(kv_end),
+        ).result
 
         # Branch on has_multi_tiles: multi-tile gets prefetch, single doesn't
         if_first = scf.IfOp(has_multi_tiles, first_result_types, has_else=True)
@@ -1693,7 +1756,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 # cbn=True: next tile needs boundary check (num_tiles==2, partial)
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
-                rm1a, rse1a, pp1a, rs1a = _process_tile_gemm1(
+                rm1a, rse1a, pp1a, rs1a, nn1a = _process_tile_gemm1(
                     p_lds_kv_0_base,
                     kv_start,
                     kv_end,
@@ -1707,17 +1770,20 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                     row_kv_ld_next=row_kv_ld_tile1,
                     kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
                     check_boundary_next=True,
+                    nn_resolve_start=kv_start_plus_2bn,
+                    nn_resolve_end=_raw(kv_end),
+                    do_resolve_nn=do_resolve_nn_first,
                 )
                 y1a = [
                     _raw(v) if not isinstance(v, ir.Value) else v
-                    for v in [rm1a, rse1a, pp1a, rs1a]
+                    for v in [rm1a, rse1a, pp1a, rs1a, nn1a]
                 ]
                 scf.YieldOp(y1a)
             with ir.InsertionPoint(if_first_cbn.regions[1].blocks[0]):
                 # cbn=False: next tile is full, no boundary check
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
-                rm1b, rse1b, pp1b, rs1b = _process_tile_gemm1(
+                rm1b, rse1b, pp1b, rs1b, nn1b = _process_tile_gemm1(
                     p_lds_kv_0_base,
                     kv_start,
                     kv_end,
@@ -1731,19 +1797,22 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                     row_kv_ld_next=row_kv_ld_tile1,
                     kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
                     check_boundary_next=False,
+                    nn_resolve_start=kv_start_plus_2bn,
+                    nn_resolve_end=_raw(kv_end),
+                    do_resolve_nn=do_resolve_nn_first,
                 )
                 y1b = [
                     _raw(v) if not isinstance(v, ir.Value) else v
-                    for v in [rm1b, rse1b, pp1b, rs1b]
+                    for v in [rm1b, rse1b, pp1b, rs1b, nn1b]
                 ]
                 scf.YieldOp(y1b)
             y1 = list(if_first_cbn.results)
             scf.YieldOp(y1)
         with ir.InsertionPoint(if_first.regions[1].blocks[0]):
-            # Single tile: no prefetch, boundary check is runtime i1
+            # Single tile: no prefetch, no 2-ahead resolve
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
-            rm2, rse2, pp2, rs2 = _process_tile_gemm1(
+            rm2, rse2, pp2, rs2, nn2 = _process_tile_gemm1(
                 p_lds_kv_0_base,
                 kv_start,
                 kv_end,
@@ -1756,7 +1825,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             )
             y2 = [
                 _raw(v) if not isinstance(v, ir.Value) else v
-                for v in [rm2, rse2, pp2, rs2]
+                for v in [rm2, rse2, pp2, rs2, nn2]
             ]
             scf.YieldOp(y2)
 
@@ -1764,6 +1833,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         row_sum_e = if_first.results[1]
         p_pack_first = if_first.results[2]
         rescale_first = if_first.results[3]
+        row_kv_ld_nn_first = if_first.results[4]
 
         # GEMM2 for first tile: C=0 hardcoded, no rescale needed
         oaccu = _gemm2_first_iter(p_pack_first, vt_base_i32)
@@ -1777,7 +1847,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
         num_tiles_m1_idx = arith.index_cast(T.index, num_tiles_m1)
         num_tiles_m2 = arith.subi(num_tiles, arith.constant(2, type=T.i32))
 
-        init_args = [row_max, row_sum_e] + oaccu
+        init_args = [row_max, row_sum_e] + oaccu + [row_kv_ld_nn_first]
         init_args = [_raw(v) if not isinstance(v, ir.Value) else v for v in init_args]
 
         for_op = scf.ForOp(
@@ -1800,6 +1870,8 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             oaccu_carried = [
                 for_op.inner_iter_args[2 + i] for i in range(NUM_PV_ITERS * 2)
             ]
+            # 2-ahead: row resolved by previous iteration's _process_tile_gemm1
+            row_kv_ld_next = for_op.inner_iter_args[2 + NUM_PV_ITERS * 2]
 
             # Buffer parity
             tile_parity = _std_arith.AndIOp(
@@ -1830,40 +1902,26 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
             ).result
             mid_cbn = _std_arith.AndIOp(is_second_to_last, last_tile_partial).result
 
-            # Resolve row for next tile prefetch.
-            # Next tile start = kv_tile_start + BN
-            kv_tile_next_start = _std_arith.AddIOp(
-                kv_tile_start_i32,
-                _raw(arith.constant(BLOCK_N, type=T.i32)),
-            ).result
-            # Next tile full end: kv_tile_start + 2*BN
-            kv_tile_next_end_full = _std_arith.AddIOp(
+            # 2-ahead resolve params for this iteration:
+            # Resolve tile at kv_tile_start + 2*BN (exists if < kv_end)
+            nn_start_mid = _std_arith.AddIOp(
                 kv_tile_start_i32,
                 _raw(c_2bn),
             ).result
-
-            # Resolve row with appropriate boundary check
-            if_mid_cbn = scf.IfOp(mid_cbn, [T.i32], has_else=True)
-            with ir.InsertionPoint(if_mid_cbn.regions[0].blocks[0]):
-                # Next tile is partial last -> boundary check
-                row_mid_cb = _get_kv_ld_row(kv_tile_next_start, _raw(kv_end), True)
-                scf.YieldOp([row_mid_cb])
-            with ir.InsertionPoint(if_mid_cbn.regions[1].blocks[0]):
-                # Next tile is full -> no boundary check
-                row_mid_nc = _get_kv_ld_row(
-                    kv_tile_next_start, kv_tile_next_end_full, False
-                )
-                scf.YieldOp([row_mid_nc])
-            row_kv_ld_next = if_mid_cbn.results[0]
+            do_resolve_nn_mid = _std_arith.CmpIOp(
+                CmpIPredicate.slt,
+                nn_start_mid,
+                _raw(kv_end),
+            ).result
 
             # Process tile: cb=False always, cbn is compile-time via sub-branch
-            mid_gemm1_types = [T.f32, T.f32, T.i64, T.f32]
+            mid_gemm1_types = [T.f32, T.f32, T.i64, T.f32, T.i32]
             if_mid_tile = scf.IfOp(mid_cbn, mid_gemm1_types, has_else=True)
             with ir.InsertionPoint(if_mid_tile.regions[0].blocks[0]):
                 # cbn=True: next tile needs boundary check
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
-                rm_ma, rse_ma, pp_ma, rs_ma = _process_tile_gemm1(
+                rm_ma, rse_ma, pp_ma, rs_ma, nn_ma = _process_tile_gemm1(
                     curr_base_idx,
                     kv_tile_start_i32,
                     _raw(kv_end),
@@ -1877,17 +1935,20 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                     row_kv_ld_next=row_kv_ld_next,
                     kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
                     check_boundary_next=True,
+                    nn_resolve_start=nn_start_mid,
+                    nn_resolve_end=_raw(kv_end),
+                    do_resolve_nn=do_resolve_nn_mid,
                 )
                 y_ma = [
                     _raw(v) if not isinstance(v, ir.Value) else v
-                    for v in [rm_ma, rse_ma, pp_ma, rs_ma]
+                    for v in [rm_ma, rse_ma, pp_ma, rs_ma, nn_ma]
                 ]
                 scf.YieldOp(y_ma)
             with ir.InsertionPoint(if_mid_tile.regions[1].blocks[0]):
                 # cbn=False: next tile is full, no boundary check
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
-                rm_mb, rse_mb, pp_mb, rs_mb = _process_tile_gemm1(
+                rm_mb, rse_mb, pp_mb, rs_mb, nn_mb = _process_tile_gemm1(
                     curr_base_idx,
                     kv_tile_start_i32,
                     _raw(kv_end),
@@ -1901,18 +1962,22 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                     row_kv_ld_next=row_kv_ld_next,
                     kv_ld_col_base_i32_arg=kv_ld_col_base_i32,
                     check_boundary_next=False,
+                    nn_resolve_start=nn_start_mid,
+                    nn_resolve_end=_raw(kv_end),
+                    do_resolve_nn=do_resolve_nn_mid,
                 )
                 y_mb = [
                     _raw(v) if not isinstance(v, ir.Value) else v
-                    for v in [rm_mb, rse_mb, pp_mb, rs_mb]
+                    for v in [rm_mb, rse_mb, pp_mb, rs_mb, nn_mb]
                 ]
                 scf.YieldOp(y_mb)
             rm_m = if_mid_tile.results[0]
             rse_m = if_mid_tile.results[1]
             pp_m = if_mid_tile.results[2]
             rs_m = if_mid_tile.results[3]
+            nn_m = if_mid_tile.results[4]
             oa_m = _gemm2_with_rescale(pp_m, rs_m, oaccu_carried, vt_base_i32)
-            yield_vals = [rm_m, rse_m] + oa_m
+            yield_vals = [rm_m, rse_m] + oa_m + [nn_m]
             yield_vals = [
                 _raw(v) if not isinstance(v, ir.Value) else v for v in yield_vals
             ]
@@ -1950,10 +2015,10 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
                 _raw(p_lds_kv_0_base),
             ).result
 
-            # Last tile: cb is runtime i1 (last_tile_partial), no prefetch
+            # Last tile: cb is runtime i1 (last_tile_partial), no prefetch, no 2-ahead
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
-            rm_l, rse_l, pp_l, rs_l = _process_tile_gemm1(
+            rm_l, rse_l, pp_l, rs_l, _nn_l = _process_tile_gemm1(
                 last_curr_base,
                 kv_last_start,
                 _raw(kv_end),
