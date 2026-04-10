@@ -262,11 +262,12 @@ def create_configs():
     x_vals = []
     use_tdm = int(IS_DEVICE_ARCH_GFX12)
     for bs in [1,]:
-        for q_heads in [64,8]:
-            for seq_l in [1024, 2048, 4096, 8192]:
-                x_vals.append(
-                    [q_heads, q_heads // 8, 64, seq_l, seq_l, bs, 0, 64, 0, 0, 0, use_tdm, 1]
-                )
+        for use_fp8 in [0, 1]:
+            for q_heads in [64,8]:
+                for seq_l in [1024, 2048, 4096, 8192]:
+                    x_vals.append(
+                        [q_heads, q_heads // 8, 128, seq_l, seq_l, bs, 0, 64, 0, use_fp8, use_fp8, use_tdm, 1]
+                    )
     sub_config = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals,
