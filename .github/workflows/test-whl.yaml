@@ -167,7 +167,7 @@ jobs:
           TEST_FILES="op_tests/test_aiter_add.py op_tests/test_aiter_sigmoid.py op_tests/test_gemm_a16w16.py op_tests/test_activation.py op_tests/test_layernorm2d.py"
 
           docker exec aiter_test bash -c "
-            set -e
+            set -eo pipefail
             testFailed=false
             for file in $TEST_FILES; do
               echo '============================================================'

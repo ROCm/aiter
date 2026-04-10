@@ -15,21 +15,18 @@ on:
       - 'scripts/generate_summary.py'
   workflow_dispatch:
     inputs:
-      docker_image_py310:
-        description: 'Docker image for Python 3.10 build'
+      docker_image:
+        description: 'Docker image for build'
         type: string
         required: false
-        default: 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1'
-      docker_image_py312:
-        description: 'Docker image for Python 3.12 build'
+      python_version:
+        description: 'Python version, e.g. 3.10, 3.12, 3.13 (default: builds both 3.10 and 3.12)'
         type: string
         required: false
-        default: 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1'
       gpu_archs:
-        description: 'GPU architectures (e.g. gfx942;gfx950)'
+        description: 'GPU architectures (default: gfx942;gfx950)'
         type: string
         required: false
-        default: 'gfx942;gfx950'
       skip_tests:
         description: 'Skip test job for faster iteration'
         type: boolean
@@ -48,8 +45,10 @@ jobs:
     uses: ./.github/workflows/aiter-release.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'devreleases' || 'devreleases' }}
-      docker_image_py310: ${{ github.event.inputs.docker_image_py310 || 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1' }}
-      docker_image_py312: ${{ github.event.inputs.docker_image_py312 || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
+      docker_image_py310: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1' }}
+      docker_image_py312: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
+      build_py310: ${{ github.event.inputs.python_version == '' || github.event.inputs.python_version == '3.10' }}
+      build_py312: ${{ github.event.inputs.python_version == '' || github.event.inputs.python_version == '3.12' }}
       gpu_archs: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
       runner: build-only-aiter
       add_date_stamp: true
@@ -60,7 +59,7 @@ jobs:
 
   test:
     needs: build
-    if: ${{ !(inputs.skip_tests || false) }}
+    if: ${{ !(github.event.inputs.skip_tests || false) }}
     uses: ./.github/workflows/test-whl.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
@@ -73,8 +72,7 @@ jobs:
     needs: [build, test]
     if: >-
       ${{ github.repository_owner == 'ROCm'
-          && github.event_name != 'pull_request'
-          && !(inputs.skip_promote || false) }}
+          && !(github.event.inputs.skip_promote || false) }}
     uses: ./.github/workflows/promote.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}

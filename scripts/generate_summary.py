@@ -37,25 +37,32 @@ def _table(path: Path, headers: list[str], rows: list[list[str]]) -> None:
 # ── Build summary ───────────────────────────────────────────────────────────
 
 
+def _get_index_url(release_type: str, gpu_archs: str = "gfx942-gfx950") -> str | None:
+    domain = DOMAIN_MAP.get(release_type)
+    if not domain:
+        return None
+    return f"https://{domain}/whl/{gpu_archs}/"
+
+
 def build_summary(summary: Path) -> None:
     docker_image = os.environ.get("SUMMARY_DOCKER_IMAGE", "unknown")
     python_version = os.environ.get("SUMMARY_PYTHON_VERSION", "unknown")
     release_type = os.environ.get("SUMMARY_RELEASE_TYPE", "unknown")
     gpu_archs = os.environ.get("SUMMARY_GPU_ARCHS", "unknown")
     wheel_dir = os.environ.get("SUMMARY_WHEEL_DIR", "dist")
+    index_url = _get_index_url(release_type, gpu_archs.replace(";", "-"))
 
     _out(summary, f"## Build Summary - Python {python_version}")
     _out(summary)
-    _table(
-        summary,
-        ["Item", "Value"],
-        [
-            ["Python version", f"`{python_version}`"],
-            ["Docker image", f"`{docker_image}`"],
-            ["Release type", f"`{release_type}`"],
-            ["GPU architectures", f"`{gpu_archs}`"],
-        ],
-    )
+    rows = [
+        ["Python version", f"`{python_version}`"],
+        ["Docker image", f"`{docker_image}`"],
+        ["Release type", f"`{release_type}`"],
+        ["GPU architectures", f"`{gpu_archs}`"],
+    ]
+    if index_url:
+        rows.append(["Index URL", index_url])
+    _table(summary, ["Item", "Value"], rows)
 
     _out(summary, "### Wheels")
     _out(summary, "```")
@@ -75,21 +82,19 @@ def build_summary(summary: Path) -> None:
 
 def promote_summary(summary: Path) -> None:
     release_type = os.environ.get("SUMMARY_RELEASE_TYPE", "unknown")
-    source = os.environ.get("SUMMARY_S3_SOURCE", "unknown")
-    dest = os.environ.get("SUMMARY_S3_DEST", "unknown")
+    s3_dest = os.environ.get("SUMMARY_S3_DEST", "")
     wheel_names = os.environ.get("SUMMARY_WHEEL_NAMES", "").strip()
+
+    url_path = "/".join(s3_dest.split("/")[3:]) if s3_dest.startswith("s3://") else "whl/gfx942-gfx950"
+    domain = DOMAIN_MAP.get(release_type)
+    index_url = f"https://{domain}/{url_path}/" if domain else None
 
     _out(summary, "## Promote Summary")
     _out(summary)
-    _table(
-        summary,
-        ["Item", "Value"],
-        [
-            ["Release type", f"`{release_type}`"],
-            ["Source", f"`{source}`"],
-            ["Destination", f"`{dest}`"],
-        ],
-    )
+    rows = [["Release type", f"`{release_type}`"]]
+    if index_url:
+        rows.append(["Index URL", index_url])
+    _table(summary, ["Item", "Value"], rows)
 
     if wheel_names:
         _out(summary, "### Promoted Wheels")
@@ -99,12 +104,7 @@ def promote_summary(summary: Path) -> None:
         _out(summary, "```")
         _out(summary)
 
-    domain = DOMAIN_MAP.get(release_type)
-    if domain:
-        index_url = f"https://{domain}/whl/gfx942-gfx950/"
-        _out(summary, "### Wheels Available At")
-        _out(summary, f"- {index_url}")
-        _out(summary)
+    if index_url:
         _out(summary, "### Install Instructions")
         _out(summary)
         _out(summary, "**Using pip:**")

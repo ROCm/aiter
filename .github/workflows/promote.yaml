@@ -19,6 +19,14 @@ jobs:
       id-token: write
       contents: read
     steps:
+      - name: Validate inputs
+        run: |
+          if [[ ! "${{ inputs.release_type }}" =~ ^(nightlies|devreleases)$ ]]; then
+            echo "ERROR: Invalid release_type: ${{ inputs.release_type }}"
+            echo "Must be 'nightlies' or 'devreleases'"
+            exit 1
+          fi
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
