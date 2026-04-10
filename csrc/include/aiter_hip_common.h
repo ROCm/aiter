@@ -72,13 +72,19 @@ struct AiterAsmKernelArgs
 
 static const std::string get_gpu_arch();
 
+// ASM kernel loading requires embedded HSA blobs (provided by QoLA at
+// build time via -DAITER_EMBEDDED_HSA_HEADER).  Consumers that only need
+// type definitions (e.g. aiter::mha_fwd_args) can include this header
+// without the embedded blobs.
+#ifdef AITER_EMBEDDED_HSA_HEADER
+
 inline void load_asm_kernel(const char* name,
                             const char* hsaco,
                             hipModule_t& module,
                             hipFunction_t& kernel_func)
 {
-#if !defined(AITER_EMBEDDED_HSA_HEADER) || !defined(AITER_EMBEDDED_HSA_MAP)
-#error "QoLA requires embedded HSA blobs. Build with --embed-hsa (or the default)."
+#if !defined(AITER_EMBEDDED_HSA_MAP)
+#error "AITER_EMBEDDED_HSA_HEADER is defined but AITER_EMBEDDED_HSA_MAP is missing."
 #endif
     std::string arch_name = get_gpu_arch();
     std::string fname = "hsa/" + arch_name + "/" + hsaco;
@@ -164,6 +170,8 @@ class AiterAsmKernelFast
                                        (void**)&config));
     };
 };
+
+#endif // AITER_EMBEDDED_HSA_HEADER
 
 static const std::string get_gpu_arch()
 {
