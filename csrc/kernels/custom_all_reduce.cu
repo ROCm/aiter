@@ -325,6 +325,9 @@ void register_graph_buffers(fptr_t _fa,
 
 int64_t allocate_meta_buffer(int64_t size)
 {
+    int device_index;
+    HIP_CALL(hipGetDevice(&device_index));
+    HipDeviceGuard device_guard(device_index);
     hipStream_t stream = aiter::getCurrentHIPStream();
     void* buffer;
     hipStreamCaptureMode mode = hipStreamCaptureModeRelaxed;
@@ -356,6 +359,7 @@ void all_reduce(fptr_t _fa,
                 bool use_new, bool open_fp8_quant,
                 int64_t reg_inp_ptr, int64_t reg_inp_bytes)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
@@ -388,6 +392,7 @@ void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& out,
                     int64_t reg_ptr, int64_t reg_bytes)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t inp_numel  = inp.numel();
@@ -412,6 +417,7 @@ void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& out,
                     int64_t dim)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     int64_t last_dim_size = inp.size(-1);
     _all_gather(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
                 last_dim_size, dim);
@@ -424,6 +430,7 @@ void all_gather_unreg(fptr_t _fa,
                       int64_t reg_bytes,
                       int64_t dim)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     int64_t data_bytes = inp.numel() * inp.element_size();
     int64_t last_dim_size = inp.size(-1);
@@ -446,6 +453,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              int64_t reg_ptr, int64_t reg_bytes,
                              bool use_1stage)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();
@@ -484,6 +492,7 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    int64_t reg_ptr, int64_t reg_bytes,
                                    bool use_1stage)
 {
+    HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto dtype     = inp.dtype();
     int64_t numel  = inp.numel();

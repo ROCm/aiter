@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
 #include "asm_fp8gemm_blockscale_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -252,7 +253,11 @@ static void print_debug_info(const KernelArgs& args, const std::string& selected
     printf("==========================================\n");
 }
 
-AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    gemm_a8w8_blockscale_bpreshuffle_asm,
+    (
     aiter_tensor_t* A,
     aiter_tensor_t* B,
     aiter_tensor_t* out,
@@ -263,7 +268,8 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
     const char*  kernelName,
     int          bpreshuffle,
     aiter_tensor_t* zero_bias_buf,
-    hipStream_t  stream)
+    hipStream_t  stream),
+    (A, B, out, A_scale, B_scale, bias, splitK, kernelName, bpreshuffle, zero_bias_buf, stream))
 {
     validate_inputs(A, B, out, A_scale, B_scale);
     int Mdim = A->size(0);
@@ -340,4 +346,5 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
         print_debug_info(args, selectedKernelName, selectedsplitK, gdx, gdy, gdz, stream, bias);
     }
     impl_ptr->launch_kernel({&args, &arg_size, gdx / blockSizeX, gdy, gdz, blockSizeX, 1, 1, stream});
+
 }
