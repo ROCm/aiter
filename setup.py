@@ -298,7 +298,10 @@ if PREBUILD_KERNELS != 0:
         # writes results tagged with the live GPU's (gfx, cu_num) back to
         # the source CSV, then rebuilds the inference .so.
         if PRETUNE_MODULES:
-            from aiter.utility.pretune import run_pretune_modules
+            # Import directly from the file to avoid triggering aiter/__init__.py,
+            # which would try to load module_aiter_core before it is registered.
+            sys.path.insert(0, os.path.join(this_dir, "aiter", "utility"))
+            from pretune import run_pretune_modules  # noqa: E402
 
             cfg_path = OPT_COMPILER_CONFIG
             with open(cfg_path, "r", encoding="utf-8") as _f:
