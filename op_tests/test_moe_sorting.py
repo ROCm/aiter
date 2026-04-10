@@ -173,6 +173,60 @@ def test_moe_sorting(
         sorted_expert_ids_b[expert_mask],
         msg="sorted_expert_ids",
     )
+
+    # Verify moe_buf pass-through: pre-allocated buffer should be reused
+    pre_buf = torch.empty((token, model_dim), dtype=dtype, device="cuda")
+    pre_buf_ptr = pre_buf.data_ptr()
+    (
+        (
+            sorted_ids_c,
+            sorted_weights_c,
+            sorted_expert_ids_c,
+            num_tokens_post_padded_c,
+            moe_buf_c,
+        ),
+        _,
+    ) = run_perftest(
+        moe_sorting,
+        topk_ids,
+        topk_weights,
+        E,
+        model_dim,
+        dtype,
+        BLOCK_SIZE_M,
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
+        moe_buf=pre_buf,
+        num_warmup=1,
+        num_iters=2,
+    )
+    assert (
+        moe_buf_c.data_ptr() == pre_buf_ptr
+    ), "moe_buf pass-through: buffer not reused"
+    checkAllclose(
+        num_tokens_post_padded_a,
+        num_tokens_post_padded_c,
+        atol=0,
+        msg="moe_buf pass-through: num_tokens_post_padded",
+    )
+    checkAllclose(
+        sorted_ids_a[:num_tokens_post_pad],
+        sorted_ids_c[:num_tokens_post_pad],
+        atol=0,
+        msg="moe_buf pass-through: sorted_ids",
+    )
+    checkAllclose(
+        sorted_weights_a[mask],
+        sorted_weights_c[mask],
+        msg="moe_buf pass-through: sorted_weights",
+    )
+    checkAllclose(
+        sorted_expert_ids_a[expert_mask],
+        sorted_expert_ids_c[expert_mask],
+        msg="moe_buf pass-through: sorted_expert_ids",
+    )
+
     return {"us": avg_b}
 
 
