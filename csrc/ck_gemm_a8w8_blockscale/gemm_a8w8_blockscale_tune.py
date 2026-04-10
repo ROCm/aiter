@@ -10,11 +10,23 @@ from einops import rearrange
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, get_asm_dir
-from aiter.ops.gemm_op_a8w8 import get_valid_asm_splitK_list
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.chip_info import get_gfx
+
+
+def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
+    """Filter splitK values to only those that produce valid TileK-aligned partitions."""
+    valid = []
+    for sk in range(1, max_splitK + 1):
+        k_per_split = (K + sk - 1) // sk
+        k_per_split_aligned = ((k_per_split + tile_k - 1) // tile_k) * tile_k
+        actual_ksplit = (K + k_per_split_aligned - 1) // k_per_split_aligned
+        if actual_ksplit == sk:
+            valid.append(sk)
+    return valid if valid else [1]
+
 
 # ck
 import sys
@@ -412,7 +424,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             if N % tile_n != 0:
                 continue
             splitK_list = (
-                get_valid_asm_splitK_list(K, 8) if useSplitK and int(splitk_supported) == 1 else [1]
+                get_valid_asm_splitK_list(K, 8)
+                if useSplitK and int(splitk_supported) == 1
+                else [1]
             )
             for kernel_name in kernel_names:
                 for splitK in splitK_list:

@@ -300,6 +300,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     constexpr int TileK = 128;
 
     if (cfg.splitK == 1 && selectedsplitK > 0) {
+        // Step 1: Validate or auto-correct splitK for TileK alignment.
+        //   - Heuristic path: auto-correct to the nearest valid splitK.
+        //   - Explicit path (tuned config): reject misaligned splitK.
         int k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
         int k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
         int actual_ksplit = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
@@ -318,6 +321,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 ", k_per_split_aligned=", k_per_split_aligned,
                 ", actual_ksplit=", actual_ksplit);
         }
+
+        // Step 2: Sanity check — verify the final partition is valid.
+        k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
+        k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
+        AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
+                   (Kdim / k_per_split_aligned) == (selectedsplitK - 1),
+                   __func__, " Kdim alignment check failed for splitK!");
+
+        // Step 3: Zero output buffer for atomic accumulation across splits.
         if (selectedsplitK > 1) {
             HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
         }

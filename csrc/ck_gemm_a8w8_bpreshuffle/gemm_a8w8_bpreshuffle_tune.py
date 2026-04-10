@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, AITER_CSRC_DIR
-from aiter.ops.gemm_op_a8w8 import get_valid_asm_splitK_list
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
 from gemm_a8w8_bpreshuffle_common import kernels_list as kernels_list_ck
@@ -16,6 +15,18 @@ from gemm_a8w8_bpreshuffle_common import kernels_list as kernels_list_ck
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
+
+
+def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
+    """Filter splitK values to only those that produce valid TileK-aligned partitions."""
+    valid = []
+    for sk in range(1, max_splitK + 1):
+        k_per_split = (K + sk - 1) // sk
+        k_per_split_aligned = ((k_per_split + tile_k - 1) // tile_k) * tile_k
+        actual_ksplit = (K + k_per_split_aligned - 1) // k_per_split_aligned
+        if actual_ksplit == sk:
+            valid.append(sk)
+    return valid if valid else [1]
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/cktile_gemm_a8w8_bpreshuffle/")
 from gemm_a8w8_bpreshuffle_cktile_common import (
