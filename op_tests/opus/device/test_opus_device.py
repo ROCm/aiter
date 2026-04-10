@@ -413,6 +413,7 @@ def test_mfma_32x32x16_bf16(mod):
         mod, "32x32x16_bf16", 32, 32, 16, torch.bfloat16, _MFMA_ARCHS_GFX942_GFX950
     )
 
+
 def test_mfma_16x16x32_f16(mod):
     """Test MFMA 16x16x32 fp16 kernel (gfx942 step_k + gfx950 native)."""
     return _test_mfma_variant(
@@ -1092,7 +1093,9 @@ def test_mma_step_k_bf16(mod):
     """Test tiled_mma_adaptor::step_k() for bf16 32x32x128."""
     arch = _get_gpu_arch()
     if arch not in _MFMA_ARCHS_GFX942_GFX950:
-        print(f"  SKIP: mma_step_k_32x32x128_bf16 requires {_MFMA_ARCHS_GFX942_GFX950}, got '{arch}'")
+        print(
+            f"  SKIP: mma_step_k_32x32x128_bf16 requires {_MFMA_ARCHS_GFX942_GFX950}, got '{arch}'"
+        )
         return 0
 
     device = torch.device("cuda")
