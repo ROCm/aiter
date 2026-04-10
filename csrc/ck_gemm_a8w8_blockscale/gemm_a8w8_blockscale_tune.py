@@ -10,6 +10,7 @@ from einops import rearrange
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, get_asm_dir
+from aiter.ops.gemm_op_a8w8 import get_valid_asm_splitK_list
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
@@ -411,7 +412,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             if N % tile_n != 0:
                 continue
             splitK_list = (
-                list(range(1, 9)) if useSplitK and int(splitk_supported) == 1 else [1]
+                get_valid_asm_splitK_list(K, 8) if useSplitK and int(splitk_supported) == 1 else [1]
             )
             for kernel_name in kernel_names:
                 for splitK in splitK_list:

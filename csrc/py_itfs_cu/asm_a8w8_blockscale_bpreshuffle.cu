@@ -305,10 +305,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         int actual_ksplit = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
         if (!opt_splitK.has_value()) {
             if (actual_ksplit != selectedsplitK) {
-                printf("warning: change splitK form %d to %d to make sure every block deals with "
-                       "128x k\n",
-                       selectedsplitK,
-                       actual_ksplit);
+                AITER_LOG_WARNING("change splitK from " << selectedsplitK << " to "
+                       << actual_ksplit << " to make sure every block deals with 128x k");
                 selectedsplitK = actual_ksplit;
             }
         } else {

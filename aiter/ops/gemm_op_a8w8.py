@@ -339,6 +339,18 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     return splitK
 
 
+def get_valid_asm_splitK_list(K: int, max_splitK: int, tile_k: int = 128):
+    """Filter splitK values to only those that produce valid TileK-aligned partitions."""
+    valid = []
+    for sk in range(1, max_splitK + 1):
+        k_per_split = (K + sk - 1) // sk
+        k_per_split_aligned = ((k_per_split + tile_k - 1) // tile_k) * tile_k
+        actual_ksplit = (K + k_per_split_aligned - 1) // k_per_split_aligned
+        if actual_ksplit == sk:
+            valid.append(sk)
+    return valid if valid else [1]
+
+
 _CKGEMM_CONFIG_CACHE = None
 
 

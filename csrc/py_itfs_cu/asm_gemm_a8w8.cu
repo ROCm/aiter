@@ -245,10 +245,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             {
                 if(actual_splitK != selectedksplit)
                 {
-                    printf("warning: change splitK form %d to %d to make sure every block deals "
-                           "with 128x k\n",
-                           selectedksplit,
-                           actual_splitK);
+                    AITER_LOG_WARNING("change splitK from " << selectedksplit << " to "
+                           << actual_splitK << " to make sure every block deals with 128x k");
                     selectedksplit = actual_splitK;
                 }
             }

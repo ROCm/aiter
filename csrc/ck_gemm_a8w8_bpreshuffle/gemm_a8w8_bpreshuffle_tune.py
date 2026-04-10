@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE, AITER_CSRC_DIR
+from aiter.ops.gemm_op_a8w8 import get_valid_asm_splitK_list
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.ops.shuffle import shuffle_weight
 from gemm_a8w8_bpreshuffle_common import kernels_list as kernels_list_ck
@@ -268,14 +269,15 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         asm_kernels_id = kernel_id_start
         for key in asm_tiles:
             tile_m, tile_n, splitk = key
-            maxsplitK = 8 if useSplitK else 1
             kernelName = asm_kernels.get((tile_m, tile_n, splitk), [])
             if len(kernelName) == 0:
                 print(f"no kernel name for ({tile_m}, {tile_n})!!!!")
                 continue
-            if splitk == 0:
-                maxsplitK = 1
-            for splitK in range(1, maxsplitK + 1):
+            if useSplitK and splitk != 0:
+                splitK_list = get_valid_asm_splitK_list(K, 8)
+            else:
+                splitK_list = [1]
+            for splitK in splitK_list:
                 kernel_name = kernelName[0]
                 info = (info_keys, asm_kernels_id, splitK, kernel_name, "asm")
                 task.append(
