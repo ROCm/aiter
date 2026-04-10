@@ -85,7 +85,11 @@ def promote_summary(summary: Path) -> None:
     s3_dest = os.environ.get("SUMMARY_S3_DEST", "")
     wheel_names = os.environ.get("SUMMARY_WHEEL_NAMES", "").strip()
 
-    url_path = "/".join(s3_dest.split("/")[3:]) if s3_dest.startswith("s3://") else "whl/gfx942-gfx950"
+    url_path = (
+        "/".join(s3_dest.split("/")[3:])
+        if s3_dest.startswith("s3://")
+        else "whl/gfx942-gfx950"
+    )
     domain = DOMAIN_MAP.get(release_type)
     index_url = f"https://{domain}/{url_path}/" if domain else None
 
