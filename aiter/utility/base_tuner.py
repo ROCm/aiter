@@ -196,18 +196,27 @@ class TunerCommon:
             "--compare",
             action="store_true",
             required=False,
-            help="Run production-op benchmark before and after tuning to compare performance",
+            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV.",
+        )
+        self.parser.add_argument(
+            "--update_improved",
+            action="store_true",
+            required=False,
+            help="With --compare, update the final tuned CSV for shapes improved by at least --min_improvement_pct.",
         )
         self.parser.add_argument(
             "--min_improvement_pct",
             dest="min_improvement_pct",
             type=float,
             default=defaults.get("min_improvement_pct", 3.0),
-            help="When used with --compare, only update tuned CSV for shapes improved by at least this percent.",
+            help="With --compare --update_improved, only update tuned CSV for shapes improved by at least this percent.",
         )
 
     def parse_args(self):
-        return self.parser.parse_args()
+        args = self.parser.parse_args()
+        if args.update_improved and not args.compare:
+            self.parser.error("--update_improved requires --compare")
+        return args
 
     @abstractmethod
     def _setup_specific_arguments(self):
@@ -396,7 +405,6 @@ class TunerCommon:
 
         if fast_mode or topk == -1:
             return rets
-        tol_err_ratio = args.errRatio
         from collections import defaultdict
 
         grouped_rets = defaultdict(list)
@@ -408,6 +416,7 @@ class TunerCommon:
         grouped_results = list(grouped_rets.items())
 
         for info_key, time_list in grouped_results:
+            tol_err_ratio = args.errRatio
             sorted_time = sorted(time_list, key=lambda x: x[1])
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio)
@@ -674,7 +683,12 @@ class TunerCommon:
         return comparison[columns]
 
     def _print_compare_update_plan(
-        self, comparison, threshold_percent, tuned_file=None, report_file=None
+        self,
+        comparison,
+        threshold_percent,
+        tuned_file=None,
+        report_file=None,
+        apply_updates=True,
     ):
         if comparison is None or comparison.empty:
             self._emit_report_lines(
@@ -683,10 +697,20 @@ class TunerCommon:
             )
             return
 
-        lines = ["============= Compare-Gated CSV Updates ============="]
+        lines = [
+            (
+                "============= Compare-Gated CSV Updates ============="
+                if apply_updates
+                else "============= Compare-Gated CSV Update Preview ============="
+            )
+        ]
         target_desc = tuned_file if tuned_file else "tuned csv"
         lines.append(
-            f"Threshold: improve >= {threshold_percent:.2f}% to update {target_desc}"
+            (
+                f"Threshold: improve >= {threshold_percent:.2f}% to update {target_desc}"
+                if apply_updates
+                else f"Threshold: improve >= {threshold_percent:.2f}% would update {target_desc} with --update_improved"
+            )
         )
         header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>8}"
         lines.append(header)
@@ -783,6 +807,22 @@ class TunerCommon:
         print(f"Compare results will be written to {compare_report_file}", flush=True)
         return compare_report_file
 
+    def _init_compare_candidate_file(self, args, output_file):
+        if not args.compare:
+            return None
+
+        candidate_root, candidate_ext = os.path.splitext(output_file)
+        compare_candidate_file = f"{candidate_root}.candidate{candidate_ext or '.csv'}"
+        if os.path.exists(output_file):
+            shutil.copyfile(output_file, compare_candidate_file)
+        elif os.path.exists(compare_candidate_file):
+            os.remove(compare_candidate_file)
+        print(
+            f"Compare candidate CSV will be written to {compare_candidate_file}",
+            flush=True,
+        )
+        return compare_candidate_file
+
     def _emit_compare_batch_header(self, header, report_file=None):
         print(header, flush=True)
         if report_file:
@@ -807,18 +847,30 @@ class TunerCommon:
         return results
 
     def _create_batch_compare_output_file(
-        self, args, results, output_file, processed_batches
+        self,
+        args,
+        results,
+        output_file,
+        processed_batches,
+        compare_candidate_file=None,
     ):
         fd, batch_compare_output_file = tempfile.mkstemp(
             prefix=f"{self.name}_compare_batch_{processed_batches}_",
             suffix=".csv",
         )
         os.close(fd)
-        if os.path.exists(output_file):
-            shutil.copyfile(output_file, batch_compare_output_file)
+        candidate_base_file = (
+            compare_candidate_file
+            if compare_candidate_file and os.path.exists(compare_candidate_file)
+            else output_file
+        )
+        if os.path.exists(candidate_base_file):
+            shutil.copyfile(candidate_base_file, batch_compare_output_file)
         self.result_to_csv(results, batch_compare_output_file, not args.all)
         if os.path.exists(batch_compare_output_file):
             self.sortResults(batch_compare_output_file, args.sort, self.sort_keys)
+            if compare_candidate_file:
+                shutil.copyfile(batch_compare_output_file, compare_candidate_file)
         return batch_compare_output_file
 
     def _apply_compare_batch_results(
@@ -831,9 +883,14 @@ class TunerCommon:
         processed_batches,
         total_batches,
         compare_report_file=None,
+        compare_candidate_file=None,
     ):
         batch_compare_output_file = self._create_batch_compare_output_file(
-            args, results, output_file, processed_batches
+            args,
+            results,
+            output_file,
+            processed_batches,
+            compare_candidate_file=compare_candidate_file,
         )
         try:
             batch_header = f"=== Running post-tune benchmark (verification) for batch {processed_batches}/{total_batches} ==="
@@ -852,15 +909,16 @@ class TunerCommon:
                 args.min_improvement_pct,
                 shapes_df=batch,
             )
-            final_df = self._merge_compare_filtered_results(
-                output_file,
-                batch_compare_output_file,
-                batch_compare_plan,
-            )
-            final_df.to_csv(output_file, index=False)
-            if os.path.exists(output_file):
-                self.sortResults(output_file, args.sort, self.sort_keys)
-            self.tunedf = self.get_tuned_gemm_list(output_file)
+            if args.update_improved:
+                final_df = self._merge_compare_filtered_results(
+                    output_file,
+                    batch_compare_output_file,
+                    batch_compare_plan,
+                )
+                final_df.to_csv(output_file, index=False)
+                if os.path.exists(output_file):
+                    self.sortResults(output_file, args.sort, self.sort_keys)
+                self.tunedf = self.get_tuned_gemm_list(output_file)
             return batch_post_tune_results, batch_compare_plan
         finally:
             if os.path.exists(batch_compare_output_file):
@@ -887,6 +945,8 @@ class TunerCommon:
         threshold_percent,
         tuned_file,
         report_file=None,
+        apply_updates=True,
+        candidate_file=None,
     ):
         if not completed_pre_tune_results:
             return
@@ -906,7 +966,15 @@ class TunerCommon:
             threshold_percent,
             tuned_file=tuned_file,
             report_file=report_file,
+            apply_updates=apply_updates,
         )
+        extra_lines = []
+        if candidate_file:
+            extra_lines.append(f"Compare candidate CSV written to {candidate_file}")
+        if not apply_updates:
+            extra_lines.append("Final tuned CSV was not updated. Re-run with --update_improved to apply improved shapes.")
+        if extra_lines:
+            self._emit_report_lines(extra_lines, report_file)
         if report_file:
             print(f"Compare results written to {report_file}", flush=True)
 
@@ -985,11 +1053,17 @@ class TunerCommon:
         compare_report_file = self._init_compare_report(
             args, output_file, batch_size, total_batches
         )
+        compare_candidate_file = self._init_compare_candidate_file(args, output_file)
         if args.verbose:
             logger.info(
                 f"total shapes to be tuned: {len(self.untunedf) }, total_batches: {total_batches}, batch_size: {batch_size}"
             )
-            logger.info(f"results will be written to {output_file}")
+            if args.compare and not args.update_improved:
+                logger.info(
+                    f"compare candidate results will be written to {compare_candidate_file}"
+                )
+            else:
+                logger.info(f"results will be written to {output_file}")
         processed_batches = 0
         results = []
         topk = -1 if fast_mode else 1
@@ -1024,6 +1098,7 @@ class TunerCommon:
                                 processed_batches,
                                 total_batches,
                                 compare_report_file=compare_report_file,
+                                compare_candidate_file=compare_candidate_file,
                             )
                         )
                         self._record_completed_compare_batch(
@@ -1077,6 +1152,8 @@ class TunerCommon:
                     args.min_improvement_pct,
                     output_file,
                     report_file=compare_report_file,
+                    apply_updates=args.update_improved,
+                    candidate_file=compare_candidate_file,
                 )
             if tune_exit is not None:
                 raise tune_exit
