@@ -4,9 +4,15 @@ import functools
 import os
 import re
 import subprocess
+import sys
 
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
+
+IS_WINDOWS = sys.platform == "win32"
+# On Windows, ROCm ships `hipinfo.exe` instead of `rocminfo`. The output
+# format differs, so we keep two separate parsers below.
+_GPU_INFO_TOOL = "hipinfo" if IS_WINDOWS else "rocminfo"
 
 GFX_MAP = {
     0: "native",
@@ -31,23 +37,32 @@ GFX_MAP = {
 }
 
 
+def _run_gpu_info_tool() -> str:
+    """Run the platform GPU info tool (rocminfo / hipinfo) and return stdout."""
+    tool = executable_path(_GPU_INFO_TOOL)
+    result = subprocess.run(
+        [tool],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
     try:
-        rocminfo = executable_path("rocminfo")
-        result = subprocess.run(
-            [rocminfo],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True,
-        )
-        for line in result.stdout.splitlines():
-            if "gfx" in line.lower():
-                return [line.split(":", 1)[-1].strip()]
+        output = _run_gpu_info_tool()
+        for line in output.splitlines():
+            # rocminfo:  "Name: gfx942"
+            # hipinfo:   "gcnArchName:                  gfx1100"
+            match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
+            if match:
+                return [match.group(1).lower()]
     except Exception as e:
-        raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
-    raise RuntimeError("No gfx arch found in rocminfo output.")
+        raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed: {e}") from e
+    raise RuntimeError(f"No gfx arch found in {_GPU_INFO_TOOL} output.")
 
 
 @torch_compile_guard()
@@ -62,11 +77,7 @@ def get_gfx_custom_op_core() -> int:
     # gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
         try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
+            output = _run_gpu_info_tool()
             for line in output.split("\n"):
                 match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
                 if match:
@@ -80,7 +91,7 @@ def get_gfx_custom_op_core() -> int:
                         )
 
         except Exception as e:
-            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
+            raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
     try:
@@ -114,27 +125,44 @@ def get_gfx_list() -> list[str]:
     return gfxs
 
 
+def _parse_cu_num_rocminfo(output: str) -> list[int]:
+    devices = re.split(r"Agent\s*\d+", output)
+    gpu_compute_units: list[int] = []
+    for device in devices:
+        for line in device.split("\n"):
+            if "Device Type" in line and line.find("GPU") != -1:
+                match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
+                if match:
+                    gpu_compute_units.append(int(match.group(1)))
+                break
+    return gpu_compute_units
+
+
+def _parse_cu_num_hipinfo(output: str) -> list[int]:
+    # hipinfo prints one block per device with a line like:
+    #   "multiProcessorCount:           80"
+    # On AMD GPUs this is the compute-unit count.
+    return [
+        int(m.group(1)) for m in re.finditer(r"multiProcessorCount\s*:\s*(\d+)", output)
+    ]
+
+
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            devices = re.split(r"Agent\s*\d+", output)
-            gpu_compute_units = []
-            for device in devices:
-                for line in device.split("\n"):
-                    if "Device Type" in line and line.find("GPU") != -1:
-                        match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
-                        if match:
-                            gpu_compute_units.append(int(match.group(1)))
-                        break
+            output = _run_gpu_info_tool()
+            if IS_WINDOWS:
+                gpu_compute_units = _parse_cu_num_hipinfo(output)
+            else:
+                gpu_compute_units = _parse_cu_num_rocminfo(output)
         except Exception as e:
-            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
+            raise RuntimeError(
+                f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {str(e)}"
+            )
+        if not gpu_compute_units:
+            raise RuntimeError(f"No GPU Compute Unit found in {_GPU_INFO_TOOL} output.")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
     return cu_num
@@ -149,7 +177,24 @@ def get_cu_num():
 def _get_pci_chip_id(device_id=0):
     import ctypes
 
-    libhip = ctypes.CDLL("libamdhip64.so")
+    # On Linux ROCm ships `libamdhip64.so`; on Windows ROCm 7 ships
+    # `amdhip64_7.dll`.
+    if IS_WINDOWS:
+        candidates = ("amdhip64_7.dll", "amdhip64.dll")
+    else:
+        candidates = ("libamdhip64.so",)
+    libhip = None
+    last_err: Exception | None = None
+    for name in candidates:
+        try:
+            libhip = ctypes.CDLL(name)
+            break
+        except OSError as e:
+            last_err = e
+    if libhip is None:
+        raise RuntimeError(
+            f"Could not load AMD HIP runtime ({', '.join(candidates)}): {last_err}"
+        )
     chip_id = ctypes.c_int(0)
     hipDeviceAttributePciChipId = 10019
     err = libhip.hipDeviceGetAttribute(

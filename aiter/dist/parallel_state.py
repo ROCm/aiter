@@ -33,7 +33,16 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-from torch.distributed import Backend, ProcessGroup
+
+# torch.distributed.Backend and ProcessGroup may be absent in minimal builds
+# (e.g. Windows ROCm wheels that ship without the full distributed stack).
+# Import them conditionally so the rest of the module can still be imported;
+# any code that actually calls distributed APIs will fail at runtime as before.
+try:
+    from torch.distributed import Backend, ProcessGroup
+except ImportError:
+    Backend = None  # type: ignore[assignment,misc]
+    ProcessGroup = None  # type: ignore[assignment,misc]
 
 import os
 from aiter import logger

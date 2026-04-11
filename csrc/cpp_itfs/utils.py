@@ -5,6 +5,7 @@
 import shutil
 import os
 import subprocess
+import sys
 from jinja2 import Template
 import ctypes
 from packaging.version import parse, Version
@@ -16,6 +17,9 @@ import logging
 import time
 import inspect
 import json
+
+IS_WINDOWS = sys.platform == "win32"
+NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
 
 
 def get_git_commit_id_short():
@@ -39,17 +43,55 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
-DEFAULT_GPU_ARCH = (
-    subprocess.run(
-        "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
-    )
-    .stdout.strip()
-    .split("\n")[0]
-)
+
+
+def _detect_default_gpu_arch() -> str:
+    """Detect the local GPU arch (gfx*).
+
+    On Linux this used to shell out to `/opt/rocm/llvm/bin/amdgpu-arch`. That
+    path doesn't exist on Windows, and even on Linux it may be missing if ROCm
+    is installed somewhere else. Fall back to whatever `amdgpu-arch` (or
+    `hipinfo` on Windows) is on PATH, and to "" if nothing works — callers
+    that actually need a real arch will fail loudly later.
+    """
+    candidates: list[list[str]] = []
+    if IS_WINDOWS:
+        hipinfo = shutil.which("hipinfo")
+        if hipinfo:
+            candidates.append([hipinfo])
+    else:
+        if os.path.exists("/opt/rocm/llvm/bin/amdgpu-arch"):
+            candidates.append(["/opt/rocm/llvm/bin/amdgpu-arch"])
+        amdgpu_arch = shutil.which("amdgpu-arch")
+        if amdgpu_arch:
+            candidates.append([amdgpu_arch])
+    for cmd in candidates:
+        try:
+            out = subprocess.run(
+                cmd, capture_output=True, text=True, check=False
+            ).stdout
+        except OSError:
+            continue
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("gfx"):
+                return line.split()[0]
+            # hipinfo line: "gcnArchName:                  gfx1100"
+            if "gfx" in line:
+                idx = line.find("gfx")
+                tail = line[idx:].split()[0]
+                if tail.startswith("gfx"):
+                    return tail
+    return ""
+
+
+DEFAULT_GPU_ARCH = _detect_default_gpu_arch()
 GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
 
-HOME_PATH = os.environ.get("HOME")
+HOME_PATH = (
+    os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+)
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
@@ -57,15 +99,24 @@ AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
 
-if AITER_REBUILD >= 1:
-    subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
+if AITER_REBUILD >= 1 and os.path.isdir(BUILD_DIR):
+    # Portable equivalent of `rm -rf {BUILD_DIR}/*` that works on Windows.
+    for _entry in os.listdir(BUILD_DIR):
+        _p = os.path.join(BUILD_DIR, _entry)
+        if os.path.isdir(_p) and not os.path.islink(_p):
+            shutil.rmtree(_p, ignore_errors=True)
+        else:
+            try:
+                os.remove(_p)
+            except OSError:
+                pass
 
 if not os.path.exists(BUILD_DIR):
     os.makedirs(BUILD_DIR, exist_ok=True)
 
 CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
 
-makefile_template = Template("""
+_LINUX_MAKEFILE_TEMPLATE = Template("""
 CXX=hipcc
 TARGET=lib.so
 
@@ -81,6 +132,27 @@ build: $(OBJS)
 clean:
 	rm -f $(TARGET) $(OBJS)
 """)
+
+_WINDOWS_NINJA_TEMPLATE = Template("""
+cxx = hipcc
+cflags = {{cxxflags | join(" ")}} {{includes | join(" ")}}
+
+rule cxx
+  command = $cxx -c $cflags $in -o $out
+
+rule link
+  command = $cxx $in -o $out -shared
+
+{% for src in sources -%}
+build {{ src.replace('.cpp', '.obj') }}: cxx {{src}}
+{% endfor %}
+build lib.dll: link {% for src in sources %}{{ src.replace('.cpp', '.obj') }} {% endfor %}
+
+default lib.dll
+""")
+
+# Backwards-compat alias for any external user.
+makefile_template = _LINUX_MAKEFILE_TEMPLATE
 
 
 def mp_lock(
@@ -111,16 +183,38 @@ def mp_lock(
 
 
 def get_hip_version():
-    hipconfig_home = shutil.which("hipconfig")
+    hipconfig_home = shutil.which("hipconfig") or shutil.which(
+        "hipconfig.exe" if IS_WINDOWS else "hipconfig"
+    )
+    if not hipconfig_home:
+        # Last-ditch: TheRock _rocm_sdk_devel/bin
+        try:
+            import importlib
+
+            mod = importlib.import_module("_rocm_sdk_devel")
+            cand = os.path.join(
+                os.path.dirname(mod.__file__),
+                "bin",
+                "hipconfig.exe" if IS_WINDOWS else "hipconfig",
+            )
+            if os.path.exists(cand):
+                hipconfig_home = cand
+        except Exception:
+            pass
+    if not hipconfig_home:
+        # Return a permissive fallback so importing this module on Windows
+        # without ROCm on PATH still succeeds. Callers that actually compile
+        # native code will fail later with a clearer error.
+        return Version("0.0.0")
     version = subprocess.run(
-        f"{hipconfig_home} --version", shell=True, capture_output=True, text=True
+        [hipconfig_home, "--version"], capture_output=True, text=True
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 
 
 @lru_cache()
 def hip_flag_checker(flag_hip: str) -> bool:
-    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
+    ret = os.system(f"hipcc {flag_hip} -x hip -c {NULL_DEVICE} -o {NULL_DEVICE}")
     if ret == 0:
         return True
     else:
@@ -230,17 +324,42 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         archs = validate_and_update_archs()
         cxxflags += [f"--offload-arch={arch}" for arch in archs]
         cxxflags = [flag for flag in set(cxxflags) if hip_flag_checker(flag)]
-        makefile_file = makefile_template.render(
-            includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
-        )
-        with open(f"{sub_build_dir}/Makefile", "w") as f:
-            f.write(makefile_file)
-        subprocess.run(
-            f"cd {sub_build_dir} && make build -j{len(sources)}",
-            shell=True,
-            capture_output=AITER_LOG_MORE < 2,
-            check=True,
-        )
+        if IS_WINDOWS:
+            # Ninja treats ':' as a rule separator, so Windows drive-letter
+            # paths (C:\foo) must be forward-slashed AND drive colons
+            # escaped (C:/ -> C$:/) before they land in build statements.
+            import re as _re
+
+            def _ninja_path(p: str) -> str:
+                p = p.replace("\\", "/").replace(" ", "$ ")
+                return _re.sub(r"^([A-Za-z]):/", r"\1$:/", p)
+
+            ninja_include_dir = _ninja_path(include_dir)
+            ninja_sources = [_ninja_path(s) for s in sources]
+            ninja_file = _WINDOWS_NINJA_TEMPLATE.render(
+                includes=[f"-I{ninja_include_dir}"],
+                sources=ninja_sources,
+                cxxflags=cxxflags,
+            )
+            with open(os.path.join(sub_build_dir, "build.ninja"), "w") as f:
+                f.write(ninja_file)
+            subprocess.run(
+                ["ninja", "-C", sub_build_dir, "-j", str(len(sources))],
+                capture_output=AITER_LOG_MORE < 2,
+                check=True,
+            )
+        else:
+            makefile_file = _LINUX_MAKEFILE_TEMPLATE.render(
+                includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags
+            )
+            with open(os.path.join(sub_build_dir, "Makefile"), "w") as f:
+                f.write(makefile_file)
+            subprocess.run(
+                f"cd {sub_build_dir} && make build -j{len(sources)}",
+                shell=True,
+                capture_output=AITER_LOG_MORE < 2,
+                check=True,
+            )
 
     def final_func():
         logger.info(
@@ -254,11 +373,18 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     mp_lock(lock_path=lock_path, main_func=main_func, final_func=final_func)
 
 
+_LIB_BASENAME = "lib.dll" if IS_WINDOWS else "lib.so"
+
+
 @lru_cache(maxsize=AITER_MAX_CACHE_SIZE)
 def run_lib(func_name, folder=None):
     if folder is None:
         folder = func_name
-    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
+    lib_path = os.path.join(BUILD_DIR, folder, _LIB_BASENAME)
+    if IS_WINDOWS:
+        lib = ctypes.CDLL(lib_path)
+    else:
+        lib = ctypes.CDLL(lib_path, os.RTLD_LAZY)
     return getattr(lib, func_name)
 
 
@@ -273,7 +399,7 @@ def get_default_func_name(md_name, args: tuple):
 
 
 def not_built(folder):
-    return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
+    return not os.path.exists(os.path.join(BUILD_DIR, folder, _LIB_BASENAME))
 
 
 def compile_template_op(
