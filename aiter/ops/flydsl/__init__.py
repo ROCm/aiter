@@ -23,3 +23,12 @@ if is_flydsl_available():
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
     ]
+
+    # RoPE kernel requires FlyDSL source with kernels/ directory.
+    # Guard import so missing source doesn't break MOE/HGEMM.
+    try:
+        from .rope_kernels import flydsl_fused_qk_rope_reshape_and_cache
+
+        __all__ += ["flydsl_fused_qk_rope_reshape_and_cache"]
+    except ImportError:
+        pass
