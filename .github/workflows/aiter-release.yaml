@@ -35,7 +35,7 @@ on:
       docker_username:
         description: 'Docker username for docker login'
         required: true
-        default: 'rocmshard'
+        default: 'rocmshared'
       gpu_archs:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
@@ -47,14 +47,12 @@ on:
       runner:
         description: 'Select build host'
         required: true
-        default: 'aiter-k8s-build'
+        default: 'aiter-1gpu-runner'
         type: choice
         options:
-          - build-only-aiter
-          - aiter-mi300-1gpu
-          - aiter-mi325-1gpu
-          - linux-aiter-mi355-1
           - aiter-1gpu-runner
+          - build-only-aiter
+          - linux-aiter-mi35x-1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.rocm_version || 'default' }}
