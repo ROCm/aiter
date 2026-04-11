@@ -181,12 +181,16 @@ template<typename F, typename... R, std::enable_if_t<(is_constant_v<R> && ...), 
 OPUS_H_D constexpr void static_for(F f, R...) { impl::static_for_impl<make_index_seq<R::value...>>{}(f); }
 
 namespace impl {
-template <typename Seq> struct static_ford_impl {
-    template <typename F, typename... Ids> OPUS_H_D constexpr void operator()(F f, Ids... ids) const {
-        static_for<get<0>(Seq{})>([=](auto I){ static_ford_impl<decltype(seq_pop_front(Seq{}))>{}(f, ids..., I); });
-    }
+// Flat static_ford: single-level static_for, non-recursive compile-time index decomposition via fold expressions
+template <index_t D, index_t... Is, index_t... Ns> constexpr index_t ford_stride(seq<Is...>, seq<Ns...>) { return ((Is > D ? Ns : index_t(1)) * ... * index_t(1)); }
+template <index_t D, index_t... Is, index_t... Ns> constexpr index_t ford_dim(seq<Is...>, seq<Ns...>) { return ((Is == D ? Ns : index_t(1)) * ...); }
+template <index_t I, index_t D, index_t... Ns> constexpr index_t ford_at() { return (I / ford_stride<D>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})) % ford_dim<D>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{}); }
+template <typename Seq> struct static_ford_impl;
+template <index_t... Ns> struct static_ford_impl<seq<Ns...>> {
+    template <typename F, index_t I, index_t... Ds> OPUS_H_D static constexpr void call_one(F& f, number<I>, seq<Ds...>) { f(number<ford_at<I, Ds, Ns...>()>{}...); }
+    template <typename F> OPUS_H_D constexpr void operator()(F f) const { static_for<(Ns * ... * 1)>([&](auto I) { call_one(f, I, make_index_seq<sizeof...(Ns)>{}); }); }
 };
-template <> struct static_ford_impl<seq<>> { template <typename F, typename... Ids> OPUS_H_D constexpr void operator()(F f, Ids... ids) const { f(ids...); } };
+template <> struct static_ford_impl<seq<>> { template <typename F> OPUS_H_D constexpr void operator()(F f) const { f(); } };
 }
 
 template<index_t... N, typename F> OPUS_H_D constexpr void static_ford(F f) { impl::static_ford_impl<seq<N...>>{}(f); }
@@ -375,8 +379,16 @@ OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2) 
 template <class T0, class T1, class T2, class T3>
 OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3) {
                                             return impl::concat_tuple(t0, t1, t2, t3, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}, make_index_seq<T3::size()>{}); }
-template <class T0, class T1, class T2, class T3, class T4, class... Ts>
-OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, Ts const&... ts) { return concat_tuple(concat_tuple(t0, t1, t2, t3), concat_tuple(t4, ts...)); }
+namespace impl {
+template <class T0, class T1, class T2, class T3, class T4, index_t... I0, index_t... I1, index_t... I2, index_t... I3, index_t... I4>
+OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, seq<I0...>, seq<I1...>, seq<I2...>, seq<I3...>, seq<I4...>) {
+    return opus::make_tuple(get<I0>(t0)..., get<I1>(t1)..., get<I2>(t2)..., get<I3>(t3)..., get<I4>(t4)...); }
+}
+template <class T0, class T1, class T2, class T3, class T4>
+OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4) {
+    return impl::concat_tuple(t0, t1, t2, t3, t4, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}, make_index_seq<T3::size()>{}, make_index_seq<T4::size()>{}); }
+template <class T0, class T1, class T2, class T3, class T4, class T5, class... Ts>
+OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, T5 const& t5, Ts const&... ts) { return concat_tuple(concat_tuple(t0, t1, t2, t3, t4), concat_tuple(t5, ts...)); }
 
 template <typename> struct is_tuple : false_type {};
 template <typename... T> struct is_tuple<opus::tuple<T...>> : true_type {};
@@ -395,8 +407,41 @@ template <typename T, index_t... Is> OPUS_H_D constexpr auto                    
 template <typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto  explode_tuple(const T& t) { return explode_tuple(t, make_index_seq<size<T>()>{}); }
 template <typename T, index_t... Is> OPUS_H_D constexpr auto                                 explode_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
 
-template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
-template <typename T> OPUS_H_D constexpr auto                flatten_tuple(const T& t) { return flatten_tuple(t, make_index_seq<size<T>()>{}); }
+template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple_general(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
+// Fast path: if all elements are non-tuple (already flat), return as-is
+template <typename T, std::enable_if_t<is_tuple_v<T> && !(is_tuple_v<tuple_element_t<0, remove_cvref_t<T>>>), bool> = true>
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { return t; }
+// 1-level nested: directly index each flat element as (group, local) — bypasses concat_tuple + explode_tuple
+namespace impl {
+// For a tuple-of-tuples T, get group sizes as a seq
+template<typename T, index_t... Gs> constexpr auto group_sizes(seq<Gs...>) { return seq<size<tuple_element_t<Gs, T>>()...>{}; }
+template<typename T, index_t... Gs> constexpr index_t group_total(seq<Gs...>) { return (size<tuple_element_t<Gs, T>>() + ...); }
+// Find group G for flat element J given group sizes
+template<index_t J, index_t... Gs, index_t... Ns>
+constexpr index_t flat_group(seq<Gs...>, seq<Ns...>) {
+    index_t acc = 0, r = 0; ((void)(acc += Ns, (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r;
+}
+// Compute cumulative group offset for group G
+template<typename T, index_t G, index_t... Gs> constexpr index_t group_offset(seq<Gs...>) { return ((Gs < G ? size<tuple_element_t<Gs, T>>() : 0) + ...); }
+// Get flat element J from tuple-of-tuples
+template<typename T, index_t J, typename GS>
+OPUS_H_D constexpr auto flatten_at(const T& t) {
+    constexpr auto gs = make_index_seq<size<T>()>{};
+    constexpr index_t G = flat_group<J>(gs, GS{});
+    constexpr index_t L = J - group_offset<T, G>(gs);
+    return get<L>(get<G>(t));
+}
+template<typename T, typename GS, index_t... Js>
+OPUS_H_D constexpr auto flatten_tuple_impl(const T& t, seq<Js...>) { return opus::make_tuple(flatten_at<T, Js, GS>(t)...); }
+}
+template <typename T, std::enable_if_t<is_tuple_v<T> && (is_tuple_v<tuple_element_t<0, remove_cvref_t<T>>>), bool> = true>
+OPUS_H_D constexpr auto flatten_tuple(const T& t) {
+    using U = remove_cvref_t<T>;
+    constexpr auto gs = make_index_seq<size<U>()>{};
+    using GS = decltype(impl::group_sizes<U>(gs));
+    constexpr index_t total = impl::group_total<U>(gs);
+    return impl::flatten_tuple_impl<U, GS>(t, make_index_seq<total>{});
+}
 
 namespace impl {
 template<typename Outer, typename Inner, index_t...Is>
@@ -436,6 +481,9 @@ template<typename R, typename T, std::enable_if_t<is_tuple_v<T>, bool> = true>
 OPUS_H_D constexpr auto reduce_tuple(const T & t) { return  impl::reduce_tuple_impl<R>(t, make_index_seq<size<T>()>{}); }
 template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_sum(const T & t) { return reduce_tuple<opus::plus>(t); }
 template<typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D constexpr auto reduce_tuple_mul(const T & t) { return reduce_tuple<opus::multiplies>(t); }
+// Fast path: fold expression for tuple of number<> types (avoids N-1 intermediate tuple types)
+template<typename... Ns, std::enable_if_t<sizeof...(Ns) != 0 && (is_constant_v<Ns> && ...), bool> = true>
+OPUS_H_D constexpr auto reduce_tuple_mul(const tuple<Ns...>&) { return opus::tuple<number<(Ns::value * ...)>>{}; }
 
 namespace impl {
 template<typename PT, index_t... Js>
@@ -647,15 +695,37 @@ OPUS_H_D constexpr auto layout_to_vectorized_issue_space() {
     return issue_space_vec;
 }
 
-// this function is usually not constexpr. pre-compute all the offset under current layout
+// Cache issue-space computations for load/store (avoids redundant evaluation across methods)
+template<typename Layout, index_t vec = 1> struct layout_load_traits {
+    static constexpr auto issue_space = layout_to_issue_space<Layout>();
+    static constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{}); static constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+};
+// Cache precomputed offsets for fully-static layouts (used by tr_load immediate-offset path)
+template<typename Layout, index_t vec, bool use_imm> struct layout_imm_offsets {};
+template<typename Layout, index_t vec> struct layout_imm_offsets<Layout, vec, true> { using L = remove_cvref_t<Layout>;
+    static constexpr auto u_linear = make_layout<-1>(layout_load_traits<Layout, vec>::issue_space_vec);
+    static constexpr auto offsets = layout_to_offsets<vec>(L(typename L::Shape{}, typename L::Stride{}, typename L::Coord{}));
+};
+
+// Decompose runtime flat index into a runtime multi-index tuple (all index_t) — avoids per-iteration template instantiation
+template<index_t... Is, index_t... Ns>
+OPUS_H_D constexpr auto flat_to_coords(index_t flat, seq<Is...>, tuple<number<Ns>...>) {
+    constexpr index_t strides[] = {impl::ford_stride<Is>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})...};
+    constexpr index_t dims[] = {Ns...};
+    return opus::make_tuple(static_cast<index_t>((flat / strides[Is]) % dims[Is])...);
+}
+
+// pre-compute all the offset under current layout, using runtime loop to avoid N unique coord_to_linear instantiations
 template<index_t vec, typename Layout>
 OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
-    constexpr auto issue_space_vec = layout_to_vectorized_issue_space<vec, Layout>();
-    constexpr index_t num_issues = get<0>(reduce_tuple_mul(issue_space_vec)).value;
+    using LT = layout_load_traits<Layout, vec>;
+    constexpr auto issue_space_vec = LT::issue_space_vec;
+    constexpr index_t num_issues = LT::r_elem.value;
+    constexpr index_t ndim = size<remove_cvref_t<decltype(issue_space_vec)>>();
     array<index_t, num_issues> offsets;
-
-    constexpr auto u_linear = make_layout<-1>(issue_space_vec);
-    static_ford(issue_space_vec, [&](auto ... ids){ offsets[u_linear(ids...)] = u(ids...); });
+    for (index_t i = 0; i < num_issues; i++) {
+        offsets[i] = u(flat_to_coords(i, make_index_seq<ndim>{}, issue_space_vec));
+    }
     return offsets;
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -708,7 +778,12 @@ template <index_t I, typename T, std::enable_if_t<is_vector_v<T>, bool> = true> 
 
 namespace impl {
 template <class T0, class T1, index_t... I0, index_t... I1>
-OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, seq<I0...>, seq<I1...>) { return opus::make_vector(get<I0>(t0)..., get<I1>(t1)...); }
+OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, seq<I0...>, seq<I1...>) {
+    if constexpr (std::is_same_v<remove_cvref_t<T0>, remove_cvref_t<T1>> && sizeof...(I0) > 1) {
+        using R = vector_t<typename vector_traits<remove_cvref_t<T0>>::dtype, sizeof...(I0) + sizeof...(I1)>;
+        return __builtin_bit_cast(R, __builtin_shufflevector(t0, t1, I0..., (sizeof...(I0) + I1)...));
+    } else { return opus::make_vector(get<I0>(t0)..., get<I1>(t1)...); }
+}
 template <class T0, class T1, class T2, index_t... I0, index_t... I1, index_t...I2>
 OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2, seq<I0...>, seq<I1...>, seq<I2...>) { return opus::make_vector(get<I0>(t0)..., get<I1>(t1)..., get<I2>(t2)...); }
 template <class T0, class T1, class T2, class T3, index_t... I0, index_t... I1, index_t...I2, index_t...I3>
@@ -716,7 +791,7 @@ OPUS_H_D constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2, 
 }
 template <class T0> OPUS_H_D  constexpr auto concat_vector(T0 const& t0) { return t0; }
 template <class T0, class T1>
-OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1) { return impl::concat_vector(t0, t1, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}); }
+OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1) { return impl::concat_vector(t0, t1, make_index_seq<size<T0>()>{}, make_index_seq<size<T1>()>{}); }
 template <class T0, class T1, class T2>
 OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2) { return impl::concat_vector(t0, t1, t2, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}); }
 template <class T0, class T1, class T2, class T3>
@@ -725,8 +800,11 @@ OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2,
 template <class T0, class T1, class T2, class T3, class T4, class... Ts>
 OPUS_H_D  constexpr auto concat_vector(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, Ts const&... ts) { return concat_vector(concat_vector(t0, t1, t2, t3), concat_vector(t4, ts...)); }
 
-template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void fill(T& a, typename vector_traits<T>::dtype const& value) { static_for<size<T>()>([&](auto i){ a[i.value] = value; }); }
-template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void clear(T& a) { fill(a, static_cast<typename vector_traits<T>::dtype>(0)); }
+template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void fill(T& a, typename vector_traits<T>::dtype const& value) {
+    if constexpr (size<T>() <= 4) { static_for<size<T>()>([&](auto i){ a[i.value] = value; }); }
+    else { for (index_t i = 0; i < size<T>(); ++i) a[i] = value; }  // runtime loop for large vectors
+}
+template <typename T, std::enable_if_t<is_vector_v<T>, bool> = true> OPUS_H_D constexpr void clear(T& a) { a = {}; }
 
 namespace impl {
 template<typename T, index_t... Is, std::enable_if_t<is_vector_v<T>, bool> = true>
@@ -754,7 +832,10 @@ OPUS_H_D constexpr auto to_vector(const T& t) { return impl::to_vector_impl(t, m
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // slice
 namespace impl {
-template<typename C, index_t...Is, std::enable_if_t<is_vector_v<C>, bool> = true> OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_vector(get<Is>(c)...); }
+template<typename C, index_t...Is, std::enable_if_t<is_vector_v<C>, bool> = true> OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) {
+    if constexpr (sizeof...(Is) == 1) return opus::make_vector(get<Is>(c)...);
+    else { using R = vector_t<typename vector_traits<remove_cvref_t<C>>::dtype, sizeof...(Is)>; return __builtin_bit_cast(R, __builtin_shufflevector(c, c, Is...)); }
+}
 template<typename C, index_t...Is, std::enable_if_t<is_array_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_array(get<Is>(c)...); }
 template<typename C, index_t...Is, std::enable_if_t<is_tuple_v<C>, bool> = true>  OPUS_H_D constexpr auto slice_impl(C&& c, seq<Is...>) { return opus::make_tuple(get<Is>(c)...); }
 
@@ -785,7 +866,10 @@ OPUS_H_D constexpr auto set_slice_impl(C&& dst_c, V&& src_c, seq<Ds...>, seq<Ss.
             dst_c = __builtin_bit_cast(dst_t, dst_i32); return;
         }
     }
-    ((dst_c[Ds] = src_c[Ss]), ...);
+    if constexpr (is_contiguous_seq(seq<Ds...>{}) && is_contiguous_seq(seq<Ss...>{}) && (is_vector_v<dst_t> || is_array_v<dst_t>) && len > 2) {
+        constexpr index_t d0 = seq<Ds...>::at(number<0>{}), s0 = seq<Ss...>::at(number<0>{});
+        for (index_t i = 0; i < len; ++i) dst_c[d0 + i] = src_c[s0 + i];  // runtime loop avoids N-element fold instantiation
+    } else { ((dst_c[Ds] = src_c[Ss]), ...); }
 }
 }
 
@@ -1348,7 +1432,7 @@ namespace impl {
 // rocm-7.1.1, when there are multiple invokes of this kernel (across different __global__ in same compile target ?) will fail to inline below function
 template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_vector_v<S>, bool> = true>
 OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) {
-    return impl::vector_return_type<void, decltype(cast<D>(get<Is>(s), std::forward<Aux>(aux)...))...>{cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...}; }
+    return impl::vector_return_type<D, decltype(cast<D>(get<Is>(s), std::forward<Aux>(aux)...))...>{cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...}; }
     //return opus::make_vector(cast<D>(get<Is>(s), std::forward<Aux>(aux)...)...); }
 template<typename D, typename S, index_t... Is, typename... Aux, std::enable_if_t<is_tuple_v<S>, bool> = true>
 OPUS_D constexpr decltype(auto) cast_impl(const S& s, seq<Is...>, Aux&&... aux) {
@@ -1374,6 +1458,8 @@ OPUS_D constexpr decltype(auto) cast(const S& s, Aux&&... aux) {
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<4>{}), make_index_seq<size<S>() / 4>{}, std::forward<Aux>(aux)...)); }
     else if constexpr (std::is_same_v<get_value_t<S>, fp8_t>  && size<S>() % 2 == 0 && std::is_same_v<D, fp32_t>) { // fp8 -> fp32, x2N
                     return impl::unfold_from_container<S>(impl::cast_impl<D>(impl::fold_as_container_of_vec(s, number<2>{}), make_index_seq<size<S>() / 2>{}, std::forward<Aux>(aux)...)); }
+    else if constexpr (is_vector_v<S> && size<S>() > 16 && sizeof...(Aux) == 0) {
+        return __builtin_convertvector(s, vector_t<D, size<S>()>); }
     else   return impl::cast_impl<D>(s, make_index_seq<size<S>()>{}, std::forward<Aux>(aux)...); }
 
 // entry point for vectorized cast(), for dpacks
@@ -1630,23 +1716,20 @@ struct gmem {
     template<index_t vec = 1, typename Layout, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load(const Layout& u, int s_os = 0/* do we really need this? */, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
-        vector_t<scalar_type, vec * vector_size * r_elem.value> r;          // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = load<vec>(u(ids...), s_os, number<aux>{});
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
-        });
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) {
+            auto tmp = load<vec>(offsets[i], s_os, number<aux>{});
+            for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
+        }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);                      // we use this layout to describe the register layout
-        array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...), s_os, number<aux>{}); }); // issue the loading instruction multiple times
+        array<vector_type<vec>, r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i], s_os, number<aux>{});
         return r;
 #endif
     }
@@ -1654,53 +1737,53 @@ struct gmem {
     template<index_t vec = 1, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store(const V& x, const Layout& u, int s_os = 0/* do we really need this? */, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_ford(issue_space_vec, [&](auto ... ids){ // issue the loading instruction multiple times
-            auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-            store<vec>(v_, u(ids...), s_os, number<aux>{});
-        });
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            store<vec>(v_, offsets[i], s_os, number<aux>{});
+        }
     }
 
     template<index_t vec = 1, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
     OPUS_D void async_load(void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
-        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<LayoutG, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
+        auto smem_offsets = layout_to_offsets<vec>(u_smem);
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
-        static_ford(issue_space_vec, [&](auto... ids) {
-            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
-        });
+        for (index_t i = 0; i < r_elem.value; i++) {
+            async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i])), gmem_offsets[i], s_os, number<aux>{});
+        }
     }
 
     template<index_t vec = 1, typename Predicate, typename Layout, index_t aux = 0, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load_if(const Predicate& pred, const Layout& u, int s_os = 0, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = pred(ids...) ? load<vec>(u(ids...), s_os, number<aux>{}) : vector_type<vec>{0};
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        static_for<r_elem.value>([&](auto i){
+            auto tmp = pred(i) ? load<vec>(offsets[i.value], s_os, number<aux>{}) : vector_type<vec>{0};
+            set_slice(r, tmp, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(u(ids...), s_os, number<aux>{}) : vector_type<vec>{0}; }); // issue the loading instruction multiple times
+        static_for<r_elem.value>([&](auto i){ r[i.value] = pred(i) ? load<vec>(offsets[i.value], s_os, number<aux>{}) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1708,38 +1791,40 @@ struct gmem {
     template<index_t vec = 1, typename Predicate, typename V, typename Layout, index_t aux = 0, std::enable_if_t<((is_array_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u, int s_os = 0, number<aux> = {})
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
-        constexpr auto u_r = make_layout<-1>(issue_space);
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_ford(issue_space_vec, [&](auto ... ids){
-            if (pred(ids...)) {
-                auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-                store<vec>(v_, u(ids...), s_os, number<aux>{});
+        static_for<r_elem.value>([&](auto i){
+            if (pred(i)) {
+                auto v_ = slice(a_, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
+                store<vec>(v_, offsets[i.value], s_os, number<aux>{});
             }
         });
     }
 
     template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
     OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
-        constexpr auto issue_space = layout_to_issue_space<LayoutG>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<LayoutG, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
+        auto smem_offsets = layout_to_offsets<vec>(u_smem);
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
 
-        static_ford(issue_space_vec, [&](auto... ids) {
-            if (pred(ids...)) {
-                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + u_smem(ids...))), u_gmem(ids...), s_os, number<aux>{});
+        static_for<r_elem.value>([&](auto i) {
+            if (pred(i)) {
+                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i.value])), gmem_offsets[i.value], s_os, number<aux>{});
             } else {
                 using type = vector_type<vec>;
                 type z = {0};
-                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + u_smem(ids...)) = z;
+                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + smem_offsets[i.value]) = z;
             }
         });
     }
@@ -1810,23 +1895,20 @@ struct smem {
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load(const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
-        vector_t<scalar_type, vec * vector_size * r_elem.value> r;          // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = load<vec>(u(ids...));
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
-        });
+        vector_t<scalar_type, vec * vector_size * r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) {
+            auto tmp = load<vec>(offsets[i]);
+            for (index_t j = 0; j < vec * vector_size; j++) r[i * vec * vector_size + j] = tmp[j];
+        }
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);                      // we use this layout to describe the register layout
-        array<vector_type<vec>, r_elem.value> r;                                      // local scratch to host the loaded register, and return it
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = load<vec>(u(ids...)); }); // issue the loading instruction multiple times
+        array<vector_type<vec>, r_elem.value> r;
+        for (index_t i = 0; i < r_elem.value; i++) r[i] = load<vec>(offsets[i]);
         return r;
 #endif
     }
@@ -1834,35 +1916,31 @@ struct smem {
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto tr_load(const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
         using L = remove_cvref_t<Layout>;
         constexpr bool use_imm = is_static_tuple_v<typename L::Shape> && is_static_tuple_v<typename L::Stride>;
-        [[maybe_unused]] const int base = u(transform_tuple([](auto) { return number<0>{}; }, issue_space_vec)) * sizeof(T);
+        [[maybe_unused]] const int base = u(transform_tuple([](auto) { return number<0>{}; }, LT::issue_space_vec)) * sizeof(T);
+        [[maybe_unused]] auto offsets = layout_to_offsets<vec>(u);
 
-        auto fn = [&](auto ... ids) {
+        auto do_load = [&](auto i) {
             if constexpr (use_imm) {
-                constexpr auto u_linear = make_layout<-1>(issue_space_vec);
-                constexpr auto offsets = layout_to_offsets<vec>(L(typename L::Shape{}, typename L::Stride{}, typename L::Coord{}));
-                constexpr int off = offsets[u_linear(ids...)] * sizeof(T);
+                using IMM = layout_imm_offsets<Layout, vec, true>;
+                constexpr int off = IMM::offsets[i.value] * sizeof(T);
                 if constexpr (off >= 0 && off <= 0xffff) { return _tr_load<vec, off>(base); }
             }
-            return tr_load<vec>(u(ids...));
+            return tr_load<vec>(offsets[i.value]);
         };
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, fn(ids...), number<u_rs>{}, number<u_rs + vec>{});
+        static_for<r_elem.value>([&](auto i){
+            set_slice(r, do_load(i), number<i.value * vec>{}, number<(i.value + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = fn(ids...); });
+        static_for<r_elem.value>([&](auto i){ r[i.value] = do_load(i); });
         return r;
 #endif
     }
@@ -1870,43 +1948,41 @@ struct smem {
     template<index_t vec = 1, typename V, typename Layout, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store(const V& x, const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
-        constexpr auto u_r = make_layout<-1>(issue_space);                      // we use this layout to describe the register layout
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_ford(issue_space_vec, [&](auto ... ids){ // issue the loading instruction multiple times
-            auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-            store<vec>(v_, u(ids...));
-        });
+        for (index_t i = 0; i < r_elem.value; i++) {
+            vector_type<vec> v_;
+            for (index_t j = 0; j < vec * vector_size; j++) v_[j] = a_[i * vec * vector_size + j];
+            store<vec>(v_, offsets[i]);
+        }
     }
 
     template<index_t vec = 1, typename Predicate, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto load_if(const Predicate& pred, const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = pred(ids...) ? load<vec>(u(ids...)) : vector_type<vec>{0};
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        static_for<r_elem.value>([&](auto i){
+            auto tmp = pred(i) ? load<vec>(offsets[i.value]) : vector_type<vec>{0};
+            set_slice(r, tmp, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(u(ids...)) : vector_type<vec>{0}; });
+        static_for<r_elem.value>([&](auto i){ r[i.value] = pred(i) ? load<vec>(offsets[i.value]) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1914,23 +1990,20 @@ struct smem {
     template<index_t vec = 1, typename Predicate, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto tr_load_if(const Predicate& pred, const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
-        constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
 #if OPUS_TILE_CONTAINER == 0
-        constexpr auto u_r = make_layout<-1>(issue_space);
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){
-            auto tmp = pred(ids...) ? tr_load<vec>(u(ids...)) : vector_type<vec>{0};
-            constexpr index_t u_rs = u_r(ids...);
-            set_slice(r, tmp, number<u_rs>{}, number<u_rs + vec>{});
+        static_for<r_elem.value>([&](auto i){
+            auto tmp = pred(i) ? tr_load<vec>(offsets[i.value]) : vector_type<vec>{0};
+            set_slice(r, tmp, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
-        constexpr auto u_r = make_layout<-1>(issue_space_vec);
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? tr_load<vec>(u(ids...)) : vector_type<vec>{0}; });
+        static_for<r_elem.value>([&](auto i){ r[i.value] = pred(i) ? tr_load<vec>(offsets[i.value]) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1938,21 +2011,21 @@ struct smem {
     template<index_t vec = 1, typename Predicate, typename V, typename Layout, std::enable_if_t<((is_array_v<V> || is_dtype_v<V> || is_vector_v<V>) && is_layout_v<Layout>), bool> = true>
     OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u)
     {
-        constexpr auto issue_space = layout_to_issue_space<Layout>();
-        constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{});
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        auto offsets = layout_to_offsets<vec>(u);
 
-        constexpr auto u_r = make_layout<-1>(issue_space);
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_ford(issue_space_vec, [&](auto ... ids){
-            if (pred(ids...)) {
-                auto v_ = slice(a_, number<u_r(ids...)>{}, number<u_r(ids...) + vec>{});
-                store<vec>(v_, u(ids...));
+        static_for<r_elem.value>([&](auto i){
+            if (pred(i)) {
+                auto v_ = slice(a_, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
+                store<vec>(v_, offsets[i.value]);
             }
         });
     }
@@ -2409,10 +2482,22 @@ struct p_dim {};
 struct y_dim {};
 
 namespace impl{ // utlity function to play with shape
+// Build filtered index seq via recursive concat_seq — avoids concat_tuple on conditional tuples
+template<typename FDim, typename Target>
+static constexpr auto pickup_filter(seq<>) { return seq<>{}; }
+template<typename FDim, typename Target, index_t I0, index_t... Rest>
+static constexpr auto pickup_filter(seq<I0, Rest...>) {
+    if constexpr (std::is_same_v<remove_cvref_t<decltype(get<I0>(FDim{}))>, remove_cvref_t<Target>>)
+        return concat_seq(seq<I0>{}, pickup_filter<FDim, Target>(seq<Rest...>{}));
+    else return pickup_filter<FDim, Target>(seq<Rest...>{});
+}
+template<typename Shape, index_t... Fs>
+OPUS_D static constexpr auto pickup_shape_apply(seq<Fs...>) { return opus::make_tuple(get<Fs>(Shape{})...); }
+
 template<typename Shape, typename FDim, typename Target, index_t... Is>
 OPUS_D static constexpr auto pickup_shape_impl(const Shape&, const FDim&, Target, seq<Is...>) {
     static_assert(size<Shape>() == size<FDim>());
-    return concat_tuple(std::conditional_t< std::is_same_v<decltype(get<Is>(FDim{})), remove_cvref_t<Target>>,  tuple<decltype(get<Is>(Shape{}))>,  tuple<> >{}...);
+    return pickup_shape_apply<Shape>(pickup_filter<FDim, Target>(seq<Is...>{}));
 }
 
 template<typename Dim, index_t... Js>
@@ -2451,8 +2536,30 @@ OPUS_D constexpr auto unfold_x_stride_each(const Stride& stride) {
     return transform_tuple([&](auto i_elem){ return i_elem * get<I>(stride); }, current_stride);
 }
 
+// Find which dim group flat element J belongs to: group G where cumulative size > J
+template<typename Dim, index_t J, index_t... Gs>
+constexpr index_t unfold_find_group(seq<Gs...>) {
+    index_t acc = 0, result = 0;
+    ((void)(acc += size<decltype(get<Gs>(Dim{}))>(), (acc <= J ? (void)(result = Gs + 1) : (void)0)), ...);
+    return result;
+}
+// Compute stride for flat element J: within-group packed stride × group base stride
+template<typename Dim, typename Shape, typename Stride, index_t J>
+OPUS_D constexpr auto unfold_x_stride_at(const Stride& stride) {
+    constexpr index_t G = unfold_find_group<Dim, J>(make_index_seq<size<Dim>()>{});
+    constexpr index_t group_end = dim_offset_sum<Dim>(make_index_seq<G + 1>{});
+    constexpr auto local_stride = packed_stride_at<Shape, J>(make_index_seq<group_end - J - 1>{});
+    return local_stride * get<G>(stride);
+}
+// Flat unfold: directly compute each element's stride, bypassing concat_tuple
+template<typename Dim, typename Shape, typename Stride, index_t... Js>
+OPUS_D constexpr auto unfold_x_stride_flat(const Stride& stride, seq<Js...>) {
+    return opus::make_tuple(unfold_x_stride_at<Dim, Shape, Stride, Js>(stride)...);
+}
 template<typename Dim, typename Shape, typename Stride, index_t... Is>
-OPUS_D constexpr auto unfold_x_stride_impl(const Stride& stride, seq<Is...>) { return concat_tuple(unfold_x_stride_each<Dim, Shape, Stride, Is>(stride)...); }
+OPUS_D constexpr auto unfold_x_stride_impl(const Stride& stride, seq<Is...>) {
+    return unfold_x_stride_flat<Dim, Shape, Stride>(stride, make_index_seq<size<Shape>()>{});
+}
 }
 
 template<typename Shape, typename Dim, typename Target>
@@ -2484,42 +2591,24 @@ OPUS_D constexpr auto unfold_x_stride(const Dim&, const Shape&, const Stride& st
 }
 
 #define OPUS_KP_(x_) static_assert(opus::tuple_count<opus::p_dim>(opus::flatten_tuple(x_ ())) == size<C>())
+// Per-axis layout API: generates y_shape_X, p_shape_X, layout_X (3 overloads), layout_X_packed, y_layout_X
+#define OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(X)                                                                                                                       \
+    OPUS_D static constexpr auto y_shape_##X() { return y_shape(shape_##X(), dim_##X()); }                                                                          \
+    OPUS_D static constexpr auto p_shape_##X() { return p_shape(shape_##X(), dim_##X()); }                                                                          \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_##X() { return make_layout<cached_vec>(shape_##X());}                                             \
+    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_##X(S&& stride) { return make_layout<cached_vec>(shape_##X(), unfold_x_stride(dim_##X(), shape_##X(), stride));} \
+    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_##X(S&& stride, C&& z) { OPUS_KP_(dim_##X); return make_layout<cached_vec>(shape_##X(), unfold_x_stride(dim_##X(), shape_##X(), stride), opus::unfold_p_coord(dim_##X(), z));}  \
+    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_##X##_packed(C&& z) { OPUS_KP_(dim_##X); return make_layout_packed<cached_vec>(shape_##X(), opus::unfold_p_coord(dim_##X(), z));}   \
+    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_##X(Ts&&... strides) {return layout_##X<cached_vec>(opus::make_tuple(strides...)); }  \
+    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_##X() { return make_layout<cached_vec>(y_shape_##X());}
+
 // any struct implement adaptor like feature must implement(or using from base) shape_a/b/c, dim_a/b/c
 #define OPUS_ADAPTOR_LAYOUT_API_DEFINE                                                                                                                              \
     template<typename S, typename D> OPUS_D static constexpr auto y_shape(const S& /*shape*/, const D& /*dim*/) { return opus::pickup_shape(S{}, D{}, y_dim{}); }   \
     template<typename S, typename D> OPUS_D static constexpr auto p_shape(const S& /*shape*/, const D& /*dim*/) { return opus::pickup_shape(S{}, D{}, p_dim{}); }   \
-                                                                                               \
-    OPUS_D static constexpr auto y_shape_a() { return y_shape(shape_a(), dim_a()); }           \
-    OPUS_D static constexpr auto y_shape_b() { return y_shape(shape_b(), dim_b()); }           \
-    OPUS_D static constexpr auto y_shape_c() { return y_shape(shape_c(), dim_c()); }           \
-                                                                                               \
-    OPUS_D static constexpr auto p_shape_a() { return p_shape(shape_a(), dim_a()); }           \
-    OPUS_D static constexpr auto p_shape_b() { return p_shape(shape_b(), dim_b()); }           \
-    OPUS_D static constexpr auto p_shape_c() { return p_shape(shape_c(), dim_c()); }           \
-                                                                                               \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_a() { return make_layout<cached_vec>(shape_a());}                         \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_b() { return make_layout<cached_vec>(shape_b());}                         \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto layout_c() { return make_layout<cached_vec>(shape_c());}                         \
-                                                                                                                                            \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_a(S&& stride) { return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride));} \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_b(S&& stride) { return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride));} \
-    template<index_t cached_vec = 0, typename S> OPUS_D constexpr auto layout_c(S&& stride) { return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride));} \
-    /* Note, all the coord passed in must be p_coord*/                                                                                      \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_a(S&& stride, C&& z) { OPUS_KP_(dim_a); return make_layout<cached_vec>(shape_a(), unfold_x_stride(dim_a(), shape_a(), stride), opus::unfold_p_coord(dim_a(), z));}  \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_b(S&& stride, C&& z) { OPUS_KP_(dim_b); return make_layout<cached_vec>(shape_b(), unfold_x_stride(dim_b(), shape_b(), stride), opus::unfold_p_coord(dim_b(), z));}  \
-    template<index_t cached_vec = 0, typename S, typename C> OPUS_D constexpr auto layout_c(S&& stride, C&& z) { OPUS_KP_(dim_c); return make_layout<cached_vec>(shape_c(), unfold_x_stride(dim_c(), shape_c(), stride), opus::unfold_p_coord(dim_c(), z));}  \
-                                                                                                                                                                                                        \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_a_packed(C&& z) { OPUS_KP_(dim_a); return make_layout_packed<cached_vec>(shape_a(), opus::unfold_p_coord(dim_a(), z));}   \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_b_packed(C&& z) { OPUS_KP_(dim_b); return make_layout_packed<cached_vec>(shape_b(), opus::unfold_p_coord(dim_b(), z));}   \
-    template<index_t cached_vec = 0, typename C> OPUS_D constexpr auto layout_c_packed(C&& z) { OPUS_KP_(dim_c); return make_layout_packed<cached_vec>(shape_c(), opus::unfold_p_coord(dim_c(), z));}   \
-                                                                                                                                                                                                        \
-    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_a(Ts&&... strides) {return layout_a<cached_vec>(opus::make_tuple(strides...)); }  \
-    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_b(Ts&&... strides) {return layout_b<cached_vec>(opus::make_tuple(strides...)); }  \
-    template<index_t cached_vec = 0, typename... Ts, std::enable_if_t<(!is_tuple_v<Ts> && ...), bool> = true> OPUS_D constexpr auto layout_c(Ts&&... strides) {return layout_c<cached_vec>(opus::make_tuple(strides...)); }  \
-                                                                                                                                    \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_a() { return make_layout<cached_vec>(y_shape_a());}             \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_b() { return make_layout<cached_vec>(y_shape_b());}             \
-    template<index_t cached_vec = 0> OPUS_D constexpr auto y_layout_c() { return make_layout<cached_vec>(y_shape_c());}
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(a)                                                                                                                           \
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(b)                                                                                                                           \
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
 // Note: any class to support adaptor need include OPUS_ADAPTOR_LAYOUT_API_DEFINE and implement shape_a()/shape_b()/shape_c()
 // P indicates dim cross thread, Y indicates dim within thread, this is X layout (X=P+Y) view the tensor as a whole
@@ -2572,9 +2661,13 @@ struct mfma_adaptor : public remove_cvref_t<MFMA> {
 template<typename MFMA>
 struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
     using base = mfma_adaptor<MFMA>;
-    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b;
+    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b; using base::y_shape; using base::p_shape;
+    using base::y_shape_a; using base::y_shape_b; using base::p_shape_a; using base::p_shape_b;
+    using base::layout_a; using base::layout_b; using base::layout_a_packed; using base::layout_b_packed; using base::y_layout_a; using base::y_layout_b;
     OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<base::rept_c>, number<base::grpm_c>, number<base::pack_c>>{}; }
     OPUS_D static constexpr auto dim_c()   { return tuple<tuple<p_dim>,  tuple<y_dim, p_dim, y_dim> >{}; }    // dim encoding for C, MxN
+    // Only generate _c layout methods (shape_c/dim_c changed)
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
@@ -2595,8 +2688,6 @@ struct mfma_adaptor_swap_ab : mfma_adaptor<MFMA> {
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, int scale_a, int scale_b) {
         typename MFMA::vtype_c c{0}; return operator()(a, b, c, scale_a, scale_b);
     }
-
-    OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 }
 // helper class to create adaptor instance for mfma, need be paired with make_mfma(). don't directly use it
@@ -2654,9 +2745,13 @@ struct wmma_adaptor : public remove_cvref_t<WMMA> {
 template<typename WMMA>
 struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     using base = wmma_adaptor<WMMA>;
-    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b;
+    using base::shape_a; using base::shape_b; using base::dim_a; using base::dim_b; using base::y_shape; using base::p_shape;
+    using base::y_shape_a; using base::y_shape_b; using base::p_shape_a; using base::p_shape_b;
+    using base::layout_a; using base::layout_b; using base::layout_a_packed; using base::layout_b_packed; using base::y_layout_a; using base::y_layout_b;
     OPUS_D static constexpr auto shape_c() { return tuple<number<base::grpn_c>, number<base::grpm_c>, number<base::rept_c>, number<base::pack_c>>{}; }
     OPUS_D static constexpr auto dim_c()   { return tuple<tuple<p_dim>,  tuple<p_dim, y_dim, y_dim> >{}; }
+    // Only generate _c layout methods (shape_c/dim_c changed)
+    OPUS_ADAPTOR_LAYOUT_API_DEFINE_FOR(c)
 
     template<typename VA, typename VB, typename VC>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c) {
@@ -2678,8 +2773,6 @@ struct wmma_adaptor_swap_ab : wmma_adaptor<WMMA> {
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, long scale_a, long scale_b) {
         return base::operator()(b, a, c, scale_a, scale_b);
     }
-
-    OPUS_ADAPTOR_LAYOUT_API_DEFINE
 };
 } // namespace impl (wmma_adaptor)
 
@@ -2733,42 +2826,45 @@ struct tiled_mma_adaptor : public MMA_ {
     OPUS_D static constexpr auto dim_b()   { return embed_nested_tuple(tile_dim_b(), MMA::dim_b()); }    // dim encoding for A, MxK
     OPUS_D static constexpr auto dim_c()   { return embed_nested_tuple(tile_dim_c(), MMA::dim_c()); }    // dim encoding for A, MxK
 
+    // Cached tile sizes (avoids re-evaluating y_shape + reduce_tuple_mul in every operator/step_k)
+    static constexpr index_t mma_a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a())).value;
+    static constexpr index_t mma_b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b())).value;
+    static constexpr index_t mma_c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c())).value;
+    static constexpr index_t tile_a_len = EXPAND_M * EXPAND_K * mma_a_len;
+    static constexpr index_t tile_b_len = EXPAND_N * EXPAND_K * mma_b_len;
+    static constexpr index_t tile_c_len = EXPAND_M * EXPAND_N * mma_c_len;
+
     // input a/b/c is array of ext type e.g. "fp16x2_t a[2];", pass "a" to this function
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         VC c_ {c};
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            auto s_a = a[i_m * EXPAND_K + i_k];
-            auto s_b = b[i_n * EXPAND_K + i_k];
-            auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c);
-            c_[i_m * EXPAND_N + i_n] = s_c;
-        });
+        for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
+            index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c); c_[i_m * EXPAND_N + i_n] = s_c;
+        }
         return c_;
     }
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
-        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
-        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
-        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
 
-        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
-        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
-        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            constexpr index_t i_tile_a = i_m * EXPAND_K + i_k;
-            constexpr index_t i_tile_b = i_n * EXPAND_K + i_k;
-            constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
-            auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
-            auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
-            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+        for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
+            index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
+            index_t i_a = (i_m * EXPAND_K + i_k) * a_len, i_b = (i_n * EXPAND_K + i_k) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
+            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c);
-            set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
-        });
+            for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
+        }
         return c_;
     }
 
@@ -2783,26 +2879,22 @@ struct tiled_mma_adaptor : public MMA_ {
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
         VC c_ {c};
-        static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
-            auto s_a = a[i_m * EXPAND_K + i_k];
-            auto s_b = b[i_n * EXPAND_K + i_k];
-            auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
-            c_[i_m * EXPAND_N + i_n] = s_c;
-        });
+        for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
+            index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b); c_[i_m * EXPAND_N + i_n] = s_c;
+        }
         return c_;
     }
 
     template<typename VA, typename VB, typename VC,
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
-        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
-        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
-        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
 
-        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
-        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
-        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
         static_ford<EXPAND_K, EXPAND_M, EXPAND_N>([&](auto i_k, auto i_m, auto i_n){
@@ -2828,12 +2920,10 @@ struct tiled_mma_adaptor : public MMA_ {
     OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         static_assert(STEP_K < EXPAND_K);
         VC c_ {c};
-        static_ford<EXPAND_M, EXPAND_N>([&](auto i_m, auto i_n){
-            auto s_a = a[i_m * EXPAND_K + STEP_K];
-            auto s_b = b[i_n * EXPAND_K + STEP_K];
-            auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c);
-            c_[i_m * EXPAND_N + i_n] = s_c;
+        static_for<EXPAND_M * EXPAND_N>([&](auto I){
+            constexpr index_t i_m = I.value / EXPAND_N, i_n = I.value % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + STEP_K]; auto s_b = b[i_n * EXPAND_K + STEP_K]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c); c_[i_m * EXPAND_N + i_n] = s_c;
         });
         return c_;
     }
@@ -2842,25 +2932,22 @@ struct tiled_mma_adaptor : public MMA_ {
                     std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         static_assert(STEP_K < EXPAND_K);
-        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
-        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
-        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
 
-        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
-        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
-        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
-        static_ford<EXPAND_M, EXPAND_N>([&](auto i_m, auto i_n){
-            constexpr index_t i_tile_a = i_m * EXPAND_K + STEP_K;
-            constexpr index_t i_tile_b = i_n * EXPAND_K + STEP_K;
-            constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
-            auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
-            auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
-            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+        for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
+            index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
+            index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
+            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c);
-            set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
-        });
+            for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
+        }
         return c_;
     }
 
@@ -2875,13 +2962,11 @@ struct tiled_mma_adaptor : public MMA_ {
     OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
         static_assert(STEP_K < EXPAND_K);
         VC c_ {c};
-        static_ford<EXPAND_M, EXPAND_N>([&](auto i_m, auto i_n){
-            auto s_a = a[i_m * EXPAND_K + STEP_K];
-            auto s_b = b[i_n * EXPAND_K + STEP_K];
-            auto s_c = c_[i_m * EXPAND_N + i_n];
-            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
-            c_[i_m * EXPAND_N + i_n] = s_c;
-        });
+        for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
+            index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
+            auto s_a = a[i_m * EXPAND_K + STEP_K]; auto s_b = b[i_n * EXPAND_K + STEP_K]; auto s_c = c_[i_m * EXPAND_N + i_n];
+            s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b); c_[i_m * EXPAND_N + i_n] = s_c;
+        }
         return c_;
     }
 
@@ -2889,25 +2974,22 @@ struct tiled_mma_adaptor : public MMA_ {
              std::enable_if_t< (is_vector_v< remove_cvref_t<VA> > && is_vector_v< remove_cvref_t<VB> > && is_vector_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
         static_assert(STEP_K < EXPAND_K);
-        static_assert(size<VA>() == get<0>(reduce_tuple_mul(y_shape_a())));
-        static_assert(size<VB>() == get<0>(reduce_tuple_mul(y_shape_b())));
-        static_assert(size<VC>() == get<0>(reduce_tuple_mul(y_shape_c())));
+        static_assert(size<VA>() == tile_a_len);
+        static_assert(size<VB>() == tile_b_len);
+        static_assert(size<VC>() == tile_c_len);
 
-        constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
-        constexpr auto b_len = get<0>(reduce_tuple_mul(MMA::y_shape_b()));
-        constexpr auto c_len = get<0>(reduce_tuple_mul(MMA::y_shape_c()));
+        constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
-        static_ford<EXPAND_M, EXPAND_N>([&](auto i_m, auto i_n){
-            constexpr index_t i_tile_a = i_m * EXPAND_K + STEP_K;
-            constexpr index_t i_tile_b = i_n * EXPAND_K + STEP_K;
-            constexpr index_t i_tile_c = i_m * EXPAND_N + i_n;
-            auto s_a = slice(a, number<i_tile_a * a_len>{}, number<i_tile_a * a_len + a_len>{});
-            auto s_b = slice(b, number<i_tile_b * b_len>{}, number<i_tile_b * b_len + b_len>{});
-            auto s_c = slice(c_, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
+        for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
+            index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
+            index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
+            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
-            set_slice(c_, s_c, number<i_tile_c * c_len>{}, number<i_tile_c * c_len + c_len>{});
-        });
+            for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
+        }
         return c_;
     }
 
