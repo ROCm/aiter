@@ -40,6 +40,10 @@ on:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
         default: 'gfx942;gfx950'
+      rocm_version:
+        description: 'ROCm version label for wheel (e.g. 7.2.1). Auto-detected from container if empty.'
+        required: false
+        default: ''
       runner:
         description: 'Select build host'
         required: true
@@ -53,8 +57,8 @@ on:
           - aiter-1gpu-runner
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.rocm_version || 'default' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build_whl_package:
@@ -120,6 +124,48 @@ jobs:
           --name aiter_build_${{ matrix.python_version }} \
           ${{ env.BUILD_DOCKER_IMAGE }}
 
+      - name: Detect ROCm version
+        if: ${{ matrix.build_enabled }}
+        id: rocm_ver
+        run: |
+          set -e
+          INPUT_VER="${{ github.event.inputs.rocm_version }}"
+          if [ -n "$INPUT_VER" ]; then
+            echo "Using user-provided ROCm version: $INPUT_VER"
+            echo "rocm_version=$INPUT_VER" >> "$GITHUB_OUTPUT"
+          else
+            DETECTED=$(docker exec aiter_build_${{ matrix.python_version }} \
+              bash -c 'cat /opt/rocm/.info/version 2>/dev/null || echo ""' | tr -d '[:space:]')
+            if [ -n "$DETECTED" ]; then
+              DETECTED=$(echo "$DETECTED" | cut -d'-' -f1)
+              echo "Auto-detected ROCm version: $DETECTED"
+              echo "rocm_version=$DETECTED" >> "$GITHUB_OUTPUT"
+            else
+              echo "WARNING: Could not detect ROCm version, wheel will have no ROCm suffix"
+              echo "rocm_version=" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Determine wheel version
+        if: ${{ matrix.build_enabled }}
+        id: whl_ver
+        run: |
+          set -e
+          ROCM_VER="${{ steps.rocm_ver.outputs.rocm_version }}"
+          BASE_VER=$(docker exec -w /workspace aiter_build_${{ matrix.python_version }} \
+            python3 -c "from setuptools_scm import get_version; print(get_version())" 2>/dev/null || true)
+          if [ -z "$BASE_VER" ]; then
+            BASE_VER=$(git describe --tags --match 'v*' 2>/dev/null | sed 's/^v//' || echo "0.1.0")
+          fi
+          if [ -n "$ROCM_VER" ]; then
+            FULL_VER="${BASE_VER}+rocm${ROCM_VER}"
+          else
+            FULL_VER="${BASE_VER}"
+          fi
+          echo "Wheel version: $FULL_VER (base=$BASE_VER, rocm=$ROCM_VER)"
+          echo "full_version=$FULL_VER" >> "$GITHUB_OUTPUT"
+          echo "rocm_suffix=rocm${ROCM_VER}" >> "$GITHUB_OUTPUT"
+
       - name: Install Dependencies
         if: ${{ matrix.build_enabled }}
         run: |
@@ -140,21 +186,22 @@ jobs:
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 ninja
 
-      - name: Build Aiter
+      - name: Build Aiter with precompiled kernels
         if: ${{ matrix.build_enabled }}
         run: |
           set -e
-          echo "Building aiter whl packages for Python ${{ matrix.python_version }}..."
+          FULL_VER="${{ steps.whl_ver.outputs.full_version }}"
+          echo "Building aiter whl version=${FULL_VER} with PREBUILD_KERNELS=1 for Python ${{ matrix.python_version }}..."
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls dist/*.whl'
+          bash -c "SETUPTOOLS_SCM_PRETEND_VERSION='${FULL_VER}' PREBUILD_KERNELS=1 GPU_ARCHS='${{ env.GPU_ARCHS }}' python3 setup.py bdist_wheel && ls -lh dist/*.whl"
 
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
         uses: actions/upload-artifact@v4
         with:
-          name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: aiter-whl-py${{ matrix.python_version }}-${{ steps.whl_ver.outputs.rocm_suffix }}-${{ github.run_id }}
           path: dist/*.whl
 
       - name: Cleanup container
