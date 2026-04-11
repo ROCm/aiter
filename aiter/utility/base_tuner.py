@@ -202,14 +202,14 @@ class TunerCommon:
             "--update_improved",
             action="store_true",
             required=False,
-            help="With --compare, update the final tuned CSV for shapes improved by at least --min_improvement_pct.",
+            help="With --compare, update the final tuned CSV for shapes improved by at least --min_improvement_pct, or when pre-run has no valid baseline but post-run passes.",
         )
         self.parser.add_argument(
             "--min_improvement_pct",
             dest="min_improvement_pct",
             type=float,
             default=defaults.get("min_improvement_pct", 3.0),
-            help="With --compare --update_improved, only update tuned CSV for shapes improved by at least this percent.",
+            help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
 
     def parse_args(self):
@@ -645,6 +645,7 @@ class TunerCommon:
             "post_status",
             "improvement_pct",
             "update",
+            "update_reason",
         ]
         if pre_df.empty or post_df.empty:
             return pd.DataFrame(columns=columns)
@@ -671,15 +672,24 @@ class TunerCommon:
             & (comparison["pre_us"] > 0)
             & (comparison["post_us"] > 0)
         )
+        no_baseline = (
+            (comparison["post_status"] == "ok")
+            & (comparison["post_us"] > 0)
+            & ~((comparison["pre_status"] == "ok") & (comparison["pre_us"] > 0))
+        )
         comparison["improvement_pct"] = (
             (comparison["pre_us"] - comparison["post_us"])
             / comparison["pre_us"]
             * 100.0
         )
         comparison.loc[~valid, "improvement_pct"] = float("nan")
-        comparison["update"] = valid & (
-            comparison["improvement_pct"] >= threshold_percent
-        )
+        comparison["update_reason"] = "skip"
+        comparison.loc[
+            valid & (comparison["improvement_pct"] >= threshold_percent),
+            "update_reason",
+        ] = "threshold_met"
+        comparison.loc[no_baseline, "update_reason"] = "no_baseline"
+        comparison["update"] = comparison["update_reason"] != "skip"
         return comparison[columns]
 
     def _print_compare_update_plan(
@@ -712,7 +722,14 @@ class TunerCommon:
                 else f"Threshold: improve >= {threshold_percent:.2f}% would update {target_desc} with --update_improved"
             )
         )
-        header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>8}"
+        lines.append(
+            (
+                "Rows with no valid pre-run baseline but passing post-run will also update."
+                if apply_updates
+                else "Rows with no valid pre-run baseline but passing post-run would also update."
+            )
+        )
+        header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>18}"
         lines.append(header)
         lines.append("-" * len(header))
         for row in comparison.itertuples(index=False):
@@ -731,9 +748,14 @@ class TunerCommon:
                 if pd.notna(row.improvement_pct)
                 else "N/A"
             )
-            action = "UPDATE" if row.update else "SKIP"
+            if row.update_reason == "threshold_met":
+                action = "UPDATE"
+            elif row.update_reason == "no_baseline":
+                action = "UPDATE_NO_BASELINE"
+            else:
+                action = "SKIP"
             lines.append(
-                f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>8}"
+                f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
             )
         self._emit_report_lines(lines, report_file)
 
@@ -972,7 +994,9 @@ class TunerCommon:
         if candidate_file:
             extra_lines.append(f"Compare candidate CSV written to {candidate_file}")
         if not apply_updates:
-            extra_lines.append("Final tuned CSV was not updated. Re-run with --update_improved to apply improved shapes.")
+            extra_lines.append(
+                "Final tuned CSV was not updated. Re-run with --update_improved to apply improved shapes."
+            )
         if extra_lines:
             self._emit_report_lines(extra_lines, report_file)
         if report_file:

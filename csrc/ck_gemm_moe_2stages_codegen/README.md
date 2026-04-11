@@ -142,6 +142,7 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   - Pre-tune reads shapes from `-i/--untune_file`.
   - Post-tune uses configs written to `<tune_file>.candidate.csv` during the compare run.
   - The final tuned CSV is only updated when `--update_improved` is also set.
+  - Shapes with no valid pre-run baseline can still update when the post-tune benchmark passes.
 
 **Example**:
 ```bash
@@ -151,7 +152,7 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 #### `--update_improved`
 - **Type**: Flag (boolean)
 - **Default**: `False`
-- **Description**: With `--compare`, update the final tuned CSV for shapes improved by at least `--min_improvement_pct`.
+- **Description**: With `--compare`, update the final tuned CSV for shapes improved by at least `--min_improvement_pct`, or for shapes with no valid pre-run baseline when the post-tune benchmark passes.
 
 **Example**:
 ```bash
@@ -161,7 +162,7 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 #### `--min_improvement_pct`
 - **Type**: Float
 - **Default**: `3.0`
-- **Description**: With `--compare --update_improved`, the minimum percentage improvement required before a compared result replaces the final tuned CSV entry.
+- **Description**: With `--compare --update_improved`, the minimum percentage improvement required before a compared result replaces the final tuned CSV entry when both pre/post benchmarks are valid. Shapes with no valid pre-run baseline but passing post-tune are still allowed to update.
 
 ### Profiling Configuration
 
