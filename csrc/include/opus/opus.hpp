@@ -411,6 +411,9 @@ template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple_gener
 // Fast path: if all elements are non-tuple (already flat), return as-is
 template <typename T, std::enable_if_t<is_tuple_v<T> && !(is_tuple_v<tuple_element_t<0, remove_cvref_t<T>>>), bool> = true>
 OPUS_H_D constexpr auto flatten_tuple(const T& t) { return t; }
+// Fallback for non-tuple types (e.g. seq) — use general recursive path
+template <typename T, std::enable_if_t<!is_tuple_v<T>, bool> = true>
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { return flatten_tuple_general(t, make_index_seq<size<T>()>{}); }
 // 1-level nested: directly index each flat element as (group, local) — bypasses concat_tuple + explode_tuple
 namespace impl {
 // For a tuple-of-tuples T, get group sizes as a seq
