@@ -173,7 +173,16 @@ jobs:
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 -r requirements.txt
-      
+
+      - name: Pin setuptools_scm
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -e
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          pip install --timeout=60 --retries=10 "setuptools_scm<10"
+
       - name: Install ninja
         if: ${{ matrix.build_enabled }}
         run: |
