@@ -12,7 +12,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .utils import is_flydsl_available
 
-_REQUIRED_FLYDSL_VERSION = "0.1.2"
+_REQUIRED_FLYDSL_VERSION = "0.1.3"
 
 __all__ = [
     "is_flydsl_available",
@@ -27,7 +27,10 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
-    if installed_flydsl_version != _REQUIRED_FLYDSL_VERSION:
+    if not (
+        installed_flydsl_version == _REQUIRED_FLYDSL_VERSION
+        or installed_flydsl_version.startswith(_REQUIRED_FLYDSL_VERSION + ".")
+    ):
         raise ImportError(
             "Unsupported `flydsl` version: "
             f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
@@ -53,3 +56,10 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_gdr_decode",
     ]
+
+    try:
+        from .rope_kernels import flydsl_fused_qk_rope_reshape_and_cache
+
+        __all__ += ["flydsl_fused_qk_rope_reshape_and_cache"]
+    except ImportError:
+        pass
