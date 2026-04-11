@@ -40,6 +40,10 @@
 #define ROTATE_STYLE_NEOX 0
 #define ROTATE_STYLE_GPTJ 1
 
+// When ENABLE_ROPE_POSITIONS_INT32 is non-zero at compile time (e.g. -DENABLE_ROPE_POSITIONS_INT32=1),
+// RoPE cached-indirect kernels are also built for int32 positions tensors; dispatch switches on
+// positions.scalar_type() at runtime. When zero, only int64 (torch.long) positions are accepted.
+
 namespace aiter {
 // =====================================================================================================================
 // Kernel Helper Functions
@@ -3294,13 +3298,14 @@ template <typename Op,
           bool StrideDInEq1,
           int32_t VecPairs = 1,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__
     void kn_entry_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                           const scalar_t* __restrict__ p_input,
                                           const scalar_f_t* __restrict__ p_cos,
                                           const scalar_f_t* __restrict__ p_sin,
-                                          const int64_t* __restrict__ p_indirect_buffer,
+                                          const pos_t* __restrict__ p_indirect_buffer,
                                           const int32_t max_position,
                                           const int32_t size_h,
                                           const int32_t size_d,
@@ -3326,7 +3331,7 @@ __launch_bounds__(256, 8) __global__
     const int32_t bid = sb_idx / size_s;
 
     const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
-    const int64_t pos     = p_indirect_buffer[ib_idx];
+    const pos_t pos       = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
     {
@@ -3370,7 +3375,8 @@ template <typename Op,
           int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__
     void kn_entry_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                           scalar_t* __restrict__ p_output_y,
@@ -3378,7 +3384,7 @@ __launch_bounds__(256, 8) __global__
                                           const scalar_t* __restrict__ p_input_y,
                                           const scalar_f_t* __restrict__ p_cos,
                                           const scalar_f_t* __restrict__ p_sin,
-                                          const int64_t* __restrict__ p_indirect_buffer,
+                                          const pos_t* __restrict__ p_indirect_buffer,
                                           const int32_t max_position,
                                           const int32_t size_h_x,
                                           const int32_t size_h_y,
@@ -3413,7 +3419,7 @@ __launch_bounds__(256, 8) __global__
     const int32_t bid = sb_idx / size_s;
 
     const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
-    const int64_t pos     = p_indirect_buffer[ib_idx];
+    const pos_t pos       = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
     {
@@ -3467,12 +3473,13 @@ template <typename Op,
           bool StrideDEq1,
           int32_t VecPairs = 1,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect_inplace(
     scalar_t* __restrict__ p_inout,
     const scalar_f_t* __restrict__ p_cos,
     const scalar_f_t* __restrict__ p_sin,
-    const int64_t* __restrict__ p_indirect_buffer,
+    const pos_t* __restrict__ p_indirect_buffer,
     const int32_t max_position,
     const int32_t size_h,
     const int32_t size_d,
@@ -3494,7 +3501,7 @@ __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect_inpla
     const int32_t bid = sb_idx / size_s;
 
     const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
-    const int64_t pos     = p_indirect_buffer[ib_idx];
+    const pos_t pos       = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
     {
@@ -3535,13 +3542,14 @@ template <typename Op,
           int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
     scalar_t* __restrict__ p_inout_x,
     scalar_t* __restrict__ p_inout_y,
     const scalar_f_t* __restrict__ p_cos,
     const scalar_f_t* __restrict__ p_sin,
-    const int64_t* __restrict__ p_indirect_buffer,
+    const pos_t* __restrict__ p_indirect_buffer,
     const int32_t max_position,
     const int32_t size_h_x,
     const int32_t size_h_y,
@@ -3568,7 +3576,7 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
     const int32_t bid = sb_idx / size_s;
 
     const uint64_t ib_idx = sid * (total_sb / size_s) + bid;
-    const int64_t pos     = p_indirect_buffer[ib_idx];
+    const pos_t pos       = p_indirect_buffer[ib_idx];
 
     if((pos >= 0) && (pos < max_position))
     {
@@ -3621,13 +3629,14 @@ template <typename Op,
           bool StrideDInEq1,
           int32_t VecPairs = 1,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__
     void kn_entry_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                            const scalar_t* __restrict__ p_input,
                                            const scalar_f_t* __restrict__ p_cos,
                                            const scalar_f_t* __restrict__ p_sin,
-                                           const int64_t* __restrict__ p_indirect_buffer_0,
+                                           const pos_t* __restrict__ p_indirect_buffer_0,
                                            const int64_t* __restrict__ p_indirect_buffer_1,
                                            const int32_t max_position,
                                            const int32_t size_h,
@@ -3698,7 +3707,8 @@ template <typename Op,
           int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__
     void kn_entry_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                            scalar_t* __restrict__ p_output_y,
@@ -3706,7 +3716,7 @@ __launch_bounds__(256, 8) __global__
                                            const scalar_t* __restrict__ p_input_y,
                                            const scalar_f_t* __restrict__ p_cos,
                                            const scalar_f_t* __restrict__ p_sin,
-                                           const int64_t* __restrict__ p_indirect_buffer_0,
+                                           const pos_t* __restrict__ p_indirect_buffer_0,
                                            const int64_t* __restrict__ p_indirect_buffer_1,
                                            const int32_t max_position,
                                            const int32_t size_h_x,
@@ -3796,12 +3806,13 @@ template <typename Op,
           bool StrideDEq1,
           int32_t VecPairs = 1,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__ void kn_entry_1c_sbhd_cached_indirect2_inplace(
     scalar_t* __restrict__ p_inout,
     const scalar_f_t* __restrict__ p_cos,
     const scalar_f_t* __restrict__ p_sin,
-    const int64_t* __restrict__ p_indirect_buffer_0,
+    const pos_t* __restrict__ p_indirect_buffer_0,
     const int64_t* __restrict__ p_indirect_buffer_1,
     const int32_t max_position,
     const int32_t size_h,
@@ -3865,13 +3876,14 @@ template <typename Op,
           int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
     scalar_t* __restrict__ p_inout_x,
     scalar_t* __restrict__ p_inout_y,
     const scalar_f_t* __restrict__ p_cos,
     const scalar_f_t* __restrict__ p_sin,
-    const int64_t* __restrict__ p_indirect_buffer_0,
+    const pos_t* __restrict__ p_indirect_buffer_0,
     const int64_t* __restrict__ p_indirect_buffer_1,
     const int32_t max_position,
     const int32_t size_h_x,
@@ -5259,12 +5271,13 @@ template <typename Op,
           bool NopeFirst,
           bool AllStrideDEq1 = false,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                       const scalar_t* __restrict__ p_input,
                                       const scalar_f_t* __restrict__ p_cos,
                                       const scalar_f_t* __restrict__ p_sin,
-                                      const int64_t* __restrict__ p_indirect_buffer,
+                                      const pos_t* __restrict__ p_indirect_buffer,
                                       const int32_t max_position,
                                       const int32_t size_s,
                                       const int32_t size_b,
@@ -5422,14 +5435,15 @@ template <typename Op,
           bool NopeFirst,
           bool AllStrideDEq1 = false,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                       scalar_t* __restrict__ p_output_y,
                                       const scalar_t* __restrict__ p_input_x,
                                       const scalar_t* __restrict__ p_input_y,
                                       const scalar_f_t* __restrict__ p_cos,
                                       const scalar_f_t* __restrict__ p_sin,
-                                      const int64_t* __restrict__ p_indirect_buffer,
+                                      const pos_t* __restrict__ p_indirect_buffer,
                                       const int32_t max_position,
                                       const int32_t size_s,
                                       const int32_t size_b,
@@ -5654,12 +5668,13 @@ template <typename Op,
           bool NopeFirst,
           bool AllStrideDEq1 = false,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                        const scalar_t* __restrict__ p_input,
                                        const scalar_f_t* __restrict__ p_cos,
                                        const scalar_f_t* __restrict__ p_sin,
-                                       const int64_t* __restrict__ p_indirect_buffer_0,
+                                       const pos_t* __restrict__ p_indirect_buffer_0,
                                        const int64_t* __restrict__ p_indirect_buffer_1,
                                        const int32_t max_position,
                                        const int32_t size_s,
@@ -5824,14 +5839,15 @@ template <typename Op,
           bool NopeFirst,
           bool AllStrideDEq1 = false,
           typename scalar_t,
-          typename scalar_f_t>
+          typename scalar_f_t,
+          typename pos_t>
 void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                        scalar_t* __restrict__ p_output_y,
                                        const scalar_t* __restrict__ p_input_x,
                                        const scalar_t* __restrict__ p_input_y,
                                        const scalar_f_t* __restrict__ p_cos,
                                        const scalar_f_t* __restrict__ p_sin,
-                                       const int64_t* __restrict__ p_indirect_buffer_0,
+                                       const pos_t* __restrict__ p_indirect_buffer_0,
                                        const int64_t* __restrict__ p_indirect_buffer_1,
                                        const int32_t max_position,
                                        const int32_t size_s,
@@ -6360,6 +6376,57 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
         });
 }
 } // namespace aiter
+
+// Call sites use positions.data_ptr<pos_t>() inside __VA_ARGS__; pos_t is a local alias.
+#if ENABLE_ROPE_POSITIONS_INT32
+#define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
+    TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
+    if((POSITIONS_ST) == at::ScalarType::Int)                                      \
+    {                                                                             \
+        using pos_t = int32_t;                                                    \
+        DISPATCH_ROPE_TYPES_PARAMS(                                               \
+            TYPE0,                                                                \
+            TYPE1,                                                                \
+            ROTATE_STYLE,                                                         \
+            REUSE_FREQS_FRONT_PART,                                               \
+            NOPE_FIRST,                                                           \
+            NAME,                                                                 \
+            __VA_ARGS__);                                                         \
+    }                                                                             \
+    else                                                                          \
+    {                                                                             \
+        TORCH_CHECK(false,                                                        \
+                    NAME,                                                         \
+                    " does not support positions dtype ",                         \
+                    toString((POSITIONS_ST)),                                     \
+                    " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
+                    " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
+    }
+#else
+#define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
+    TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
+    if((POSITIONS_ST) == at::ScalarType::Long)                                    \
+    {                                                                             \
+        using pos_t = int64_t;                                                    \
+        DISPATCH_ROPE_TYPES_PARAMS(                                               \
+            TYPE0,                                                                \
+            TYPE1,                                                                \
+            ROTATE_STYLE,                                                         \
+            REUSE_FREQS_FRONT_PART,                                               \
+            NOPE_FIRST,                                                           \
+            NAME,                                                                 \
+            __VA_ARGS__);                                                         \
+    }                                                                             \
+    else                                                                          \
+    {                                                                             \
+        TORCH_CHECK(false,                                                        \
+                    NAME,                                                         \
+                    " does not support positions dtype ",                         \
+                    toString((POSITIONS_ST)),                                     \
+                    " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
+                    " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
+    }
+#endif
 
 #define DISPATCH_ROPE_TYPES_PARAMS(                                               \
     TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
