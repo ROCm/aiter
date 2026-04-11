@@ -1286,13 +1286,59 @@ OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*sc
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f, number<sel> = {}) { return bf16x2_t{}; }
 #else
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 1>{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 2>{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>  OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return array<fp4_t, 4>{}; }
+// Software FP4 E2M1 (1s+2e+1m, bias=1) emulation; positive values: 0,0.5,1,1.5,2,3,4,6
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x2(const S& s, float scale = 1.0f) {
+    auto encode = [](float v) -> u8_t {
+        u8_t sign = v < 0.0f ? 0x8u : 0u;
+        float a = v < 0.0f ? -v : v;
+        return sign | (a < 0.25f ? 0u : a < 0.75f ? 1u : a < 1.25f ? 2u : a < 1.75f ? 3u :
+                       a < 2.5f  ? 4u : a < 3.5f  ? 5u : a < 5.0f  ? 6u : 7u);
+    };
+    u8_t lo = encode(s[0] * scale), hi = encode(s[1] * scale);
+    return __builtin_bit_cast(array<fp4_t, 1>, static_cast<u8_t>((hi << 4) | lo));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x4(const S& s, float scale = 1.0f) {
+    auto encode = [](float v) -> u8_t {
+        u8_t sign = v < 0.0f ? 0x8u : 0u;
+        float a = v < 0.0f ? -v : v;
+        return sign | (a < 0.25f ? 0u : a < 0.75f ? 1u : a < 1.25f ? 2u : a < 1.75f ? 3u :
+                       a < 2.5f  ? 4u : a < 3.5f  ? 5u : a < 5.0f  ? 6u : 7u);
+    };
+    u8_t b0 = static_cast<u8_t>((encode(s[1]*scale)<<4) | encode(s[0]*scale));
+    u8_t b1 = static_cast<u8_t>((encode(s[3]*scale)<<4) | encode(s[2]*scale));
+    return __builtin_bit_cast(array<fp4_t, 2>, static_cast<u16_t>(static_cast<u16_t>(b1)<<8 | b0));
+}
+template<typename S, std::enable_if_t<std::is_same_v<S, fp32x8_t>, bool> = true>
+OPUS_D constexpr decltype(auto) fp32_to_fp4_packed_x8(const S& s, float scale = 1.0f) {
+    auto encode = [](float v) -> u8_t {
+        u8_t sign = v < 0.0f ? 0x8u : 0u;
+        float a = v < 0.0f ? -v : v;
+        return sign | (a < 0.25f ? 0u : a < 0.75f ? 1u : a < 1.25f ? 2u : a < 1.75f ? 3u :
+                       a < 2.5f  ? 4u : a < 3.5f  ? 5u : a < 5.0f  ? 6u : 7u);
+    };
+    u8_t b[4];
+    for(int i = 0; i < 4; i++)
+        b[i] = static_cast<u8_t>((encode(s[2*i+1]*scale)<<4) | encode(s[2*i]*scale));
+    u32_t w = static_cast<u32_t>(b[3])<<24 | static_cast<u32_t>(b[2])<<16 |
+              static_cast<u32_t>(b[1])<<8  | b[0];
+    return __builtin_bit_cast(array<fp4_t, 4>, w);
+}
 template<typename S, std::enable_if_t<is_any_of_v<S, fp4_t, array<fp4_t, 1>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x2_t{}; }
 template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 2>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x4(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x4_t{}; }
 template<typename S, std::enable_if_t<std::is_same_v<S, array<fp4_t, 4>>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_fp32_packed_x8(const S& /*s*/, float /*scale*/ = 1.0f) { return fp32x8_t{}; }
-template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>  OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return fp4_t{}; }
+template<typename S, std::enable_if_t<std::is_same_v<S, bf16x2_t>, bool> = true>
+OPUS_D constexpr decltype(auto) bf16_to_fp4_packed_x2(const S& s, float scale = 1.0f) {
+    auto encode = [](float v) -> u8_t {
+        u8_t sign = v < 0.0f ? 0x8u : 0u;
+        float a = v < 0.0f ? -v : v;
+        return sign | (a < 0.25f ? 0u : a < 0.75f ? 1u : a < 1.25f ? 2u : a < 1.75f ? 3u :
+                       a < 2.5f  ? 4u : a < 3.5f  ? 5u : a < 5.0f  ? 6u : 7u);
+    };
+    u8_t lo = encode(bf16_to_fp32(s[0]) * scale), hi = encode(bf16_to_fp32(s[1]) * scale);
+    return __builtin_bit_cast(fp4_t, static_cast<u8_t>((hi << 4) | lo));
+}
 template<typename S, std::enable_if_t<std::is_same_v<S, fp4_t>, bool> = true>     OPUS_D constexpr decltype(auto) fp4_to_bf16_packed_x2(const S& /*s*/, float /*scale*/ = 1.0f) { return bf16x2_t{}; }
 #endif
 #pragma clang diagnostic pop

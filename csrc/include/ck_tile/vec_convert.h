@@ -77,7 +77,18 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f32(fp32_t a, fp32_t b, 
     asm volatile("v_cvt_scalef32_pk_fp4_f32 %0, %1, %2, %3" : "=v"(c) : "v"(a), "v"(b), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
 #else
-    return fp4x2_t{};
+    // Software FP4 E2M1 emulation: positive values are 0,0.5,1,1.5,2,3,4,6
+    auto encode = [](float v) -> uint8_t {
+        uint8_t sign = v < 0.0f ? 0x8u : 0u;
+        float abs_v  = v < 0.0f ? -v : v;
+        uint8_t code = abs_v < 0.25f ? 0u : abs_v < 0.75f ? 1u : abs_v < 1.25f ? 2u :
+                       abs_v < 1.75f ? 3u : abs_v < 2.5f  ? 4u : abs_v < 3.5f  ? 5u :
+                       abs_v < 5.0f  ? 6u : 7u;
+        return sign | code;
+    };
+    uint8_t lo = encode(a * scale);
+    uint8_t hi = encode(b * scale);
+    return fp4x2_t{static_cast<uint8_t>((hi << 4) | lo)};
 #endif
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f16(fp16x2_v a, fp32_t scale)
@@ -88,7 +99,17 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f16(fp16x2_v a, fp32_t s
     asm volatile("v_cvt_scalef32_pk_fp4_f16 %0, %1, %2" : "=v"(c) : "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
 #else
-    return fp4x2_t{};
+    auto encode = [](float v) -> uint8_t {
+        uint8_t sign = v < 0.0f ? 0x8u : 0u;
+        float abs_v  = v < 0.0f ? -v : v;
+        uint8_t code = abs_v < 0.25f ? 0u : abs_v < 0.75f ? 1u : abs_v < 1.25f ? 2u :
+                       abs_v < 1.75f ? 3u : abs_v < 2.5f  ? 4u : abs_v < 3.5f  ? 5u :
+                       abs_v < 5.0f  ? 6u : 7u;
+        return sign | code;
+    };
+    uint8_t lo = encode(type_convert<float>(a[0]) * scale);
+    uint8_t hi = encode(type_convert<float>(a[1]) * scale);
+    return fp4x2_t{static_cast<uint8_t>((hi << 4) | lo)};
 #endif
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_bf16(bf16x2_v a, fp32_t scale)
@@ -99,7 +120,17 @@ CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_bf16(bf16x2_v a, fp32_t 
     asm volatile("v_cvt_scalef32_pk_fp4_bf16 %0, %1, %2" : "=v"(c) : "v"(a), "v"(scale));
     return bit_cast<fp4x2_t>(bit_cast<int8x2_t>(c[0])[0]);
 #else
-    return fp4x2_t{};
+    auto encode = [](float v) -> uint8_t {
+        uint8_t sign = v < 0.0f ? 0x8u : 0u;
+        float abs_v  = v < 0.0f ? -v : v;
+        uint8_t code = abs_v < 0.25f ? 0u : abs_v < 0.75f ? 1u : abs_v < 1.25f ? 2u :
+                       abs_v < 1.75f ? 3u : abs_v < 2.5f  ? 4u : abs_v < 3.5f  ? 5u :
+                       abs_v < 5.0f  ? 6u : 7u;
+        return sign | code;
+    };
+    uint8_t lo = encode(type_convert<float>(a[0]) * scale);
+    uint8_t hi = encode(type_convert<float>(a[1]) * scale);
+    return fp4x2_t{static_cast<uint8_t>((hi << 4) | lo)};
 #endif
 }
 

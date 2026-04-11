@@ -781,7 +781,6 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         num_rows_factor);
                 });
         }
-#if defined(__Float4_e2m1fn_x2)
         else if(out.dtype() == torch_fp4x2)
         {
             int ori_cols  = out.size(-1) * 2;
@@ -809,7 +808,6 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         num_rows_factor);
                 });
         }
-#endif
         else
         {
             TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
@@ -829,13 +827,11 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
                 dynamic_per_token_scaled_quant_kernel, opus::i8_t, cols);
         }
-#if defined(__Float4_e2m1fn_x2)
         else if(out.dtype() == torch_fp4x2)
         {
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
                 dynamic_per_token_scaled_quant_kernel, opus::fp4_t, cols);
         }
-#endif
         else
         {
             TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
@@ -877,7 +873,6 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
     dim3 const block(groupQuantBlockSize);
 
-#if defined(__Float4_e2m1fn_x2)
     AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
             using input_dtype = typename t2opus<scalar_t>::type;
@@ -894,9 +889,6 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                 num_rows_ptr,
                 num_rows_factor);
         });
-#else
-    TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
-#endif
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \
