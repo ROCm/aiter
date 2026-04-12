@@ -6,21 +6,22 @@
 
 /**
  * @file opus/hip_minimal.hpp
- * @brief Minimal HIP declarations for both host and device compilation.
+ * @brief Minimal HIP host-side declarations for kernel launch and device management.
  *
- * Replaces <hip/hip_runtime.h> (~100K+ preprocessed lines) with only the
- * declarations actually needed, saving ~500ms per translation unit.
+ * Replaces <hip/hip_runtime.h> (~100K+ preprocessed lines) for the HOST pass only.
+ * For device-side intrinsics, use opus::thread_id_x(), opus::block_id_x(), etc. from opus.hpp.
  *
- * - Device pass: __launch_bounds__, __shared__/__device__/__global__,
- *                __all() warp vote intrinsic
- * - Host pass:   dim3, hipLaunchKernelGGL, hipMalloc/hipFree, error handling
- * - Both passes: attribute keyword fallbacks
+ * Usage (recommended separate host/device pattern):
+ *   #ifdef __HIP_DEVICE_COMPILE__
+ *   #include <opus/opus.hpp>        // device: template library + device intrinsics
+ *   #else
+ *   #include <opus/hip_minimal.hpp> // host: dim3, hipMalloc, hipLaunchKernelGGL, etc.
+ *   #endif
  *
  * Compile: hipcc kernel.cu -I<aiter_root>/csrc/include -D__HIPCC_RTC__ ...
  */
 
-// ========== Both passes: attribute keyword fallbacks ==========
-// Provided by hipcc's implicit wrapper, but define as fallbacks for --genco or standalone builds
+// ========== Attribute keyword fallbacks (both passes) ==========
 #ifndef __launch_bounds__
 #define __launch_bounds_impl0__(requiredMaxThreadsPerBlock) \
     __attribute__((amdgpu_flat_work_group_size(1, requiredMaxThreadsPerBlock)))
@@ -31,7 +32,6 @@
 #define __launch_bounds__(...) \
     __launch_bounds_select__(__VA_ARGS__, __launch_bounds_impl1__, __launch_bounds_impl0__, )(__VA_ARGS__)
 #endif
-
 #ifndef __shared__
 #define __shared__ __attribute__((shared))
 #endif
@@ -45,56 +45,35 @@
 #define __host__ __attribute__((host))
 #endif
 
-// ========== Device pass only ==========
-#if defined(__HIP_DEVICE_COMPILE__)
-// Warp vote — set HIP header guards to prevent redefinition if hip headers are included later
-#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_DEVICE_LIBRARY_DECLS_H)
-extern "C" __device__ int __ockl_wfall_i32(int);
-#endif
-#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_WARP_FUNCTIONS_H)
-#define HIP_INCLUDE_HIP_AMD_DETAIL_WARP_FUNCTIONS_H  // prevent hip's redefinition
-__device__ inline int __all(int predicate) { return __ockl_wfall_i32(predicate); }
-#endif
-#endif // __HIP_DEVICE_COMPILE__
-
-// ========== Both passes: type declarations (guarded to avoid conflict with hip_runtime_api.h) ==========
+// ========== Host-side declarations (guarded to coexist with <hip/hip_runtime.h>) ==========
 #if !defined(HIP_INCLUDE_HIP_HIP_RUNTIME_API_H)
-#if !defined(__HIP_PLATFORM_AMD__)
-#define __HIP_PLATFORM_AMD__
-#endif
+
+#include <cstddef>   // size_t
+
 typedef int hipError_t;
 typedef void* hipStream_t;
 #define hipSuccess 0
+
 struct dim3 {
     unsigned int x, y, z;
     constexpr dim3(unsigned int _x = 1, unsigned int _y = 1, unsigned int _z = 1)
         : x(_x), y(_y), z(_z) {}
 };
-#endif // !HIP_INCLUDE_HIP_HIP_RUNTIME_API_H
 
-// ========== Host pass only ==========
-#if !defined(__HIP_DEVICE_COMPILE__)
-
-#include <cstddef>   // size_t
-
-// ---------- Error handling ----------
+// Error handling
 extern "C" hipError_t hipGetLastError();
 extern "C" hipError_t hipDeviceSynchronize();
 extern "C" const char* hipGetErrorString(hipError_t error);
 
-// ---------- Memory management ----------
+// Memory management
 extern "C" hipError_t hipMalloc(void** ptr, size_t size);
 extern "C" hipError_t hipFree(void* ptr);
 extern "C" hipError_t hipMemset(void* dst, int value, size_t sizeBytes);
 enum hipMemcpyKind { hipMemcpyHostToHost = 0, hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2, hipMemcpyDeviceToDevice = 3, hipMemcpyDefault = 4 };
 extern "C" hipError_t hipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind);
+template <typename T> inline hipError_t hipMalloc(T** ptr, size_t size) { return hipMalloc(reinterpret_cast<void**>(ptr), size); }
 
-template <typename T>
-inline hipError_t hipMalloc(T** ptr, size_t size) {
-    return hipMalloc(reinterpret_cast<void**>(ptr), size);
-}
-
-// ---------- Events (timing) ----------
+// Events (timing)
 typedef void* hipEvent_t;
 extern "C" hipError_t hipEventCreate(hipEvent_t* event);
 extern "C" hipError_t hipEventDestroy(hipEvent_t event);
@@ -102,24 +81,15 @@ extern "C" hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream = null
 extern "C" hipError_t hipEventSynchronize(hipEvent_t event);
 extern "C" hipError_t hipEventElapsedTime(float* ms, hipEvent_t start, hipEvent_t stop);
 
-// ---------- Kernel launch ----------
-extern "C" hipError_t __hipPushCallConfiguration(dim3 gridDim, dim3 blockDim,
-                                                  size_t sharedMem = 0,
-                                                  hipStream_t stream = nullptr);
-extern "C" hipError_t __hipPopCallConfiguration(dim3* gridDim, dim3* blockDim,
-                                                 size_t* sharedMem,
-                                                 hipStream_t* stream);
-
-extern "C" hipError_t hipLaunchKernel(const void* function_address,
-                                      dim3 numBlocks, dim3 dimBlocks,
-                                      void** args, size_t sharedMemBytes,
-                                      hipStream_t stream);
-
+// Kernel launch (<<<>>> syntax)
+extern "C" hipError_t __hipPushCallConfiguration(dim3 gridDim, dim3 blockDim, size_t sharedMem = 0, hipStream_t stream = nullptr);
+extern "C" hipError_t __hipPopCallConfiguration(dim3* gridDim, dim3* blockDim, size_t* sharedMem, hipStream_t* stream);
+extern "C" hipError_t hipLaunchKernel(const void* function_address, dim3 numBlocks, dim3 dimBlocks, void** args, size_t sharedMemBytes, hipStream_t stream);
 #ifndef hipLaunchKernelGGL
 #define hipLaunchKernelGGL(kernel, numBlocks, dimBlocks, sharedMemBytes, stream, ...) \
     kernel<<<numBlocks, dimBlocks, sharedMemBytes, stream>>>(__VA_ARGS__)
 #endif
 
-#endif // !defined(__HIP_DEVICE_COMPILE__)
+#endif // !HIP_INCLUDE_HIP_HIP_RUNTIME_API_H
 
 #endif // HIP_MINIMAL_HPP

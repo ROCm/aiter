@@ -23,13 +23,13 @@
 
 #ifdef __HIPCC__
 #define OPUS_H inline __host__
-#define OPUS_D inline __device__
+#define OPUS_D __device__
 #define OPUS_H_D inline __host__ __device__
 #define OPUS_D_EXTERN __device__
 #define OPUS_H_D_EXTERN __host__ __device__
 #else
 #define OPUS_H inline
-#define OPUS_D inline
+#define OPUS_D
 #define OPUS_H_D inline
 #define OPUS_D_EXTERN
 #define OPUS_H_D_EXTERN
@@ -1496,6 +1496,29 @@ OPUS_H_D constexpr index_t get_smem_size()
     return 65536;   // 64KB
 #endif
 }
+
+// ---- Device intrinsic wrappers ----
+// Replace HIP runtime macros (threadIdx.x, __syncthreads, __all, etc.) so kernels compile
+// with just #include <opus/opus.hpp> — no <hip/hip_runtime.h> needed.
+OPUS_D index_t thread_id_x() { return __builtin_amdgcn_workitem_id_x(); }
+OPUS_D index_t thread_id_y() { return __builtin_amdgcn_workitem_id_y(); }
+OPUS_D index_t thread_id_z() { return __builtin_amdgcn_workitem_id_z(); }
+OPUS_D index_t block_id_x()  { return __builtin_amdgcn_workgroup_id_x(); }
+OPUS_D index_t block_id_y()  { return __builtin_amdgcn_workgroup_id_y(); }
+OPUS_D index_t block_id_z()  { return __builtin_amdgcn_workgroup_id_z(); }
+OPUS_D index_t block_size_x() { return __builtin_amdgcn_workgroup_size_x(); }
+OPUS_D index_t block_size_y() { return __builtin_amdgcn_workgroup_size_y(); }
+OPUS_D index_t block_size_z() { return __builtin_amdgcn_workgroup_size_z(); }
+OPUS_D index_t grid_size_x()  { return __builtin_amdgcn_grid_size_x(); }
+OPUS_D index_t grid_size_y()  { return __builtin_amdgcn_grid_size_y(); }
+OPUS_D index_t grid_size_z()  { return __builtin_amdgcn_grid_size_z(); }
+OPUS_D void    sync_threads() { __builtin_amdgcn_s_barrier(); }
+#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_DEVICE_LIBRARY_DECLS_H)
+extern "C" __device__ int __ockl_wfall_i32(int);
+#endif
+#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_WARP_FUNCTIONS_H)
+OPUS_D int     warp_all(int predicate) { return __ockl_wfall_i32(predicate); }
+#endif
 
 #if OPUS_ENABLE_RUNTIME_QUERY
 OPUS_H index_t query_warp_size() { int d; (void)hipGetDevice(&d); hipDeviceProp_t p; (void)hipGetDeviceProperties(&p, d); return static_cast<index_t>(p.warpSize); }
