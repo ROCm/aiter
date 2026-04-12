@@ -171,7 +171,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
 

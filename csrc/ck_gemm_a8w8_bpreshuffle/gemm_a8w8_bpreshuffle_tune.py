@@ -506,7 +506,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
     ):
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
         task = []
@@ -518,8 +518,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             K = untunedf.loc[i, "K"]
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
             seed = seed + 1
-            total_kernel_nums = 0
-            # kernels_num = len(kernels_list_ck)
+            prev_task_count = len(task)
             info_keys = (cu_num, M, N, K, q_dtype_w)
             if "all" in args.libtype or "ck" in args.libtype:
                 task.extend(
@@ -547,9 +546,9 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                     )
                 )
 
-            total_kernel_nums = len(task)
+            shape_kernel_nums = len(task) - prev_task_count
 
-            tasks_data.append((total_kernel_nums, ()))
+            tasks_data.append((shape_kernel_nums, ()))
         ret = []
         if task:
             ret = mp_tuner(

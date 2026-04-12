@@ -508,7 +508,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         useSplitK = args.splitK
         mp_num = args.mp
         isPreshuffleB = args.preshuffle
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         block_per_cu = args.blockPerCu
         cu_num = self.get_cu_num()
@@ -524,7 +524,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             seed = seed + 1
-            total_kernel_nums = 0
+            prev_task_count = len(task)
             info_keys = (cu_num, M, N, K)
             lib = args.libtype
             if lib in ("ck", "both", "all"):
@@ -558,9 +558,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                         run_kwargs,
                     )
                 )
-            total_kernel_nums = len(task)
+            shape_kernel_nums = len(task) - prev_task_count
 
-            tasks_data.append((total_kernel_nums, ()))
+            tasks_data.append((shape_kernel_nums, ()))
         ret = []
         if task:
             ret = mp_tuner(

@@ -138,7 +138,7 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
         issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
         task = []
@@ -156,8 +156,8 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
             )
             # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
             total_kernel_nums = 0
-            for i in range(kernels_num):
-                kernel = kernels_list[i]
+            for kid in range(kernels_num):
+                kernel = kernels_list[kid]
                 maxsplitK = (
                     aiter.compute_batched_gemm_SplitK(
                         M,
@@ -171,7 +171,7 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, B, M, N, K), i, splitK, "")
+                    info = ((cu_num, B, M, N, K), kid, splitK, "")
                     task.append(
                         (
                             info,
@@ -180,7 +180,7 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                             kernel_instance_test,
                             (
                                 [0, 1, 2, 3, 4],
-                                i,
+                                kid,
                                 splitK,
                             ),  # [0, 1, 2, 3, 4] is index of paramters for kernel_instance_test in generate_data
                             {
@@ -200,7 +200,6 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
             tasks_data.append((total_kernel_nums, ()))
         ret = []
         if task:
-            shape_grouped = False
             ret = mp_tuner(
                 task,
                 tasks_data,

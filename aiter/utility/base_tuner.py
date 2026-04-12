@@ -133,6 +133,14 @@ class TunerCommon:
             help="Use splitK kernels",
         )
         self.parser.add_argument(
+            "--shape_grouped",
+            action="store_true",
+            default=False,
+            required=False,
+            help="Group all kernel candidates for the same shape onto one GPU "
+            "to eliminate cross-GPU timing variance (also saves generate_data calls)",
+        )
+        self.parser.add_argument(
             "--sort",
             type=dtypes.str2bool,
             default=defaults.get("sort", False),

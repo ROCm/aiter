@@ -223,7 +223,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         from aiter.jit.utils.chip_info import get_gfx
 

@@ -117,7 +117,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
         issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
 
@@ -133,8 +133,8 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
             print(f"tuning B:{B}, M:{M}, N:{N}, K:{K}")
             # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
             total_kernel_nums = 0
-            for i in range(kernels_num):
-                kernel = kernels_list[i]
+            for kid in range(kernels_num):
+                kernel = kernels_list[kid]
                 maxsplitK = (
                     aiter.compute_batched_gemm_SplitK(
                         M,
@@ -148,7 +148,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, B, M, N, K), i, splitK, "")
+                    info = ((cu_num, B, M, N, K), kid, splitK, "")
                     task.append(
                         (
                             info,
@@ -157,7 +157,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                             run_batched_gemm,
                             (
                                 [0, 1, 2],
-                                i,
+                                kid,
                                 splitK,
                             ),  # [0, 1, 2] is index of paramters for run_batched_gemm in generate_data
                             {
