@@ -1,492 +1,282 @@
 How to Add a New Operator
 ==========================
 
-This tutorial shows you how to add a custom operator to AITER.
+This tutorial shows how to add a custom operator to AITER using the JIT
+compilation system. AITER kernels are written in HIP C++ or Triton and are
+JIT-compiled at first use via ``ninja``.
 
 Overview
 --------
 
-Adding a new operator involves:
+1. Write the kernel (HIP C++ in ``csrc/`` or Triton in ``aiter/ops/triton/``)
+2. Register the build config in ``aiter/jit/optCompilerConfig.json``
+3. Create the Python op in ``aiter/ops/``
+4. Provide a fake-tensor implementation for ``torch.compile``
+5. Add tests in ``op_tests/``
 
-1. **Define the operator interface** (Python)
-2. **Implement the kernel** (ROCm/HIP C++)
-3. **Create Python bindings** (PyBind11)
-4. **Add tests**
-5. **Register the operator**
+Option A: HIP C++ Kernel
+--------------------------
 
-Step 1: Define the Operator Interface
---------------------------------------
+Step 1: Write the HIP Kernel
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Create your operator's Python interface in ``aiter/ops/``:
-
-.. code-block:: python
-
-   # aiter/ops/my_custom_op.py
-   import torch
-   from typing import Optional
-
-   def my_custom_op(
-       input: torch.Tensor,
-       weight: torch.Tensor,
-       bias: Optional[torch.Tensor] = None,
-       activation: str = "gelu"
-   ) -> torch.Tensor:
-       """
-       Custom operator that does something awesome.
-
-       Args:
-           input: Input tensor (batch, seq_len, hidden_dim)
-           weight: Weight tensor (hidden_dim, output_dim)
-           bias: Optional bias tensor (output_dim,)
-           activation: Activation function ('gelu', 'relu', 'none')
-
-       Returns:
-           Output tensor (batch, seq_len, output_dim)
-       """
-       # Import the C++ extension
-       from aiter._C import my_custom_op_impl
-
-       # Input validation
-       assert input.is_cuda, "Input must be on CUDA device"
-       assert input.dtype in [torch.float16, torch.bfloat16], \
-           "Only FP16/BF16 supported"
-
-       # Call C++ implementation
-       return my_custom_op_impl(input, weight, bias, activation)
-
-Step 2: Implement the ROCm Kernel
-----------------------------------
-
-Create the kernel implementation in ``csrc/``:
+Create a kernel file in ``csrc/kernels/``. AITER targets AMD GPUs, so use HIP
+APIs and ``__hip_bfloat16`` (not ``__nv_bfloat16``). Source files use the
+``.cu`` extension but are compiled with ``hipcc``.
 
 .. code-block:: cpp
 
-   // csrc/my_custom_op.hip
+   // csrc/kernels/my_op_kernels.cu
    #include <hip/hip_runtime.h>
-   #include <torch/extension.h>
+   #include <hip/hip_fp16.h>
+   #include <hip/hip_bfloat16.h>
 
-   // Kernel implementation
-   template<typename T>
-   __global__ void my_custom_kernel(
-       const T* input,
-       const T* weight,
-       const T* bias,
-       T* output,
-       int batch_size,
-       int seq_len,
-       int hidden_dim,
-       int output_dim
+   template <typename T>
+   __global__ void my_op_kernel(
+       const T* __restrict__ input,
+       T* __restrict__ output,
+       int n
    ) {
        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-       int total_elements = batch_size * seq_len * output_dim;
-
-       if (idx < total_elements) {
-           int b = idx / (seq_len * output_dim);
-           int s = (idx / output_dim) % seq_len;
-           int o = idx % output_dim;
-
-           // Your computation here
-           T sum = 0;
-           for (int h = 0; h < hidden_dim; h++) {
-               int input_idx = b * seq_len * hidden_dim + s * hidden_dim + h;
-               int weight_idx = h * output_dim + o;
-               sum += input[input_idx] * weight[weight_idx];
-           }
-
-           if (bias != nullptr) {
-               sum += bias[o];
-           }
-
-           // Apply activation
-           // (GELU, ReLU, etc.)
-           output[idx] = sum;
+       if (idx < n) {
+           output[idx] = input[idx];  // your computation here
        }
    }
 
-   // Host function
-   torch::Tensor my_custom_op_cuda(
-       torch::Tensor input,
-       torch::Tensor weight,
-       torch::Tensor bias,
-       std::string activation
+   void launch_my_op(
+       const void* input, void* output, int n, hipStream_t stream
    ) {
-       // Get dimensions
-       auto batch_size = input.size(0);
-       auto seq_len = input.size(1);
-       auto hidden_dim = input.size(2);
-       auto output_dim = weight.size(1);
-
-       // Allocate output
-       auto output = torch::empty(
-           {batch_size, seq_len, output_dim},
-           input.options()
-       );
-
-       // Launch kernel
-       int total_elements = batch_size * seq_len * output_dim;
        int threads = 256;
-       int blocks = (total_elements + threads - 1) / threads;
-
-       if (input.dtype() == torch::kFloat16) {
-           my_custom_kernel<__half><<<blocks, threads>>>(
-               reinterpret_cast<__half*>(input.data_ptr()),
-               reinterpret_cast<__half*>(weight.data_ptr()),
-               bias.defined() ? reinterpret_cast<__half*>(bias.data_ptr()) : nullptr,
-               reinterpret_cast<__half*>(output.data_ptr()),
-               batch_size, seq_len, hidden_dim, output_dim
-           );
-       } else {
-           // BF16 case
-           my_custom_kernel<__nv_bfloat16><<<blocks, threads>>>(
-               reinterpret_cast<__nv_bfloat16*>(input.data_ptr()),
-               reinterpret_cast<__nv_bfloat16*>(weight.data_ptr()),
-               bias.defined() ? reinterpret_cast<__nv_bfloat16*>(bias.data_ptr()) : nullptr,
-               reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-               batch_size, seq_len, hidden_dim, output_dim
-           );
-       }
-
-       return output;
+       int blocks = (n + threads - 1) / threads;
+       my_op_kernel<__half><<<blocks, threads, 0, stream>>>(
+           static_cast<const __half*>(input),
+           static_cast<__half*>(output),
+           n
+       );
    }
 
-Step 3: Create Python Bindings
--------------------------------
+GPU architecture targets are ``gfx942`` (MI300X), ``gfx950`` (MI355X), and
+``gfx1250`` (MI450). The JIT system detects the current GPU and compiles for
+the correct target automatically.
 
-Add PyBind11 bindings in ``csrc/my_custom_op_bindings.cpp``:
+Step 2: Write the PyBind Interface
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Create a pybind wrapper in ``csrc/pybind/``:
 
 .. code-block:: cpp
 
+   // csrc/pybind/my_op_pybind.cu
    #include <torch/extension.h>
 
-   // Forward declare CUDA function
-   torch::Tensor my_custom_op_cuda(
-       torch::Tensor input,
-       torch::Tensor weight,
-       torch::Tensor bias,
-       std::string activation
-   );
+   // Forward declaration
+   void launch_my_op(const void* input, void* output, int n, hipStream_t stream);
 
-   // Wrapper for Python
-   torch::Tensor my_custom_op_impl(
-       torch::Tensor input,
-       torch::Tensor weight,
-       torch::Tensor bias,
-       std::string activation
-   ) {
-       TORCH_CHECK(input.is_cuda(), "Input must be CUDA tensor");
-       return my_custom_op_cuda(input, weight, bias, activation);
+   void my_op_fwd(torch::Tensor input, torch::Tensor output) {
+       int n = input.numel();
+       auto stream = at::cuda::getCurrentHIPStream().stream();
+       launch_my_op(input.data_ptr(), output.data_ptr(), n, stream);
    }
 
    PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-       m.def("my_custom_op_impl", &my_custom_op_impl,
-             "My custom operator (CUDA)",
-             py::arg("input"),
-             py::arg("weight"),
-             py::arg("bias"),
-             py::arg("activation"));
+       m.def("my_op_fwd", &my_op_fwd, "My custom op forward");
    }
 
-Step 4: Update Build Configuration
------------------------------------
+Step 3: Register the Build Config
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Add your operator to ``setup.py``:
+Add an entry to ``aiter/jit/optCompilerConfig.json``:
 
-.. code-block:: python
+.. code-block:: json
 
-   # setup.py
-   from setuptools import setup
-   from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+   {
+       "module_my_op": {
+           "srcs": [
+               "f'{AITER_CSRC_DIR}/pybind/my_op_pybind.cu'",
+               "f'{AITER_CSRC_DIR}/kernels/my_op_kernels.cu'"
+           ],
+           "flags_extra_cc": [],
+           "flags_extra_hip": [],
+           "extra_ldflags": "None",
+           "extra_include": [],
+           "verbose": "False",
+           "blob_gen_cmd": "''"
+       }
+   }
 
-   setup(
-       name='aiter',
-       ext_modules=[
-           CUDAExtension(
-               name='aiter._C',
-               sources=[
-                   'csrc/my_custom_op.hip',
-                   'csrc/my_custom_op_bindings.cpp',
-                   # ... other sources
-               ],
-               extra_compile_args={
-                   'cxx': ['-O3', '-std=c++17'],
-                   'nvcc': [
-                       '-O3',
-                       '--use_fast_math',
-                       '-gencode', 'arch=compute_90a,code=sm_90a',  # MI250X
-                       '-gencode', 'arch=compute_942,code=sm_942',  # MI300X
-                   ]
-               }
-           ),
-       ],
-       cmdclass={'build_ext': BuildExtension}
-   )
+The ``srcs`` entries are f-string expressions evaluated at build time.
+``AITER_CSRC_DIR`` points to the ``csrc/`` directory.
 
-Step 5: Add Tests
------------------
+Step 4: Create the Python Op
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Create tests in ``tests/test_my_custom_op.py``:
+Create ``aiter/ops/my_op.py`` using the ``@compile_ops`` decorator. This
+decorator handles JIT compilation, module caching, and ``torch.compile``
+registration.
 
 .. code-block:: python
 
+   # aiter/ops/my_op.py
    import torch
-   import pytest
-   from aiter.ops import my_custom_op
+   from torch import Tensor
+   from ..jit.core import compile_ops
 
-   @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-   @pytest.mark.parametrize("batch_size", [1, 4, 16])
-   @pytest.mark.parametrize("seq_len", [128, 512, 2048])
-   def test_my_custom_op_correctness(dtype, batch_size, seq_len):
-       hidden_dim = 512
-       output_dim = 2048
 
-       # Create inputs
-       input = torch.randn(batch_size, seq_len, hidden_dim,
-                          device='cuda', dtype=dtype)
-       weight = torch.randn(hidden_dim, output_dim,
-                           device='cuda', dtype=dtype)
-       bias = torch.randn(output_dim, device='cuda', dtype=dtype)
+   def gen_my_op_fake(input: Tensor) -> Tensor:
+       """Fake tensor impl for torch.compile tracing."""
+       return torch.empty_like(input)
 
-       # Run custom op
-       output = my_custom_op(input, weight, bias, activation='gelu')
 
-       # Reference implementation (PyTorch)
-       ref_output = torch.matmul(input, weight)
-       if bias is not None:
-           ref_output = ref_output + bias
-       ref_output = torch.nn.functional.gelu(ref_output)
+   @compile_ops("module_my_op", gen_fake=gen_my_op_fake)
+   def my_op_fwd(input: Tensor) -> Tensor:
+       """My custom operator."""
+       ...
 
-       # Check correctness
-       torch.testing.assert_close(
-           output, ref_output,
-           rtol=1e-2, atol=1e-2  # FP16/BF16 tolerance
-       )
+Key points:
 
-   def test_my_custom_op_performance():
-       batch_size, seq_len = 16, 2048
-       hidden_dim, output_dim = 4096, 4096
+- The first argument to ``@compile_ops`` is the module name matching the key
+  in ``optCompilerConfig.json``.
+- The function body is ``...`` (ellipsis). The decorator replaces it with the
+  JIT-compiled C++ implementation at runtime.
+- The function name must match the pybind function name. Use ``fc_name`` if
+  they differ: ``@compile_ops("module_my_op", fc_name="my_op_fwd")``.
+- The ``gen_fake`` callable returns tensors with the correct shape/dtype for
+  ``torch.compile`` tracing without running the real kernel.
 
-       input = torch.randn(batch_size, seq_len, hidden_dim,
-                          device='cuda', dtype=torch.float16)
-       weight = torch.randn(hidden_dim, output_dim,
-                           device='cuda', dtype=torch.float16)
-       bias = torch.randn(output_dim, device='cuda', dtype=torch.float16)
-
-       # Warmup
-       for _ in range(10):
-           _ = my_custom_op(input, weight, bias)
-       torch.cuda.synchronize()
-
-       # Benchmark
-       import time
-       start = time.time()
-       for _ in range(100):
-           output = my_custom_op(input, weight, bias)
-       torch.cuda.synchronize()
-       elapsed = time.time() - start
-
-       print(f"Average time: {elapsed/100*1000:.2f} ms")
-       print(f"Throughput: {batch_size*seq_len*100/elapsed:.2f} tokens/sec")
-
-Step 6: Build and Install
+Option B: Triton Kernel
 --------------------------
 
-Build your extension:
+Triton kernels live under ``aiter/ops/triton/`` and do not need
+``optCompilerConfig.json`` entries. They are compiled by the Triton JIT
+compiler directly.
 
-.. code-block:: bash
+Step 1: Write the Triton Kernel
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-   # Clean build
-   python setup.py clean
-   rm -rf build/
-
-   # Build and install
-   python setup.py develop
-
-   # Or for production
-   python setup.py install
-
-Step 7: Register in Main Module
---------------------------------
-
-Add to ``aiter/__init__.py``:
+Create the kernel in ``aiter/ops/triton/_triton_kernels/``:
 
 .. code-block:: python
 
-   # aiter/__init__.py
-   from aiter.ops.my_custom_op import my_custom_op
-
-   __all__ = [
-       'my_custom_op',
-       # ... other exports
-   ]
-
-Advanced: Optimizations
------------------------
-
-Use CK (Composable Kernel) for Better Performance
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: cpp
-
-   #include "ck/tensor_operation/gpu/device/device_gemm.hpp"
-
-   // Use CK's optimized GEMM
-   using DeviceGemmInstance = ck::tensor_operation::device::DeviceGemm<
-       /* ... template parameters ... */
-   >;
-
-Use Triton for Easier Kernel Development
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: python
-
+   # aiter/ops/triton/_triton_kernels/my_triton_op.py
    import triton
    import triton.language as tl
 
    @triton.jit
-   def my_custom_kernel(
-       input_ptr, weight_ptr, output_ptr,
-       M, N, K,
-       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+   def _my_triton_kernel(
+       input_ptr, output_ptr,
+       n_elements,
+       BLOCK_SIZE: tl.constexpr,
    ):
-       # Triton kernel implementation
-       # (Much easier than raw HIP/CUDA!)
-       pass
+       pid = tl.program_id(0)
+       offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+       mask = offsets < n_elements
 
-Common Patterns
----------------
+       x = tl.load(input_ptr + offsets, mask=mask)
+       # Your computation here
+       tl.store(output_ptr + offsets, x, mask=mask)
 
-Pattern 1: Fused Operations
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Step 2: Write the Python Wrapper
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Combine multiple ops into one kernel:
-
-.. code-block:: python
-
-   def fused_linear_gelu(input, weight, bias):
-       """
-       Fuses: output = GELU(input @ weight + bias)
-       Faster than separate ops!
-       """
-       pass
-
-Pattern 2: In-Place Operations
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Modify tensors in-place to save memory:
+Create the wrapper in ``aiter/ops/triton/``:
 
 .. code-block:: python
 
-   def inplace_rmsnorm_(input, weight, eps=1e-6):
-       """
-       In-place RMSNorm (modifies input)
-       Note the trailing underscore!
-       """
-       pass
+   # aiter/ops/triton/my_triton_op.py
+   import torch
+   import triton
+   from aiter.ops.triton._triton_kernels.my_triton_op import _my_triton_kernel
 
-Pattern 3: Autograd Support
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   def my_triton_op(output: torch.Tensor, input: torch.Tensor):
+       n_elements = input.numel()
+       BLOCK_SIZE = triton.next_power_of_2(min(n_elements, 1024))
+       grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+       _my_triton_kernel[grid](
+           input, output, n_elements, BLOCK_SIZE=BLOCK_SIZE,
+       )
 
-Add backward pass for training:
+Adding Tests
+------------
+
+Create a test file in ``op_tests/``. Follow the existing pattern using
+``aiter.test_common``:
 
 .. code-block:: python
 
-   class MyCustomOpFunction(torch.autograd.Function):
-       @staticmethod
-       def forward(ctx, input, weight, bias):
-           ctx.save_for_backward(input, weight, bias)
-           return my_custom_op_impl(input, weight, bias)
+   # op_tests/test_my_op.py
+   import torch
+   import aiter
+   from aiter.test_common import checkAllclose, benchmark
 
-       @staticmethod
-       def backward(ctx, grad_output):
-           input, weight, bias = ctx.saved_tensors
-           # Compute gradients
-           grad_input = ...
-           grad_weight = ...
-           grad_bias = ...
-           return grad_input, grad_weight, grad_bias
+   @benchmark()
+   def test_my_op(m, n, dtype):
+       ret = {}
+       input = torch.randn(m, n, dtype=dtype, device="cuda")
 
-Best Practices
---------------
+       # Reference (PyTorch)
+       ref_output = input.clone()  # replace with actual reference
 
-1. **Start Simple**: Get it working first, optimize later
-2. **Test Correctness**: Always compare with PyTorch reference
-3. **Profile First**: Use ``rocprof`` to find bottlenecks
-4. **Use CK/Triton**: Don't write raw kernels unless necessary
-5. **Document Everything**: Add docstrings and comments
-6. **Add Type Hints**: Makes the API clearer
-7. **Handle Edge Cases**: Check for invalid inputs
+       # AITER op
+       output = torch.empty_like(input)
+       aiter.my_op_fwd(output, input)
 
-Debugging Tips
---------------
+       err = checkAllclose(ref_output, output)
+       ret["M"] = m
+       ret["N"] = n
+       ret["err"] = err
+       return ret
 
-Print Kernel Launches
-^^^^^^^^^^^^^^^^^^^^^
+   if __name__ == "__main__":
+       for dtype in [torch.float16, torch.bfloat16]:
+           for m in [1, 32, 512]:
+               test_my_op(m, 4096, dtype)
+
+Run with:
 
 .. code-block:: bash
 
-   export HIP_VISIBLE_DEVICES=0
-   export AMD_LOG_LEVEL=3  # Verbose logging
+   python op_tests/test_my_op.py
 
-Check for Memory Errors
-^^^^^^^^^^^^^^^^^^^^^^^
+torch.compile Compatibility
+----------------------------
 
-.. code-block:: bash
+The ``gen_fake`` function passed to ``@compile_ops`` is registered as the
+fake-tensor implementation via ``torch_compile_guard`` in
+``aiter/jit/utils/torch_guard.py``. This allows ``torch.compile`` to trace
+through the op without executing the real kernel.
 
-   # Use compute-sanitizer (if available)
-   rocm-compute-sanitizer python test_my_op.py
-
-Profile Your Operator
-^^^^^^^^^^^^^^^^^^^^^
-
-.. code-block:: bash
-
-   rocprof --stats python benchmark_my_op.py
-
-Example: Complete RMSNorm Implementation
------------------------------------------
-
-Here's a complete example you can use as a template:
-
-**Python Interface** (``aiter/ops/rmsnorm.py``):
+For HIP ops, the decorator handles this automatically. For Triton ops, if you
+need ``torch.compile`` support, register the op manually:
 
 .. code-block:: python
 
    import torch
-   from aiter._C import rmsnorm_forward
 
-   def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-       """
-       Root Mean Square Layer Normalization.
+   @torch.library.custom_op("aiter::my_triton_op", mutates_args=["output"])
+   def my_triton_op(output: torch.Tensor, input: torch.Tensor) -> None:
+       # call the Triton kernel
+       ...
 
-       Args:
-           x: Input tensor (..., hidden_dim)
-           weight: Scaling weights (hidden_dim,)
-           eps: Epsilon for numerical stability
+   @my_triton_op.register_fake
+   def _(output: torch.Tensor, input: torch.Tensor) -> None:
+       pass  # output is mutated in-place, nothing to return
 
-       Returns:
-           Normalized tensor with same shape as input
-       """
-       assert x.is_cuda and weight.is_cuda
-       assert x.dtype in [torch.float16, torch.bfloat16]
-       return rmsnorm_forward(x, weight, eps)
+Best Practices
+--------------
 
-**See Full Code**: Check ``csrc/`` directory for complete implementations!
+1. **Match existing patterns.** Study ``aiter/ops/activation.py`` (simple HIP
+   ops) or ``aiter/ops/triton/quant/quant.py`` (Triton ops) as templates.
+2. **Test correctness first.** Compare against a PyTorch reference
+   implementation with ``checkAllclose``.
+3. **Use in-place output tensors.** Most AITER ops take a pre-allocated ``out``
+   tensor as the first argument and return ``None``.
+4. **Profile with rocm-trace-lite.** Measure kernel duration and memory
+   bandwidth to verify performance.
+5. **Run ruff and pytest before committing.** Lint and test locally before
+   pushing.
 
-Next Steps
-----------
+See Also
+--------
 
-* :doc:`../api/operators` - See existing operator implementations
-* :doc:`../benchmarks` - Learn how to benchmark your operator
-* :doc:`profiling` - Profile and optimize performance
-
-Contributing
-------------
-
-Want to contribute your operator to AITER?
-
-1. Follow the coding style
-2. Add comprehensive tests
-3. Benchmark vs existing solutions
-4. Submit a PR with clear description
-
-See ``CONTRIBUTING.md`` for details!
+* :doc:`../api/operators` - Existing operator reference
+* :doc:`../api/gemm` - GEMM operator reference

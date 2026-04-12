@@ -1,0 +1,44 @@
+{
+  "categories": [
+    {
+      "title": "## New Features",
+      "labels": ["feature", "enhancement"]
+    },
+    {
+      "title": "## Performance",
+      "labels": ["performance", "optimization"]
+    },
+    {
+      "title": "## Bug Fixes",
+      "labels": ["bug", "fix"]
+    },
+    {
+      "title": "## Refactoring",
+      "labels": ["refactor", "cleanup"]
+    },
+    {
+      "title": "## Infrastructure",
+      "labels": ["ci", "infrastructure", "build"]
+    }
+  ],
+  "sort": {
+    "order": "ASC",
+    "on_property": "mergedAt"
+  },
+  "template": "#{{CHANGELOG}}\n\n**Full Changelog**: https://github.com/ROCm/aiter/compare/{{FROM_TAG}}...{{TO_TAG}}",
+  "pr_template": "- {{TITLE}} (#{{NUMBER}})",
+  "empty_template": "No changes.",
+  "label_extractor": [
+    {
+      "pattern": "^(feat|feature|add|Add|new)",
+      "target": "$1",
+      "on_property": "title",
+      "method": "match",
+      "flags": "i"
+    }
+  ],
+  "max_tags_to_fetch": 200,
+  "max_pull_requests": 1000,
+  "max_back_track_time_days": 90,
+  "base_branches": ["main"]
+}

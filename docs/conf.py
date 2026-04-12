@@ -12,7 +12,19 @@ sys.path.insert(0, os.path.abspath(".."))
 project = "AITER"
 copyright = "2026, AMD"
 author = "AMD ROCm Team"
-release = "0.1.0"
+# Auto-detect version from setuptools_scm or git
+try:
+    from importlib.metadata import version as get_version
+
+    release = get_version("amd-aiter")
+except Exception:
+    try:
+        from setuptools_scm import get_version
+
+        release = get_version(root="..", relative_to=__file__)
+    except Exception:
+        release = "dev"
+version = ".".join(release.split(".")[:2])
 
 # -- General configuration ---------------------------------------------------
 extensions = [
@@ -33,7 +45,7 @@ html_static_path = ["_static"]
 
 html_theme_options = {
     "logo_only": False,
-    "display_version": True,
+    # "display_version" removed in newer sphinx_rtd_theme, version shown by default
     "prev_next_buttons_location": "bottom",
     "style_external_links": False,
     "vcs_pageview_mode": "",
@@ -82,3 +94,18 @@ autodoc_default_options = {
     "undoc-members": True,
     "exclude-members": "__weakref__",
 }
+
+# Mock imports for modules that require ROCm/GPU at import time.
+# This allows Sphinx to build on CPU-only CI runners.
+autodoc_mock_imports = [
+    "triton",
+    "triton.language",
+    "aiter.jit",
+    "aiter.jit.core",
+    "aiter.utility",
+    "aiter.utility.dtypes",
+    "aiter.ops.enum",
+    "hip",
+    "hipblas",
+    "rocm",
+]

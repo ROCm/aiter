@@ -316,9 +316,9 @@ Monitor GPU memory usage:
 Next Steps
 ----------
 
-* :doc:`attention_tutorial` - Deep dive into attention mechanisms
-* :doc:`variable_length` - Handle variable-length sequences
-* :doc:`moe_tutorial` - Mixture of Experts optimization
+* :doc:`add_new_op` - How to add a new operator
+* :doc:`../api/attention` - Attention API reference
+* :doc:`../api/moe` - MoE API reference
 
 Common Gotchas
 --------------

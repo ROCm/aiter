@@ -3,7 +3,7 @@
 AITER Documentation
 ===================
 
-**AITER** (AMD Inference and Training Enhanced Repository) is AMD's high-performance AI operator library for ROCm, providing optimized kernels for inference and training workloads.
+**AITER** (AI Tensor Engine for ROCm) is AMD's high-performance AI operator library for ROCm, providing optimized kernels for inference and training workloads.
 
 .. image:: https://img.shields.io/badge/ROCm-Compatible-red
    :target: https://rocm.docs.amd.com/
@@ -16,10 +16,10 @@ AITER Documentation
 Why AITER?
 ----------
 
-* **High Performance**: Optimized kernels using Triton, Composable Kernel (CK), and hand-written assembly
+* **High Performance**: Optimized kernels using Triton, Composable Kernel (CK), ASM, and FlyDSL
 * **Comprehensive**: Supports both inference and training workloads
 * **Flexible**: C++ and Python APIs for easy integration
-* **AMD Optimized**: Built specifically for AMD GPUs and the ROCm platform
+* **AMD Optimized**: Built specifically for AMD Instinct GPUs and the ROCm platform
 
 Quick Start
 -----------
@@ -29,12 +29,13 @@ Installation
 
 .. code-block:: bash
 
-   pip install aiter  # Coming soon!
+   # From GitHub Release (recommended)
+   pip install amd-aiter --find-links https://github.com/ROCm/aiter/releases/latest
 
-   # For now, install from source:
+   # From source
    git clone --recursive https://github.com/ROCm/aiter.git
    cd aiter
-   python3 setup.py develop
+   pip install -e .
 
 Quick Example
 ^^^^^^^^^^^^^
@@ -44,8 +45,13 @@ Quick Example
    import aiter
    import torch
 
-   # Example: Flash Attention
-   # TODO: Add actual example code
+   # RMS Normalization
+   x = torch.randn(2, 4096, dtype=torch.bfloat16, device="cuda")
+   weight = torch.ones(4096, dtype=torch.bfloat16, device="cuda")
+   out = aiter.rms_norm(x, weight, 1e-6)
+
+   # Fused MoE
+   # See API Reference for full function signatures
 
 Core Features
 -------------
@@ -53,72 +59,78 @@ Core Features
 Attention Kernels
 ^^^^^^^^^^^^^^^^^
 
-* **Multi-Head Attention (MHA)**: Standard attention with optimized implementations
-* **Multi-Latent Attention (MLA)**: DeepSeek-style latent attention
-* **Paged Attention**: Efficient KV-cache management for serving
+* **Multi-Head Attention (MHA)**: Flash attention forward and backward passes
+* **Multi-Latent Attention (MLA)**: DeepSeek-style latent attention for decode and prefill
+* **Paged Attention**: Efficient KV-cache management for serving (v1, v2, ragged, ASM)
 
 GEMM Operations
 ^^^^^^^^^^^^^^^
 
-* **Mixed Precision GEMM**: FP16, BF16, FP8, INT4 support
-* **Tuned GEMM**: Pre-tuned configurations for common shapes
-* **Fused Operations**: GEMM with activation fusion
+* **FP8 GEMM (A8W8)**: Multiple backends -- CK, CK Tile, ASM, FlyDSL
+* **BF16/FP16 GEMM (A16W16)**: ASM-optimized with auto-tuning
+* **FP4 GEMM (A4W4)**: FP4 precision with block-scale support
+* **Batched GEMM**: FP8 and BF16 batched operations
+* **DeepGEMM**: Specialized deep GEMM kernels
+* **Auto-Tuned GEMM**: Pre-tuned configurations for common model shapes
 
 Mixture of Experts (MoE)
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-* **Fused MoE**: Optimized expert routing and computation
-* **Multiple Routing**: Support for various routing strategies
-* **Quantized Experts**: FP8 and INT4 expert weights
+* **Fused MoE**: Optimized expert routing and computation (``fmoe``, ``fmoe_g1u1``)
+* **Quantized MoE**: FP8 block-scale and INT8 expert weights
+* **2-Stage MoE**: Sorting + compute pipeline for large expert counts
 
-Normalization
-^^^^^^^^^^^^^
+Normalization & Activation
+^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-* **RMSNorm**: Root mean square normalization
-* **LayerNorm**: Standard layer normalization
-* **Fused Variants**: Combined with other operations
+* **RMSNorm / LayerNorm**: With fused variants (residual add, quantization)
+* **Activation**: SiLU, GELU, GELU-tanh (fused with multiply)
 
 Other Operators
 ^^^^^^^^^^^^^^^
 
-* **RoPE**: Rotary position embeddings
-* **Quantization**: BF16/FP16 → FP8/INT4 conversion
-* **Element-wise**: Optimized basic operations
-* **Communication**: AllReduce and collective operations via Triton/Iris
+* **RoPE**: Rotary position embeddings (forward, backward, cached)
+* **Quantization**: Per-token, per-tensor, per-group, FP4/FP8 conversion
+* **KV Cache**: reshape_and_cache with optional quantization
+* **Sampling**: Greedy, random, mixed sampling kernels
+* **Communication**: Custom AllReduce, fused AllReduce+RMSNorm+Quant
 
 GPU Support
 -----------
 
-AITER supports AMD GPUs with the following architectures:
-
 .. list-table::
    :header-rows: 1
-   :widths: 20 20 30 30
+   :widths: 20 15 25 20 20
 
    * - Architecture
      - gfx Target
-     - Example GPUs
+     - GPUs
      - ROCm Version
-   * - CDNA 2
-     - gfx90a
-     - MI210, MI250, MI250X
-     - ROCm 5.0+
+     - Status
    * - CDNA 3
      - gfx942
-     - MI300A, MI300X
-     - ROCm 6.0+
+     - MI300A, MI300X, MI325X
+     - ROCm 7.0+
+     - Fully supported
    * - CDNA 3.5
      - gfx950
-     - MI350X (upcoming)
-     - ROCm 6.3+
+     - MI355X
+     - ROCm 7.0+
+     - Fully supported
+   * - CDNA 4
+     - gfx1250
+     - MI450
+     - ROCm 7.2+
+     - Experimental
 
 Quick Links
 -----------
 
-* 🚀 :doc:`quickstart` - Get started in 5 minutes
-* 📖 :doc:`tutorials/add_new_op` - **How to add a new operator** (step-by-step)
-* 🔧 :doc:`api/attention` - Flash Attention API
-* 💡 :doc:`tutorials/basic_usage` - Basic usage examples
+* :doc:`quickstart` - Get started in 5 minutes
+* :doc:`compatibility` - ROCm version matrix and installation options
+* :doc:`models` - Supported model architectures
+* :doc:`tutorials/add_new_op` - How to add a new operator
+* :doc:`gemm_tuning` - GEMM performance tuning guide
 
 Table of Contents
 -----------------
@@ -129,7 +141,8 @@ Table of Contents
 
    installation
    quickstart
-   tutorials/index
+   compatibility
+   models
 
 .. toctree::
    :maxdepth: 2
@@ -143,12 +156,12 @@ Table of Contents
 
 .. toctree::
    :maxdepth: 2
-   :caption: Advanced Topics
+   :caption: Guides
 
-   performance/benchmarks
-   performance/profiling
+   tutorials/index
+   gemm_tuning
    advanced/triton_kernels
-   advanced/ck_integration
+   performance/benchmarks
 
 .. toctree::
    :maxdepth: 1

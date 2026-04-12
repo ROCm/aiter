@@ -134,7 +134,7 @@ For Triton-based communication primitives:
 
    pip install -r requirements-triton-comms.txt
 
-See :doc:`tutorials/triton_comms` for more details.
+See the `Triton communication documentation <advanced/triton_kernels.html>`_ for more details.
 
 Troubleshooting
 ---------------
