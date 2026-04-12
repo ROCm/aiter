@@ -143,9 +143,7 @@ class TestAPISignatureConsistency:
             if _module_refs
             else [pytest.param("skip", "skip", marks=pytest.mark.skip)]
         ),
-        ids=[f"{r[1]}::{r[0]}" for r in _module_refs]
-        if _module_refs
-        else ["no_refs"],
+        ids=[f"{r[1]}::{r[0]}" for r in _module_refs] if _module_refs else ["no_refs"],
     )
     def test_module_ref_importable(self, module_path, source_file):
         """Each ``aiter.ops.xxx`` module reference must be importable."""
