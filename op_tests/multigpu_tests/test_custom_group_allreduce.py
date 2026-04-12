@@ -4,7 +4,7 @@
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing_extensions import Optional, Union, List
+from typing_extensions import Optional
 
 import torch
 import torch.distributed as dist
