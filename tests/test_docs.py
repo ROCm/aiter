@@ -106,9 +106,11 @@ class TestAPISignatureConsistency:
 
     @pytest.mark.parametrize(
         "dotted_path,source_file",
-        _api_refs
-        if _api_refs
-        else [pytest.param("skip", "skip", marks=pytest.mark.skip)],
+        (
+            _api_refs
+            if _api_refs
+            else [pytest.param("skip", "skip", marks=pytest.mark.skip)]
+        ),
         ids=[f"{r[1]}::{r[0]}" for r in _api_refs] if _api_refs else ["no_refs"],
     )
     def test_autofunction_importable(self, dotted_path, source_file):
@@ -136,10 +138,14 @@ class TestAPISignatureConsistency:
 
     @pytest.mark.parametrize(
         "module_path,source_file",
-        _module_refs
+        (
+            _module_refs
+            if _module_refs
+            else [pytest.param("skip", "skip", marks=pytest.mark.skip)]
+        ),
+        ids=[f"{r[1]}::{r[0]}" for r in _module_refs]
         if _module_refs
-        else [pytest.param("skip", "skip", marks=pytest.mark.skip)],
-        ids=[f"{r[1]}::{r[0]}" for r in _module_refs] if _module_refs else ["no_refs"],
+        else ["no_refs"],
     )
     def test_module_ref_importable(self, module_path, source_file):
         """Each ``aiter.ops.xxx`` module reference must be importable."""
@@ -227,12 +233,16 @@ class TestCodeExamples:
 
     @pytest.mark.parametrize(
         "rst_file,line_no,code",
-        _code_blocks
-        if _code_blocks
-        else [pytest.param("skip", 0, "", marks=pytest.mark.skip)],
-        ids=[f"{cb[0]}:L{cb[1]}" for cb in _code_blocks]
-        if _code_blocks
-        else ["no_blocks"],
+        (
+            _code_blocks
+            if _code_blocks
+            else [pytest.param("skip", 0, "", marks=pytest.mark.skip)]
+        ),
+        ids=(
+            [f"{cb[0]}:L{cb[1]}" for cb in _code_blocks]
+            if _code_blocks
+            else ["no_blocks"]
+        ),
     )
     def test_code_block_parses(self, rst_file, line_no, code):
         """Each Python code block must be syntactically valid."""
@@ -252,12 +262,16 @@ class TestCodeExamples:
 
     @pytest.mark.parametrize(
         "rst_file,line_no,code",
-        _code_blocks
-        if _code_blocks
-        else [pytest.param("skip", 0, "", marks=pytest.mark.skip)],
-        ids=[f"imports:{cb[0]}:L{cb[1]}" for cb in _code_blocks]
-        if _code_blocks
-        else ["no_blocks"],
+        (
+            _code_blocks
+            if _code_blocks
+            else [pytest.param("skip", 0, "", marks=pytest.mark.skip)]
+        ),
+        ids=(
+            [f"imports:{cb[0]}:L{cb[1]}" for cb in _code_blocks]
+            if _code_blocks
+            else ["no_blocks"]
+        ),
     )
     def test_code_block_imports_valid(self, rst_file, line_no, code):
         """Import statements in code blocks must reference real modules."""
