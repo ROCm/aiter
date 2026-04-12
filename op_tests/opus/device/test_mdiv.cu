@@ -26,8 +26,8 @@ __global__ void mdiv_kernel(const unsigned int* __restrict__ dividends,
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "hip_minimal.h"
 #include <cstdio>
 #include "opus/opus.hpp"
 using namespace opus;

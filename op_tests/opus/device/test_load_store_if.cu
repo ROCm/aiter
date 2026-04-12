@@ -135,8 +135,8 @@ template __global__ void predicated_copy_2d_kernel<256, 4, 4>(const float*, floa
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "hip_minimal.h"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \

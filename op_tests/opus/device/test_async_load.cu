@@ -46,8 +46,8 @@ template __global__ void async_load_kernel<256>(const float*, float*, int);
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "hip_minimal.h"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \

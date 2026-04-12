@@ -64,7 +64,7 @@ The device test build applies several techniques from the OPUS best-practices gu
 | 2 | Parallel compilation (each .cu -> .o, then link) | 3,950 ms | ~9 s | 4.7x |
 | 3 | Split `test_mfma.cu` into 3 files (f16/f32/f8) | 2,670 ms | ~8 s | 6.9x |
 | 4 | Add `-D__HIPCC_RTC__` to reduce device-pass header parsing | 2,070 ms | ~7.5 s | 8.9x |
-| 5 | Replace `<hip/hip_runtime.h>` with `hip_host_minimal.h` | **1,740 ms** | **~6.9 s** | **10.5x** |
+| 5 | Replace `<hip/hip_runtime.h>` with `hip_minimal.h` | **1,740 ms** | **~6.9 s** | **10.5x** |
 
 ### What each optimization does
 
@@ -86,7 +86,7 @@ The device test build applies several techniques from the OPUS best-practices gu
    needed for runtime compilation, reducing preprocessing load on both host and device
    passes. Saves ~500ms per file on header parsing.
 
-5. **`hip_host_minimal.h`** — A ~70-line header (`csrc/include/hip_host_minimal.h`) that
+5. **`hip_minimal.h`** — A ~70-line header (`csrc/include/hip_minimal.h`) that
    declares only the dozen HIP APIs the host launcher code actually uses (`dim3`,
    `hipLaunchKernelGGL`, `hipMalloc`, `hipDeviceSynchronize`, etc.), replacing
    `<hip/hip_runtime.h>` (~100K preprocessed lines) on the host pass. Combined with
@@ -164,8 +164,8 @@ __global__ void my_kernel(const float* in, float* out, int n) {
 
 #else
 // ── Host pass: minimal HIP header for kernel launch API ──
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "hip_minimal.h"
 
 __global__ void my_kernel(const float* in, float* out, int n);
 

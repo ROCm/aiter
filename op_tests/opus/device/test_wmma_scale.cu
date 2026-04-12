@@ -279,7 +279,7 @@ template __global__ void tiled_wmma_scale_kernel<opus::fp8_t, 16, 16, 128, 4, 1>
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "hip_host_minimal.h"
+#include "hip_minimal.h"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \

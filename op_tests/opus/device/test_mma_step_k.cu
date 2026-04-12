@@ -89,7 +89,7 @@ __global__ void mma_step_k_bf16_kernel(
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "hip_host_minimal.h"
+#include "hip_minimal.h"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \
