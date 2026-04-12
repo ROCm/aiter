@@ -26,7 +26,7 @@ op_tests/opus/
 │   ├── test_finfo.cu            # opus::finfo kernel
 │   ├── test_mdiv.cu             # opus::magic_div kernel
 │   ├── test_workgroup_barrier.cu# Workgroup barrier kernel
-│   ├── setup.py                 # Parallel hipcc build: 17 .cu -> .o -> .so
+│   ├── setup.py                 # Parallel hipcc build: 18 .cu -> .o -> .so
 │   └── test_opus_device.py      # Python test runner (builds .so, runs all tests)
 ├── run_tests.sh                 # Runs host test + device tests
 └── README.md
@@ -95,47 +95,47 @@ The device test build applies several techniques from the OPUS best-practices gu
 Measured on MI355 (gfx950) with ROCm 7.1.1:
 
 ```
-real    0m4.1s      (wall clock)
-user    0m12.9s     (CPU time, summed across parallel hipcc jobs)
-sys     0m2.3s
-
 Phase                              Time
 ────────────────────────────────  ──────
-Host build (hipcc test_opus_basic)  1,400 ms
+Host build (hipcc test_opus_basic)    738 ms
 Host run (13 unit tests)               12 ms
-Device .so build (16 .cu, parallel)   921 ms
-  compile (16 parallel jobs)           887 ms
-  link (.o -> .so)                      34 ms
+Device .so build (18 .cu, parallel)   625 ms
+  compile (18 parallel jobs)           599 ms
+  link (.o -> .so)                      25 ms
 Device tests (torch import + GPU)   1,800 ms
   torch import + .so build              ~800 ms
   kernel execution (60+ tests)        ~1,000 ms
 ────────────────────────────────  ──────
-Total wall clock                    ~4.1 s
+Total wall clock                    ~3.2 s
 ```
 
-On MI308 (gfx942) with ROCm 6.3: compile 1,694ms, total ~6.6s.
-
-### Per-file device compile times (MI355 / gfx950, 16 parallel jobs)
+### Per-file device compile times (MI355 / gfx950, 18 parallel jobs)
 
 ```
-test_finfo.cu              128 ms
-test_async_load.cu         128 ms
-test_vector_add.cu         131 ms
-test_numeric_limits.cu     139 ms
-test_workgroup_barrier.cu  149 ms
-test_wmma_f16.cu           162 ms
-test_wmma_f32.cu           163 ms
-test_mdiv.cu               165 ms
+test_async_load.cu         119 ms
+test_finfo.cu              124 ms
+test_vector_add.cu         125 ms
+test_numeric_limits.cu     128 ms
+test_workgroup_barrier.cu  139 ms
+test_wmma_f16.cu           152 ms
+test_wmma_f32.cu           156 ms
+test_mdiv.cu               161 ms
+test_wmma_f8.cu            165 ms
 test_wmma_scale.cu         172 ms
-test_wmma_f8.cu            173 ms
-test_load_store_if.cu      224 ms
-test_mxfp.cu               226 ms
-test_dtype_convert.cu      287 ms
-test_mfma_f32.cu           763 ms
-test_mfma_f8.cu            852 ms
-test_mfma_f16.cu           875 ms  <-- critical path
-link                        34 ms
+test_load_store_if.cu      187 ms
+test_mxfp.cu               214 ms
+test_dtype_convert.cu      282 ms
+test_mma_step_k.cu         421 ms
+test_tr_load_f16.cu        434 ms
+test_mfma_f32.cu           522 ms
+test_mfma_f8.cu            572 ms
+test_mfma_f16.cu           587 ms  <-- critical path
+link                        25 ms
 ```
+
+Before opus.hpp compile-time optimizations, the MFMA-heavy files took 750-890ms each
+(930ms total parallel build). The optimizations reduced these by 1.3-2.1x, bringing
+the parallel build from 930ms to 625ms (33% faster).
 
 ## How to add a new device test
 
