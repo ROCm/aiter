@@ -151,11 +151,11 @@ Performance Tips
 Next Steps
 ----------
 
-* :doc:`tutorials/attention` - Deep dive into attention mechanisms
-* :doc:`tutorials/moe` - Learn about MoE optimizations
-* :doc:`tutorials/variable_length` - Handle variable-length sequences
-* :doc:`api/attention` - Full API reference
-* :doc:`benchmarks` - Performance comparisons
+* :doc:`tutorials/add_new_op` - How to add a new operator
+* :doc:`api/attention` - Attention API reference
+* :doc:`api/gemm` - GEMM API reference
+* :doc:`api/moe` - MoE API reference
+* :doc:`performance/benchmarks` - Performance benchmarks
 
 Common Issues
 -------------

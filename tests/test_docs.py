@@ -15,7 +15,6 @@ No GPU required — these tests run on CPU.
 
 import ast
 import importlib
-import os
 import re
 import subprocess
 import sys
@@ -32,6 +31,7 @@ TUTORIAL_DIR = DOCS_DIR / "tutorials"
 # Test 1: API Signature Consistency
 # Every function/class referenced in docs/api/*.rst must be importable.
 # ---------------------------------------------------------------------------
+
 
 def _extract_autofunction_refs(rst_path: Path) -> list[str]:
     """Extract all '.. autofunction:: X' and '.. autoclass:: X' from an RST file."""
@@ -106,7 +106,9 @@ class TestAPISignatureConsistency:
 
     @pytest.mark.parametrize(
         "dotted_path,source_file",
-        _api_refs if _api_refs else [pytest.param("skip", "skip", marks=pytest.mark.skip)],
+        _api_refs
+        if _api_refs
+        else [pytest.param("skip", "skip", marks=pytest.mark.skip)],
         ids=[f"{r[1]}::{r[0]}" for r in _api_refs] if _api_refs else ["no_refs"],
     )
     def test_autofunction_importable(self, dotted_path, source_file):
@@ -134,7 +136,9 @@ class TestAPISignatureConsistency:
 
     @pytest.mark.parametrize(
         "module_path,source_file",
-        _module_refs if _module_refs else [pytest.param("skip", "skip", marks=pytest.mark.skip)],
+        _module_refs
+        if _module_refs
+        else [pytest.param("skip", "skip", marks=pytest.mark.skip)],
         ids=[f"{r[1]}::{r[0]}" for r in _module_refs] if _module_refs else ["no_refs"],
     )
     def test_module_ref_importable(self, module_path, source_file):
@@ -152,6 +156,7 @@ class TestAPISignatureConsistency:
 # Test 2: Code Example Smoke Tests
 # Python code blocks in RST must at least parse (syntax check).
 # ---------------------------------------------------------------------------
+
 
 def _extract_python_code_blocks(rst_path: Path) -> list[tuple[int, str]]:
     """Extract Python code blocks from RST file.
@@ -181,7 +186,10 @@ def _extract_python_code_blocks(rst_path: Path) -> list[tuple[int, str]]:
             while i < len(lines):
                 if lines[i].strip() == "":
                     code_lines.append("")
-                elif len(lines[i]) > 0 and len(lines[i]) - len(lines[i].lstrip()) >= indent:
+                elif (
+                    len(lines[i]) > 0
+                    and len(lines[i]) - len(lines[i].lstrip()) >= indent
+                ):
                     code_lines.append(lines[i][indent:])
                 else:
                     break
@@ -219,8 +227,12 @@ class TestCodeExamples:
 
     @pytest.mark.parametrize(
         "rst_file,line_no,code",
-        _code_blocks if _code_blocks else [pytest.param("skip", 0, "", marks=pytest.mark.skip)],
-        ids=[f"{cb[0]}:L{cb[1]}" for cb in _code_blocks] if _code_blocks else ["no_blocks"],
+        _code_blocks
+        if _code_blocks
+        else [pytest.param("skip", 0, "", marks=pytest.mark.skip)],
+        ids=[f"{cb[0]}:L{cb[1]}" for cb in _code_blocks]
+        if _code_blocks
+        else ["no_blocks"],
     )
     def test_code_block_parses(self, rst_file, line_no, code):
         """Each Python code block must be syntactically valid."""
@@ -240,8 +252,12 @@ class TestCodeExamples:
 
     @pytest.mark.parametrize(
         "rst_file,line_no,code",
-        _code_blocks if _code_blocks else [pytest.param("skip", 0, "", marks=pytest.mark.skip)],
-        ids=[f"imports:{cb[0]}:L{cb[1]}" for cb in _code_blocks] if _code_blocks else ["no_blocks"],
+        _code_blocks
+        if _code_blocks
+        else [pytest.param("skip", 0, "", marks=pytest.mark.skip)],
+        ids=[f"imports:{cb[0]}:L{cb[1]}" for cb in _code_blocks]
+        if _code_blocks
+        else ["no_blocks"],
     )
     def test_code_block_imports_valid(self, rst_file, line_no, code):
         """Import statements in code blocks must reference real modules."""
@@ -279,6 +295,7 @@ class TestCodeExamples:
 # The documentation must build without warnings.
 # ---------------------------------------------------------------------------
 
+
 class TestSphinxBuild:
     """Verify that Sphinx can build the documentation."""
 
@@ -296,9 +313,13 @@ class TestSphinxBuild:
         build_dir = DOCS_DIR / "_build" / "test"
         result = subprocess.run(
             [
-                sys.executable, "-m", "sphinx",
-                "-W", "--keep-going",
-                "-b", "html",
+                sys.executable,
+                "-m",
+                "sphinx",
+                "-W",
+                "--keep-going",
+                "-b",
+                "html",
                 "-q",  # quiet
                 str(DOCS_DIR),
                 str(build_dir),
@@ -310,13 +331,15 @@ class TestSphinxBuild:
 
         # Clean up test build dir
         import shutil
+
         if build_dir.exists():
             shutil.rmtree(build_dir, ignore_errors=True)
 
         if result.returncode != 0:
             # Extract just the warning/error lines
             errors = [
-                line for line in result.stderr.splitlines()
+                line
+                for line in result.stderr.splitlines()
                 if "WARNING" in line or "ERROR" in line
             ]
             error_summary = "\n".join(errors[:20])
@@ -351,13 +374,22 @@ class TestSphinxBuild:
                 if stripped == "":
                     if in_toctree:
                         continue  # blank line within toctree is OK
-                if stripped and not stripped.startswith(":") and not stripped.startswith(".."):
+                if (
+                    stripped
+                    and not stripped.startswith(":")
+                    and not stripped.startswith("..")
+                ):
                     # This is a document reference
                     doc_path = DOCS_DIR / (stripped + ".rst")
                     if not doc_path.exists():
                         missing.append(stripped)
                 # Detect end of toctree (non-indented non-blank line)
-                if line and not line.startswith(" ") and not line.startswith("\t") and stripped:
+                if (
+                    line
+                    and not line.startswith(" ")
+                    and not line.startswith("\t")
+                    and stripped
+                ):
                     in_toctree = False
 
         if missing:
@@ -370,6 +402,7 @@ class TestSphinxBuild:
 # Test 4: Version Consistency
 # Documentation version must match the installed package version.
 # ---------------------------------------------------------------------------
+
 
 class TestVersionConsistency:
     """Verify documentation version stays in sync with the package."""
@@ -390,7 +423,7 @@ class TestVersionConsistency:
         )
         if hardcoded:
             pytest.fail(
-                f"conf.py has hardcoded version: release = \"{hardcoded[0]}\". "
+                f'conf.py has hardcoded version: release = "{hardcoded[0]}". '
                 f"Use auto-detection from setuptools_scm or importlib.metadata."
             )
 
@@ -420,15 +453,16 @@ class TestVersionConsistency:
                 "_version.py not found (generated by setuptools_scm at build time)"
             )
         content = version_file.read_text()
-        assert "__version__" in content, (
-            "_version.py exists but does not define __version__"
-        )
+        assert (
+            "__version__" in content
+        ), "_version.py exists but does not define __version__"
 
 
 # ---------------------------------------------------------------------------
 # Test 5: RST Structure Validation
 # Catch common RST issues that Sphinx might not flag clearly.
 # ---------------------------------------------------------------------------
+
 
 class TestRSTStructure:
     """Validate RST file structure and cross-references."""
@@ -453,9 +487,7 @@ class TestRSTStructure:
                 orphans.append(str(api_file.name))
 
         if orphans:
-            pytest.fail(
-                f"API docs not in index.rst toctree: {', '.join(orphans)}"
-            )
+            pytest.fail(f"API docs not in index.rst toctree: {', '.join(orphans)}")
 
     @pytest.mark.skipif(
         not DOCS_DIR.exists(),
@@ -488,7 +520,5 @@ class TestRSTStructure:
                     violations.append(f"{rel}:{i}: {line.strip()[:80]}")
 
         if violations:
-            pytest.fail(
-                f"CUDA references found in ROCm docs:\n"
-                + "\n".join(violations[:10])
-            )
+            msg = "CUDA references found in ROCm docs:\n" + "\n".join(violations[:10])
+            pytest.fail(msg)
