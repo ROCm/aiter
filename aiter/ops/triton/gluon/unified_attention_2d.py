@@ -7,105 +7,104 @@ from aiter.ops.triton.utils._triton import arch_info
 import os
 from aiter.ops.triton.utils.types import e4m3_dtype
 
+SUPPORTED_ARCHS = ["gfx950", "gfx1250"]
+
 float8_info = torch.finfo(e4m3_dtype)
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
 @gluon.constexpr_function
-def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, WARP_SIZE, NUM_WARPS, FP8_DOT):
-    """Build DistributedLinearLayout and PaddedSharedLayout for CDNA4 async KV loading.
+def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, shape):
+    """
+    Derive a DistributedLinearLayout from a PaddedSharedLayout's offset_bases.
 
-    Parameters are derived from dtype (FP8_DOT) and head_size to match the TTGIR
-    layouts for {bf16, fp8} x {head_size 64, 128}.
+    Mirrors Triton's CoalesceAsyncCopy pass for CDNA4 (WARP_SIZE=64):
+      1) First log2(contiguity) bases → reg  (contiguous elements per vector load)
+      2) Next  6 bases               → lane (64 threads per warp)
+      3) Next  log2(num_warps) bases  → warp (zero-padded if tile is too small)
+      4) Any remaining bases          → appended to reg
+    """
+    rank = len(shape)
+    lg2_c = contiguity.bit_length() - 1
+    lg2_nw = num_warps.bit_length() - 1
+    lg2_ws = 6 # WAVE SIZE is 64
+
+    i = 0
+    reg_bases = offset_bases[i:i + lg2_c]  
+    i += lg2_c
+    lane_bases = offset_bases[i:i + lg2_ws]      
+    i += lg2_ws
+    warp_bases = offset_bases[i:i + lg2_nw]
+    i += lg2_nw
+    warp_bases = warp_bases + [[0] * rank] * (lg2_nw - len(warp_bases))
+    reg_bases = reg_bases + offset_bases[i:]
+
+    return gl.DistributedLinearLayout(
+        reg_bases=reg_bases, lane_bases=lane_bases, warp_bases=warp_bases,
+        block_bases=[], shape=shape,
+    )
+
+@gluon.constexpr_function
+def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV):
+    """
+    Build load and shared memory layouts for CDNA4 async KV cache loading.
+
+    The PaddedSharedLayout defines an XOR-swizzled shared memory mapping.
+    The DistributedLinearLayout (load layout) is derived from it by partitioning
+    offset_bases across reg/lane/warp — matching Triton's CoalesceAsyncCopy.
 
     Returns (blocked_k, blocked_v, shared_k_layout, shared_v_layout).
     """
-    # 128-bit loads: 16 fp8 (1B) or 8 bf16 (2B) elements per vector load
-    CONTIGUITY = 16 if FP8_DOT else 8
+    CONTIGUITY = 16 if FP8_KV else 8  # elements per 128-bit vector load
+    LG2_C  = CONTIGUITY.bit_length() - 1
+    LG2_HS = HEAD_SIZE.bit_length() - 1
+    LG2_TS = TILE_SIZE.bit_length() - 1
+    LG2_NW = NUM_WARPS.bit_length() - 1
+    LG2_WS = 6 # WAVE SIZE is 64
 
-    # log2 for powers of 2
-    LG2_C = 4 if FP8_DOT else 3
-    LG2_HS = 7 if HEAD_SIZE > 64 else 6
-    LG2_TS = 7 if TILE_SIZE > 64 else 6
-    LG2_WS = 7 if WARP_SIZE > 64 else 6
-    LG2_NW = 3 if NUM_WARPS > 4 else 2
+    # CDNA4 WARP_SIZE=64 → 6 lane bits, split between HEAD_SIZE and TILE_SIZE dims
+    hs_lane = LG2_HS - LG2_C   # lane bits covering the HEAD_SIZE (contiguous) dim
+    ts_lane = LG2_WS - hs_lane       # remaining lane bits for the TILE_SIZE dim
+    ts_reg  = LG2_TS - ts_lane - LG2_NW  # leftover reg bits for TILE_SIZE dim
 
-    # Bit allocations: K [HEAD_SIZE, TILE_SIZE], V [TILE_SIZE, HEAD_SIZE]
-    # d0_lane = number of lane bits covering the contiguous dimension (HEAD_SIZE)
-    d0_lane = LG2_HS - LG2_C
-    k_d1_lane = LG2_WS - d0_lane
-    k_d1_reg = LG2_TS - LG2_NW - k_d1_lane
-    v_d0_lane = LG2_WS - d0_lane
-    v_d0_reg = LG2_TS - v_d0_lane - LG2_NW
-
-    # --- K DistributedLinearLayout [HEAD_SIZE, TILE_SIZE] ---
-    # dim0 (HEAD_SIZE): CONTIGUITY contiguous elements in regs, rest in lanes
-    # dim1 (TILE_SIZE): warps at lowest bits, then regs, then lanes
-    k_reg = ([[1 << i, 0] for i in range(LG2_C)]
-             + [[0, 1 << (LG2_NW + i)] for i in range(k_d1_reg)])
-    k_lane = ([[1 << (LG2_C + i), 0] for i in range(d0_lane)]
-              + [[0, 1 << (LG2_NW + k_d1_reg + i)] for i in range(k_d1_lane)])
-    k_warp = [[0, 1 << i] for i in range(LG2_NW)]
-    blocked_k = gl.DistributedLinearLayout(
-        reg_bases=k_reg, lane_bases=k_lane, warp_bases=k_warp,
-        block_bases=[], shape=[HEAD_SIZE, TILE_SIZE],
-    )
-
-    # --- V DistributedLinearLayout [TILE_SIZE, HEAD_SIZE] ---
-    # dim1 (HEAD_SIZE): CONTIGUITY contiguous elements in regs, rest in lanes
-    # dim0 (TILE_SIZE): warp placement depends on HEAD_SIZE vs TILE_SIZE
-    v_reg = [[0, 1 << i] for i in range(LG2_C)]
-    v_d1_lane_bases = [[0, 1 << (LG2_C + i)] for i in range(d0_lane)]
-    if HEAD_SIZE > TILE_SIZE:
-        # Consecutive warps at lowest dim0 bits
-        v_warp = [[1, 0], [2, 0]]
-        if v_d0_reg >= v_d0_lane:
-            v_reg += [[1 << (LG2_NW + i), 0] for i in range(v_d0_reg)]
-            v_d0_lane_bases = [[1 << (LG2_NW + v_d0_reg + i), 0]
-                               for i in range(v_d0_lane)]
-            v_N = LG2_NW + v_d0_reg
-        else:
-            v_d0_lane_bases = [[1 << (LG2_NW + i), 0]
-                               for i in range(v_d0_lane)]
-            v_reg += [[1 << (LG2_NW + v_d0_lane + i), 0]
-                      for i in range(v_d0_reg)]
-            v_N = LG2_NW
-    else:
-        # Split warps: bit 0 and bit above all lane bits
-        v_warp = [[1, 0], [1 << (1 + v_d0_lane), 0]]
-        v_d0_lane_bases = [[1 << (1 + i), 0] for i in range(v_d0_lane)]
-        v_d0_reg_start = 1 + v_d0_lane + 1
-        v_reg += [[1 << (v_d0_reg_start + i), 0] for i in range(v_d0_reg)]
-        v_N = 1
-    v_lane = v_d1_lane_bases + v_d0_lane_bases
-    blocked_v = gl.DistributedLinearLayout(
-        reg_bases=v_reg, lane_bases=v_lane, warp_bases=v_warp,
-        block_bases=[], shape=[TILE_SIZE, HEAD_SIZE],
-    )
-
-    # --- K PaddedSharedLayout [HEAD_SIZE, TILE_SIZE] ---
-    # XOR swizzle: dim1 offsets rotated by log2(HEAD_SIZE / CONTIGUITY)
-    R_K = LG2_HS - LG2_C
+    # ── K shared [HEAD_SIZE, TILE_SIZE] ──────────────────────────────
+    # dim0 (HEAD_SIZE): identity.  dim1 (TILE_SIZE): XOR rotation by hs_lane.
     k_offset = ([[1 << i, 0] for i in range(LG2_HS)]
-                + [[0, 1 << ((i + R_K) % LG2_TS)] for i in range(LG2_TS)])
+                + [[0, 1 << ((i + hs_lane) % LG2_TS)] for i in range(LG2_TS)])
     shared_k = gl.PaddedSharedLayout(
-        interval_padding_pairs=[[TILE_SIZE * CONTIGUITY, CONTIGUITY]],
-        offset_bases=k_offset,
-        cga_layout=[],
-        shape=[HEAD_SIZE, TILE_SIZE],
+        interval_padding_pairs=[[1024, 16] if FP8_KV else [512, 8]],
+        offset_bases=k_offset, cga_layout=[], shape=[HEAD_SIZE, TILE_SIZE],
     )
 
-    # --- V PaddedSharedLayout [TILE_SIZE, HEAD_SIZE] ---
-    # XOR swizzle: dim0 offsets partially rotated (M bits swizzled, rest identity)
-    v_M = v_d0_lane + v_N
+    # ── V shared [TILE_SIZE, HEAD_SIZE] ──────────────────────────────
+    # dim1 (HEAD_SIZE): identity.  dim0 (TILE_SIZE): XOR rotation by v_N
+    # within a swizzle window of v_M bits (bits above v_M are identity).
+    #
+    # v_N is the position of the first lane base among the TILE_SIZE dim0
+    # bases after CoalesceAsyncCopy partitioning.  The partitioning assigns
+    # dim0 bases to lane/warp/reg in an order that depends on whether warps
+    # are split (HEAD_SIZE <= TILE_SIZE) or consecutive (HEAD_SIZE > TILE_SIZE):
+    #   split warps:      warp[0] | lane... | warp[1] | reg...  → v_N = 1
+    #   consec, reg≥lane: warp..  | reg...  | lane...            → v_N = LG2_NW + ts_reg
+    #   consec, reg<lane: warp..  | lane... | reg...             → v_N = LG2_NW
+    if HEAD_SIZE <= TILE_SIZE:
+        v_N = 1
+    elif ts_reg >= ts_lane:
+        v_N = LG2_NW + ts_reg
+    else:
+        v_N = LG2_NW
+    v_M = v_N + ts_lane
+
     v_offset = ([[0, 1 << i] for i in range(LG2_HS)]
                 + [([1 << ((i + v_N) % v_M), 0] if i < v_M
                     else [1 << i, 0]) for i in range(LG2_TS)])
     shared_v = gl.PaddedSharedLayout(
-        interval_padding_pairs=[[TILE_SIZE * CONTIGUITY, TILE_SIZE // 2]],
-        offset_bases=v_offset,
-        cga_layout=[],
-        shape=[TILE_SIZE, HEAD_SIZE],
+        interval_padding_pairs=[[1024, 32] if FP8_KV else [512, 32]],
+        offset_bases=v_offset, cga_layout=[], shape=[TILE_SIZE, HEAD_SIZE],
     )
+
+    # ── Derive load layouts from shared layouts ──────────────────────
+    blocked_k = _offset_bases_to_blocked(k_offset, CONTIGUITY, NUM_WARPS, [HEAD_SIZE, TILE_SIZE])
+    blocked_v = _offset_bases_to_blocked(v_offset, CONTIGUITY, NUM_WARPS, [TILE_SIZE, HEAD_SIZE])
 
     return blocked_k, blocked_v, shared_k, shared_v
 
@@ -127,21 +126,13 @@ class AsyncKVLoaderConfig:
     @gluon.constexpr_function
     def __init__(self, cfg):
         blocked_k, blocked_v, shared_k, shared_v = _make_cdna4_kv_load_layouts(
-            cfg.HEAD_SIZE, cfg.TILE_SIZE, cfg.WARP_SIZE, cfg.NUM_WARPS, cfg.FP8_DOT)
+            cfg.HEAD_SIZE, cfg.TILE_SIZE, cfg.NUM_WARPS, cfg.FP8_DOT)
 
         self.blocked_k = gl.constexpr(blocked_k)
         self.blocked_v = gl.constexpr(blocked_v)
 
-        if cfg.SHUFFLED_KV_CACHE:
-            self.shared_k_layout = gl.constexpr(
-                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-            )
-            self.shared_v_layout = gl.constexpr(
-                gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-            )
-        else:
-            self.shared_k_layout = gl.constexpr(shared_k)
-            self.shared_v_layout = gl.constexpr(shared_v)
+        self.shared_k_layout = gl.constexpr(shared_k)
+        self.shared_v_layout = gl.constexpr(shared_v)
 
         self.KV_CACHE_MODIFIER = cfg.KV_CACHE_MODIFIER
         self.USE_LOAD_BUFFER_OP = cfg.USE_LOAD_BUFFER_OP
@@ -1620,7 +1611,7 @@ def unified_attention(
     new_kv_layout=False,
     num_kv_blocks=1,
     use_tdm=True,
-    waves_per_eu=4,
+    waves_per_eu=1,
     shuffled_kv_cache=False,
     num_warps=4,
     block_m=128,
@@ -1648,10 +1639,15 @@ def unified_attention(
         output_scale: Output scale
         sinks: Sinks tensor [num_query_heads,]
     """
+    ARCH_NAME = arch_info.get_arch()
+    assert ARCH_NAME in SUPPORTED_ARCHS, f"Supported archs: {SUPPORTED_ARCHS}"
     NUM_SEQS = len(seqused_k)
     NUM_Q_HEADS = q.shape[1]
     HEAD_SIZE = q.shape[2]
     num_blocks = k.shape[0]
+    Q_FP8 = q.element_size() == 1
+    KV_FP8 = k.element_size() == 1
+    
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, block_size // 16, head_size * 16
         # value_cache: num_blocks, num_kv_heads, head_size // 16, block_size * 16
@@ -1678,9 +1674,11 @@ def unified_attention(
                 ), "Shuffling is only supported with TDM, without TDM-Gather"
             BLOCK_SIZE = k.shape[1]
             NUM_KV_HEADS = k.shape[2]
-
-    # if use_tdm:
-    #     assert ARCH_NAME == "gfx1250", "With TDM, ARCH must be gfx1250"
+    # TODO: improve the support
+    if ARCH_NAME == "gfx950":   
+        assert BLOCK_SIZE >= 64, "Only block_size >= 64 supported for gfx950"
+    if use_tdm:
+        assert ARCH_NAME == "gfx1250", "With TDM, ARCH must be gfx1250"
     BLOCK_M = block_m
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
@@ -1691,14 +1689,13 @@ def unified_attention(
         num_kv_blocks & (num_kv_blocks - 1) == 0
     ), "num_kv_blocks must be a power of 2"
     TILE_SIZE = num_kv_blocks * BLOCK_SIZE
-    ARCH_NAME = arch_info.get_arch()
+    
     NUM_WARPS = num_warps
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
-    Q_FP8 = q.element_size() == 1
-    KV_FP8 = k.element_size() == 1
+
     # waves_per_eu = 2 if HEAD_SIZE < 128 else 2
     grid = (NUM_KV_HEADS, total_query_blocks)
     attn_kernel = kernel_unified_attention_2d[grid](
