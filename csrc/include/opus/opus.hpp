@@ -379,16 +379,12 @@ OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2) 
 template <class T0, class T1, class T2, class T3>
 OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3) {
                                             return impl::concat_tuple(t0, t1, t2, t3, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}, make_index_seq<T3::size()>{}); }
-namespace impl {
-template <class T0, class T1, class T2, class T3, class T4, index_t... I0, index_t... I1, index_t... I2, index_t... I3, index_t... I4>
-OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, seq<I0...>, seq<I1...>, seq<I2...>, seq<I3...>, seq<I4...>) {
-    return opus::make_tuple(get<I0>(t0)..., get<I1>(t1)..., get<I2>(t2)..., get<I3>(t3)..., get<I4>(t4)...); }
-}
+namespace impl { template <class T0, class T1, class T2, class T3, class T4, index_t... I0, index_t... I1, index_t... I2, index_t... I3, index_t... I4>
+OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, seq<I0...>, seq<I1...>, seq<I2...>, seq<I3...>, seq<I4...>) { return opus::make_tuple(get<I0>(t0)..., get<I1>(t1)..., get<I2>(t2)..., get<I3>(t3)..., get<I4>(t4)...); } }
 template <class T0, class T1, class T2, class T3, class T4>
-OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4) {
-    return impl::concat_tuple(t0, t1, t2, t3, t4, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}, make_index_seq<T3::size()>{}, make_index_seq<T4::size()>{}); }
+OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4) { return impl::concat_tuple(t0, t1, t2, t3, t4, make_index_seq<T0::size()>{}, make_index_seq<T1::size()>{}, make_index_seq<T2::size()>{}, make_index_seq<T3::size()>{}, make_index_seq<T4::size()>{}); }
 template <class T0, class T1, class T2, class T3, class T4, class T5, class... Ts>
-OPUS_H_D  constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, T5 const& t5, Ts const&... ts) { return concat_tuple(concat_tuple(t0, t1, t2, t3, t4), concat_tuple(t5, ts...)); }
+OPUS_H_D constexpr auto concat_tuple(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4, T5 const& t5, Ts const&... ts) { return concat_tuple(concat_tuple(t0, t1, t2, t3, t4), concat_tuple(t5, ts...)); }
 
 template <typename> struct is_tuple : false_type {};
 template <typename... T> struct is_tuple<opus::tuple<T...>> : true_type {};
@@ -408,43 +404,21 @@ template <typename T, std::enable_if_t<is_tuple_v<T>, bool> = true> OPUS_H_D con
 template <typename T, index_t... Is> OPUS_H_D constexpr auto                                 explode_tuple(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
 
 template <typename T, index_t... Is> OPUS_H_D constexpr auto flatten_tuple_general(const T& t, seq<Is...>) { return concat_tuple(explode_tuple(get<Is>(t))...); }
-// Fast path: if all elements are non-tuple (already flat), return as-is
 template <typename T, std::enable_if_t<is_tuple_v<T> && !(is_tuple_v<tuple_element_t<0, remove_cvref_t<T>>>), bool> = true>
-OPUS_H_D constexpr auto flatten_tuple(const T& t) { return t; }
-// Fallback for non-tuple types (e.g. seq) — use general recursive path
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { return t; }  // already flat
 template <typename T, std::enable_if_t<!is_tuple_v<T>, bool> = true>
-OPUS_H_D constexpr auto flatten_tuple(const T& t) { return flatten_tuple_general(t, make_index_seq<size<T>()>{}); }
-// 1-level nested: directly index each flat element as (group, local) — bypasses concat_tuple + explode_tuple
-namespace impl {
-// For a tuple-of-tuples T, get group sizes as a seq
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { return flatten_tuple_general(t, make_index_seq<size<T>()>{}); }  // non-tuple (e.g. seq)
+namespace impl { // direct flatten for 1-level nested tuples — bypasses concat_tuple + explode_tuple
 template<typename T, index_t... Gs> constexpr auto group_sizes(seq<Gs...>) { return seq<size<tuple_element_t<Gs, T>>()...>{}; }
 template<typename T, index_t... Gs> constexpr index_t group_total(seq<Gs...>) { return (size<tuple_element_t<Gs, T>>() + ...); }
-// Find group G for flat element J given group sizes
-template<index_t J, index_t... Gs, index_t... Ns>
-constexpr index_t flat_group(seq<Gs...>, seq<Ns...>) {
-    index_t acc = 0, r = 0; ((void)(acc += Ns, (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r;
-}
-// Compute cumulative group offset for group G
+template<index_t J, index_t... Gs, index_t... Ns> constexpr index_t flat_group(seq<Gs...>, seq<Ns...>) { index_t acc = 0, r = 0; ((void)(acc += Ns, (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r; }
 template<typename T, index_t G, index_t... Gs> constexpr index_t group_offset(seq<Gs...>) { return ((Gs < G ? size<tuple_element_t<Gs, T>>() : 0) + ...); }
-// Get flat element J from tuple-of-tuples
-template<typename T, index_t J, typename GS>
-OPUS_H_D constexpr auto flatten_at(const T& t) {
-    constexpr auto gs = make_index_seq<size<T>()>{};
-    constexpr index_t G = flat_group<J>(gs, GS{});
-    constexpr index_t L = J - group_offset<T, G>(gs);
-    return get<L>(get<G>(t));
-}
-template<typename T, typename GS, index_t... Js>
-OPUS_H_D constexpr auto flatten_tuple_impl(const T& t, seq<Js...>) { return opus::make_tuple(flatten_at<T, Js, GS>(t)...); }
+template<typename T, index_t J, typename GS> OPUS_H_D constexpr auto flatten_at(const T& t) {
+    constexpr auto gs = make_index_seq<size<T>()>{}; constexpr index_t G = flat_group<J>(gs, GS{}); return get<J - group_offset<T, G>(gs)>(get<G>(t)); }
+template<typename T, typename GS, index_t... Js> OPUS_H_D constexpr auto flatten_tuple_impl(const T& t, seq<Js...>) { return opus::make_tuple(flatten_at<T, Js, GS>(t)...); }
 }
 template <typename T, std::enable_if_t<is_tuple_v<T> && (is_tuple_v<tuple_element_t<0, remove_cvref_t<T>>>), bool> = true>
-OPUS_H_D constexpr auto flatten_tuple(const T& t) {
-    using U = remove_cvref_t<T>;
-    constexpr auto gs = make_index_seq<size<U>()>{};
-    using GS = decltype(impl::group_sizes<U>(gs));
-    constexpr index_t total = impl::group_total<U>(gs);
-    return impl::flatten_tuple_impl<U, GS>(t, make_index_seq<total>{});
-}
+OPUS_H_D constexpr auto flatten_tuple(const T& t) { using U = remove_cvref_t<T>; constexpr auto gs = make_index_seq<size<U>()>{}; return impl::flatten_tuple_impl<U, decltype(impl::group_sizes<U>(gs))>(t, make_index_seq<impl::group_total<U>(gs)>{}); }
 
 namespace impl {
 template<typename Outer, typename Inner, index_t...Is>
@@ -703,34 +677,21 @@ template<typename Layout, index_t vec = 1> struct layout_load_traits {
     static constexpr auto issue_space = layout_to_issue_space<Layout>();
     static constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{}); static constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
 };
-// Cache precomputed offsets for fully-static layouts (used by tr_load immediate-offset path)
-template<typename Layout, index_t vec, bool use_imm> struct layout_imm_offsets {};
+template<typename Layout, index_t vec, bool use_imm> struct layout_imm_offsets {};  // cached offsets for tr_load immediate-offset path
 template<typename Layout, index_t vec> struct layout_imm_offsets<Layout, vec, true> { using L = remove_cvref_t<Layout>;
     static constexpr auto u_linear = make_layout<-1>(layout_load_traits<Layout, vec>::issue_space_vec);
-    static constexpr auto offsets = layout_to_offsets<vec>(L(typename L::Shape{}, typename L::Stride{}, typename L::Coord{}));
-};
-
-// Decompose runtime flat index into a runtime multi-index tuple (all index_t) — avoids per-iteration template instantiation
-template<index_t... Is, index_t... Ns>
-OPUS_H_D constexpr auto flat_to_coords(index_t flat, seq<Is...>, tuple<number<Ns>...>) {
-    constexpr index_t strides[] = {impl::ford_stride<Is>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})...};
-    constexpr index_t dims[] = {Ns...};
-    return opus::make_tuple(static_cast<index_t>((flat / strides[Is]) % dims[Is])...);
-}
-
-// pre-compute all the offset under current layout, using runtime loop to avoid N unique coord_to_linear instantiations
-template<index_t vec, typename Layout>
-OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
-    using LT = layout_load_traits<Layout, vec>;
-    constexpr auto issue_space_vec = LT::issue_space_vec;
-    constexpr index_t num_issues = LT::r_elem.value;
-    constexpr index_t ndim = size<remove_cvref_t<decltype(issue_space_vec)>>();
+    static constexpr auto offsets = layout_to_offsets<vec>(L(typename L::Shape{}, typename L::Stride{}, typename L::Coord{})); };
+// Runtime flat index → multi-index tuple (all index_t) — avoids per-iteration template instantiation
+template<index_t... Is, index_t... Ns> OPUS_H_D constexpr auto flat_to_coords(index_t flat, seq<Is...>, tuple<number<Ns>...>) {
+    constexpr index_t strides[] = {impl::ford_stride<Is>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})...}, dims[] = {Ns...};
+    return opus::make_tuple(static_cast<index_t>((flat / strides[Is]) % dims[Is])...); }
+// Pre-compute offsets via runtime loop — 1 coord_to_linear instantiation per layout instead of N
+template<index_t vec, typename Layout> OPUS_H_D constexpr auto layout_to_offsets(const Layout& u) {
+    using LT = layout_load_traits<Layout, vec>; constexpr auto issue_space_vec = LT::issue_space_vec;
+    constexpr index_t num_issues = LT::r_elem.value, ndim = size<remove_cvref_t<decltype(issue_space_vec)>>();
     array<index_t, num_issues> offsets;
-    for (index_t i = 0; i < num_issues; i++) {
-        offsets[i] = u(flat_to_coords(i, make_index_seq<ndim>{}, issue_space_vec));
-    }
-    return offsets;
-}
+    for (index_t i = 0; i < num_issues; i++) offsets[i] = u(flat_to_coords(i, make_index_seq<ndim>{}, issue_space_vec));
+    return offsets; }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
 template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
@@ -2485,23 +2446,13 @@ struct p_dim {};
 struct y_dim {};
 
 namespace impl{ // utlity function to play with shape
-// Build filtered index seq via recursive concat_seq — avoids concat_tuple on conditional tuples
-template<typename FDim, typename Target>
-static constexpr auto pickup_filter(seq<>) { return seq<>{}; }
-template<typename FDim, typename Target, index_t I0, index_t... Rest>
-static constexpr auto pickup_filter(seq<I0, Rest...>) {
-    if constexpr (std::is_same_v<remove_cvref_t<decltype(get<I0>(FDim{}))>, remove_cvref_t<Target>>)
-        return concat_seq(seq<I0>{}, pickup_filter<FDim, Target>(seq<Rest...>{}));
-    else return pickup_filter<FDim, Target>(seq<Rest...>{});
-}
-template<typename Shape, index_t... Fs>
-OPUS_D static constexpr auto pickup_shape_apply(seq<Fs...>) { return opus::make_tuple(get<Fs>(Shape{})...); }
-
+template<typename FDim, typename Target> static constexpr auto pickup_filter(seq<>) { return seq<>{}; }
+template<typename FDim, typename Target, index_t I0, index_t... Rest> static constexpr auto pickup_filter(seq<I0, Rest...>) {
+    if constexpr (std::is_same_v<remove_cvref_t<decltype(get<I0>(FDim{}))>, remove_cvref_t<Target>>) return concat_seq(seq<I0>{}, pickup_filter<FDim, Target>(seq<Rest...>{}));
+    else return pickup_filter<FDim, Target>(seq<Rest...>{}); }
+template<typename Shape, index_t... Fs> OPUS_D static constexpr auto pickup_shape_apply(seq<Fs...>) { return opus::make_tuple(get<Fs>(Shape{})...); }
 template<typename Shape, typename FDim, typename Target, index_t... Is>
-OPUS_D static constexpr auto pickup_shape_impl(const Shape&, const FDim&, Target, seq<Is...>) {
-    static_assert(size<Shape>() == size<FDim>());
-    return pickup_shape_apply<Shape>(pickup_filter<FDim, Target>(seq<Is...>{}));
-}
+OPUS_D static constexpr auto pickup_shape_impl(const Shape&, const FDim&, Target, seq<Is...>) { static_assert(size<Shape>() == size<FDim>()); return pickup_shape_apply<Shape>(pickup_filter<FDim, Target>(seq<Is...>{})); }
 
 template<typename Dim, index_t... Js>
 OPUS_D constexpr index_t dim_group_size_sum(seq<Js...>) { return (static_cast<index_t>(get<Js>(Dim{}).size()) + ... + 0); }
@@ -2539,30 +2490,13 @@ OPUS_D constexpr auto unfold_x_stride_each(const Stride& stride) {
     return transform_tuple([&](auto i_elem){ return i_elem * get<I>(stride); }, current_stride);
 }
 
-// Find which dim group flat element J belongs to: group G where cumulative size > J
-template<typename Dim, index_t J, index_t... Gs>
-constexpr index_t unfold_find_group(seq<Gs...>) {
-    index_t acc = 0, result = 0;
-    ((void)(acc += size<decltype(get<Gs>(Dim{}))>(), (acc <= J ? (void)(result = Gs + 1) : (void)0)), ...);
-    return result;
-}
-// Compute stride for flat element J: within-group packed stride × group base stride
-template<typename Dim, typename Shape, typename Stride, index_t J>
-OPUS_D constexpr auto unfold_x_stride_at(const Stride& stride) {
-    constexpr index_t G = unfold_find_group<Dim, J>(make_index_seq<size<Dim>()>{});
-    constexpr index_t group_end = dim_offset_sum<Dim>(make_index_seq<G + 1>{});
-    constexpr auto local_stride = packed_stride_at<Shape, J>(make_index_seq<group_end - J - 1>{});
-    return local_stride * get<G>(stride);
-}
-// Flat unfold: directly compute each element's stride, bypassing concat_tuple
-template<typename Dim, typename Shape, typename Stride, index_t... Js>
-OPUS_D constexpr auto unfold_x_stride_flat(const Stride& stride, seq<Js...>) {
-    return opus::make_tuple(unfold_x_stride_at<Dim, Shape, Stride, Js>(stride)...);
-}
-template<typename Dim, typename Shape, typename Stride, index_t... Is>
-OPUS_D constexpr auto unfold_x_stride_impl(const Stride& stride, seq<Is...>) {
-    return unfold_x_stride_flat<Dim, Shape, Stride>(stride, make_index_seq<size<Shape>()>{});
-}
+template<typename Dim, index_t J, index_t... Gs> constexpr index_t unfold_find_group(seq<Gs...>) {
+    index_t acc = 0, r = 0; ((void)(acc += size<decltype(get<Gs>(Dim{}))>(), (acc <= J ? (void)(r = Gs + 1) : (void)0)), ...); return r; }
+template<typename Dim, typename Shape, typename Stride, index_t J> OPUS_D constexpr auto unfold_x_stride_at(const Stride& stride) {
+    constexpr index_t G = unfold_find_group<Dim, J>(make_index_seq<size<Dim>()>{}); constexpr index_t group_end = dim_offset_sum<Dim>(make_index_seq<G + 1>{});
+    return packed_stride_at<Shape, J>(make_index_seq<group_end - J - 1>{}) * get<G>(stride); }
+template<typename Dim, typename Shape, typename Stride, index_t... Js> OPUS_D constexpr auto unfold_x_stride_flat(const Stride& stride, seq<Js...>) { return opus::make_tuple(unfold_x_stride_at<Dim, Shape, Stride, Js>(stride)...); }
+template<typename Dim, typename Shape, typename Stride, index_t... Is> OPUS_D constexpr auto unfold_x_stride_impl(const Stride& stride, seq<Is...>) { return unfold_x_stride_flat<Dim, Shape, Stride>(stride, make_index_seq<size<Shape>()>{}); }
 }
 
 template<typename Shape, typename Dim, typename Target>
