@@ -15,6 +15,9 @@ op_tests/opus/
 │   ├── test_mfma_f32.cu         # MFMA fp32 kernels
 │   ├── test_mfma_f8.cu          # MFMA fp8/bf8 kernels
 │   ├── test_mxfp.cu             # MXFP8/MXFP4 kernels (gfx950 only)
+│   ├── test_wmma_f16.cu         # WMMA fp16/bf16 kernels (gfx1250 only)
+│   ├── test_wmma_f32.cu         # WMMA fp32 kernels (gfx1250 only)
+│   ├── test_wmma_f8.cu          # WMMA fp8/bf8 kernels (gfx1250 only)
 │   ├── test_wmma_scale.cu       # WMMA scaled f8f6f4/f4 kernels (gfx1250 only)
 │   ├── test_mma_step_k.cu       # tiled_mma_adaptor::step_k bf16 kernel
 │   ├── test_vector_add.cu       # Vector addition kernel
@@ -243,6 +246,7 @@ In `device/test_opus_device.py`:
 | `test_dtype_convert` | fp32<->fp4 x4 pk | `cast<fp4_t>(fp32x4_t)` packed x4, e2m1 | gfx950 |
 | `test_dtype_convert` | fp32<->fp4 x8 pk | `cast<fp4_t>(fp32x8_t)` packed x8, e2m1 | gfx950 |
 | `test_load_store_if` | predicated_copy | `gmem::load_if`, `gmem::store_if`, free functions `opus::load_if`/`opus::store_if`, `layout_linear::operator+` | all |
+| `test_load_store_if` | predicated_copy_2d | 2D layout `load_if`/`store_if` with multi-index `(i_row, i_col)` predicate, `unfold_x_stride`, `unfold_p_coord` | all |
 | `test_load_store_if` | free_func_vector_add | Free functions `opus::load`/`opus::store`, `is_gmem_v`/`is_mem_v` type traits | all |
 | `test_load_store_if` | predicated_async_load | `gmem::async_load_if`, free function `opus::async_load_if`, `layout_linear::operator+` | all |
 | `test_numeric_limits` | all types | `opus::numeric_limits<T>` for fp32/fp16/bf16/fp8/bf8/i32/i16/i8/u8 | all |
@@ -258,7 +262,7 @@ In `device/test_opus_device.py`:
 | `test_mma_step_k` | 32x32x128 bf16 step_k | `make_tiled_mma`, `step_k` | gfx942 + gfx950 |
 | `test_workgroup_barrier` | cumulative + streamk | `opus::workgroup_barrier` cross-workgroup synchronization | all |
 
-Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 mma_step_k + 1 vector_add + 1 async_load + 1 tr_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
+Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 mma_step_k + 1 vector_add + 1 async_load + 1 tr_load + 11 dtype_convert + 4 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
 
 ## Notes
 
