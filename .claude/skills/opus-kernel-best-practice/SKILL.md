@@ -1,6 +1,12 @@
-# OPUS Compile-Time Best Practices
+---
+name: opus-kernel-best-practice
+description: Compile-time optimization guidance for HIP/C++ kernels using opus.hpp. Use when writing or reviewing OPUS kernels, analyzing compile time, reducing template instantiation overhead, or optimizing hipcc build performance.
+argument-hint: [file or topic]
+---
 
-Techniques for reducing HIP/C++ kernel compile time when using `opus.hpp`. These patterns were developed while optimizing a GQA flash attention kernel from **4.8s → 1.5s** (70% reduction) in device-only compilation.
+# OPUS Kernel Compile-Time Best Practices
+
+Techniques for reducing HIP/C++ kernel compile time when using `opus.hpp`. These patterns were developed while optimizing a GQA flash attention kernel from **4.8s to 1.5s** (70% reduction) in device-only compilation.
 
 ## 1. Minimize Header Overhead
 
@@ -78,7 +84,7 @@ for (index_t i = 0; i < N; i++) {
 ```cpp
 // SLOW: N unique coord_to_linear instantiations (one per multi-index combination)
 static_ford(issue_space_vec, [&](auto... ids) {
-    offsets[u_linear(ids...)] = u(ids...);   // u(number<0>{}, number<1>{}) is different type from u(number<0>{}, number<2>{})
+    offsets[u_linear(ids...)] = u(ids...);
 });
 
 // FAST: 1 coord_to_linear instantiation (all iterations use tuple<index_t, ...>)
@@ -98,8 +104,6 @@ constexpr auto a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a()));
 // FAST: cached once as class member
 static constexpr index_t mma_a_len = get<0>(reduce_tuple_mul(MMA::y_shape_a())).value;
 ```
-
-Applied in `tiled_mma_adaptor`: `mma_a/b/c_len` and `tile_a/b/c_len` are cached as `static constexpr` class members.
 
 ## 3. Use LLVM Builtins for Vector Operations
 
@@ -170,7 +174,7 @@ constexpr auto reduce_tuple_mul(const tuple<Ns...>&) { return tuple<number<(Ns::
 One file with 14 MFMA template instantiations (~3.9s) bottlenecks parallel builds. Split into per-type files (f16/f32/f8) to balance workload:
 
 ```
-test_mfma.cu (3.9s) → test_mfma_f16.cu (0.9s) + test_mfma_f32.cu (0.5s) + test_mfma_f8.cu (0.9s)
+test_mfma.cu (3.9s) -> test_mfma_f16.cu (0.9s) + test_mfma_f32.cu (0.5s) + test_mfma_f8.cu (0.9s)
 ```
 
 ### Use `hipcc --genco` for device-only compilation when launching from Python
@@ -186,7 +190,7 @@ hipcc kernel.cc --cuda-device-only -c -o /dev/null \
   -Xclang -ftime-trace=trace.json
 ```
 
-Analyze with [chrome://tracing](chrome://tracing) or a script:
+Analyze with chrome://tracing or a script:
 
 ```python
 import json

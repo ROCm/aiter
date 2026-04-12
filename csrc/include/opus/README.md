@@ -263,3 +263,9 @@ Using `ctypes.CDLL` to call `extern "C"` functions — or `hipModuleLaunchKernel
 | `--genco` (device-only compile) | Device | Eliminates host pass entirely |
 | `__HIP_DEVICE_COMPILE__` guard | Host | Skips heavy headers during host pass |
 | ctypes / `hipModuleLaunchKernel` | Host | Eliminates C++ binding compilation |
+
+## Compile-Time Best Practices
+
+For a comprehensive guide on reducing compile time when writing kernels with opus.hpp — including template instantiation reduction, LLVM builtins, and profiling with `-ftime-trace` — see the [OPUS Kernel Best Practice skill](../../../.claude/skills/opus-kernel-best-practice/SKILL.md).
+
+Invoke it in Claude Code with `/opus-kernel-best-practice`.
