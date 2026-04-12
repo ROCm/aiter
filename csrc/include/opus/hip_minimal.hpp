@@ -47,13 +47,30 @@
 
 // ========== Device pass only ==========
 #if defined(__HIP_DEVICE_COMPILE__)
-
-// Warp vote intrinsic — __all(predicate) returns non-zero iff predicate is
-// non-zero for every active lane in the wavefront
+// Warp vote — set HIP header guards to prevent redefinition if hip headers are included later
+#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_DEVICE_LIBRARY_DECLS_H)
 extern "C" __device__ int __ockl_wfall_i32(int);
+#endif
+#if !defined(HIP_INCLUDE_HIP_AMD_DETAIL_WARP_FUNCTIONS_H)
+#define HIP_INCLUDE_HIP_AMD_DETAIL_WARP_FUNCTIONS_H  // prevent hip's redefinition
 __device__ inline int __all(int predicate) { return __ockl_wfall_i32(predicate); }
-
+#endif
 #endif // __HIP_DEVICE_COMPILE__
+
+// ========== Both passes: type declarations (guarded to avoid conflict with hip_runtime_api.h) ==========
+#if !defined(HIP_INCLUDE_HIP_HIP_RUNTIME_API_H)
+#if !defined(__HIP_PLATFORM_AMD__)
+#define __HIP_PLATFORM_AMD__
+#endif
+typedef int hipError_t;
+typedef void* hipStream_t;
+#define hipSuccess 0
+struct dim3 {
+    unsigned int x, y, z;
+    constexpr dim3(unsigned int _x = 1, unsigned int _y = 1, unsigned int _z = 1)
+        : x(_x), y(_y), z(_z) {}
+};
+#endif // !HIP_INCLUDE_HIP_HIP_RUNTIME_API_H
 
 // ========== Host pass only ==========
 #if !defined(__HIP_DEVICE_COMPILE__)
@@ -61,9 +78,6 @@ __device__ inline int __all(int predicate) { return __ockl_wfall_i32(predicate);
 #include <cstddef>   // size_t
 
 // ---------- Error handling ----------
-typedef int hipError_t;
-typedef void* hipStream_t;
-#define hipSuccess 0
 extern "C" hipError_t hipGetLastError();
 extern "C" hipError_t hipDeviceSynchronize();
 extern "C" const char* hipGetErrorString(hipError_t error);
@@ -87,13 +101,6 @@ extern "C" hipError_t hipEventDestroy(hipEvent_t event);
 extern "C" hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream = nullptr);
 extern "C" hipError_t hipEventSynchronize(hipEvent_t event);
 extern "C" hipError_t hipEventElapsedTime(float* ms, hipEvent_t start, hipEvent_t stop);
-
-// ---------- dim3 ----------
-struct dim3 {
-    unsigned int x, y, z;
-    constexpr dim3(unsigned int _x = 1, unsigned int _y = 1, unsigned int _z = 1)
-        : x(_x), y(_y), z(_z) {}
-};
 
 // ---------- Kernel launch ----------
 extern "C" hipError_t __hipPushCallConfiguration(dim3 gridDim, dim3 blockDim,
