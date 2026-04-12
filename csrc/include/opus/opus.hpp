@@ -1735,19 +1735,23 @@ struct gmem {
     OPUS_D auto load_if(const Predicate& pred, const Layout& u, int s_os = 0, number<aux> = {})
     {
         using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space = LT::issue_space;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
         constexpr auto r_elem = LT::r_elem;
         auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
 
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){
-            auto tmp = pred(i) ? load<vec>(offsets[i.value], s_os, number<aux>{}) : vector_type<vec>{0};
-            set_slice(r, tmp, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
+        static_ford(issue_space_vec, [&](auto ... ids){
+            constexpr index_t idx = u_r(ids...);
+            auto tmp = pred(ids...) ? load<vec>(offsets[idx], s_os, number<aux>{}) : vector_type<vec>{0};
+            set_slice(r, tmp, number<idx * vec>{}, number<(idx + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){ r[i.value] = pred(i) ? load<vec>(offsets[i.value], s_os, number<aux>{}) : vector_type<vec>{0}; });
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(offsets[u_r(ids...)], s_os, number<aux>{}) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1756,20 +1760,23 @@ struct gmem {
     OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u, int s_os = 0, number<aux> = {})
     {
         using LT = layout_load_traits<Layout, vec>;
-        constexpr auto r_elem = LT::r_elem;
+        constexpr auto issue_space = LT::issue_space;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
         auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space);
 
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_for<r_elem.value>([&](auto i){
-            if (pred(i)) {
-                auto v_ = slice(a_, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
-                store<vec>(v_, offsets[i.value], s_os, number<aux>{});
+        static_ford(issue_space_vec, [&](auto ... ids){
+            if (pred(ids...)) {
+                constexpr index_t idx = u_r(ids...);
+                auto v_ = slice(a_, number<idx>{}, number<idx + vec>{});
+                store<vec>(v_, offsets[make_layout<-1>(issue_space_vec)(ids...)], s_os, number<aux>{});
             }
         });
     }
@@ -1777,18 +1784,20 @@ struct gmem {
     template<index_t vec = 1, typename Predicate, typename LayoutG, typename LayoutS, index_t aux = 0, std::enable_if_t<is_layout_v<LayoutG> && is_layout_v<LayoutS>, bool> = true>
     OPUS_D void async_load_if(const Predicate& pred, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0, number<aux> = {}) {
         using LT = layout_load_traits<LayoutG, vec>;
-        constexpr auto r_elem = LT::r_elem;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
         auto gmem_offsets = layout_to_offsets<vec>(u_gmem);
         auto smem_offsets = layout_to_offsets<vec>(u_smem);
         auto smem_ptr = reinterpret_cast<OPUS_LDS_ADDR scalar_type*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
 
-        static_for<r_elem.value>([&](auto i) {
-            if (pred(i)) {
-                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[i.value])), gmem_offsets[i.value], s_os, number<aux>{});
+        static_ford(issue_space_vec, [&](auto... ids) {
+            constexpr index_t idx = u_r(ids...);
+            if (pred(ids...)) {
+                async_load<vec>(reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_ptr + smem_offsets[idx])), gmem_offsets[idx], s_os, number<aux>{});
             } else {
                 using type = vector_type<vec>;
                 type z = {0};
-                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + smem_offsets[i.value]) = z;
+                *reinterpret_cast<OPUS_LDS_ADDR type*>(smem_ptr + smem_offsets[idx]) = z;
             }
         });
     }
@@ -1934,19 +1943,22 @@ struct smem {
     OPUS_D auto load_if(const Predicate& pred, const Layout& u)
     {
         using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
         constexpr auto r_elem = LT::r_elem;
         auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
 
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){
-            auto tmp = pred(i) ? load<vec>(offsets[i.value]) : vector_type<vec>{0};
-            set_slice(r, tmp, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
+        static_ford(issue_space_vec, [&](auto ... ids){
+            constexpr index_t idx = u_r(ids...);
+            auto tmp = pred(ids...) ? load<vec>(offsets[idx]) : vector_type<vec>{0};
+            set_slice(r, tmp, number<idx * vec>{}, number<(idx + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){ r[i.value] = pred(i) ? load<vec>(offsets[i.value]) : vector_type<vec>{0}; });
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? load<vec>(offsets[u_r(ids...)]) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1955,19 +1967,22 @@ struct smem {
     OPUS_D auto tr_load_if(const Predicate& pred, const Layout& u)
     {
         using LT = layout_load_traits<Layout, vec>;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
         constexpr auto r_elem = LT::r_elem;
         auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space_vec);
 
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){
-            auto tmp = pred(i) ? tr_load<vec>(offsets[i.value]) : vector_type<vec>{0};
-            set_slice(r, tmp, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
+        static_ford(issue_space_vec, [&](auto ... ids){
+            constexpr index_t idx = u_r(ids...);
+            auto tmp = pred(ids...) ? tr_load<vec>(offsets[idx]) : vector_type<vec>{0};
+            set_slice(r, tmp, number<idx * vec>{}, number<(idx + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){ r[i.value] = pred(i) ? tr_load<vec>(offsets[i.value]) : vector_type<vec>{0}; });
+        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? tr_load<vec>(offsets[u_r(ids...)]) : vector_type<vec>{0}; });
         return r;
 #endif
     }
@@ -1976,20 +1991,23 @@ struct smem {
     OPUS_D void store_if(const Predicate& pred, const V& x, const Layout& u)
     {
         using LT = layout_load_traits<Layout, vec>;
-        constexpr auto r_elem = LT::r_elem;
+        constexpr auto issue_space = LT::issue_space;
+        constexpr auto issue_space_vec = LT::issue_space_vec;
         auto offsets = layout_to_offsets<vec>(u);
+        constexpr auto u_r = make_layout<-1>(issue_space);
 
 #if OPUS_TILE_CONTAINER == 0
         auto a_ = [&](){ if constexpr (is_array_v<V>) return to_vector(x);
-                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<r_elem.value>{});
+                         else if constexpr (is_dtype_v<V>) return make_repeated_vector(x, number<get<0>(reduce_tuple_mul(issue_space)).value>{});
                          else if constexpr (is_vector_v<V>) return x; }();
 #elif OPUS_TILE_CONTAINER == 1
         auto a_ = to_array(x);
 #endif
-        static_for<r_elem.value>([&](auto i){
-            if (pred(i)) {
-                auto v_ = slice(a_, number<i.value * vec>{}, number<(i.value + 1) * vec>{});
-                store<vec>(v_, offsets[i.value]);
+        static_ford(issue_space_vec, [&](auto ... ids){
+            if (pred(ids...)) {
+                constexpr index_t idx = u_r(ids...);
+                auto v_ = slice(a_, number<idx>{}, number<idx + vec>{});
+                store<vec>(v_, offsets[make_layout<-1>(issue_space_vec)(ids...)]);
             }
         });
     }
