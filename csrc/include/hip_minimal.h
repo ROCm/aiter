@@ -62,6 +62,7 @@ __device__ inline int __all(int predicate) { return __ockl_wfall_i32(predicate);
 
 // ---------- Error handling ----------
 typedef int hipError_t;
+typedef void* hipStream_t;
 #define hipSuccess 0
 extern "C" hipError_t hipGetLastError();
 extern "C" hipError_t hipDeviceSynchronize();
@@ -71,11 +72,21 @@ extern "C" const char* hipGetErrorString(hipError_t error);
 extern "C" hipError_t hipMalloc(void** ptr, size_t size);
 extern "C" hipError_t hipFree(void* ptr);
 extern "C" hipError_t hipMemset(void* dst, int value, size_t sizeBytes);
+enum hipMemcpyKind { hipMemcpyHostToHost = 0, hipMemcpyHostToDevice = 1, hipMemcpyDeviceToHost = 2, hipMemcpyDeviceToDevice = 3, hipMemcpyDefault = 4 };
+extern "C" hipError_t hipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKind kind);
 
 template <typename T>
 inline hipError_t hipMalloc(T** ptr, size_t size) {
     return hipMalloc(reinterpret_cast<void**>(ptr), size);
 }
+
+// ---------- Events (timing) ----------
+typedef void* hipEvent_t;
+extern "C" hipError_t hipEventCreate(hipEvent_t* event);
+extern "C" hipError_t hipEventDestroy(hipEvent_t event);
+extern "C" hipError_t hipEventRecord(hipEvent_t event, hipStream_t stream = nullptr);
+extern "C" hipError_t hipEventSynchronize(hipEvent_t event);
+extern "C" hipError_t hipEventElapsedTime(float* ms, hipEvent_t start, hipEvent_t stop);
 
 // ---------- dim3 ----------
 struct dim3 {
@@ -85,8 +96,6 @@ struct dim3 {
 };
 
 // ---------- Kernel launch ----------
-typedef void* hipStream_t;
-
 extern "C" hipError_t __hipPushCallConfiguration(dim3 gridDim, dim3 blockDim,
                                                   size_t sharedMem = 0,
                                                   hipStream_t stream = nullptr);
