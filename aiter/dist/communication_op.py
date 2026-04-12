@@ -20,7 +20,13 @@ from typing import Any, Dict, Optional, Union
 import torch
 import torch.distributed
 
-from .parallel_state import get_tp_group, get_pp_group, get_dp_group, get_ep_group
+from .parallel_state import (
+    get_tp_group,
+    get_pp_group,
+    get_dp_group,
+    get_ep_group,
+    get_custom_group,
+)
 
 # ============================================================
 # Tensor Model Parallel (TP) communication operations
@@ -242,3 +248,15 @@ def pipeline_model_parallel_broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_pp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+# ============================================================
+# Custom group communication operations
+# ============================================================
+
+
+def custom_all_reduce(
+    input_: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
+) -> torch.Tensor:
+    """All-reduce the input tensor across the user-specified custom group."""
+    return get_custom_group().all_reduce(input_, use_new, open_fp8_quant)
