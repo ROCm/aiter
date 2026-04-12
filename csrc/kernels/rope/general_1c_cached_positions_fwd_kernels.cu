@@ -58,6 +58,7 @@ void rope_cached_positions_fwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         input.dtype(),
         cos.dtype(),
+        positions.dtype(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,

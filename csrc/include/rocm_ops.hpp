@@ -1814,6 +1814,19 @@ namespace py = pybind11;
           py::arg("weight"),                 \
           py::arg("epsilon"));
 
+#define GATED_RMSNORM_QUANT_PYBIND                             \
+    m.def("gated_rmsnorm_fp8_group_quant",                     \
+          &aiter::gated_rmsnorm_fp8_group_quant,               \
+          py::arg("out"),                                      \
+          py::arg("scale"),                                    \
+          py::arg("x"),                                        \
+          py::arg("z"),                                        \
+          py::arg("weight"),                                   \
+          py::arg("epsilon"),                                  \
+          py::arg("group_size"),                               \
+          py::arg("transpose_scale") = false,                  \
+          "Fused Gated RMSNorm + FP8 Group Quantization");
+
 #define MHC_PYBIND                              \
     AITER_SET_STREAM_PYBIND                     \
     m.def("mhc_pre_gemm_sqrsum",                \
