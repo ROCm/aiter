@@ -8,54 +8,94 @@ argument-hint: [file or topic]
 
 Techniques for reducing HIP/C++ kernel compile time when using `opus.hpp`. These patterns were developed while optimizing a GQA flash attention kernel from **4.8s to 1.5s** (70% reduction) in device-only compilation.
 
-## 1. Minimize Header Overhead
+## Required headers and include paths
 
-### Replace `<hip/hip_runtime.h>` with minimal declarations + compiler builtins
+For kernel development with OPUS, use these two headers from the aiter repo:
 
-Standard `<hip/hip_runtime.h>` expands to ~190K preprocessed lines. Replace with a ~60-line `hip_minimal.h` using AMDGCN builtins:
+- **`opus/opus.hpp`** — the OPUS template library (device code)
+- **`hip_host_minimal.h`** — minimal HIP declarations for both host and device (replaces `<hip/hip_runtime.h>`)
+
+Both live under `csrc/include/`. Compile with:
+
+```bash
+hipcc my_kernel.cu -I<aiter_root>/csrc/include -D__HIPCC_RTC__ -std=c++20 -O3 --offload-arch=gfx950
+```
+
+## 0. Always Separate Device and Host Code (Most Important)
+
+**This is the single most impactful technique.** hipcc always performs **two compilation passes** on every `.hip`/`.cu` file — one for the host (x86_64) and one for the device (AMDGPU). The heavy `opus.hpp` template library is only needed on the device side, but without a guard, hipcc parses it on BOTH passes, doubling the frontend cost.
+
+**Always structure your kernel files like this:**
 
 ```cpp
-// Instead of:
-#include <hip/hip_runtime.h>
-int tid = threadIdx.x;
+// my_kernel.cu
+#ifdef __HIP_DEVICE_COMPILE__
+// ── Device pass: include opus.hpp and define kernels ──
+#include "opus/opus.hpp"
 
-// Use:
-int tid = __builtin_amdgcn_workitem_id_x();
-int bid = __builtin_amdgcn_workgroup_id_x();
-int bsz = __builtin_amdgcn_workgroup_size_x();
-__builtin_amdgcn_s_barrier();  // __syncthreads()
+__global__ __launch_bounds__(256, 2)
+void my_kernel(const float* src, float* dst, int n) {
+    // ... opus layout, load, store, MMA, etc.
+}
+
+#else
+// ── Host pass: minimal declarations + launcher only ──
+#include "hip_host_minimal.h"
+
+__global__ void my_kernel(const float* src, float* dst, int n);  // declaration only
+
+extern "C" void run_my_kernel(const void* d_src, void* d_dst, int n) {
+    dim3 grid((n + 255) / 256), block(256);
+    hipLaunchKernelGGL(my_kernel, grid, block, 0, 0,
+                       (const float*)d_src, (float*)d_dst, n);
+    hipDeviceSynchronize();
+}
+#endif
+```
+
+**Why this works:**
+- The device pass sees `opus.hpp` + kernel definitions — full template expansion
+- The host pass sees only `hip_host_minimal.h` (~70 lines) + kernel declaration + launch wrapper
+- **Saves ~50% of total compile time** by eliminating opus.hpp parsing on the host pass
+- The `extern "C"` launcher can be called from Python via `ctypes.CDLL` — no pybind11/torch extension needed
+
+**Compile flags:**
+
+```bash
+hipcc my_kernel.cu \
+  -I<aiter_root>/csrc/include \
+  -D__HIPCC_RTC__ \
+  -std=c++20 -O3 -ffast-math \
+  --offload-arch=gfx950 \
+  -fPIC -shared -o my_kernel.so
+```
+
+## 1. Minimize Header Overhead
+
+### Replace `<hip/hip_runtime.h>` with `hip_host_minimal.h`
+
+Standard `<hip/hip_runtime.h>` expands to ~190K preprocessed lines. The aiter-provided `hip_host_minimal.h` (~80 lines) declares only what's needed — `dim3`, `hipLaunchKernelGGL`, `hipMalloc`/`hipFree`, `__launch_bounds__`, `__shared__`/`__device__`/`__global__`, and `__all()`. Use AMDGCN compiler builtins for device intrinsics:
+
+```cpp
+int tid = __builtin_amdgcn_workitem_id_x();     // threadIdx.x
+int bid = __builtin_amdgcn_workgroup_id_x();     // blockIdx.x
+int bsz = __builtin_amdgcn_workgroup_size_x();   // blockDim.x
+__builtin_amdgcn_s_barrier();                     // __syncthreads()
 ```
 
 ### Use `-D__HIPCC_RTC__` to suppress implicit includes
 
 Even with minimal headers, hipcc's implicit `__clang_hip_runtime_wrapper.h` pulls in `<cmath>`, `<cstdlib>`, etc. The `-D__HIPCC_RTC__` flag skips these. Provide `#define INFINITY __builtin_huge_valf()` if needed.
 
-### Guard device code with `__HIP_DEVICE_COMPILE__`
-
-hipcc compiles each `.hip`/`.cu` file in **two passes** (host + device). The heavy `opus.hpp` is only needed on the device side:
-
-```cpp
-#ifdef __HIP_DEVICE_COMPILE__
-#include "opus/opus.hpp"
-__global__ void my_kernel(...) { /* uses opus */ }
-#else
-#include "hip_host_minimal.h"
-__global__ void my_kernel(...);  // declaration only
-extern "C" void run_kernel(...) { hipLaunchKernelGGL(my_kernel, ...); }
-#endif
-```
-
-This avoids parsing opus.hpp on the host pass (saves ~50% of frontend time).
-
 ### Use ctypes instead of pybind11/torch extension for Python bindings
 
-The C++ binding layer is often the biggest compile cost. Replace pybind11/torch `CUDAExtension` with `extern "C"` host launchers loaded via `ctypes.CDLL`:
+The C++ binding layer is often the biggest compile cost. The `extern "C"` + `ctypes.CDLL` pattern from Section 0 eliminates it entirely:
 
 | Binding | Compile time |
 |---------|-------------|
 | torch `CUDAExtension` | ~21s |
 | pybind11 + Ninja | ~4.2s |
-| ctypes (`extern "C"`) | ~0.4s |
+| ctypes (`extern "C"`, see Section 0) | ~0.4s |
 
 ## 2. Reduce Template Instantiation Count
 
@@ -213,13 +253,13 @@ for dur, name in inst[:20]:
 
 | Technique | Typical savings | Where applied |
 |-----------|----------------|---------------|
+| **Separate device/host code** (`__HIP_DEVICE_COMPILE__` guard) | **~50% total** | All `.cu`/`.hip` files — always do this first |
 | Runtime `for` loops in load/store/MMA | 30-60% frontend | `buffer_view::load/store`, `tiled_mma_adaptor::operator()` |
 | Runtime `flat_to_coords` | 40-50% frontend | `layout_to_offsets` |
 | `__builtin_convertvector` | 5-10% frontend | `cast` for vectors >16 elements |
 | `__builtin_shufflevector` | 3-5% frontend | `slice_impl` for vectors |
 | Cache constexpr members | 10-15% frontend | `layout_load_traits`, `mma_a/b/c_len` |
 | Direct indexing (bypass concat_tuple) | 5-10% frontend | `unfold_x_stride`, `pickup_shape`, `flatten_tuple` |
-| `__HIP_DEVICE_COMPILE__` guard | ~50% per-file | All `.cu`/`.hip` files using opus.hpp |
 | `-D__HIPCC_RTC__` | ~25% per-file | Compiler flags |
 | `hipcc --genco` | ~15% per-file | Python-launched kernels |
 | Split large TU files | Better parallelism | Test suites, multi-kernel builds |

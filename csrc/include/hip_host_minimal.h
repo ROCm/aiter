@@ -6,18 +6,67 @@
 
 /**
  * @file hip_host_minimal.h
- * @brief Minimal HIP host-side declarations for kernel launch and device management.
+ * @brief Minimal HIP declarations for both host and device compilation.
  *
  * Build-time optimization: replaces the full <hip/hip_runtime.h> (~100K+ lines
- * after preprocessing) with only the dozen declarations actually needed by the
- * host launcher code.  This saves ~500ms per translation unit on the host pass.
+ * after preprocessing) with only the declarations actually needed.
+ * This saves ~500ms per translation unit on the host pass.
  *
- * If you need more HIP APIs than declared here, either add them below or
- * switch back to the full header:
- *     // #include "hip_host_minimal.h"    // fast: minimal declarations
- *     // #include <hip/hip_runtime.h>     // slow: full HIP runtime (~100K lines)
+ * Device-side: provides __launch_bounds__, __shared__/__device__/__global__
+ * fallbacks, and __all() warp vote intrinsic.
+ *
+ * Host-side: provides dim3, hipLaunchKernelGGL, hipMalloc/hipFree, etc.
+ *
+ * Usage with separate device/host compilation pattern:
+ *   #ifdef __HIP_DEVICE_COMPILE__
+ *   #include "opus/opus.hpp"              // heavy template library, device only
+ *   __global__ void my_kernel(...) { ... }
+ *   #else
+ *   #include "hip_host_minimal.h"         // lightweight host declarations
+ *   __global__ void my_kernel(...);       // declaration only
+ *   extern "C" void run_kernel(...) { hipLaunchKernelGGL(my_kernel, ...); }
+ *   #endif
+ *
+ * Compile: hipcc kernel.cu -I<aiter_root>/csrc/include -D__HIPCC_RTC__ ...
  */
 
+// ========== Device-side definitions ==========
+// __launch_bounds__ — key macro for occupancy control, missing from hipcc's implicit wrapper
+#ifndef __launch_bounds__
+#define __launch_bounds_impl0__(requiredMaxThreadsPerBlock) \
+    __attribute__((amdgpu_flat_work_group_size(1, requiredMaxThreadsPerBlock)))
+#define __launch_bounds_impl1__(requiredMaxThreadsPerBlock, minBlocksPerMultiprocessor) \
+    __attribute__((amdgpu_flat_work_group_size(1, requiredMaxThreadsPerBlock), \
+                   amdgpu_waves_per_eu(minBlocksPerMultiprocessor)))
+#define __launch_bounds_select__(_1, _2, impl_, ...) impl_
+#define __launch_bounds__(...) \
+    __launch_bounds_select__(__VA_ARGS__, __launch_bounds_impl1__, __launch_bounds_impl0__, )(__VA_ARGS__)
+#endif
+
+// __shared__ / __device__ / __global__ / __host__ — provided by hipcc's implicit wrapper,
+// but define as fallbacks for device-only or --genco compilation
+#ifndef __shared__
+#define __shared__ __attribute__((shared))
+#endif
+#ifndef __device__
+#define __device__ __attribute__((device))
+#endif
+#ifndef __global__
+#define __global__ __attribute__((global))
+#endif
+#ifndef __host__
+#define __host__ __attribute__((host))
+#endif
+
+// Warp vote intrinsic — __all(predicate) returns non-zero iff predicate is
+// non-zero for every active lane in the wavefront
+#if defined(__HIP_DEVICE_COMPILE__)
+extern "C" __device__ int __ockl_wfall_i32(int);
+__device__ inline int __all(int predicate) { return __ockl_wfall_i32(predicate); }
+#endif
+
+// ========== Host-side definitions ==========
+#if !defined(__HIP_DEVICE_COMPILE__)
 #include <cstddef>   // size_t
 
 // ---------- Error handling ----------
@@ -67,5 +116,7 @@ extern "C" hipError_t hipLaunchKernel(const void* function_address,
 #define hipLaunchKernelGGL(kernel, numBlocks, dimBlocks, sharedMemBytes, stream, ...) \
     kernel<<<numBlocks, dimBlocks, sharedMemBytes, stream>>>(__VA_ARGS__)
 #endif
+
+#endif // !defined(__HIP_DEVICE_COMPILE__)
 
 #endif // HIP_HOST_MINIMAL_H
