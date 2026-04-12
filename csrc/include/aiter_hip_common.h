@@ -38,8 +38,16 @@ template <typename... Args>
 [[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
 {
     std::ostringstream oss;
-    oss << "[AITER] " << file << ":" << line << " ";
-    (oss << ... << std::forward<Args>(args));
+    oss << "[AITER] " << file << ":" << line;
+    if constexpr(sizeof...(Args) > 0)
+    {
+        oss << " ";
+        (oss << ... << std::forward<Args>(args));
+    }
+    else
+    {
+        oss << " check failed";
+    }
     std::string msg = oss.str();
     std::cerr << msg << std::endl;
     if(g_aiter_can_throw)
@@ -50,13 +58,13 @@ template <typename... Args>
 }
 } // namespace aiter_detail
 
-#define AITER_CHECK(x, ...)                                            \
-    do                                                                 \
-    {                                                                  \
-        if(!(x)) [[unlikely]]                                          \
-        {                                                              \
-            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__); \
-        }                                                              \
+#define AITER_CHECK(x, ...)                                                         \
+    do                                                                              \
+    {                                                                               \
+        if(!(x)) [[unlikely]]                                                       \
+        {                                                                           \
+            aiter_detail::check_fail(__FILE__, __LINE__ __VA_OPT__(, ) __VA_ARGS__); \
+        }                                                                           \
     } while(0)
 
 #define HIP_CALL(call)                                                            \

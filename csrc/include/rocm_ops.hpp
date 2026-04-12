@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -102,6 +103,7 @@ namespace py = pybind11;
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
     m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
 #define AITER_UNARY_PYBIND                                  \
+    AITER_SET_STREAM_PYBIND                                 \
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
@@ -167,9 +169,11 @@ namespace py = pybind11;
           py::arg("out_") = std::nullopt);
 
 #define ATTENTION_PYBIND                                          \
+    AITER_SET_STREAM_PYBIND                                       \
     m.def("paged_attention_rocm", &paged_attention);
 
 #define ATTENTION_RAGGED_PYBIND                                   \
+    AITER_SET_STREAM_PYBIND                                       \
     m.def("paged_attention_ragged",                               \
           &paged_attention_ragged,                                \
           "paged_attention_ragged(Tensor! out, Tensor exp_sums,"  \
@@ -184,6 +188,7 @@ namespace py = pybind11;
           "                float k_scale, float v_scale) -> ()");
 
 #define ATTENTION_V1_PYBIND                                       \
+    AITER_SET_STREAM_PYBIND                                       \
     m.def("paged_attention_v1",                                   \
           &paged_attention_v1,                                    \
           "paged_attention_v1(Tensor! out, Tensor exp_sums,"      \
@@ -243,6 +248,7 @@ namespace py = pybind11;
           py::arg("w_scale") = std::nullopt);
 
 #define CACHE_PYBIND                                                                \
+    AITER_SET_STREAM_PYBIND                                                         \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
           "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");      \
@@ -1113,6 +1119,7 @@ namespace py = pybind11;
           py::arg("gen")               = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
+    AITER_SET_STREAM_PYBIND                                                    \
     m.def("topk_softmax",                                                      \
           &aiter::topk_softmax,                                                \
           py::arg("topk_weights"),                                             \
@@ -1164,6 +1171,7 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND             \
+    AITER_SET_STREAM_PYBIND         \
     m.def("topk_sigmoid",           \
           &aiter::topk_sigmoid,     \
           py::arg("topk_weights"),  \
@@ -1265,10 +1273,12 @@ namespace py = pybind11;
           py::arg("x_bias") = std::nullopt);
 
 #define POS_ENCODING_PYBIND                                               \
+    AITER_SET_STREAM_PYBIND                                               \
     m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding"); \
     m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
 
 #define QUANT_PYBIND                                                     \
+    AITER_SET_STREAM_PYBIND                                              \
     m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);   \
     m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant); \
     m.def("dynamic_per_token_scaled_quant",                              \
@@ -1348,6 +1358,7 @@ namespace py = pybind11;
           py::arg("num_rows"));
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
+    AITER_SET_STREAM_PYBIND                                                                \
     m.def("init_custom_qr",                                                                \
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
@@ -1372,6 +1383,7 @@ namespace py = pybind11;
     m.def("qr_max_size", &aiter::qr_max_size);
 
 #define RMSNORM_PYBIND                                                                             \
+    AITER_SET_STREAM_PYBIND                                                                        \
     m.def("rms_norm_cu",                                                                           \
           &rms_norm,                                                                               \
           "Apply Root Mean Square (RMS) Normalization to the input tensor.");                      \
@@ -1432,23 +1444,25 @@ namespace py = pybind11;
           py::arg("epsilon"),                                                                      \
           py::arg("use_model_sensitive_rmsnorm") = 0);
 
-#define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
-#define ROPE_2C_UNCACHED_FWD_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
-#define ROPE_1C_CACHED_FWD_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
-#define ROPE_2C_CACHED_FWD_PYBIND m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
-#define ROPE_1C_THD_FWD_PYBIND m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
-#define ROPE_1C_2D_FWD_PYBIND m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
+#define ROPE_1C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
+#define ROPE_2C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
+#define ROPE_1C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
+#define ROPE_2C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
+#define ROPE_1C_THD_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
+#define ROPE_1C_2D_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
 
-#define ROPE_1C_UNCACHED_BWD_PYBIND m.def("rope_bwd_impl", &rope_bwd_impl);
-#define ROPE_2C_UNCACHED_BWD_PYBIND m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
-#define ROPE_1C_CACHED_BWD_PYBIND m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
-#define ROPE_2C_CACHED_BWD_PYBIND m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
-#define ROPE_1C_THD_BWD_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
-#define ROPE_1C_2D_BWD_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+#define ROPE_1C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_bwd_impl", &rope_bwd_impl);
+#define ROPE_2C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
+#define ROPE_1C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
+#define ROPE_2C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
+#define ROPE_1C_THD_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
+#define ROPE_1C_2D_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
 #define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND                 \
     m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl)
 #define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND    \
+    AITER_SET_STREAM_PYBIND                    \
     m.def("rope_cached_positions_2c_fwd_impl", \
           &rope_cached_positions_2c_fwd_impl,  \
           py::arg("output_x"),                 \
@@ -1462,11 +1476,14 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"),   \
           py::arg("nope_first"))
 #define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND                         \
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl)
 #define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND                         \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl)
 
 #define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
+    AITER_SET_STREAM_PYBIND                                 \
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
           &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,  \
           py::arg("qkv"),                                   \
@@ -1498,6 +1515,7 @@ namespace py = pybind11;
           py::arg("rotary_dim") = 0);
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
+    AITER_SET_STREAM_PYBIND                                     \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
           &aiter::fused_qk_norm_rope_cache_quant_shuffle);      \
     m.def("fused_qk_rmsnorm",                                   \
@@ -1638,6 +1656,7 @@ namespace py = pybind11;
     m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
 #define TOP_K_PER_ROW_PYBIND       \
+    AITER_SET_STREAM_PYBIND        \
     m.def("top_k_per_row_prefill", \
           &top_k_per_row_prefill,  \
           py::arg("logits"),       \
@@ -1745,6 +1764,7 @@ namespace py = pybind11;
           py::arg("final_lse") = std::nullopt);
 
 #define TOPK_PLAIN_PYBIND                         \
+    AITER_SET_STREAM_PYBIND                       \
     m.def("topk_plain",                           \
           &topk_plain,                            \
           py::arg("values"),                      \
@@ -1758,6 +1778,7 @@ namespace py = pybind11;
           py::arg("stride1")   = 1);
 
 #define RMSNORM_QUANT_PYBIND                 \
+    AITER_SET_STREAM_PYBIND                  \
     m.def("add_rmsnorm_quant",               \
           &aiter::add_rmsnorm_quant,         \
           py::arg("out"),                    \
@@ -1794,6 +1815,7 @@ namespace py = pybind11;
           py::arg("epsilon"));
 
 #define MHC_PYBIND                              \
+    AITER_SET_STREAM_PYBIND                     \
     m.def("mhc_pre_gemm_sqrsum",                \
           &aiter::mhc_pre_gemm_sqrsum,          \
           "mhc_pre_gemm_sqrsum",                \
@@ -1827,6 +1849,7 @@ namespace py = pybind11;
           py::arg("post_layer_mix"),            \
           py::arg("comb_res_mix"));
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
+    AITER_SET_STREAM_PYBIND                                                    \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \
           "Causal 1D convolution update with state (for inference/decoding).", \
@@ -1841,6 +1864,7 @@ namespace py = pybind11;
           py::arg("pad_slot_id")        = -1);
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
+    AITER_SET_STREAM_PYBIND                                           \
     m.def("fused_split_gdr_update",                                   \
           &aiter::fused_split_gdr_update,                             \
           "Fused split GDR decode update (HIP, ksplit4_db backend).", \

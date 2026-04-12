@@ -3334,7 +3334,7 @@ void cp_gather_indexer_k_quant_cache(
     int batch_size       = block_table.size(0);
     int num_tokens       = dst_k.size(0);
     int head_dim         = dst_k.size(1);
-    int quant_block_size = head_dim / (dst_scale.size(1) * dst_scale.itemsize() / 4);
+    int quant_block_size = head_dim / (dst_scale.size(1) * dst_scale.element_size() / 4);
 
     AITER_CHECK(kv_cache.device_id == dst_k.device_id,
                 "kv_cache and dst_k must be on the same device");
