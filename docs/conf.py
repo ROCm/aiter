@@ -12,7 +12,17 @@ sys.path.insert(0, os.path.abspath(".."))
 project = "AITER"
 copyright = "2026, AMD"
 author = "AMD ROCm Team"
-release = "0.1.0"
+# Auto-detect version from setuptools_scm or git
+try:
+    from importlib.metadata import version as get_version
+    release = get_version("amd-aiter")
+except Exception:
+    try:
+        from setuptools_scm import get_version
+        release = get_version(root="..", relative_to=__file__)
+    except Exception:
+        release = "dev"
+version = ".".join(release.split(".")[:2])
 
 # -- General configuration ---------------------------------------------------
 extensions = [

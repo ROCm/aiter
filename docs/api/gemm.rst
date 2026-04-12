@@ -1,284 +1,320 @@
 GEMM Operations
 ===============
 
-AITER provides optimized General Matrix Multiply (GEMM) operations for AMD GPUs.
+AITER provides optimized General Matrix Multiply (GEMM) operations for AMD GPUs
+across multiple precisions (FP8, BF16/FP16, FP4) with multiple backend
+implementations (ASM, CK, CK Tile, Triton, FlyDSL).
 
-Grouped GEMM
-------------
 
-.. autofunction:: aiter.grouped_gemm
+A8W8 (FP8) GEMM
+----------------
 
-Efficient grouped matrix multiplication for Mixture of Experts (MoE) layers.
+Functions in ``aiter.ops.gemm_op_a8w8``. All functions compute
+``Out = dequant(XQ @ WQ^T)`` using FP8 (8-bit floating point) inputs with
+per-tensor or block-wise scaling.
 
-**Parameters:**
+.. function:: gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Out, bias=None, splitK=0)
 
-* **input** (*torch.Tensor*) - Input tensor ``(total_tokens, hidden_dim)``
-* **weights** (*torch.Tensor*) - Expert weights ``(num_experts, hidden_dim, output_dim)``
-* **expert_ids** (*torch.Tensor*) - Expert assignments ``(total_tokens, top_k)``
-* **topk** (*int*, optional) - Number of experts per token. Default: inferred from ``expert_ids``
+   CK (Composable Kernel) based FP8 GEMM with per-tensor scaling.
 
-**Returns:**
+   :param XQ: Activation tensor ``[M, K]``, FP8.
+   :param WQ: Weight tensor ``[N, K]``, FP8.
+   :param x_scale: Activation scale ``[M, 1]``, FP32.
+   :param w_scale: Weight scale ``[1, N]``, FP32.
+   :param Out: Pre-allocated output tensor ``[M, N]``.
+   :param bias: Optional bias tensor.
+   :param splitK: Split-K factor for parallelism (default 0 = auto).
+   :returns: Output tensor ``Out``.
 
-* **output** (*torch.Tensor*) - Result ``(total_tokens, output_dim)``
+.. function:: gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out, splitK=0)
 
-**Example:**
+   CK-based FP8 GEMM with pre-shuffled weight layout for improved memory access.
 
-.. code-block:: python
+   :param XQ: Activation tensor ``[M, K]``, FP8.
+   :param WQ: Pre-shuffled weight tensor ``[N, K]``, FP8.
+   :param x_scale: Activation scale.
+   :param w_scale: Weight scale.
+   :param Out: Pre-allocated output tensor ``[M, N]``.
+   :param splitK: Split-K factor (default 0).
+   :returns: Output tensor ``Out``.
 
-   import torch
-   import aiter
+.. function:: gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, out, splitK=0)
 
-   # 4096 tokens, 512 hidden dim, 8 experts, top-2 routing
-   tokens = 4096
-   hidden = 512
-   num_experts = 8
-   output_dim = 2048
+   CK Tile variant of FP8 GEMM with pre-shuffled weights.
 
-   x = torch.randn(tokens, hidden, device='cuda', dtype=torch.float16)
-   expert_weights = torch.randn(num_experts, hidden, output_dim,
-                                device='cuda', dtype=torch.float16)
-   expert_ids = torch.randint(0, num_experts, (tokens, 2), device='cuda')
+   Same interface as ``gemm_a8w8_bpreshuffle_ck``.
 
-   output = aiter.grouped_gemm(x, expert_weights, expert_ids)
+.. function:: gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Out, config)
+
+   FlyDSL variant of FP8 GEMM with pre-shuffled weights. Falls back to
+   ``gemm_a8w8_bpreshuffle_ck`` if no matching FlyDSL kernel is found.
+
+   :param config: Dictionary with ``kernelId`` selecting the FlyDSL kernel.
+
+.. function:: gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Out, kernelName="", bias=None, bpreshuffle=True, splitK=None)
+
+   ASM (hand-tuned assembly) FP8 GEMM. Highest performance for supported shapes.
+
+   :param XQ: Activation tensor ``[M, K]``, INT8/FP8.
+   :param WQ: Weight tensor ``[N, K]``, shuffled layout ``(32, 16)``.
+   :param x_scale: Activation scale ``[M, 1]``, FP32.
+   :param w_scale: Weight scale ``[1, N]``, FP32.
+   :param Out: Pre-allocated output tensor ``[M, N]``, BF16.
+   :param kernelName: Specific ASM kernel name (empty string = auto).
+   :param bias: Optional bias tensor ``[1, N]``, FP32.
+   :param bpreshuffle: Whether weights are pre-shuffled (default True).
+   :param splitK: Split-K factor (default None = auto).
+   :returns: Output tensor ``Out``.
+
+Block-Scale FP8 GEMM
+^^^^^^^^^^^^^^^^^^^^^
+
+Block-scale variants use per-block quantization scales instead of per-tensor
+scales, providing better accuracy for large matrices.
+
+.. function:: gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Out)
+
+   CK-based block-scale FP8 GEMM.
+
+.. function:: gemm_a8w8_blockscale_cktile(XQ, WQ, x_scale, w_scale, Out, isBpreshuffled=False)
+
+   CK Tile variant of block-scale FP8 GEMM.
+
+   :param isBpreshuffled: Whether the weight tensor uses pre-shuffled layout.
+
+.. function:: gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+
+   CK-based block-scale FP8 GEMM with pre-shuffled weights.
+
+.. function:: gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Out, isBpreshuffled=True)
+
+   CK Tile variant of block-scale FP8 GEMM with pre-shuffled weights.
+
+.. function:: gemm_a8w8_blockscale_bpreshuffle_asm(A, B, out, A_scale, B_scale, bias=None, splitK=None, kernelName=None, bpreshuffle=True, zero_bias_buf=None)
+
+   ASM block-scale FP8 GEMM with pre-shuffled weights.
+
+   :param zero_bias_buf: Optional zero-initialized bias buffer ``[1, N]``, FP32.
+     Auto-created if both ``bias`` and ``zero_bias_buf`` are None.
+
+.. function:: flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, out)
+
+   ASM block-scale FP8 flat matrix multiply.
+
+
+A16W16 (BF16/FP16) GEMM
+------------------------
+
+Functions in ``aiter.ops.gemm_op_a16w16``.
+
+.. function:: gemm_a16w16_asm(A, B, out, bias=None, splitK=None, kernelName=None, bpreshuffle=False)
+
+   ASM-optimized BF16/FP16 GEMM.
+
+   :param A: Activation tensor ``[M, K]``, BF16/FP16.
+   :param B: Weight tensor ``[N, K]``, BF16/FP16.
+   :param out: Pre-allocated output tensor ``[M, N]``.
+   :param bias: Optional bias tensor.
+   :param splitK: Split-K factor (default None = auto).
+   :param kernelName: Specific ASM kernel name.
+   :param bpreshuffle: Whether weights are pre-shuffled (default False).
+   :returns: Output tensor ``out``.
+
+
+A4W4 (FP4) GEMM
+----------------
+
+Functions in ``aiter.ops.gemm_op_a4w4``. These operate on MXFP4 (4-bit
+floating point) packed inputs where each byte holds two FP4 values.
+
+.. note::
+
+   A4W4 GEMM is **not supported** on gfx942 (MI300X). Supported on gfx950+.
+
+.. function:: gemm_a4w4(A, B, A_scale, B_scale, bias=None, dtype=torch.bfloat16, alpha=1.0, beta=0.0, bpreshuffle=True)
+
+   Top-level FP4 GEMM. Auto-selects between ``gemm_a4w4_blockscale`` and
+   ``gemm_a4w4_asm`` based on tuned configuration.
+
+   :param A: Activation tensor ``[M, K/2]``, packed FP4x2.
+   :param B: Weight tensor ``[N, K/2]``, packed FP4x2.
+   :param A_scale: Activation scale ``[M, K/32]``, E8M0 format.
+   :param B_scale: Weight scale ``[N, K/32]``, E8M0 format.
+   :param bias: Optional bias tensor ``[1, N]``, FP32.
+   :param dtype: Output dtype (default BF16).
+   :param alpha: Scalar multiplier (default 1.0).
+   :param beta: Accumulation scalar (default 0.0).
+   :param bpreshuffle: Whether weights are pre-shuffled (default True).
+   :returns: Output tensor ``[M, N]`` in ``dtype``.
+
+.. function:: gemm_a4w4_asm(A, B, A_scale, B_scale, out, kernelName="", bias=None, alpha=1.0, beta=0.0, bpreshuffle=True, log2_k_split=None)
+
+   ASM-optimized FP4 GEMM.
+
+   :param out: Pre-allocated output tensor. Dim0 must be padded to multiples of 32.
+   :param log2_k_split: Log2 of the K-split factor.
+
+.. function:: gemm_a4w4_blockscale(XQ, WQ, x_scale, w_scale, Out, splitK=0)
+
+   CK-based block-scale FP4 GEMM.
+
 
 Batched GEMM
-------------
+-------------
 
-.. autofunction:: aiter.batched_gemm
+Batched GEMM operations for processing multiple independent matrix multiplications
+in a single kernel launch.
 
-Batched matrix multiplication with optimizations for AMD hardware.
+Batched FP8 GEMM
+^^^^^^^^^^^^^^^^^
 
-**Parameters:**
+Functions in ``aiter.ops.batched_gemm_op_a8w8``.
 
-* **a** (*torch.Tensor*) - First batch ``(batch, m, k)``
-* **b** (*torch.Tensor*) - Second batch ``(batch, k, n)``
-* **transpose_a** (*bool*, optional) - Transpose A. Default: ``False``
-* **transpose_b** (*bool*, optional) - Transpose B. Default: ``False``
+.. function:: batched_gemm_a8w8(XQ, WQ, x_scale, w_scale, out, bias=None, splitK=0)
 
-**Returns:**
+   Low-level batched FP8 GEMM. Requires pre-allocated output tensor.
 
-* **output** (*torch.Tensor*) - Result ``(batch, m, n)``
+   :param XQ: Batched activation tensor ``[B, M, K]``, FP8.
+   :param WQ: Batched weight tensor ``[B, K, N]``, FP8.
+   :param x_scale: Activation scale tensor.
+   :param w_scale: Weight scale tensor.
+   :param out: Pre-allocated output tensor ``[B, M, N]``.
+   :param bias: Optional bias tensor.
+   :param splitK: Split-K factor (default 0).
+   :returns: Output tensor ``out``.
 
-Fused GEMM Operations
----------------------
+.. function:: batched_gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, bias=None, dtype=torch.bfloat16, splitK=None)
 
-GEMM + Bias
-^^^^^^^^^^^
+   High-level batched FP8 GEMM with CK tuning. Auto-allocates output tensor and
+   selects optimal split-K from tuned configuration.
 
-.. autofunction:: aiter.gemm_bias
+   :param dtype: Output dtype (BF16 or FP16).
+   :returns: Output tensor ``[B, M, N]``.
 
-Matrix multiply with bias addition fused.
+Batched BF16 GEMM
+^^^^^^^^^^^^^^^^^^
 
-**Parameters:**
+Functions in ``aiter.ops.batched_gemm_op_bf16``.
 
-* **input** (*torch.Tensor*) - Input ``(m, k)``
-* **weight** (*torch.Tensor*) - Weight ``(k, n)`` or ``(n, k)`` if transposed
-* **bias** (*torch.Tensor*) - Bias ``(n,)``
-* **transpose_weight** (*bool*, optional) - Default: ``True``
+.. function:: batched_gemm_bf16(XQ, WQ, out, bias=None, splitK=0)
 
-**Returns:**
+   Low-level batched BF16 GEMM.
 
-* **output** (*torch.Tensor*) - ``(m, n)``
+   :param XQ: Batched activation tensor ``[B, M, K]``, BF16.
+   :param WQ: Batched weight tensor ``[B, K, N]``, BF16.
+   :param out: Pre-allocated output tensor ``[B, M, N]``.
+   :param bias: Optional bias tensor.
+   :param splitK: Split-K factor (default 0).
+   :returns: Output tensor ``out``.
 
-**Example:**
+.. function:: batched_gemm_bf16_CK(XQ, WQ, bias=None, dtype=torch.bfloat16, splitK=None)
 
-.. code-block:: python
+   High-level batched BF16 GEMM with CK tuning. Auto-allocates output.
 
-   x = torch.randn(1024, 512, device='cuda', dtype=torch.float16)
-   weight = torch.randn(2048, 512, device='cuda', dtype=torch.float16)
-   bias = torch.randn(2048, device='cuda', dtype=torch.float16)
+   :param dtype: Output dtype (BF16 or FP16).
+   :returns: Output tensor ``[B, M, N]``.
 
-   # Fused: y = x @ weight.T + bias
-   output = aiter.gemm_bias(x, weight, bias, transpose_weight=True)
 
-GEMM + GELU
-^^^^^^^^^^^
+DeepGEMM
+--------
 
-.. autofunction:: aiter.gemm_gelu
+Functions in ``aiter.ops.deepgemm``. DeepGEMM provides grouped GEMM operations
+with explicit group layout control.
 
-Matrix multiply with GELU activation fused.
+.. function:: deepgemm(XQ, WQ, Y, group_layout, x_scale=None, w_scale=None)
 
-**Parameters:**
+   Top-level DeepGEMM entry point. Currently delegates to ``deepgemm_ck``.
 
-* **input** (*torch.Tensor*) - Input tensor
-* **weight** (*torch.Tensor*) - Weight tensor
-* **bias** (*torch.Tensor*, optional) - Bias tensor
+   :param XQ: Activation tensor.
+   :param WQ: Weight tensor.
+   :param Y: Pre-allocated output tensor.
+   :param group_layout: Tensor describing the group layout.
+   :param x_scale: Optional activation scale.
+   :param w_scale: Optional weight scale.
+   :returns: Output tensor ``Y``.
 
-**Returns:**
+.. function:: deepgemm_ck(XQ, WQ, Y, group_layout, x_scale=None, w_scale=None)
 
-* **output** (*torch.Tensor*) - Result with GELU applied
+   CK-based DeepGEMM implementation.
 
-GEMM + ReLU
-^^^^^^^^^^^
 
-.. autofunction:: aiter.gemm_relu
+Auto-Tuned GEMM
+----------------
 
-Matrix multiply with ReLU activation fused.
+Functions in ``aiter.tuned_gemm``. The auto-tuning layer selects the best
+backend (ASM, CK, hipBLASLt, Triton, FlyDSL, or PyTorch) based on matrix shape
+and pre-computed tuning configurations.
 
-**Parameters:**
+.. function:: gemm_a16w16(A, B, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None)
 
-* **input** (*torch.Tensor*) - Input tensor
-* **weight** (*torch.Tensor*) - Weight tensor
-* **bias** (*torch.Tensor*, optional) - Bias tensor
+   Top-level BF16/FP16 GEMM with automatic backend selection.
 
-**Returns:**
+   The backend is chosen from tuned CSV configurations keyed on ``(M, N, K, dtype)``.
+   Supported backends: ``hipblaslt``, ``asm``, ``skinny``, ``triton``, ``flydsl``,
+   ``torch`` (fallback).
 
-* **output** (*torch.Tensor*) - Result with ReLU applied
+   :param A: Activation tensor ``[M, K]`` (or ``[*, M, K]`` for batched).
+   :param B: Weight tensor ``[N, K]``.
+   :param bias: Optional bias tensor.
+   :param otype: Output dtype (default same as input).
+   :param scale_a: Optional activation scale (for FP8 inputs via hipBLASLt).
+   :param scale_b: Optional weight scale.
+   :param scale_c: Optional output scale.
+   :returns: Output tensor ``[M, N]``.
 
-CUTLASS-style GEMM
-------------------
+.. class:: TunedGemm
 
-.. autofunction:: aiter.cutlass_gemm
+   Stateful wrapper around ``gemm_a16w16`` for BF16/FP16 GEMM with optional
+   FP8 per-tensor quantization scaling.
 
-High-performance GEMM using CUTLASS-inspired kernels for AMD.
+   .. method:: mm(inp, weights, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None)
 
-**Parameters:**
+      Delegates to :func:`gemm_a16w16`.
 
-* **a** (*torch.Tensor*) - Matrix A
-* **b** (*torch.Tensor*) - Matrix B
-* **alpha** (*float*, optional) - Scalar multiplier. Default: ``1.0``
-* **beta** (*float*, optional) - Scalar for accumulation. Default: ``0.0``
-* **c** (*torch.Tensor*, optional) - Accumulation matrix
+   A global instance ``tgemm`` is available as ``aiter.tuned_gemm.tgemm``.
 
-**Returns:**
 
-* **output** (*torch.Tensor*) - Result: ``alpha * (A @ B) + beta * C``
+Backend Selection
+-----------------
 
-Sparse GEMM
------------
-
-.. autofunction:: aiter.sparse_gemm
-
-Sparse matrix multiplication with various sparsity patterns.
-
-**Parameters:**
-
-* **input** (*torch.Tensor*) - Dense input
-* **weight** (*torch.Tensor*) - Sparse weight (CSR/COO format)
-* **sparsity_pattern** (*str*) - Pattern type: ``'csr'``, ``'coo'``, ``'block'``
-
-**Returns:**
-
-* **output** (*torch.Tensor*) - Dense output
-
-INT8 Quantized GEMM
--------------------
-
-.. autofunction:: aiter.int8_gemm
-
-INT8 quantized matrix multiplication for inference acceleration.
-
-**Parameters:**
-
-* **input** (*torch.Tensor*) - Quantized input INT8
-* **weight** (*torch.Tensor*) - Quantized weight INT8
-* **input_scale** (*torch.Tensor*) - Input dequantization scale
-* **weight_scale** (*torch.Tensor*) - Weight dequantization scale
-* **output_dtype** (*torch.dtype*, optional) - Output type. Default: ``torch.float16``
-
-**Returns:**
-
-* **output** (*torch.Tensor*) - Dequantized result
-
-**Example:**
-
-.. code-block:: python
-
-   # Quantized matrices (simulated)
-   x_int8 = torch.randint(-127, 127, (1024, 512), device='cuda', dtype=torch.int8)
-   w_int8 = torch.randint(-127, 127, (2048, 512), device='cuda', dtype=torch.int8)
-
-   # Scales for dequantization
-   x_scale = torch.randn(1, device='cuda', dtype=torch.float32)
-   w_scale = torch.randn(1, device='cuda', dtype=torch.float32)
-
-   # INT8 GEMM with automatic dequantization
-   output = aiter.int8_gemm(x_int8, w_int8, x_scale, w_scale)
-
-Performance Characteristics
-----------------------------
+AITER provides multiple backend implementations for each precision:
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 20 25 25
+   :widths: 15 50 35
 
-   * - Operation
-     - Typical Speedup
-     - Best Use Case
-     - Memory Usage
-   * - grouped_gemm
-     - 3-10x vs loops
-     - MoE layers
-     - Low
-   * - batched_gemm
-     - 2-4x vs sequential
-     - Batched inference
-     - Moderate
-   * - gemm_bias
-     - 1.5-2x vs unfused
-     - Linear layers
-     - Low
-   * - int8_gemm
-     - 2-3x vs FP16
-     - Quantized models
-     - Very Low
-   * - cutlass_gemm
-     - Best raw GEMM
-     - Large matrices
-     - Moderate
+   * - Backend
+     - Description
+     - Used By
+   * - **CK**
+     - AMD Composable Kernel library. Default for most shapes.
+     - A8W8, A4W4, Batched, DeepGEMM
+   * - **CK Tile**
+     - Tile-based CK variant with different tiling strategies.
+     - A8W8 block-scale and pre-shuffle
+   * - **ASM**
+     - Hand-tuned GFX ISA assembly. Best peak performance.
+     - A8W8, A16W16, A4W4, block-scale
+   * - **FlyDSL**
+     - AMD FlyDSL code-generation framework.
+     - A8W8 pre-shuffle, A16W16
+   * - **Triton**
+     - OpenAI Triton for AMD GPUs. Portable, CK-free path.
+     - A16W16
+   * - **hipBLASLt**
+     - AMD hipBLASLt library (via ``hipb_mm``).
+     - A16W16 (gfx942)
+   * - **PyTorch**
+     - ``torch.nn.functional.linear`` fallback.
+     - A16W16 (untuned shapes)
 
-Optimization Tips
------------------
+For production inference, use :func:`gemm_a16w16` or :class:`TunedGemm` which
+automatically select the fastest backend. Use precision-specific functions
+(``gemm_a8w8_*``, ``gemm_a4w4_*``) when you need explicit control over the
+quantization format and backend.
 
-1. **Matrix Dimensions**: Multiple of 128 for best performance (MI300X)
-2. **Data Layout**: Row-major preferred for AMD GPUs
-3. **Precision**: FP16/BF16 recommended over FP32
-4. **Fusion**: Use fused ops (gemm_bias, gemm_gelu) when possible
-5. **Batch Size**: Larger batches improve throughput
-
-Example: Optimal MoE Forward Pass
-----------------------------------
-
-.. code-block:: python
-
-   import torch
-   import aiter
-
-   class OptimizedMoELayer:
-       def __init__(self, hidden_dim, num_experts, expert_dim):
-           self.hidden_dim = hidden_dim
-           self.num_experts = num_experts
-           self.expert_dim = expert_dim
-
-           # Expert weights (all experts in one tensor)
-           self.w1 = torch.randn(num_experts, hidden_dim, expert_dim,
-                                device='cuda', dtype=torch.float16)
-           self.w2 = torch.randn(num_experts, expert_dim, hidden_dim,
-                                device='cuda', dtype=torch.float16)
-
-       def forward(self, x, expert_ids, routing_weights):
-           # x: (total_tokens, hidden_dim)
-           # expert_ids: (total_tokens, top_k)
-           # routing_weights: (total_tokens, top_k)
-
-           # First grouped GEMM
-           hidden = aiter.grouped_gemm(x, self.w1, expert_ids)
-
-           # Activation
-           hidden = aiter.gelu(hidden)
-
-           # Second grouped GEMM
-           output = aiter.grouped_gemm(hidden, self.w2, expert_ids)
-
-           # Apply routing weights
-           output = output * routing_weights.unsqueeze(-1)
-
-           return output
 
 See Also
 --------
 
-* :doc:`../tutorials/moe` - MoE tutorial
-* :doc:`../tutorials/quantization` - INT8 quantization guide
-* :doc:`moe` - MoE-specific operations
-* :doc:`../benchmarks` - GEMM benchmarks
+* :doc:`moe` - MoE-specific grouped GEMM operations
