@@ -15,6 +15,7 @@ on:
       - main
     paths:
       - 'docs/**'
+      - 'tests/test_docs.py'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -50,6 +51,11 @@ jobs:
         run: |
           cd docs
           sphinx-build -W --keep-going -b html . _build/html
+
+      - name: Run documentation tests
+        run: |
+          pip install pytest
+          pytest tests/test_docs.py -v --tb=short -x 2>&1 | tail -60
 
       - name: Check for broken links
         run: |
