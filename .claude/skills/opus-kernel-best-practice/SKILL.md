@@ -10,16 +10,25 @@ Techniques for reducing HIP/C++ kernel compile time when using `opus.hpp`. These
 
 ## Required headers and include paths
 
-For kernel development with OPUS, use these two headers from the aiter repo:
+For kernel development with OPUS, use these headers from `csrc/include/`:
 
-- **`opus/opus.hpp`** — the OPUS template library (device code)
-- **`opus/hip_minimal.hpp`** — minimal HIP declarations for both host and device (replaces `<hip/hip_runtime.h>`)
-
-Both live under `csrc/include/`. Compile with:
+- **`opus/opus.hpp`** — the OPUS template library + device intrinsic wrappers. **This is the only include needed for device code.** Provides `opus::thread_id_x()`, `opus::block_id_x()`, `opus::sync_threads()`, `opus::warp_all()`, etc.
+- **`opus/hip_minimal.hpp`** — minimal HIP **host-side only** declarations (`dim3`, `hipMalloc`, `hipLaunchKernelGGL`, etc.). Use on the host pass instead of `<hip/hip_runtime.h>`.
 
 ```bash
 hipcc my_kernel.cu -I<aiter_root>/csrc/include -D__HIPCC_RTC__ -std=c++20 -O3 --offload-arch=gfx950
 ```
+
+| HIP runtime | opus:: wrapper | LLVM builtin |
+|---|---|---|
+| `threadIdx.x` | `opus::thread_id_x()` | `__builtin_amdgcn_workitem_id_x()` |
+| `blockIdx.x` | `opus::block_id_x()` | `__builtin_amdgcn_workgroup_id_x()` |
+| `blockDim.x` | `opus::block_size_x()` | `__builtin_amdgcn_workgroup_size_x()` |
+| `gridDim.x * blockDim.x` | `opus::grid_size_x()` | `__builtin_amdgcn_grid_size_x()` |
+| `__syncthreads()` | `opus::sync_threads()` | `__builtin_amdgcn_s_barrier()` |
+| `__all(pred)` | `opus::warp_all(pred)` | — |
+
+If anything is missing, contact the maintainer (carlus.huang@amd.com) for adding support.
 
 ## 0. Always Separate Device and Host Code (Most Important)
 
