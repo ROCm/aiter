@@ -41,7 +41,7 @@ template __global__ void vector_add_kernel<256, 4>(const float*, const float*, f
 #else
 // ── Host pass: hip_runtime.h for launch API, empty kernel stubs ─────────────
 // #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
-#include "hip_minimal.h"
+#include "opus/hip_minimal.hpp"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \

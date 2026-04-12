@@ -13,7 +13,7 @@ Techniques for reducing HIP/C++ kernel compile time when using `opus.hpp`. These
 For kernel development with OPUS, use these two headers from the aiter repo:
 
 - **`opus/opus.hpp`** — the OPUS template library (device code)
-- **`hip_minimal.h`** — minimal HIP declarations for both host and device (replaces `<hip/hip_runtime.h>`)
+- **`opus/hip_minimal.hpp`** — minimal HIP declarations for both host and device (replaces `<hip/hip_runtime.h>`)
 
 Both live under `csrc/include/`. Compile with:
 
@@ -40,7 +40,7 @@ void my_kernel(const float* src, float* dst, int n) {
 
 #else
 // ── Host pass: minimal declarations + launcher only ──
-#include "hip_minimal.h"
+#include "opus/hip_minimal.hpp"
 
 __global__ void my_kernel(const float* src, float* dst, int n);  // declaration only
 
@@ -55,7 +55,7 @@ extern "C" void run_my_kernel(const void* d_src, void* d_dst, int n) {
 
 **Why this works:**
 - The device pass sees `opus.hpp` + kernel definitions — full template expansion
-- The host pass sees only `hip_minimal.h` (~70 lines) + kernel declaration + launch wrapper
+- The host pass sees only `opus/hip_minimal.hpp` (~70 lines) + kernel declaration + launch wrapper
 - **Saves ~50% of total compile time** by eliminating opus.hpp parsing on the host pass
 - The `extern "C"` launcher can be called from Python via `ctypes.CDLL` — no pybind11/torch extension needed
 
@@ -72,9 +72,9 @@ hipcc my_kernel.cu \
 
 ## 1. Minimize Header Overhead
 
-### Replace `<hip/hip_runtime.h>` with `hip_minimal.h`
+### Replace `<hip/hip_runtime.h>` with `opus/hip_minimal.hpp`
 
-Standard `<hip/hip_runtime.h>` expands to ~190K preprocessed lines. The aiter-provided `hip_minimal.h` (~80 lines) declares only what's needed — `dim3`, `hipLaunchKernelGGL`, `hipMalloc`/`hipFree`, `__launch_bounds__`, `__shared__`/`__device__`/`__global__`, and `__all()`. Use AMDGCN compiler builtins for device intrinsics:
+Standard `<hip/hip_runtime.h>` expands to ~190K preprocessed lines. The aiter-provided `opus/hip_minimal.hpp` (~80 lines) declares only what's needed — `dim3`, `hipLaunchKernelGGL`, `hipMalloc`/`hipFree`, `__launch_bounds__`, `__shared__`/`__device__`/`__global__`, and `__all()`. Use AMDGCN compiler builtins for device intrinsics:
 
 ```cpp
 int tid = __builtin_amdgcn_workitem_id_x();     // threadIdx.x

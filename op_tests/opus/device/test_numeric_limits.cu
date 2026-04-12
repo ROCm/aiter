@@ -47,7 +47,7 @@ __global__ void numeric_limits_kernel(unsigned int* out) {
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
 // #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
-#include "hip_minimal.h"
+#include "opus/hip_minimal.hpp"
 #include <cstdio>
 
 namespace {

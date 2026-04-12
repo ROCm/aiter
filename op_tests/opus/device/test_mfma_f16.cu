@@ -103,7 +103,7 @@ template __global__ void mfma_kernel_generic<opus::bf16_t, opus::bf16_t, 16, 16,
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
 // #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
-#include "hip_minimal.h"
+#include "opus/hip_minimal.hpp"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \

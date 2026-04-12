@@ -124,7 +124,7 @@ template __global__ void tr_load_f16_kernel<16, 32>(const opus::fp16_t*, opus::f
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
 // #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
-#include "hip_minimal.h"
+#include "opus/hip_minimal.hpp"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \
