@@ -204,6 +204,13 @@ class OpusDeviceLib:
         fn.argtypes = [_VP, _VP, _I]
         fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
 
+    # -- predicated_copy_2d --
+    def run_predicated_copy_2d(self, Src, Dst, actual_rows, actual_cols, total_rows, stride):
+        fn = self._lib.run_predicated_copy_2d
+        fn.restype = None
+        fn.argtypes = [_VP, _VP, _I, _I, _I, _I]
+        fn(self._ptr(Src), self._ptr(Dst), actual_rows, actual_cols, total_rows, stride)
+
     # -- free_func_add --
     def run_free_func_add(self, A, B, Result):
         fn = self._lib.run_free_func_add
@@ -1700,6 +1707,47 @@ def test_predicated_copy(mod):
     return 0
 
 
+def test_predicated_copy_2d(mod):
+    """Test 2D predicated load_if/store_if with multi-index predicate (i_row, i_col).
+
+    Catches bugs where _if methods pass flat index instead of multi-index to predicates.
+    Uses a 2D layout with row/col boundary checking — the predicate receives (i_row, i_col)
+    and uses them to check bounds, which would fail if given a single flat index.
+    """
+    ROWS = 4          # issue space rows per workgroup
+    COLS = 4          # issue space cols per thread
+    BLOCK_SIZE = 256  # threads per block
+    stride = BLOCK_SIZE * COLS  # row stride in elements
+
+    # Actual data: slightly smaller than full tile to trigger boundary predicate
+    actual_rows = 6   # < ROWS * num_blocks for last block
+    actual_cols = BLOCK_SIZE * COLS - 3  # not aligned, last few cols should be masked
+    total_rows = ((actual_rows + ROWS - 1) // ROWS) * ROWS  # padded to full tiles
+    total_elems = total_rows * stride
+
+    device = torch.device("cuda")
+    torch.manual_seed(123)
+    Src = torch.randn(total_elems, device=device, dtype=torch.float32)
+    Dst = torch.full((total_elems,), -1.0, device=device, dtype=torch.float32)
+
+    mod.run_predicated_copy_2d(Src, Dst, actual_rows, actual_cols, total_rows, stride)
+
+    # Build expected: copy only elements where row < actual_rows AND col < actual_cols
+    Expected = torch.full((total_elems,), -1.0, device=device, dtype=torch.float32)
+    for r in range(actual_rows):
+        for c in range(actual_cols):
+            Expected[r * stride + c] = Src[r * stride + c]
+
+    ok = torch.equal(Dst, Expected)
+    if not ok:
+        diff = (Dst - Expected).abs()
+        n_diff = diff.gt(0).sum().item()
+        print(f"  FAIL: predicated_copy_2d mismatch, {n_diff}/{total_elems} elements differ, max_diff={diff.max().item():.6e}")
+        return 1
+    print(f"  PASS: predicated_copy_2d ({actual_rows}x{actual_cols}), 2D multi-index predicate")
+    return 0
+
+
 def test_free_func_vector_add(mod):
     """Test opus::load / opus::store free function wrappers (vector add)."""
     n = 1310720  # same as regular vector_add test
@@ -2131,6 +2179,7 @@ def main():
     failures += test_dtype_convert_fp32_fp4_x2(mod)
     failures += test_dtype_convert_fp32_fp4_x4(mod)
     failures += test_predicated_copy(mod)
+    failures += test_predicated_copy_2d(mod)
     failures += test_free_func_vector_add(mod)
     failures += test_predicated_async_load(mod)
     failures += test_numeric_limits(mod)
