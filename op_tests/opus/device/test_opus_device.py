@@ -205,7 +205,9 @@ class OpusDeviceLib:
         fn(self._ptr(Src), self._ptr(Dst), int(Src.numel()))
 
     # -- predicated_copy_2d --
-    def run_predicated_copy_2d(self, Src, Dst, actual_rows, actual_cols, total_rows, stride):
+    def run_predicated_copy_2d(
+        self, Src, Dst, actual_rows, actual_cols, total_rows, stride
+    ):
         fn = self._lib.run_predicated_copy_2d
         fn.restype = None
         fn.argtypes = [_VP, _VP, _I, _I, _I, _I]
@@ -1714,13 +1716,13 @@ def test_predicated_copy_2d(mod):
     Uses a 2D layout with row/col boundary checking — the predicate receives (i_row, i_col)
     and uses them to check bounds, which would fail if given a single flat index.
     """
-    ROWS = 4          # issue space rows per workgroup
-    COLS = 4          # issue space cols per thread
+    ROWS = 4  # issue space rows per workgroup
+    COLS = 4  # issue space cols per thread
     BLOCK_SIZE = 256  # threads per block
     stride = BLOCK_SIZE * COLS  # row stride in elements
 
     # Actual data: slightly smaller than full tile to trigger boundary predicate
-    actual_rows = 6   # < ROWS * num_blocks for last block
+    actual_rows = 6  # < ROWS * num_blocks for last block
     actual_cols = BLOCK_SIZE * COLS - 3  # not aligned, last few cols should be masked
     total_rows = ((actual_rows + ROWS - 1) // ROWS) * ROWS  # padded to full tiles
     total_elems = total_rows * stride
@@ -1742,9 +1744,13 @@ def test_predicated_copy_2d(mod):
     if not ok:
         diff = (Dst - Expected).abs()
         n_diff = diff.gt(0).sum().item()
-        print(f"  FAIL: predicated_copy_2d mismatch, {n_diff}/{total_elems} elements differ, max_diff={diff.max().item():.6e}")
+        print(
+            f"  FAIL: predicated_copy_2d mismatch, {n_diff}/{total_elems} elements differ, max_diff={diff.max().item():.6e}"
+        )
         return 1
-    print(f"  PASS: predicated_copy_2d ({actual_rows}x{actual_cols}), 2D multi-index predicate")
+    print(
+        f"  PASS: predicated_copy_2d ({actual_rows}x{actual_cols}), 2D multi-index predicate"
+    )
     return 0
 
 
