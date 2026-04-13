@@ -19,7 +19,7 @@
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
 
-namespace aiter
+namespace vllm
 {
 
   template <typename scalar_t, bool IS_NEOX>
@@ -155,7 +155,7 @@ namespace aiter
         token_idx, query_stride, key_stride);
   }
 
-} // namespace aiter
+} // namespace vllm
 
 void rotary_embedding(
     const aiter_tensor_t &positions, // [batch_size, seq_len] or [num_tokens]
@@ -184,14 +184,14 @@ void rotary_embedding(
     if (is_neox) {
       if (is_nope_first)
       {
-        aiter::rotary_embedding_kernel<scalar_t, true, true><<<grid, block, 0, stream>>>(
+        vllm::rotary_embedding_kernel<scalar_t, true, true><<<grid, block, 0, stream>>>(
             reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
             reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
-        aiter::rotary_embedding_kernel<scalar_t, true, false><<<grid, block, 0, stream>>>(
+        vllm::rotary_embedding_kernel<scalar_t, true, false><<<grid, block, 0, stream>>>(
             reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
             reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
@@ -199,14 +199,14 @@ void rotary_embedding(
     } else {
       if (is_nope_first)
       {
-        aiter::rotary_embedding_kernel<scalar_t, false, true><<<grid, block, 0, stream>>>(
+        vllm::rotary_embedding_kernel<scalar_t, false, true><<<grid, block, 0, stream>>>(
             reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
             reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
       }
       else
       {
-        aiter::rotary_embedding_kernel<scalar_t, false, false><<<grid, block, 0, stream>>>(
+        vllm::rotary_embedding_kernel<scalar_t, false, false><<<grid, block, 0, stream>>>(
             reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
             reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()), rot_dim,
             query_stride, key_stride, num_heads, num_kv_heads, head_size);
@@ -247,7 +247,7 @@ void batched_rotary_embedding(
     if (is_neox) {
       if (is_nope_first)
       {
-        aiter::batched_rotary_embedding_kernel<scalar_t, true, true>
+        vllm::batched_rotary_embedding_kernel<scalar_t, true, true>
             <<<grid, block, 0, stream>>>(
                 reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
                 reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
@@ -256,7 +256,7 @@ void batched_rotary_embedding(
       }
       else
       {
-        aiter::batched_rotary_embedding_kernel<scalar_t, true, false>
+        vllm::batched_rotary_embedding_kernel<scalar_t, true, false>
             <<<grid, block, 0, stream>>>(
                 reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
                 reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
@@ -266,7 +266,7 @@ void batched_rotary_embedding(
     } else {
       if (is_nope_first)
       {
-        aiter::batched_rotary_embedding_kernel<scalar_t, false, true>
+        vllm::batched_rotary_embedding_kernel<scalar_t, false, true>
             <<<grid, block, 0, stream>>>(
                 reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
                 reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),
@@ -275,7 +275,7 @@ void batched_rotary_embedding(
       }
       else
       {
-        aiter::batched_rotary_embedding_kernel<scalar_t, false, false>
+        vllm::batched_rotary_embedding_kernel<scalar_t, false, false>
             <<<grid, block, 0, stream>>>(
                 reinterpret_cast<int64_t*>(positions.data_ptr()), reinterpret_cast<scalar_t*>(query.data_ptr()),
                 reinterpret_cast<scalar_t*>(key.data_ptr()), reinterpret_cast<scalar_t*>(cos_cache.data_ptr()), reinterpret_cast<scalar_t*>(sin_cache.data_ptr()),

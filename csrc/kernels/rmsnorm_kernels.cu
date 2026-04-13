@@ -23,7 +23,7 @@
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
-namespace aiter
+namespace vllm
 {
 
   template <typename scalar_t>
@@ -548,7 +548,7 @@ namespace aiter
   //   }
   // }
 
-} // namespace aiter
+} // namespace vllm
 
 void rms_norm(const aiter_tensor_t &out,    // [..., hidden_size]
               const aiter_tensor_t &input,  // [..., hidden_size]
@@ -563,7 +563,7 @@ void rms_norm(const aiter_tensor_t &out,    // [..., hidden_size]
   HipDeviceGuard device_guard(input.device_id);
   const hipStream_t stream = aiter::getCurrentHIPStream();
   AITER_DISPATCH_FLOATING(input.dtype(), "rms_norm_kernel", [&]
-                               { aiter::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                               { vllm::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
                                      reinterpret_cast<scalar_t*>(out.data_ptr()), reinterpret_cast<scalar_t*>(input.data_ptr()),
                                      reinterpret_cast<scalar_t*>(weight.data_ptr()), epsilon, num_tokens, hidden_size); });
 }
@@ -590,7 +590,7 @@ void rms_norm(const aiter_tensor_t &out,    // [..., hidden_size]
 
 #define LAUNCH_FUSED_ADD_RMS_NORM(width)                                                                                             \
   AITER_DISPATCH_FLOATING(                                                                                                           \
-      input.dtype(), "fused_add_rms_norm_kernel", [&] { aiter::fused_add_rms_norm_kernel<scalar_t, width>                            \
+      input.dtype(), "fused_add_rms_norm_kernel", [&] { vllm::fused_add_rms_norm_kernel<scalar_t, width>                            \
                                                                   <<<grid, block, 0, stream>>>(reinterpret_cast<scalar_t*>(input.data_ptr()),           \
                                                                                                reinterpret_cast<scalar_t*>(residual.data_ptr()),        \
                                                                                                reinterpret_cast<scalar_t*>(weight.data_ptr()), epsilon, \
