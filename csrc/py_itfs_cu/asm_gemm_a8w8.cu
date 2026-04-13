@@ -238,21 +238,40 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
 
         if(cfg.splitK == 1 && selectedksplit > 0)
         {
-            int k_per_split         = (Kdim + ks - 1) / selectedksplit;
+            // Step 1: Validate or auto-correct splitK for TileK(128) alignment.
+            //   - Heuristic path: auto-correct to the nearest valid splitK.
+            //   - Explicit path (tuned config): reject misaligned splitK.
+            int k_per_split         = (Kdim + selectedksplit - 1) / selectedksplit;
             int k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
-
-            int actual_splitK = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
-            if(actual_splitK != selectedksplit)
+            int actual_splitK       = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
+            if(!opt_splitK.has_value())
             {
-                printf("warning: change splitK form %d to %d to make sure every block deals with "
-                       "128x k\n",
-                       selectedksplit,
-                       actual_splitK);
-                selectedksplit = actual_splitK;
+                if(actual_splitK != selectedksplit)
+                {
+                    AITER_LOG_WARNING("change splitK from " << selectedksplit << " to "
+                           << actual_splitK << " to make sure every block deals with 128x k");
+                    selectedksplit = actual_splitK;
+                }
+            }
+            else
+            {
+                AITER_CHECK(
+                    selectedksplit == actual_splitK,
+                    __func__,
+                    " Kdim alignment check failed for splitK! Kdim=", Kdim,
+                    ", selectedksplit=", selectedksplit,
+                    ", k_per_split_aligned=", k_per_split_aligned,
+                    ", actual_splitK=", actual_splitK);
             }
 
+            // Step 2: Sanity check — verify the final partition is valid.
             k_per_split         = (Kdim + selectedksplit - 1) / selectedksplit;
             k_per_split_aligned = ((k_per_split + 127) / 128) * 128;
+            AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
+                       (Kdim / k_per_split_aligned) == (selectedksplit - 1),
+                       __func__, " Kdim alignment check failed for splitK!");
+
+            // Step 3: Zero output buffer for atomic accumulation across splits.
             args.ks = selectedksplit;
             if(selectedksplit > 1)
             {

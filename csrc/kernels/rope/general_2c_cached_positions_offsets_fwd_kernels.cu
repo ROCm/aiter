@@ -73,9 +73,10 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     const int32_t max_position = cos.size(0);
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input_x));
-    DISPATCH_ROPE_TYPES_PARAMS(
+    DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(
         input_x.scalar_type(),
         cos.scalar_type(),
+        positions.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
@@ -87,7 +88,7 @@ void rope_cached_positions_offsets_2c_fwd_impl(
             input_y.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
             sin.data_ptr<scalar_t_1>(),
-            positions.data_ptr<int64_t>(),
+            positions.data_ptr<pos_t>(),
             offsets.data_ptr<int64_t>(),
             max_position,
             size_s, size_b, size_h_x, size_h_y, size_d,
