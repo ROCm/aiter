@@ -54,7 +54,9 @@ def ref_rmsnorm_quant(
     return q, scales
 
 
-def _scale_broadcast(scales: torch.Tensor, N: int, group_size: int | None) -> torch.Tensor:
+def _scale_broadcast(
+    scales: torch.Tensor, N: int, group_size: int | None
+) -> torch.Tensor:
     if group_size is None:
         return scales.unsqueeze(-1).expand(-1, N)
     return scales.repeat_interleave(group_size, dim=1)

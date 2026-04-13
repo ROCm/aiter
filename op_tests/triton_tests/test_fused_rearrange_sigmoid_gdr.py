@@ -144,10 +144,14 @@ def test_fused_rearrange_sigmoid_gdr_sweep(
     if use_qk_l2norm_in_kernel:
         torch.manual_seed(42)
         qkv = torch.randn(T, key_dim * 2 + value_dim, device=device, dtype=dtype) * 0.05
-        A_log = torch.randn(HV, device=device, dtype=torch.float32).clamp(-2.0, 0.5) * 0.02
+        A_log = (
+            torch.randn(HV, device=device, dtype=torch.float32).clamp(-2.0, 0.5) * 0.02
+        )
         a = (torch.randn(T, HV, device=device, dtype=dtype) * 0.05).clamp(-1.0, 1.0)
         a = a / gate_logit_normalizer
-        b_gate = (torch.randn(T, HV, device=device, dtype=dtype) * 0.05).clamp(-1.0, 1.0)
+        b_gate = (torch.randn(T, HV, device=device, dtype=dtype) * 0.05).clamp(
+            -1.0, 1.0
+        )
         dt_bias = (torch.randn(HV, device=device, dtype=dtype) * 0.005).clamp(-0.5, 0.5)
         initial = torch.randn(1, HV, V, K, device=device, dtype=dtype) * 0.05
     else:
