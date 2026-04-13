@@ -31,12 +31,13 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         std::optional<const at::Tensor> bias_,         // [sq, sk]
         std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
         std::optional<const at::Tensor> rng_state_,
-        std::optional<at::Generator> gen_)
+        std::optional<at::Generator> gen_,
+        std::optional<const at::Tensor> sink_,         // [b, hq] log-space sink scores (float)
+        std::optional<at::Tensor> d_sink_)             // [hq] sink gradient output (float)
 {
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::hip::getCurrentHIPStream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -132,36 +133,19 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias;
     bool has_dbias = dbias_.has_value();
     auto opts = q.options();
-    const fmha_bwd_traits traits{
-        seqlen_q,
-        seqlen_k,
-        batch_size,
-        seqlen_q, // max_seqlen_q
-        seqlen_k, // max_seqlen_k
-        head_size_q,
-        head_size_v,
-        num_heads,
-        num_heads_k,
-        q_dtype_str,
-        false, // is_group_mode
-        mask.type,
-        bias_type,
-        has_dbias,
-        p_dropout > 0,
-        false, // is_store_randval
-        deterministic,
-    };
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    auto stream = at::hip::getCurrentHIPStream();
 
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    const fmha_bwd_launcher launcher(traits);
-    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
-    at::Tensor dq_accum;
-    if (launcher.needs_zero_dq_acc)
-        dq_accum = torch::zeros({batch_size, num_heads, nsplits, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
-    else
-        dq_accum = torch::empty({batch_size, num_heads, nsplits, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
+    // nsplits: deterministic mode splits dK into ceil(seqlen_k/16) pieces for atomic-free accumulation.
+    constexpr ck_tile::index_t kN0 = 16;
+    const ck_tile::index_t nsplits = deterministic
+        ? ck_tile::integer_divide_ceil(seqlen_k, kN0)
+        : 1;
+    // Always zero dq_accum: the dq_dk_dv kernel writes via atomicAdd regardless of
+    // deterministic mode, so an uninitialized accumulator would corrupt dQ.
+    at::Tensor dq_accum = torch::zeros({batch_size, num_heads, nsplits, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -196,8 +180,11 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         std::lock_guard<std::mutex> lock(gen->mutex_);
         auto philox_args = gen->philox_cuda_state(counter_offset);
         hipLaunchKernelGGL(
-            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
+            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream,
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
+    } else {
+        // No dropout: allocate a dummy tensor so data_ptr() is always valid.
+        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     }
 
     if (seqlen_q > 0) {
@@ -299,6 +286,29 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                 nhead_stride_dbias = dbias.stride(2);
             }
 
+            void* sink_data_ptr   = nullptr;
+            void* d_sink_data_ptr = nullptr;
+            if (sink_.has_value() && sink_.value().defined()) {
+                const auto& sink = sink_.value();
+                CHECK_DEVICE(sink);
+                TORCH_CHECK(sink.dtype() == torch::kFloat32, "sink must be float32");
+                TORCH_CHECK(sink.is_contiguous(), "sink must be contiguous");
+                TORCH_CHECK(sink.dim() == 2 && sink.size(0) == batch_size && sink.size(1) == num_heads,
+                            "sink must have shape [batch_size, num_heads]");
+                sink_data_ptr = sink.data_ptr();
+            }
+            if (d_sink_.has_value() && d_sink_.value().defined()) {
+                TORCH_CHECK(sink_data_ptr != nullptr,
+                            "d_sink requires sink to also be provided");
+                const auto& d_sink = d_sink_.value();
+                CHECK_DEVICE(d_sink);
+                TORCH_CHECK(d_sink.dtype() == torch::kFloat32, "d_sink must be float32");
+                TORCH_CHECK(d_sink.is_contiguous(), "d_sink must be contiguous");
+                TORCH_CHECK(d_sink.dim() == 1 && d_sink.size(0) == num_heads,
+                            "d_sink must have shape [num_heads]");
+                d_sink_data_ptr = d_sink.data_ptr();
+            }
+
             return mha_bwd_args{false, // use_v3
                                 false, // is_v3_atomic_fp32
                                 false, // how_v3_bf16_cvt
@@ -329,6 +339,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 dv_expanded.data_ptr(),
                                 dbias_ptr,
                                 dq_accum.data_ptr(),
+                                sink_data_ptr,   // sink_ptr [b, hq]
+                                d_sink_data_ptr, // d_sink_ptr [hq]
                                 nullptr, // seqstart_q_ptr
                                 nullptr, // seqstart_k_ptr
                                 nullptr, // seqlen_q_ptr

@@ -13,6 +13,17 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
 from flydsl.expr import buffer_ops
+from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+
+def get_warp_size(arch=None):
+    """Return the wavefront/warp size for the given GPU architecture.
+
+    CDNA (gfx9xx) uses wave64, RDNA (gfx10xx/gfx11xx/gfx12xx) uses wave32.
+    """
+    if arch is None:
+        arch = get_rocm_arch()
+    return 32 if is_rdna_arch(arch) else 64
 
 
 def _create_llvm_ptr(value, address_space: int = 1):

@@ -374,24 +374,35 @@ class MhaKernelHandler(KernelHandler):
 
     def build_args(self) -> str:
         shape = self._shape
-        return (
-            f"-mode fwd -causal true --layout {self._mha_layout} --dtype bf16 -b {self._batch_size} "
+        # bshd (batch-seq-head-dim) - fwd
+        # thd (token-head-dim) - fwd_varlen with equal seq lens
+        fn = "fwd_varlen" if self._mha_layout == "thd" else "fwd"
+        args = (
+            f"-fn {fn} -causal true --dtype bf16 -b {self._batch_size} "
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
             f"-d {shape['dqk']} -dv {shape['dv']} -metric {self._metric}"
         )
+        if fn == "fwd_varlen":
+            args += " -equal_seqlens"
+        return args
 
     def parse_stdout(self, stdout: str) -> float:
+        # Expected output (4 lines):
+        #   [0] "[1/1] <model> B=... HQ=... ..."   (progress)
+        #   [1] "bench_mha:"
+        #   [2] "model  BATCH  HQ  HK  N_CTX_Q  N_CTX_K  D_HEAD  D_HEAD_V  ..."   (header)
+        #   [3] "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  ...  <value>"   (data)
         lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
-        if len(lines) < 3:
+        if len(lines) < 4:
             raise ValueError(
-                f"Unexpected MHA bench output: expected at least 3 lines, got {len(lines)}"
+                f"Unexpected MHA bench output: expected at least 4 lines, got {len(lines)}"
             )
-        if lines[0] != ["bench_mha:"]:
-            raise ValueError(f"Unexpected MHA bench output: first line {lines[0]!r}")
-        data = lines[2]
-        if len(data) < 7:
+        if lines[1] != ["bench_mha:"]:
+            raise ValueError(f"Unexpected MHA bench output: second line {lines[1]!r}")
+        data = lines[3]
+        if len(data) < 15:
             raise ValueError(f"Unexpected MHA bench data line: {data!r}")
-        return float(data[6])
+        return float(data[-1])
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -519,7 +530,7 @@ def call_function(
         else:
             print("Out of resources while benchmarking %s. %s" % (handler.to_str(), e))
 
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         print(
             "Unexpected error while benchmarking %s. %s: %s"
             % (
@@ -605,10 +616,12 @@ def run_benchmarks(
                 )
                 continue
 
+            # MLA only reports time (ms)
+            run_metric = "time" if kernel == "mla" else metric
+
             bench_fn = KERNEL_DICT[kernel]
             handler = _get_handler(kernel)
-            # MLA only reports time (ms); use "time" metric for it
-            run_metric = "time" if kernel == "mla" else metric
+
             handler.set_run(model, kernel, run_metric, gemm_layout, mha_layout, TP)
             tp_shapes = handler.get_tp_shapes(shapes)
             for shape in tp_shapes:
@@ -662,7 +675,9 @@ def parse_arg_list(
     return sorted(set(result))  # Remove duplicates and sort
 
 
-def parse_args(available_models: list[str]) -> argparse.Namespace:
+def parse_args(
+    available_models: list[str], available_kernels: list[str]
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Model benchmarking tool",
         allow_abbrev=False,
@@ -719,11 +734,23 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            "model name filter: case-insensitive regex matched against model name (default: all models). "
+            "Model name filter: case-insensitive regex matched against model names "
+            "(default: all models). "
             "e.g. 'llama3' to include only Llama3 family, "
             "'llama|qwen' to include both Llama and Qwen families, "
             "'^(?!.*deepseek)' to exclude DeepSeek family."
             f"\nAvailable models: {', '.join(available_models)}."
+        ),
+    )
+    parser.add_argument(
+        "--kernel",
+        default=None,
+        help=(
+            "Kernel name filter: case-insensitive regex matched against kernel names "
+            "(default: all kernels). "
+            "e.g. 'gemm' to include any kernel name containing gemm, "
+            "'moe|rmsnorm' for MoE and RMSNorm."
+            f"\nAvailable kernels: {', '.join(available_kernels)}."
         ),
     )
     parser.add_argument(
@@ -754,12 +781,57 @@ def parse_args(available_models: list[str]) -> argparse.Namespace:
     return args
 
 
+def filter_models_and_kernels(
+    data: ModelShapesData,
+    available_models: list[str],
+    model_pattern: str | None,
+    kernel_pattern: str | None,
+) -> ModelShapesData | None:
+
+    def _filter_by_regex(
+        pattern: str, pattern_name: str, candidates: list[str]
+    ) -> list[str]:
+        try:
+            pat = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            print(
+                f"Invalid {pattern_name} regex: {pattern!r} - running all {pattern_name}s."
+            )
+            return candidates
+        return [n for n in candidates if pat.search(n) is not None]
+
+    if model_pattern is not None:
+        matched_models = _filter_by_regex(model_pattern, "model", available_models)
+        data = {m: data[m] for m in matched_models}
+        if not data:
+            print("There are no models after filtering by model name.")
+            return None
+
+    if kernel_pattern is not None:
+        filtered: ModelShapesData = {}
+        for m, kernels in data.items():
+            matched_kernels = _filter_by_regex(
+                kernel_pattern, "kernel", sorted(list(kernels.keys()))
+            )
+            kept = {k: kernels[k] for k in matched_kernels}
+            if kept:
+                filtered[m] = kept
+        data = filtered
+        if not data:
+            print("There are no models/kernels after filtering by kernel name.")
+            return None
+
+    return data
+
+
 def main() -> None:
     data = read_json("model_shapes.json")
-    available_models = list(data.keys())
-    args = parse_args(available_models)
+    available_models = sorted(list(data.keys()))
+    available_kernels = sorted(list(KERNEL_DICT.keys()))
+    args = parse_args(available_models, available_kernels)
 
     models = args.model
+    kernels = args.kernel
     batch_sizes = args.batch_size
     seq_lens = args.seq_len
     TP = args.TP
@@ -768,15 +840,10 @@ def main() -> None:
     mha_layout = args.mha_layout
     output_file = args.output_file
 
-    if models is not None:
-        try:
-            pattern: re.Pattern[str] = re.compile(models, re.IGNORECASE)
-            data = {m: data[m] for m in available_models if pattern.search(m)}
-            if not data:
-                print("There are no models after filtering by model name.")
-                return
-        except re.error:
-            print(f"Invalid model filter regex: {models!r} - running all models.")
+    filtered_data = filter_models_and_kernels(data, available_models, models, kernels)
+    if filtered_data is None:
+        return
+    data = filtered_data
 
     results = run_benchmarks(
         data, batch_sizes, seq_lens, TP, gemm_layout, mha_layout, metric

@@ -4,70 +4,102 @@
 
 #define AITER_C_ITFS extern "C" __attribute__((visibility("default")))
 
-#include "aiter_logger.h"
 #include "aiter_enum.h"
-#include "aiter_tensor.h"
+#include "aiter_logger.h"
 #if !ENABLE_CK
 #include "ck_tile_shim.h"
 #else
 #include "ck_tile/core.hpp"
 #endif
 #include <cstdint>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
 
-enum class GPUArch
-{
-    gfx942,
-    gfx950
-};
-
-#define CHECK_COND(x)                                                                             \
-    do                                                                                            \
-    {                                                                                             \
-        if(!(x))                                                                                  \
-        {                                                                                         \
-            std::cerr << "check failed, file=" << __FILE__ << ", line=" << __LINE__ << std::endl; \
-            std::terminate();                                                                     \
-        }                                                                                         \
-    } while(0)
-
 namespace aiter_detail {
+
+inline thread_local bool g_aiter_can_throw = false;
+
 template <typename... Args>
-inline void check_print(std::ostream& os, Args&&... args)
+[[noreturn, noinline]] inline void aiter_check_fatal(const char* file, size_t line, Args&&... args)
 {
-    (os << ... << std::forward<Args>(args));
+    std::cerr << "[AITER] " << file << ":" << line << " ";
+    (std::cerr << ... << std::forward<Args>(args)) << std::endl;
+    std::abort();
+}
+
+template <typename... Args>
+[[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
+{
+    std::ostringstream oss;
+    oss << "[AITER] " << file << ":" << line << " ";
+    (oss << ... << std::forward<Args>(args));
+    std::string msg = oss.str();
+    std::cerr << msg << std::endl;
+    if(g_aiter_can_throw)
+    {
+        throw std::runtime_error(std::move(msg));
+    }
+    std::abort();
 }
 } // namespace aiter_detail
 
-#define AITER_CHECK(x, ...)                                                                        \
-    do                                                                                             \
-    {                                                                                              \
-        if(!(x))                                                                                   \
-        {                                                                                          \
-            std::cerr << "[AITER] " << __FILE__ << ":" << __LINE__ << " ";                         \
-            aiter_detail::check_print(std::cerr, __VA_ARGS__);                                     \
-            std::cerr << std::endl;                                                                \
-            std::terminate();                                                                      \
-        }                                                                                          \
+#define AITER_CHECK(x, ...)                                            \
+    do                                                                 \
+    {                                                                  \
+        if(!(x)) [[unlikely]]                                          \
+        {                                                              \
+            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__); \
+        }                                                              \
     } while(0)
 
-#define HIP_CALL(call)                                                       \
-    do                                                                       \
-    {                                                                        \
-        hipError_t err = call;                                               \
-        if(err != hipSuccess)                                                \
-        {                                                                    \
-            printf("\n[AITER] %s:%d fail to call %s ---> [HIP error](%s)\n", \
-                   __FILE__,                                                 \
-                   __LINE__,                                                 \
-                   #call,                                                    \
-                   hipGetErrorString(err));                                  \
-            exit(0);                                                         \
-        }                                                                    \
+// Fatal on any HIP error — use for init/teardown/resource management where
+// failure means unrecoverable state.
+#define HIP_CALL(call)                                                            \
+    do                                                                            \
+    {                                                                             \
+        hipError_t err = call;                                                    \
+        if(err != hipSuccess) [[unlikely]]                                        \
+        {                                                                         \
+            aiter_detail::aiter_check_fatal(__FILE__,                                 \
+                                        __LINE__,                                 \
+                                        "fail to call " #call " ---> [HIP error](", \
+                                        hipGetErrorString(err),                   \
+                                        ')');                                       \
+        }                                                                         \
+    } while(0)
+
+// Launch-specific HIP error handling.
+// - hipErrorInvalidValue is treated as recoverable because it commonly means
+//   a software configuration problem (for example invalid grid/block dims)
+//   that tuning code can catch and skip without leaving the GPU in a bad state.
+// - All other launch failures remain fatal because they may indicate runtime
+//   or hardware problems after which continuing is unsafe.
+#define HIP_CALL_LAUNCH(call)                                                     \
+    do                                                                            \
+    {                                                                             \
+        hipError_t err = call;                                                    \
+        if(err != hipSuccess) [[unlikely]]                                        \
+        {                                                                         \
+            if(err == hipErrorInvalidValue)                                        \
+            {                                                                     \
+                aiter_detail::check_fail(__FILE__, __LINE__,                       \
+                    "fail to call " #call " ---> [HIP error](",                    \
+                    hipGetErrorString(err), ')');                                   \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                aiter_detail::aiter_check_fatal(__FILE__, __LINE__,               \
+                    "fail to call " #call " ---> [HIP error](",                    \
+                    hipGetErrorString(err), ')');                                   \
+            }                                                                     \
+        }                                                                         \
     } while(0)
 
 struct p3
@@ -119,8 +151,8 @@ inline void load_asm_kernel(const char* name,
 #if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
         std::string fname = "hsa/" + arch_name + "/" + hsaco;
         auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
-        CHECK_COND(hasco_obj != AITER_EMBEDDED_HSA_MAP.end());
-        CHECK_COND(hasco_obj->second.data() != nullptr);
+        AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
+        AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
         AITER_LOG_INFO("hipModuleLoad: " << fname << " GetFunction: " << name);
         HIP_CALL(hipModuleLoadData(&module, hasco_obj->second.data()));
 #endif
@@ -137,7 +169,9 @@ class AiterAsmKernel
 
     public:
     AiterAsmKernel(const char* name, const char* hsaco)
-    { load_asm_kernel(name, hsaco, module, kernel_func); };
+    {
+        load_asm_kernel(name, hsaco, module, kernel_func);
+    };
 
     ~AiterAsmKernel() { HIP_CALL(hipModuleUnload(module)); }
 
@@ -149,7 +183,7 @@ class AiterAsmKernel
                           kargs.arg_size_ptr,
                           HIP_LAUNCH_PARAM_END};
 
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+        HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,
                                        kargs.gdy,
                                        kargs.gdz,
@@ -187,7 +221,7 @@ class AiterAsmKernelFast
                           kargs.arg_size_ptr,
                           HIP_LAUNCH_PARAM_END};
 
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+        HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,
                                        kargs.gdy,
                                        kargs.gdz,
@@ -240,6 +274,42 @@ static uint32_t get_num_cu_func()
     return num_cu;
 }
 
+static uint32_t get_warp_size_func()
+{
+    static const uint32_t warp_size = []() {
+        hipDevice_t dev;
+        hipDeviceProp_t dev_prop;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+        return static_cast<uint32_t>(dev_prop.warpSize);
+    }();
+    return warp_size;
+}
+
+struct WarpSizeValue
+{
+    __host__ __device__ constexpr operator int() const
+    {
+#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__GFX9__)
+        return 64;
+#else
+        return 32;
+#endif
+#else
+        if(__builtin_is_constant_evaluated())
+        {
+            return 64; // host pass fallback
+        }
+        return static_cast<int>(get_warp_size_func());
+#endif
+    }
+};
+
+// WARNING: Do not use WARP_SIZE as const/constexpr in host code;
+// it will take the host-pass fallback path and cause a compile error.
+inline constexpr WarpSizeValue WARP_SIZE{};
+
 static int get_pci_chip_id()
 {
     static const int chip_id = []() {
@@ -260,15 +330,18 @@ static bool is_mi308_device()
     return chip_id == 0x74a2 || chip_id == 0x74a8 || chip_id == 0x74b6 || chip_id == 0x74bc;
 }
 
-class HipDeviceGuard {
-public:
-    explicit HipDeviceGuard(int device_id) {
+class HipDeviceGuard
+{
+    public:
+    explicit HipDeviceGuard(int device_id)
+    {
         HIP_CALL(hipGetDevice(&prev_device_));
         HIP_CALL(hipSetDevice(device_id));
     }
     ~HipDeviceGuard() noexcept { HIP_CALL(hipSetDevice(prev_device_)); }
-    HipDeviceGuard(const HipDeviceGuard&) = delete;
+    HipDeviceGuard(const HipDeviceGuard&)            = delete;
     HipDeviceGuard& operator=(const HipDeviceGuard&) = delete;
-private:
+
+    private:
     int prev_device_{};
 };
