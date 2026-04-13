@@ -120,7 +120,7 @@ def qk_dot(
     SAGE_MXFP4: tl.constexpr = False,
 ):
     if SAGE_MXFP4:
-        return qk_scale * tl.dot_scaled(
+        return tl.dot_scaled(
             Q, q_descale, "e2m1", K, k_descale, "e2m1", fast_math=True
         )
     else:
@@ -374,7 +374,10 @@ def _tile_loop_mask(
 
         L = L * alpha + l_j
         M = m_j
-        acc += tl.dot(P.to(V.dtype), V)
+        if SAGE_MXFP4:
+            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     return acc, L, M
 
@@ -605,7 +608,10 @@ def _tile_loop_no_mask(
 
         L = L * alpha + l_j
         M = m_j
-        acc += tl.dot(P.to(V.dtype), V)
+        if SAGE_MXFP4:
+            acc += tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16))
+        else:
+            acc += tl.dot(P.to(V.dtype), V)
 
     return acc, L, M
 
@@ -692,7 +698,7 @@ def kernel_unified_attention_2d(
         _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
         qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
     else:
-        qk_scale = sm_scale * RCP_LN2
+        qk_scale = 1.0
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -1117,7 +1123,7 @@ def kernel_unified_attention_3d(
         _k_ds = tl.load(k_scale) if k_scale is not None else 1.0
         qk_scale = sm_scale * RCP_LN2 * _q_ds * _k_ds
     else:
-        qk_scale = sm_scale * RCP_LN2
+        qk_scale = 1.0
 
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
