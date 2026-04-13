@@ -84,16 +84,16 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True):
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    # tag = "asm"
-    # weight_asm = shuffle_weight(weight, layout=(16, 16))
-    # c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
+    tag = "asm"
+    weight_asm = shuffle_weight(weight, layout=(16, 16))
+    c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
 
-    # err_asm = checkAllclose(a, c, msg=f"{tag}")
-    # ret[f"{tag} us"] = avg_c
-    # ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
-    # ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
-    # ret[f"{tag} err"] = err_asm
-    # ret["asm/ck"] = avg_c / avg_b
+    err_asm = checkAllclose(a, c, msg=f"{tag}")
+    ret[f"{tag} us"] = avg_c
+    ret[f"{tag} TFLOPS"] = m * n * k * 2 / avg_c / 1e6
+    ret[f"{tag} TB/s"] = (x.nbytes + weight.nbytes) / avg_c / 1e6
+    ret[f"{tag} err"] = err_asm
+    ret["asm/ck"] = avg_c / avg_b
 
     return ret
 
@@ -119,7 +119,7 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest()
-def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
+def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     m, k = x.shape
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)

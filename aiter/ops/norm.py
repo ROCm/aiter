@@ -115,32 +115,3 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     bias: Tensor,
 #     epsilon: float,
 #     x_bias: Optional[Tensor] = None,):...
-@compile_ops("module_asm_layernorm", ffi_type="ctypes")
-def layernorm2d_with_add_asm(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    epsilon: float,
-    x_bias: Optional[Tensor] = None,
-) -> None: ...
-
-
-@compile_ops(
-    "module_asm_layernorm",
-    ffi_type="ctypes",
-)
-def layernorm2d_with_add_smoothquant_asm(
-    out: Tensor,
-    input: Tensor,
-    residual_in: Tensor,
-    residual_out: Tensor,
-    xscale: Tensor,
-    yscale: Tensor,
-    weight: Tensor,
-    bias: Tensor,
-    epsilon: float,
-    x_bias: Optional[Tensor] = None,
-) -> None: ...
