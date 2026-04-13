@@ -40,10 +40,14 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_kernel_params,
 )
 
-DEFAULT_CSV = os.path.join(
-    os.path.dirname(__file__),
-    "../configs/model_configs/dsv3_fp4_tuned_fmoe.csv",
+_CONFIGS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "../../configs/model_configs"
 )
+
+DEFAULT_CSVS = [
+    os.path.join(_CONFIGS_DIR, "dsv3_fp4_tuned_fmoe.csv"),
+    os.path.join(_CONFIGS_DIR, "kimik2_fp4_tuned_fmoe.csv"),
+]
 
 
 def parse_csv(csv_path: str):
@@ -412,13 +416,12 @@ def compile_one_config(
     mode: str = "atomic",
     persist: bool = False,
     sort_block_m: int = 0,
-    run_kernel: bool = False,
     **kwargs,
 ) -> dict:
-    """Compile one MoE kernel configuration.
+    """Compile one MoE kernel configuration and save to cache.
 
-    When run_kernel=True, also launches the kernel with random data to verify
-    that the compiled binary actually runs on the GPU.
+    Uses COMPILE_ONLY=1 to trigger MLIR compilation and pkl cache write
+    without executing the kernel on GPU.
 
     Returns a dict with timing info.
     """
@@ -430,87 +433,42 @@ def compile_one_config(
     result = {"kernel_name": kernel_name, "shape": shape_str, "compile_time": None}
 
     t0 = time.time()
+    prev_compile_only = os.environ.get("COMPILE_ONLY")
+    os.environ["COMPILE_ONLY"] = "1"
     try:
-        if stage == 1:
-            _fuse_fq = fuse_fp4_quant
-            compile_flydsl_moe_stage1(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=experts,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage1=doweight_stage1,
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=out_dtype,
-                waves_per_eu=waves_per_eu,
-                k_batch=k_batch,
-                b_nt=b_nt,
-                gate_only=gate_only,
-                fuse_fp4_quant=_fuse_fq,
-                fuse_sort_scale=_fuse_fq,
-            )
-        elif stage == 2:
-            accumulate = mode != "reduce"
-            persist_m = -1 if persist else 4
-
-            compile_flydsl_moe_stage2(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=experts,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage2=False,
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=out_dtype,
-                accumulate=accumulate,
-                persist_m=persist_m,
-                sort_block_m=sort_block_m,
-            )
-        else:
-            raise ValueError(f"Unknown stage: {stage}")
+        _run_kernel(
+            stage=stage,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            doweight_stage1=doweight_stage1,
+            waves_per_eu=waves_per_eu,
+            k_batch=k_batch,
+            b_nt=b_nt,
+            gate_only=gate_only,
+            fuse_fp4_quant=fuse_fp4_quant,
+            mode=mode,
+            persist=persist,
+            sort_block_m=sort_block_m,
+        )
 
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}")
-
-        if run_kernel:
-            try:
-                t1 = time.time()
-                _run_kernel(
-                    stage=stage,
-                    model_dim=model_dim,
-                    inter_dim=inter_dim,
-                    experts=experts,
-                    topk=topk,
-                    tile_m=tile_m,
-                    tile_n=tile_n,
-                    tile_k=tile_k,
-                    a_dtype=a_dtype,
-                    b_dtype=b_dtype,
-                    out_dtype=out_dtype,
-                    doweight_stage1=doweight_stage1,
-                    waves_per_eu=waves_per_eu,
-                    k_batch=k_batch,
-                    b_nt=b_nt,
-                    gate_only=gate_only,
-                    fuse_fp4_quant=fuse_fp4_quant,
-                    mode=mode,
-                    persist=persist,
-                    sort_block_m=sort_block_m,
-                )
-                run_elapsed = time.time() - t1
-                print(f"    run_kernel OK  {run_elapsed:.1f}s")
-            except Exception as e:
-                result["compile_time"] = None
-                print(f"    run_kernel [FAIL]: {e}")
     except Exception as e:
         print(f"  [FAIL] compile  {shape_str}: {e}")
+    finally:
+        if prev_compile_only is None:
+            os.environ.pop("COMPILE_ONLY", None)
+        else:
+            os.environ["COMPILE_ONLY"] = prev_compile_only
 
     return result
 
@@ -558,13 +516,9 @@ def main():
     parser.add_argument(
         "--csv",
         type=str,
-        default=DEFAULT_CSV,
-        help="Path to the tuned CSV config file",
-    )
-    parser.add_argument(
-        "--run_kernel",
-        action="store_true",
-        help="After compilation, launch each kernel with random data to verify it runs",
+        nargs="+",
+        default=DEFAULT_CSVS,
+        help="Path(s) to tuned CSV config file(s)",
     )
     parser.add_argument(
         "--test_bad_tile",
@@ -573,15 +527,18 @@ def main():
     )
     args = parser.parse_args()
 
-    csv_path = os.path.abspath(args.csv)
-    if not os.path.isfile(csv_path):
-        print(f"Error: CSV file not found: {csv_path}")
-        sys.exit(1)
+    csv_paths = [os.path.abspath(p) for p in args.csv]
+    for csv_path in csv_paths:
+        if not os.path.isfile(csv_path):
+            print(f"Error: CSV file not found: {csv_path}")
+            sys.exit(1)
 
     cache_dir = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     arch = os.environ.get("ARCH", "(auto-detect)")
 
-    all_jobs = parse_csv(csv_path)
+    all_jobs = []
+    for csv_path in csv_paths:
+        all_jobs.extend(parse_csv(csv_path))
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
@@ -589,13 +546,13 @@ def main():
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
-    print(f"  CSV:          {csv_path}")
+    for csv_path in csv_paths:
+        print(f"  CSV:          {csv_path}")
     print(f"  Stage1 jobs:  {len(stage1_jobs)}")
     print(f"  Stage2 jobs:  {len(stage2_jobs)}")
     print(f"  Total jobs:   {len(all_jobs)}")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
-    print(f"  run_kernel:   {args.run_kernel}")
     print("=" * 72)
 
     total_t0 = time.time()
@@ -605,14 +562,14 @@ def main():
         print(f"\n--- Stage 1 ({len(stage1_jobs)} kernels) ---")
         for i, job in enumerate(stage1_jobs, 1):
             print(f"\n[{i}/{len(stage1_jobs)}] ", end="")
-            r = compile_one_config(**job, run_kernel=args.run_kernel)
+            r = compile_one_config(**job)
             results.append(r)
 
     if stage2_jobs:
         print(f"\n--- Stage 2 ({len(stage2_jobs)} kernels) ---")
         for i, job in enumerate(stage2_jobs, 1):
             print(f"\n[{i}/{len(stage2_jobs)}] ", end="")
-            r = compile_one_config(**job, run_kernel=args.run_kernel)
+            r = compile_one_config(**job)
             results.append(r)
 
     total_elapsed = time.time() - total_t0

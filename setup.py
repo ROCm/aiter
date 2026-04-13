@@ -290,6 +290,34 @@ if PREBUILD_KERNELS != 0:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
+        # --- FlyDSL MoE AOT pre-compilation ---
+        try:
+            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+            os.makedirs(flydsl_cache_dir, exist_ok=True)
+            os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = flydsl_cache_dir
+
+            from aiter.aot.flydsl.moe import (
+                DEFAULT_CSVS,
+                compile_one_config,
+                parse_csv,
+            )
+
+            moe_jobs = []
+            for csv_path in DEFAULT_CSVS:
+                if os.path.isfile(csv_path):
+                    moe_jobs.extend(parse_csv(csv_path))
+                else:
+                    print(f"[aiter] FlyDSL MoE AOT: CSV not found: {csv_path}")
+            if moe_jobs:
+                print(
+                    f"[aiter] FlyDSL MoE AOT: {len(moe_jobs)} kernels to compile "
+                    f"(cache: {flydsl_cache_dir})"
+                )
+                for job in moe_jobs:
+                    compile_one_config(**job)
+        except Exception as e:
+            print(f"[aiter] FlyDSL MoE AOT skipped: {e}")
+
 
 class NinjaBuildExtension(build_ext):
     """Custom build_ext that defers expensive operations until run() is called."""
