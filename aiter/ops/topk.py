@@ -58,7 +58,20 @@ def gen_moe_fused_gate_fake_tensor(
     return [output, indices]
 
 
-@compile_ops("module_moe_asm", develop=True, gen_fake=gen_moe_fused_gate_fake_tensor)
+@compile_ops("module_moe_asm", develop=True, fc_name="moe_fused_gate")
+def _moe_fused_gate(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
+
+
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -69,7 +82,19 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]: ...
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _moe_fused_gate(
+        input,
+        bias,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        topk,
+        n_share_experts_fusion,
+        routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk(

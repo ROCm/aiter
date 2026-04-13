@@ -742,13 +742,13 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
     const int64_t token_idx = blockIdx.x;
     for(int64_t idx = threadIdx.x; idx < d; idx += blockDim.x)
     {
-        scalar_t x = 0.0;
+        float x = 0.0f;
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            x += *(&input[token_idx * TOPK * d + k * d + idx]);
+            x += static_cast<float>(*(&input[token_idx * TOPK * d + k * d + idx]));
         }
-        out[token_idx * d + idx] = x;
+        out[token_idx * d + idx] = static_cast<scalar_t>(x);
     }
 }
 
@@ -794,7 +794,7 @@ void topk_softmax(const aiter_tensor_t& topk_weights,         // [num_tokens, to
 
     // Process routing experts with softmax + topk, and shared experts with sigmoid in one kernel
     AITER_DISPATCH_FLOATING(gating_output.dtype(), "topk_softmax", [&] {
-        using input_dtype = typename t2opus<scalar_t>::type;
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;
         vllm::moe::topkGatingSoftmaxKernelLauncher(
             reinterpret_cast<input_dtype*>(gating_output.data_ptr()),
             reinterpret_cast<float*>(topk_weights.data_ptr()),

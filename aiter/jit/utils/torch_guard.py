@@ -70,6 +70,7 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "_moe_fused_gate",
     "init_custom_qr",
     "qr_handle_nbytes",
     "qr_max_size",

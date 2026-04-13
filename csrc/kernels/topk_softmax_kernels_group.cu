@@ -356,7 +356,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
     // float *topk_values_f = reinterpret_cast<float *>(ptr);
 
     f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
-    using cktype_i                = typename t2opus<DTYPE_I>::type;
+    using cktype_i                = typename aiter::hip2opus<DTYPE_I>::type;
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
@@ -576,7 +576,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
             // max_idx = result_kvp.key;
             if constexpr(isBiased)
             {
-                max_val -= correction_bias[max_idx];
+                max_val -= static_cast<float>(correction_bias[max_idx]);
                 // max_val -= bias[max_idx];
             }
             scores[max_idx] = -INFINITY;
@@ -669,7 +669,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     // float *topk_values_f = reinterpret_cast<float *>(ptr);
 
     f32vec* scores_vec            = reinterpret_cast<f32vec*>(scores);
-    using cktype_i                = typename t2opus<DTYPE_I>::type;
+    using cktype_i                = typename aiter::hip2opus<DTYPE_I>::type;
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
