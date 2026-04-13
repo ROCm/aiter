@@ -55,7 +55,7 @@ def select_2d_config(
     # TILE_SIZE >= 32 is required: TILE_SIZE=16 causes Triton compiler
     # crashes for FP8/MXFP4 on gfx950 (unsupported 16x16 FP8 MFMA) and
     # correctness failures for BF16 with BLOCK_M=16.
-    TILE_SIZE = 32 if arch.is_rdna else 64
+    TILE_SIZE = 16
     # TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
     waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
 
@@ -76,7 +76,7 @@ def select_2d_config(
 
     # base prefill, for short cases
     if not all_decode:
-        num_stages_2d, num_warps = 1, 2
+        num_stages_2d, num_warps = 3, 8
     # pure decode config
     else:
         # to not have masking when loading KV
@@ -84,14 +84,14 @@ def select_2d_config(
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
-            num_stages_2d, num_warps = 3, 2
+            num_stages_2d, num_warps = 3, 8
 
     # large prefill config
     if max_seqlen_q >= 256:
         BLOCK_M = 64 if arch.is_rdna else 128
         if is_quantized and not arch.is_rdna:
             TILE_SIZE = 128
-        num_stages_2d, num_warps = 1, 4
+        num_stages_2d, num_warps = 3, 8
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
@@ -109,7 +109,7 @@ def select_2d_config(
 def select_3d_config(
     head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
 ):
-    reduce_num_warps = 2
+    reduce_num_warps = 4
     attn_warps = 2
     TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
