@@ -208,12 +208,12 @@ class FMoeKernel
 
         if constexpr(switchGxy)
         {
-            HIP_CALL(hipModuleLaunchKernel(
+            HIP_CALL_LAUNCH(hipModuleLaunchKernel(
                 kernel_func, gdy, gdx, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
         }
         else
         {
-            HIP_CALL(hipModuleLaunchKernel(
+            HIP_CALL_LAUNCH(hipModuleLaunchKernel(
                 kernel_func, gdx, gdy, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
         }
     };

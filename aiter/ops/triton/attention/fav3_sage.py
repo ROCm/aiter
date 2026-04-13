@@ -24,7 +24,7 @@ def get_sage_fwd_configs():
             "BLOCK_N": 128,
             "waves_per_eu": 2,
             "PRE_LOAD_V": False,
-            "num_stages": 4,
+            "num_stages": 5,
             "num_warps": 8,
         }
     elif arch == "gfx942":
@@ -76,6 +76,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
         return_lse: bool = True,
         layout: str = "bshd",
         config: Optional[dict] = None,
+        block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ):
         # 1. Dimension Mapping & Config Setup
         bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
@@ -86,6 +87,21 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             config = get_sage_fwd_configs()
 
         BLKQ, BLKK = config["BLOCK_M"], config["BLOCK_N"]
+        num_q_blocks = (seqlen_q + BLKQ - 1) // BLKQ
+        num_k_blocks = (seqlen_k + BLKK - 1) // BLKK
+
+        if block_lut is not None:
+            kv_block_indices, lut_start, lut_count = block_lut
+            use_block_sparse = True
+            if causal or window_size != (-1, -1):
+                raise NotImplementedError(
+                    "The Triton block-sparse attention path selected by block_lut "
+                    "does not support causal or sliding-window masking; "
+                    "require causal=False and window_size=(-1, -1)."
+                )
+        else:
+            kv_block_indices = lut_start = lut_count = None
+            use_block_sparse = False
 
         # 2. Validation: Early Exit for unsupported features
         if attention_chunk not in (0, 1):
@@ -149,21 +165,14 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             return_lse,
             layout,
             config,
+            kv_block_indices=kv_block_indices,
+            lut_start=lut_start,
+            lut_count=lut_count,
+            use_block_sparse=use_block_sparse,
         )
 
-        # 6. Context Saving for Backward
         if return_lse:
-            ctx.save_for_backward(
-                q_int8, k_int8, v_fp8, out, softmax_lse, q_descale, k_descale
-            )
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.deterministic = deterministic
-            ctx.sm_margin = sm_margin
-            ctx.input_dtype = q.dtype
-            ctx.layout = layout
+            return out, softmax_lse
 
         return out
 
@@ -183,6 +192,7 @@ class _FAv3SageWrapperFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # layout
             None,  # config
+            None,  # block_lut
         )
 
 
@@ -197,9 +207,10 @@ def fav3_sage_wrapper_func(
     softcap: float = 0.0,
     deterministic: bool = False,
     sm_margin: int = 0,
-    inference_mode: bool = True,
+    return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """
     SageAttention v1 high-precision entry point.
@@ -227,10 +238,13 @@ def fav3_sage_wrapper_func(
         pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
-        inference_mode: do not return softmax_lse
+        return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
+        block_lut: Optional ragged LUT for block-sparse attention,
+                (kv_block_indices, lut_start, lut_count) from block_attn_mask_to_ragged_lut.
+                When None, dense attention is used.
 
     Returns:
         out: Output tensor [batch, seqlen, num_q_heads, head_dim] or [batch, num_q_heads, seqlen, head_dim] (FP32)
@@ -262,8 +276,6 @@ def fav3_sage_wrapper_func(
             "sm_margin != 0 not supported in Sage Attention v1 API"
         )
 
-    return_lse = not inference_mode
-
     return _FAv3SageWrapperFunc.apply(
         q,
         k,
@@ -278,6 +290,7 @@ def fav3_sage_wrapper_func(
         return_lse,
         layout,
         config,
+        block_lut,
     )
 
 
@@ -297,6 +310,10 @@ def fav3_sage_func(
     return_lse: bool = False,
     layout: str = "bshd",
     config: Optional[dict] = None,
+    kv_block_indices: Optional[torch.Tensor] = None,
+    lut_start: Optional[torch.Tensor] = None,
+    lut_count: Optional[torch.Tensor] = None,
+    use_block_sparse: bool = False,
 ):
     """
     SageAttention v1.
@@ -316,7 +333,7 @@ def fav3_sage_func(
         pack_gqa: GQA packing flag (not yet supported)
         deterministic: Whether to use deterministic backward (not yet supported)
         sm_margin: SM margin parameter (not yet supported)
-        inference_model: do not return softmax_lse
+        return_lse: return softmax_lse if True, otherwise return None
         layout: bshd or bhsd layout for the inputs
         config: Optional kernel configuration dict with keys BLOCK_M, BLOCK_N,
                 waves_per_eu, PRE_LOAD_V, num_stages, num_warps
@@ -399,6 +416,23 @@ def fav3_sage_func(
     window_size_left, window_size_right = int(window_size[0]), int(window_size[1])
     use_sliding_window = window_size_left != -1 or window_size_right != -1
 
+    if use_block_sparse:
+        if kv_block_indices is None or lut_start is None or lut_count is None:
+            raise ValueError(
+                "kv_block_indices, lut_start, and lut_count must be provided "
+                "when use_block_sparse=True"
+            )
+        if causal:
+            raise NotImplementedError(
+                "The Triton block-sparse attention path selected by block_lut "
+                "does not support causal masking."
+                "require causal=False."
+            )
+    else:
+        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
+
     # --- 7. Kernel Launch ---
     def grid(META):
         return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
@@ -456,6 +490,10 @@ def fav3_sage_func(
         None,
         None,
         None,
+        kv_block_indices,
+        lut_start,
+        lut_count,
+        num_q_blocks,
         dropout_p=0.0,
         philox_seed=None,
         philox_offset_base=None,
@@ -479,6 +517,7 @@ def fav3_sage_func(
         USE_EXP2=True,
         RETURN_SCORES=False,
         USE_SEQUSED=False,
+        USE_BLOCK_SPARSE=use_block_sparse,
         **config,
     )
 

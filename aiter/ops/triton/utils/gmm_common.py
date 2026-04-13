@@ -343,7 +343,7 @@ def gen_gmm_tensors(
     rng_seed: int | None = RNG_SEED,
     unif_group_sizes: bool = False,
     use_bias: bool = False,
-) -> tuple[Tensor, Tensor, list[Tensor], Tensor]:
+) -> tuple[Tensor, Tensor, list[Tensor], Tensor, Tensor | None]:
     lhs, rhs, group_sizes_0 = gen_gmm_input(
         M,
         K,
@@ -563,7 +563,7 @@ def gen_tgmm_tensors(
     rng_seed: int | None = RNG_SEED,
     unif_group_sizes: bool = False,
     use_bias: bool = False,
-) -> tuple[Tensor, Tensor, list[Tensor], Tensor]:
+) -> tuple[Tensor, Tensor, list[Tensor], Tensor, Tensor | None]:
     lhs, rhs, group_sizes_0 = gen_tgmm_input(
         M,
         K,
