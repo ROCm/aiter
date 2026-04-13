@@ -12,6 +12,29 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
+last_dispatch_info = {}
+
+
+def predict_kernel_path(
+    num_seqs, num_q_heads, num_kv_heads, max_seqlen_q, max_seqlen_k,
+    total_q_tokens, sliding_window=None, force_kernel=None,
+):
+    """Predict the 2D/3D dispatch without running the kernel."""
+    if force_kernel is not None:
+        return force_kernel.upper()
+    num_queries_per_kv = num_q_heads // num_kv_heads
+    BLOCK_M = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    total_q_blocks = total_q_tokens // BLOCK_Q + num_seqs
+    num_2d_prgms = total_q_blocks * num_kv_heads
+    SLIDING_WINDOW = 1 + (sliding_window - 1 if sliding_window else -1)
+    target = get_num_sms() * 4
+    is_2d = use_2d_kernel(
+        0, SLIDING_WINDOW, max_seqlen_q == 1,
+        max_seqlen_q, max_seqlen_k, target, num_2d_prgms,
+    )
+    return "2D" if is_2d else "3D"
+
 
 def select_2d_config(
     block_size,
@@ -220,6 +243,7 @@ def unified_attention(
     kv_layout="cache",  # "cache" or "thd"
     cu_seqlens_k=None,  # required if kv_layout=="thd"
     rope_size=None, # if set, r part of the head dim is processed separately. Set to 0 if you want to disable the handling of the rope separately.
+    force_kernel=None, # None = auto dispatch, "2d" = force 2D kernel, "3d" = force 3D kernel
 ):
     """
     Compute unified multi-head attention with Triton kernels, supporting paged KV-cache and THD layouts,
@@ -412,7 +436,8 @@ def unified_attention(
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
     is_quantized = sage_mxfp4 or q_descale is not None
-    if use_2d_kernel(
+
+    _auto_2d = use_2d_kernel(
         head_size_qk,
         SLIDING_WINDOW,
         ALL_DECODE,
@@ -420,7 +445,19 @@ def unified_attention(
         max_seqlen_k,
         target_num_prgms,
         num_2d_prgms,
-    ):
+    )
+    if force_kernel is not None:
+        _dispatch_2d = force_kernel == "2d"
+    else:
+        _dispatch_2d = _auto_2d
+
+    last_dispatch_info["kernel"] = "2D" if _dispatch_2d else "3D"
+    last_dispatch_info["auto"] = "2D" if _auto_2d else "3D"
+    last_dispatch_info["num_2d_prgms"] = num_2d_prgms
+    last_dispatch_info["target_prgms"] = target_num_prgms
+    last_dispatch_info["forced"] = force_kernel is not None
+
+    if _dispatch_2d:
         config = select_2d_config(
             block_size,
             head_size_qk,

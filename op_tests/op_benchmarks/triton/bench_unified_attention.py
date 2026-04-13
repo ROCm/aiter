@@ -6,7 +6,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention
+from aiter.ops.triton.attention.unified_attention import unified_attention, predict_kernel_path
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -150,6 +150,27 @@ def create_benchmark_configs(custom, args):
     for i in range(len(x_vals_list)):
         x_vals_list[i] = (*x_vals_list[i], decode_p)
 
+    sliding_window_val = args.sliding_window if hasattr(args, 'sliding_window') else None
+    for i in range(len(x_vals_list)):
+        vals = x_vals_list[i]
+        has_model = "model" in x_names
+        batch = vals[1] if has_model else vals[0]
+        hq = vals[2] if has_model else vals[1]
+        hk_v = vals[3] if has_model else vals[2]
+        sq = vals[4] if has_model else vals[3]
+        sk_v = vals[5] if has_model else vals[4]
+        dp = vals[-1]
+        eff_sq = 1 if dp >= 1.0 else sq
+        total_q = int(batch * eff_sq)
+        kpath = predict_kernel_path(
+            int(batch), int(hq), int(hk_v), int(eff_sq), int(sk_v),
+            total_q, sliding_window=sliding_window_val,
+            force_kernel=args.force_kernel,
+        )
+        x_vals_list[i] = (*vals, kpath)
+
+    x_names.append("KERNEL")
+
     all_metrics = {
         "time": ("time(ms)", "ms"),
         "throughput": ("throughput(TFLOPS)", "TFLOPS"),
@@ -198,6 +219,7 @@ def run_benchmark(custom, args):
         D_HEAD,
         D_HEAD_V,
         DECODE_P,
+        KERNEL,
         dtype,
         causal,
         provider,
@@ -302,7 +324,7 @@ def run_benchmark(custom, args):
                 value_cache,
                 hadamard_rotation=True,
                 R=None,
-                BLOCK_R=args.BLOCK_R if args.BLOCK_R else D_HEAD,
+                BLOCK_R=args.BLOCK_R if args.BLOCK_R else (D_HEAD & -D_HEAD),
                 layout_k=args.kv_layout,
                 v_descale=None,
             )
@@ -328,6 +350,7 @@ def run_benchmark(custom, args):
             sage_mxfp4=args.sagev2,
             kv_layout=args.kv_layout,
             cu_seqlens_k=cu_key_lens,
+            force_kernel=args.force_kernel,
         )
 
         ms = triton.testing.do_bench(fn)
@@ -542,6 +565,13 @@ def parse_args():
     )
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
+    parser.add_argument(
+        "-force_kernel",
+        type=str,
+        choices=["2d", "3d"],
+        default=None,
+        help="Force kernel dispatch: '2d' or '3d'. Default: auto.",
+    )
 
     parser.add_argument(
         "-metric",
