@@ -36,8 +36,10 @@ def extract(isa_path: str, kernel_symbol: str, target: str) -> str:
             section_start = i
             break
     if section_start is None:
-        print(f"Error: kernel symbol '{kernel_symbol}' not found in {isa_path}",
-              file=sys.stderr)
+        print(
+            f"Error: kernel symbol '{kernel_symbol}' not found in {isa_path}",
+            file=sys.stderr,
+        )
         # List available symbols
         symbols = []
         for line in lines:
@@ -45,7 +47,7 @@ def extract(isa_path: str, kernel_symbol: str, target: str) -> str:
             if m:
                 symbols.append(m.group(1))
         if symbols:
-            print(f"Available symbols:", file=sys.stderr)
+            print("Available symbols:", file=sys.stderr)
             for s in symbols:
                 print(f"  {s}", file=sys.stderr)
         sys.exit(1)
@@ -56,7 +58,7 @@ def extract(isa_path: str, kernel_symbol: str, target: str) -> str:
 
     # Collect instructions
     instructions = []
-    for line in lines[section_start + 1:]:
+    for line in lines[section_start + 1 :]:
         stripped = line.strip()
         if not stripped or stripped.startswith("Disassembly"):
             break
@@ -101,9 +103,11 @@ def extract(isa_path: str, kernel_symbol: str, target: str) -> str:
     n_buf = sum(1 for _, i in instructions if "buffer_load" in i)
     n_lds = sum(1 for _, i in instructions if i.startswith("ds_"))
     n_branch = len(branch_targets)
-    print(f"Extracted {len(instructions)} instructions "
-          f"(MFMA={n_mfma}, buf_load={n_buf}, LDS={n_lds}, branches={n_branch})",
-          file=sys.stderr)
+    print(
+        f"Extracted {len(instructions)} instructions "
+        f"(MFMA={n_mfma}, buf_load={n_buf}, LDS={n_lds}, branches={n_branch})",
+        file=sys.stderr,
+    )
 
     return "\n".join(output)
 
@@ -121,12 +125,19 @@ def list_symbols(isa_path: str) -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract reassemblable .s from llvm-objdump output")
+        description="Extract reassemblable .s from llvm-objdump output"
+    )
     parser.add_argument("isa_file", help="llvm-objdump -d output file")
-    parser.add_argument("kernel_symbol", nargs="?",
-                        help="Kernel symbol name (omit to list available symbols)")
-    parser.add_argument("--target", default="amdgcn-amd-amdhsa--gfx942",
-                        help="AMDGCN target triple (default: amdgcn-amd-amdhsa--gfx942)")
+    parser.add_argument(
+        "kernel_symbol",
+        nargs="?",
+        help="Kernel symbol name (omit to list available symbols)",
+    )
+    parser.add_argument(
+        "--target",
+        default="amdgcn-amd-amdhsa--gfx942",
+        help="AMDGCN target triple (default: amdgcn-amd-amdhsa--gfx942)",
+    )
     parser.add_argument("-o", "--output", help="Output .s file (default: stdout)")
     args = parser.parse_args()
 
