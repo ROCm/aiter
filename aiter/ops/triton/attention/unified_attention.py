@@ -427,6 +427,11 @@ def unified_attention(
                 **attn_config,
             )
         else:
+            if shuffled_kv_cache:
+                assert (
+                    q_dtype == kv_cache_dtype
+                ), "q_dtype and kv_cache_dtype must be the same for shuffled KV cache for Triton UA3D kernel"
+
             kernel_unified_attention_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -474,6 +479,7 @@ def unified_attention(
                 num_seqs=num_seqs,
                 BLOCK_M=BLOCK_M,
                 ALL_DECODE=ALL_DECODE,
+                SHUFFLED_KV_CACHE=shuffled_kv_cache,
                 **attn_config,
             )
 
