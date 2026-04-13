@@ -33,23 +33,41 @@ void qr_destroy(fptr_t _fa) {
   }
 }
 
-AiterTensor qr_get_handle(fptr_t _fa) {
-  auto fa = reinterpret_cast<DeviceComms*>(_fa);
-  hipIpcMemHandle_t handle = fa->get_handle();
-  auto data_handle =
-      AiterTensor::empty({static_cast<int64_t>(sizeof(hipIpcMemHandle_t))}, AITER_DTYPE_u8, -1);
-  std::memcpy(data_handle.data_ptr(), &handle, sizeof(hipIpcMemHandle_t));
-  return data_handle;
+int64_t qr_handle_nbytes() {
+  return static_cast<int64_t>(sizeof(hipIpcMemHandle_t));
 }
 
-void qr_open_handles(fptr_t _fa,
-                     const std::vector<aiter_tensor_t>& handles) {
+void qr_get_handle(fptr_t _fa, int64_t out_ptr, int64_t out_nbytes) {
+  if (out_ptr == 0) {
+    throw std::invalid_argument("qr_get_handle: out_ptr must not be null");
+  }
+  if (out_nbytes < qr_handle_nbytes()) {
+    throw std::invalid_argument(
+        "qr_get_handle: output buffer is smaller than hipIpcMemHandle_t");
+  }
+
+  auto fa = reinterpret_cast<DeviceComms*>(_fa);
+  hipIpcMemHandle_t handle = fa->get_handle();
+  std::memcpy(reinterpret_cast<void*>(out_ptr), &handle, sizeof(hipIpcMemHandle_t));
+}
+
+void qr_open_handles(fptr_t _fa, const std::vector<int64_t>& handle_ptrs,
+                     int64_t handle_nbytes) {
+  if (handle_nbytes < qr_handle_nbytes()) {
+    throw std::invalid_argument(
+        "qr_open_handles: input buffer is smaller than hipIpcMemHandle_t");
+  }
+
   auto fa = reinterpret_cast<DeviceComms*>(_fa);
   std::vector<hipIpcMemHandle_t> ipc_handles;
-  ipc_handles.reserve(handles.size());
-  for (auto& handle : handles) {
+  ipc_handles.reserve(handle_ptrs.size());
+  for (auto handle_ptr : handle_ptrs) {
+    if (handle_ptr == 0) {
+      throw std::invalid_argument("qr_open_handles: handle_ptr must not be null");
+    }
     hipIpcMemHandle_t ipc_handle;
-    std::memcpy(&ipc_handle, handle.data_ptr(), sizeof(hipIpcMemHandle_t));
+    std::memcpy(&ipc_handle, reinterpret_cast<void*>(handle_ptr),
+                sizeof(hipIpcMemHandle_t));
     ipc_handles.push_back(ipc_handle);
   }
   fa->open_ipc_handles(ipc_handles);

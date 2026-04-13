@@ -3,6 +3,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "quick_all_reduce_base.h"
 #include <vector>
+#include <optional>
 #define caltime
 
 namespace aiter {

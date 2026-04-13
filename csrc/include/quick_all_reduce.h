@@ -14,8 +14,9 @@ namespace aiter {
 fptr_t
 init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size = std::nullopt);
 void qr_destroy(fptr_t _fa);
-AiterTensor qr_get_handle(fptr_t _fa);
-void qr_open_handles(fptr_t _fa, const std::vector<aiter_tensor_t>& handles);
+int64_t qr_handle_nbytes();
+void qr_get_handle(fptr_t _fa, int64_t out_ptr, int64_t out_nbytes);
+void qr_open_handles(fptr_t _fa, const std::vector<int64_t>& handle_ptrs, int64_t handle_nbytes);
 void qr_all_reduce(fptr_t _fa,
                    const aiter_tensor_t& inp,
                    const aiter_tensor_t& out,

@@ -1365,6 +1365,7 @@ namespace py = pybind11;
           py::arg("world_size"),                                                           \
           py::arg("qr_max_size") = std::nullopt);                                          \
     m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_handle_nbytes", &aiter::qr_handle_nbytes, "qr_handle_nbytes() -> int");      \
     m.def("qr_all_reduce",                                                                 \
           &aiter::qr_all_reduce,                                                           \
           "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \
@@ -1374,12 +1375,18 @@ namespace py = pybind11;
           py::arg("out"),                                                                  \
           py::arg("quant_level"),                                                          \
           py::arg("cast_bf2half") = false);                                                \
-    m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
+    m.def("qr_get_handle",                                                                  \
+          &aiter::qr_get_handle,                                                            \
+          "qr_get_handle(int fa, int out_ptr, int out_nbytes) -> ()",                      \
+          py::arg("fa"),                                                                    \
+          py::arg("out_ptr"),                                                               \
+          py::arg("out_nbytes"));                                                           \
     m.def("qr_open_handles",                                                               \
           &aiter::qr_open_handles,                                                         \
-          "qr_open_handles(int fa, Tensor[] handles)",                                     \
+          "qr_open_handles(int fa, int[] handle_ptrs, int handle_nbytes)",                 \
           py::arg("fa"),                                                                   \
-          py::arg("handles"));                                                             \
+          py::arg("handle_ptrs"),                                                          \
+          py::arg("handle_nbytes"));                                                       \
     m.def("qr_max_size", &aiter::qr_max_size);
 
 #define RMSNORM_PYBIND                                                                             \

@@ -71,10 +71,13 @@ NONE_WRAPPED_OP = [
     "compile_mha_fwd",
     "compile_mha_bwd",
     "init_custom_qr",
+    "qr_handle_nbytes",
     "qr_max_size",
     "qr_destroy",
     "qr_open_handles",
     "qr_get_handle",
+    "_qr_open_handles",
+    "_qr_get_handle",
     # These take pybind aiter_tensor_t, not torch.Tensor — incompatible with torch.compile
     "all_reduce",
     "reduce_scatter",
