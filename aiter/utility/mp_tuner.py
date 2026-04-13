@@ -306,9 +306,9 @@ def mp_tuner(
 
         # in_datas already has one entry per shape from the tuner;
         # just verify cardinality matches and use it directly.
-        assert len(task_group) == len(in_datas), (
-            f"shape_grouped: group count ({len(task_group)}) != in_datas count ({len(in_datas)})"
-        )
+        assert len(task_group) == len(
+            in_datas
+        ), f"shape_grouped: group count ({len(task_group)}) != in_datas count ({len(in_datas)})"
         ref_data_index = list(range(len(task_group)))
     else:
         task_group = tasks
