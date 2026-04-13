@@ -33,7 +33,7 @@ __global__ void finfo_kernel(float* out) {
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
-#include "opus/hip_minimal.hpp"
+#include "hip_host_minimal.h"
 #include <cstdio>
 
 namespace {

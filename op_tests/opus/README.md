@@ -15,9 +15,6 @@ op_tests/opus/
 │   ├── test_mfma_f32.cu         # MFMA fp32 kernels
 │   ├── test_mfma_f8.cu          # MFMA fp8/bf8 kernels
 │   ├── test_mxfp.cu             # MXFP8/MXFP4 kernels (gfx950 only)
-│   ├── test_wmma_f16.cu         # WMMA fp16/bf16 kernels (gfx1250 only)
-│   ├── test_wmma_f32.cu         # WMMA fp32 kernels (gfx1250 only)
-│   ├── test_wmma_f8.cu          # WMMA fp8/bf8 kernels (gfx1250 only)
 │   ├── test_wmma_scale.cu       # WMMA scaled f8f6f4/f4 kernels (gfx1250 only)
 │   ├── test_mma_step_k.cu       # tiled_mma_adaptor::step_k bf16 kernel
 │   ├── test_vector_add.cu       # Vector addition kernel
@@ -29,7 +26,7 @@ op_tests/opus/
 │   ├── test_finfo.cu            # opus::finfo kernel
 │   ├── test_mdiv.cu             # opus::magic_div kernel
 │   ├── test_workgroup_barrier.cu# Workgroup barrier kernel
-│   ├── setup.py                 # Parallel hipcc build: 18 .cu -> .o -> .so
+│   ├── setup.py                 # Parallel hipcc build: 17 .cu -> .o -> .so
 │   └── test_opus_device.py      # Python test runner (builds .so, runs all tests)
 ├── run_tests.sh                 # Runs host test + device tests
 └── README.md
@@ -64,7 +61,7 @@ The device test build applies several techniques from the OPUS best-practices gu
 | 2 | Parallel compilation (each .cu -> .o, then link) | 3,950 ms | ~9 s | 4.7x |
 | 3 | Split `test_mfma.cu` into 3 files (f16/f32/f8) | 2,670 ms | ~8 s | 6.9x |
 | 4 | Add `-D__HIPCC_RTC__` to reduce device-pass header parsing | 2,070 ms | ~7.5 s | 8.9x |
-| 5 | Replace `<hip/hip_runtime.h>` with `opus/hip_minimal.hpp` | **1,740 ms** | **~6.9 s** | **10.5x** |
+| 5 | Replace `<hip/hip_runtime.h>` with `hip_host_minimal.h` | **1,740 ms** | **~6.9 s** | **10.5x** |
 
 ### What each optimization does
 
@@ -86,7 +83,7 @@ The device test build applies several techniques from the OPUS best-practices gu
    needed for runtime compilation, reducing preprocessing load on both host and device
    passes. Saves ~500ms per file on header parsing.
 
-5. **`opus/hip_minimal.hpp`** — A ~70-line header (`csrc/include/opus/hip_minimal.hpp`) that
+5. **`hip_host_minimal.h`** — A ~70-line header (`csrc/include/hip_host_minimal.h`) that
    declares only the dozen HIP APIs the host launcher code actually uses (`dim3`,
    `hipLaunchKernelGGL`, `hipMalloc`, `hipDeviceSynchronize`, etc.), replacing
    `<hip/hip_runtime.h>` (~100K preprocessed lines) on the host pass. Combined with
@@ -98,47 +95,47 @@ The device test build applies several techniques from the OPUS best-practices gu
 Measured on MI355 (gfx950) with ROCm 7.1.1:
 
 ```
+real    0m4.1s      (wall clock)
+user    0m12.9s     (CPU time, summed across parallel hipcc jobs)
+sys     0m2.3s
+
 Phase                              Time
 ────────────────────────────────  ──────
-Host build (hipcc test_opus_basic)    738 ms
+Host build (hipcc test_opus_basic)  1,400 ms
 Host run (13 unit tests)               12 ms
-Device .so build (18 .cu, parallel)   625 ms
-  compile (18 parallel jobs)           599 ms
-  link (.o -> .so)                      25 ms
+Device .so build (16 .cu, parallel)   921 ms
+  compile (16 parallel jobs)           887 ms
+  link (.o -> .so)                      34 ms
 Device tests (torch import + GPU)   1,800 ms
   torch import + .so build              ~800 ms
   kernel execution (60+ tests)        ~1,000 ms
 ────────────────────────────────  ──────
-Total wall clock                    ~3.2 s
+Total wall clock                    ~4.1 s
 ```
 
-### Per-file device compile times (MI355 / gfx950, 18 parallel jobs)
+On MI308 (gfx942) with ROCm 6.3: compile 1,694ms, total ~6.6s.
+
+### Per-file device compile times (MI355 / gfx950, 16 parallel jobs)
 
 ```
-test_async_load.cu         119 ms
-test_finfo.cu              124 ms
-test_vector_add.cu         125 ms
-test_numeric_limits.cu     128 ms
-test_workgroup_barrier.cu  139 ms
-test_wmma_f16.cu           152 ms
-test_wmma_f32.cu           156 ms
-test_mdiv.cu               161 ms
-test_wmma_f8.cu            165 ms
+test_finfo.cu              128 ms
+test_async_load.cu         128 ms
+test_vector_add.cu         131 ms
+test_numeric_limits.cu     139 ms
+test_workgroup_barrier.cu  149 ms
+test_wmma_f16.cu           162 ms
+test_wmma_f32.cu           163 ms
+test_mdiv.cu               165 ms
 test_wmma_scale.cu         172 ms
-test_load_store_if.cu      187 ms
-test_mxfp.cu               214 ms
-test_dtype_convert.cu      282 ms
-test_mma_step_k.cu         421 ms
-test_tr_load_f16.cu        434 ms
-test_mfma_f32.cu           522 ms
-test_mfma_f8.cu            572 ms
-test_mfma_f16.cu           587 ms  <-- critical path
-link                        25 ms
+test_wmma_f8.cu            173 ms
+test_load_store_if.cu      224 ms
+test_mxfp.cu               226 ms
+test_dtype_convert.cu      287 ms
+test_mfma_f32.cu           763 ms
+test_mfma_f8.cu            852 ms
+test_mfma_f16.cu           875 ms  <-- critical path
+link                        34 ms
 ```
-
-Before opus.hpp compile-time optimizations, the MFMA-heavy files took 750-890ms each
-(930ms total parallel build). The optimizations reduced these by 1.3-2.1x, bringing
-the parallel build from 930ms to 625ms (33% faster).
 
 ## How to add a new device test
 
@@ -164,8 +161,8 @@ __global__ void my_kernel(const float* in, float* out, int n) {
 
 #else
 // ── Host pass: minimal HIP header for kernel launch API ──
-// #include <hip/hip_runtime.h>   // replaced by opus/hip_minimal.hpp for faster builds
-#include "opus/hip_minimal.hpp"
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
 
 __global__ void my_kernel(const float* in, float* out, int n);
 
@@ -246,7 +243,6 @@ In `device/test_opus_device.py`:
 | `test_dtype_convert` | fp32<->fp4 x4 pk | `cast<fp4_t>(fp32x4_t)` packed x4, e2m1 | gfx950 |
 | `test_dtype_convert` | fp32<->fp4 x8 pk | `cast<fp4_t>(fp32x8_t)` packed x8, e2m1 | gfx950 |
 | `test_load_store_if` | predicated_copy | `gmem::load_if`, `gmem::store_if`, free functions `opus::load_if`/`opus::store_if`, `layout_linear::operator+` | all |
-| `test_load_store_if` | predicated_copy_2d | 2D layout `load_if`/`store_if` with multi-index `(i_row, i_col)` predicate, `unfold_x_stride`, `unfold_p_coord` | all |
 | `test_load_store_if` | free_func_vector_add | Free functions `opus::load`/`opus::store`, `is_gmem_v`/`is_mem_v` type traits | all |
 | `test_load_store_if` | predicated_async_load | `gmem::async_load_if`, free function `opus::async_load_if`, `layout_linear::operator+` | all |
 | `test_numeric_limits` | all types | `opus::numeric_limits<T>` for fp32/fp16/bf16/fp8/bf8/i32/i16/i8/u8 | all |
@@ -262,7 +258,7 @@ In `device/test_opus_device.py`:
 | `test_mma_step_k` | 32x32x128 bf16 step_k | `make_tiled_mma`, `step_k` | gfx942 + gfx950 |
 | `test_workgroup_barrier` | cumulative + streamk | `opus::workgroup_barrier` cross-workgroup synchronization | all |
 
-Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 mma_step_k + 1 vector_add + 1 async_load + 1 tr_load + 11 dtype_convert + 4 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
+Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 mma_step_k + 1 vector_add + 1 async_load + 1 tr_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
 
 ## Notes
 

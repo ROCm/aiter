@@ -94,7 +94,7 @@ template __global__ void wmma_kernel_v2<opus::fp32_t, opus::fp32_t, 16, 16, 4>(
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "opus/hip_minimal.hpp"
+#include "hip_host_minimal.h"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \

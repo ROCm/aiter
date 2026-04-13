@@ -105,7 +105,7 @@ template __global__ void wmma_kernel_f8<opus::fp8_t, opus::fp8_t, opus::fp16_t, 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-#include "opus/hip_minimal.hpp"
+#include "hip_host_minimal.h"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \

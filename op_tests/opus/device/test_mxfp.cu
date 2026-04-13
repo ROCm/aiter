@@ -21,8 +21,8 @@
 
 #include "opus/opus.hpp"
 #ifndef __HIP_DEVICE_COMPILE__
-// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
-#include "opus/hip_minimal.hpp"
+// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
+#include "hip_host_minimal.h"
 #include <cstdio>
 #define HIP_CALL(call) do { \
     hipError_t err = (call); \

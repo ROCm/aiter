@@ -263,24 +263,3 @@ Using `ctypes.CDLL` to call `extern "C"` functions — or `hipModuleLaunchKernel
 | `--genco` (device-only compile) | Device | Eliminates host pass entirely |
 | `__HIP_DEVICE_COMPILE__` guard | Host | Skips heavy headers during host pass |
 | ctypes / `hipModuleLaunchKernel` | Host | Eliminates C++ binding compilation |
-
-## Device Intrinsic Wrappers
-
-`opus.hpp` provides device intrinsic wrappers so kernels only need `#include <opus/opus.hpp>` — no `<hip/hip_runtime.h>` required for device code:
-
-| HIP runtime | opus:: wrapper |
-|---|---|
-| `threadIdx.x` | `opus::thread_id_x()` |
-| `blockIdx.x` | `opus::block_id_x()` |
-| `blockDim.x` | `opus::block_size_x()` |
-| `gridDim.x * blockDim.x` | `opus::grid_size_x()` |
-| `__syncthreads()` | `opus::sync_threads()` |
-| `__all(pred)` | `opus::warp_all(pred)` |
-
-For host-side code (kernel launch, memory management), use `#include <opus/hip_minimal.hpp>` which provides `dim3`, `hipMalloc`, `hipLaunchKernelGGL`, etc.
-
-## Compile-Time Best Practices
-
-For a comprehensive guide on reducing compile time — including the recommended host/device separation pattern, template instantiation reduction, LLVM builtins, and profiling with `-ftime-trace` — see the [OPUS Kernel Best Practice skill](../../../.claude/skills/opus-kernel-best-practice/SKILL.md).
-
-Invoke it in Claude Code with `/opus-kernel-best-practice`.
