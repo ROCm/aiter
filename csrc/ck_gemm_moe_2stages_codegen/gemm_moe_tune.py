@@ -2213,10 +2213,14 @@ class FmoeTuner(TunerCommon):
                         )
                     )
                     w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                        fp4_utils.e8m0_shuffle(w1_scale)
+                        if w1_scale is not None
+                        else None
                     )
                     w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                        fp4_utils.e8m0_shuffle(w2_scale)
+                        if w2_scale is not None
+                        else None
                     )
                 elif (
                     q_type == QuantType.per_1x32
@@ -2231,17 +2235,25 @@ class FmoeTuner(TunerCommon):
                     w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
                     w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
                     w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                        fp4_utils.e8m0_shuffle(w1_scale)
+                        if w1_scale is not None
+                        else None
                     )
                     w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                        fp4_utils.e8m0_shuffle(w2_scale)
+                        if w2_scale is not None
+                        else None
                     )
                 else:
                     w1_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                        fp4_utils.e8m0_shuffle(w1_scale)
+                        if w1_scale is not None
+                        else None
                     )
                     w2_scale_fmoe = (
-                        fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                        fp4_utils.e8m0_shuffle(w2_scale)
+                        if w2_scale is not None
+                        else None
                     )
 
                 w1_qt_fmoe.is_shuffled = True

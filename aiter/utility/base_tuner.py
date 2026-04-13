@@ -590,7 +590,9 @@ class TunerCommon:
     def _get_benchmark_kernel_us(self, row, suffix=""):
         return getattr(row, f"benchmark_kernel_us{suffix}", None)
 
-    def _print_benchmark_results(self, label, results, report_file=None, shapes_df=None):
+    def _print_benchmark_results(
+        self, label, results, report_file=None, shapes_df=None
+    ):
         """Print benchmark results to stdout or append them to a report file."""
         if not results:
             self._emit_report_lines([f"{label}: no results"], report_file)
@@ -639,9 +641,7 @@ class TunerCommon:
                     f"{shape_str:<40} | {kernel_str:>10} | {e2e_str:>10} | {status_summary:>8}"
                 )
             else:
-                lines.append(
-                    f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}"
-                )
+                lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
             lines.append(
                 self._format_benchmark_keys(
                     {key: getattr(row, key, "") for key in self.keys}
@@ -877,7 +877,9 @@ class TunerCommon:
                 f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
             )
             lines.append(
-                self._format_benchmark_keys({key: getattr(row, key, "") for key in self.keys})
+                self._format_benchmark_keys(
+                    {key: getattr(row, key, "") for key in self.keys}
+                )
             )
             pre_summary, pre_detail = self._split_benchmark_status(row.pre_status)
             post_summary, post_detail = self._split_benchmark_status(row.post_status)
