@@ -73,7 +73,8 @@ def pertoken_quant(
 
 
 def per_1x32_f4_quant(
-    x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False, pack_dim=-1):
+    x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False, pack_dim=-1
+):
     """Quantize a tensor to MXFP4 (e2m1) format with per-1x32 block scaling.
 
     By default, packing is along the last dimension (dim=-1), which produces
