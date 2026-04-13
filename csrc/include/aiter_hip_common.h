@@ -391,3 +391,27 @@ class HipDeviceGuard
     private:
     int prev_device_{};
 };
+
+template <class Key, class T, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>>
+struct SynchronizedCache
+{
+    template <typename K, typename F>
+    inline T& get_or_create(K&& k, F&& factory)
+    {
+        std::lock_guard<std::mutex> map_mu_guard(map_mu);
+
+        struct Wrapper
+        {
+            F& f;
+            // Makes sure we only invoke lambda on insert
+            operator T() && { return f(); }
+        };
+
+        auto [it, _] = map.try_emplace(std::forward<K>(k), Wrapper{factory});
+        return it->second;
+    }
+
+    private:
+    std::mutex map_mu;
+    std::unordered_map<Key, T, Hash, KeyEqual> map;
+};
