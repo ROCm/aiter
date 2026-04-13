@@ -1,5 +1,7 @@
 """Preshuffle GEMM kernel using the @flyc.kernel API."""
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
@@ -118,10 +120,10 @@ def _get_preload(tile_m, tile_n, tile_k):
     )
 
 
+@functools.lru_cache(maxsize=1024)
 def compile_preshuffle_gemm_a8(
     *,
-    M: int = 0,
-    N: int = 0,
+    N: int,
     K: int,
     tile_m: int,
     tile_n: int,
@@ -140,8 +142,8 @@ def compile_preshuffle_gemm_a8(
     Returns a JitFunction that auto-compiles and executes when called.
     Signature:  launch_fn(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, M, N, stream)
 
-    Compile-time constants: K, tile_m/n/k, in_dtype, out_dtype (determine loop structure).
-    Runtime parameters: M, N (passed as i32 kernel args).
+    Compile-time constants: N, K, tile_m/n/k, in_dtype, out_dtype (determine loop structure).
+    Runtime parameters: M (passed as i32 kernel arg).
 
     Args:
         out_dtype: Output element type, "fp16" or "bf16" (default: "fp16").
@@ -176,6 +178,19 @@ def compile_preshuffle_gemm_a8(
     elem_bytes = 1 if (in_dtype in ("fp8", "int8", "int4", "fp4")) else 2
     a_elem_vec_pack = 2 if is_fp4 else 1
     b_elem_vec_pack = 2 if is_fp4 else 1
+
+    KERNEL_NAME = (
+        f"preshuffle_gemm_{in_dtype}_{out_dtype}"
+        f"_t{tile_m}x{tile_n}x{tile_k}"
+        f"_lds{lds_stage}"
+        f"_pl{dsrd_preload}x{dvmem_preload}"
+    )
+    if use_cshuffle_epilog:
+        KERNEL_NAME += "_csh"
+    if use_async_copy:
+        KERNEL_NAME += "_async"
+    if waves_per_eu is not None:
+        KERNEL_NAME += f"_wpe{waves_per_eu}"
 
     tile_k_bytes = int(tile_k) * int(elem_bytes)
 
@@ -1638,6 +1653,7 @@ def compile_preshuffle_gemm_a8(
         gx = (i32_m + (tile_m - 1)) // tile_m
         gy = i32_n // tile_n
 
+        kernel_gemm._func.__name__ = KERNEL_NAME
         launcher = kernel_gemm(
             arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, i32_n
         )
@@ -1660,8 +1676,7 @@ def compile_preshuffle_gemm_a8(
 
 def compile_preshuffle_gemm_w4(
     *,
-    M: int = 0,
-    N: int = 0,
+    N: int,
     K: int,
     tile_m: int,
     tile_n: int,
@@ -1684,7 +1699,6 @@ def compile_preshuffle_gemm_w4(
     if str(get_hip_arch()) != "gfx950":
         raise RuntimeError(f"FP4 GEMM requires gfx950, got {get_hip_arch()}")
     inner = compile_preshuffle_gemm_a8(
-        M=M,
         N=N,
         K=K,
         tile_m=tile_m,
