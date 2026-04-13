@@ -97,14 +97,46 @@ __global__ void predicated_async_load_kernel(const float* __restrict__ src,
     dst[gid] = smem_buf[tid];
 }
 
+// 2D predicated copy: layout shape = (ROWS, COLS), predicate receives multi-index (i_row, i_col)
+// Tests that _if methods pass multi-index to predicates, not flat index
+template<int BLOCK_SIZE, int ROWS, int COLS>
+__global__ void predicated_copy_2d_kernel(const float* __restrict__ src,
+                                           float* __restrict__ dst,
+                                           int actual_rows, int actual_cols, int stride)
+{
+    using namespace opus;
+    int tid = __builtin_amdgcn_workitem_id_x();
+    int wg  = __builtin_amdgcn_workgroup_id_x();
+    int base_row = wg * ROWS;
+
+    auto g_src = make_gmem(src);
+    auto g_dst = make_gmem(dst);
+
+    // 2D shape: (ROWS, COLS) with y_dim for both — issue space will be (ROWS, COLS)
+    constexpr auto shape = opus::make_tuple(number<ROWS>{}, number<COLS>{});
+    constexpr auto dim   = opus::make_tuple(opus::make_tuple(y_dim{}), opus::make_tuple(y_dim{}));
+    auto u = make_layout(shape,
+        unfold_x_stride(dim, shape, opus::tuple{stride, 1_I}),
+        unfold_p_coord(dim, opus::tuple{})) + (base_row * stride + tid * COLS);
+
+    // 2D predicate: receives (i_row, i_col) multi-index, checks row/col bounds
+    auto pred = [&](auto i_row, auto i_col) -> bool {
+        return (base_row + i_row.value) < actual_rows && (tid * COLS + i_col.value) < actual_cols;
+    };
+
+    auto data = load_if(g_src, pred, u);
+    store_if(g_dst, pred, data, u);
+}
+
 template __global__ void predicated_copy_kernel<256, 4>(const float*, float*, int);
 template __global__ void free_func_add_kernel<256, 4>(const float*, const float*, float*, int);
 template __global__ void predicated_async_load_kernel<256>(const float*, float*, int, int);
+template __global__ void predicated_copy_2d_kernel<256, 4, 4>(const float*, float*, int, int, int);
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "opus/hip_minimal.hpp"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \
@@ -128,6 +160,30 @@ template<int BLOCK_SIZE>
 __global__ void predicated_async_load_kernel(const float* __restrict__ src,
                                               float* __restrict__ dst,
                                               int n, int n_padded) {}
+
+template<int BLOCK_SIZE, int ROWS, int COLS>
+__global__ void predicated_copy_2d_kernel(const float* __restrict__ src,
+                                           float* __restrict__ dst,
+                                           int actual_rows, int actual_cols, int stride) {}
+
+extern "C" void run_predicated_copy_2d(const void* d_src, void* d_dst,
+                                        int actual_rows, int actual_cols,
+                                        int total_rows, int stride)
+{
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int ROWS = 4;
+    constexpr int COLS = 4;
+    int blocks = (total_rows + ROWS - 1) / ROWS;
+
+    hipLaunchKernelGGL(
+        (predicated_copy_2d_kernel<BLOCK_SIZE, ROWS, COLS>),
+        dim3(blocks), dim3(BLOCK_SIZE), 0, 0,
+        static_cast<const float*>(d_src),
+        static_cast<float*>(d_dst),
+        actual_rows, actual_cols, stride);
+    HIP_CALL(hipGetLastError());
+    HIP_CALL(hipDeviceSynchronize());
+}
 
 extern "C" void run_predicated_copy(const void* d_src, void* d_dst, int n)
 {
