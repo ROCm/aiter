@@ -106,9 +106,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
             else:
                 i_t = 0
             state_idx = tl.load(
-                ssm_state_indices
-                + i_n * stride_indices_seq
-                + i_t * stride_indices_tok
+                ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok
             ).to(tl.int64)
             if state_idx < 0:
                 return
@@ -148,9 +146,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
 
         if INPLACE_FINAL_STATE:
             final_state_idx = tl.load(
-                ssm_state_indices
-                + i_n * stride_indices_seq
-                + i_t * stride_indices_tok
+                ssm_state_indices + i_n * stride_indices_seq + i_t * stride_indices_tok
             ).to(tl.int64)
             if final_state_idx >= 0:
                 p_ht = ht + final_state_idx * stride_final_state_token
