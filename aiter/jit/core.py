@@ -791,6 +791,17 @@ def build_module(
         if not any("ENABLE_CK" in f for f in flags_extra_cc):
             flags_cc.append(f"-DENABLE_CK={enable_ck}")
 
+        enable_rope_positions_int32 = int(
+            os.environ.get("ENABLE_ROPE_POSITIONS_INT32", "0")
+        )
+        if not any("ENABLE_ROPE_POSITIONS_INT32" in f for f in flags_extra_cc):
+            flags_cc.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
+            flags_hip.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
