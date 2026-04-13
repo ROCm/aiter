@@ -19,6 +19,7 @@ Usage:
   /opt/rocm/llvm/bin/clang++ -x assembler -target amdgcn-amd-amdhsa \\
       -mcpu=gfx942 -o kernel_recompiled.co kernel.s
 """
+
 import re
 import sys
 import argparse
