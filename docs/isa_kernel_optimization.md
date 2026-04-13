@@ -2,6 +2,8 @@
 
 A guide to inspecting, analyzing, modifying, and recompiling AITER GPU kernel ISA using the ROCm LLVM toolchain.
 
+> **Code examples and Dockerfile:** See [`docs/examples/isa_optimization/`](examples/isa_optimization/) for runnable scripts and a Docker development environment.
+
 ## Overview
 
 AITER ships optimized GPU kernels as compiled code objects (`.co` files). Sometimes you need to go deeper than source-level optimization. This guide shows how to:
