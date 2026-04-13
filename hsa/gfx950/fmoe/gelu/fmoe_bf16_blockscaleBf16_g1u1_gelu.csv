@@ -1,3 +1,5 @@
 knl_name,co_name,atm,vskip,smf,tg_num_perCU,ps,subGU_m,subGU_n
 _ZN5aiter47fmoe_bf16_blockscaleBf16_g1u1_vs_ps_gelu_32x128E,fmoe_bf16_blockscaleBf16_g1u1_ps_gelu_32x128.co,0,1,0,2,1,32,128
 _ZN5aiter47fmoe_bf16_blockscaleBf16_g1u1_vs_ps_gelu_32x256E,fmoe_bf16_blockscaleBf16_g1u1_ps_gelu_32x256.co,0,1,0,1,1,32,256
+_ZN5aiter48fmoe_bf16_blockscaleBf16_g1u1_vs_pf2_gelu_16x128E,fmoe_bf16_blockscaleBf16_g1u1_vs_1tg_gelu_16x128.co,0,1,0,1,0,16,128
+_ZN5aiter48fmoe_bf16_blockscaleBf16_g1u1_vs_pf2_gelu_16x256E,fmoe_bf16_blockscaleBf16_g1u1_vs_1tg_gelu_16x256.co,0,1,0,1,0,16,256
