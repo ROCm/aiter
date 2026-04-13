@@ -13,6 +13,11 @@ on:
       - '.gitignore'
 
   workflow_dispatch:
+    inputs:
+      triton_commit:
+        description: 'Triton wheel commit to install for standard tests'
+        required: false
+        default: 'd1660454'
   schedule:
     - cron: '0 22 * * *'  # 6:00 AM Beijing Time (UTC+8)
 
@@ -26,6 +31,8 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   AITER_TEST: "op_tests"
+  TRITON_WHEEL_S3_PREFIX: "whl-staging/triton"
+  TRITON_WHEEL_COMMIT: ${{ github.event.inputs.triton_commit || 'd1660454' }}
 
 jobs:
   check-signal:
@@ -71,7 +78,6 @@ jobs:
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip install --upgrade "ninja>=1.11.1"
-          RUN pip install --upgrade "setuptools_scm<9"
           RUN pip install tabulate
           RUN pip list
 
@@ -84,16 +90,14 @@ jobs:
                 git submodule set-branch --branch develop 3rdparty/composable_kernel; \
                 git submodule sync && \
                 git submodule update --init --recursive --remote --jobs 4; \
-                echo "Nightly CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"; \
               else \
                 echo "Using pinned CK commit..."; \
                 git submodule sync && \
                 git submodule update --init --recursive --depth 1 --jobs 4; \
-                echo "Pinned CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"; \
               fi \
            && pip install -r requirements.txt \
-           && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: 128" \
-           && PREBUILD_KERNELS=1 MAX_JOBS=128 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
+           && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
+           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
            && pip install dist/*.whl \
            && echo "Prebuilding kernels completed"
 
@@ -173,7 +177,7 @@ jobs:
             rm -rf awscliv2.zip aws
           fi
 
-      - name: Upload wheels and latest main manifest to S3
+      - name: Upload wheels to S3
         if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         run: |
           for WHL in dist/*.whl; do
@@ -182,25 +186,6 @@ jobs:
             aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
           done
           echo "Wheels uploaded to S3 staging"
-
-          MANIFEST_WHL=$(ls -t dist/amd_aiter*.whl 2>/dev/null | head -1)
-          if [ -z "$MANIFEST_WHL" ]; then
-            echo "ERROR: No amd_aiter wheel found in dist/"
-            exit 1
-          fi
-
-          MANIFEST_WHL_NAME=$(basename "$MANIFEST_WHL")
-          MANIFEST_WHL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/${MANIFEST_WHL_NAME}"
-          MANIFEST_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-          python3 -c "import json, pathlib, sys; pathlib.Path('latest-main-wheel.json').write_text(json.dumps({'branch': sys.argv[1], 'timestamp': sys.argv[2], 'commit': sys.argv[3], 'wheel_name': sys.argv[4], 'wheel_url': sys.argv[5]}, indent=2) + '\n', encoding='utf-8')" \
-            "$GITHUB_REF_NAME" "$MANIFEST_TIMESTAMP" "$GITHUB_SHA" "$MANIFEST_WHL_NAME" "$MANIFEST_WHL_URL"
-
-          aws s3 cp latest-main-wheel.json \
-            s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/main/latest.json \
-            --content-type application/json
-
-          echo "Uploaded latest main wheel manifest for ${MANIFEST_WHL_NAME}"
 
   split_aiter_tests:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
@@ -226,29 +211,32 @@ jobs:
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_image, split_aiter_tests] 
+    needs: [build_aiter_image, split_aiter_tests]
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard_total: 5
             shard_idx: 0
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard_total: 5
             shard_idx: 1
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard_total: 5
             shard_idx: 2
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard_total: 5
             shard_idx: 3
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-mi355-1
+            label: MI355
             shard_total: 5
             shard_idx: 4
           - runner: aiter-1gpu-runner
@@ -297,6 +285,37 @@ jobs:
           echo "AITER_TEST=$(cat aiter_shard_${{ matrix.shard_idx }}.list)" >> $GITHUB_ENV
           echo "$AITER_TEST"
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
+
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &> /dev/null; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+            rm -rf awscliv2.zip aws
+          fi
+
+      - name: Download Triton wheel from S3
+        run: |
+          set -euo pipefail
+          S3_URI="s3://framework-whls-nightlies/${{ env.TRITON_WHEEL_S3_PREFIX }}/${{ env.TRITON_WHEEL_COMMIT }}/"
+          mkdir -p triton_wheels
+          aws s3 cp "${S3_URI}" triton_wheels/ --recursive
+          echo "Downloaded Triton wheel(s) from ${S3_URI}"
+          ls -lh triton_wheels
+          shopt -s nullglob
+          wheels=(triton_wheels/*.whl)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one Triton wheel in ${S3_URI}, found ${#wheels[@]}"
+            exit 1
+          fi
+          echo "TRITON_WHEEL_PATH=/workspace/${wheels[0]}" >> "$GITHUB_ENV"
+
       - name: Run the container
         run: |
           set -ex
@@ -337,30 +356,29 @@ jobs:
           aiter_test \
           bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
-      - name: Restore CK from prebuilt image
+      - name: Sync CK submodule
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           set -ex
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "Nightly build: restoring CK that was synced from develop in the prebuild image..."
+            echo "Nightly build: syncing latest CK from develop branch..."
+            git submodule set-branch --branch develop 3rdparty/composable_kernel
+            git submodule sync
+            git submodule update --init --recursive --remote --jobs 4
           else
-            echo "Restoring the pinned CK checkout from the prebuild image..."
+            echo "Using pinned CK commit..."
+            git submodule sync
+            git submodule update --init --recursive --depth 1 --jobs 4
           fi
 
-          rm -rf "${{ github.workspace }}/3rdparty/composable_kernel"
-          rm -rf "${{ github.workspace }}/.git/modules/3rdparty/composable_kernel"
-          mkdir -p "${{ github.workspace }}/3rdparty"
-          mkdir -p "${{ github.workspace }}/.git/modules/3rdparty"
-          docker cp aiter_test:/aiter/.git/modules/3rdparty/composable_kernel \
-            "${{ github.workspace }}/.git/modules/3rdparty/composable_kernel"
-          docker cp aiter_test:/aiter/3rdparty/composable_kernel \
-            "${{ github.workspace }}/3rdparty/composable_kernel"
-
-          IMAGE_CK_COMMIT=$(docker exec aiter_test git -C /aiter/3rdparty/composable_kernel rev-parse HEAD)
-          WORKSPACE_CK_COMMIT=$(git -C "${{ github.workspace }}/3rdparty/composable_kernel" rev-parse HEAD)
-          echo "Image CK commit: ${IMAGE_CK_COMMIT}"
-          echo "Workspace CK commit: ${WORKSPACE_CK_COMMIT}"
-          test "${IMAGE_CK_COMMIT}" = "${WORKSPACE_CK_COMMIT}"
+      - name: Install Triton wheel
+        run: |
+          set -euo pipefail
+          echo "Installing Triton wheel: ${TRITON_WHEEL_PATH}"
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "pip uninstall -y triton || true && pip install \"${TRITON_WHEEL_PATH}\" && pip show triton"
 
       - name: Show Aiter version
         run: |
@@ -429,7 +447,7 @@ jobs:
           echo "Checking Standard Test Results..."
           all_passed=true
           for shard in {0..4}; do
-            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
+            for runner in {linux-aiter-mi355-1,aiter-1gpu-runner}; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
@@ -452,8 +470,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
+          - runner: linux-aiter-mi355-8
+            label: MI355
           - runner: aiter-8gpu-runner
             label: MI325
     runs-on: ${{ matrix.runner }}
