@@ -5,7 +5,6 @@ from aiter import dtypes
 import argparse
 import pandas as pd
 import random
-from aiter.utility import fp4_utils
 
 # torch.set_printoptions(threshold=torch.inf)
 
@@ -656,9 +655,9 @@ def run_torch_fused_norm_rope_group_quant(
                     cur_scale = tile_data.abs().max() * k_inverted_DTYPE_MAX
                     exponent = _f32_to_e8m0_ceil(cur_scale)
                     e8m0_u32 = exponent << 23
-                    cur_scale_e8m0 = torch.tensor(
-                        e8m0_u32, dtype=torch.int32
-                    ).view(torch.float32)
+                    cur_scale_e8m0 = torch.tensor(e8m0_u32, dtype=torch.int32).view(
+                        torch.float32
+                    )
 
                     quantized_tile = (tile_data / cur_scale_e8m0).to(dtypes.fp8)
                     kv_cache[block_idx, block_off, kv_head, tile_start:tile_end] = (
@@ -709,10 +708,13 @@ def run_torch_fused_norm_rope_group_quant(
             x2 = q_pe_input_f32[..., half_dim:]
             cos_exp = cos_f32.unsqueeze(1).expand_as(x1)
             sin_exp = sin_f32.unsqueeze(1).expand_as(x1)
-            q_pe_f32 = torch.cat([
-                x1 * cos_exp - x2 * sin_exp,
-                x2 * cos_exp + x1 * sin_exp,
-            ], dim=-1)
+            q_pe_f32 = torch.cat(
+                [
+                    x1 * cos_exp - x2 * sin_exp,
+                    x2 * cos_exp + x1 * sin_exp,
+                ],
+                dim=-1,
+            )
         else:
             cos_exp = cos_f32.unsqueeze(1).expand(-1, q_pe_input_f32.shape[1], -1)
             sin_exp = sin_f32.unsqueeze(1).expand(-1, q_pe_input_f32.shape[1], -1)
@@ -731,7 +733,9 @@ def run_torch_fused_norm_rope_group_quant(
             # Find first mismatch location
             diff_mask = (q_pe_f32 - q_pe_bf16_f32).abs() > 0.5
             idx = diff_mask.nonzero()[0]
-            print(f"[DEBUG] First diff at {idx.tolist()}: f32={q_pe_f32[tuple(idx)].item():.6f}, bf16={q_pe_bf16_f32[tuple(idx)].item():.6f}, orig={q_pe_orig[tuple(idx)].item():.6f}")
+            print(
+                f"[DEBUG] First diff at {idx.tolist()}: f32={q_pe_f32[tuple(idx)].item():.6f}, bf16={q_pe_bf16_f32[tuple(idx)].item():.6f}, orig={q_pe_orig[tuple(idx)].item():.6f}"
+            )
 
         if is_nope_first:
             q_concat = torch.cat((q_nope.float(), q_pe_f32), dim=-1)
@@ -882,24 +886,26 @@ def test_fused_qk_norm_rope_group_quant_cache_mla(
     q_scale_out = torch.zeros(
         num_tokens, num_heads, num_groups, dtype=torch.uint8, device=device
     )
-    ref_kv_cache, ref_k_pe, ref_q_out, ref_q_pe, ref_q_scale = run_torch_fused_norm_rope_group_quant(
-        q_nope,
-        q_pe,
-        kv_c,
-        k_pe,
-        k_weight,
-        ref_temp,
-        q_out,
-        slot_mapping,
-        pos,
-        cos_cache,
-        sin_cache,
-        1e-6,
-        group_size,
-        is_neox,
-        is_nope_first,
-        q_out_dtype,
-        kv_cache_dtype,
+    ref_kv_cache, ref_k_pe, ref_q_out, ref_q_pe, ref_q_scale = (
+        run_torch_fused_norm_rope_group_quant(
+            q_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            k_weight,
+            ref_temp,
+            q_out,
+            slot_mapping,
+            pos,
+            cos_cache,
+            sin_cache,
+            1e-6,
+            group_size,
+            is_neox,
+            is_nope_first,
+            q_out_dtype,
+            kv_cache_dtype,
+        )
     )
     k_pe_out = torch.empty_like(k_pe)
     # Correctness run
@@ -1267,4 +1273,3 @@ if "fused_qk_norm_group_quant" in args.case:
         "fused_qk_norm_rope_group_quant_cache_mla summary (markdown):\n%s",
         df_md,
     )
-
