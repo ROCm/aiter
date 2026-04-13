@@ -521,9 +521,17 @@ class MLAProgram:
         return L, M, acc
 
     @gluon.jit
-    def load_physical_block_idx(self, j, block_tables_ptr_shifted):
-        physical_block_idx = gl.load(block_tables_ptr_shifted + j)
+    def load_physical_block_idx_with_mod(
+        self, j, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
+    ):
+        physical_block_idx = gl.load(
+            block_tables_ptr_shifted + j_hbm_start + (j % max_num_blocks_this_seg)
+        )
+        return j + 1, physical_block_idx
 
+    @gluon.jit
+    def load_physical_block_idx(self, j, block_tables_ptr_shifted, j_hbm_start):
+        physical_block_idx = gl.load(block_tables_ptr_shifted + j_hbm_start + j)
         return j + 1, physical_block_idx
 
     @gluon.jit
@@ -1076,19 +1084,25 @@ def _mla_decode_fwd_kernel(
 
     L, M, acc = pgm.allocate_accumulator()
 
-    j_hbm: gl.int32 = segm_idx * tiles_per_segment
+    j_hbm_start: gl.int32 = segm_idx * tiles_per_segment
+    max_num_blocks_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
+    j_hbm: gl.int32 = 0
     buffer_id: gl.int32 = 0
 
     j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-        j_hbm, block_tables_ptr_shifted
+        j_hbm, block_tables_ptr_shifted, j_hbm_start
+    )
+    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+        j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
     )
     row_offsets = pgm.get_kv_buffer_row_offsets(physical_block_idx)
     pgm.tdm_load_global_to_shared_kv_lora(row_offsets, 0)
     pgm.tdm_load_global_to_shared_k_rope(row_offsets, 0)
 
     for _ in range(pgm.tile_start, pgm.tile_end - 1):
-        j_hbm, physical_block_idx = pgm.load_physical_block_idx(
-            j_hbm, block_tables_ptr_shifted
+        physical_block_idx = next_physical_block_idx
+        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
         )
 
         S = gl.zeros([BLOCK_M, TILE_SIZE], dtype=tl.float32, layout=cfg.QK_WMMA_LAYOUT)
