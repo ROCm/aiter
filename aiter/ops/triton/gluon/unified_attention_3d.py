@@ -1456,6 +1456,8 @@ def _unified_attention_gluon_kernel_3d(
     )
     q_shared.store(Q_load)
     Q = q_shared.load(layout=cfg.Q_DOT_LAYOUT)
+    Q = Q.to(gl.float32) * qk_factor
+    Q = Q.to(query_ptr.type.element_ty)
 
     # define offsets and masks in QK WMMA_LAYOUT
     offs_q_m_qk = gl.arange(
@@ -1551,7 +1553,6 @@ def _unified_attention_gluon_kernel_3d(
         segm_idx,
         query_offset_1_qk,
         query_mask_1_qk,
-        # qk_factor,
     )
 
     j_hbm_start: gl.int32 = pgm.tile_start
@@ -1561,9 +1562,6 @@ def _unified_attention_gluon_kernel_3d(
     need_addtional_mask: gl.constexpr = (
         cfg.SLIDING_WINDOW > 0 or cfg.USE_ALIBI_SLOPES or cfg.USE_QQ_BIAS
     )
-    # seq_offset = j_hbm_start * cfg.TILE_SIZE + gl.arange(
-    #     0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
-    # )
     if need_addtional_mask:
         seq_offset = j_hbm_start * cfg.TILE_SIZE + gl.arange(
             0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, cfg.QK_WMMA_LAYOUT)
@@ -1594,7 +1592,6 @@ def _unified_attention_gluon_kernel_3d(
 
         # Compute attention for current tile
         S = pgm.compute_qk(k)
-        S = S * qk_factor
 
         S = pgm.apply_softcap(S)
         if need_addtional_mask:
@@ -1610,7 +1607,6 @@ def _unified_attention_gluon_kernel_3d(
         acc = pgm.compute_pv(p, v, acc)
 
         buffer_id = next_buffer_id
-        # seq_offset += cfg.TILE_SIZE
         if need_addtional_mask:
             seq_offset += cfg.TILE_SIZE
 
@@ -1623,7 +1619,6 @@ def _unified_attention_gluon_kernel_3d(
     k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
     # Compute attention for current tile
     S = pgm.compute_qk(k)
-    S = S * qk_factor
 
     S = pgm.apply_softcap(S)
     seq_mask = seq_offset[None, :] < pgm.context_len + pgm.query_pos_qk + 1
