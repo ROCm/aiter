@@ -70,7 +70,7 @@ def get_kernel_config(m, n, k, routing_data):
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
+    num_stages = 1
 
     split_k = 1
     if block_m == 16:
