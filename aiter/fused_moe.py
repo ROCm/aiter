@@ -842,7 +842,6 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    # cfg = cfg_2stages.get(keys, None)
     cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
@@ -894,8 +893,6 @@ def get_2stage_cfgs(
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
-
-        run_1stage = run_1stage or run_1stage_xbf16
 
         block_m = (
             BLOCK_SIZE_M
