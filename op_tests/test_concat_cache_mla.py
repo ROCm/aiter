@@ -631,7 +631,7 @@ def run_torch_fused_norm_rope_group_quant(
         # Vectorized K group quant: [N, KVH, kv_lora_rank] → [N, KVH, num_tiles, group_size]
         k_tiled = k_nope_f32.reshape(num_tokens, num_kv_heads, num_tiles, group_size)
         k_group_max = k_tiled.abs().amax(dim=-1)  # [N, KVH, num_tiles]
-        k_scales_f32 = k_group_max * inv_fp8_max   # [N, KVH, num_tiles]
+        k_scales_f32 = k_group_max * inv_fp8_max  # [N, KVH, num_tiles]
         # e8m0 ceil: extract exponent, round up if mantissa != 0
         k_u32 = k_scales_f32.view(torch.int32)
         k_exponents = ((k_u32 >> 23) & 0xFF).to(torch.int32)
@@ -639,13 +639,21 @@ def run_torch_fused_norm_rope_group_quant(
         k_exponents = k_exponents + k_has_mantissa.to(torch.int32)
         # Reconstruct e8m0 scale for dequant
         k_e8m0_u32 = (k_exponents << 23).view(torch.float32)  # [N, KVH, num_tiles]
-        k_inv_scale = k_e8m0_u32.unsqueeze(-1).expand_as(k_tiled)  # [N, KVH, num_tiles, group_size]
-        k_quantized = (k_tiled / k_inv_scale).to(dtypes.fp8).reshape(num_tokens, num_kv_heads, kv_lora_rank)
+        k_inv_scale = k_e8m0_u32.unsqueeze(-1).expand_as(
+            k_tiled
+        )  # [N, KVH, num_tiles, group_size]
+        k_quantized = (
+            (k_tiled / k_inv_scale)
+            .to(dtypes.fp8)
+            .reshape(num_tokens, num_kv_heads, kv_lora_rank)
+        )
 
         for i in range(num_tokens):
             bi, bo = block_indices[i], block_offsets[i]
             kv_cache[bi, bo, :, :kv_lora_rank] = k_quantized[i]
-            kv_cache.view(torch.uint8)[bi, bo, :, kv_lora_rank:kv_lora_rank + num_tiles] = k_exponents[i].to(torch.uint8)
+            kv_cache.view(torch.uint8)[
+                bi, bo, :, kv_lora_rank : kv_lora_rank + num_tiles
+            ] = k_exponents[i].to(torch.uint8)
 
     kv_cache_swapped = kv_cache
     num_heads = q_nope.shape[1]
@@ -666,7 +674,9 @@ def run_torch_fused_norm_rope_group_quant(
             x2 = q_pe_input_f32[..., half_dim:]
             cos_exp = cos_f32.unsqueeze(1).expand_as(x1)
             sin_exp = sin_f32.unsqueeze(1).expand_as(x1)
-            q_pe_f32 = torch.cat([x1 * cos_exp - x2 * sin_exp, x2 * cos_exp + x1 * sin_exp], dim=-1)
+            q_pe_f32 = torch.cat(
+                [x1 * cos_exp - x2 * sin_exp, x2 * cos_exp + x1 * sin_exp], dim=-1
+            )
         else:
             cos_exp = cos_f32.unsqueeze(1).expand(-1, q_pe_input_f32.shape[1], -1)
             sin_exp = sin_f32.unsqueeze(1).expand(-1, q_pe_input_f32.shape[1], -1)
@@ -692,8 +702,14 @@ def run_torch_fused_norm_rope_group_quant(
         q_exponents = q_exponents + q_has_mantissa.to(torch.int32)
         # Reconstruct e8m0 scale
         q_e8m0_u32 = (q_exponents << 23).view(torch.float32)  # [N, H, num_groups]
-        q_inv_scale = q_e8m0_u32.unsqueeze(-1).expand_as(q_tiled)  # [N, H, num_groups, group_size]
-        q_quantized = (q_tiled / q_inv_scale).to(dtypes.fp8).reshape(num_tokens, num_heads, head_size)
+        q_inv_scale = q_e8m0_u32.unsqueeze(-1).expand_as(
+            q_tiled
+        )  # [N, H, num_groups, group_size]
+        q_quantized = (
+            (q_tiled / q_inv_scale)
+            .to(dtypes.fp8)
+            .reshape(num_tokens, num_heads, head_size)
+        )
 
         q_out = q_quantized
         q_scale_ref = q_exponents.to(torch.uint8)
