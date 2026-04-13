@@ -84,25 +84,24 @@ def ref_fused_rearrange_sigmoid_gdr(
 # Each row ends with ``use_qk_l2norm_in_kernel`` (True for stable long-T sweep).
 # One small bf16 row uses False to cover the no–L2-norm path (replaces former ``basic``).
 _FUSED_GDR_SWEEP = [
-    (1, 63, 1, 1, 64, 1, 1, torch.float16, True),
-    (2, 500, 4, 4, 60, 1, 1, torch.float16, True),
-    (2, 1000, 2, 8, 128, 1, 0.1, torch.float16, True),
-    (3, 1024, 2, 2, 128, 0.1, 1, torch.float16, True),
-    (4, 1024, 3, 3, 128, 1, 10, torch.float16, True),
-    (4, 2048, 4, 4, 64, 0.1, 1, torch.float16, True),
-    (2, 1024, 4, 4, 128, 1, 0.1, torch.float16, True),
-    (2, 1024, 4, 8, 128, 1, 10, torch.float16, True),
-    (2, 1024, 4, 4, 128, 1, 0.1, torch.bfloat16, True),
-    (2, 1024, 4, 8, 128, 1, 1, torch.bfloat16, True),
-    (4, 2048, 4, 8, 64, 0.1, 1, torch.bfloat16, True),
-    (1, 8, 4, 4, 16, 16**-0.5, 1, torch.bfloat16, False),
+    (63, 1, 1, 64, 1, 1, torch.float16, True),
+    (500, 4, 4, 60, 1, 1, torch.float16, True),
+    (1000, 2, 8, 128, 1, 0.1, torch.float16, True),
+    (1024, 2, 2, 128, 0.1, 1, torch.float16, True),
+    (1024, 3, 3, 128, 1, 10, torch.float16, True),
+    (2048, 4, 4, 64, 0.1, 1, torch.float16, True),
+    (1024, 4, 4, 128, 1, 0.1, torch.float16, True),
+    (1024, 4, 8, 128, 1, 10, torch.float16, True),
+    (1024, 4, 4, 128, 1, 0.1, torch.bfloat16, True),
+    (1024, 4, 8, 128, 1, 1, torch.bfloat16, True),
+    (2048, 4, 8, 64, 0.1, 1, torch.bfloat16, True),
+    (8, 4, 4, 16, 16**-0.5, 1, torch.bfloat16, False),
 ]
 
 
 @cuda_ok
 @pytest.mark.parametrize(
     (
-        "_B",
         "T",
         "H",
         "HV",
@@ -115,15 +114,12 @@ _FUSED_GDR_SWEEP = [
     [
         pytest.param(
             *row,
-            id="B{}-T{}-H{}-HV{}-D{}-scale{}-gate_logit_normalizer{}-{}-l2{}".format(
-                *row[:8], row[8]
-            ),
+            id="T{}-H{}-HV{}-D{}-scale{}-gate_logit_normalizer{}-{}-l2{}".format(*row),
         )
         for row in _FUSED_GDR_SWEEP
     ],
 )
 def test_fused_rearrange_sigmoid_gdr_sweep(
-    _B: int,
     T: int,
     H: int,
     HV: int,

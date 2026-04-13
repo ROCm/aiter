@@ -39,8 +39,6 @@ def fused_rearrange_sigmoid_gated_delta_rule(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused Triton sigmoid-gated delta rule over packed QKV (decode-oriented).
-
-    See vLLM ``fused_rearrange_sigmoid_gated_delta_rule`` for argument semantics.
     """
     expected_shape = (qkv.shape[0], key_dim * 2 + value_dim)
     assert (
