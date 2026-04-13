@@ -12,11 +12,18 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .utils import is_flydsl_available
 
-_REQUIRED_FLYDSL_VERSION = "0.1.3"
+_MIN_FLYDSL_VERSION = "0.1.2"
 
 __all__ = [
     "is_flydsl_available",
 ]
+
+
+def _flydsl_version_tuple(ver_str: str):
+    """Parse '0.1.2' into (0, 1, 2) for comparison."""
+    parts = ver_str.split(".")
+    return tuple(int(x) for x in parts[:3])
+
 
 if is_flydsl_available():
     try:
@@ -27,13 +34,12 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
-    if not (
-        installed_flydsl_version == _REQUIRED_FLYDSL_VERSION
-        or installed_flydsl_version.startswith(_REQUIRED_FLYDSL_VERSION + ".")
+    if _flydsl_version_tuple(installed_flydsl_version) < _flydsl_version_tuple(
+        _MIN_FLYDSL_VERSION
     ):
         raise ImportError(
             "Unsupported `flydsl` version: "
-            f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
+            f"expected >= `{_MIN_FLYDSL_VERSION}`, "
             f"got `{installed_flydsl_version}`."
         )
 
