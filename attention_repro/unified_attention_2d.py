@@ -943,13 +943,6 @@ def kernel_unified_attention_2d(
         query_mask_1_pv = query_offset_1_pv < NUM_QUERY_HEADS
         # Using regular approach: Prescale with RCP_LN2, needed for exp2
         # FMA based approach: Prescale with / SCALE
-        M = (
-            gl.load(
-                sink_ptr + query_offset_1_pv,
-                mask=query_mask_1_pv,
-                other=float("-inf"),
-            ).to(dtype=gl.float32) / SCALE
-        )
         M = gl.amd.cdna4.buffer_load(
             ptr=sink_ptr,
             offsets=query_offset_1_pv,
