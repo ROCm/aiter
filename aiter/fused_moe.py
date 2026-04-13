@@ -842,35 +842,8 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    def use_asm_embedded_quantization():
-        # For big model_dim ck's split-k is a better alternative
-        return (
-            model_dim <= 2048
-            and get_gfx() == "gfx950"
-            and token > 1
-            and token < 16
-            and topk > 8
-            and dtype == torch.bfloat16
-            and q_dtype_w == torch.float8_e4m3fn
-            and (inter_dim % 128) == 0
-        )
-
-    def use_cfg():
-        problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
-        bypass_type = (
-            ActivationType.Silu,
-            dtypes.bf16,
-            dtypes.fp8,
-            dtypes.fp8,
-            QuantType.per_1x128,
-        )
-        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
-            aiter.logger.info("bypass tuned results for fp8 blockscale")
-            return False
-        return True
-
     # cfg = cfg_2stages.get(keys, None)
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
+    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -914,7 +887,7 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 256 == 0)
+                run_1stage = token > 32 and (inter_dim % 128 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
