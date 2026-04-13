@@ -310,7 +310,7 @@ def per_1x32_f4_quant_hip(
                 torch.empty(
                     (
                         (m + 255) // 256 * 256,
-                        (n // 32 + 7) // 8 * 8,
+                        ((n + 31) // 32 + 7) // 8 * 8,
                     ),
                     dtype=torch.uint8,
                     device=device,
@@ -321,7 +321,7 @@ def per_1x32_f4_quant_hip(
         else:
             scale = (
                 torch.empty(
-                    (m, n // 32),
+                    (m, (n + 31) // 32),
                     dtype=torch.uint8,
                     device=device,
                 )
@@ -546,6 +546,102 @@ def moe_smooth_per_token_scaled_quant_v2(
     v2: expert loops along sorted_token_ids. Supports both moe stage1 and stage2.
     """
     ...
+
+
+@compile_ops("module_quant")
+def mxfp4_moe_sort_hip(
+    out_scale: torch.Tensor,
+    scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    cols: int,
+) -> None:
+    """
+    MoE scale sorting with MXFP4 shuffle layout.
+    """
+    ...
+
+
+def mxfp4_moe_sort_fwd(
+    scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    cols: int,
+):
+    out_scale = torch.empty(
+        (sorted_ids.shape[0] + 31) // 32 * 32,
+        (cols + 31) // 32,
+        dtype=dtypes.fp8_e8m0,
+        device=scale.device,
+    )
+    mxfp4_moe_sort_hip(out_scale, scale, sorted_ids, num_valid_ids, token_num, cols)
+    return out_scale
+
+
+@compile_ops("module_quant")
+def fused_dynamic_mxfp4_quant_moe_sort_hip(
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_m: int,
+    group_size: int = 32,
+) -> None:
+    """
+    HIP path for fused dynamic MXFP4 quantization and MoE scale sorting.
+    """
+    ...
+
+
+def fused_dynamic_mxfp4_quant_moe_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,  # stage1 and stage2: same topk value
+    block_size: int,
+    num_rows: Optional[torch.Tensor] = None,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    token_num_quant_moe_sort_switch = [
+        8 * 64 / topk,  # stage1
+        8 * 1024 / topk,  # stage2
+    ]
+    M, N = input.view(-1, input.shape[-1]).shape
+    is_stage1 = M == token_num
+    topk = 1 if is_stage1 else topk
+    scale = torch.empty(
+        (sorted_ids.shape[0] + 31) // 32 * 32,
+        (N + 31) // 32,
+        dtype=dtypes.fp8_e8m0,
+        device=input.device,
+    )
+    if (
+        (is_stage1 and M <= token_num_quant_moe_sort_switch[0])
+        or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1] * topk)
+        or group_size != 32
+    ):
+        out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
+        fused_dynamic_mxfp4_quant_moe_sort_hip(
+            out,
+            scale,
+            input,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
+            block_size,
+            group_size,
+        )
+    else:
+        out, scale_ = per_1x32_f4_quant_hip(
+            input, None, dtypes.fp4x2, num_rows=num_rows, num_rows_factor=topk
+        )
+        mxfp4_moe_sort_hip(scale, scale_, sorted_ids, num_valid_ids, token_num, N)
+    return out, scale
 
 
 @compile_ops("module_quant")

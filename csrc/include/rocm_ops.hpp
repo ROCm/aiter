@@ -1357,6 +1357,24 @@ namespace py = pybind11;
           py::arg("block_m"),                                            \
           py::arg("shuffle_scale") = false,                              \
           py::arg("transpose_out") = false);                             \
+    m.def("fused_dynamic_mxfp4_quant_moe_sort_hip",                      \
+          &aiter::fused_dynamic_mxfp4_quant_moe_sort_hip,                \
+          py::arg("out"),                                                \
+          py::arg("scales"),                                             \
+          py::arg("input"),                                              \
+          py::arg("sorted_ids"),                                         \
+          py::arg("num_valid_ids"),                                      \
+          py::arg("token_num"),                                          \
+          py::arg("block_m"),                                            \
+          py::arg("group_size") = 32);                                   \
+    m.def("mxfp4_moe_sort_hip",                                          \
+          &aiter::mxfp4_moe_sort_hip,                                    \
+          py::arg("out_scale"),                                          \
+          py::arg("scale"),                                              \
+          py::arg("sorted_ids"),                                         \
+          py::arg("num_valid_ids"),                                      \
+          py::arg("token_num"),                                          \
+          py::arg("cols"));                                              \
     m.def("partial_transpose",                                           \
           &aiter::partial_transpose,                                     \
           py::arg("out"),                                                \
@@ -1808,6 +1826,19 @@ namespace py = pybind11;
           py::arg("input"),                  \
           py::arg("weight"),                 \
           py::arg("epsilon"));
+
+#define GATED_RMSNORM_QUANT_PYBIND                             \
+    m.def("gated_rmsnorm_fp8_group_quant",                     \
+          &aiter::gated_rmsnorm_fp8_group_quant,               \
+          py::arg("out"),                                      \
+          py::arg("scale"),                                    \
+          py::arg("x"),                                        \
+          py::arg("z"),                                        \
+          py::arg("weight"),                                   \
+          py::arg("epsilon"),                                  \
+          py::arg("group_size"),                               \
+          py::arg("transpose_scale") = false,                  \
+          "Fused Gated RMSNorm + FP8 Group Quantization");
 
 #define MHC_PYBIND                              \
     m.def("mhc_pre_gemm_sqrsum",                \

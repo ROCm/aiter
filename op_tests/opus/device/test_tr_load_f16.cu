@@ -110,6 +110,7 @@ __global__ void tr_load_f16_kernel(const opus::fp16_t* __restrict__ in_row_major
         make_tuple(16_I, 1_I),
         make_tuple(0_I, lane_id % mma.grpn_b, 0_I, lane_id / mma.grpn_b));
 
+    s_waitcnt_lgkmcnt(number<0>{});
     g_out.template store<8>(__builtin_bit_cast(fp16x8_t, r), u_b);
 #else
     (void)in_row_major;
