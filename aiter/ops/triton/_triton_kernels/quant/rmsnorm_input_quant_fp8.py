@@ -14,20 +14,25 @@ import triton.language as tl
 )
 @triton.jit
 def rms_norm_input_quant_fp8_kernel(
-    X,  # pointer to the input
-    W,  # pointer to the weights
-    B,  # pointer to the biases
-    Z,  # pointer to the other branch
-    Y_quant,  # pointer to the quantized output
-    Scales,  # pointer to the scales
-    stride_x_row,  # how much to increase the pointer when moving by 1 row
+    X,
+    W,
+    B,
+    Z,
+    Y_quant,
+    Scales,
+    stride_x_row,
     stride_z_row,
     stride_y_row,
-    M,  # number of rows in X
-    N: tl.constexpr,  # number of columns in X
-    eps,  # epsilon to avoid division by zero
-    BLOCK_N: tl.constexpr,
+    stride_s_row,
+    stride_s_g,
+    M,
+    N: tl.constexpr,
+    eps,
+    RMS_TILE: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_G: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
@@ -37,86 +42,84 @@ def rms_norm_input_quant_fp8_kernel(
     FP8_MIN_SCALING_FACTOR: tl.constexpr,
     ACTIVATION: tl.constexpr,
 ):
-    # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
-    group = tl.program_id(1)
-
-    # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
     rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
-    cols = tl.arange(0, BLOCK_N)
+    row_mask_1d = rows < M
 
-    # Compute offsets for 2D tile
-    row_offsets = rows[:, None] * stride_x_row
-    col_offsets = cols[None, :] + group * BLOCK_N
+    # --- Full-row RMS: accumulate sum of squares in float32 ---
+    sumsq = tl.zeros([ROWS_PER_BLOCK], dtype=tl.float32)
+    off = 0
+    while off < N:
+        cols = tl.arange(0, RMS_TILE) + off
+        col_mask = cols < N
+        mask = row_mask_1d[:, None] & col_mask[None, :]
+        row_offsets = rows[:, None] * stride_x_row
+        col_offsets = cols[None, :]
+        X_base = X + row_offsets + col_offsets
+        x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
+        if HAS_Z and not NORM_BEFORE_GATE:
+            Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+            if ACTIVATION == "swish" or ACTIVATION == "silu":
+                x *= z * tl.sigmoid(z)
+            elif ACTIVATION == "sigmoid":
+                x *= tl.sigmoid(z)
+        xbar = tl.where(mask, x, 0.0)
+        sumsq += tl.sum(xbar * xbar, axis=1)
+        off += RMS_TILE
 
-    # Base pointers
-    X_base = X + row_offsets + col_offsets
-    Y_base = Y_quant + rows[:, None] * stride_y_row + col_offsets
-    S_base = Scales + rows
+    var = sumsq / N
+    rstd = tl.rsqrt(var + eps)
 
-    # Create mask for valid rows and columns
-    row_mask = rows[:, None] < M
-    col_mask = cols[None, :] < N
-    mask = row_mask & col_mask
+    # --- Per-group: normalize (when NORM_BEFORE_GATE), linear, optional gate, FP8 ---
+    for g in range(NUM_GROUPS):
+        col0 = g * GROUP_SIZE
+        cols = tl.arange(0, BLOCK_G) + col0
+        col_mask = cols < N
+        mask = row_mask_1d[:, None] & col_mask[None, :]
+        row_offsets = rows[:, None] * stride_x_row
+        col_offsets = cols[None, :]
+        X_base = X + row_offsets + col_offsets
+        x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
 
-    # Load input data with 2D tile
-    x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
+        if HAS_Z and not NORM_BEFORE_GATE:
+            Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+            if ACTIVATION == "swish" or ACTIVATION == "silu":
+                x *= z * tl.sigmoid(z)
+            elif ACTIVATION == "sigmoid":
+                x *= tl.sigmoid(z)
 
-    if HAS_Z and not NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
-        if ACTIVATION == "swish" or ACTIVATION == "silu":
-            x *= z * tl.sigmoid(z)
-        elif ACTIVATION == "sigmoid":
-            x *= tl.sigmoid(z)
+        x_hat = x * rstd[:, None]
 
-    xbar = tl.where(mask, x, 0.0)
-    var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
-    rstd = tl.rsqrt(var + eps)  # Shape: [ROWS_PER_BLOCK]
+        w_mask = cols < N
+        w = tl.load(W + cols, mask=w_mask, other=0.0).to(tl.float32)
+        if HAS_BIAS:
+            b = tl.load(B + cols, mask=w_mask, other=0.0).to(tl.float32)
+            y = x_hat * w[None, :] + b[None, :]
+        else:
+            y = x_hat * w[None, :]
 
-    # Load weights and biases (broadcast across rows)
-    w_offsets = cols + group * BLOCK_N
-    w_mask = w_offsets < N
-    w = tl.load(W + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        if HAS_Z and NORM_BEFORE_GATE:
+            Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+            if ACTIVATION == "swish" or ACTIVATION == "silu":
+                y *= z * tl.sigmoid(z)
+            elif ACTIVATION == "sigmoid":
+                y *= tl.sigmoid(z)
 
-    if HAS_BIAS:
-        b = tl.load(B + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        abs_y = tl.where(mask, tl.abs(y), 0.0)
+        absmax = tl.max(abs_y, axis=1)
+        scales_raw = absmax / FP8_MAX
+        if USE_UE8M0:
+            scales_raw = tl.exp2(tl.ceil(tl.log2(scales_raw)))
+        scales = tl.maximum(scales_raw, FP8_MIN_SCALING_FACTOR)
 
-    # Normalize and apply linear transformation
-    x_hat = x * rstd[:, None]
+        y_scaled = y / scales[:, None]
+        y_quant = tl.maximum(tl.minimum(y_scaled, FP8_MAX), FP8_MIN)
 
-    y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
+        Y_base = Y_quant + rows[:, None] * stride_y_row + col_offsets
+        tl.store(Y_base, y_quant.to(Y_quant.dtype.element_ty), mask=mask)
 
-    if HAS_Z and NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
-        if ACTIVATION == "swish" or ACTIVATION == "silu":
-            y *= z * tl.sigmoid(z)
-        elif ACTIVATION == "sigmoid":
-            y *= tl.sigmoid(z)
-
-    ## Now we got y, we next quantize y
-
-    # Compute per-row absmax (only considering valid elements)
-    abs_y = tl.where(mask, tl.abs(y), 0.0)
-    absmax = tl.max(abs_y, axis=1)  # Shape: [ROWS_PER_BLOCK]
-
-    # Compute scales
-    scales_raw = absmax / FP8_MAX
-    # TODO: Add USE_UE8M0 as a constexpr parameter if needed:
-    if USE_UE8M0:
-        scales_raw = tl.exp2(tl.ceil(tl.log2(scales_raw)))
-    scales = tl.maximum(scales_raw, FP8_MIN_SCALING_FACTOR)  # Shape: [ROWS_PER_BLOCK]
-
-    # Quantize: divide by scale (broadcast to match y shape) and clamp
-    y_scaled = (
-        y / scales[:, None]
-    )  # Broadcast scales from [ROWS_PER_BLOCK] to [ROWS_PER_BLOCK, BLOCK_N]
-    y_quant = tl.maximum(tl.minimum(y_scaled, FP8_MAX), FP8_MIN)
-
-    # Store quantized output
-    tl.store(Y_base, y_quant.to(Y_quant.dtype.element_ty), mask=mask)
-
-    # Store scales (one per row)
-    scales_row_mask = rows < M
-    tl.store(S_base, scales, mask=scales_row_mask)
+        S_ptr = Scales + rows * stride_s_row + g * stride_s_g
+        tl.store(S_ptr, scales, mask=row_mask_1d)

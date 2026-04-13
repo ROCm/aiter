@@ -28,6 +28,7 @@ def ref_rmsnorm_quant(
     activation: str,
     fmin: float,
     fmax: float,
+    group_size: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     x32 = x.float()
     z32 = z.float()
@@ -42,10 +43,21 @@ def ref_rmsnorm_quant(
         elif activation == "sigmoid":
             y = y * torch.sigmoid(z32)
     fp8_dtype = get_fp8_e4m3_dtype()
-    scales = y.abs().amax(dim=-1).clamp_min(1e-12) / fmax
-    y_scaled = y / scales.unsqueeze(-1)
-    q = y_scaled.clamp(fmin, fmax).to(fp8_dtype)
+    gs = x.shape[1] if group_size is None else group_size
+    ng = x.shape[1] // gs
+    yg = y.view(y.shape[0], ng, gs)
+    scales = yg.abs().amax(dim=-1).clamp_min(1e-12) / fmax
+    y_scaled = yg / scales.unsqueeze(-1)
+    q = y_scaled.clamp(fmin, fmax).to(fp8_dtype).view_as(y)
+    if group_size is None:
+        scales = scales.squeeze(-1)
     return q, scales
+
+
+def _scale_broadcast(scales: torch.Tensor, N: int, group_size: int | None) -> torch.Tensor:
+    if group_size is None:
+        return scales.unsqueeze(-1).expand(-1, N)
+    return scales.repeat_interleave(group_size, dim=1)
 
 
 @cuda_ok
@@ -75,11 +87,14 @@ def test_rmsnorm_input_quant_fp8_matches_ref():
         fp8_max=fmax,
         fp8_min_scaling_factor=scale_floor,
     )
-    y_ref, scales_ref = ref_rmsnorm_quant(x, w, bias, z, 1e-5, True, "silu", fmin, fmax)
+    y_ref, scales_ref = ref_rmsnorm_quant(
+        x, w, bias, z, 1e-5, True, "silu", fmin, fmax, None
+    )
 
     torch.testing.assert_close(scales_t, scales_ref, rtol=1e-3, atol=1e-3)
-    dq = y_q.float() * scales_t.unsqueeze(-1)
-    dq_ref = y_ref.float() * scales_ref.unsqueeze(-1)
+    sb = _scale_broadcast(scales_ref, N, None)
+    dq = y_q.float() * sb
+    dq_ref = y_ref.float() * sb
     torch.testing.assert_close(dq, dq_ref, rtol=0.15, atol=0.15)
 
     y_default, scales_default = rmsnorm_input_quant_fp8(
@@ -94,3 +109,73 @@ def test_rmsnorm_input_quant_fp8_matches_ref():
     )
     torch.testing.assert_close(scales_t, scales_default, rtol=0.0, atol=0.0)
     torch.testing.assert_close(y_q.float(), y_default.float(), rtol=0.0, atol=0.0)
+
+
+_MS = [1, 3, 4, 512, 1024, 2048, 4096]
+_NS = [128, 256]
+_GROUP_SIZES = {
+    128: [1, 2, 4, 8, 16, 32, 64, 128],
+    256: [1, 2, 4, 8, 16, 32, 64, 128, 256],
+}
+
+
+def _sweep_cases():
+    out = []
+    for N in _NS:
+        for M in _MS:
+            for g in _GROUP_SIZES[N]:
+                out.append(pytest.param(M, N, g, id=f"M{M}-N{N}-g{g}"))
+    return out
+
+
+@cuda_ok
+@pytest.mark.parametrize(("M", "N", "group_size"), _sweep_cases())
+def test_rmsnorm_input_quant_fp8_sweep(M: int, N: int, group_size: int):
+    device = "cuda"
+    torch.manual_seed(1)
+    x = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+    z = torch.randn(M, N, device=device, dtype=torch.bfloat16)
+    w = torch.randn(N, device=device, dtype=torch.bfloat16)
+    bias = torch.randn(N, device=device, dtype=torch.bfloat16)
+    fmin, fmax = get_fp8_min_max_bounds(get_fp8_e4m3_dtype())
+    scale_floor = 1.0 / (fmax * 512.0)
+
+    y_q, scales_t = rmsnorm_input_quant_fp8(
+        x,
+        w,
+        bias,
+        z,
+        1e-5,
+        norm_before_gate=True,
+        use_ue8m0=False,
+        activation="silu",
+        fp8_min=fmin,
+        fp8_max=fmax,
+        fp8_min_scaling_factor=scale_floor,
+        group_size=group_size,
+    )
+    y_ref, scales_ref = ref_rmsnorm_quant(
+        x, w, bias, z, 1e-5, True, "silu", fmin, fmax, group_size
+    )
+
+    assert scales_t.shape == scales_ref.shape
+    torch.testing.assert_close(scales_t, scales_ref, rtol=1e-3, atol=1e-3)
+    sb = _scale_broadcast(scales_ref, N, group_size)
+    dq = y_q.float() * sb
+    dq_ref = y_ref.float() * sb
+    torch.testing.assert_close(dq, dq_ref, rtol=0.15, atol=0.15)
+
+
+@cuda_ok
+def test_rmsnorm_input_quant_fp8_group_size_errors():
+    device = "cuda"
+    x = torch.randn(2, 128, device=device, dtype=torch.bfloat16)
+    z = torch.randn_like(x)
+    w = torch.randn(128, device=device, dtype=torch.bfloat16)
+    b = torch.randn(128, device=device, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="less than or equal to hidden size"):
+        rmsnorm_input_quant_fp8(x, w, b, z, 1e-5, group_size=256)
+    with pytest.raises(ValueError, match="divisible by group_size"):
+        rmsnorm_input_quant_fp8(x, w, b, z, 1e-5, group_size=48)
+    with pytest.raises(ValueError, match="positive"):
+        rmsnorm_input_quant_fp8(x, w, b, z, 1e-5, group_size=0)

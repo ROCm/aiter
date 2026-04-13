@@ -57,18 +57,26 @@ def rmsnorm_input_quant_fp8(
     fp8_min: float | None = None,
     fp8_max: float | None = None,
     fp8_min_scaling_factor: float | None = None,
+    group_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused RMSNorm (with optional bias), optional multiplicative gate from ``z``,
-    and per-row FP8 quantization (same contract as vLLM ``_rmsnorm_quantize_group_native``).
+    and FP8 quantization (same contract as vLLM ``_rmsnorm_quantize_group_native`` for
+    ``group_size == N``).
 
     ``x`` and ``z`` must be 2D contiguous with identical shape ``(M, N)``.
-    Returns ``(x_quant_fp8, scales)`` where ``scales`` is ``(M,)`` float32.
+    Returns ``(x_quant_fp8, scales)`` where ``scales`` is ``(M,)`` float32 if
+    ``group_size`` is ``None`` (one scale per row), or ``(M, N // group_size)`` float32
+    when ``group_size`` divides ``N`` (one scale per row per column group).
 
     ``fp8_min`` / ``fp8_max`` / ``fp8_min_scaling_factor`` default from ``out_dtype`` (or
     ``get_fp8_e4m3_dtype()``) using the same rules as vLLM ``get_fp8_min_max`` and
     ``1.0 / (_FP8_MAX * 512)``. Pass them explicitly when you want to pin values (e.g. from
     vLLM's ``get_fp8_min_max()`` at model init).
+
+    Raises:
+        ValueError: if ``group_size`` is not ``None`` and ``group_size > N``,
+            ``group_size <= 0``, or ``N`` is not divisible by ``group_size``.
     """
     assert x.is_contiguous() and z.is_contiguous()
     assert x.shape == z.shape, "x and z must have the same shape"
@@ -85,19 +93,41 @@ def rmsnorm_input_quant_fp8(
         bias = bias.contiguous()
 
     M, N = x.shape
-    ngroups = 1
+    if group_size is not None:
+        if group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {group_size}")
+        if group_size > N:
+            raise ValueError(
+                f"group_size ({group_size}) must be less than or equal to hidden size "
+                f"N ({N}); per-column FP8 groups cannot exceed the row width."
+            )
+        if N % group_size != 0:
+            raise ValueError(
+                f"hidden size N ({N}) must be divisible by group_size ({group_size})."
+            )
+
+    effective_gs = N if group_size is None else int(group_size)
+    num_groups = N // effective_gs
+
     MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
-    if N > BLOCK_N:
+    if N > MAX_FUSED_SIZE:
         raise RuntimeError("This RMSNorm quant kernel does not support N >= 64KB.")
 
-    num_warps = min(max(BLOCK_N // 256, 1), 8)
+    rms_tile = min(512, triton.next_power_of_2(N))
+    block_g = triton.next_power_of_2(effective_gs)
     rows_per_block = calc_rows_per_block(M, x.device)
+    num_warps = min(max(block_g // 256, 1), 8)
 
     x_quant = torch.empty(M, N, dtype=fp8_dtype, device=x.device)
-    scales = torch.empty(M, dtype=torch.float32, device=x.device)
+    if group_size is None:
+        scales = torch.empty(M, dtype=torch.float32, device=x.device)
+        stride_s_row = int(scales.stride(0))
+        stride_s_g = 0
+    else:
+        scales = torch.empty(M, num_groups, dtype=torch.float32, device=x.device)
+        stride_s_row, stride_s_g = (int(scales.stride(0)), int(scales.stride(1)))
 
-    grid = (triton.cdiv(M, rows_per_block), ngroups)
+    grid = (triton.cdiv(M, rows_per_block),)
     rms_norm_input_quant_fp8_kernel[grid](
         x,
         weight,
@@ -108,11 +138,16 @@ def rmsnorm_input_quant_fp8(
         x.stride(0),
         z.stride(0),
         x_quant.stride(0),
+        stride_s_row,
+        stride_s_g,
         M,
         N,
         eps,
-        BLOCK_N=BLOCK_N,
+        RMS_TILE=rms_tile,
         ROWS_PER_BLOCK=rows_per_block,
+        GROUP_SIZE=effective_gs,
+        NUM_GROUPS=num_groups,
+        BLOCK_G=block_g,
         NORM_BEFORE_GATE=norm_before_gate,
         FP8_MIN=fp8_min,
         FP8_MAX=fp8_max,
