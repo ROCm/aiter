@@ -308,9 +308,14 @@ class TunerCommon:
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
         all_tuned_file = self.update_config_files(tuned_gemm_file, self.name)
         if os.path.exists(all_tuned_file):
-            column_order = _read_csv(all_tuned_file, nrows=0).columns.tolist()
-            tunedf = _read_csv(all_tuned_file)
-            tunedf = tunedf[column_order]
+            try:
+                column_order = _read_csv(all_tuned_file, nrows=0).columns.tolist()
+                tunedf = _read_csv(all_tuned_file)
+                tunedf = tunedf[column_order]
+            except pd.errors.EmptyDataError:
+                print(f"Empty tuned file: {all_tuned_file}")
+                columns = self.columns if not columns else columns
+                tunedf = pd.DataFrame(columns=columns)
         else:
             print(f"Not exist tuned file: {all_tuned_file}")
             columns = self.columns if not columns else columns
@@ -560,21 +565,90 @@ class TunerCommon:
         for line in lines:
             print(line, flush=True)
 
-    def _print_benchmark_results(self, label, results, report_file=None):
+    def _split_benchmark_status(self, status):
+        status = "" if status is None else str(status)
+        if status == "ok":
+            return "OK", ""
+        if status.startswith("error:"):
+            return "ERROR", status[len("error:") :].strip()
+        if status == "mismatch":
+            return "MISMATCH", "output mismatch vs reference"
+        if not status:
+            return "UNKNOWN", ""
+        return status.upper(), ""
+
+    def _format_benchmark_keys(self, row):
+        parts = []
+        for key in self.keys:
+            value = row.get(key, "")
+            parts.append(f"{key}={value}")
+        return "keys: " + ", ".join(parts)
+
+    def _get_benchmark_e2e_us(self, row, suffix=""):
+        return getattr(row, f"benchmark_e2e_us{suffix}", -1)
+
+    def _get_benchmark_kernel_us(self, row, suffix=""):
+        return getattr(row, f"benchmark_kernel_us{suffix}", None)
+
+    def _print_benchmark_results(self, label, results, report_file=None, shapes_df=None):
         """Print benchmark results to stdout or append them to a report file."""
         if not results:
             self._emit_report_lines([f"{label}: no results"], report_file)
             return
+        results_df = self._benchmark_results_to_df(results, shapes_df=shapes_df)
         lines = [f"============= {label} Benchmark Results ============="]
-        header = f"{'Shape':<40} | {'Time(us)':>10} | {'Status':>8}"
+        has_kernel_us = (
+            not results_df.empty
+            and "benchmark_kernel_us" in results_df.columns
+            and results_df["benchmark_kernel_us"].notna().any()
+        )
+        if has_kernel_us:
+            header = (
+                f"{'Shape':<40} | {'Kernel(us)':>10} | {'E2E(us)':>10} | {'Status':>8}"
+            )
+        else:
+            header = f"{'Shape':<40} | {'E2E(us)':>10} | {'Status':>8}"
         lines.append(header)
         lines.append("-" * len(header))
-        for r in results:
-            shape_str = r.get("shape", "unknown")
-            us = r.get("us", -1)
-            status = r.get("status", "unknown")
-            us_str = f"{us:.2f}" if us > 0 else "N/A"
-            lines.append(f"{shape_str:<40} | {us_str:>10} | {status:>8}")
+        if results_df.empty:
+            for r in results:
+                shape_str = r.get("shape", "unknown")
+                e2e_us = r.get("e2e_us", -1)
+                status = r.get("status", "unknown")
+                status_summary, status_detail = self._split_benchmark_status(status)
+                e2e_str = f"{e2e_us:.2f}" if e2e_us > 0 else "N/A"
+                lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
+                if status_detail:
+                    lines.append(f"{'':<40} | {'':>10} | {'reason: ' + status_detail}")
+            self._emit_report_lines(lines, report_file)
+            return
+        for row in results_df.itertuples(index=False):
+            shape_str = getattr(row, "shape", "unknown")
+            e2e_us = self._get_benchmark_e2e_us(row)
+            kernel_us = self._get_benchmark_kernel_us(row)
+            status = getattr(row, "benchmark_status", "unknown")
+            status_summary, status_detail = self._split_benchmark_status(status)
+            e2e_str = f"{e2e_us:.2f}" if e2e_us > 0 else "N/A"
+            if has_kernel_us:
+                kernel_str = (
+                    f"{kernel_us:.2f}"
+                    if kernel_us is not None and pd.notna(kernel_us) and kernel_us > 0
+                    else "N/A"
+                )
+                lines.append(
+                    f"{shape_str:<40} | {kernel_str:>10} | {e2e_str:>10} | {status_summary:>8}"
+                )
+            else:
+                lines.append(
+                    f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}"
+                )
+            lines.append(
+                self._format_benchmark_keys(
+                    {key: getattr(row, key, "") for key in self.keys}
+                )
+            )
+            if status_detail:
+                lines.append(f"reason: {status_detail}")
         self._emit_report_lines(lines, report_file)
 
     def _print_comparison(self, pre_results, post_results, report_file=None):
@@ -585,38 +659,74 @@ class TunerCommon:
                 report_file,
             )
             return
-        # Build lookup by shape
-        post_map = {r["shape"]: r for r in post_results}
+        pre_df = self._benchmark_results_to_df(pre_results)
+        post_df = self._benchmark_results_to_df(post_results)
+        if pre_df.empty or post_df.empty:
+            self._emit_report_lines(
+                ["Cannot print comparison: missing comparable benchmark rows"],
+                report_file,
+            )
+            return
+        comparison_df = pre_df.merge(
+            post_df,
+            on=self.keys,
+            how="outer",
+            suffixes=("_pre", "_post"),
+        )
+        comparison_df["shape"] = comparison_df["shape_pre"]
+        missing_shape_mask = comparison_df["shape"].isna() | (
+            comparison_df["shape"] == ""
+        )
+        comparison_df.loc[missing_shape_mask, "shape"] = comparison_df.loc[
+            missing_shape_mask, "shape_post"
+        ]
         lines = ["============= Tune Performance Comparison ============="]
-        header = f"{'Shape':<40} | {'Pre-tune(us)':>13} | {'Post-tune(us)':>14} | {'Speedup':>8} | {'Status':>8}"
+        header = f"{'Shape':<40} | {'Pre-E2E(us)':>13} | {'Post-E2E(us)':>14} | {'Speedup':>8} | {'Status':>8}"
         lines.append(header)
         lines.append("-" * len(header))
-        for pre in pre_results:
-            shape = pre["shape"]
-            post = post_map.get(shape)
-            pre_us = pre.get("us", -1)
-            if post is None:
+        for row in comparison_df.itertuples(index=False):
+            shape = getattr(row, "shape", "unknown")
+            pre_us = self._get_benchmark_e2e_us(row, "_pre")
+            post_us = self._get_benchmark_e2e_us(row, "_post")
+            post_status = getattr(row, "benchmark_status_post", "error")
+            if pd.isna(post_status):
+                pre_str = f"{pre_us:.2f}" if pd.notna(pre_us) and pre_us > 0 else "N/A"
                 lines.append(
-                    f"{shape:<40} | {pre_us:>13.2f} | {'N/A':>14} | {'N/A':>8} | {'MISS':>8}",
+                    f"{shape:<40} | {pre_str:>13} | {'N/A':>14} | {'N/A':>8} | {'MISS':>8}",
+                )
+                lines.append(
+                    self._format_benchmark_keys(
+                        {key: getattr(row, key, "") for key in self.keys}
+                    )
                 )
                 continue
-            post_us = post.get("us", -1)
-            post_status = post.get("status", "error")
+            status_summary, status_detail = self._split_benchmark_status(post_status)
             if pre_us > 0 and post_us > 0:
                 speedup = pre_us / post_us
                 speedup_str = f"{speedup:.2f}x"
             else:
                 speedup_str = "N/A"
-            status = "OK" if post_status == "ok" else "ERROR"
             pre_str = f"{pre_us:.2f}" if pre_us > 0 else "N/A"
             post_str = f"{post_us:.2f}" if post_us > 0 else "N/A"
             lines.append(
-                f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status:>8}"
+                f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status_summary:>8}"
             )
+            lines.append(
+                self._format_benchmark_keys(
+                    {key: getattr(row, key, "") for key in self.keys}
+                )
+            )
+            if status_detail:
+                lines.append(f"reason: {status_detail}")
         self._emit_report_lines(lines, report_file)
 
     def _benchmark_results_to_df(self, results, shapes_df=None):
-        columns = self.keys + ["shape", "benchmark_us", "benchmark_status"]
+        columns = self.keys + [
+            "shape",
+            "benchmark_status",
+            "benchmark_kernel_us",
+            "benchmark_e2e_us",
+        ]
         if shapes_df is None:
             shapes_df = self.untunedf
         if shapes_df is None or len(shapes_df) == 0 or not results:
@@ -635,8 +745,9 @@ class TunerCommon:
             bench = results[idx] or {}
             row = shapes_df.iloc[idx].to_dict()
             row["shape"] = bench.get("shape", "")
-            row["benchmark_us"] = bench.get("us", -1)
             row["benchmark_status"] = bench.get("status", "unknown")
+            row["benchmark_kernel_us"] = bench.get("kernel_us", None)
+            row["benchmark_e2e_us"] = bench.get("e2e_us", -1)
             rows.append(row)
         return pd.DataFrame(rows, columns=columns)
 
@@ -669,8 +780,8 @@ class TunerCommon:
         comparison.loc[missing_shape_mask, "shape"] = comparison.loc[
             missing_shape_mask, "shape_post"
         ]
-        comparison["pre_us"] = comparison["benchmark_us_pre"]
-        comparison["post_us"] = comparison["benchmark_us_post"]
+        comparison["pre_us"] = comparison["benchmark_e2e_us_pre"]
+        comparison["post_us"] = comparison["benchmark_e2e_us_post"]
         comparison["pre_status"] = comparison["benchmark_status_pre"]
         comparison["post_status"] = comparison["benchmark_status_post"]
 
@@ -737,7 +848,7 @@ class TunerCommon:
                 else "Rows with no valid pre-run baseline but passing post-run would also update."
             )
         )
-        header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>18}"
+        header = f"{'Shape':<40} | {'Pre-E2E':>10} | {'Post-E2E':>10} | {'Improve':>9} | {'Action':>18}"
         lines.append(header)
         lines.append("-" * len(header))
         for row in comparison.itertuples(index=False):
@@ -765,6 +876,15 @@ class TunerCommon:
             lines.append(
                 f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
             )
+            lines.append(
+                self._format_benchmark_keys({key: getattr(row, key, "") for key in self.keys})
+            )
+            pre_summary, pre_detail = self._split_benchmark_status(row.pre_status)
+            post_summary, post_detail = self._split_benchmark_status(row.post_status)
+            if pre_detail:
+                lines.append(f"pre-{pre_summary.lower()}: {pre_detail}")
+            if post_detail:
+                lines.append(f"post-{post_summary.lower()}: {post_detail}")
         self._emit_report_lines(lines, report_file)
 
     def _merge_compare_filtered_results(self, base_file, candidate_file, comparison):
@@ -896,6 +1016,10 @@ class TunerCommon:
         )
         if os.path.exists(candidate_base_file):
             shutil.copyfile(candidate_base_file, batch_compare_output_file)
+        else:
+            pd.DataFrame(columns=self.columns).to_csv(
+                batch_compare_output_file, index=False
+            )
         self.result_to_csv(results, batch_compare_output_file, not args.all)
         if os.path.exists(batch_compare_output_file):
             self.sortResults(batch_compare_output_file, args.sort, self.sort_keys)
@@ -1030,8 +1154,8 @@ class TunerCommon:
                 cu = self.get_cu_num()
                 if "cu_num" in tunedf.columns:
                     tunedf = tunedf[tunedf["cu_num"] == cu]
-                self.untunedf = (
-                    tunedf[self.keys].drop_duplicates().reset_index(drop=True)
+                self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
+                    drop=True
                 )
 
         print(self.untunedf)
@@ -1097,6 +1221,7 @@ class TunerCommon:
             else:
                 logger.info(f"results will be written to {output_file}")
         processed_batches = 0
+        completed_batches = 0
         results = []
         topk = -1 if fast_mode else 1
         self.tune_start_time = time.time()
@@ -1143,8 +1268,9 @@ class TunerCommon:
                         )
                     else:
                         self.result_to_csv(results, output_file, not args.all)
+                    completed_batches += 1
                     logger.info(
-                        f"processed {processed_batches} batches of {total_batches}, Processing Status ====> {round(processed_batches / total_batches,2)*100:.1f}% tuned in {self.name}"
+                        f"processed {completed_batches} batches of {total_batches}, Processing Status ====> {round(completed_batches / total_batches,2)*100:.1f}% tuned in {self.name}"
                     )
                 else:
                     logger.info(
@@ -1155,12 +1281,12 @@ class TunerCommon:
         except KeyboardInterrupt:
             tuning_status = "Interrupted"
             logger.error(
-                f"interrupted by user, tuning stopped, {processed_batches-1} batches processed"
+                f"interrupted by user, tuning stopped, {completed_batches} batches processed"
             )
         except Exception as e:
             tuning_status = "Error"
             logger.error(
-                f"error in batch {processed_batches} of {total_batches}: {str(e)}",
+                f"error in batch {processed_batches} of {total_batches} after {completed_batches} completed batches: {str(e)}",
                 exc_info=True,
             )
         finally:

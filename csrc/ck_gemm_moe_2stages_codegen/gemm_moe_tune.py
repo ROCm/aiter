@@ -24,6 +24,8 @@ from aiter.fused_moe import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
+    shuffle_scale_a16w4,
+    shuffle_weight_a16w4,
 )
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
@@ -2155,6 +2157,12 @@ class FmoeTuner(TunerCommon):
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
             shape_str = f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk})"
+            kernel_us = None
+            if "us" in row and pd.notna(row["us"]):
+                try:
+                    kernel_us = float(row["us"])
+                except (TypeError, ValueError):
+                    kernel_us = None
             try:
                 torch.manual_seed(0)
                 hidden = (
@@ -2188,9 +2196,54 @@ class FmoeTuner(TunerCommon):
                     w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
                     w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
-                # Preshuffle weights to match production layout (tuner tunes with bpreshuffle=True)
-                w1_qt_fmoe = shuffle_weight(w1_qt, (16, 16))
-                w2_qt_fmoe = shuffle_weight(w2_qt, (16, 16))
+                # Match the production/test path used by op_tests/test_moe_2stage.py.
+                w1_qt_fmoe = w1_qt
+                w2_qt_fmoe = w2_qt
+                w1_scale_fmoe = w1_scale
+                w2_scale_fmoe = w2_scale
+                if q_dtype_w == torch.int4:
+                    w1_qt_fmoe = rearrange_4bit_elements(
+                        convert_int8_to_uint32_int4(
+                            shuffle_weight(w1_qt_fmoe, (16, 16), use_int4=True)
+                        )
+                    )
+                    w2_qt_fmoe = rearrange_4bit_elements(
+                        convert_int8_to_uint32_int4(
+                            shuffle_weight(w2_qt_fmoe, (16, 16), use_int4=True)
+                        )
+                    )
+                    w1_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                    )
+                    w2_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                    )
+                elif (
+                    q_type == QuantType.per_1x32
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                    and q_dtype_w == dtypes.fp4x2
+                ):
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
+                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
+                    w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
+                elif q_dtype_w != dtypes.fp4x2:
+                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
+                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
+                    w1_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                    )
+                    w2_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                    )
+                else:
+                    w1_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w1_scale) if w1_scale is not None else None
+                    )
+                    w2_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w2_scale) if w2_scale is not None else None
+                    )
+
                 w1_qt_fmoe.is_shuffled = True
                 w2_qt_fmoe.is_shuffled = True
 
@@ -2215,7 +2268,7 @@ class FmoeTuner(TunerCommon):
 
                 out, us = run_perftest(
                     fused_moe,
-                    a1_qt,
+                    hidden,
                     w1_qt_fmoe,
                     w2_qt_fmoe,
                     topk_weights,
@@ -2223,9 +2276,8 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
-                    w1_scale=w1_scale,
-                    w2_scale=w2_scale,
-                    a1_scale=a1_scale,
+                    w1_scale=w1_scale_fmoe,
+                    w2_scale=w2_scale_fmoe,
                     dtype=dtype,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
@@ -2246,9 +2298,23 @@ class FmoeTuner(TunerCommon):
                 )
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
                 status = "ok" if err_ratio <= args.errRatio else "mismatch"
-                results.append({"shape": shape_str, "us": us, "status": status})
+                results.append(
+                    {
+                        "shape": shape_str,
+                        "e2e_us": us,
+                        "kernel_us": kernel_us,
+                        "status": status,
+                    }
+                )
             except Exception as e:
-                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+                results.append(
+                    {
+                        "shape": shape_str,
+                        "e2e_us": -1,
+                        "kernel_us": kernel_us,
+                        "status": f"error:{e}",
+                    }
+                )
         return results
 
     def tune(

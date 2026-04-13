@@ -101,9 +101,11 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                 ref = run_torch(x, weight, x_scale, w_scale)
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
                 status = "ok" if err_ratio <= args.errRatio else "mismatch"
-                results.append({"shape": shape_str, "us": us, "status": status})
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
-                results.append({"shape": shape_str, "us": -1, "status": f"error:{e}"})
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
         return results
 
     def calculate(self, results, bpes=(1, 1, 2)):
