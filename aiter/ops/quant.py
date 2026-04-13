@@ -72,8 +72,8 @@ def pertoken_quant(
     return y, y_scale
 
 
-def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False,
-                      pack_dim=-1):
+def per_1x32_f4_quant(
+    x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False, pack_dim=-1):
     """Quantize a tensor to MXFP4 (e2m1) format with per-1x32 block scaling.
 
     By default, packing is along the last dimension (dim=-1), which produces
@@ -98,7 +98,7 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False,
     """
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
-    F8E8M0_EXP_BIAS = 127
+    F8E8M0_EXP_BIAS = 127  # noqa:F841
     F4E2M1_MAX = 6.0
     MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
     # dtypeMax = F4E2M1_MAX
