@@ -34,6 +34,9 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
+    from .gemm_kernels import (
+        flydsl_preshuffle_gemm_a8,
+    )
     from .moe_kernels import (
         flydsl_moe_stage1,
         flydsl_moe_stage2,
@@ -41,8 +44,12 @@ if is_flydsl_available():
 
     from .gemm_kernels import flydsl_hgemm
 
+    from .linear_attention_kernels import flydsl_gdr_decode
+
     __all__ += [
+        "flydsl_preshuffle_gemm_a8",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",
+        "flydsl_gdr_decode",
     ]
