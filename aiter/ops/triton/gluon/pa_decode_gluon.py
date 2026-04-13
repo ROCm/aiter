@@ -35,12 +35,13 @@ except ImportError:
         pass
 
     @gluon.jit
-    def _amd_iglp_sched_group_barrier(tensor,inst_mask, cnt, _):
+    def _amd_iglp_sched_group_barrier(tensor, inst_mask, cnt, _):
         pass
 
     @gluon.jit
     def _amd_set_prio(value, prio):
         pass
+
 
 @gluon.jit
 def _fused_max_combine(a1, a2, b1, b2):
@@ -86,6 +87,12 @@ def parse_triton_version(version_str):
             break
     return tuple(parts)
 
+
+DS_WRITE = gl.constexpr(0x200)
+DS_READ = gl.constexpr(0x100)
+VMEM_LOAD = gl.constexpr(0x020)
+MFMA = gl.constexpr(0x008)
+COMPUTE = gl.constexpr(0x001)
 
 TRITON_VERSION = parse_triton_version(triton.__version__)
 # Pre-compute version check as constexpr for use in JIT kernels
@@ -359,13 +366,17 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
 
     # ==================== Memory Layout Definitions ====================
-    # Query tensor layout - blocked for efficient memory access (2D)
-    blocked_query_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[4, 16],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
+    if COMPUTE_TYPE.is_fp8():
+        SHARED_LAYOUT_WIDTH: gl.constexpr = 8
+    else:
+        SHARED_LAYOUT_WIDTH: gl.constexpr = 4
+    shared_query_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        SHARED_LAYOUT_WIDTH, 1, 16, order=[1, 0]
     )
+    shared_value_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        1, 1, 8, order=[0]
+    )
+    shared_key_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 8, order=[0])
 
     # MTP Query tensor layout (3D) [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
     if ONE_QUERY_GROUP_SIZE_POW2 <= 16:
@@ -496,7 +507,14 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     mtp_head_size_offsets = gl.arange(0, HEAD_SIZE_POW2, layout=mtp_head_size_layout)
 
     kv_scale_column_offsets = gl.arange(
-        0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
+        0,
+        KV_COMPUTE_BLOCK_SIZE,
+        layout=gl.BlockedLayout(
+            size_per_thread=[1],
+            threads_per_warp=[64],
+            warps_per_cta=[4],
+            order=[0],
+        ),
     )
 
     head_size_split_offsets = gl.arange(
@@ -568,7 +586,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         mtp_query_tensor,
         [QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2],
     )
-    query_tensor = gl.convert_layout(mtp_query_tensor, layout=blocked_query_layout)
 
     # ==================== Query Quantization Scale Handling ====================
     if QUERY_QUANT_MODE == 0:
@@ -675,31 +692,71 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         if kv_sequence_start_index >= context_length:
             return
 
+    query_shared = gl.allocate_shared_memory(
+        COMPUTE_TYPE, [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2], shared_query_layout
+    )
+    mtp_query_tensor = mtp_query_tensor.to(COMPUTE_TYPE)
+    query_shared.store(mtp_query_tensor)
+
+    if KV_QUANT_MODE == 1:
+        value_scale_shared = gl.allocate_shared_memory(
+            gl.float32, [KV_COMPUTE_BLOCK_SIZE], shared_value_scale_layout
+        )
+        key_scale_shared = gl.allocate_shared_memory(
+            gl.float32, [KV_COMPUTE_BLOCK_SIZE], shared_key_scale_layout
+        )
+
     KV_COMPUTE_BLOCK_COUNT: gl.constexpr = (
         CONTEXT_PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
     )
+    block_table_id = kv_sequence_start_index // KV_BLOCK_SIZE
+    # ==================== Block Table Lookup ====================
+    block_tables_start_ptr = block_tables_ptr + sequence_idx * stride_block_table_seq
+    kv_page_id = gl.load(block_tables_start_ptr + block_table_id)
+    # ==================== Key Quantization Scale Handling ====================
+    if KV_QUANT_MODE == 0:
+        # Per-tensor quantization
+        key_scale_value = gl.load(key_scale)
+        value_scale_value = gl.load(value_scale)
 
     # ==================== Main Attention Computation Loop ====================
     for kv_block_index in gl.static_range(KV_COMPUTE_BLOCK_COUNT):
+        current_page_offset = page_offset + kv_block_index * KV_COMPUTE_BLOCK_SIZE
         kv_sub_sequence_start_index = (
             kv_sequence_start_index + kv_block_index * KV_COMPUTE_BLOCK_SIZE
         )
-
-        block_table_id = kv_sub_sequence_start_index // KV_BLOCK_SIZE
-        current_page_offset = page_offset + kv_block_index * KV_COMPUTE_BLOCK_SIZE
+        if KV_QUANT_MODE == 1:
+            # Per-token quantization: load scales in a distributed block layout,
+            # then remap to the QK linear layout used by the compute path.
+            key_scale_offsets = (
+                kv_page_id * kv_scale_stride_0
+                + kv_head_idx * kv_scale_stride_1
+                + current_page_offset
+                + kv_scale_column_offsets
+            )
+            kv_scale_mask = (
+                kv_sub_sequence_start_index + kv_scale_column_offsets
+                >= sequence_start_idx
+            )
+            key_scale_value = gl.load(
+                key_scale + key_scale_offsets,
+                mask=kv_scale_mask,
+                other=0.0,
+            )
+            key_scale_shared.store(key_scale_value)
+            value_scale_value = gl.load(
+                value_scale + key_scale_offsets,
+                mask=kv_scale_mask,
+                other=0.0,
+            )
+            value_scale_shared.store(value_scale_value)
 
         # Calculate column offsets for QK computation
         qk_column_offsets = kv_sub_sequence_start_index + gl.arange(
             0, KV_COMPUTE_BLOCK_SIZE, layout=gl.SliceLayout(0, qk_linear_layout)
         )
 
-        # ==================== Block Table Lookup ====================
-        block_tables_start_ptr = (
-            block_tables_ptr + sequence_idx * stride_block_table_seq
-        )
-        kv_page_id = tl.load(block_tables_start_ptr + block_table_id)
         kv_page_id = kv_page_id.to(gl.int64)
-
         # ==================== Key Cache Loading ====================
         # Calculate key cache block offsets [KEY_HEAD_SIZE_POW2_SPLIT, KV_COMPUTE_BLOCK_SIZE, CONTIGUOUS_KV_ELEMENTS_16B_LOAD]
         key_block_offsets = (
@@ -713,28 +770,26 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
         # Load key cache block
         key_block = gl.load(key_cache_ptr + key_block_offsets)
-
-        # ==================== Key Quantization Scale Handling ====================
-        if KV_QUANT_MODE >= 0:
-            if KV_QUANT_MODE == 0:
-                # Per-tensor quantization
-                key_scale_value = tl.load(key_scale)
-                value_scale_value = tl.load(value_scale)
-            elif KV_QUANT_MODE == 1:
-                # Per-token quantization
-                key_scale_offsets = (
-                    kv_page_id * kv_scale_stride_0
-                    + kv_head_idx * kv_scale_stride_1
-                    + current_page_offset
-                    + kv_scale_column_offsets
-                )
-                key_scale_value = gl.load(key_scale + key_scale_offsets)
-                value_scale_value = gl.load(value_scale + key_scale_offsets)
-
         # Reshape key block to [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         key_block = gl.permute(key_block, [0, 2, 1])
         key_block = gl.reshape(key_block, [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE])
+        for _ in gl.static_range(8):
+            key_block = _amd_iglp_sched_group_barrier(key_block, VMEM_LOAD, 1, 0)
+            key_block = _amd_iglp_sched_group_barrier(key_block, COMPUTE, 4, 0)
+        key_block = _amd_iglp_sched_barrier(key_block, 0x0)
 
+        # ==================== QK Matrix Multiplication ====================
+        # Initialize QK accumulator
+        qk_accumulator = gl.zeros(
+            (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
+            dtype=gl.float32,
+            layout=qk_mfma_layout,
+        )
+
+        # Convert layouts for MFMA operation
+        query_converted = query_shared.load(qk_lhs_layout)
+        key_converted = gl.convert_layout(key_block, layout=qk_rhs_layout)
+        key_converted = key_converted.to(COMPUTE_TYPE)
         # ==================== Value Cache Loading ====================
         if VALUE_TRANSPOSED:
             # Calculate offsets for transposed value cache
@@ -768,30 +823,21 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             value_block = gl.load(value_cache_ptr + value_block_offsets)
             # Transpose to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [1, 0])
-
-        # ==================== QK Matrix Multiplication ====================
-        # Initialize QK accumulator
-        qk_accumulator = gl.zeros(
-            (QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE),
-            dtype=gl.float32,
-            layout=qk_mfma_layout,
-        )
-
-        # Convert layouts for MFMA operation
-        query_converted = gl.convert_layout(query_tensor, layout=qk_lhs_layout)
-        key_converted = gl.convert_layout(key_block, layout=qk_rhs_layout)
-        query_converted = query_converted.to(COMPUTE_TYPE)
-        key_converted = key_converted.to(COMPUTE_TYPE)
-
         # Perform matrix multiplication
         qk_matrix = gl.amd.cdna3.mfma(query_converted, key_converted, qk_accumulator)
         qk_matrix = gl.reshape(
             qk_matrix, [QUERY_GROUP_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         )
-
+        for _ in gl.static_range(8):
+            qk_matrix = _amd_iglp_sched_group_barrier(qk_matrix, VMEM_LOAD, 1, 1)
+            qk_matrix = _amd_iglp_sched_group_barrier(qk_matrix, COMPUTE, 4, 1)
+        qk_matrix = _amd_iglp_sched_barrier(qk_matrix, 0x0)
         # ==================== Scale QK Scores ====================
         if KV_QUANT_MODE >= 0:
             if KV_QUANT_MODE == 1:
+                key_scale_value = key_scale_shared.load(
+                    gl.SliceLayout(0, qk_linear_layout)
+                )
                 # Expand key scale for broadcasting [1, KV_COMPUTE_BLOCK_SIZE]
                 key_scale_value = key_scale_value[None, :]
             if QUERY_QUANT_MODE >= 0:
@@ -852,6 +898,9 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         # ==================== Value Scaling for FP8 ====================
         if value_block.dtype.is_fp8():
             if KV_QUANT_MODE == 1:
+                value_scale_value = value_scale_shared.load(
+                    gl.SliceLayout(0, qk_linear_layout)
+                )
                 # Per-token quantization scaling
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
@@ -861,11 +910,14 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 )
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
-                value_scale_value = (
-                    value_scale_value * float(FP8_MAX_VALUE) / (value_scale_max + 1e-8)
+                # Use fast reciprocal plus multiplies instead of a full divide.
+                inv_value_scale_max = hip_libdevice.fast_dividef(
+                    1.0, value_scale_max + 1e-8
                 )
+                fp8_inv_scale = float(FP8_MAX_VALUE) * inv_value_scale_max
+                value_scale_value = value_scale_value * fp8_inv_scale
                 attention_probs = value_scale_value[None, :] * attention_probs
-                probability_scale = value_scale_max / float(FP8_MAX_VALUE)
+                probability_scale = value_scale_max * (1.0 / float(FP8_MAX_VALUE))
             elif KV_QUANT_MODE == 0:
                 attention_probs *= float(FP8_MAX_VALUE)
                 probability_scale = value_scale_value / float(FP8_MAX_VALUE)
@@ -1059,13 +1111,7 @@ def paged_attention_decode_sliding_window_head_1(
     if KV_QUANT_MODE >= 0:
         gl.static_assert(key_scale.dtype.element_ty == gl.float32)
         gl.static_assert(value_scale.dtype.element_ty == gl.float32)
-    
-    DS_WRITE: gl.constexpr = 0x200
-    DS_READ: gl.constexpr = 0x100
-    VMEM_LOAD: gl.constexpr = 0x020
-    MFMA: gl.constexpr = 0x008
-    VALU: gl.constexpr = 0x002
-    
+
     sequence_idx = gl.program_id(0)
     mtp_idx = gl.program_id(1)
     split_idx = gl.program_id(2)
@@ -1866,10 +1912,14 @@ def paged_attention_decode_sliding_window_head_1(
             value_scale_value = gl.where(
                 valid_token_mask, value_scale_value, float(0.0)
             )
-            value_scale_broadcast = tl.broadcast_to(value_scale_value[None, :], attention_scores.shape)
+            value_scale_broadcast = tl.broadcast_to(
+                value_scale_value[None, :], attention_scores.shape
+            )
             current_max_logits, value_scale_max_2d = gl.reduce(
-                (attention_scores, value_scale_broadcast), axis=1, combine_fn=_fused_max_combine
-                )
+                (attention_scores, value_scale_broadcast),
+                axis=1,
+                combine_fn=_fused_max_combine,
+            )
             # All rows are identical (broadcast from 1D); collapse to scalar.
             # This is a cheap intra-wave reduction, no extra cross-wave barrier.
             value_scale_max = gl.max(value_scale_max_2d, axis=0)
@@ -1917,7 +1967,9 @@ def paged_attention_decode_sliding_window_head_1(
                 # Use HIP libdevice fast_dividef which generates v_rcp_f32 + one Newton-Raphson step
                 # This reduces ~12 instructions to ~3-4 instructions with acceptable precision loss
                 # The relative error is < 2^-22 which is sufficient for FP8 quantization scaling
-                inv_value_scale_max = hip_libdevice.fast_dividef(1.0, value_scale_max + 1e-8)
+                inv_value_scale_max = hip_libdevice.fast_dividef(
+                    1.0, value_scale_max + 1e-8
+                )
                 fp8_inv_scale = float(FP8_MAX_VALUE) * inv_value_scale_max
                 value_scale_value = value_scale_value * fp8_inv_scale
                 attention_probs = value_scale_value[None, :] * attention_probs
@@ -1955,14 +2007,30 @@ def paged_attention_decode_sliding_window_head_1(
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
         )
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, VMEM_LOAD, 2, 1)
-        key_block_offsets2 = _amd_iglp_sched_group_barrier(key_block_offsets2, MFMA, 4, 1)
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, VMEM_LOAD, 2, 1
+        )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, MFMA, 4, 1
+        )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, VMEM_LOAD, 2, 1
+        )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, MFMA, 4, 1
+        )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, VMEM_LOAD, 2, 1
+        )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, MFMA, 4, 1
+        )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, VMEM_LOAD, 2, 1
+        )
+        key_block_offsets2 = _amd_iglp_sched_group_barrier(
+            key_block_offsets2, MFMA, 4, 1
+        )
         key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
         if KV_QUANT_MODE >= 0:
             attention_accumulator += probability_scale * attention_output
