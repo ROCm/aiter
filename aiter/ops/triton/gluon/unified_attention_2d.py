@@ -143,7 +143,7 @@ def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SI
             vec=CONTIGUITY, per_phase=2, max_phase=8, order=[0, 1]
         )
         shared_v = gl.SwizzledSharedLayout(
-            vec=CONTIGUITY, per_phase=1, max_phase=8, order=[1, 0]
+            vec=CONTIGUITY, per_phase=1, max_phase=1 if not FP8_KV else 8, order=[1, 0]
         )
 
     return blocked_k, blocked_v, shared_k, shared_v
