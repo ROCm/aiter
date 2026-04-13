@@ -464,7 +464,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
          (max_seqlen_qo == 4)) ||
         ((arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 && kv_is_fp8 &&
-         (max_seqlen_qo == 1)) ||
+         (max_seqlen_qo == 1)) || 
+        ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 128 == 0) && !q_is_fp8 && !kv_is_fp8) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     const bool use_qseqlen_fold =
@@ -493,7 +494,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
                     ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
                     ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
-                    ((num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8),
+                    ((num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8) ||
+                    ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 128 == 0) && !q_is_fp8 && !kv_is_fp8),
                 __func__,
                 ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8.")

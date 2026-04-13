@@ -86,8 +86,8 @@ def dump_mla_metadata_v1_txt(
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.bf16 and nhead == 32:
-        return False
+    # if dtype == dtypes.bf16 and nhead == 32:
+    #     return False
     return True
 
 
@@ -1146,8 +1146,8 @@ def test_mla(
     # """ test code for decode_update_mla_metadata_v1 """
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
-    # print(f"{work_indptr=}")
-    # print(f"{work_info_set[:work_indptr[-1].item()]=}")
+    print(f"{work_indptr=}")
+    print(f"{work_info_set[:32]=}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
@@ -1320,41 +1320,7 @@ def test_mla(
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
 
-        if not non_persistent_mode:
-            partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
-                torch_mla_split_kv_and_reduce(
-                    q,
-                    kv_buffer,
-                    qo_indptr,
-                    kv_indptr,
-                    kv_indices,
-                    kv_last_page_lens,
-                    sm_scale,
-                    kv_lora_rank,
-                    qk_rope_head_dim,
-                    dtype=out_dtype,
-                    work_meta_data=work_meta_data,
-                    work_info_set=work_info_set,
-                    work_indptr=work_indptr,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    max_seqlen_q=max_seqlen_qo,
-                    is_causal=True,
-                )
-            )
-
-            checkAllclose(
-                split_out_ref,
-                out_asm,
-                msg=f"mla_decode-absorb_fp8    [golden fp8 split_out_ref vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-            )
-            if partial_out_ref.shape[0] > 0:
-                checkAllclose(
-                    partial_out_ref,
-                    attn_logits[: partial_out_ref.shape[0]].flatten(0, 1),
-                    msg=f"mla_decode-absorb_fp8    [partial_out_ref vs attn_logits]: {us_asm_decode:>8.2f} us......",
-                )
+        cal_diff(out_ref, out_asm, "out")
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():

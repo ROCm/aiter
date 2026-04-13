@@ -941,6 +941,12 @@ def get_mla_metadata_info_v1(
             and num_head_qo == 128
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
+        )       
+        or (
+            get_gfx() == "gfx950"
+            and (num_head_qo * max_seqlen_qo) % 128 == 0
+            and kv_dtype == dtypes.bf16
+            and q_dtype == dtypes.bf16
         )
         or (
             get_gfx() == "gfx950"
