@@ -248,14 +248,14 @@ if PREBUILD_KERNELS != 0:
             all_opts_args_build.extend(extra_args_build)
 
         bd = f"{core.get_user_jit_dir()}/build"
-
+        
         shutil.rmtree(bd, ignore_errors=True)
         for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
             try:
                 os.remove(f)
             except Exception:
                 pass
-
+        
         def build_one_module(one_opt_args):
             flags_cc = list(one_opt_args["flags_extra_cc"]) + [
                 f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
@@ -263,7 +263,7 @@ if PREBUILD_KERNELS != 0:
             flags_hip = list(one_opt_args["flags_extra_hip"]) + [
                 f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
             ]
-
+        
             core.build_module(
                 md_name=one_opt_args["md_name"],
                 srcs=one_opt_args["srcs"],
@@ -296,6 +296,15 @@ if PREBUILD_KERNELS != 0:
             os.makedirs(flydsl_cache_dir, exist_ok=True)
             os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = flydsl_cache_dir
 
+            # setup.py loads `jit.core` via sys.path (line 134-135).
+            # Map those modules into the `aiter.*` namespace so that
+            # `import aiter.jit.core` reuses the same instances.
+            for _name in list(sys.modules):
+                if _name == "jit" or _name.startswith("jit."):
+                    _pkg = f"aiter.{_name}"
+                    if _pkg not in sys.modules:
+                        sys.modules[_pkg] = sys.modules[_name]
+
             from aiter.aot.flydsl.moe import (
                 DEFAULT_CSVS,
                 compile_one_config,
@@ -316,6 +325,8 @@ if PREBUILD_KERNELS != 0:
                 for job in moe_jobs:
                     compile_one_config(**job)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[aiter] FlyDSL MoE AOT skipped: {e}")
 
 
