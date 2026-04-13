@@ -276,7 +276,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         const float lse_scale_1 = p_lds_lse_scale[tile_idx + 1 - reduce_tile_start];
 
         // calculate on tile 0
-        opus::static_for<kVecWidth>([&](auto i) { reg_out[i] += lse_scale_0 * oaccu_0[i]; });
+        opus::static_for<kVecWidth>([&](auto i) { reg_out[i.value] += lse_scale_0 * oaccu_0[i.value]; });
 
         // load partial map for tile 3
         reduce_partial_map_1_local = p_lds_reduce_partial_map[tile_idx + 3 - reduce_tile_start];
@@ -286,7 +286,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         lse_scale_0 = p_lds_lse_scale[tile_idx + 2 - reduce_tile_start];
 
         // calculate on tile 1
-        opus::static_for<kVecWidth>([&](auto i) { reg_out[i] += lse_scale_1 * oaccu_1[i]; });
+        opus::static_for<kVecWidth>([&](auto i) { reg_out[i.value] += lse_scale_1 * oaccu_1[i.value]; });
     }
 
     if((tile_idx + 1) < reduce_tile_end)
@@ -306,7 +306,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         const float lse_scale_1 = p_lds_lse_scale[tile_idx + 1 - reduce_tile_start];
 
         // calculate on tile 0
-        opus::static_for<kVecWidth>([&](auto i) { reg_out[i] += lse_scale_0 * oaccu_0[i]; });
+        opus::static_for<kVecWidth>([&](auto i) { reg_out[i.value] += lse_scale_0 * oaccu_0[i.value]; });
 
         // load data for tile 2
         if((tile_idx + 2) < reduce_tile_end)
@@ -316,7 +316,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         }
 
         // calculate on tile 1
-        opus::static_for<kVecWidth>([&](auto i) { reg_out[i] += lse_scale_1 * oaccu_1[i]; });
+        opus::static_for<kVecWidth>([&](auto i) { reg_out[i.value] += lse_scale_1 * oaccu_1[i.value]; });
 
         tile_idx += 2;
     }
@@ -327,7 +327,7 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
         // * data for tile 0 is ready.
 
         // calculate on tile 0
-        opus::static_for<kVecWidth>([&](auto i) { reg_out[i] += lse_scale_0 * oaccu_0[i]; });
+        opus::static_for<kVecWidth>([&](auto i) { reg_out[i.value] += lse_scale_0 * oaccu_0[i.value]; });
     }
 
     out_t* p_final_out = p_final_out_base + seq_idx * params.stride_s_o;
@@ -534,14 +534,14 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
             const float new_scale   = expf(lse_val - new_max_lse);
 
             opus::static_for<kVecWidth>([&](auto i) {
-                reg_out[i] = old_scale * reg_out[i] + new_scale * oaccu[i];
+                reg_out[i.value] = old_scale * reg_out[i.value] + new_scale * oaccu[i.value];
             });
 
             max_lse   = new_max_lse;
             sum_e_lse = sum_e_lse * old_scale + new_scale;
         }
 
-        opus::static_for<kVecWidth>([&](auto i) { reg_out[i] = reg_out[i] / sum_e_lse; });
+        opus::static_for<kVecWidth>([&](auto i) { reg_out[i.value] = reg_out[i.value] / sum_e_lse; });
 
         auto g_final_out = opus::make_gmem<out_t>(p_final_out);
         auto reg_out_casted = opus::cast<out_t>(reg_out);
