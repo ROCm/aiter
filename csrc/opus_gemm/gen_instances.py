@@ -11,14 +11,14 @@ from opus_gemm_common import OpusGemmInstance, kernels_list, default_kernels_dic
 
 PIPELINE_HEADER_MAP = {
     "a8w8_scale": "pipeline/opus_gemm_pipeline_a8w8_scale.cuh",
-    "a8w8":       "pipeline/opus_gemm_pipeline_noscale.cuh",
-    "a16w16":     "pipeline/opus_gemm_pipeline_noscale.cuh",
+    "a8w8":       "pipeline/opus_gemm_pipeline_a8w8_noscale.cuh",
+    "a16w16":     "pipeline/opus_gemm_pipeline_a16w16.cuh",
 }
 
 KERNEL_FUNC_MAP = {
     "a8w8_scale": "gemm_a8w8_scale_kernel",
-    "a8w8":       "gemm_noscale_kernel",
-    "a16w16":     "gemm_noscale_kernel",
+    "a8w8":       "gemm_a8w8_noscale_kernel",
+    "a16w16":     "gemm_a16w16_kernel",
 }
 
 INPUT_DTYPE_MAP = {

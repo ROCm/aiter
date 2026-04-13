@@ -1,25 +1,19 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Shared noscale pipeline for a8w8 (fp8, W_K=128) and a16w16 (bf16, W_K=32).
+// FP8 noscale pipeline for a8w8 (fp8, W_K=128).
 // T_M=2, T_N=4 wave mapping. No scale factors.
+// MMA uses cbsz/blgp args (0,0) required by fp8 MFMA.
 #pragma once
 
 #include "../opus_gemm_common.cuh"
 
-// fp8 MFMA needs cbsz/blgp args (0,0); bf16 MFMA does not accept them
-template<typename D_A, typename MMA, typename VA, typename VB, typename VC>
-__device__ __forceinline__ auto mma_dispatch(MMA& mma, VA& va, VB& vb, VC& vc) {
-    if constexpr (sizeof(D_A) == 1) {
-        return mma(va, vb, vc, 0, 0);
-    } else {
-        return mma(va, vb, vc);
-    }
-}
-
 // ============================================================================
 // Layout functions for noscale kernels (T_M=2, T_N=4 wave mapping)
+// Guarded: these are __device__ functions only needed on the device pass.
 // ============================================================================
+
+#ifdef __HIP_DEVICE_COMPILE__
 
 template<typename T>
 inline __device__ auto make_layout_ga_noscale(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
@@ -160,12 +154,16 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n / T::T_M, lane_id_n % T::T_N, wave_id_n % T::T_M, lane_id_n / T::T_N, lane_id / T::W_N}));
 }
 
+#endif // __HIP_DEVICE_COMPILE__
+
 // ============================================================================
-// Noscale GEMM kernel (shared by a8w8 and a16w16)
+// FP8 noscale GEMM kernel (a8w8 without scale)
+// Kernel definition visible on both passes (host pass needs it for stub generation).
 // ============================================================================
 
 template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opus_gemm_noscale_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kernel(opus_gemm_noscale_kargs kargs) {
+#ifdef __HIP_DEVICE_COMPILE__
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -269,7 +267,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[0][0]);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -280,7 +278,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[0][1]);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -291,7 +289,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[1][0]);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -302,7 +300,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
         __builtin_amdgcn_s_barrier();
 
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[1][1]);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -315,7 +313,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[0][0]);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -326,7 +324,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[0][1]);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -337,7 +335,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[1][0]);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -348,7 +346,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
         __builtin_amdgcn_s_barrier();
 
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[1][1]);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -364,7 +362,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
         s_waitcnt_lgkmcnt(0_I);
 
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[0][0]);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -374,7 +372,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[0][1]);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -385,8 +383,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[1][0]);
-        v_c[1][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[1][1]);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -403,7 +401,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[0][0]);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -414,7 +412,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[0][1]);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -424,8 +422,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma_dispatch<D_A>(mma, v_a, v_b[0], v_c[1][0]);
-        v_c[1][1] = mma_dispatch<D_A>(mma, v_a, v_b[1], v_c[1][1]);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -464,4 +462,5 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_noscale_kernel(opu
     store_c(v_c[0][1], 0, 1);
     store_c(v_c[1][0], 1, 0);
     store_c(v_c[1][1], 1, 1);
+#endif // __HIP_DEVICE_COMPILE__
 }
