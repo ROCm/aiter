@@ -24,6 +24,17 @@ using opus::operator""_I;
 
 #define CHECK_HIP_KERNEL_LAUNCH() CHECK_HIP(hipGetLastError())
 
+__host__ __device__ inline int ceil_div(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+__host__ __device__ constexpr inline int ceil_div_constexpr(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+#ifdef __HIP_DEVICE_COMPILE__
+// ── Device-only utilities (skipped on host pass to reduce parse time) ──
+
 #define MFMA_MASK 0x08
 #define VALU_MASK 0x02
 
@@ -34,14 +45,6 @@ __device__ __forceinline__ void sched_barrier_pairs() {
     SCHED_BARRIER(MFMA_MASK, 1, Group);
     SCHED_BARRIER(VALU_MASK, VALU_CNT, Group);
     if constexpr (Pairs > 1) sched_barrier_pairs<Pairs - 1, VALU_CNT, Group>();
-}
-
-__host__ __device__ inline int ceil_div(int a, int b) {
-    return (a + b - 1) / b;
-}
-
-__host__ __device__ constexpr inline int ceil_div_constexpr(int a, int b) {
-    return (a + b - 1) / b;
 }
 
 template<int E_M, int E_N, int ELEM_C, typename D_ACC, typename D_SF>
@@ -65,3 +68,5 @@ inline __device__ void scale_c_tile(
         });
     });
 }
+
+#endif // __HIP_DEVICE_COMPILE__

@@ -6,7 +6,10 @@
 
 // ============================================================================
 // Layout functions for A/B matrix global/shared/register data movement
+// Guarded: these are __device__ functions only needed on the device pass.
 // ============================================================================
+
+#ifdef __HIP_DEVICE_COMPILE__
 
 template<typename T>
 inline __device__ auto make_layout_ga(int lane_id, int wave_id_m, int wave_id_n, int stride_a) {
@@ -165,12 +168,16 @@ inline __device__ auto make_layout_sfa(int lane_id, int wave_id_m, int stride_sf
         opus::unfold_p_coord(sfa_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M}));
 }
 
+#endif // __HIP_DEVICE_COMPILE__ (layout functions)
+
 // ============================================================================
 // Hand-tuned GEMM kernel with block-scale (a8w8 + scale 1x128x128)
+// Kernel definition visible on both passes (host pass needs it for stub generation).
 // ============================================================================
 
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(opus_gemm_kargs kargs) {
+#ifdef __HIP_DEVICE_COMPILE__
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -532,4 +539,5 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(
     store<T::VEC_C>(g_c, v_c[0][1], u_gc, c_offset(0, 1));
     store<T::VEC_C>(g_c, v_c[1][0], u_gc, c_offset(1, 0));
     store<T::VEC_C>(g_c, v_c[1][1], u_gc, c_offset(1, 1));
+#endif // __HIP_DEVICE_COMPILE__
 }
