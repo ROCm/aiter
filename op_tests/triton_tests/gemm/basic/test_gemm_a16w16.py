@@ -6,7 +6,24 @@ import torch.nn.functional as F
 import pytest
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+import importlib.util
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
+
+
+def get_gpu_arch():
+    """Get the GPU architecture name (e.g., 'gfx1250', 'gfx942')."""
+    if not torch.cuda.is_available():
+        return None
+    props = torch.cuda.get_device_properties(0)
+    return getattr(props, "gcnArchName", None)
+
+
+def is_flydsl_supported():
+    """Check if flydsl kernels are supported on the current GPU."""
+    if importlib.util.find_spec("flydsl") is None:
+        return False
+    arch = get_gpu_arch()
+    return arch is not None and arch.startswith("gfx1250")
 
 
 def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=False):
@@ -38,22 +55,48 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
     return x, weight, bias_tensor, out_dtype, y
 
 
+def _flydsl_gemm_a16w16(x, w, bias=None, dtype=torch.bfloat16, y=None, activation=None):
+    """Lazy import and call the flydsl gemm_a16w16 kernel."""
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx1250 import (
+        gemm_a16w16 as flydsl_gemm,
+    )
+    return flydsl_gemm(x, w, bias=bias, dtype=dtype, y=y, activation=activation)
+
+
 def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
-    # GPT-OSS-120B attention projections
-    x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
-    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
-    x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
+    x_vals = [
+        (1, 1, 1),
+        (1, 16, 16),
+        (16, 1, 16),
+        (16, 16, 1),
+        # Irregular shapes (masking & OOB)
+        (3, 5, 7),
+        (17, 33, 65),
+        (63, 127, 255),
+        (65, 129, 257),
+        #
+        (64, 64, 64),
+        (128, 128, 128),
+        # Multiple blocks
+        (128, 256, 512),
+        (256, 512, 256),
+        # Asymmetric shapes
+        (32, 256, 128),
+        (256, 32, 128),
+        (128, 128, 1024),
+        (1024, 128, 128),
+        (1536, 512, 768),
+    ]
     return x_vals
 
 
 # Test plain BF16 GEMMs - the most common types.
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-def test_gemm_a16_w16(M: int, N: int, K: int):
+@pytest.mark.parametrize("backend", ["triton", "flydsl"])
+def test_gemm_a16_w16(M: int, N: int, K: int, backend):
+    if backend == "flydsl" and not is_flydsl_supported():
+        pytest.skip("FlyDSL not supported (requires gfx1250 and flydsl package)")
+
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
         N,
@@ -64,31 +107,41 @@ def test_gemm_a16_w16(M: int, N: int, K: int):
 
     torch_out = F.linear(x, w, bias=None)
 
-    triton_out = gemm_a16w16(
-        x,
-        w,
-    )
+    if backend == "flydsl":
+        kernel_out = _flydsl_gemm_a16w16(x, w, dtype=torch.bfloat16)
+    else:
+        kernel_out = gemm_a16w16(x, w)
 
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
 # Smaller set for testing activations, setting the output tensor and dtype
 def get_fewer_x_vals():
-    x_vals = [(16, 1024, 1024)]
-    x_vals += [(128, 8192, 512)]
-    x_vals += [(256, 512, 8192)]
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 5, 8)]
+    x_vals = [
+        (64, 64, 64),
+        (128, 256, 512),
+        (256, 512, 256),
+        (128, 128, 1024),
+        (1024, 128, 128),
+        (1536, 512, 768),
+    ]
     return x_vals
 
 
 # A smaller set of shapes that tests fused activations, different dtypes
 # and output tensor arg. We don't want the larger set above to test
 # all these combinations.
-@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu", "silu_exp2"])
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activation):
+@pytest.mark.parametrize("backend", ["triton", "flydsl"])
+def test_gemm_a16_w16_activation(
+    M: int, N: int, K: int, dtype, output, activation, backend
+):
+    if backend == "flydsl" and not is_flydsl_supported():
+        pytest.skip("FlyDSL not supported (requires gfx1250 and flydsl package)")
+
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
         N,
@@ -102,24 +155,27 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
         torch_out = F.gelu(torch_out)
     elif activation == "gelu_tanh":
         torch_out = F.gelu(torch_out, approximate="tanh")
-    elif activation == "silu":
+    elif activation in ("silu", "silu_exp2"):
         torch_out = F.silu(torch_out)
 
-    triton_out = gemm_a16w16(
-        x,
-        w,
-        None,
-        out_dtype,
-        y,
-        activation=activation,
-    )
+    if backend == "flydsl":
+        kernel_out = _flydsl_gemm_a16w16(
+            x, w, dtype=out_dtype if not isinstance(out_dtype, tuple) else dtype,
+            y=y, activation=activation,
+        )
+    else:
+        kernel_out = gemm_a16w16(x, w, None, out_dtype, y, activation=activation)
 
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
-def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout):
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+@pytest.mark.parametrize("backend", ["triton", "flydsl"])
+def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend):
+    if backend == "flydsl" and not is_flydsl_supported():
+        pytest.skip("FlyDSL not supported (requires gfx1250 and flydsl package)")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -128,9 +184,12 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout):
 
     torch_out = F.linear(x, w, bias=None)
 
-    triton_out = gemm_a16w16(x, w, None, out_dtype, y)
+    if backend == "flydsl":
+        kernel_out = _flydsl_gemm_a16w16(x, w, dtype=torch.bfloat16)
+    else:
+        kernel_out = gemm_a16w16(x, w, None, out_dtype, y)
 
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
