@@ -624,49 +624,28 @@ def run_torch_fused_norm_rope_group_quant(
         kv_cache[block_indices[i], block_offsets[i], :, :kv_lora_rank] = k_concat[i]
     ##
     if kv_cache_dtype == "fp8":
-        # FlashMLA-style tile-based group quantization for k_nope
-        # Layout per (block, offset, head): [kv_lora_rank fp8 data | num_tiles e8m0 scales]
-        tile_size = group_size
-        num_tiles = kv_lora_rank // tile_size
+        num_tiles = kv_lora_rank // group_size
         fp8_max = torch.finfo(dtypes.fp8).max
-        k_inverted_DTYPE_MAX = torch.tensor(
-            1.0 / fp8_max, dtype=torch.float32, device=kv_c.device
-        )
+        inv_fp8_max = 1.0 / fp8_max
 
-        def _f32_to_e8m0_ceil(x):
-            u32 = x.view(torch.int32).item()
-            exponent = (u32 >> 23) & 0xFF
-            if u32 & 0x7FFFFF:
-                exponent += 1
-            return exponent
+        # Vectorized K group quant: [N, KVH, kv_lora_rank] → [N, KVH, num_tiles, group_size]
+        k_tiled = k_nope_f32.reshape(num_tokens, num_kv_heads, num_tiles, group_size)
+        k_group_max = k_tiled.abs().amax(dim=-1)  # [N, KVH, num_tiles]
+        k_scales_f32 = k_group_max * inv_fp8_max   # [N, KVH, num_tiles]
+        # e8m0 ceil: extract exponent, round up if mantissa != 0
+        k_u32 = k_scales_f32.view(torch.int32)
+        k_exponents = ((k_u32 >> 23) & 0xFF).to(torch.int32)
+        k_has_mantissa = (k_u32 & 0x7FFFFF) != 0
+        k_exponents = k_exponents + k_has_mantissa.to(torch.int32)
+        # Reconstruct e8m0 scale for dequant
+        k_e8m0_u32 = (k_exponents << 23).view(torch.float32)  # [N, KVH, num_tiles]
+        k_inv_scale = k_e8m0_u32.unsqueeze(-1).expand_as(k_tiled)  # [N, KVH, num_tiles, group_size]
+        k_quantized = (k_tiled / k_inv_scale).to(dtypes.fp8).reshape(num_tokens, num_kv_heads, kv_lora_rank)
 
         for i in range(num_tokens):
-            block_idx = block_indices[i]
-            block_off = block_offsets[i]
-
-            for kv_head in range(num_kv_heads):
-                k_data = k_nope_f32[i, kv_head, :]
-
-                for tile_idx in range(num_tiles):
-                    tile_start = tile_idx * tile_size
-                    tile_end = tile_start + tile_size
-                    tile_data = k_data[tile_start:tile_end]
-
-                    cur_scale = tile_data.abs().max() * k_inverted_DTYPE_MAX
-                    exponent = _f32_to_e8m0_ceil(cur_scale)
-                    e8m0_u32 = exponent << 23
-                    cur_scale_e8m0 = torch.tensor(e8m0_u32, dtype=torch.int32).view(
-                        torch.float32
-                    )
-
-                    quantized_tile = (tile_data / cur_scale_e8m0).to(dtypes.fp8)
-                    kv_cache[block_idx, block_off, kv_head, tile_start:tile_end] = (
-                        quantized_tile
-                    )
-
-                    kv_cache.view(torch.uint8)[
-                        block_idx, block_off, kv_head, kv_lora_rank + tile_idx
-                    ] = exponent
+            bi, bo = block_indices[i], block_offsets[i]
+            kv_cache[bi, bo, :, :kv_lora_rank] = k_quantized[i]
+            kv_cache.view(torch.uint8)[bi, bo, :, kv_lora_rank:kv_lora_rank + num_tiles] = k_exponents[i].to(torch.uint8)
 
     kv_cache_swapped = kv_cache
     num_heads = q_nope.shape[1]
@@ -674,31 +653,10 @@ def run_torch_fused_norm_rope_group_quant(
     num_groups = head_size // group_size  # nope groups + pe group
 
     if out_dtype == dtypes.fp8:
-        # Q group quant: nope groups + pe group, scales → separate tensor
         fp8_max_q = torch.finfo(dtypes.fp8).max
-        q_out_fp8 = torch.zeros(
-            num_tokens, num_heads, head_size, dtype=dtypes.fp8, device=q_nope.device
-        )
-        q_scale_ref = torch.zeros(
-            num_tokens, num_heads, num_groups, dtype=torch.uint8, device=q_nope.device
-        )
+        inv_fp8_max_q = 1.0 / fp8_max_q
 
-        def _f32_to_e8m0_ceil_q(x):
-            u32 = x.view(torch.int32).item()
-            exponent = (u32 >> 23) & 0xFF
-            if u32 & 0x7FFFFF:
-                exponent += 1
-            return exponent
-
-        q_inverted_DTYPE_MAX = torch.tensor(
-            1.0 / fp8_max_q, dtype=torch.float32, device=q_nope.device
-        )
-
-        # Use bf16 RoPE result (q_pe already has RoPE applied via rope_cached_positions_fwd)
-        # Then convert to float32 for quantization — matches kernel's bf16→f32 RoPE pipeline
-        # Kernel: loads bf16 q_pe → f32 → RoPE in f32 → quantize in f32
-        # Reference: bf16 q_pe → RoPE in bf16 → f32 → quantize in f32 (small bf16 truncation)
-        # To match kernel exactly, compute RoPE in float32 from original inputs
+        # Float32 RoPE for pe (matches kernel's bf16→f32→RoPE→quant pipeline)
         q_pe_input_f32 = q_pe_orig.float()
         cos_f32 = cos_cache[positions.squeeze(0)].float()
         sin_f32 = sin_cache[positions.squeeze(0)].float()
@@ -708,59 +666,37 @@ def run_torch_fused_norm_rope_group_quant(
             x2 = q_pe_input_f32[..., half_dim:]
             cos_exp = cos_f32.unsqueeze(1).expand_as(x1)
             sin_exp = sin_f32.unsqueeze(1).expand_as(x1)
-            q_pe_f32 = torch.cat(
-                [
-                    x1 * cos_exp - x2 * sin_exp,
-                    x2 * cos_exp + x1 * sin_exp,
-                ],
-                dim=-1,
-            )
+            q_pe_f32 = torch.cat([x1 * cos_exp - x2 * sin_exp, x2 * cos_exp + x1 * sin_exp], dim=-1)
         else:
             cos_exp = cos_f32.unsqueeze(1).expand(-1, q_pe_input_f32.shape[1], -1)
             sin_exp = sin_f32.unsqueeze(1).expand(-1, q_pe_input_f32.shape[1], -1)
-            x_even = q_pe_input_f32[..., 0::2]
-            x_odd = q_pe_input_f32[..., 1::2]
+            x_even, x_odd = q_pe_input_f32[..., 0::2], q_pe_input_f32[..., 1::2]
             q_pe_f32 = torch.zeros_like(q_pe_input_f32)
             q_pe_f32[..., 0::2] = x_even * cos_exp - x_odd * sin_exp
             q_pe_f32[..., 1::2] = x_odd * cos_exp + x_even * sin_exp
 
-        # Also check: dump first mismatch for debugging
-        # Compare float32 RoPE vs bf16 RoPE to verify reference correctness
-        q_pe_bf16_f32 = q_pe.float()  # bf16 RoPE'd result → f32
-        rope_diff = (q_pe_f32 - q_pe_bf16_f32).abs().max().item()
-        if rope_diff > 0.5:
-            print(f"[DEBUG] float32 vs bf16 RoPE max diff: {rope_diff}")
-            # Find first mismatch location
-            diff_mask = (q_pe_f32 - q_pe_bf16_f32).abs() > 0.5
-            idx = diff_mask.nonzero()[0]
-            print(
-                f"[DEBUG] First diff at {idx.tolist()}: f32={q_pe_f32[tuple(idx)].item():.6f}, bf16={q_pe_bf16_f32[tuple(idx)].item():.6f}, orig={q_pe_orig[tuple(idx)].item():.6f}"
-            )
-
+        # Concatenate nope + float32 RoPE'd pe
         if is_nope_first:
             q_concat = torch.cat((q_nope.float(), q_pe_f32), dim=-1)
         else:
             q_concat = torch.cat((q_pe_f32, q_nope.float()), dim=-1)
 
-        for i in range(num_tokens):
-            for head in range(num_heads):
-                q_data = q_concat[i, head, :]
-                for g in range(num_groups):
-                    tile_start = g * group_size
-                    tile_end = tile_start + group_size
-                    tile_data = q_data[tile_start:tile_end]
+        # Vectorized Q group quant: [N, H, head_size] → [N, H, num_groups, group_size]
+        q_tiled = q_concat.reshape(num_tokens, num_heads, num_groups, group_size)
+        q_group_max = q_tiled.abs().amax(dim=-1)  # [N, H, num_groups]
+        q_scales_f32 = q_group_max * inv_fp8_max_q
+        # e8m0 ceil: extract exponent, round up if mantissa != 0
+        q_u32 = q_scales_f32.view(torch.int32)
+        q_exponents = ((q_u32 >> 23) & 0xFF).to(torch.int32)
+        q_has_mantissa = (q_u32 & 0x7FFFFF) != 0
+        q_exponents = q_exponents + q_has_mantissa.to(torch.int32)
+        # Reconstruct e8m0 scale
+        q_e8m0_u32 = (q_exponents << 23).view(torch.float32)  # [N, H, num_groups]
+        q_inv_scale = q_e8m0_u32.unsqueeze(-1).expand_as(q_tiled)  # [N, H, num_groups, group_size]
+        q_quantized = (q_tiled / q_inv_scale).to(dtypes.fp8).reshape(num_tokens, num_heads, head_size)
 
-                    cur_scale = tile_data.abs().max() * q_inverted_DTYPE_MAX
-                    exponent = _f32_to_e8m0_ceil_q(cur_scale)
-                    e8m0_u32 = exponent << 23
-                    cur_scale_e8m0 = torch.tensor(e8m0_u32, dtype=torch.int32).view(
-                        torch.float32
-                    )
-
-                    quantized_tile = (tile_data / cur_scale_e8m0).to(dtypes.fp8)
-                    q_out_fp8[i, head, tile_start:tile_end] = quantized_tile
-                    q_scale_ref[i, head, g] = exponent
-        q_out = q_out_fp8
+        q_out = q_quantized
+        q_scale_ref = q_exponents.to(torch.uint8)
     else:
         # bf16: nope + RoPE'd pe concatenated
         if is_nope_first:
