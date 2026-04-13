@@ -16,6 +16,7 @@ op_tests/opus/
 │   ├── test_mfma_f8.cu          # MFMA fp8/bf8 kernels
 │   ├── test_mxfp.cu             # MXFP8/MXFP4 kernels (gfx950 only)
 │   ├── test_wmma_scale.cu       # WMMA scaled f8f6f4/f4 kernels (gfx1250 only)
+│   ├── test_mma_step_k.cu       # tiled_mma_adaptor::step_k bf16 kernel
 │   ├── test_vector_add.cu       # Vector addition kernel
 │   ├── test_async_load.cu       # Async global->LDS->global copy kernel
 │   ├── test_tr_load_f16.cu      # LDS transpose load kernel (gfx950 only)
@@ -25,7 +26,7 @@ op_tests/opus/
 │   ├── test_finfo.cu            # opus::finfo kernel
 │   ├── test_mdiv.cu             # opus::magic_div kernel
 │   ├── test_workgroup_barrier.cu# Workgroup barrier kernel
-│   ├── setup.py                 # Parallel hipcc build: 16 .cu -> .o -> .so
+│   ├── setup.py                 # Parallel hipcc build: 17 .cu -> .o -> .so
 │   └── test_opus_device.py      # Python test runner (builds .so, runs all tests)
 ├── run_tests.sh                 # Runs host test + device tests
 └── README.md
@@ -254,9 +255,10 @@ In `device/test_opus_device.py`:
 | `test_wmma_scale` | tiled 16x16x128 fp8 2x2 | `make_tiled_mma`, 4 waves (32x32 block), scaled | gfx1250 |
 | `test_wmma_scale` | tiled 16x16x128 fp8 4x1 | `make_tiled_mma`, 4 waves (64x16 block), scaled | gfx1250 |
 | `test_wmma_scale` | per-lane scale fp8 | Random E8M0 per m-row/n-col, bitwise exact | gfx1250 |
+| `test_mma_step_k` | 32x32x128 bf16 step_k | `make_tiled_mma`, `step_k` | gfx942 + gfx950 |
 | `test_workgroup_barrier` | cumulative + streamk | `opus::workgroup_barrier` cross-workgroup synchronization | all |
 
-Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 vector_add + 1 async_load + 1 tr_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
+Total: **60+ test calls** (14 MFMA + 4 MXFP + 11 WMMA + 10 WMMA-scale + 1 mma_step_k + 1 vector_add + 1 async_load + 1 tr_load + 11 dtype_convert + 3 load_store_if + 9 numeric_limits + 7 finfo + 11 mdiv + 4 workgroup_barrier).
 
 ## Notes
 
