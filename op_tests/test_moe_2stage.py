@@ -25,6 +25,8 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
+    pack_int8_to_packed_int4,
+    shuffle_scale_for_int4,
 )
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -49,7 +51,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=False,
 ):
-    if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
+    if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32, aiter.QuantType.per_1x32_i4]:
         return
     torch_quant = aiter.get_torch_quant(qType)
     input = torch.randn((token, model_dim), dtype=dtype)
@@ -79,6 +81,25 @@ def test_fmoe(
     elif qType == aiter.QuantType.per_Token and WQDType == torch.int4:  # int4 w quant
         w1_qt, w1_scale = aiter.pertoken_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
         w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
+    elif qType == aiter.QuantType.per_1x32_i4:  # a16wi4: int4 weights, bf16 activations
+        # Groupwise quantization: quantize each group of 32 K-elements to int4 [-7, 7]
+        group_size = 32
+        N1 = inter_dim * 2 if use_g1u1 else inter_dim
+        # w1: [E, N1, model_dim] -> groups along K
+        w1_groups = w1.view(E, N1, model_dim // group_size, group_size)
+        w1_group_max = w1_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)  # [E, N1, G, 1]
+        w1_scale_raw = (w1_group_max / 7.0).squeeze(-1)  # [E, N1, G]
+        w1_qt = (w1_groups / w1_scale_raw.unsqueeze(-1)).round().clamp(-7, 7).to(dtypes.i8)
+        w1_qt = w1_qt.view(E, N1, model_dim)
+        # Scale: [E, K//32, N] = permuted from [E, N, G]
+        w1_scale = w1_scale_raw.permute(0, 2, 1).to(dtypes.bf16)  # [E, G, N]
+        # w2: [E, model_dim, inter_dim] -> groups along K (=inter_dim)
+        w2_groups = w2.view(E, model_dim, inter_dim // group_size, group_size)
+        w2_group_max = w2_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+        w2_scale_raw = (w2_group_max / 7.0).squeeze(-1)  # [E, model_dim, G2]
+        w2_qt = (w2_groups / w2_scale_raw.unsqueeze(-1)).round().clamp(-7, 7).to(dtypes.i8)
+        w2_qt = w2_qt.view(E, model_dim, inter_dim)
+        w2_scale = w2_scale_raw.permute(0, 2, 1).to(dtypes.bf16)  # [E, G2, model_dim]
     elif qType == aiter.QuantType.per_128x128:
 
         def weight_per_128x128_quant(weight, quant_dtype):
@@ -113,12 +134,15 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    if qType != aiter.QuantType.per_1x32:
+    if qType == aiter.QuantType.per_1x32:
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+    elif qType == aiter.QuantType.per_1x32_i4:
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
     else:
-        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
 
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
@@ -134,6 +158,9 @@ def test_fmoe(
     ):  # a16w4 & a8w4
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
+    elif qType == aiter.QuantType.per_1x32_i4:  # a16wi4
+        a1_qt = input.to(dtypes.bf16)
+        a1_scale = None
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
@@ -145,6 +172,9 @@ def test_fmoe(
     ):  # a16w4
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+    elif qType == aiter.QuantType.per_1x32_i4:  # a16wi4: no bias
+        exp_bias1_aiter = exp_bias1 = None
+        exp_bias2_aiter = exp_bias2 = None
     else:
         exp_bias1_aiter = exp_bias1 = None
         exp_bias2_aiter = exp_bias2 = None
@@ -165,6 +195,18 @@ def test_fmoe(
         )
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+    elif qType == aiter.QuantType.per_1x32_i4:  # a16wi4
+        w1_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w1_qt_aiter, (16, 16))
+        )
+        w1_qt_aiter = w1_qt_aiter.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+        w2_qt_aiter = pack_int8_to_packed_int4(
+            shuffle_weight(w2_qt_aiter, (16, 16))
+        )
+        w2_qt_aiter = w2_qt_aiter.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+        # groupwise scale: [E, K//32, N] bf16 -> shuffle and flatten for kernel
+        w1_scale_aiter = shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
+        w2_scale_aiter = shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
@@ -210,6 +252,9 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 & a8w4
+        a2_qt = out1_ref
+        a2_scale = None
+    elif qType == aiter.QuantType.per_1x32_i4:  # a16wi4: bf16 pass-through
         a2_qt = out1_ref
         a2_scale = None
     else:
@@ -280,6 +325,7 @@ l_quant = [
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
+    (aiter.QuantType.per_1x32_i4, dtypes.bf16, dtypes.i8),  # a16wi4
 ]
 
 
@@ -343,7 +389,8 @@ parser.add_argument(
     4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
     5: aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8,  # a8w8,
     6: aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2,  # a16w4,
-    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,""",
+    7: aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2,  # a8w4,
+    8: aiter.QuantType.per_1x32_i4, dtypes.bf16, dtypes.i8,  # a16wi4,""",
 )
 
 parser.add_argument(
@@ -492,6 +539,27 @@ for (
                         intermediate_pad=0,
                     )
                     df.append(ret)
+    elif (quant_type, aq_dtype, wq_dtype) == (
+        aiter.QuantType.per_1x32_i4,
+        dtypes.bf16,
+        dtypes.i8,
+    ):  # a16wi4
+        for m in args.tokenNum:
+            ret = test_fmoe(
+                dtype,
+                m,
+                model_dim,
+                inter_dim,
+                args.expert,
+                args.topk,
+                aiter.ActivationType.Swiglu,
+                quant_type,
+                aq_dtype,
+                wq_dtype,
+                use_g1u1=True,
+                doweight_stage1=doweight_stage1,
+            )
+            df.append(ret)
     else:
         for act_type in args.act:
             for m in args.tokenNum:

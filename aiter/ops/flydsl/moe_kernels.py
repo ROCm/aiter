@@ -151,6 +151,70 @@ def get_flydsl_stage2_kernels(
     return kernels
 
 
+def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for all supported int4_bf16 stage1 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "int4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
+                kernels[name] = {
+                    "stage": 1,
+                    "a_dtype": a_dtype,
+                    "b_dtype": b_dtype,
+                    "out_dtype": out_dtype,
+                    "tile_m": tm,
+                    "tile_n": tn,
+                    "tile_k": tk,
+                    "MPerBlock": tm,
+                    "in_dtype": "int4_bf16",
+                }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for all supported int4_bf16 stage2 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "int4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic", "reduce"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "int4_bf16",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -158,6 +222,10 @@ def _register_all_configs():
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
                 _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
+    # int4_bf16 (a16wi4) configs
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
 
 
 _register_all_configs()
@@ -214,6 +282,16 @@ def compile_flydsl_moe_stage1(
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
+        in_dtype = a_dtype
+        group_size = -1
+        _use_cshuffle = None
+        _scale_is_bf16 = False
+        if b_dtype == "int4":
+            in_dtype = "int4_bf16"
+            group_size = 32
+            _use_cshuffle = False
+            _scale_is_bf16 = True
+
         return compile_moe_gemm1(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -223,8 +301,12 @@ def compile_flydsl_moe_stage1(
             tile_n=tile_n,
             tile_k=tile_k,
             doweight_stage1=doweight_stage1,
-            in_dtype=a_dtype,
+            in_dtype=in_dtype,
+            group_size=group_size,
             out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            scale_is_bf16=_scale_is_bf16,
+            k_batch=k_batch,
         )
 
 
@@ -267,6 +349,14 @@ def compile_flydsl_moe_stage2(
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
 
+        in_dtype = a_dtype
+        group_size = -1
+        _scale_is_bf16 = False
+        if b_dtype == "int4":
+            in_dtype = "int4_bf16"
+            group_size = 32
+            _scale_is_bf16 = True
+
         return compile_moe_gemm2(
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -276,9 +366,11 @@ def compile_flydsl_moe_stage2(
             tile_n=tile_n,
             tile_k=tile_k,
             doweight_stage2=doweight_stage2,
-            in_dtype=a_dtype,
+            in_dtype=in_dtype,
+            group_size=group_size,
             out_dtype=out_dtype,
             accumulate=accumulate,
+            scale_is_bf16=_scale_is_bf16,
         )
 
 
@@ -559,7 +651,7 @@ def flydsl_moe_stage1(
     _need_quant = fuse_fp4_quant or _splitk_fq
     _need_sort = _need_quant and (fuse_sort_scale or _splitk_fq)
 
-    _sort_block_m = max(32, tile_m)
+    _sort_block_m = tile_m
     _all_blks = sorted_expert_ids.shape[0]
     _dense_blks = (
         min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])

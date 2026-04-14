@@ -272,6 +272,9 @@ def fused_moe_(
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
+    elif quant_type == QuantType.per_1x32_i4:
+        q_dtype_a = dtypes.bf16
+        q_dtype_w = dtypes.i8
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -988,6 +991,30 @@ def get_2stage_cfgs(
             run_1stage,
             fuse_fp4_quant=_s1_fq,
         )
+    if q_type == QuantType.per_1x32_i4 and is_flydsl_available():
+        # a16wi4: bf16 activations, packed int4 weights with groupwise scale
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_n = 128
+        _tile_k = 128
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
+        kn2 = flydsl_kernel_name(2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic")
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+            ),
+            _tile_m,
+            0,
+            False,
+        )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
@@ -1158,7 +1185,11 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
     )
-    if (
+    if quant_type == QuantType.per_1x32_i4:
+        # a16wi4: bf16 activations, no activation quantization
+        a1 = hidden_states.to(dtype)
+        a1_scale = None
+    elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
@@ -1226,9 +1257,10 @@ def fused_moe_2stages(
             device=device,
         )
     else:
+        _a2_dtype = dtype
         a2 = torch.empty(
             (token_num, topk, inter_dim),
-            dtype=dtype,
+            dtype=_a2_dtype,
             device=device,
         )
     extra_stage1_args = {}
@@ -1259,7 +1291,10 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    if metadata.fuse_fp4_quant and isinstance(a2, tuple):
+    if quant_type == QuantType.per_1x32_i4:
+        # a16wi4: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
+    elif metadata.fuse_fp4_quant and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)
         a2 = (
@@ -1507,7 +1542,11 @@ def torch_moe_stage1(
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32:
+    if quant_type == QuantType.per_1x32_i4:
+        # a16wi4: int4 weights stored as int8, bf16 activations
+        hidden_states = hidden_states.to(ctype)
+        w1 = w1.to(ctype)
+    elif quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
         w1 = fp4_utils.mxfp4_to_f32(w1)
@@ -1542,6 +1581,18 @@ def torch_moe_stage1(
         hidden_states = hidden_states * a1_scale
     elif quant_type == QuantType.No:
         pass
+    elif quant_type == QuantType.per_1x32_i4:
+        # a16wi4: groupwise dequant int4 weights with scale [E, K//32, N]
+        # w1_scale is [E, K//32, N] groupwise scale
+        group_size = 32
+        num_groups = model_dim // group_size
+        w1_shape = w1.shape
+        # w1: [E, N, K] -> apply scale per group of K
+        w1 = w1.view(E, N, num_groups, group_size) * w1_scale.view(
+            E, num_groups, N
+        ).permute(0, 2, 1).unsqueeze(-1)
+        w1 = w1.view(w1_shape)
+        # activations are bf16, no scaling needed
     elif quant_type == QuantType.per_1x32:
         w1_shape = w1.shape
         w1 = w1.view(E, N, model_dim // 32, 32) * w1_scale.view(
@@ -1583,7 +1634,11 @@ def torch_moe_stage1(
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
         if use_swiglu:
-            out = swiglu(gate, up)
+            if quant_type == QuantType.per_1x32_i4:
+                # FlyDSL int4_bf16 kernel uses standard silu(gate)*up
+                out = torch.nn.functional.silu(gate) * up
+            else:
+                out = swiglu(gate, up)
         else:
             out = torch_act(gate) * up
     else:
@@ -1606,7 +1661,11 @@ def torch_moe_stage2(
 ):
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if quant_type == QuantType.per_1x32:
+    if quant_type == QuantType.per_1x32_i4:
+        # a16wi4: int4 weights stored as int8, bf16 activations
+        hidden_states = hidden_states.to(ctype)
+        w2 = w2.to(ctype)
+    elif quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
         w2 = fp4_utils.mxfp4_to_f32(w2)
@@ -1638,6 +1697,18 @@ def torch_moe_stage2(
             w2_scale.shape[0], w2.shape[1] // 128, 1, w2.shape[2] // 128, 1
         )
         w2 = w2.view(w2_shape)
+    elif quant_type == QuantType.per_1x32_i4:
+        # a16wi4: groupwise dequant int4 weights with scale [E, K//32, N]
+        # w2: [E, model_dim, inter_dim], w2_scale is [E, inter_dim//32, model_dim]
+        group_size = 32
+        num_groups = inter_dim // group_size
+        w2_shape = w2.shape
+        # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
+        w2 = w2.view(E, model_dim, num_groups, group_size) * w2_scale.view(
+            E, num_groups, model_dim
+        ).permute(0, 2, 1).unsqueeze(-1)
+        w2 = w2.view(w2_shape)
+        # activations are bf16, no scaling
     elif quant_type == QuantType.per_1x32:
         a2_shape = hidden_states.shape
         if a2_scale is not None:
