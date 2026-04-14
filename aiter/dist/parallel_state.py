@@ -1051,12 +1051,81 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
-_CUSTOM: Optional[GroupCoordinator] = None
+def has_custom_group() -> bool:
+    """Return whether any custom group is initialized."""
+    return bool(_CUSTOM)
 
 
-def get_custom_group() -> GroupCoordinator:
-    assert _CUSTOM is not None, "custom allreduce group is not initialized"
-    return _CUSTOM
+class CustomGroupConfig:
+    """Configuration builder for custom communication groups.
+
+    Usage:
+        config = CustomGroupConfig()
+        config.add_group("attn",
+            tp_group=[[0,1,2,3],[4,5,6,7]],
+            dp_group=[[0,4],[1,5],[2,6],[3,7]])
+        config.add_group("comm",
+            tp_group=[0,1,2,3,4,5,6,7])
+        ensure_model_parallel_initialized(..., custom_group_config=config.data())
+
+    Or pass a raw dict directly:
+        ensure_model_parallel_initialized(..., custom_group_config={
+            "attn": {"tp_group": [[0,1,2,3],[4,5,6,7]],
+                     "dp_group": [[0,4],[1,5],[2,6],[3,7]]},
+            "comm": {"tp_group": [0,1,2,3,4,5,6,7], "dp_group": []},
+        })
+    """
+
+    def __init__(self):
+        self._groups: Dict[str, Dict] = {}
+
+    def add_group(
+        self,
+        name: str,
+        tp_group: Optional[List] = None,
+        dp_group: Optional[List] = None,
+    ) -> "CustomGroupConfig":
+        assert name not in self._groups, f"custom group '{name}' already exists"
+        entry: Dict = {}
+        if tp_group is not None:
+            entry["tp_group"] = tp_group
+        if dp_group is not None and dp_group != []:
+            entry["dp_group"] = dp_group
+        assert entry, (
+            f"custom group '{name}': at least one of tp_group or dp_group "
+            f"must be provided"
+        )
+        self._groups[name] = entry
+        return self
+
+    def data(self) -> Dict[str, Dict]:
+        assert self._groups, "no custom groups have been added"
+        return dict(self._groups)
+
+
+_CUSTOM: Dict[str, "GroupCoordinator"] = {}
+
+
+def get_custom_group(
+    name: Optional[str] = None,
+) -> "Union[GroupCoordinator, Dict[str, GroupCoordinator]]":
+    """Get custom group coordinator(s).
+
+    - If only one custom group is initialized, returns the GroupCoordinator
+      instance directly (name is optional).
+    - If multiple custom groups are initialized and name is None, returns the
+      full dict so the caller can select by name.
+    - If name is given, returns that specific GroupCoordinator.
+    """
+    assert _CUSTOM, "custom allreduce group is not initialized"
+    if name is not None:
+        assert name in _CUSTOM, (
+            f"custom group '{name}' not found, " f"available: {list(_CUSTOM.keys())}"
+        )
+        return _CUSTOM[name]
+    if len(_CUSTOM) == 1:
+        return next(iter(_CUSTOM.values()))
+    return dict(_CUSTOM)
 
 
 # kept for backward compatibility
@@ -1078,10 +1147,14 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    if _CUSTOM is not None:
-        with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-            context
-        ), get_custom_group().graph_capture(context):
+    if _CUSTOM:
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            context = stack.enter_context(get_tp_group().graph_capture())
+            stack.enter_context(get_pp_group().graph_capture(context))
+            for group in _CUSTOM.values():
+                stack.enter_context(group.graph_capture(context))
             yield context
     else:
         with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
@@ -1206,8 +1279,7 @@ def initialize_model_parallel(
     # decode_context_model_parallel_size: Optional[int] = 1,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
-    custom_tp_group_ranks: Optional[List[List[int]]] = None,
-    custom_dp_group_ranks: Optional[List[List[int]]] = None,
+    custom_group_config: Optional[Dict[str, Dict]] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1321,115 +1393,118 @@ def initialize_model_parallel(
         group_ranks, get_world_group().local_rank, backend, group_name="ep"
     )
 
-    # Build the custom allreduce group (optional).
+    # Build the custom allreduce group(s) (optional).
     global _CUSTOM
-    assert _CUSTOM is None, "custom allreduce group is already initialized"
-    if custom_tp_group_ranks is not None and custom_dp_group_ranks is not None:
-        # Both provided → EP mode, must be 2D lists
-        assert all(
-            isinstance(g, list) for g in custom_tp_group_ranks
-        ), "custom_tp_group_ranks must be List[List[int]] when both are provided"
-        assert all(
-            isinstance(g, list) for g in custom_dp_group_ranks
-        ), "custom_dp_group_ranks must be List[List[int]] when both are provided"
-        for g in custom_tp_group_ranks:
-            assert len(g) == tensor_model_parallel_size, (
-                f"each custom TP group size ({len(g)}) must equal "
-                f"tensor_model_parallel_size ({tensor_model_parallel_size})"
-            )
-        for g in custom_dp_group_ranks:
-            assert len(g) == data_parallel_size, (
-                f"each custom DP group size ({len(g)}) must equal "
-                f"data_parallel_size ({data_parallel_size})"
-            )
-        tp_total = sum(len(g) for g in custom_tp_group_ranks)
-        dp_total = sum(len(g) for g in custom_dp_group_ranks)
-        assert tp_total == world_size, (
-            f"total ranks in custom_tp_group_ranks ({tp_total}) "
-            f"must equal world_size ({world_size})"
-        )
-        assert dp_total == world_size, (
-            f"total ranks in custom_dp_group_ranks ({dp_total}) "
-            f"must equal world_size ({world_size})"
-        )
-        # Check no duplicate ranks and full coverage
-        all_tp_ranks = [r for g in custom_tp_group_ranks for r in g]
-        all_dp_ranks = [r for g in custom_dp_group_ranks for r in g]
-        assert (
-            len(set(all_tp_ranks)) == world_size
-        ), "custom_tp_group_ranks contains duplicate ranks"
-        assert (
-            len(set(all_dp_ranks)) == world_size
-        ), "custom_dp_group_ranks contains duplicate ranks"
-        assert set(all_tp_ranks) == set(
-            range(world_size)
-        ), f"custom_tp_group_ranks must cover all ranks 0..{world_size - 1}"
-        assert set(all_dp_ranks) == set(
-            range(world_size)
-        ), f"custom_dp_group_ranks must cover all ranks 0..{world_size - 1}"
-        # Check TP and DP form a valid grid: ranks in the same TP group
-        # must be in different DP groups
-        rank_to_dp = {}
-        for dp_idx, dp_group in enumerate(custom_dp_group_ranks):
-            for r in dp_group:
-                rank_to_dp[r] = dp_idx
-        for tp_group in custom_tp_group_ranks:
-            dp_indices = [rank_to_dp[r] for r in tp_group]
-            assert len(set(dp_indices)) == len(dp_indices), (
-                f"TP group {tp_group} has ranks sharing the same DP group, "
-                f"TP and DP groupings conflict"
-            )
-        custom_groups = _derive_ep_groups(custom_tp_group_ranks, custom_dp_group_ranks)
-        _CUSTOM = init_model_parallel_group(
-            custom_groups,
-            get_world_group().local_rank,
-            backend,
-            group_name="custom",
-        )
-    elif custom_tp_group_ranks is not None:
-        # Only TP → single group, must be 1D list
-        assert all(
-            isinstance(r, int) for r in custom_tp_group_ranks
-        ), "custom_tp_group_ranks must be List[int] when provided alone"
-        assert len(custom_tp_group_ranks) == tensor_model_parallel_size, (
-            f"custom_tp_group_ranks length ({len(custom_tp_group_ranks)}) "
-            f"must equal tensor_model_parallel_size ({tensor_model_parallel_size})"
-        )
-        assert len(custom_tp_group_ranks) == world_size, (
-            f"custom_tp_group_ranks length ({len(custom_tp_group_ranks)}) "
-            f"must equal world_size ({world_size})"
-        )
-        assert (
-            data_parallel_size == 1
-        ), "data_parallel_size must be 1 when only custom_tp_group_ranks is provided"
-        _CUSTOM = init_model_parallel_group(
-            [custom_tp_group_ranks],
-            get_world_group().local_rank,
-            backend,
-            group_name="custom",
-        )
-    elif custom_dp_group_ranks is not None:
-        # Only DP → single group, must be 1D list
-        assert all(
-            isinstance(r, int) for r in custom_dp_group_ranks
-        ), "custom_dp_group_ranks must be List[int] when provided alone"
-        assert len(custom_dp_group_ranks) == data_parallel_size, (
-            f"custom_dp_group_ranks length ({len(custom_dp_group_ranks)}) "
-            f"must equal data_parallel_size ({data_parallel_size})"
-        )
-        assert len(custom_dp_group_ranks) == world_size, (
-            f"custom_dp_group_ranks length ({len(custom_dp_group_ranks)}) "
-            f"must equal world_size ({world_size})"
-        )
-        assert (
-            tensor_model_parallel_size == 1
-        ), "tensor_model_parallel_size must be 1 when only custom_dp_group_ranks is provided"
-        _CUSTOM = init_model_parallel_group(
-            [custom_dp_group_ranks],
-            get_world_group().local_rank,
-            backend,
-            group_name="custom",
-        )
+    assert not _CUSTOM, "custom allreduce group is already initialized"
+    if custom_group_config is not None:
+        for gname, gcfg in custom_group_config.items():
+            tp_group = gcfg.get("tp_group")
+            dp_group = gcfg.get("dp_group")
+            has_tp = tp_group is not None
+            has_dp = dp_group is not None and len(dp_group) > 0
+
+            if has_tp and has_dp:
+                # Both provided → EP mode, must be 2D lists
+                assert all(isinstance(g, list) for g in tp_group), (
+                    f"custom group '{gname}': tp_group must be "
+                    f"List[List[int]] when both tp_group and dp_group "
+                    f"are provided"
+                )
+                assert all(isinstance(g, list) for g in dp_group), (
+                    f"custom group '{gname}': dp_group must be "
+                    f"List[List[int]] when both tp_group and dp_group "
+                    f"are provided"
+                )
+                tp_size = len(tp_group[0])
+                dp_size = len(dp_group[0])
+                for g in tp_group:
+                    assert len(g) == tp_size, (
+                        f"custom group '{gname}': each TP subgroup size "
+                        f"({len(g)}) must equal tp_size ({tp_size})"
+                    )
+                for g in dp_group:
+                    assert len(g) == dp_size, (
+                        f"custom group '{gname}': each DP subgroup size "
+                        f"({len(g)}) must equal dp_size ({dp_size})"
+                    )
+                tp_total = sum(len(g) for g in tp_group)
+                dp_total = sum(len(g) for g in dp_group)
+                assert tp_total == world_size, (
+                    f"custom group '{gname}': total ranks in tp_group "
+                    f"({tp_total}) must equal world_size ({world_size})"
+                )
+                assert dp_total == world_size, (
+                    f"custom group '{gname}': total ranks in dp_group "
+                    f"({dp_total}) must equal world_size ({world_size})"
+                )
+                all_tp_ranks = [r for g in tp_group for r in g]
+                all_dp_ranks = [r for g in dp_group for r in g]
+                assert len(set(all_tp_ranks)) == world_size, (
+                    f"custom group '{gname}': tp_group contains " f"duplicate ranks"
+                )
+                assert len(set(all_dp_ranks)) == world_size, (
+                    f"custom group '{gname}': dp_group contains " f"duplicate ranks"
+                )
+                assert set(all_tp_ranks) == set(range(world_size)), (
+                    f"custom group '{gname}': tp_group must cover all "
+                    f"ranks 0..{world_size - 1}"
+                )
+                assert set(all_dp_ranks) == set(range(world_size)), (
+                    f"custom group '{gname}': dp_group must cover all "
+                    f"ranks 0..{world_size - 1}"
+                )
+                rank_to_dp = {}
+                for dp_idx, dp_grp in enumerate(dp_group):
+                    for r in dp_grp:
+                        rank_to_dp[r] = dp_idx
+                for tp_grp in tp_group:
+                    dp_indices = [rank_to_dp[r] for r in tp_grp]
+                    assert len(set(dp_indices)) == len(dp_indices), (
+                        f"custom group '{gname}': TP group {tp_grp} has "
+                        f"ranks sharing the same DP group, TP and DP "
+                        f"groupings conflict"
+                    )
+                derived_groups = _derive_ep_groups(tp_group, dp_group)
+                _CUSTOM[gname] = init_model_parallel_group(
+                    derived_groups,
+                    get_world_group().local_rank,
+                    backend,
+                    group_name=f"custom_{gname}",
+                )
+            elif has_tp:
+                # Only TP → single group, tp_group is 1D list
+                assert all(isinstance(r, int) for r in tp_group), (
+                    f"custom group '{gname}': tp_group must be "
+                    f"List[int] when provided alone"
+                )
+                assert len(tp_group) == world_size, (
+                    f"custom group '{gname}': tp_group length "
+                    f"({len(tp_group)}) must equal world_size "
+                    f"({world_size})"
+                )
+                _CUSTOM[gname] = init_model_parallel_group(
+                    [tp_group],
+                    get_world_group().local_rank,
+                    backend,
+                    group_name=f"custom_{gname}",
+                )
+            elif has_dp:
+                # Only DP → single group, dp_group is 1D list
+                assert all(isinstance(r, int) for r in dp_group), (
+                    f"custom group '{gname}': dp_group must be "
+                    f"List[int] when provided alone"
+                )
+                assert len(dp_group) == world_size, (
+                    f"custom group '{gname}': dp_group length "
+                    f"({len(dp_group)}) must equal world_size "
+                    f"({world_size})"
+                )
+                _CUSTOM[gname] = init_model_parallel_group(
+                    [dp_group],
+                    get_world_group().local_rank,
+                    backend,
+                    group_name=f"custom_{gname}",
+                )
 
     logger.info(
         "rank %s in world size %s is assigned as "
@@ -1448,8 +1523,7 @@ def ensure_model_parallel_initialized(
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
-    custom_tp_group_ranks: Optional[List[List[int]]] = None,
-    custom_dp_group_ranks: Optional[List[List[int]]] = None,
+    custom_group_config: Optional[Dict[str, Dict]] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1462,8 +1536,7 @@ def ensure_model_parallel_initialized(
             pipeline_model_parallel_size,
             backend,
             data_parallel_size,
-            custom_tp_group_ranks=custom_tp_group_ranks,
-            custom_dp_group_ranks=custom_dp_group_ranks,
+            custom_group_config=custom_group_config,
         )
         return
 
@@ -1546,9 +1619,9 @@ def destroy_model_parallel():
     _EP = None
 
     global _CUSTOM
-    if _CUSTOM:
-        _CUSTOM.destroy()
-    _CUSTOM = None
+    for group in _CUSTOM.values():
+        group.destroy()
+    _CUSTOM = {}
 
 
 def destroy_distributed_environment():
