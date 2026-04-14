@@ -129,6 +129,7 @@ def _precompile_to_cache(
     No dependency on HIP ops (moe_sorting, shuffle_weight, etc.).
     """
     import torch
+
     dev = torch.device("cuda")
     is_fp4 = b_dtype == "fp4"
     tokens = tile_m
@@ -150,36 +151,74 @@ def _precompile_to_cache(
             k_in = model_dim
 
             if is_fp4:
-                out = torch.zeros(tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8)
+                out = torch.zeros(
+                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
+                )
                 a = torch.zeros(tokens * model_dim // 2, device=dev, dtype=torch.uint8)
-                w = torch.zeros(E * 2 * inter_dim * model_dim // 2, device=dev, dtype=torch.uint8)
+                w = torch.zeros(
+                    E * 2 * inter_dim * model_dim // 2, device=dev, dtype=torch.uint8
+                )
                 a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
                 w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
                 out_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
                 args = _s1_args_fp4(
-                    out, a, w, a_scale, w_scale,
-                    sorted_ids, sorted_expert_ids, sw, num_valid_ids,
-                    out_scale, tokens, n_in, k_in, _grid_y, dev,
+                    out,
+                    a,
+                    w,
+                    a_scale,
+                    w_scale,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    sw,
+                    num_valid_ids,
+                    out_scale,
+                    tokens,
+                    n_in,
+                    k_in,
+                    _grid_y,
+                    dev,
                 )
             else:
-                out = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16)
+                out = torch.zeros(
+                    tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16
+                )
                 a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.int8)
-                w = torch.zeros(E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8)
+                w = torch.zeros(
+                    E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8
+                )
                 a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
                 w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
                 args = _s1_args_std(
-                    out, a, w, a_scale, w_scale,
-                    sorted_ids, sorted_expert_ids, sw, num_valid_ids,
-                    tokens, n_in, k_in, _grid_y,
+                    out,
+                    a,
+                    w,
+                    a_scale,
+                    w_scale,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    sw,
+                    num_valid_ids,
+                    tokens,
+                    n_in,
+                    k_in,
+                    _grid_y,
                 )
 
             exe = compile_flydsl_moe_stage1(
-                model_dim=model_dim, inter_dim=inter_dim,
-                experts=E, topk=topk,
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=E,
+                topk=topk,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
                 doweight_stage1=doweight_stage1,
-                a_dtype=a_dtype, b_dtype=b_dtype, out_dtype=out_dtype,
-                waves_per_eu=waves_per_eu, k_batch=k_batch, b_nt=b_nt,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                out_dtype=out_dtype,
+                waves_per_eu=waves_per_eu,
+                k_batch=k_batch,
+                b_nt=b_nt,
                 gate_only=gate_only,
                 fuse_fp4_quant=fuse_fp4_quant and not _is_splitk,
                 fuse_sort_scale=fuse_fp4_quant and not _is_splitk,
@@ -194,14 +233,29 @@ def _precompile_to_cache(
 
             if is_fp4:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8)
-                w = torch.zeros(E * model_dim * inter_dim // 2, device=dev, dtype=torch.uint8)
+                a = torch.zeros(
+                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
+                )
+                w = torch.zeros(
+                    E * model_dim * inter_dim // 2, device=dev, dtype=torch.uint8
+                )
                 a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
                 w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
                 args = _s2_args_fp4(
-                    out, a, w, a_scale, w_scale,
-                    sorted_ids, sorted_expert_ids, sw, num_valid_ids,
-                    tokens, n_in, k_in, _grid_y, dev,
+                    out,
+                    a,
+                    w,
+                    a_scale,
+                    w_scale,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    sw,
+                    num_valid_ids,
+                    tokens,
+                    n_in,
+                    k_in,
+                    _grid_y,
+                    dev,
                 )
             else:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
@@ -210,18 +264,35 @@ def _precompile_to_cache(
                 a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
                 w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
                 args = _s2_args_std(
-                    out, a, w, a_scale, w_scale,
-                    sorted_ids, sorted_expert_ids, sw, num_valid_ids,
-                    tokens, n_in, k_in, _grid_y,
+                    out,
+                    a,
+                    w,
+                    a_scale,
+                    w_scale,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    sw,
+                    num_valid_ids,
+                    tokens,
+                    n_in,
+                    k_in,
+                    _grid_y,
                 )
 
             exe = compile_flydsl_moe_stage2(
-                model_dim=model_dim, inter_dim=inter_dim,
-                experts=E, topk=topk,
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=E,
+                topk=topk,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
                 doweight_stage2=False,
-                a_dtype=a_dtype, b_dtype=b_dtype, out_dtype=out_dtype,
-                accumulate=accumulate, persist_m=_persist_m,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                out_dtype=out_dtype,
+                accumulate=accumulate,
+                persist_m=_persist_m,
                 sort_block_m=sort_block_m,
             )
             _run_compiled(exe, args)
@@ -232,8 +303,9 @@ def _precompile_to_cache(
             os.environ["COMPILE_ONLY"] = prev
 
 
-def compile_one_config(kernel_name: str, model_dim: int, inter_dim: int,
-                       experts: int, topk: int, **kwargs) -> dict:
+def compile_one_config(
+    kernel_name: str, model_dim: int, inter_dim: int, experts: int, topk: int, **kwargs
+) -> dict:
     """Compile one MoE kernel configuration and save to cache.
 
     Uses COMPILE_ONLY=1 with dummy tensors to trigger MLIR compilation and
@@ -251,8 +323,11 @@ def compile_one_config(kernel_name: str, model_dim: int, inter_dim: int,
     t0 = time.time()
     try:
         _precompile_to_cache(
-            model_dim=model_dim, inter_dim=inter_dim,
-            experts=experts, topk=topk, **kwargs,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            **kwargs,
         )
         elapsed = time.time() - t0
         result["compile_time"] = elapsed

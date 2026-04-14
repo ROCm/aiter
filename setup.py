@@ -248,14 +248,14 @@ if PREBUILD_KERNELS != 0:
             all_opts_args_build.extend(extra_args_build)
 
         bd = f"{core.get_user_jit_dir()}/build"
-        
+
         shutil.rmtree(bd, ignore_errors=True)
         for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
             try:
                 os.remove(f)
             except Exception:
                 pass
-        
+
         def build_one_module(one_opt_args):
             flags_cc = list(one_opt_args["flags_extra_cc"]) + [
                 f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
@@ -263,7 +263,7 @@ if PREBUILD_KERNELS != 0:
             flags_hip = list(one_opt_args["flags_extra_hip"]) + [
                 f"-DPREBUILD_KERNELS={PREBUILD_KERNELS}"
             ]
-        
+
             core.build_module(
                 md_name=one_opt_args["md_name"],
                 srcs=one_opt_args["srcs"],
@@ -326,6 +326,7 @@ if PREBUILD_KERNELS != 0:
                     compile_one_config(**job)
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             print(f"[aiter] FlyDSL MoE AOT skipped: {e}")
 
