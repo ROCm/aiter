@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import torch
 from torch import Tensor
 from typing import Optional
 from ..jit.core import (
@@ -43,3 +44,27 @@ def deepgemm(
     if backend == "opus":
         return deepgemm_opus(XQ, WQ, Y, group_layout, x_scale, w_scale)
     return deepgemm_ck(XQ, WQ, Y, group_layout, x_scale, w_scale)
+
+
+def gen_opus_gemm_a16w16_tune_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm_a16w16_tune",
+    gen_fake=gen_opus_gemm_a16w16_tune_fake_tensors,
+)
+def opus_gemm_a16w16_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...

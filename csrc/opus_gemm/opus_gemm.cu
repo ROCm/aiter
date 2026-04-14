@@ -4,8 +4,10 @@
 #include "opus_gemm_common.cuh"
 #include "opus_gemm_lookup.h"
 #include "opus_gemm_manifest.h"
+#include "opus_gemm_a16w16_tune_lookup.h"
 #include "py_itfs_common.h"
 #include <cmath>
+#include <string>
 
 // Scale kernel signature (a8w8_scale)
 using OpusScaleKernel = std::function<
@@ -90,6 +92,69 @@ torch::Tensor opus_gemm(
   else
   {
     TORCH_CHECK(false, "opus_gemm: unsupported input dtype, expected fp8 or bf16");
+  }
+  return Y;
+}
+
+// ── a16w16 tune dispatch (id-based) ──
+
+using OpusA16W16TuneKernel = std::function<
+    torch::Tensor(torch::Tensor &, torch::Tensor &,
+                  torch::Tensor &)>;
+
+using OpusA16W16TuneMap = std::unordered_map<
+    int,
+    OpusA16W16TuneKernel>;
+
+template <typename CDataType>
+OpusA16W16TuneKernel opus_a16w16_tune_dispatch(int id)
+{
+  static const auto lookup = []
+  {
+    return OpusA16W16TuneMap{GENERATE_A16W16_TUNE_LOOKUP(CDataType)};
+  }();
+
+  auto it = lookup.find(id);
+  TORCH_CHECK(it != lookup.end(),
+              "Kernel id " + std::to_string(id) + " not found in a16w16 tune lookup table!");
+  return it->second;
+}
+
+torch::Tensor opus_gemm_a16w16_tune(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &Y,
+    int kernelId,
+    int splitK)
+{
+  TORCH_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
+  TORCH_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
+  TORCH_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
+  TORCH_CHECK(XQ.dtype() == WQ.dtype(),
+              "XQ and WQ should have the same dtype!");
+
+  if (XQ.dtype() == at::ScalarType::BFloat16)
+  {
+    if (Y.dtype() == at::ScalarType::BFloat16)
+    {
+      opus_a16w16_tune_dispatch<bf16_t>(kernelId)(XQ, WQ, Y);
+    }
+    else if (Y.dtype() == at::ScalarType::Float)
+    {
+      opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y);
+    }
+    else
+    {
+      TORCH_CHECK(false,
+                  "opus_gemm_a16w16_tune: unsupported output dtype, expected bf16 or fp32");
+    }
+  }
+  else
+  {
+    TORCH_CHECK(false,
+                "opus_gemm_a16w16_tune: unsupported input dtype " +
+                    std::string(c10::toString(XQ.dtype())) +
+                    ", expected bf16");
   }
   return Y;
 }

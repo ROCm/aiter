@@ -95,6 +95,38 @@ def test_a16w16(batch, M, N, K, out_dtype=torch.bfloat16):
     print(f"[a16w16] batch={batch} M={M} N={N} K={K} dtype={out_dtype} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
 
 
+def load_gptoss_shapes(csv_path="aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv"):
+    import pandas as pd
+    df = pd.read_csv(csv_path)
+    shapes = list(zip(df["M"].astype(int), df["N"].astype(int), df["K"].astype(int)))
+    return list(dict.fromkeys(shapes))
+
+
+def test_a16w16_gptoss_shapes(batch=1, csv_path=None):
+    shapes = load_gptoss_shapes(csv_path) if csv_path else load_gptoss_shapes()
+    print(f"\n{'='*80}")
+    print(f"Testing a16w16 with gptoss bf16 shapes ({len(shapes)} shapes, batch={batch})")
+    print(f"{'='*80}")
+    passed = 0
+    failed = 0
+    for M, N, K in shapes:
+        tag = f"a16w16 b={batch} M={M} N={N} K={K}"
+        try:
+            XQ = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
+            WQ = torch.randn(batch, N, K, device="cuda", dtype=torch.bfloat16)
+            Y = torch.zeros(batch, M, N, device="cuda", dtype=torch.bfloat16)
+            ref_out = run_torch_ref_noscale(XQ, WQ, torch.bfloat16)
+            Y, us = run_perftest(deepgemm_opus, XQ, WQ, Y, None, None, None)
+            err = checkAllclose(Y, ref_out, msg=tag, rtol=0.1, atol=0.5)
+            tflops = 2.0 * batch * M * N * K / us / 1e6
+            print(f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
+            passed += 1
+        except Exception as e:
+            print(f"[FAIL] {tag} | {e}")
+            failed += 1
+    print(f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test opus_gemm kernels")
     parser.add_argument("-m", type=int, default=256)
@@ -115,6 +147,13 @@ if __name__ == "__main__":
         choices=["fp32", "bf16"],
         help="Output dtype",
     )
+    parser.add_argument(
+        "--csv_file",
+        type=str,
+        default=None,
+        metavar="CSV",
+        help="Run a16w16 test with shapes from a CSV file (must have M,N,K columns)",
+    )
     args = parser.parse_args()
 
     out_dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
@@ -128,3 +167,6 @@ if __name__ == "__main__":
     if args.type in ("a16w16", "all"):
         k_a16 = max(args.k, 128)
         test_a16w16(args.batch, args.m, args.n, k_a16, out_dtype=torch.bfloat16)
+
+    if args.csv_file is not None:
+        test_a16w16_gptoss_shapes(batch=args.batch, csv_path=args.csv_file)
