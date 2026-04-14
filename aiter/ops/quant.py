@@ -143,8 +143,7 @@ def per_1x32_f4_quant(
     return y, scale
 
 
-def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2,
-                                      shuffle=False):
+def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2,shuffle=False):
     """Convenience function: quantize both LHS and RHS for ``tl.dot_scaled``.
 
     Handles the packing dimension automatically:
