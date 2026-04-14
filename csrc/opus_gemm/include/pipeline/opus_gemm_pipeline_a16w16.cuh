@@ -294,10 +294,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_b[0] = load<T::VEC_B>(s_b[toc][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2));
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
+        v_b[0] = load<T::VEC_B>(s_b[toc][0], u_rb);
 
         __builtin_amdgcn_s_setprio(1);
         v_c[1][1] = mma(v_a, v_b[1], v_c[1][1]);
@@ -340,10 +340,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3));
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
+        v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
 
         __builtin_amdgcn_s_setprio(1);
         v_c[1][1] = mma(v_a, v_b[1], v_c[1][1]);
