@@ -6,6 +6,7 @@ import os
 from multiprocessing import Pool, freeze_support, set_start_method
 from typing_extensions import Optional
 
+import pandas as pd
 import torch
 import torch.distributed as dist
 
@@ -137,12 +138,21 @@ def test_custom_tp(
     pool.close()
     pool.join()
     rets = [el.get() for el in rets]
+    all_us = [us for _, us in rets]
+    max_err = 0.0
     for out, us in rets:
         msg = (
             f"test_custom_tp: GPUs={device_ids} {shape=} {dtype=} "
             f"{withGraph=} {us:>8.2f}"
         )
-        checkAllclose(ref, out.to(ref), msg=msg)
+        err = checkAllclose(ref, out.to(ref), msg=msg)
+        max_err = max(max_err, err)
+    return {
+        "test": "custom_tp",
+        "min_us": min(all_us),
+        "max_us": max(all_us),
+        "err": max_err,
+    }
 
 
 # ============================================================
@@ -189,12 +199,21 @@ def test_custom_dp(
     pool.close()
     pool.join()
     rets = [el.get() for el in rets]
+    all_us = [us for _, us in rets]
+    max_err = 0.0
     for out, us in rets:
         msg = (
             f"test_custom_dp: GPUs={device_ids} {shape=} {dtype=} "
             f"{withGraph=} {us:>8.2f}"
         )
-        checkAllclose(ref, out.to(ref), msg=msg)
+        err = checkAllclose(ref, out.to(ref), msg=msg)
+        max_err = max(max_err, err)
+    return {
+        "test": "custom_dp",
+        "min_us": min(all_us),
+        "max_us": max(all_us),
+        "err": max_err,
+    }
 
 
 # ============================================================
@@ -243,12 +262,21 @@ def test_custom_ep(
     pool.close()
     pool.join()
     rets = [el.get() for el in rets]
+    all_us = [us for _, us in rets]
+    max_err = 0.0
     for out, us in rets:
         msg = (
             f"test_custom_ep: tp={custom_tp} dp={custom_dp} {shape=} "
             f"{dtype=} {withGraph=} {us:>8.2f}"
         )
-        checkAllclose(ref, out.to(ref), msg=msg)
+        err = checkAllclose(ref, out.to(ref), msg=msg)
+        max_err = max(max_err, err)
+    return {
+        "test": "custom_ep",
+        "min_us": min(all_us),
+        "max_us": max(all_us),
+        "err": max_err,
+    }
 
 
 # ============================================================
@@ -398,19 +426,33 @@ def test_two_phase_tp4dp2_then_tp8(
     pool.join()
     rets = [el.get() for el in rets]
 
+    all_us1 = []
+    all_us2 = []
+    max_err = 0.0
     for result1, result2 in rets:
         out1, us1 = result1
         out2, us2 = result2
+        all_us1.append(us1)
+        all_us2.append(us2)
         msg1 = (
             f"test_two_phase (attn tp4dp2->ep8): {shape=} {dtype=} "
             f"{withGraph=} {us1:>8.2f}"
         )
-        checkAllclose(ref_phase1, out1.to(ref_phase1), msg=msg1)
+        err1 = checkAllclose(ref_phase1, out1.to(ref_phase1), msg=msg1)
         msg2 = (
             f"test_two_phase (comm tp8 allgather): {shape=} {dtype=} "
             f"{withGraph=} {us2:>8.2f}"
         )
-        checkAllclose(ref_phase2, out2.to(ref_phase2), msg=msg2)
+        err2 = checkAllclose(ref_phase2, out2.to(ref_phase2), msg=msg2)
+        max_err = max(max_err, err1, err2)
+    return {
+        "test": "two_phase",
+        "attn_min_us": min(all_us1),
+        "attn_max_us": max(all_us1),
+        "comm_min_us": min(all_us2),
+        "comm_max_us": max(all_us2),
+        "err": max_err,
+    }
 
 
 if __name__ == "__main__":
@@ -418,6 +460,7 @@ if __name__ == "__main__":
     shape = (128, 8192)
     dtype = torch.bfloat16
 
+    df = []
     for withGraph in [True, False]:
         for test_fn in [
             test_custom_tp,
@@ -425,7 +468,7 @@ if __name__ == "__main__":
             test_custom_ep,
             test_two_phase_tp4dp2_then_tp8,
         ]:
-            test_fn(
+            ret = test_fn(
                 shape,
                 dtype,
                 withGraph=withGraph,
@@ -433,3 +476,23 @@ if __name__ == "__main__":
                     get_ip(), get_open_port()
                 ),
             )
+            df.append(ret)
+    df = pd.DataFrame(df)
+    show_cols = [
+        "test",
+        "shape",
+        "dtype",
+        "withGraph",
+        "min_us",
+        "max_us",
+        "attn_min_us",
+        "attn_max_us",
+        "comm_min_us",
+        "comm_max_us",
+        "err",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+    logger.info(
+        "custom group allreduce summary (markdown):\n%s",
+        df[show_cols].to_markdown(index=False),
+    )
