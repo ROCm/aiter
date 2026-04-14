@@ -117,6 +117,7 @@ class AttentionConfig:
         IS_Q_FP8,
         IS_KV_FP8,
         ALL_DECODE,
+        K_WIDTH,
     ):
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
@@ -132,6 +133,7 @@ class AttentionConfig:
         self.IS_Q_FP8 = gl.constexpr(IS_Q_FP8)
         self.IS_KV_FP8 = gl.constexpr(IS_KV_FP8)
         self.ALL_DECODE = gl.constexpr(ALL_DECODE)
+        self.K_WIDTH = gl.constexpr(K_WIDTH)
         # Derived constants
         self.TILE_SIZE = gl.constexpr(BLOCK_SIZE * NUM_BLOCKS_GATHER_PER_TILE)
         self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
@@ -178,26 +180,24 @@ class AttentionConfig:
                 instr_shape=[16, 16, 64 if (self.IS_Q_FP8 and self.IS_KV_FP8) else 32],
             )
         )
-        k_width = 16 if self.IS_KV_FP8 and self.SHUFFLED_KV_CACHE else 8
-        self.K_WIDTH = gl.constexpr(k_width)
         self.Q_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
-                operand_index=0, parent=self.QK_WMMA_LAYOUT, k_width=k_width
+                operand_index=0, parent=self.QK_WMMA_LAYOUT, k_width=self.K_WIDTH
             )
         )
         self.K_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
-                operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=k_width
+                operand_index=1, parent=self.QK_WMMA_LAYOUT, k_width=self.K_WIDTH
             )
         )
         self.P_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
-                operand_index=0, parent=self.PV_WMMA_LAYOUT, k_width=k_width
+                operand_index=0, parent=self.PV_WMMA_LAYOUT, k_width=self.K_WIDTH
             )
         )
         self.V_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
-                operand_index=1, parent=self.PV_WMMA_LAYOUT, k_width=k_width
+                operand_index=1, parent=self.PV_WMMA_LAYOUT, k_width=self.K_WIDTH
             )
         )
 
@@ -840,48 +840,75 @@ class AttentionProgram:
 
     @gluon.jit
     def lds_unshuffle_k(self, buffer_id):
+        # return (
+        #     self.k_shared.index(buffer_id)
+        #     .reshape(
+        #         (
+        #             self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+        #             self.cfg.BLOCK_SIZE // 16,
+        #             self.cfg.HEAD_SIZE // (2 * self.cfg.K_WIDTH),
+        #             2,
+        #             16,
+        #             self.cfg.K_WIDTH,
+        #         )
+        #     )
+        #     .permute((0, 1, 4, 2, 3, 5))
+        #     .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
+        #     .permute((1, 0))
+        # )
         return (
             self.k_shared.index(buffer_id)
             .reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                    self.cfg.BLOCK_SIZE // 16,
-                    self.cfg.HEAD_SIZE // (2 * self.cfg.K_WIDTH),
-                    2,
-                    16,
+                    self.cfg.HEAD_SIZE // self.cfg.K_WIDTH,
+                    self.cfg.TILE_SIZE,
                     self.cfg.K_WIDTH,
                 )
             )
-            .permute((0, 1, 4, 2, 3, 5))
+            .permute((0, 2, 1, 3))
             .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
             .permute((1, 0))
         )
 
     @gluon.jit
     def lds_unshuffle_v(self, buffer_id):
+        # return (
+        #     self.v_shared.index(buffer_id)
+        #     .reshape(
+        #         (
+        #             self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+        #             self.cfg.HEAD_SIZE // 16,
+        #             self.cfg.BLOCK_SIZE // (2 * self.cfg.K_WIDTH),
+        #             2,
+        #             16,
+        #             self.cfg.K_WIDTH,
+        #         )
+        #     )
+        #     .permute((0, 1, 4, 2, 3, 5))
+        #     .reshape(
+        #         (
+        #             self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+        #             self.cfg.HEAD_SIZE,
+        #             self.cfg.BLOCK_SIZE,
+        #         )
+        #     )
+        #     .permute((1, 0, 2))
+        #     .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
+        #     .permute((1, 0))
+        # )
         return (
             self.v_shared.index(buffer_id)
             .reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                    self.cfg.HEAD_SIZE // 16,
-                    self.cfg.BLOCK_SIZE // (2 * self.cfg.K_WIDTH),
-                    2,
-                    16,
+                    self.cfg.TILE_SIZE // self.cfg.K_WIDTH,
+                    self.cfg.HEAD_SIZE,
                     self.cfg.K_WIDTH,
                 )
             )
-            .permute((0, 1, 4, 2, 3, 5))
-            .reshape(
-                (
-                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                    self.cfg.HEAD_SIZE,
-                    self.cfg.BLOCK_SIZE,
-                )
-            )
-            .permute((1, 0, 2))
-            .reshape((self.cfg.HEAD_SIZE, self.cfg.TILE_SIZE))
-            .permute((1, 0))
+            .permute((0, 1, 3, 2))
+            .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
         )
 
     @gluon.jit
@@ -1325,7 +1352,8 @@ def _unified_attention_gluon_kernel_3d(
     num_ctas: gl.constexpr = 1,  # int
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: gl.constexpr = False,  #
+    K_WIDTH: gl.constexpr = 0,  # int
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool
     USE_STORE_BUFFER_OP: gl.constexpr = False,  # bool
     IS_Q_FP8: gl.constexpr = False,  # bool
@@ -1359,6 +1387,7 @@ def _unified_attention_gluon_kernel_3d(
         IS_Q_FP8,
         IS_KV_FP8,
         ALL_DECODE,
+        K_WIDTH,
     )
 
     # Workgroup offsets

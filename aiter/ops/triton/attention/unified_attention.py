@@ -217,13 +217,19 @@ def unified_attention(
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
     num_tokens, num_query_heads, head_size = q.shape
+    K_WIDTH = 0
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, block_size, head_size
         # value_cache: num_blocks, num_kv_heads, head_size, block_size
-        num_blocks, num_kv_heads, block_size, _ = k.shape
+        # num_blocks, num_kv_heads, block_size, _ = k.shape
+
+        # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
+        # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
+        num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
     else:
         # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
-        num_blocks, block_size, num_kv_heads, _ = k.shape
+        num_blocks, block_size, num_kv_heads, _ = k
+
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
 
@@ -367,6 +373,7 @@ def unified_attention(
             segm_expsum = out  # dummy ptr
 
         if IS_DEVICE_ARCH_GFX12:
+            print(f"{K_WIDTH=}")
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
@@ -420,6 +427,7 @@ def unified_attention(
                 BLOCK_M=BLOCK_M,
                 ALL_DECODE=ALL_DECODE,
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
+                K_WIDTH=K_WIDTH,
                 WARP_SIZE=WARP_SIZE,
                 NUM_BLOCKS_GATHER_PER_TILE=1,
                 IS_Q_FP8=(q_dtype == e4m3_dtype),
@@ -480,6 +488,7 @@ def unified_attention(
                 BLOCK_M=BLOCK_M,
                 ALL_DECODE=ALL_DECODE,
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
+                K_WIDTH=K_WIDTH,
                 **attn_config,
             )
 
