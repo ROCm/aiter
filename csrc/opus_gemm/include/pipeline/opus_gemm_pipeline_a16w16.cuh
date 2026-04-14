@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// BF16 noscale pipeline for a16w16 (bf16, W_K=32).
-// T_M=2, T_N=4 wave mapping. No scale factors.
+// BF16 noscale pipeline for a16w16 (bf16).
+// TILE and WAVE dimensions are configurable via Traits. No scale factors.
 // BF16 MFMA does not accept cbsz/blgp args.
 #pragma once
 
-#include "../opus_gemm_common.cuh"
+#include "opus_gemm_traits_a16w16.cuh"
 
 // ============================================================================
-// Layout functions for noscale kernels (T_M=2, T_N=4 wave mapping)
+// Layout functions for noscale kernels (TILE/WAVE from Traits)
 // Guarded: these are __device__ functions only needed on the device pass.
 // ============================================================================
 
