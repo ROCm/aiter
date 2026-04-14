@@ -1751,7 +1751,6 @@ def test_batch_prefill_large_kvcache(
 
     is_fp8 = input_dtype == "fp8"
     dtype = torch.bfloat16
-    k_vector_size = 16 // (1 if is_fp8 else 2)  # fp8=16, bf16=8
 
     # Compute num_blocks from target KV cache size
     elem_size = 1 if is_fp8 else 2  # fp8=1 byte, bf16=2 bytes
