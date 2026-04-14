@@ -288,11 +288,19 @@ class FmoeTuner(TunerCommon):
         blockM,
         q_type,
         act_type,
+        use_g1u1,
     ):
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        if act_type == ActivationType.Swiglu:
+            act = "swiglu"
+        elif act_type == ActivationType.Gelu:
+            act = "gelu"
+        else:
+            act = "silu"
         fuse_fq = kparams.get("fuse_fp4_quant", False)
         token_num = a1_qt.shape[0]
-        inter_dim = w1_qt_shffle_ck.shape[1] // 2
+        inter_dim = (
+            w1_qt_shffle_ck.shape[1] // 2 if use_g1u1 else w1_qt_shffle_ck.shape[1]
+        )
         result = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_qt_shffle_ck,
@@ -307,10 +315,11 @@ class FmoeTuner(TunerCommon):
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
             act=act,
+            use_g1u1=use_g1u1,
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
-            use_async_copy=True,
+            use_async_copy=kparams.get("use_async_copy", False),
             k_batch=kparams.get("k_batch", 1),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
@@ -2002,20 +2011,19 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64, 128] or not use_g1u1:
-                continue
             for kname, kparams in flydsl_s1_kernels.items():
                 ktm = kparams["tile_m"]
                 if ktm != blockM and not (ktm == 16 and blockM == 32 and token <= 16):
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
+                if is_splitk and not use_g1u1:
+                    continue
+                if kparams.get("gate_only", False) and not use_g1u1:
+                    continue
 
-                if is_splitk:
-                    fq_params = {**kparams, "fuse_fp4_quant": True}
-                    s1_variants = [(kname + "_fq", fq_params, True)]
-                else:
-                    s1_variants = [(kname, kparams, False)]
+                s1_variants = [(kname, kparams, False)]
+                if (not is_splitk) or (act_type != ActivationType.Gelu):
                     fq_params = {**kparams, "fuse_fp4_quant": True}
                     s1_variants.append((kname + "_fq", fq_params, True))
 
@@ -2060,6 +2068,7 @@ class FmoeTuner(TunerCommon):
                                 blockM,
                                 q_type,
                                 act_type,
+                                use_g1u1,
                             ),
                             {},
                             FmoeTuner.run_torch_moe_stage1,
@@ -2331,7 +2340,7 @@ class FmoeTuner(TunerCommon):
     ):
         self._flydsl_fallbacks = []
         mp_num = args.mp
-        blockMs = [32, 64, 128]
+        blockMs = [16, 32, 64, 128]
         keys = self.keys
         tasks = []
         tasks_ck = []
@@ -2362,9 +2371,9 @@ class FmoeTuner(TunerCommon):
             if get_gfx() not in ["gfx950"] and q_type == aiter.QuantType.per_1x32:
                 print(f"{q_type} is not supported on {get_gfx()}")
                 return []
-            if not use_g1u1:
-                print("no moe solution(g1u0) can tune for ", line)
-                continue
+            # if not use_g1u1:
+            #     print("no moe solution(g1u0) can tune for ", line)
+            #     continue
             act_type = eval(act_type)
             info = (
                 cu_num,
@@ -2381,9 +2390,14 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             )
-            tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, blockMs))
-            tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
+            shape_blockMs = (
+                [m for m in blockMs if m >= 32]
+                if q_type == QuantType.per_1x32
+                else blockMs
+            )
+            tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
+            tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
+            tasks_ck.extend(self.gen_flydsl_2stages_task(info, shape_blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)

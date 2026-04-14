@@ -66,50 +66,55 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
 
-    tile_ns = [32, 64, 128] if is_fp4 else [128]
+    tile_ns = [32, 64, 128, 256] if is_fp4 else [128]
     tile_ks = [256]
     tile_ms = [16, 32, 64, 128]
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
+    async_copies = [False, True]
 
     for tm in tile_ms:
         if tm in [16, 32]:
             tile_ns = [32, 64, 128]
         else:
-            tile_ns = [64, 128]
+            tile_ns = [64, 128, 256]
         for tn in tile_ns:
             for tk in tile_ks:
-                for wpe in waves_per_eus:
-                    for kb in k_batches if wpe == 3 else [1]:
-                        gate_onlys = [False, True] if kb > 1 else [False]
-                        for bnt in b_nts:
-                            for go in gate_onlys:
-                                name = flydsl_kernel_name(
-                                    1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                                )
-                                if wpe != 1:
-                                    name += f"_w{wpe}"
-                                if kb != 1:
-                                    name += f"_kb{kb}"
-                                if bnt != 2:
-                                    name += f"_bnt{bnt}"
-                                if go:
-                                    name += "_go"
-                                kernels[name] = {
-                                    "stage": 1,
-                                    "a_dtype": a_dtype,
-                                    "b_dtype": b_dtype,
-                                    "out_dtype": out_dtype,
-                                    "tile_m": tm,
-                                    "tile_n": tn,
-                                    "tile_k": tk,
-                                    "MPerBlock": tm,
-                                    "waves_per_eu": wpe,
-                                    "k_batch": kb,
-                                    "b_nt": bnt,
-                                    "gate_only": go,
-                                }
+                for async_copy in async_copies:
+                    for wpe in waves_per_eus:
+                        for kb in k_batches if wpe == 3 else [1]:
+                            gate_onlys = [False, True] if kb > 1 else [False]
+                            for bnt in b_nts:
+                                for go in gate_onlys:
+                                    name = flydsl_kernel_name(
+                                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                                    )
+                                    if async_copy:
+                                        name += "_async"
+                                    if wpe != 1:
+                                        name += f"_w{wpe}"
+                                    if kb != 1:
+                                        name += f"_kb{kb}"
+                                    if bnt != 2:
+                                        name += f"_bnt{bnt}"
+                                    if go:
+                                        name += "_go"
+                                    kernels[name] = {
+                                        "stage": 1,
+                                        "a_dtype": a_dtype,
+                                        "b_dtype": b_dtype,
+                                        "out_dtype": out_dtype,
+                                        "tile_m": tm,
+                                        "tile_n": tn,
+                                        "tile_k": tk,
+                                        "MPerBlock": tm,
+                                        "use_async_copy": async_copy,
+                                        "waves_per_eu": wpe,
+                                        "k_batch": kb,
+                                        "b_nt": bnt,
+                                        "gate_only": go,
+                                    }
     return kernels
 
 
@@ -176,6 +181,7 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
+    use_g1u1: bool = True,
     persist_m: int = 1,
     fuse_fp4_quant: bool = False,
     fuse_sort_scale: bool = False,
@@ -202,6 +208,7 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             act=act,
+            use_g1u1=use_g1u1,
             persist_m=persist_m,
             fuse_fp4_quant=fuse_fp4_quant,
             fuse_sort_scale=fuse_sort_scale,
@@ -476,6 +483,7 @@ def flydsl_moe_stage1(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     act: str = "silu",
+    use_g1u1: Optional[bool] = None,
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
@@ -488,9 +496,12 @@ def flydsl_moe_stage1(
     b_nt: int = 2,
     gate_only: bool = False,
 ):
-    """Fused gate+up GEMM (MOE stage1).
+    """Fused MOE stage1 GEMM.
 
-    a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
+    a: (token_num, model_dim)
+    w1:
+      - g1u1: (E, 2*inter_dim, model_dim) pre-shuffled
+      - g1u0: (E, inter_dim, model_dim) pre-shuffled
     For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
     `shuffle_weight(..., (16, 16))` and `e8m0_shuffle(...)`.
 
@@ -498,9 +509,10 @@ def flydsl_moe_stage1(
     layout directly, avoiding a separate moe_mxfp4_sort call.
 
     When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
-    add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
+    add into a zeroed buffer, then an activation+mul helper fuses reduction.
+    Split-K is currently supported only for g1u1.
 
-    When gate_only=True (requires k_batch>1), each workgroup computes only
+    When gate_only=True (requires use_g1u1 and k_batch>1), each workgroup computes only
     one B-tile stream (no gate/up interleaving).  The grid X doubles so
     that by_n naturally covers both gate and up regions.
 
@@ -510,7 +522,46 @@ def flydsl_moe_stage1(
     """
     token_num = a.shape[0]
     E = w1.shape[0]
-    inter_dim = w1.shape[1] // 2
+
+    if use_g1u1 is None:
+        logical_out_inter_dim = None
+        if out is not None:
+            logical_out_inter_dim = out.shape[-1] * (2 if fuse_fp4_quant else 1)
+        if logical_out_inter_dim is not None:
+            if w1.shape[1] == 2 * logical_out_inter_dim:
+                use_g1u1 = True
+                inter_dim = logical_out_inter_dim
+            elif w1.shape[1] == logical_out_inter_dim:
+                use_g1u1 = False
+                inter_dim = logical_out_inter_dim
+            else:
+                raise ValueError(
+                    f"Unable to infer g1u mode from w1.shape={tuple(w1.shape)} "
+                    f"and out.shape={tuple(out.shape)}"
+                )
+        else:
+            # Preserve the historical direct-call behavior: when the caller does
+            # not provide enough shape information, assume the legacy g1u1 path.
+            if (w1.shape[1] % 2) != 0:
+                raise ValueError(
+                    f"Unable to infer g1u1 inter_dim from odd w1.shape[1]={w1.shape[1]}"
+                )
+            use_g1u1 = True
+            inter_dim = w1.shape[1] // 2
+    else:
+        use_g1u1 = bool(use_g1u1)
+        if use_g1u1:
+            if (w1.shape[1] % 2) != 0:
+                raise ValueError(
+                    f"g1u1 stage1 expects w1.shape[1] to be even, got {w1.shape[1]}"
+                )
+            inter_dim = w1.shape[1] // 2
+        else:
+            inter_dim = w1.shape[1]
+
+    if act == "swiglu" and not use_g1u1:
+        raise ValueError("swiglu stage1 requires use_g1u1=True")
+
     model_dim = a.shape[1]
 
     if a_dtype == "fp4":
@@ -525,6 +576,11 @@ def flydsl_moe_stage1(
 
     dev = a.device
     _splitk_fq = _is_splitk and fuse_fp4_quant
+
+    if _is_splitk and not use_g1u1:
+        raise ValueError("g1u0 stage1 does not support k_batch > 1")
+    if _splitk_fq and act not in ("silu", "swiglu"):
+        raise ValueError("split-K fused fp4 quant only supports silu/swiglu stage1")
 
     if out is None:
         if fuse_fp4_quant:
@@ -589,7 +645,15 @@ def flydsl_moe_stage1(
 
     _kernel_out = tmp_out if _is_splitk else out
     is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    _n_in = inter_dim * (2 if (is_fp4 and use_g1u1) else 1)
+    # _n_in is used by kernel launch to compute gx.
+    # Keep historical behavior:
+    # - use_g1u1=True (gated): fp4 path uses 2*inter_dim, non-fp4 uses inter_dim
+    # - use_g1u1=False  (non-gated): always inter_dim
+    if use_g1u1:
+        _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    else:
+        _n_in = inter_dim
     _k_in = model_dim
 
     if is_fp4:
@@ -640,6 +704,7 @@ def flydsl_moe_stage1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
+        use_g1u1=use_g1u1,
         persist_m=_persist_m,
         fuse_fp4_quant=_gemm_fq,
         fuse_sort_scale=_gemm_fss,
@@ -668,9 +733,14 @@ def flydsl_moe_stage1(
             ),
         )
     elif _is_splitk:
-        from aiter.ops.activation import silu_and_mul
+        if act == "gelu":
+            from aiter.ops.activation import gelu_and_mul
 
-        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+            gelu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+        else:
+            from aiter.ops.activation import silu_and_mul
+
+            silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
 
     if fuse_fp4_quant:
         from aiter.utility.dtypes import fp8_e8m0

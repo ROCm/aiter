@@ -645,7 +645,14 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    use_g1u1 = w1.shape[1] == (2 * inter_dim)
+    if activation == ActivationType.Swiglu:
+        act = "swiglu"
+    elif activation == ActivationType.Gelu:
+        act = "gelu"
+    else:
+        act = "silu"
     _fq = fuse_fp4_quant or parsed.get("fuse_fp4_quant", False)
     _fss = fuse_sort_scale or (_fq and not fuse_sort_scale)
     return aiter.ops.flydsl.flydsl_moe_stage1(
@@ -663,11 +670,13 @@ def _flydsl_stage1_wrapper(
         b_dtype=parsed["b_dtype"],
         out_dtype=parsed["out_dtype"],
         act=act,
+        use_g1u1=use_g1u1,
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
         fuse_fp4_quant=_fq,
         fuse_sort_scale=_fss,
+        use_async_copy=parsed.get("use_async_copy", False),
         k_batch=parsed.get("k_batch", 1),
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
