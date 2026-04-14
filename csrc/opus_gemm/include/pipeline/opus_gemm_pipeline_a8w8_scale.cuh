@@ -2,7 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include "../opus_gemm_common.cuh"
+#include "opus_gemm_traits_a8w8_scale.cuh"
 
 // ============================================================================
 // Layout functions for A/B matrix global/shared/register data movement
@@ -176,7 +176,7 @@ inline __device__ auto make_layout_sfa(int lane_id, int wave_id_m, int stride_sf
 // ============================================================================
 
 template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(opus_gemm_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_scale_kernel(opus_gemm_scale_kargs kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
     using namespace opus;
 

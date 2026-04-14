@@ -39,16 +39,42 @@ class OpusGemmInstance:
         )
 
 
+def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk):
+    vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
+    return OpusGemmInstance(
+        bs, bm, bn, bk, 2, tn, wm, wn, wk,
+        vec, vec, 4, 0, 0, 0, "a16w16", ["fp32_t", "bf16_t"],
+    )
+
+
 # fmt: off
-kernels_list = {
+# --- per-pipeline kernel instance lists ---
+a8w8_scale_kernels_list = {
     1: OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
-    2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8",       ["fp32_t"]),
-    3: OpusGemmInstance(512, 256, 256, 64,  2, 4, 16, 16, 32,  8, 8, 4,  0, 0, 0,      "a16w16",     ["fp32_t", "bf16_t"]),
 }
+
+a8w8_kernels_list = {
+    2: OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0, "a8w8", ["fp32_t"]),
+}
+
+a16w16_kernels_list = {
+    # ── MFMA 16x16x32, T_N=2, BS=256 (2-block/CU capable) ──
+    3:  _a16w16(256, 128, 128, 32,  2, 16, 16, 32),
+    4:  _a16w16(256, 128, 256, 32,  2, 16, 16, 32),
+    5:  _a16w16(256, 256, 128, 32,  2, 16, 16, 32),
+    # ── MFMA 16x16x32, T_N=4, BS=512 (1-block/CU) ──
+    6:  _a16w16(512, 128, 128, 64,  4, 16, 16, 32),
+    7:  _a16w16(512, 256, 128, 64,  4, 16, 16, 32),
+    8:  _a16w16(512, 128, 256, 64,  4, 16, 16, 32),
+    9:  _a16w16(512, 256, 256, 64,  4, 16, 16, 32),  # existing / current default
+}
+
+# combined list (used by production gen_instances / dispatch)
+kernels_list = {**a8w8_scale_kernels_list, **a8w8_kernels_list, **a16w16_kernels_list}
 
 default_kernels_dict = {
     (-1): OpusGemmInstance(512, 256, 256, 128, 4, 2, 16, 16, 128, 16, 16, 4, 1, 128, 128, "a8w8_scale", ["fp32_t"]),
     (-2): OpusGemmInstance(512, 256, 256, 128, 2, 4, 16, 16, 128, 16, 16, 4, 0, 0, 0,     "a8w8",       ["fp32_t"]),
-    (-3): OpusGemmInstance(512, 256, 256, 64,  2, 4, 16, 16, 32,  8, 8, 4,  0, 0, 0,      "a16w16",     ["fp32_t", "bf16_t"]),
+    (-3): _a16w16(512, 256, 256, 64, 4, 16, 16, 32),  # same as a16w16 #9
 }
 # fmt: on

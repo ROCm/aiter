@@ -6,7 +6,7 @@
 // MMA uses cbsz/blgp args (0,0) required by fp8 MFMA.
 #pragma once
 
-#include "../opus_gemm_common.cuh"
+#include "opus_gemm_traits_a8w8_noscale.cuh"
 
 // ============================================================================
 // Layout functions for noscale kernels (T_M=2, T_N=4 wave mapping)
