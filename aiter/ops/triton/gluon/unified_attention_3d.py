@@ -1341,6 +1341,7 @@ def _unified_attention_gluon_kernel_3d(
     NUM_QUERY_HEADS: gl.constexpr,  # int
     NUM_KV_HEADS: gl.constexpr,  # int
     BLOCK_SIZE: gl.constexpr,  # int
+    TILE_SIZE: gl.constexpr,  # int
     HEAD_SIZE: gl.constexpr,  # int
     BLOCK_Q: gl.constexpr,  # int
     BLOCK_M: gl.constexpr,  # int

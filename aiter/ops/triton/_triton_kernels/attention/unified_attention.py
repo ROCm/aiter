@@ -99,6 +99,8 @@ def kernel_unified_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
     ALL_DECODE: tl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
+    K_WIDTH: tl.constexpr = 0,  # int
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -107,26 +109,36 @@ def kernel_unified_attention_2d(
     RCP_LN2 = 1.4426950408889634
     qk_scale = scale * RCP_LN2
 
-    seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
-    )
+    if ALL_DECODE:
+        seq_idx = q_block_global_idx
+        q_block_local_idx: tl.int32 = 0
+        cur_batch_query_len: tl.int32 = 1
+        cur_batch_in_all_start_index: tl.int32 = q_block_global_idx
+    else:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        )
 
-    q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
+        q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
 
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
 
-    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
+        cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
 
-    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
-        return
+        if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+            return
 
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+
+    offs_shfl = None
+    if SHUFFLED_KV_CACHE:
+        offs_shfl = tl.arange(0, TILE_SIZE * HEAD_SIZE_PADDED)
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
@@ -252,43 +264,86 @@ def kernel_unified_attention_2d(
         else:
             tile_mask = seq_offset < max_seq_prefix_len
 
-        physical_block_idx = tl.load(
-            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-        ).to(tl.int64)
+        k_mask = None
+        v_mask = None
+        other = None
+        if SHUFFLED_KV_CACHE:
+            physical_block_idx_shfl = tl.load(
+                block_tables_ptr + block_table_offset + j
+            ).to(tl.int64)
+            k_offset = (
+                physical_block_idx_shfl * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_1
+                + offs_shfl
+            )
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
+            v_offset = (
+                physical_block_idx_shfl * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_1
+                + offs_shfl
+            )
+        else:
+            physical_block_idx = tl.load(
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+            ).to(tl.int64)
 
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            )
+            v_mask = dim_mask[None, :] & tile_mask[:, None]
+
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+            k_mask = dim_mask[:, None] & tile_mask[None, :]
+            other = 0.0
 
         # K : (HEAD_SIZE, TILE_SIZE)
         K_load = tl.load(
             key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
+            mask=k_mask,
+            other=other,
             cache_modifier=KV_cache_modifier,
         )
 
         K = K_load.to(Q.dtype)
+        if SHUFFLED_KV_CACHE:
+            K = (
+                K.reshape(
+                    HEAD_SIZE_PADDED // K_WIDTH,
+                    TILE_SIZE,
+                    K_WIDTH,
+                )
+                .permute(1, 0, 2)
+                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+                .trans(1, 0)
+            )
 
         # V : (TILE_SIZE, HEAD_SIZE)
         V_load = tl.load(
             value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
+            mask=v_mask,
+            other=other,
             cache_modifier=KV_cache_modifier,
         )
 
         V = V_load.to(Q.dtype)
+        if SHUFFLED_KV_CACHE:
+            V = (
+                V.reshape(
+                    TILE_SIZE // K_WIDTH,
+                    HEAD_SIZE_PADDED,
+                    K_WIDTH,
+                )
+                .permute(0, 2, 1)
+                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+            )
 
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
@@ -435,12 +490,6 @@ def kernel_unified_attention_3d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
-
-    if SHUFFLED_KV_CACHE:
-        tl.static_assert(
-            TILE_SIZE == BLOCK_SIZE,
-            "TILE_SIZE must be equal to BLOCK_SIZE if SHUFFLED_KV_CACHE is True",
-        )
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
@@ -734,6 +783,7 @@ def kernel_unified_attention_3d(
         M = m_j
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # if TILE_SIZE < 32 and V.dtype.is_fp8():
         acc += tl.dot(P.to(V.dtype), V)
 
     if v_descale is not None:

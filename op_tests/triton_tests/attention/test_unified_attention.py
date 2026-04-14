@@ -267,7 +267,7 @@ def ref_paged_attn(
 )
 @pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
 @pytest.mark.parametrize("head_size", [64])
-@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, o_dtype, use_out_scale",
@@ -297,8 +297,6 @@ def test_triton_unified_attn_3d(
     use_out_scale: bool,
 ) -> None:
     torch.cuda.empty_cache()
-    if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
-        pytest.skip("block size must be at least 32 for fp8")
 
     if DEVICE_ARCH not in (
         "gfx950",
@@ -309,9 +307,9 @@ def test_triton_unified_attn_3d(
         pytest.skip(f"skip {DEVICE_ARCH}")
 
     if shuffled_kv_cache:
-        if block_size < 64:
+        if q_dtype == e4m3_dtype and kv_dtype == e4m3_dtype and block_size < 32:
             pytest.skip(
-                "Only block size >= 64 is supported for shuffled KV cache with gluon backend"
+                "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
             )
 
         num_stage_assume = 2

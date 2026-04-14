@@ -37,6 +37,9 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    q_dtype,
+    kv_cache_dtype,
+    shuffled_kv_cache,
 ):
     arch = get_arch()
 
@@ -68,6 +71,16 @@ def select_2d_config(
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
+
+    # fix TILE_SIZE to block_size if shuffled_kv_cache is True
+    if shuffled_kv_cache:
+        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            assert (
+                block_size >= 32
+            ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        TILE_SIZE = block_size
+    elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+        TILE_SIZE = max(32, TILE_SIZE)
 
     return {
         "BLOCK_M": BLOCK_M,
@@ -115,9 +128,9 @@ def select_3d_config(
                 waves_per_eu = 2
                 num_segments = 8
 
-        assert (
-            block_size >= 64
-        ), "Only block_size >= 64 is supported for shuffled KV cache"
+        # assert (
+        #     block_size >= 64
+        # ), "Only block_size >= 64 is supported for shuffled KV cache"
 
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
@@ -152,7 +165,18 @@ def select_3d_config(
     ):
         waves_per_eu = 0
 
+    # fix TILE_SIZE to block_size if shuffled_kv_cache is True
+    if shuffled_kv_cache:
+        if q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+            assert (
+                block_size >= 32
+            ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+        TILE_SIZE = block_size
+    elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
+        TILE_SIZE = max(32, TILE_SIZE)
+
     attn_config = {
+        "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
         "waves_per_eu": waves_per_eu,
@@ -283,6 +307,9 @@ def unified_attention(
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
+            q_dtype,
+            kv_cache_dtype,
+            shuffled_kv_cache,
         )
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
@@ -335,6 +362,8 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            K_WIDTH=K_WIDTH,
             **config,
         )
 
@@ -466,7 +495,6 @@ def unified_attention(
                 query_stride_1=q.stride(1),
                 qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
                 BLOCK_SIZE=block_size,
-                TILE_SIZE=block_size,
                 HEAD_SIZE=head_size,
                 HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
                 USE_ALIBI_SLOPES=use_alibi_slopes,
