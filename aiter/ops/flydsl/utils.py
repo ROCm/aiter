@@ -27,12 +27,12 @@ def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
         if device is None:
             device = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device)
-        shared_memory_per_block = int(
-            getattr(props, "shared_memory_per_block", 0) or 0
-        )
+        shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
         if shared_memory_per_block > 0:
             return shared_memory_per_block
-        return addressable_lds_bytes_for_gfx(getattr(props, "gcnArchName", fallback_gfx))
+        return addressable_lds_bytes_for_gfx(
+            getattr(props, "gcnArchName", fallback_gfx)
+        )
     except Exception:
         return addressable_lds_bytes_for_gfx(fallback_gfx)
 
