@@ -516,6 +516,8 @@ def unified_attention(
                 ALL_DECODE=ALL_DECODE,
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
                 K_WIDTH=K_WIDTH,
+                IS_Q_FP8=(q_dtype == e4m3_dtype),
+                IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
                 **attn_config,
             )
 

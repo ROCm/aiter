@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 import torch
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -436,7 +437,28 @@ def kernel_unified_attention_2d(
     )
 
 
-@triton.jit
+
+kernel_unified_attention_3d_repr = make_kernel_repr(
+    "kernel_unified_attention_3d",
+    [
+        "num_query_heads",
+        "num_queries_per_kv",
+        "BLOCK_SIZE",
+        "TILE_SIZE",
+        "HEAD_SIZE",
+        "NUM_SEGMENTS_PER_SEQ",
+        "num_warps",
+        "waves_per_eu",
+        "num_stages",
+        "ALL_DECODE",
+        "SHUFFLED_KV_CACHE",
+        "IS_Q_FP8",
+        "IS_KV_FP8",
+    ],
+)
+
+
+@triton.jit(repr=kernel_unified_attention_3d_repr)
 def kernel_unified_attention_3d(
     segm_output_ptr,
     # [num_tokens, num_query_heads, num_segments, head_size]
@@ -482,10 +504,15 @@ def kernel_unified_attention_3d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
+    num_warps: tl.constexpr,  # int
+    waves_per_eu: tl.constexpr,  # int
+    num_stages: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    IS_Q_FP8: tl.constexpr = False,  # bool
+    IS_KV_FP8: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
