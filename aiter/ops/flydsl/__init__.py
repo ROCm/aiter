@@ -14,6 +14,16 @@ from .utils import is_flydsl_available
 
 _REQUIRED_FLYDSL_VERSION = "0.1.2"
 
+
+def _flydsl_matches_pinned(installed_ver: str, pinned_ver: str) -> bool:
+    """Same X.Y.Z as pin, allowing dev/rc/post/local segments (e.g. 0.1.2.dev462 == 0.1.2)."""
+    try:
+        from packaging.version import Version
+    except ImportError:
+        return installed_ver == pinned_ver
+    return Version(installed_ver).release == Version(pinned_ver).release
+
+
 __all__ = [
     "is_flydsl_available",
 ]
@@ -27,10 +37,10 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
-    if installed_flydsl_version != _REQUIRED_FLYDSL_VERSION:
+    if not _flydsl_matches_pinned(installed_flydsl_version, _REQUIRED_FLYDSL_VERSION):
         raise ImportError(
             "Unsupported `flydsl` version: "
-            f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
+            f"expected `{_REQUIRED_FLYDSL_VERSION}` (same release, dev/rc/post allowed), "
             f"got `{installed_flydsl_version}`."
         )
 

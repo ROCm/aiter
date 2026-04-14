@@ -52,11 +52,21 @@ def is_develop_mode():
     return False
 
 
+def _flydsl_matches_pinned(installed_ver: str, pinned_ver: str) -> bool:
+    """Same X.Y.Z as pin, allowing dev/rc/post/local segments (e.g. 0.1.2.dev462 == 0.1.2)."""
+    try:
+        from packaging.version import Version
+    except ImportError:
+        return installed_ver == pinned_ver
+    return Version(installed_ver).release == Version(pinned_ver).release
+
+
 if not IS_WINDOWS and is_develop_mode():
+    _flydsl_pin = FLYDSL_VERSION.split("==")[1]
     try:
         from importlib.metadata import version as pkg_version
 
-        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+        if not _flydsl_matches_pinned(pkg_version("flydsl"), _flydsl_pin):
             raise ImportError("version mismatch")
     except Exception:
         subprocess.check_call(
