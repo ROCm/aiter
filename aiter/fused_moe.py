@@ -648,7 +648,7 @@ def _flydsl_stage1_wrapper(
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    _a_scale_one = parsed.get("a_scale_one", True)
+    _a_scale_one = parsed.get("a_scale_one", False)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
@@ -962,7 +962,7 @@ def get_2stage_cfgs(
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
-        _s1_fq = is_flydsl1 and "_fq" in kernelName1
+        _s1_fq = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
         if is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,

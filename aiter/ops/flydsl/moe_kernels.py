@@ -70,7 +70,7 @@ def get_flydsl_stage1_kernels(
     tile_ks = [256]
     tile_ms = [32, 64, 128]
 
-    waves_per_eus = [1, 2, 3]
+    waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
     xcd_swizzles = [0, 4]
