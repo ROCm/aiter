@@ -658,7 +658,7 @@ def kernel_unified_attention_2d(
     else:
         max_seq_prefix_len = seq_len
 
-    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+    cdiv_fn(max_seq_prefix_len, TILE_SIZE)
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
