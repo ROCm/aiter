@@ -80,7 +80,7 @@ __global__ void tr_load_f16_kernel(const opus::fp16_t* __restrict__ in_row_major
     using namespace opus;
     static_assert(get_warp_size() == 64, "layout assumes wave64");
 
-    __shared__ alignas(16) fp16_t smem_tile[ROWS * COLS];
+    __shared__ fp16_t smem_tile[ROWS * COLS];
 
     const int lane_id = static_cast<int>(__builtin_amdgcn_workitem_id_x());
     constexpr int stride = COLS;
@@ -110,6 +110,7 @@ __global__ void tr_load_f16_kernel(const opus::fp16_t* __restrict__ in_row_major
         make_tuple(16_I, 1_I),
         make_tuple(0_I, lane_id % mma.grpn_b, 0_I, lane_id / mma.grpn_b));
 
+    s_waitcnt_lgkmcnt(number<0>{});
     g_out.template store<8>(__builtin_bit_cast(fp16x8_t, r), u_b);
 #else
     (void)in_row_major;
@@ -122,8 +123,8 @@ template __global__ void tr_load_f16_kernel<16, 32>(const opus::fp16_t*, opus::f
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
 #include "opus/opus.hpp"
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "opus/hip_minimal.hpp"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \
