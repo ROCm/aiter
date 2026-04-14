@@ -269,7 +269,7 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
 
     Preshuffle GEMM always uses 16x16 MFMA (4 VGPRs per thread per block).
     Per-thread accum VGPRs = round_up(tile_m, 16) * round_up(tile_n, 16) / 256.
-    Estimated total ? accum * 1.5 (pipeline overhead for A/B buffers).
+    Estimated total ~= accum * 1.5 (pipeline overhead for A/B buffers).
     Returns the max waves_per_eu that the register file can support.
     """
     padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
