@@ -4,6 +4,7 @@
 import torch
 
 from aiter.ops.triton._triton_kernels.gather_kv_b_proj import (
+    _next_pow2,
     _triton_gather_kv_b_proj,
 )
 
@@ -49,6 +50,9 @@ def gather_kv_b_proj(
     assert tp_k_head_num_k == tp_k_head_num_v
     assert ChunkK % block_size == 0
 
+    padded_k = _next_pow2(qk_nope_head_dim)
+    padded_v = _next_pow2(v_head_dim)
+
     grid = (batch_size * tp_k_head_num_k,)
     _triton_gather_kv_b_proj[grid](
         batch_size,
@@ -68,6 +72,8 @@ def gather_kv_b_proj(
         KV_CDim=weight_k,
         KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
         ChunkK=ChunkK,
+        PaddedK=padded_k,
+        PaddedV=padded_v,
         WEIGHT_PRESHUFFLE=weight_preshuffle,
         PER_ROW_SCALE=per_row_scale,
         num_stages=3,
