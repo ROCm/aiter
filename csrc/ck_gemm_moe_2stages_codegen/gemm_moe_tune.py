@@ -586,13 +586,7 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-        score = torch.zeros((token, expert), dtype=dtype)
-        start_col = 0
-        end_col = topk
-        for token_id in range(token):
-            score[token_id, start_col:end_col] = 1.0
-            start_col = end_col % expert
-            end_col = start_col + topk
+        score = torch.randn((token, expert), dtype=dtype)
         topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(

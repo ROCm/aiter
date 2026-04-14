@@ -84,8 +84,8 @@ __global__ void streamk_reduce_kernel(
 
 #else
 // ── Host pass ───────────────────────────────────────────────────────────────
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "opus/hip_minimal.hpp"
 #include <cstdio>
 
 #define HIP_CALL(call) do { \
