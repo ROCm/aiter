@@ -49,8 +49,6 @@ struct __attribute__((packed)) KernelArgs
     p3 _p23;
     void* ptr_LSEP;
     p2 _p24;
-    unsigned int gqa_ratio;
-    p3 _p25;
 };
 
 std::string get_heuristic_kernel_mla(std::string q_type,
@@ -148,7 +146,7 @@ void mla_decode_stage1_asm_fwd(
     args.scalar      = softmax_scale;
     args.s_MQA       = gqa_ratio * max_seqlen_q;
     args.s_kv_split  = kv_split;
-    args.s_Q_Bs      =  persistent ? gqa_ratio : stride_Q;
+    args.s_Q_Bs      =  stride_Q;
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
     args.out_16_nosplit = kv_split;
@@ -344,6 +342,7 @@ void mla_decode_stage1_asm_fwd(
     if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
+        args.s_Q_Bs = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;
     std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
