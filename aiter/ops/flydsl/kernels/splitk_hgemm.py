@@ -18,6 +18,7 @@ from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from .tensor_shim import GTensor, STensor, _to_raw, get_dtype_in_kernel
+from ..utils import get_shared_memory_per_block
 
 SPLIT_K_COUNTER_MAX_LEN = 128
 SPLIT_K_SIGNAL_STATE_COUNT = 3
@@ -178,6 +179,15 @@ def compile_hgemm_kernel(
     assert BLOCK_MN_SIZE % BLOCK_VECS == 0
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
+    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
+    KERNEL_NAME += "_NA" if not ASYNC_COPY else "_AS"
+    if B_PRE_SHUFFLE:
+        KERNEL_NAME += "_BP"
+    if IS_SPLIT_K:
+        KERNEL_NAME += f"_SPK{SPLIT_K}"
+    if B_TO_LDS:
+        KERNEL_NAME += "_BS"
+
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
     AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
@@ -188,21 +198,19 @@ def compile_hgemm_kernel(
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
         SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    assert SMEM_USE <= 163840
+    smem_limit = get_shared_memory_per_block(fallback_gfx=GPU_ARCH)
+    if SMEM_USE > smem_limit:
+        raise RuntimeError(
+            f"{KERNEL_NAME} requires {SMEM_USE} bytes LDS, "
+            f"but device limit is {smem_limit} bytes "
+            f"(arch={GPU_ARCH}, TILE_M={TILE_M}, TILE_N={TILE_N}, TILE_K={TILE_K}, "
+            f"SPLIT_K={SPLIT_K}, B_TO_LDS={B_TO_LDS})",
+        )
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
-
-    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
-    KERNEL_NAME += "_NA" if not ASYNC_COPY else "_AS"
-    if B_PRE_SHUFFLE:
-        KERNEL_NAME += "_BP"
-    if IS_SPLIT_K:
-        KERNEL_NAME += f"_SPK{SPLIT_K}"
-    if B_TO_LDS:
-        KERNEL_NAME += "_BS"
 
     @flyc.kernel
     def hgemm_kernel(
@@ -925,9 +933,17 @@ def compile_hgemm_kernel(
     def _compile(C, A, B, m, COUNTER, signal_state, stream):
         with CompilationContext.compile_hints(_compile_hints):
             if _compile_cache.get(m, None) is None:
-                _compile_cache[m] = flyc.compile(
-                    launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream
-                )
+                try:
+                    _compile_cache[m] = flyc.compile(
+                        launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"{KERNEL_NAME} failed "
+                        f"(arch={GPU_ARCH}, n={n}, k={k}, TILE_M={TILE_M}, TILE_N={TILE_N}, "
+                        f"TILE_K={TILE_K}, SPLIT_K={SPLIT_K}, B_TO_LDS={B_TO_LDS}, "
+                        f"SMEM_USE={SMEM_USE}, SMEM_LIMIT={smem_limit}): {e}",
+                    ) from e
             return _compile_cache[m]
 
     _launch.compile = _compile

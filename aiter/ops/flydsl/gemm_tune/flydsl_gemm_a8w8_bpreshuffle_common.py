@@ -4,6 +4,11 @@ from dataclasses import dataclass
 import math
 import os
 
+from aiter.ops.flydsl.utils import (
+    addressable_lds_bytes_for_gfx as _addressable_lds_bytes_for_gfx,
+    get_shared_memory_per_block,
+)
+
 
 def get_gfx():
     """Detect GPU arch: honour GPU_ARCHS env, fall back to chip_info, default gfx942."""
@@ -165,26 +170,13 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
     )
 
 
-# Per-kernel LDS cap for tune filtering (must match LLVM AMDGPU
-# getAddressableLocalMemorySize for the compile target).
-# When arch cannot be parsed (no GPU, bad string), stay conservative for CDNA.
-_FALLBACK_MAX_LDS_BYTES = 65536
-
-
 def addressable_lds_bytes_for_gfx(gfx: str) -> int:
-    g = (gfx or "").strip().lower().split(":")[0]
-    if not g.startswith("gfx"):
-        return _FALLBACK_MAX_LDS_BYTES
-    if g.startswith("gfx950"):
-        return 163840
-    if g.startswith("gfx7") or g.startswith("gfx8"):
-        return 32768
-    return 65536
+    return _addressable_lds_bytes_for_gfx(gfx)
 
 
 def max_lds_bytes_for_tune() -> int:
-    """Addressable LDS limit for current target (from ``get_gfx()``)."""
-    return addressable_lds_bytes_for_gfx(get_gfx())
+    """Addressable LDS limit for current target."""
+    return get_shared_memory_per_block(fallback_gfx=get_gfx())
 
 
 # fmt: off
@@ -277,7 +269,7 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
 
     Preshuffle GEMM always uses 16x16 MFMA (4 VGPRs per thread per block).
     Per-thread accum VGPRs = round_up(tile_m, 16) * round_up(tile_n, 16) / 256.
-    Estimated total ≈ accum * 1.5 (pipeline overhead for A/B buffers).
+    Estimated total ? accum * 1.5 (pipeline overhead for A/B buffers).
     Returns the max waves_per_eu that the register file can support.
     """
     padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
