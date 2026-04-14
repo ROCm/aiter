@@ -262,8 +262,7 @@ def mla_decode_fwd(
         )
 
         if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8
-            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
+            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
         ):
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
