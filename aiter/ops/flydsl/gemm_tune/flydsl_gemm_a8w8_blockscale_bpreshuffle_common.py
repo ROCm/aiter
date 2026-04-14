@@ -88,7 +88,7 @@ _base_tiles_common = [
 ]
 
 _CSHUFFLE_VALS   = (0,)
-_ASYNC_COPY_VALS = (0,)
+_ASYNC_COPY_VALS = (0, 1)
 _WAVES_PER_EU    = (0,)
 # fmt: on
 
