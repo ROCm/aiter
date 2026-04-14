@@ -25,7 +25,7 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
-from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl
+from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl, const_expr
 from flydsl._mlir.dialects import llvm, scf, memref
 from flydsl._mlir.dialects.arith import CmpIPredicate
 
