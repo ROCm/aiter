@@ -26,13 +26,8 @@ from aiter.fused_moe import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
-<<<<<<< HEAD
-    shuffle_weight_a16w4,
-    shuffle_scale_a16w4,
-=======
     shuffle_scale_a16w4,
     shuffle_weight_a16w4,
->>>>>>> main
 )
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
