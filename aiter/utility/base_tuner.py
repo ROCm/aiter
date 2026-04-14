@@ -3,6 +3,8 @@
 
 import os
 import sys
+import shutil
+import tempfile
 import argparse
 import torch
 import pandas as pd
@@ -16,6 +18,20 @@ from aiter import dtypes
 INVALID_TIME = -1
 
 
+def _read_csv(filepath, **kwargs):
+    """Read CSV with automatic cleanup of common formatting issues:
+    trailing tabs/spaces, extra unnamed columns, whitespace in headers/values.
+    """
+    df = pd.read_csv(filepath, **kwargs)
+    df.columns = df.columns.str.strip()
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
+    str_cols = df.select_dtypes(include=["object"]).columns
+    for col in str_cols:
+        df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
+    df.dropna(how="all", inplace=True)
+    return df
+
+
 class TunerCommon:
     ARG_DEFAULTS = {
         "verbose": False,
@@ -27,6 +43,7 @@ class TunerCommon:
         "timeout": None,  # 100s timeout for per test
         "warmup": 5,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
+        "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
     }
     dtype2bpe_dict = {
         dtypes.fp16: 2,
@@ -116,6 +133,14 @@ class TunerCommon:
             help="Use splitK kernels",
         )
         self.parser.add_argument(
+            "--shape_grouped",
+            action="store_true",
+            default=False,
+            required=False,
+            help="Group all kernel candidates for the same shape onto one GPU "
+            "to eliminate cross-GPU timing variance (also saves generate_data calls)",
+        )
+        self.parser.add_argument(
             "--sort",
             type=dtypes.str2bool,
             default=defaults.get("sort", False),
@@ -165,9 +190,41 @@ class TunerCommon:
             default=defaults["timeout"],
             help="timeout for task group",
         )
+        self.parser.add_argument(
+            "--run_config",
+            nargs="?",
+            const=True,
+            default=False,
+            metavar="TUNED_CSV",
+            help="Run production operator benchmark and exit (no tuning). "
+            "If a tuned CSV path is given, read shapes and kernels from it; "
+            "otherwise read shapes from -i and run with default kernels.",
+        )
+        self.parser.add_argument(
+            "--compare",
+            action="store_true",
+            required=False,
+            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV.",
+        )
+        self.parser.add_argument(
+            "--update_improved",
+            action="store_true",
+            required=False,
+            help="With --compare, update the final tuned CSV for shapes improved by at least --min_improvement_pct, or when pre-run has no valid baseline but post-run passes.",
+        )
+        self.parser.add_argument(
+            "--min_improvement_pct",
+            dest="min_improvement_pct",
+            type=float,
+            default=defaults.get("min_improvement_pct", 3.0),
+            help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
+        )
 
     def parse_args(self):
-        return self.parser.parse_args()
+        args = self.parser.parse_args()
+        if args.update_improved and not args.compare:
+            self.parser.error("--update_improved requires --compare")
+        return args
 
     @abstractmethod
     def _setup_specific_arguments(self):
@@ -207,10 +264,10 @@ class TunerCommon:
         ## merge config files
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
 
-        df_list.append(pd.read_csv(path_list[0]))
+        df_list.append(_read_csv(path_list[0]))
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
-                df = pd.read_csv(path)
+                df = _read_csv(path)
                 base_cols = [c for c in df_list[0].columns if c != "_tag"]
                 new_cols = [c for c in df.columns if c != "_tag"]
                 assert (
@@ -238,7 +295,7 @@ class TunerCommon:
         assert os.path.exists(
             untuned_gemm_file
         ), f"Not exist untuned file: {untuned_gemm_file}"
-        untunedf = pd.read_csv(untuned_gemm_file)
+        untunedf = _read_csv(untuned_gemm_file)
         filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
@@ -251,9 +308,14 @@ class TunerCommon:
     def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
         all_tuned_file = self.update_config_files(tuned_gemm_file, self.name)
         if os.path.exists(all_tuned_file):
-            column_order = pd.read_csv(all_tuned_file, nrows=0).columns.tolist()
-            tunedf = pd.read_csv(all_tuned_file)
-            tunedf = tunedf[column_order]
+            try:
+                column_order = _read_csv(all_tuned_file, nrows=0).columns.tolist()
+                tunedf = _read_csv(all_tuned_file)
+                tunedf = tunedf[column_order]
+            except pd.errors.EmptyDataError:
+                print(f"Empty tuned file: {all_tuned_file}")
+                columns = self.columns if not columns else columns
+                tunedf = pd.DataFrame(columns=columns)
         else:
             print(f"Not exist tuned file: {all_tuned_file}")
             columns = self.columns if not columns else columns
@@ -321,7 +383,7 @@ class TunerCommon:
         return df_old
 
     def sortResults(self, tune_file, issorted, values):
-        tunedf = pd.read_csv(tune_file)
+        tunedf = _read_csv(tune_file)
         if issorted:
             tunedf = tunedf.sort_values(by=values)
         dedup_keys = self.keys
@@ -348,7 +410,7 @@ class TunerCommon:
                 logger.info(f"saving profile to {args.profile_file}")
             profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
             if os.path.exists(args.profile_file):
-                old_df = pd.read_csv(args.profile_file)
+                old_df = _read_csv(args.profile_file)
             else:
                 old_df = pd.DataFrame(columns=self.columns)
             profiledf = pd.concat([old_df, profiledf], ignore_index=True)
@@ -356,7 +418,6 @@ class TunerCommon:
 
         if fast_mode or topk == -1:
             return rets
-        tol_err_ratio = args.errRatio
         from collections import defaultdict
 
         grouped_rets = defaultdict(list)
@@ -368,6 +429,7 @@ class TunerCommon:
         grouped_results = list(grouped_rets.items())
 
         for info_key, time_list in grouped_results:
+            tol_err_ratio = args.errRatio
             sorted_time = sorted(time_list, key=lambda x: x[1])
             filtered_time = [
                 (info_ex, round(us, 4), max_err_ratio)
@@ -434,14 +496,709 @@ class TunerCommon:
         """update tflops and bw from old tune_file"""
         pass
 
+    def run_config(self, args):
+        """Run the production operator for each shape in the untuned CSV.
+        Subclasses should override this to call the actual production operator.
+        Returns a list of dicts: [{"shape": str, "us": float, "status": "ok"/"error"}]
+        """
+        logger.info(f"run_config not implemented for {self.name}, skipping benchmark")
+        return []
+
+    def _clear_op_caches(self):
+        """Clear operator-specific config caches. Subclasses should override this
+        to clear only their own caches."""
+        pass
+
+    def _set_config_env_for_run_config(self, args, config_file=None):
+        """Set the config env var to point to a tuned config file, clear caches,
+        and enable AITER_REBUILD so that run_config rebuilds with new configs.
+        *config_file* overrides the default (``-o`` / ``args.tune_file``).
+        """
+        defaults = self.get_arg_defaults()
+        env_name = defaults.get("config_env_name")
+        if not env_name:
+            # Must return a 2-tuple: callers always unpack into old_val, old_rebuild.
+            return None, None
+        output_file = config_file if config_file else self.get_out_file(args.tune_file)
+        old_val = os.environ.get(env_name)
+        os.environ[env_name] = output_file
+        logger.info(f"Setting {env_name}={output_file} for benchmark")
+        # Clear operator-specific config caches
+        self._clear_op_caches()
+        # Enable AITER_REBUILD (level 2: rm .so only, keep build cache for faster rebuild)
+        # and clear module caches so operators rebuild with new config
+        from aiter.jit import core as jit_core
+
+        old_rebuild = jit_core.AITER_REBUILD
+        jit_core.AITER_REBUILD = 2
+        jit_core.get_module.cache_clear()
+        # Reset rebuilded_list so all modules get rebuilt on next call
+        jit_core.rebuilded_list = ["module_aiter_enum"]
+        # Clear loaded modules dict (use getattr to avoid Python name mangling of __ prefix in class methods)
+        mds = getattr(jit_core, "__mds", None)
+        if mds is not None:
+            mds.clear()
+        # Clear get_config_file lru_cache so it re-reads the env var
+        jit_core.AITER_CONFIGS.get_config_file.cache_clear()
+        return old_val, old_rebuild
+
+    def _restore_config_env(self, env_name, old_val, old_rebuild=0):
+        """Restore the config env var and AITER_REBUILD to original values."""
+        if env_name is None:
+            return
+        if old_val is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old_val
+        try:
+            from aiter.jit import core as jit_core
+
+            jit_core.AITER_REBUILD = old_rebuild
+        except ImportError:
+            pass
+
+    def _emit_report_lines(self, lines, report_file=None):
+        if report_file:
+            with open(report_file, "a") as f:
+                f.write("\n".join(lines) + "\n")
+            return
+        for line in lines:
+            print(line, flush=True)
+
+    def _split_benchmark_status(self, status):
+        status = "" if status is None else str(status)
+        if status == "ok":
+            return "OK", ""
+        if status.startswith("error:"):
+            return "ERROR", status[len("error:") :].strip()
+        if status == "mismatch":
+            return "MISMATCH", "output mismatch vs reference"
+        if not status:
+            return "UNKNOWN", ""
+        return status.upper(), ""
+
+    def _format_benchmark_keys(self, row):
+        parts = []
+        for key in self.keys:
+            value = row.get(key, "")
+            parts.append(f"{key}={value}")
+        return "keys: " + ", ".join(parts)
+
+    def _get_benchmark_e2e_us(self, row, suffix=""):
+        return getattr(row, f"benchmark_e2e_us{suffix}", -1)
+
+    def _get_benchmark_kernel_us(self, row, suffix=""):
+        return getattr(row, f"benchmark_kernel_us{suffix}", None)
+
+    def _print_benchmark_results(
+        self, label, results, report_file=None, shapes_df=None
+    ):
+        """Print benchmark results to stdout or append them to a report file."""
+        if not results:
+            self._emit_report_lines([f"{label}: no results"], report_file)
+            return
+        results_df = self._benchmark_results_to_df(results, shapes_df=shapes_df)
+        lines = [f"============= {label} Benchmark Results ============="]
+        has_kernel_us = (
+            not results_df.empty
+            and "benchmark_kernel_us" in results_df.columns
+            and results_df["benchmark_kernel_us"].notna().any()
+        )
+        if has_kernel_us:
+            header = (
+                f"{'Shape':<40} | {'Kernel(us)':>10} | {'E2E(us)':>10} | {'Status':>8}"
+            )
+        else:
+            header = f"{'Shape':<40} | {'E2E(us)':>10} | {'Status':>8}"
+        lines.append(header)
+        lines.append("-" * len(header))
+        if results_df.empty:
+            for r in results:
+                shape_str = r.get("shape", "unknown")
+                e2e_us = r.get("e2e_us", -1)
+                status = r.get("status", "unknown")
+                status_summary, status_detail = self._split_benchmark_status(status)
+                e2e_str = f"{e2e_us:.2f}" if e2e_us > 0 else "N/A"
+                lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
+                if status_detail:
+                    lines.append(f"{'':<40} | {'':>10} | {'reason: ' + status_detail}")
+            self._emit_report_lines(lines, report_file)
+            return
+        for row in results_df.itertuples(index=False):
+            shape_str = getattr(row, "shape", "unknown")
+            e2e_us = self._get_benchmark_e2e_us(row)
+            kernel_us = self._get_benchmark_kernel_us(row)
+            status = getattr(row, "benchmark_status", "unknown")
+            status_summary, status_detail = self._split_benchmark_status(status)
+            e2e_str = f"{e2e_us:.2f}" if e2e_us > 0 else "N/A"
+            if has_kernel_us:
+                kernel_str = (
+                    f"{kernel_us:.2f}"
+                    if kernel_us is not None and pd.notna(kernel_us) and kernel_us > 0
+                    else "N/A"
+                )
+                lines.append(
+                    f"{shape_str:<40} | {kernel_str:>10} | {e2e_str:>10} | {status_summary:>8}"
+                )
+            else:
+                lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
+            lines.append(
+                self._format_benchmark_keys(
+                    {key: getattr(row, key, "") for key in self.keys}
+                )
+            )
+            if status_detail:
+                lines.append(f"reason: {status_detail}")
+        self._emit_report_lines(lines, report_file)
+
+    def _print_comparison(self, pre_results, post_results, report_file=None):
+        """Print comparison to stdout or append it to a report file."""
+        if not pre_results or not post_results:
+            self._emit_report_lines(
+                ["Cannot print comparison: missing pre or post results"],
+                report_file,
+            )
+            return
+        pre_df = self._benchmark_results_to_df(pre_results)
+        post_df = self._benchmark_results_to_df(post_results)
+        if pre_df.empty or post_df.empty:
+            self._emit_report_lines(
+                ["Cannot print comparison: missing comparable benchmark rows"],
+                report_file,
+            )
+            return
+        comparison_df = pre_df.merge(
+            post_df,
+            on=self.keys,
+            how="outer",
+            suffixes=("_pre", "_post"),
+        )
+        comparison_df["shape"] = comparison_df["shape_pre"]
+        missing_shape_mask = comparison_df["shape"].isna() | (
+            comparison_df["shape"] == ""
+        )
+        comparison_df.loc[missing_shape_mask, "shape"] = comparison_df.loc[
+            missing_shape_mask, "shape_post"
+        ]
+        lines = ["============= Tune Performance Comparison ============="]
+        header = f"{'Shape':<40} | {'Pre-E2E(us)':>13} | {'Post-E2E(us)':>14} | {'Speedup':>8} | {'Status':>8}"
+        lines.append(header)
+        lines.append("-" * len(header))
+        for row in comparison_df.itertuples(index=False):
+            shape = getattr(row, "shape", "unknown")
+            pre_us = self._get_benchmark_e2e_us(row, "_pre")
+            post_us = self._get_benchmark_e2e_us(row, "_post")
+            post_status = getattr(row, "benchmark_status_post", "error")
+            if pd.isna(post_status):
+                pre_str = f"{pre_us:.2f}" if pd.notna(pre_us) and pre_us > 0 else "N/A"
+                lines.append(
+                    f"{shape:<40} | {pre_str:>13} | {'N/A':>14} | {'N/A':>8} | {'MISS':>8}",
+                )
+                lines.append(
+                    self._format_benchmark_keys(
+                        {key: getattr(row, key, "") for key in self.keys}
+                    )
+                )
+                continue
+            status_summary, status_detail = self._split_benchmark_status(post_status)
+            if pre_us > 0 and post_us > 0:
+                speedup = pre_us / post_us
+                speedup_str = f"{speedup:.2f}x"
+            else:
+                speedup_str = "N/A"
+            pre_str = f"{pre_us:.2f}" if pre_us > 0 else "N/A"
+            post_str = f"{post_us:.2f}" if post_us > 0 else "N/A"
+            lines.append(
+                f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status_summary:>8}"
+            )
+            lines.append(
+                self._format_benchmark_keys(
+                    {key: getattr(row, key, "") for key in self.keys}
+                )
+            )
+            if status_detail:
+                lines.append(f"reason: {status_detail}")
+        self._emit_report_lines(lines, report_file)
+
+    def _benchmark_results_to_df(self, results, shapes_df=None):
+        columns = self.keys + [
+            "shape",
+            "benchmark_status",
+            "benchmark_kernel_us",
+            "benchmark_e2e_us",
+        ]
+        if shapes_df is None:
+            shapes_df = self.untunedf
+        if shapes_df is None or len(shapes_df) == 0 or not results:
+            return pd.DataFrame(columns=columns)
+
+        shapes_df = shapes_df[self.keys].reset_index(drop=True)
+        limit = min(len(shapes_df), len(results))
+        if len(shapes_df) != len(results):
+            logger.warning(
+                f"benchmark results count mismatch in {self.name}: "
+                f"{len(results)} results for {len(shapes_df)} shapes; matching by row order"
+            )
+
+        rows = []
+        for idx in range(limit):
+            bench = results[idx] or {}
+            row = shapes_df.iloc[idx].to_dict()
+            row["shape"] = bench.get("shape", "")
+            row["benchmark_status"] = bench.get("status", "unknown")
+            row["benchmark_kernel_us"] = bench.get("kernel_us", None)
+            row["benchmark_e2e_us"] = bench.get("e2e_us", -1)
+            rows.append(row)
+        return pd.DataFrame(rows, columns=columns)
+
+    def _build_compare_update_plan(
+        self, pre_results, post_results, threshold_percent, shapes_df=None
+    ):
+        pre_df = self._benchmark_results_to_df(pre_results, shapes_df=shapes_df)
+        post_df = self._benchmark_results_to_df(post_results, shapes_df=shapes_df)
+        columns = self.keys + [
+            "shape",
+            "pre_us",
+            "post_us",
+            "pre_status",
+            "post_status",
+            "improvement_pct",
+            "update",
+            "update_reason",
+        ]
+        if pre_df.empty or post_df.empty:
+            return pd.DataFrame(columns=columns)
+
+        comparison = pre_df.merge(
+            post_df,
+            on=self.keys,
+            how="outer",
+            suffixes=("_pre", "_post"),
+        )
+        comparison["shape"] = comparison["shape_pre"]
+        missing_shape_mask = comparison["shape"].isna() | (comparison["shape"] == "")
+        comparison.loc[missing_shape_mask, "shape"] = comparison.loc[
+            missing_shape_mask, "shape_post"
+        ]
+        comparison["pre_us"] = comparison["benchmark_e2e_us_pre"]
+        comparison["post_us"] = comparison["benchmark_e2e_us_post"]
+        comparison["pre_status"] = comparison["benchmark_status_pre"]
+        comparison["post_status"] = comparison["benchmark_status_post"]
+
+        valid = (
+            (comparison["pre_status"] == "ok")
+            & (comparison["post_status"] == "ok")
+            & (comparison["pre_us"] > 0)
+            & (comparison["post_us"] > 0)
+        )
+        no_baseline = (
+            (comparison["post_status"] == "ok")
+            & (comparison["post_us"] > 0)
+            & ~((comparison["pre_status"] == "ok") & (comparison["pre_us"] > 0))
+        )
+        comparison["improvement_pct"] = (
+            (comparison["pre_us"] - comparison["post_us"])
+            / comparison["pre_us"]
+            * 100.0
+        )
+        comparison.loc[~valid, "improvement_pct"] = float("nan")
+        comparison["update_reason"] = "skip"
+        comparison.loc[
+            valid & (comparison["improvement_pct"] >= threshold_percent),
+            "update_reason",
+        ] = "threshold_met"
+        comparison.loc[no_baseline, "update_reason"] = "no_baseline"
+        comparison["update"] = comparison["update_reason"] != "skip"
+        return comparison[columns]
+
+    def _print_compare_update_plan(
+        self,
+        comparison,
+        threshold_percent,
+        tuned_file=None,
+        report_file=None,
+        apply_updates=True,
+    ):
+        if comparison is None or comparison.empty:
+            self._emit_report_lines(
+                ["Compare-gated CSV update skipped: no comparable benchmark rows"],
+                report_file,
+            )
+            return
+
+        lines = [
+            (
+                "============= Compare-Gated CSV Updates ============="
+                if apply_updates
+                else "============= Compare-Gated CSV Update Preview ============="
+            )
+        ]
+        target_desc = tuned_file if tuned_file else "tuned csv"
+        lines.append(
+            (
+                f"Threshold: improve >= {threshold_percent:.2f}% to update {target_desc}"
+                if apply_updates
+                else f"Threshold: improve >= {threshold_percent:.2f}% would update {target_desc} with --update_improved"
+            )
+        )
+        lines.append(
+            (
+                "Rows with no valid pre-run baseline but passing post-run will also update."
+                if apply_updates
+                else "Rows with no valid pre-run baseline but passing post-run would also update."
+            )
+        )
+        header = f"{'Shape':<40} | {'Pre-E2E':>10} | {'Post-E2E':>10} | {'Improve':>9} | {'Action':>18}"
+        lines.append(header)
+        lines.append("-" * len(header))
+        for row in comparison.itertuples(index=False):
+            pre_str = (
+                f"{row.pre_us:.2f}"
+                if pd.notna(row.pre_us) and row.pre_us > 0
+                else "N/A"
+            )
+            post_str = (
+                f"{row.post_us:.2f}"
+                if pd.notna(row.post_us) and row.post_us > 0
+                else "N/A"
+            )
+            improve_str = (
+                f"{row.improvement_pct:.2f}%"
+                if pd.notna(row.improvement_pct)
+                else "N/A"
+            )
+            if row.update_reason == "threshold_met":
+                action = "UPDATE"
+            elif row.update_reason == "no_baseline":
+                action = "UPDATE_NO_BASELINE"
+            else:
+                action = "SKIP"
+            lines.append(
+                f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
+            )
+            lines.append(
+                self._format_benchmark_keys(
+                    {key: getattr(row, key, "") for key in self.keys}
+                )
+            )
+            pre_summary, pre_detail = self._split_benchmark_status(row.pre_status)
+            post_summary, post_detail = self._split_benchmark_status(row.post_status)
+            if pre_detail:
+                lines.append(f"pre-{pre_summary.lower()}: {pre_detail}")
+            if post_detail:
+                lines.append(f"post-{post_summary.lower()}: {post_detail}")
+        self._emit_report_lines(lines, report_file)
+
+    def _merge_compare_filtered_results(self, base_file, candidate_file, comparison):
+        old_df = self.get_tuned_gemm_list(base_file)
+        if not os.path.exists(candidate_file):
+            return old_df
+
+        candidate_df = self.get_tuned_gemm_list(candidate_file)
+        if comparison is None or comparison.empty:
+            return old_df
+
+        improved_keys = set(
+            comparison.loc[comparison["update"], self.keys]
+            .astype(str)
+            .apply(tuple, axis=1)
+            .tolist()
+        )
+        if not improved_keys:
+            return old_df
+
+        def key_mask(df):
+            if df.empty:
+                return pd.Series([], index=df.index, dtype=bool)
+            return df[self.keys].astype(str).apply(tuple, axis=1).isin(improved_keys)
+
+        kept_old = old_df[~key_mask(old_df)].copy()
+        improved_rows = candidate_df[key_mask(candidate_df)].copy()
+        merged = pd.concat([kept_old, improved_rows], ignore_index=True)
+        dedup_keys = list(self.keys)
+        if "_tag" in merged.columns:
+            merged["_tag"] = merged["_tag"].fillna("")
+            dedup_keys.append("_tag")
+        merged = merged.drop_duplicates(subset=dedup_keys, keep="last").reset_index(
+            drop=True
+        )
+        return merged
+
+    def _run_config_for_shapes(self, args, shapes_df, config_file=None):
+        original_untunedf = self.untunedf
+        shapes_df = shapes_df.reset_index(drop=True)
+        self.untunedf = shapes_df
+        try:
+            if config_file is None:
+                return self.run_config(args)
+            defaults = self.get_arg_defaults()
+            env_name = defaults.get("config_env_name")
+            old_val, old_rebuild = self._set_config_env_for_run_config(
+                args, config_file=config_file
+            )
+            try:
+                return self.run_config(args)
+            finally:
+                self._restore_config_env(env_name, old_val, old_rebuild)
+        finally:
+            self.untunedf = original_untunedf
+
+    def _init_compare_report(self, args, output_file, batch_size, total_batches):
+        if not args.compare or (total_batches <= 1 and len(self.untunedf) <= 30):
+            return None
+
+        report_root, _ = os.path.splitext(output_file)
+        compare_report_file = f"{report_root}.compare.txt"
+        with open(compare_report_file, "w") as f:
+            f.write(
+                f"Compare report for {self.name}\n"
+                f"Shapes: {len(self.untunedf)}\n"
+                f"Batch size: {batch_size}\n"
+                f"Total batches: {total_batches}\n\n"
+            )
+        print(f"Compare results will be written to {compare_report_file}", flush=True)
+        return compare_report_file
+
+    def _init_compare_candidate_file(self, args, output_file):
+        if not args.compare:
+            return None
+
+        candidate_root, candidate_ext = os.path.splitext(output_file)
+        compare_candidate_file = f"{candidate_root}.candidate{candidate_ext or '.csv'}"
+        if os.path.exists(output_file):
+            shutil.copyfile(output_file, compare_candidate_file)
+        elif os.path.exists(compare_candidate_file):
+            os.remove(compare_candidate_file)
+        print(
+            f"Compare candidate CSV will be written to {compare_candidate_file}",
+            flush=True,
+        )
+        return compare_candidate_file
+
+    def _emit_compare_batch_header(self, header, report_file=None):
+        print(header, flush=True)
+        if report_file:
+            self._emit_report_lines([header], report_file)
+
+    def _run_compare_benchmark(
+        self,
+        args,
+        batch,
+        header,
+        result_label,
+        report_file=None,
+        config_file=None,
+        print_results=True,
+    ):
+        self._emit_compare_batch_header(header, report_file)
+        results = self._run_config_for_shapes(args, batch, config_file=config_file)
+        if print_results:
+            self._print_benchmark_results(
+                result_label, results, report_file=report_file
+            )
+        return results
+
+    def _create_batch_compare_output_file(
+        self,
+        args,
+        results,
+        output_file,
+        processed_batches,
+        compare_candidate_file=None,
+    ):
+        fd, batch_compare_output_file = tempfile.mkstemp(
+            prefix=f"{self.name}_compare_batch_{processed_batches}_",
+            suffix=".csv",
+        )
+        os.close(fd)
+        candidate_base_file = (
+            compare_candidate_file
+            if compare_candidate_file and os.path.exists(compare_candidate_file)
+            else output_file
+        )
+        if os.path.exists(candidate_base_file):
+            shutil.copyfile(candidate_base_file, batch_compare_output_file)
+        else:
+            pd.DataFrame(columns=self.columns).to_csv(
+                batch_compare_output_file, index=False
+            )
+        self.result_to_csv(results, batch_compare_output_file, not args.all)
+        if os.path.exists(batch_compare_output_file):
+            self.sortResults(batch_compare_output_file, args.sort, self.sort_keys)
+            if compare_candidate_file:
+                shutil.copyfile(batch_compare_output_file, compare_candidate_file)
+        return batch_compare_output_file
+
+    def _apply_compare_batch_results(
+        self,
+        args,
+        batch,
+        results,
+        batch_pre_tune_results,
+        output_file,
+        processed_batches,
+        total_batches,
+        compare_report_file=None,
+        compare_candidate_file=None,
+    ):
+        batch_compare_output_file = self._create_batch_compare_output_file(
+            args,
+            results,
+            output_file,
+            processed_batches,
+            compare_candidate_file=compare_candidate_file,
+        )
+        try:
+            batch_header = f"=== Running post-tune benchmark (verification) for batch {processed_batches}/{total_batches} ==="
+            batch_post_tune_results = self._run_compare_benchmark(
+                args,
+                batch,
+                batch_header,
+                "Post-tune",
+                report_file=compare_report_file,
+                config_file=batch_compare_output_file,
+                print_results=args.verbose,
+            )
+            batch_compare_plan = self._build_compare_update_plan(
+                batch_pre_tune_results,
+                batch_post_tune_results,
+                args.min_improvement_pct,
+                shapes_df=batch,
+            )
+            if args.update_improved:
+                final_df = self._merge_compare_filtered_results(
+                    output_file,
+                    batch_compare_output_file,
+                    batch_compare_plan,
+                )
+                final_df.to_csv(output_file, index=False)
+                if os.path.exists(output_file):
+                    self.sortResults(output_file, args.sort, self.sort_keys)
+                self.tunedf = self.get_tuned_gemm_list(output_file)
+            return batch_post_tune_results, batch_compare_plan
+        finally:
+            if os.path.exists(batch_compare_output_file):
+                os.remove(batch_compare_output_file)
+
+    def _record_completed_compare_batch(
+        self,
+        completed_pre_tune_results,
+        completed_post_tune_results,
+        compare_plans,
+        batch_pre_tune_results,
+        batch_post_tune_results,
+        batch_compare_plan,
+    ):
+        completed_pre_tune_results.extend(batch_pre_tune_results or [])
+        completed_post_tune_results.extend(batch_post_tune_results or [])
+        compare_plans.append(batch_compare_plan)
+
+    def _print_compare_summary(
+        self,
+        completed_pre_tune_results,
+        completed_post_tune_results,
+        compare_plans,
+        threshold_percent,
+        tuned_file,
+        report_file=None,
+        apply_updates=True,
+        candidate_file=None,
+    ):
+        if not completed_pre_tune_results:
+            return
+
+        self._print_comparison(
+            completed_pre_tune_results,
+            completed_post_tune_results,
+            report_file=report_file,
+        )
+        combined_compare_plan = (
+            pd.concat(compare_plans, ignore_index=True).reset_index(drop=True)
+            if compare_plans
+            else pd.DataFrame()
+        )
+        self._print_compare_update_plan(
+            combined_compare_plan,
+            threshold_percent,
+            tuned_file=tuned_file,
+            report_file=report_file,
+            apply_updates=apply_updates,
+        )
+        extra_lines = []
+        if candidate_file:
+            extra_lines.append(f"Compare candidate CSV written to {candidate_file}")
+        if not apply_updates:
+            extra_lines.append(
+                "Final tuned CSV was not updated. Re-run with --update_improved to apply improved shapes."
+            )
+        if extra_lines:
+            self._emit_report_lines(extra_lines, report_file)
+        if report_file:
+            print(f"Compare results written to {report_file}", flush=True)
+
     #
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
+
+        # Resolve --run_config: can be False, True (no file), or a file path string.
+        # Strict semantics:
+        #   --run_config <tuned_csv>  -> tuned kernels using that config file
+        #   --run_config              -> default kernels (no config env override)
+        run_config_file = args.run_config if isinstance(args.run_config, str) else None
+
+        # --run_config with tuned file: load shapes from the tuned CSV.
+        # --run_config without file: keep shapes from -i (pre_process), run default kernels.
+        # --compare: always use untuned shapes from -i (pre_process).
+        if args.run_config and run_config_file:
+            tunedf = self.get_tuned_gemm_list(run_config_file)
+            if not tunedf.empty and self.keys[0] in tunedf.columns:
+                cu = self.get_cu_num()
+                if "cu_num" in tunedf.columns:
+                    tunedf = tunedf[tunedf["cu_num"] == cu]
+                self.untunedf = tunedf.drop_duplicates(subset=self.keys).reset_index(
+                    drop=True
+                )
+
         print(self.untunedf)
         output_file = self.get_out_file(args.tune_file)
         if args.verbose:
             logger.info(f"args: {args}")
+
+        # --run_config: only run benchmark and exit (no tuning)
+        if args.run_config:
+            if self.untunedf.empty:
+                logger.info("No shapes to benchmark, nothing to run")
+                return pd.DataFrame()
+            if run_config_file:
+                defaults = self.get_arg_defaults()
+                env_name = defaults.get("config_env_name")
+                old_val, old_rebuild = self._set_config_env_for_run_config(
+                    args, config_file=run_config_file
+                )
+                try:
+                    print(
+                        "=== Running production operator benchmark (tuned) ===",
+                        flush=True,
+                    )
+                    results = self.run_config(args)
+                    self._print_benchmark_results("Benchmark (tuned)", results)
+                finally:
+                    self._restore_config_env(env_name, old_val, old_rebuild)
+            else:
+                print(
+                    "=== Running production operator benchmark (default) ===",
+                    flush=True,
+                )
+                results = self.run_config(args)
+                self._print_benchmark_results("Benchmark (default)", results)
+            return self.tunedf if self.tunedf is not None else pd.DataFrame()
+
+        # Only include batches that fully completed compare+update in the final summary.
+        completed_pre_tune_results = []
+        completed_post_tune_results = []
+        compare_plans = []
+
         if len(self.untunedf) == 0:
             # self.update_tflops_bw(args.tune_file)
             self.sortResults(output_file, args.sort, self.sort_keys)
@@ -451,12 +1208,22 @@ class TunerCommon:
             return self.tunedf if self.tunedf is not None else pd.DataFrame()
         batch_size = min(args.batch, len(self.untunedf))
         total_batches = (len(self.untunedf) + batch_size - 1) // batch_size
+        compare_report_file = self._init_compare_report(
+            args, output_file, batch_size, total_batches
+        )
+        compare_candidate_file = self._init_compare_candidate_file(args, output_file)
         if args.verbose:
             logger.info(
                 f"total shapes to be tuned: {len(self.untunedf) }, total_batches: {total_batches}, batch_size: {batch_size}"
             )
-            logger.info(f"results will be written to {output_file}")
+            if args.compare and not args.update_improved:
+                logger.info(
+                    f"compare candidate results will be written to {compare_candidate_file}"
+                )
+            else:
+                logger.info(f"results will be written to {output_file}")
         processed_batches = 0
+        completed_batches = 0
         results = []
         topk = -1 if fast_mode else 1
         self.tune_start_time = time.time()
@@ -465,31 +1232,93 @@ class TunerCommon:
             for i in range(0, len(self.untunedf), batch_size):
                 batch = self.untunedf.iloc[i : i + batch_size].reset_index(drop=True)
                 processed_batches += 1
+                batch_pre_tune_results = None
+                if args.compare:
+                    batch_header = f"=== Running pre-tune benchmark (batch {processed_batches}/{total_batches}) ==="
+                    batch_pre_tune_results = self._run_compare_benchmark(
+                        args,
+                        batch,
+                        batch_header,
+                        "Pre-tune",
+                        report_file=compare_report_file,
+                        print_results=args.verbose,
+                    )
                 all_results = self.tune(batch, self.tunedf, args)
                 if all_results:
                     results = self.post_process(all_results, args, topk)
-                    self.result_to_csv(results, output_file, not args.all)
+                    if args.compare:
+                        batch_post_tune_results, batch_compare_plan = (
+                            self._apply_compare_batch_results(
+                                args,
+                                batch,
+                                results,
+                                batch_pre_tune_results,
+                                output_file,
+                                processed_batches,
+                                total_batches,
+                                compare_report_file=compare_report_file,
+                                compare_candidate_file=compare_candidate_file,
+                            )
+                        )
+                        self._record_completed_compare_batch(
+                            completed_pre_tune_results,
+                            completed_post_tune_results,
+                            compare_plans,
+                            batch_pre_tune_results,
+                            batch_post_tune_results,
+                            batch_compare_plan,
+                        )
+                    else:
+                        self.result_to_csv(results, output_file, not args.all)
+                    completed_batches += 1
                     logger.info(
-                        f"processed {processed_batches} batches of {total_batches}, Processing Status ====> {round(processed_batches / total_batches,2)*100:.1f}% tuned in {self.name}"
+                        f"processed {completed_batches} batches of {total_batches}, Processing Status ====> {round(completed_batches / total_batches,2)*100:.1f}% tuned in {self.name}"
                     )
                 else:
                     logger.info(
                         f"tune result is none or all shape is tuned in {args.tune_file}!"
                     )
-            self.sortResults(output_file, args.sort, self.sort_keys)
+            if os.path.exists(output_file):
+                self.sortResults(output_file, args.sort, self.sort_keys)
         except KeyboardInterrupt:
             tuning_status = "Interrupted"
             logger.error(
-                f"interrupted by user, tuning stopped, {processed_batches-1} batches processed"
+                f"interrupted by user, tuning stopped, {completed_batches} batches processed"
             )
         except Exception as e:
             tuning_status = "Error"
             logger.error(
-                f"error in batch {processed_batches} of {total_batches}: {str(e)}",
+                f"error in batch {processed_batches} of {total_batches} after {completed_batches} completed batches: {str(e)}",
                 exc_info=True,
             )
         finally:
-            self.tune_summary(tuning_status)
+            tune_exit = None
+            summary_exc = None
+            try:
+                self.tune_summary(tuning_status)
+            except SystemExit as e:
+                tune_exit = e
+            except Exception as e:
+                summary_exc = e
+                logger.error(
+                    f"tune_summary failed (tuning may still have written results): {e}",
+                    exc_info=True,
+                )
+            if args.compare:
+                self._print_compare_summary(
+                    completed_pre_tune_results,
+                    completed_post_tune_results,
+                    compare_plans,
+                    args.min_improvement_pct,
+                    output_file,
+                    report_file=compare_report_file,
+                    apply_updates=args.update_improved,
+                    candidate_file=compare_candidate_file,
+                )
+            if tune_exit is not None:
+                raise tune_exit
+            if summary_exc is not None:
+                raise summary_exc
 
 
 class GemmCommonTuner(TunerCommon):
@@ -541,7 +1370,7 @@ class GemmCommonTuner(TunerCommon):
                 if args.verbose:
                     logger.info("skiped tuned shapes:")
                     print(self.untunedf[mask])
-                self.untunedf = self.untunedf[~mask]
+                self.untunedf = self.untunedf[~mask].reset_index(drop=True)
 
     def calculate(self, results, bpes=(2, 2, 2)):
         """calculate TFLOPS and bandwidth"""
@@ -565,11 +1394,15 @@ class GemmCommonTuner(TunerCommon):
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
-            kernelName = (
-                "None"
-                if time == self.INVALID_TIME or time == self.INF_TIME
-                else self.getKernelName(kernelId) if kernelName == "" else kernelName
-            )
+            # Resolve kernel name for both success and failure (profile CSV / debugging).
+            # Treat missing/NA like "" so we always look up CK kernel names; otherwise NaN
+            # would serialize as "Null" via na_rep in to_csv.
+            need_lookup = kernelName == "" or pd.isna(kernelName)
+            resolved = self.getKernelName(kernelId) if need_lookup else kernelName
+            if resolved is None or pd.isna(resolved):
+                kernelName = "None"
+            else:
+                kernelName = str(resolved)
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
 

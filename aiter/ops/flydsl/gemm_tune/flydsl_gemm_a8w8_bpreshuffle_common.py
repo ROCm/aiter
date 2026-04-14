@@ -267,21 +267,23 @@ def _vgpr_per_simd(gfx: str) -> int:
     return 512
 
 
+_MFMA_M = 16
+_MFMA_N = 16
+_THREADS_PER_TG = _WAVES_PER_WG * 64
+
+
 def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
     """Estimate max achievable waves_per_eu from C-accumulator VGPR pressure.
 
-    Each workgroup has _WAVES_PER_WG waves sharing the output tile.
-    Per-wave VGPR ≈ (accum share) * 1.5 (pipeline overhead for A/B buffers).
+    Preshuffle GEMM always uses 16x16 MFMA (4 VGPRs per thread per block).
+    Per-thread accum VGPRs = round_up(tile_m, 16) * round_up(tile_n, 16) / 256.
+    Estimated total ≈ accum * 1.5 (pipeline overhead for A/B buffers).
     Returns the max waves_per_eu that the register file can support.
     """
-    mfma_m = 16 if tile_m < 32 else 32
-    mfma_n = 16 if tile_n < 32 else 32
-    vgpr_per_mfma = 16 if (mfma_m >= 32 and mfma_n >= 32) else 4
-    blocks_m = math.ceil(tile_m / mfma_m)
-    blocks_n = math.ceil(tile_n / mfma_n)
-    c_vgprs_total = blocks_m * blocks_n * vgpr_per_mfma
-    c_per_wave = c_vgprs_total / _WAVES_PER_WG
-    est_per_wave = c_per_wave * 1.5
+    padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
+    padded_n = math.ceil(tile_n / _MFMA_N) * _MFMA_N
+    c_per_thread = padded_m * padded_n // _THREADS_PER_TG
+    est_per_wave = c_per_thread * 1.5
     return int(total_vgpr / max(est_per_wave, 1))
 
 
