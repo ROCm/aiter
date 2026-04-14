@@ -56,7 +56,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
     bias_tensor = None
     if bias:
-        bias_tensor = torch.empty((N), dtype=dtype).cuda()
+        bias_tensor = torch.randn((N), dtype=dtype).cuda()
 
     y = None
     if output:
@@ -95,7 +95,7 @@ def get_x_vals():
     return x_vals
 
 
-def run_gemm(x, w, bias, out_dtype, y, backend, activation=None):
+def run_gemm(x, w, bias, out_dtype, y, backend, activation=None, kernel_type="basic"):
     """Unified GEMM runner dispatching via the backend parameter."""
     if isinstance(out_dtype, tuple):
         dtype_arg = out_dtype
@@ -110,6 +110,7 @@ def run_gemm(x, w, bias, out_dtype, y, backend, activation=None):
         y=y,
         activation=activation,
         backend=backend,
+        kernel_type=kernel_type,
     )
 
 
@@ -118,9 +119,12 @@ def run_gemm(x, w, bias, out_dtype, y, backend, activation=None):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("kernel_type", ["basic", "lds_pipeline"])
 def test_gemm_a16_w16_activation(
-    M: int, N: int, K: int, dtype, output, activation, backend
+    M: int, N: int, K: int, dtype, output, activation, backend, kernel_type
 ):
+    if backend == "triton" and kernel_type != "basic":
+        pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
 
@@ -142,7 +146,7 @@ def test_gemm_a16_w16_activation(
     elif activation == "silu_exp2":
         torch_out = F.silu(torch_out)
 
-    kernel_out = run_gemm(x, w, None, out_dtype, y, backend, activation=activation)
+    kernel_out = run_gemm(x, w, None, out_dtype, y, backend, activation=activation, kernel_type=kernel_type)
 
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-2)
 
@@ -151,7 +155,10 @@ def test_gemm_a16_w16_activation(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
-def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, backend):
+@pytest.mark.parametrize("kernel_type", ["basic", "lds_pipeline"])
+def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, backend, kernel_type):
+    if backend == "triton" and kernel_type != "basic":
+        pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
 
@@ -163,7 +170,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, backend):
 
     torch_out = F.linear(x, w, bias=bias)
 
-    kernel_out = run_gemm(x, w, bias, out_dtype, y, backend)
+    kernel_out = run_gemm(x, w, bias, out_dtype, y, backend, kernel_type=kernel_type)
 
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -173,7 +180,10 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output, backend):
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
-def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output, backend):
+@pytest.mark.parametrize("kernel_type", ["basic", "lds_pipeline"])
+def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output, backend, kernel_type):
+    if backend == "triton" and kernel_type != "basic":
+        pytest.skip("kernel_type only applies to gluon backend")
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
 
@@ -185,7 +195,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output, back
 
     torch_out = F.linear(x, w, bias=None)
 
-    kernel_out = run_gemm(x, w, None, out_dtype, y, backend)
+    kernel_out = run_gemm(x, w, None, out_dtype, y, backend, kernel_type=kernel_type)
 
     torch.testing.assert_close(kernel_out, torch_out, atol=1e-1, rtol=1e-1)
 
