@@ -62,7 +62,7 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
 FLYDSL_FALLBACK_TAG = "flydsl_fallback"
-FLYDSL_TUNE_MOE_EXPERT_BALANCE = os.environ.get("FLYDSL_TUNE_MOE_EXPERT_BALANCE", "True").lower() == "true"
+FLYDSL_TUNE_MOE_EXPERT_BALANCE = os.environ.get("FLYDSL_TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 
 COS_DIFF_THRESHOLD = 1e-1
 

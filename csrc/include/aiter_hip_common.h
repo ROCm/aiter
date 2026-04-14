@@ -59,6 +59,8 @@ template <typename... Args>
         }                                                              \
     } while(0)
 
+// Fatal on any HIP error — use for init/teardown/resource management where
+// failure means unrecoverable state.
 #define HIP_CALL(call)                                                            \
     do                                                                            \
     {                                                                             \
@@ -70,6 +72,33 @@ template <typename... Args>
                                         "fail to call " #call " ---> [HIP error](", \
                                         hipGetErrorString(err),                   \
                                         ')');                                       \
+        }                                                                         \
+    } while(0)
+
+// Launch-specific HIP error handling.
+// - hipErrorInvalidValue is treated as recoverable because it commonly means
+//   a software configuration problem (for example invalid grid/block dims)
+//   that tuning code can catch and skip without leaving the GPU in a bad state.
+// - All other launch failures remain fatal because they may indicate runtime
+//   or hardware problems after which continuing is unsafe.
+#define HIP_CALL_LAUNCH(call)                                                     \
+    do                                                                            \
+    {                                                                             \
+        hipError_t err = call;                                                    \
+        if(err != hipSuccess) [[unlikely]]                                        \
+        {                                                                         \
+            if(err == hipErrorInvalidValue)                                        \
+            {                                                                     \
+                aiter_detail::check_fail(__FILE__, __LINE__,                       \
+                    "fail to call " #call " ---> [HIP error](",                    \
+                    hipGetErrorString(err), ')');                                   \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                aiter_detail::aiter_check_fatal(__FILE__, __LINE__,               \
+                    "fail to call " #call " ---> [HIP error](",                    \
+                    hipGetErrorString(err), ')');                                   \
+            }                                                                     \
         }                                                                         \
     } while(0)
 
@@ -154,7 +183,7 @@ class AiterAsmKernel
                           kargs.arg_size_ptr,
                           HIP_LAUNCH_PARAM_END};
 
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+        HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,
                                        kargs.gdy,
                                        kargs.gdz,
@@ -192,7 +221,7 @@ class AiterAsmKernelFast
                           kargs.arg_size_ptr,
                           HIP_LAUNCH_PARAM_END};
 
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+        HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,
                                        kargs.gdy,
                                        kargs.gdz,
