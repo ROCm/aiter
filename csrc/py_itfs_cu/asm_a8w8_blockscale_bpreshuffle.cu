@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
 #include "asm_fp8gemm_blockscale_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -252,7 +253,11 @@ static void print_debug_info(const KernelArgs& args, const std::string& selected
     printf("==========================================\n");
 }
 
-AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    gemm_a8w8_blockscale_bpreshuffle_asm,
+    (
     aiter_tensor_t* A,
     aiter_tensor_t* B,
     aiter_tensor_t* out,
@@ -263,7 +268,8 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
     const char*  kernelName,
     int          bpreshuffle,
     aiter_tensor_t* zero_bias_buf,
-    hipStream_t  stream)
+    hipStream_t  stream),
+    (A, B, out, A_scale, B_scale, bias, splitK, kernelName, bpreshuffle, zero_bias_buf, stream))
 {
     validate_inputs(A, B, out, A_scale, B_scale);
     int Mdim = A->size(0);
@@ -294,21 +300,36 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
     constexpr int TileK = 128;
 
     if (cfg.splitK == 1 && selectedsplitK > 0) {
+        // Step 1: Validate or auto-correct splitK for TileK alignment.
+        //   - Heuristic path: auto-correct to the nearest valid splitK.
+        //   - Explicit path (tuned config): reject misaligned splitK.
         int k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
         int k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
         int actual_ksplit = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
-        if (actual_ksplit != selectedsplitK) {
-            printf("warning: change splitK form %d to %d to make sure every block deals with "
-                   "128x k\n",
-                   selectedsplitK,
-                   actual_ksplit);
-            selectedsplitK = actual_ksplit;
+        if (!opt_splitK.has_value()) {
+            if (actual_ksplit != selectedsplitK) {
+                AITER_LOG_WARNING("change splitK from " << selectedsplitK << " to "
+                       << actual_ksplit << " to make sure every block deals with 128x k");
+                selectedsplitK = actual_ksplit;
+            }
+        } else {
+            AITER_CHECK(
+                selectedsplitK == actual_ksplit,
+                __func__,
+                " Kdim alignment check failed for splitK! Kdim=", Kdim,
+                ", selectedsplitK=", selectedsplitK,
+                ", k_per_split_aligned=", k_per_split_aligned,
+                ", actual_ksplit=", actual_ksplit);
         }
+
+        // Step 2: Sanity check — verify the final partition is valid.
         k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
         k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
         AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
                    (Kdim / k_per_split_aligned) == (selectedsplitK - 1),
                    __func__, " Kdim alignment check failed for splitK!");
+
+        // Step 3: Zero output buffer for atomic accumulation across splits.
         if (selectedsplitK > 1) {
             HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
         }
@@ -340,4 +361,5 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
         print_debug_info(args, selectedKernelName, selectedsplitK, gdx, gdy, gdz, stream, bias);
     }
     impl_ptr->launch_kernel({&args, &arg_size, gdx / blockSizeX, gdy, gdz, blockSizeX, 1, 1, stream});
+
 }

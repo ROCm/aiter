@@ -8,7 +8,7 @@ requires = [
     "psutil",
     "ninja",
     "pandas",
-    "flydsl==0.1.1+20260401.5ac412e"
+    "flydsl==0.1.2"
 ]
 
 [tool.setuptools_scm]

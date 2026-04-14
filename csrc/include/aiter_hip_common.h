@@ -6,20 +6,26 @@
 
 #include "aiter_enum.h"
 #include "aiter_logger.h"
-#include "aiter_tensor.h"
 #if !ENABLE_CK
 #include "ck_tile_shim.h"
 #else
 #include "ck_tile/core.hpp"
 #endif
 #include <cstdint>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
 #ifdef AITER_EMBEDDED_HSA_HEADER
 #include AITER_EMBEDDED_HSA_HEADER
 #endif
 
-namespace detail {
+namespace aiter_detail {
+
+inline thread_local bool g_aiter_can_throw = false;
+
 template <typename... Args>
 [[noreturn, noinline]] inline void aiter_check_fatal(const char* file, size_t line, Args&&... args)
 {
@@ -27,28 +33,72 @@ template <typename... Args>
     (std::cerr << ... << std::forward<Args>(args)) << std::endl;
     std::abort();
 }
-} // namespace detail
 
-#define AITER_CHECK(x, ...)                                             \
-    do                                                                  \
-    {                                                                   \
-        if(!(x)) [[unlikely]]                                           \
-        {                                                               \
-            detail::aiter_check_fatal(__FILE__, __LINE__, __VA_ARGS__); \
-        }                                                               \
+template <typename... Args>
+[[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
+{
+    std::ostringstream oss;
+    oss << "[AITER] " << file << ":" << line << " ";
+    (oss << ... << std::forward<Args>(args));
+    std::string msg = oss.str();
+    std::cerr << msg << std::endl;
+    if(g_aiter_can_throw)
+    {
+        throw std::runtime_error(std::move(msg));
+    }
+    std::abort();
+}
+} // namespace aiter_detail
+
+#define AITER_CHECK(x, ...)                                            \
+    do                                                                 \
+    {                                                                  \
+        if(!(x)) [[unlikely]]                                          \
+        {                                                              \
+            aiter_detail::check_fail(__FILE__, __LINE__, __VA_ARGS__); \
+        }                                                              \
     } while(0)
 
+// Fatal on any HIP error — use for init/teardown/resource management where
+// failure means unrecoverable state.
 #define HIP_CALL(call)                                                            \
     do                                                                            \
     {                                                                             \
         hipError_t err = call;                                                    \
         if(err != hipSuccess) [[unlikely]]                                        \
         {                                                                         \
-            detail::aiter_check_fatal(__FILE__,                                   \
-                                      __LINE__,                                   \
-                                      "fail to call " #call " ---> [HIP error](", \
-                                      hipGetErrorString(err),                     \
-                                      ')');                                       \
+            aiter_detail::aiter_check_fatal(__FILE__,                                 \
+                                        __LINE__,                                 \
+                                        "fail to call " #call " ---> [HIP error](", \
+                                        hipGetErrorString(err),                   \
+                                        ')');                                       \
+        }                                                                         \
+    } while(0)
+
+// Launch-specific HIP error handling.
+// - hipErrorInvalidValue is treated as recoverable because it commonly means
+//   a software configuration problem (for example invalid grid/block dims)
+//   that tuning code can catch and skip without leaving the GPU in a bad state.
+// - All other launch failures remain fatal because they may indicate runtime
+//   or hardware problems after which continuing is unsafe.
+#define HIP_CALL_LAUNCH(call)                                                     \
+    do                                                                            \
+    {                                                                             \
+        hipError_t err = call;                                                    \
+        if(err != hipSuccess) [[unlikely]]                                        \
+        {                                                                         \
+            if(err == hipErrorInvalidValue)                                        \
+            {                                                                     \
+                aiter_detail::check_fail(__FILE__, __LINE__,                       \
+                    "fail to call " #call " ---> [HIP error](",                    \
+                    hipGetErrorString(err), ')');                                   \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                aiter_detail::aiter_check_fatal(__FILE__, __LINE__,               \
+                    "fail to call " #call " ---> [HIP error](",                    \
+                    hipGetErrorString(err), ')');                                   \
+            }                                                                     \
         }                                                                         \
     } while(0)
 
@@ -133,7 +183,7 @@ class AiterAsmKernel
                           kargs.arg_size_ptr,
                           HIP_LAUNCH_PARAM_END};
 
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+        HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,
                                        kargs.gdy,
                                        kargs.gdz,
@@ -171,7 +221,7 @@ class AiterAsmKernelFast
                           kargs.arg_size_ptr,
                           HIP_LAUNCH_PARAM_END};
 
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+        HIP_CALL_LAUNCH(hipModuleLaunchKernel(kernel_func,
                                        kargs.gdx,
                                        kargs.gdy,
                                        kargs.gdz,

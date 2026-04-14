@@ -28,7 +28,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
-from aiter.utility.dtypes import fp8, _torch_to_aiter_dtype, torch_to_aiter_pybind
+from aiter.utility.dtypes import fp8
 
 try:
     ops.meta_size()
@@ -44,13 +44,6 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
-
-
-_torch_to_aiter = torch_to_aiter_pybind
-
-
-def _current_stream_ptr() -> int:
-    return torch.cuda.current_stream().cuda_stream
 
 
 class IPCBuffer:
@@ -77,7 +70,7 @@ class IPCBuffer:
         self._uncached = uncached
         if uncached:
             self._buffer = None
-            self._raw_ptr = ops.allocate_meta_buffer(size, _current_stream_ptr())
+            self._raw_ptr = ops.allocate_meta_buffer(size)
         else:
             self._buffer = torch.empty(size, dtype=torch.uint8, device=device)
             self._raw_ptr = self._buffer.data_ptr()
@@ -475,18 +468,16 @@ class CustomAllreduce:
         if out is None:
             out = torch.empty_like(inp)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
         ops.all_reduce(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             use_new,
             open_fp8_quant,
             reg_inp,
             reg_inp_bytes,
-            stream,
         )
         return out
 
@@ -528,16 +519,14 @@ class CustomAllreduce:
         registered: bool = False,
     ):
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             reg,
             reg_bytes,
-            stream,
         )
 
     def custom_reduce_scatter(
@@ -571,13 +560,11 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         ops.all_gather_reg(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             dim,
-            stream,
         )
         return out
 
@@ -591,15 +578,13 @@ class CustomAllreduce:
                 device=inp.device,
             )
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
-        stream = _current_stream_ptr()
         ops.all_gather_unreg(
             self._ptr,
-            _torch_to_aiter(inp),
+            inp,
             self._pool["input"].data_ptr,
-            _torch_to_aiter(out),
+            out,
             self._pool["input"].max_size,
             dim,
-            stream,
         )
         return out
 
@@ -631,7 +616,6 @@ class CustomAllreduce:
     ):
         if res_out is None:
             res_out = torch.empty_like(inp)
-        stream = _current_stream_ptr()
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
@@ -640,16 +624,15 @@ class CustomAllreduce:
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             ops.fused_allreduce_rmsnorm(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
                 use_1stage,
-                stream,
             )
             return out, res_out
         else:
@@ -662,17 +645,16 @@ class CustomAllreduce:
                 )
             ops.fused_allreduce_rmsnorm_quant(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(scale_out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                scale_out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
                 use_1stage,
-                stream,
             )
             return out, res_out, scale_out
 
