@@ -19,6 +19,7 @@
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
 #include <cmath>
+#include <cstdint>
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -117,46 +118,42 @@ namespace aiter
             }
         }
     }
+
 }
 
 template <typename Operation>
-AiterTensor unary_operation(const aiter_tensor_t &input)
+void unary_operation(const aiter_tensor_t &input, const aiter_tensor_t &output)
 {
     int dim = input.dim();
     int M = dim == 2 ? 1 : input.size(0);
     int N = dim == 2 ? input.size(0) : input.size(1);
     int K = dim == 2 ? input.size(1) : input.size(2);
-    const uint32_t rows = 8;
-    const uint32_t vec = 16 / sizeof(input.dtype());
-    AITER_CHECK(N % rows == 0, "N must be divisible by rows");
-    AITER_CHECK(K % vec == 0, "K must be divisible by vec");
-
-    auto output = AiterTensor::empty(input.sizes_vec(), input.dtype(), input.device_id);
+    constexpr uint32_t rows = 8;
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    int elements = N * K;
 
     constexpr uint32_t wg = 256;
-    int grid_x = (elements / (rows * vec) + wg - 1) / wg;
-    const dim3 grid_dim(grid_x, 1, 1);
-    const dim3 block_dim(wg, 1, 1);
-
     AITER_DISPATCH_FLOATING(
         input.dtype(), "unary_operator_tile_kernel", [&]
-        { aiter::unary_operator_tile_kernel<scalar_t, rows, vec, Operation>
-              <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_c, M, N, K); });
-    return output;
+        {
+            constexpr uint32_t vec = 16 / sizeof(scalar_t);
+            int elements = N * K;
+            int grid_x = (elements / (rows * vec) + wg - 1) / wg;
+            const dim3 grid_dim(grid_x, 1, 1);
+            const dim3 block_dim(wg, 1, 1);
+            aiter::unary_operator_tile_kernel<scalar_t, rows, vec, Operation>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_c, M, N, K);
+        });
 }
 
-AiterTensor aiter_sigmoid(const aiter_tensor_t &input)
+void aiter_sigmoid(const aiter_tensor_t &input, const aiter_tensor_t &output)
 {
-    return unary_operation<aiter::SigmoidOp>(input);
+    unary_operation<aiter::SigmoidOp>(input, output);
 }
 
-AiterTensor aiter_tanh(const aiter_tensor_t &input)
+void aiter_tanh(const aiter_tensor_t &input, const aiter_tensor_t &output)
 {
-    return unary_operation<aiter::TanhOp>(input);
+    unary_operation<aiter::TanhOp>(input, output);
 }

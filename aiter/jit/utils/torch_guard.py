@@ -70,6 +70,8 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "_sigmoid_fast",
+    "_tanh_fast",
     "_moe_fused_gate",
     "init_custom_qr",
     "qr_handle_nbytes",

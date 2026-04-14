@@ -111,9 +111,48 @@ def mul_(input: Tensor, other: Tensor) -> Tensor: ...
 def div_(input: Tensor, other: Tensor) -> Tensor: ...
 
 
-@compile_ops("module_aiter_unary", develop=True, gen_fake=sigmoid_fake_shape)
-def sigmoid(input: Tensor) -> Tensor: ...
+@compile_ops("module_aiter_unary", fc_name="sigmoid", develop=True)
+def _sigmoid_fast(input: Tensor, output: Tensor) -> None: ...
 
 
-@compile_ops("module_aiter_unary", develop=True, gen_fake=sigmoid_fake_shape)
-def tanh(input: Tensor) -> Tensor: ...
+@compile_ops("module_aiter_unary", fc_name="tanh", develop=True)
+def _tanh_fast(input: Tensor, output: Tensor) -> None: ...
+
+
+def _unary_fast_supported(input: Tensor) -> bool:
+    if not input.is_cuda:
+        return False
+    if input.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    if not input.is_contiguous():
+        return False
+
+    dim = input.dim()
+    if dim == 2:
+        N, K = input.size(0), input.size(1)
+    elif dim == 3:
+        N, K = input.size(1), input.size(2)
+    else:
+        return False
+
+    rows = 8
+    vec = 16 // input.element_size()
+    return N % rows == 0 and K % vec == 0
+
+
+def sigmoid(input: Tensor) -> Tensor:
+    if not _unary_fast_supported(input):
+        return torch.sigmoid(input)
+
+    output = torch.empty_like(input)
+    _sigmoid_fast(input, output)
+    return output
+
+
+def tanh(input: Tensor) -> Tensor:
+    if not _unary_fast_supported(input):
+        return torch.tanh(input)
+
+    output = torch.empty_like(input)
+    _tanh_fast(input, output)
+    return output
