@@ -31,7 +31,7 @@ def grouped_topk(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     num_expert_group: int,
-    topk_group: int,
+    topk_grp: int,
     need_renorm: bool,
     is_softmax: bool = True,
     routed_scaling_factor: float = 1.0,

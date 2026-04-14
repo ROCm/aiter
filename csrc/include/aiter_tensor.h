@@ -123,6 +123,13 @@ public:
         return t;
     }
 
+    /// Wrap an existing tensor descriptor without taking ownership.
+    explicit AiterTensor(const aiter_tensor_t& other)
+        : aiter_tensor_t(other),
+          owns_memory_(false)
+    {
+    }
+
     ~AiterTensor()
     {
         if(owns_memory_ && ptr)

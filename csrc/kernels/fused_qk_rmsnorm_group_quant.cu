@@ -686,14 +686,10 @@ void fused_qk_rmsnorm_group_quant(
     bool has_residual = res1.has_value();
     bool output_unquantized_inp1 = out1_unquantized_opt.has_value();
 
-    aiter_tensor_t out1_unquantized_storage;
-    AiterTensor out1_unquantized_empty;
-    if(output_unquantized_inp1) {
-        out1_unquantized_storage = out1_unquantized_opt.value();
-    } else {
-        out1_unquantized_empty = AiterTensor::empty({0}, inp1.dtype(), inp1.device_id);
-        out1_unquantized_storage = static_cast<aiter_tensor_t&>(out1_unquantized_empty);
-    }
+    AiterTensor out1_unquantized_owned = AiterTensor::empty({0}, inp1.dtype(), inp1.device_id);
+    aiter_tensor_t out1_unquantized_storage =
+        output_unquantized_inp1 ? out1_unquantized_opt.value()
+                                : static_cast<aiter_tensor_t&>(out1_unquantized_owned);
     const aiter_tensor_t& out1_unquantized = out1_unquantized_storage;
     if(output_unquantized_inp1)
     {

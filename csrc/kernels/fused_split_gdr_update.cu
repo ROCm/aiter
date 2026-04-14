@@ -434,8 +434,8 @@ AiterTensor fused_split_gdr_update(
         scale = 1.0f / std::sqrt(static_cast<float>(K));
     }
 
-    AiterTensor o_storage;
-    aiter_tensor_t o;
+    std::optional<AiterTensor> o_storage;
+    aiter_tensor_t o{};
     if (output.has_value()) {
         o = output.value();
         AITER_CHECK(o.dtype() == AITER_DTYPE_bf16, "output must be bfloat16");
@@ -443,15 +443,16 @@ AiterTensor fused_split_gdr_update(
             o.size(0) == B && o.size(1) == T && o.size(2) == HV && o.size(3) == V,
             "output shape mismatch");
     } else {
-        o_storage = AiterTensor::empty({B, T, HV, V}, mixed_qkv.dtype(), mixed_qkv.device_id);
-        o = o_storage;
+        o_storage.emplace(AiterTensor::empty({B, T, HV, V}, mixed_qkv.dtype(), mixed_qkv.device_id));
+        o = static_cast<aiter_tensor_t&>(*o_storage);
     }
 
-    AiterTensor initial_state_indices_storage;
+    std::optional<AiterTensor> initial_state_indices_storage;
     aiter_tensor_t initial_state_indices_ptr = initial_state_indices;
     if (initial_state_indices.data_ptr() == nullptr || initial_state_indices.numel() == 0) {
-        initial_state_indices_storage = AiterTensor::zeros({B}, AITER_DTYPE_i32, mixed_qkv.device_id);
-        initial_state_indices_ptr = initial_state_indices_storage;
+        initial_state_indices_storage.emplace(
+            AiterTensor::zeros({B}, AITER_DTYPE_i32, mixed_qkv.device_id));
+        initial_state_indices_ptr = static_cast<aiter_tensor_t&>(*initial_state_indices_storage);
     }
 
     int bk_runtime = 1;
@@ -487,7 +488,7 @@ AiterTensor fused_split_gdr_update(
         AITER_CHECK(false, "Unsupported BK: ", bk_runtime);
     }
 
-    return o_storage.numel() > 0 ? std::move(o_storage) : AiterTensor(o);
+    return o_storage.has_value() ? std::move(*o_storage) : AiterTensor(o);
 }
 
 #undef DISPATCH_KS_BOOL
