@@ -9,7 +9,7 @@ from typing_extensions import Optional
 import torch
 import torch.distributed as dist
 
-from aiter.dist.communication_op import custom_all_reduce
+from aiter.dist.communication_op import custom_all_gather, custom_all_reduce
 from aiter.dist.parallel_state import (
     CustomGroupConfig,
     destroy_distributed_environment,
@@ -320,11 +320,11 @@ def allreduce_two_phase(
         _, us1 = run1()
         result1 = (out1, us1)
 
-        # Phase 2: communication allreduce
+        # Phase 2: communication allgather
         graph2 = torch.cuda.CUDAGraph()
         with comm_group.graph_capture() as gc:
             with torch.cuda.graph(graph2, stream=gc.stream):
-                out2 = custom_all_reduce(inp2, group="comm")
+                out2 = custom_all_gather(inp2, group="comm")
         out2.fill_(0)
 
         @perftest()
@@ -343,7 +343,7 @@ def allreduce_two_phase(
 
         @perftest()
         def run2(x):
-            return custom_all_reduce(x, group="comm")
+            return custom_all_gather(x, group="comm")
 
         result2 = run2(inp2)
 
@@ -376,10 +376,8 @@ def test_two_phase_tp4dp2_then_tp8(
     for x in xs_phase1:
         ref_phase1 += x
 
-    # Phase 2 ref: comm group (tp8 = all 8 ranks)
-    ref_phase2 = torch.zeros(shape, dtype=dtype)
-    for x in xs_phase2:
-        ref_phase2 += x
+    # Phase 2 ref: comm group allgather (tp8 = all 8 ranks, concat along dim=0)
+    ref_phase2 = torch.cat(xs_phase2, dim=0)
 
     rets = []
     for i in range(world_size):
@@ -409,7 +407,8 @@ def test_two_phase_tp4dp2_then_tp8(
         )
         checkAllclose(ref_phase1, out1.to(ref_phase1), msg=msg1)
         msg2 = (
-            f"test_two_phase (comm tp8): {shape=} {dtype=} " f"{withGraph=} {us2:>8.2f}"
+            f"test_two_phase (comm tp8 allgather): {shape=} {dtype=} "
+            f"{withGraph=} {us2:>8.2f}"
         )
         checkAllclose(ref_phase2, out2.to(ref_phase2), msg=msg2)
 

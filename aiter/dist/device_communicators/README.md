@@ -18,7 +18,7 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
-from aiter.dist.communication_op import custom_all_reduce
+from aiter.dist.communication_op import custom_all_reduce, custom_all_gather
 ```
 
 ### `CustomGroupConfig` Class
@@ -44,6 +44,12 @@ Retrieve initialized `GroupCoordinator` instances.
 ### `custom_all_reduce(input_, ..., group=None)`
 
 Perform allreduce on a custom group. When only one group exists, `group` can be omitted. When multiple groups exist, pass the group name.
+
+### `custom_all_gather(input_, ..., group=None)`
+
+Perform allgather on a custom group. When only one group exists, `group` can be omitted. When multiple groups exist, pass the group name.
+
+> **Note:** For multi-group functionality, only `allreduce` and `allgather` operations are currently supported.
 
 ## Config Dict Format
 
