@@ -20,6 +20,7 @@ def worker(
     atol=1e-2,
     printLog=False,
     tol_err_ratio=0.05,
+    compare_fn=None,
 ):
     from aiter.test_common import run_perftest
 
@@ -67,18 +68,26 @@ def worker(
                 if isinstance(ref[i], torch.Tensor):
                     if res[i].shape != ref[i].shape:
                         res[i] = res[i].view(-1)[: ref[i].numel()].view(ref[i].shape)
-                    if ref[i].dtype.itemsize == 1:
-                        ref[i] = ref[i].view(torch.uint8).to(dtypes.fp32)
-                        res[i] = res[i].view(torch.uint8).to(dtypes.fp32)
-                    err_ratio = checkAllclose(
-                        ref[i],
-                        res[i],
-                        atol=atol,
-                        rtol=rtol,
-                        tol_err_ratio=tol_err_ratio,
-                        printLog=printLog,
-                        msg=f"info:{info} res[{i}] ",
-                    )
+                    if compare_fn is not None:
+                        err_ratio = compare_fn(
+                            ref[i],
+                            res[i],
+                            msg=f"info:{info} res[{i}] ",
+                            printLog=printLog,
+                        )
+                    else:
+                        if ref[i].dtype.itemsize == 1:
+                            ref[i] = ref[i].view(torch.uint8).to(dtypes.fp32)
+                            res[i] = res[i].view(torch.uint8).to(dtypes.fp32)
+                        err_ratio = checkAllclose(
+                            ref[i],
+                            res[i],
+                            atol=atol,
+                            rtol=rtol,
+                            tol_err_ratio=tol_err_ratio,
+                            printLog=printLog,
+                            msg=f"info:{info} res[{i}] ",
+                        )
                     max_err_ratio = max(max_err_ratio, err_ratio)
     except RuntimeError as e:
         if "CUDA" in str(e) or "HIP" in str(e) or "out of memory" in str(e).lower():
@@ -208,9 +217,13 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                     torch.cuda.synchronize()
                     _prev_ref_key = _cur_key
 
-            # Extract rtol, atol from rest if available, otherwise use defaults
+            # Extract rtol, atol from rest if available, otherwise use defaults.
+            # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
+            compare_fn = (
+                rest[2] if len(rest) > 2 and callable(rest[2]) else None
+            )
 
             work_args = (
                 gpu_id,
@@ -223,6 +236,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 atol,
                 verbose,  # Use the verbose from work_group parameter
                 err_ratio,  # Use the err_ratio from work_group parameter
+                compare_fn,
             )
 
             # Run worker with explicit GPU ID

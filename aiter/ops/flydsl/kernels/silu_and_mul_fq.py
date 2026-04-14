@@ -1,28 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Fused silu_and_mul + MXFP4 quantization + sorted-scale write kernel (FlyDSL).
+"""Fused silu_and_mul + quantization + sorted-scale write kernel (FlyDSL).
 
 Designed for split-K MOE stage1 post-processing:
 
   input   : tmp_out  (token_num * topk, inter_dim * 2) bf16
   sorted  : sorted_token_ids (sorted_len,) i32 -- packed (token<<0 | slot<<24)
             num_valid_ids    (1,) i32
-  output  : out_fp4          raw byte buffer -- FP4x2 packed, row stride = inter_dim//2
-            out_scale_sorted raw byte buffer -- tiled E8M0 scale (same layout as moe_mxfp4_sort)
+  output  : out              raw byte buffer (FP4x2, FP8, or BF16 depending on quant_mode)
+            out_scale_sorted raw byte buffer -- tiled E8M0 scale (quant_mode fp4/fp8 only)
 
-Grid:  (num_sorted_rows, 1, 1)  -- one workgroup per sorted row (including blockM padding).
-Block: (BLOCK_THREADS, 1, 1)
-
-Each workgroup:
-  1. Loads sorted_token_ids[bid] -> (token_id, slot_id) -> row = token_id * topk + slot_id
-  2. If bid < num_valid_ids (valid row):
-     a. Reads gate = tmp_out[row, 0:inter_dim], up = tmp_out[row, inter_dim:2*inter_dim]
-     b. Computes silu(gate) * up in f32
-     c. Per-1x32 MXFP4 quant -> writes packed FP4 + E8M0 scale in tiled layout
-  3. If bid >= num_valid_ids (blockM padding row):
-     a. Writes zero FP4 bytes to out_fp4
-     b. Writes zero E8M0 scale to out_scale_sorted (keeps tiled layout consistent)
+Compile options:
+  quant_mode : "fp4" | "fp8" | "none"
+  gui_layout : False -> gate-up separated  [gate_0:N, up_0:N]
+               True  -> block-interleaved  [gate_0:16, up_0:16, gate_16:32, ...]
 """
 
 import flydsl.compiler as flyc
@@ -40,45 +32,65 @@ BLOCK_THREADS = 256
 WARP_SIZE = 64
 
 
-def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
-    """Return a JIT launcher for fused silu_and_mul + mxfp4 quant + scale sort.
+def build_silu_and_mul_fq_module(
+    inter_dim: int,
+    topk: int,
+    quant_mode: str = "fp4",
+    gui_layout: bool = False,
+):
+    """Return a JIT launcher for fused silu_and_mul + optional quant + scale sort.
 
     Parameters
     ----------
     inter_dim : int
         Output columns of stage1 (after activation). Input has inter_dim*2 cols.
-        Must be divisible by 32 (MXFP4 block size).
+        Must be divisible by 32 (quant block size).
     topk : int
         Number of expert slots per token.
+    quant_mode : str
+        "fp4"  -> MXFP4 output + e8m0 scale (tiled layout)
+        "fp8"  -> MXFP8 (e4m3fn) output + e8m0 scale (tiled layout)
+        "none" -> bf16 output, no quantization (out_scale_sorted ignored)
+    gui_layout : bool
+        False -> input is gate-up separated  [gate_0:N | up_0:N]
+        True  -> input is block-interleaved  [gate_0:16, up_0:16, gate_16:32, ...]
     """
     assert inter_dim % 32 == 0, f"inter_dim={inter_dim} must be divisible by 32"
+    _need_fp4 = quant_mode == "fp4"
+    _need_fp8 = quant_mode == "fp8"
+    _need_quant = _need_fp4 or _need_fp8
+    assert _need_fp4 or _need_fp8 or quant_mode == "none"
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
-    # VEC: number of f32 elements each thread handles; must be even for FP4 packing
     VEC = max(ELEMS_PER_THREAD, 2)
     if VEC % 2 != 0:
         VEC += 1
     assert 32 % VEC == 0, f"VEC={VEC} must divide 32 evenly"
-    # threads that actually participate in a 32-element quant group
+    if gui_layout:
+        assert VEC <= 16, f"VEC={VEC} must be <=16 for block-interleave layout"
     THREADS_PER_QUANT_BLK = 32 // VEC
-    # shuffle distances for intra-group reduction
     SHUFFLE_DISTS = []
     d = 1
     while d < THREADS_PER_QUANT_BLK:
         SHUFFLE_DISTS.append(d)
         d *= 2
 
+    _fp_headroom = 2 if _need_fp4 else 8
+
     elem_bytes_bf16 = 2
+
+    if _need_fp8:
+        from flydsl._mlir.dialects import rocdl
 
     @flyc.kernel
     def silu_and_mul_fq_kernel(
-        x: fx.Tensor,  # (token_num*topk, inter_dim*2) bf16
-        out_fp4: fx.Tensor,  # raw byte buffer for packed FP4 output
-        out_scale_sorted: fx.Tensor,  # raw byte buffer for sorted E8M0 scales
-        sorted_ids: fx.Tensor,  # (sorted_len,) i32
-        num_valid_ids: fx.Tensor,  # (1,) i32
-        token_num: Int32,  # host scalar
+        x: fx.Tensor,
+        out_buf: fx.Tensor,
+        out_scale_sorted: fx.Tensor,
+        sorted_ids: fx.Tensor,
+        num_valid_ids: fx.Tensor,
+        token_num: Int32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -112,15 +124,15 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
         c0x80000000_i32 = arith.constant(0x80000000, type=i32)
         c0_f32 = arith.constant(0.0, type=f32)
         c1_f32 = arith.constant(1.0, type=f32)
+        c_headroom_i32 = arith.constant(_fp_headroom, type=i32)
 
         scale_cols_i32 = arith.constant(scale_cols, type=i32)
         inter_dim_i32 = arith.constant(inter_dim, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
         n32_sort = scale_cols_i32 * c32_i32
 
-        # Buffer resources
         in_rsrc = buffer_ops.create_buffer_resource(x, max_size=True)
-        out_rsrc = buffer_ops.create_buffer_resource(out_fp4, max_size=True)
+        out_rsrc = buffer_ops.create_buffer_resource(out_buf, max_size=True)
         scale_rsrc = buffer_ops.create_buffer_resource(out_scale_sorted, max_size=True)
         tid_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
         nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
@@ -140,24 +152,23 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
         s_ok = arith.cmpi(CmpIPredicate.ult, slot_id, topk_i32)
         is_valid = arith.andi(row_in_range, arith.andi(t_ok, s_ok))
 
-        def _f32_to_e2m1(qx_f32):
-            """Convert a scaled f32 value to fp4 (e2m1) 4-bit integer."""
-            qx = qx_f32.bitcast(i32)
-            s = qx & c0x80000000_i32
-            e = (qx >> c23_i32) & c0xFF_i32
-            m = qx & c0x7FFFFF_i32
-            adj_exp = arith.maxsi(c126_i32 - e, c0_i32)
-            m_denorm = (c0x400000_i32 | (m >> c1_i32)) >> adj_exp
-            is_denorm = arith.cmpi(CmpIPredicate.ult, e, c127_i32)
-            m = arith.select(is_denorm, m_denorm, m)
-            e = arith.maxsi(e - c126_i32, c0_i32)
-            combined = (e << c2_i32) | (m >> c21_i32)
-            rounded = (combined + c1_i32) >> c1_i32
-            e2m1 = arith.minui(rounded, c7_i32)
-            return (s >> c28_i32) | e2m1
+        if _need_fp4:
+            def _f32_to_e2m1(qx_f32):
+                qx = qx_f32.bitcast(i32)
+                s = qx & c0x80000000_i32
+                e = (qx >> c23_i32) & c0xFF_i32
+                m = qx & c0x7FFFFF_i32
+                adj_exp = arith.maxsi(c126_i32 - e, c0_i32)
+                m_denorm = (c0x400000_i32 | (m >> c1_i32)) >> adj_exp
+                is_denorm = arith.cmpi(CmpIPredicate.ult, e, c127_i32)
+                m = arith.select(is_denorm, m_denorm, m)
+                e = arith.maxsi(e - c126_i32, c0_i32)
+                combined = (e << c2_i32) | (m >> c21_i32)
+                rounded = (combined + c1_i32) >> c1_i32
+                e2m1 = arith.minui(rounded, c7_i32)
+                return (s >> c28_i32) | e2m1
 
         thread_id = ArithValue(tid)
-
         COLS_PER_ITER = BLOCK_THREADS * VEC
 
         for iter_idx in range_constexpr(
@@ -174,42 +185,60 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
                 _if_valid = scf.IfOp(is_valid, has_else=True)
                 with ir.InsertionPoint(_if_valid.then_block):
                     in_row = token_id * topk_i32 + slot_id
-                    # FP4 output in token order: row = token_id * topk + slot_id
-                    out_row_byte_base = in_row * arith.constant(
-                        inter_dim // 2, type=i32
-                    )
-                    fp4_byte_off = out_row_byte_base + (col0 >> c1_i32)
                     in_row_byte_base = in_row * arith.constant(
                         inter_dim * 2 * elem_bytes_bf16, type=i32
                     )
-                    up_byte_offset = arith.constant(
-                        inter_dim * elem_bytes_bf16, type=i32
-                    )
 
-                    gate_byte = in_row_byte_base + col0 * arith.constant(
-                        elem_bytes_bf16, type=i32
-                    )
-                    up_byte = gate_byte + up_byte_offset
-                    gate_dw = gate_byte >> c2_i32
-                    up_dw = up_byte >> c2_i32
                     vec_dw = VEC * elem_bytes_bf16 // 4
 
-                    gate_raw = buffer_ops.buffer_load(
-                        in_rsrc, gate_dw, vec_width=vec_dw, dtype=i32
+                    if gui_layout:
+                        # Block-interleaved (block=16):
+                        #   [gate_0:16, up_0:16, gate_16:32, up_16:32, ...]
+                        c16_i32 = arith.constant(16, type=i32)
+                        block_idx = col0 >> c4_i32
+                        offset_in_blk = col0 & c15_i32
+                        gate_col = block_idx * c32_i32 + offset_in_blk
+                        up_col = gate_col + c16_i32
+                    else:
+                        # Gate-up separated: gate at col0, up at col0 + inter_dim
+                        gate_col = col0
+                        up_col = col0 + inter_dim_i32
+
+                    gate_byte = in_row_byte_base + gate_col * arith.constant(
+                        elem_bytes_bf16, type=i32
                     )
-                    up_raw = buffer_ops.buffer_load(
-                        in_rsrc, up_dw, vec_width=vec_dw, dtype=i32
+                    up_byte = in_row_byte_base + up_col * arith.constant(
+                        elem_bytes_bf16, type=i32
                     )
+                    gate_dw = gate_byte >> c2_i32
+                    up_dw = up_byte >> c2_i32
 
                     vec_bf16_ty = T.vec(VEC, T.bf16)
                     vec_f32_ty = T.vec(VEC, f32)
+
                     if vec_dw == 1:
                         vec1_i32_ty = T.vec(1, i32)
-                        gate_vec = vector.from_elements(vec1_i32_ty, [gate_raw])
-                        up_vec = vector.from_elements(vec1_i32_ty, [up_raw])
-                        gate_bf16 = vector.bitcast(vec_bf16_ty, gate_vec)
-                        up_bf16 = vector.bitcast(vec_bf16_ty, up_vec)
+                        gate_raw = buffer_ops.buffer_load(
+                            in_rsrc, gate_dw, vec_width=1, dtype=i32
+                        )
+                        up_raw = buffer_ops.buffer_load(
+                            in_rsrc, up_dw, vec_width=1, dtype=i32
+                        )
+                        gate_bf16 = vector.bitcast(
+                            vec_bf16_ty,
+                            vector.from_elements(vec1_i32_ty, [gate_raw]),
+                        )
+                        up_bf16 = vector.bitcast(
+                            vec_bf16_ty,
+                            vector.from_elements(vec1_i32_ty, [up_raw]),
+                        )
                     else:
+                        gate_raw = buffer_ops.buffer_load(
+                            in_rsrc, gate_dw, vec_width=vec_dw, dtype=i32
+                        )
+                        up_raw = buffer_ops.buffer_load(
+                            in_rsrc, up_dw, vec_width=vec_dw, dtype=i32
+                        )
                         gate_bf16 = vector.bitcast(vec_bf16_ty, gate_raw)
                         up_bf16 = vector.bitcast(vec_bf16_ty, up_raw)
                     gate_f32 = gate_bf16.extf(vec_f32_ty)
@@ -234,116 +263,205 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
                         )
                         act_vals.append(g * sig * u)
 
-                    local_max = c0_f32
-                    for vi in range_constexpr(VEC):
-                        abs_v = llvm.call_intrinsic(
-                            f32, "llvm.fabs.f32", [act_vals[vi]], [], []
+                    if _need_quant:
+                        local_max = c0_f32
+                        for vi in range_constexpr(VEC):
+                            abs_v = llvm.call_intrinsic(
+                                f32, "llvm.fabs.f32", [act_vals[vi]], [], []
+                            )
+                            local_max = arith.maximumf(local_max, abs_v)
+
+                        for sh_dist in SHUFFLE_DISTS:
+                            off = arith.constant(sh_dist, type=i32)
+                            peer = local_max.shuffle_xor(off, c64_i32)
+                            local_max = arith.maximumf(local_max, peer)
+
+                        max_i32_v = local_max.bitcast(i32)
+                        max_rounded = (max_i32_v + c0x200000_i32) & c0xFF800000_i32
+                        exp_field = max_rounded >> c23_i32
+                        e8m0_biased = arith.maxsi(
+                            exp_field - c_headroom_i32, c0_i32
                         )
-                        local_max = arith.maximumf(local_max, abs_v)
+                        quant_exp = c254_i32 - e8m0_biased
+                        quant_scale = (quant_exp << c23_i32).bitcast(f32)
 
-                    for sh_dist in SHUFFLE_DISTS:
-                        off = arith.constant(sh_dist, type=i32)
-                        peer = local_max.shuffle_xor(off, c64_i32)
-                        local_max = arith.maximumf(local_max, peer)
+                        if _need_fp4:
+                            out_row_byte_base = in_row * arith.constant(
+                                inter_dim // 2, type=i32
+                            )
+                            out_byte_off = out_row_byte_base + (col0 >> c1_i32)
 
-                    max_i32_v = local_max.bitcast(i32)
-                    max_rounded = (max_i32_v + c0x200000_i32) & c0xFF800000_i32
-                    exp_field = max_rounded >> c23_i32
-                    e8m0_biased = arith.maxsi(exp_field - c2_i32, c0_i32)
+                            fp4_vals = []
+                            for vi in range_constexpr(VEC):
+                                scaled_v = act_vals[vi] * quant_scale
+                                fp4_vals.append(_f32_to_e2m1(scaled_v))
 
-                    quant_exp = c254_i32 - e8m0_biased
-                    quant_scale = (quant_exp << c23_i32).bitcast(f32)
+                            packed_i32 = fp4_vals[0] | (fp4_vals[1] << c4_i32)
+                            for k in range_constexpr(1, VEC // 2):
+                                byte_k = fp4_vals[2 * k] | (
+                                    fp4_vals[2 * k + 1] << c4_i32
+                                )
+                                packed_i32 = packed_i32 | (
+                                    byte_k << arith.constant(k * 8, type=i32)
+                                )
 
-                    fp4_vals = []
-                    for vi in range_constexpr(VEC):
-                        scaled_v = act_vals[vi] * quant_scale
-                        fp4_vals.append(_f32_to_e2m1(scaled_v))
+                            _pack_bytes = VEC // 2
+                            if _pack_bytes == 1:
+                                store_val = arith.TruncIOp(T.i8, packed_i32)
+                                buffer_ops.buffer_store(
+                                    store_val, out_rsrc, out_byte_off,
+                                    offset_is_bytes=True,
+                                )
+                            elif _pack_bytes == 2:
+                                store_val = arith.TruncIOp(T.i16, packed_i32)
+                                buffer_ops.buffer_store(
+                                    store_val, out_rsrc, out_byte_off,
+                                    offset_is_bytes=True,
+                                )
+                            else:
+                                buffer_ops.buffer_store(
+                                    packed_i32, out_rsrc, out_byte_off,
+                                    offset_is_bytes=True,
+                                )
+                        else:
+                            out_row_byte_base = in_row * arith.constant(
+                                inter_dim, type=i32
+                            )
+                            out_byte_off = out_row_byte_base + col0
 
-                    packed_i32 = fp4_vals[0] | (fp4_vals[1] << c4_i32)
-                    for k in range_constexpr(1, VEC // 2):
-                        byte_k = fp4_vals[2 * k] | (fp4_vals[2 * k + 1] << c4_i32)
-                        packed_i32 = packed_i32 | (
-                            byte_k << arith.constant(k * 8, type=i32)
+                            scaled_vals = []
+                            for vi in range_constexpr(VEC):
+                                scaled_vals.append(act_vals[vi] * quant_scale)
+
+                            if VEC <= 4:
+                                packed_i32 = c0_i32
+                                for _w in range_constexpr(VEC // 2):
+                                    packed_i32 = rocdl.cvt_pk_fp8_f32(
+                                        i32, scaled_vals[2 * _w],
+                                        scaled_vals[2 * _w + 1],
+                                        packed_i32, _w,
+                                    )
+                                if VEC == 2:
+                                    store_val = arith.TruncIOp(T.i16, packed_i32)
+                                    buffer_ops.buffer_store(
+                                        store_val, out_rsrc, out_byte_off,
+                                        offset_is_bytes=True,
+                                    )
+                                else:
+                                    buffer_ops.buffer_store(
+                                        packed_i32, out_rsrc, out_byte_off,
+                                        offset_is_bytes=True,
+                                    )
+                            else:
+                                for _wg in range_constexpr(VEC // 4):
+                                    _b = _wg * 4
+                                    packed_w = c0_i32
+                                    packed_w = rocdl.cvt_pk_fp8_f32(
+                                        i32, scaled_vals[_b],
+                                        scaled_vals[_b + 1],
+                                        packed_w, 0,
+                                    )
+                                    packed_w = rocdl.cvt_pk_fp8_f32(
+                                        i32, scaled_vals[_b + 2],
+                                        scaled_vals[_b + 3],
+                                        packed_w, 1,
+                                    )
+                                    word_off = out_byte_off + arith.constant(
+                                        _wg * 4, type=i32
+                                    )
+                                    buffer_ops.buffer_store(
+                                        packed_w, out_rsrc, word_off,
+                                        offset_is_bytes=True,
+                                    )
+
+                        lane_in_blk = col0 & c31_i32
+                        _if_sw = scf.IfOp(
+                            arith.cmpi(CmpIPredicate.eq, lane_in_blk, c0_i32)
                         )
+                        with ir.InsertionPoint(_if_sw.then_block):
+                            row_s = bid_i32
+                            col_s = col0 >> c5_i32
+                            d0 = row_s >> c5_i32
+                            d1 = (row_s >> c4_i32) & c1_i32
+                            d2 = row_s & c15_i32
+                            d3 = col_s >> c3_i32
+                            d4 = (col_s >> c2_i32) & c1_i32
+                            d5 = col_s & c3_i32
+                            s_byte_off = (
+                                d0 * n32_sort + d3 * c256_i32
+                                + d5 * c64_i32 + d2 * c4_i32
+                                + d4 * c2_i32 + d1
+                            )
+                            e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
+                            buffer_ops.buffer_store(
+                                e8m0_i8, scale_rsrc, s_byte_off,
+                                offset_is_bytes=True,
+                            )
+                            scf.YieldOp([])
 
-                    _pack_bytes = VEC // 2
-                    if _pack_bytes == 1:
-                        store_val = arith.TruncIOp(T.i8, packed_i32)
-                        buffer_ops.buffer_store(
-                            store_val, out_rsrc, fp4_byte_off, offset_is_bytes=True
-                        )
-                    elif _pack_bytes == 2:
-                        store_val = arith.TruncIOp(T.i16, packed_i32)
-                        buffer_ops.buffer_store(
-                            store_val, out_rsrc, fp4_byte_off, offset_is_bytes=True
-                        )
                     else:
-                        buffer_ops.buffer_store(
-                            packed_i32, out_rsrc, fp4_byte_off, offset_is_bytes=True
+                        out_row_byte_base = in_row * arith.constant(
+                            inter_dim * elem_bytes_bf16, type=i32
                         )
+                        out_byte_off = out_row_byte_base + col0 * arith.constant(
+                            elem_bytes_bf16, type=i32
+                        )
+                        out_dw_off = out_byte_off >> c2_i32
+                        _vec_f32_ty = T.vec(VEC, f32)
+                        _vec_bf16_ty = T.vec(VEC, T.bf16)
+                        act_f32_vec = vector.from_elements(_vec_f32_ty, act_vals)
+                        act_bf16_vec = act_f32_vec.truncf(_vec_bf16_ty)
+                        act_i32 = vector.bitcast(
+                            T.vec(VEC * elem_bytes_bf16 // 4, i32), act_bf16_vec
+                        )
+                        vec_dw_out = VEC * elem_bytes_bf16 // 4
+                        if vec_dw_out == 1:
+                            store_scalar = vector.extract(
+                                act_i32, static_position=[0], dynamic_position=[]
+                            )
+                            buffer_ops.buffer_store(
+                                store_scalar, out_rsrc, out_dw_off
+                            )
+                        else:
+                            buffer_ops.buffer_store(
+                                act_i32, out_rsrc, out_dw_off
+                            )
 
-                    lane_in_blk = col0 & c31_i32
-                    _if_sw = scf.IfOp(arith.cmpi(CmpIPredicate.eq, lane_in_blk, c0_i32))
-                    with ir.InsertionPoint(_if_sw.then_block):
-                        row_s = bid_i32
-                        col_s = col0 >> c5_i32
-                        d0 = row_s >> c5_i32
-                        d1 = (row_s >> c4_i32) & c1_i32
-                        d2 = row_s & c15_i32
-                        d3 = col_s >> c3_i32
-                        d4 = (col_s >> c2_i32) & c1_i32
-                        d5 = col_s & c3_i32
-                        s_byte_off = (
-                            d0 * n32_sort
-                            + d3 * c256_i32
-                            + d5 * c64_i32
-                            + d2 * c4_i32
-                            + d4 * c2_i32
-                            + d1
-                        )
-                        e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
-                        buffer_ops.buffer_store(
-                            e8m0_i8, scale_rsrc, s_byte_off, offset_is_bytes=True
-                        )
-                        scf.YieldOp([])
                     scf.YieldOp([])
 
                 with ir.InsertionPoint(_if_valid.else_block):
-                    # Padding row: skip FP4 write (stage2 gather-loads by token_id,
-                    # so padding rows are never read). Only write zero scale.
-                    lane_in_blk_p = col0 & c31_i32
-                    _if_sw_p = scf.IfOp(
-                        arith.cmpi(CmpIPredicate.eq, lane_in_blk_p, c0_i32)
-                    )
-                    with ir.InsertionPoint(_if_sw_p.then_block):
-                        row_s_p = bid_i32
-                        col_s_p = col0 >> c5_i32
-                        d0_p = row_s_p >> c5_i32
-                        d1_p = (row_s_p >> c4_i32) & c1_i32
-                        d2_p = row_s_p & c15_i32
-                        d3_p = col_s_p >> c3_i32
-                        d4_p = (col_s_p >> c2_i32) & c1_i32
-                        d5_p = col_s_p & c3_i32
-                        s_byte_off_p = (
-                            d0_p * n32_sort
-                            + d3_p * c256_i32
-                            + d5_p * c64_i32
-                            + d2_p * c4_i32
-                            + d4_p * c2_i32
-                            + d1_p
+                    if _need_quant:
+                        lane_in_blk_p = col0 & c31_i32
+                        _if_sw_p = scf.IfOp(
+                            arith.cmpi(CmpIPredicate.eq, lane_in_blk_p, c0_i32)
                         )
-                        c0_i8 = arith.TruncIOp(T.i8, c0_i32)
-                        buffer_ops.buffer_store(
-                            c0_i8, scale_rsrc, s_byte_off_p, offset_is_bytes=True
-                        )
-                        scf.YieldOp([])
+                        with ir.InsertionPoint(_if_sw_p.then_block):
+                            row_s_p = bid_i32
+                            col_s_p = col0 >> c5_i32
+                            d0_p = row_s_p >> c5_i32
+                            d1_p = (row_s_p >> c4_i32) & c1_i32
+                            d2_p = row_s_p & c15_i32
+                            d3_p = col_s_p >> c3_i32
+                            d4_p = (col_s_p >> c2_i32) & c1_i32
+                            d5_p = col_s_p & c3_i32
+                            s_byte_off_p = (
+                                d0_p * n32_sort + d3_p * c256_i32
+                                + d5_p * c64_i32 + d2_p * c4_i32
+                                + d4_p * c2_i32 + d1_p
+                            )
+                            c0_i8 = arith.TruncIOp(T.i8, c0_i32)
+                            buffer_ops.buffer_store(
+                                c0_i8, scale_rsrc, s_byte_off_p,
+                                offset_is_bytes=True,
+                            )
+                            scf.YieldOp([])
                     scf.YieldOp([])
                 scf.YieldOp([])
 
     @flyc.jit
     def launch_silu_and_mul_fq(
         x: fx.Tensor,
-        out_fp4: fx.Tensor,
+        out_buf: fx.Tensor,
         out_scale_sorted: fx.Tensor,
         sorted_ids: fx.Tensor,
         num_valid_ids: fx.Tensor,
@@ -357,7 +475,7 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
 
         idx_rows = arith.index_cast(T.index, num_sorted_rows)
         launcher = silu_and_mul_fq_kernel(
-            x, out_fp4, out_scale_sorted, sorted_ids, num_valid_ids, token_num
+            x, out_buf, out_scale_sorted, sorted_ids, num_valid_ids, token_num
         )
         launcher.launch(
             grid=(idx_rows, 1, 1),
