@@ -3426,16 +3426,16 @@ def compile_mixed_moe_gemm2(
                                     mi_val = arith.constant(mi_idx * 16, index=True)
                                     curr_row_a_lds = row_a_lds + mi_val
 
-                                    if (
-                                        const_expr((a0_prefetch is not None)
+                                    if const_expr(
+                                        (a0_prefetch is not None)
                                         and (k_idx == 0)
-                                        and (mi_idx == 0))
+                                        and (mi_idx == 0)
                                     ):
                                         a0, a1 = a0_prefetch
-                                    elif (
-                                        const_expr((a1_prefetch is not None)
+                                    elif const_expr(
+                                        (a1_prefetch is not None)
                                         and (k_idx == 1)
-                                        and (mi_idx == 0))
+                                        and (mi_idx == 0)
                                     ):
                                         a0, a1 = a1_prefetch
                                     else:
