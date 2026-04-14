@@ -9,7 +9,7 @@ import triton.language as tl
 import numpy as np
 import argparse
 from itertools import product
-from unified_attention_2d import (
+from unified_attention_2d_merged import (
     unified_attention as gluon_unified_attention_2d,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
@@ -36,7 +36,7 @@ parser.add_argument('--num_warps', type=int, default=4, help='')
 parser.add_argument('--block_m', type=int, default=128, help='')
 parser.add_argument('--remove_indirect_access', type=int, default=1, help='')
 parser.add_argument('--num_buffers', type=int, default=2, help='')
-
+parser.add_argument('--loop_variant', type=int, default=1, help='')
 args = parser.parse_args()
 print(args)
 
@@ -113,6 +113,7 @@ func = lambda:  gluon_unified_attention_2d(
         block_m=args.block_m,
         remove_indirect_access=args.remove_indirect_access,
         num_buffers=args.num_buffers,
+        loop_variant=args.loop_variant,
     )
 
 

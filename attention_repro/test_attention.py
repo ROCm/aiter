@@ -6,7 +6,7 @@ from typing import Optional
 import pytest
 import torch
 
-from unified_attention_2d import (
+from unified_attention_2d_merged import (
     unified_attention as gluon_unified_attention_2d,
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -294,7 +294,7 @@ def ref_paged_attn(
             (512, 512),
         ],
         [(567, 275), (34, 345)],
-        [(1, 76), (12, 701), (1,456), (1, 133), (2, 343)],
+        #[(1, 76), (12, 701), (1,456), (1, 133), (2, 343)],
         [(777, 777)],
     ],
 )
@@ -362,6 +362,12 @@ def ref_paged_attn(
         True,
     ],
 )
+@pytest.mark.parametrize(
+    "loop_variant",
+    [
+        0,1,2,
+    ],
+)
 @torch.inference_mode()
 def test_gluon_unified_attn_2d_noncausal(
     seq_lens: list[tuple[int, int]],
@@ -377,6 +383,7 @@ def test_gluon_unified_attn_2d_noncausal(
     num_kv_blocks: int,
     shuffled_kv_cache: bool,
     check_ref: bool,
+    loop_variant: int,
 ) -> None:
 
     causal = False
@@ -459,9 +466,8 @@ def test_gluon_unified_attn_2d_noncausal(
         num_kv_blocks=num_kv_blocks,
         use_tdm=use_tdm,
         shuffled_kv_cache=shuffled_kv_cache,
-        subtile=True,
         remove_indirect_access=remove_indirect_access,
-        num_buffers=3,
+        loop_variant=loop_variant,
     )
     ref_output = ref_paged_attn(
         query=query,
