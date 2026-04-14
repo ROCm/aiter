@@ -285,8 +285,10 @@ def mla_decode_fwd(
         extra_kargs = {"waves_per_eu": 4}
 
         has_final_lse = final_lse is not None
-        final_lse_buf = final_lse if has_final_lse else torch.empty(
-            (1,), dtype=dtypes.fp32, device=device
+        final_lse_buf = (
+            final_lse
+            if has_final_lse
+            else torch.empty((1,), dtype=dtypes.fp32, device=device)
         )
 
         _fwd_kernel_stage2_asm[grid](
