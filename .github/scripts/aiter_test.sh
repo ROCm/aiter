@@ -4,6 +4,7 @@ set -euo pipefail
 MULTIGPU=${MULTIGPU:-FALSE}
 SHARD_TOTAL=${SHARD_TOTAL:-5}
 SHARD_IDX=${SHARD_IDX:-0}
+export CLANG_TOOLCHAIN_PROGRAM_TIMEOUT="${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT:-300}"
 
 files=()
 failedFiles=()
@@ -48,6 +49,7 @@ else
 fi
 
 echo "Running ${sharded_files[@]} in shard $SHARD_IDX of $SHARD_TOTAL."
+echo "Using CLANG_TOOLCHAIN_PROGRAM_TIMEOUT=${CLANG_TOOLCHAIN_PROGRAM_TIMEOUT}" | tee -a latest_test.log
 
 for file in "${sharded_files[@]}"; do
     # Print a clear separator and test file name for readability

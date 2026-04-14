@@ -53,8 +53,8 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
     const int32_t cluster_size = [&]() {
         const int32_t avg_packed_qo_len = sum_packed_qo_len / num_batches;
         const int32_t cluster_size =
-            ck_tile::integer_divide_ceil(avg_packed_qo_len, Traits::kPackedQoLenPerWg);
-        return ck_tile::min(cluster_size, Traits::kMaxClusterSize);
+            integer_divide_ceil(avg_packed_qo_len, Traits::kPackedQoLenPerWg);
+        return std::min(cluster_size, Traits::kMaxClusterSize);
     }();
     TORCH_CHECK(
         (dev_prop.multiProcessorCount % cluster_size) == 0, __func__, ": Invalid cluster_size!");
@@ -71,8 +71,8 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
     for(const auto& binfo : batch_infos)
     {
         const int32_t packed_qo_len = binfo.qo_len * num_heads;
-        const int32_t num_qo_tiles  = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
-        const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
+        const int32_t num_qo_tiles  = integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t packed_qo_tile_len = std::min(packed_qo_len, cluster_len_q);
 
         num_qo_clusters_indptr.push_back(num_qo_clusters_indptr.back() + num_qo_tiles);
 
@@ -86,8 +86,8 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
                                                                   num_heads,
                                                                   is_causal);
             // always assume that each batch of tile will be splited once along kv.
-            const int32_t kv_len_splited = ck_tile::integer_least_multiple(
-                ck_tile::integer_divide_ceil(kv_len_valid, 2), kv_granularity);
+            const int32_t kv_len_splited = integer_least_multiple(
+                integer_divide_ceil(kv_len_valid, 2), kv_granularity);
             workload_sum += 2 * cal_cost(packed_qo_tile_len, kv_len_splited) + kv_granularity;
         }
     }
@@ -125,7 +125,7 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
         const int32_t qo_len         = binfo.qo_len;
         const int32_t kv_len         = binfo.kv_len;
         const int32_t packed_qo_len  = qo_len * num_heads;
-        const int32_t num_qo_tiles   = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t num_qo_tiles   = integer_divide_ceil(packed_qo_len, cluster_len_q);
         const int32_t qo_batch_start = p_seqlens_qo_indptr[bid];
         const int32_t kv_batch_start = p_seqlens_kv_indptr[bid];
         const int32_t kv_batch_end   = p_seqlens_kv_indptr[bid + 1];
@@ -145,15 +145,15 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
             const int32_t remaining_capability_top =
                 cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q);
             const int32_t num_splits_estimated =
-                ck_tile::integer_divide_ceil(remaining_kv_len, remaining_capability_top);
+                integer_divide_ceil(remaining_kv_len, remaining_capability_top);
             // For the case of #splits==2, make sure that the tailing tile is smaller than
             // Traits::kSplitTolerance.
             const bool split_kv =
                 (num_splits_estimated == 2)
                     ? ((remaining_kv_len - remaining_capability_top) > Traits::kSplitTolerance)
                     : (num_splits_estimated > 1);
-            const int32_t kv_len_limit_floor = ck_tile::integer_least_multiple(
-                ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
+            const int32_t kv_len_limit_floor = integer_least_multiple(
+                integer_divide_ceil(kv_len, num_clusters), kv_granularity);
 
             do
             {
@@ -164,7 +164,7 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
                     cal_kv_len(workload_limit_global - accum_cost, cluster_len_q);
                 const int32_t kv_len_limit_local = [&]() {
                     const int32_t limit_ori =
-                        ck_tile::max(remaining_capability, kv_len_limit_floor);
+                        std::max(remaining_capability, kv_len_limit_floor);
                     const int32_t tail_size = (remaining_kv_len > limit_ori)
                                                   ? (remaining_kv_len - limit_ori)
                                                   : 0x7fffffff;
@@ -172,7 +172,7 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
                         (tail_size <= Traits::kSplitTolerance) ? remaining_kv_len : limit_ori;
                     return limit_fin;
                 }();
-                const int32_t kv_len_consuming = ck_tile::min(remaining_kv_len, kv_len_limit_local);
+                const int32_t kv_len_consuming = std::min(remaining_kv_len, kv_len_limit_local);
                 const int32_t cost             = cal_cost(cluster_len_q, kv_len_consuming);
 #if PRINT_DBG
                 printf("[metadata] cost heap updated: cid=%d, pre_cost=%d, new_cost=%d, "
@@ -191,7 +191,7 @@ get_mla_metadata_v1_1_host(const torch::Tensor& seqlens_qo_indptr, // [batch siz
                 work_info.batch_idx = bid;
                 work_info.qo_start  = tid * cluster_len_q + qo_batch_start;
                 work_info.qo_end =
-                    ck_tile::min(work_info.qo_start + cluster_len_q, qo_batch_start + qo_len);
+                    std::min(work_info.qo_start + cluster_len_q, qo_batch_start + qo_len);
                 work_info.kv_start  = kv_start_local + kv_batch_start;
                 work_info.kv_end    = work_info.kv_start + kv_len_consuming;
                 work_info.kv_offset = kv_batch_end - work_info.kv_end;

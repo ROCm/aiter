@@ -24,6 +24,18 @@ on:
         description: 'Docker image for Python 3.12 build'
         required: true
         default: 'rocm/vllm-dev:nightly'
+      docker_password_secret:
+        description: 'Docker password secret for docker login'
+        required: true
+        default: 'DOCKER_PASSWORD'
+        type: choice
+        options:
+          - DOCKER_PASSWORD
+          - DOCKER_PASSWORD_ROCM
+      docker_username:
+        description: 'Docker username for docker login'
+        required: true
+        default: 'rocmshared'
       gpu_archs:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
@@ -31,18 +43,16 @@ on:
       runner:
         description: 'Select build host'
         required: true
-        default: 'aiter-k8s-build'
+        default: 'aiter-1gpu-runner'
         type: choice
         options:
-          - aiter-k8s-build
-          - aiter-mi300-1gpu
-          - aiter-mi325-1gpu
-          - linux-aiter-mi355-1
           - aiter-1gpu-runner
+          - build-only-aiter
+          - linux-aiter-mi35x-1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build_whl_package:
@@ -89,6 +99,12 @@ jobs:
           git submodule sync
           git submodule update --init --recursive --depth 1 --jobs 4
 
+      - name: Docker login
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -ex
+          echo "${{ secrets[github.event.inputs.docker_password_secret] }}" | docker login -u "${{ github.event.inputs.docker_username }}" --password-stdin
+
       - name: Run the container
         if: ${{ matrix.build_enabled }}
         run: |
@@ -111,7 +127,16 @@ jobs:
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 -r requirements.txt
-      
+
+      - name: Pin setuptools_scm
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -e
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          pip install --timeout=60 --retries=10 "setuptools_scm<10"
+
       - name: Install ninja
         if: ${{ matrix.build_enabled }}
         run: |

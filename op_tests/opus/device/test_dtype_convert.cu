@@ -28,8 +28,8 @@
 
 #include "opus/opus.hpp"
 #ifndef __HIP_DEVICE_COMPILE__
-// #include <hip/hip_runtime.h>   // replaced by hip_host_minimal.h for faster builds
-#include "hip_host_minimal.h"
+// #include <hip/hip_runtime.h>   // replaced by hip_minimal.h for faster builds
+#include "opus/hip_minimal.hpp"
 #endif
 
 // ═══════════════════════════════════════════════════════════════════════════

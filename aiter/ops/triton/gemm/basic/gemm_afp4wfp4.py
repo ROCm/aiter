@@ -452,8 +452,6 @@ def gemm_afp4wfp4_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K_cfg, True)
 
-    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
-
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K_elems, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -474,6 +472,8 @@ def gemm_afp4wfp4_preshuffle(
     else:
         config["SPLITK_BLOCK_SIZE"] = K_elems
         y_pp = None
+
+    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)

@@ -3,15 +3,24 @@ from pathlib import Path
 import torch
 import tempfile
 
+import pytest
+
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.tools.compile import compile_kernel, CompileArgs
 
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
     with_custom_metadata_path,
 )
+
+TARGET_ARCH: str = "gfx942"
+SKIP_TEST: bool = get_arch() != TARGET_ARCH
+SKIP_REASON: str = f"{os.path.basename(__file__)} only runs on {TARGET_ARCH}."
+
+pytestmark = pytest.mark.skipif(SKIP_TEST, reason=SKIP_REASON)
 
 triton_path = triton.__path__[0]
 kernel_path = os.path.join(Path(__file__).parent, "kernel.py")
@@ -5785,7 +5794,7 @@ def test_f32_kernel():
         compile_args = CompileArgs(
             path=kernel_path,
             kernel_name="empty_kernel",
-            signature=f"*fp32:16,1",
+            signature="*fp32:16,1",
             grid="1,1,1",
             num_warps=4,
             num_stages=2,
@@ -5867,6 +5876,9 @@ def test_separate_compile_and_run():
 
 
 if __name__ == "__main__":
-    test_f32_kernel()
-    test_jit()
-    test_separate_compile_and_run()
+    if SKIP_TEST:
+        print(SKIP_REASON)
+    else:
+        test_f32_kernel()
+        test_jit()
+        test_separate_compile_and_run()

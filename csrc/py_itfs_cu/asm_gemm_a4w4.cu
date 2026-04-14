@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_hip_common.h"
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
 #include "asm_f4gemm_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -152,19 +153,24 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
 
 // A4W4 asm gemm kernel
 // D=A*B*alpha+beta*C
-extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
-    AiterTensor* A,       // A:[M, K/2] f4x2
-    AiterTensor* B,       // B:[N, K/2] f4x2
-    AiterTensor* A_scale, // A_scale:[M, K/32] e8m0 paded
-    AiterTensor* B_scale, // B_scale:[N, K/32] e8m0 paded
-    AiterTensor* out,     // Out:[M, N] bf16
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    gemm_a4w4_asm,
+    (
+    aiter_tensor_t* A,       // A:[M, K/2] f4x2
+    aiter_tensor_t* B,       // B:[N, K/2] f4x2
+    aiter_tensor_t* A_scale, // A_scale:[M, K/32] e8m0 padded
+    aiter_tensor_t* B_scale, // B_scale:[N, K/32] e8m0 padded
+    aiter_tensor_t* out,     // Out:[M, N] bf16
     const char*  kernelName,
-    AiterTensor* bias,    // bias:[M, N] f32, can be nullptr
+    aiter_tensor_t* bias,    // bias:[M, N] f32, can be nullptr
     float        alpha,
     float        beta,
     int          bpreshuffle,
     int          log2_k_split,
-    hipStream_t  stream)
+    hipStream_t  stream),
+    (A, B, A_scale, B_scale, out, kernelName, bias, alpha, beta, bpreshuffle, log2_k_split, stream))
 {
     AITER_CHECK(
         out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
