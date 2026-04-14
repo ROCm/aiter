@@ -1371,21 +1371,31 @@ def _gemm_a16w16_lds_pipeline_kernel(
     if USE_ACTIVATION:
         accumulator = activation(accumulator)
 
-    offs_cm = pid_m * BLOCK_M + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+    # TDM Store: accumulator → shared memory → global memory
+    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
     )
-    offs_cn = pid_n * BLOCK_N + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+    c_buffer = gl.allocate_shared_memory(
+        c_ptr.type.element_ty,
+        shape=[BLOCK_M, BLOCK_N],
+        layout=SHARED_LAYOUT_C,
     )
+    c_buffer.store(accumulator.to(c_ptr.type.element_ty))
 
-    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    # Ensure all wavefronts have finished writing to LDS before TDM reads it.
+    gl.barrier()
 
-    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    # Store
-    gl.amd.gfx1250.buffer_store(
-        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
+    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=c_ptr,
+        shape=(M, N),
+        strides=(stride_cm, stride_cn),
+        block_shape=(BLOCK_M, BLOCK_N),
+        layout=SHARED_LAYOUT_C,
     )
+    gl.amd.gfx1250.tdm.async_store(
+        c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_buffer
+    )
+    gl.amd.gfx1250.tdm.async_wait(0)
 
 
 _KERNEL_MAP = {
