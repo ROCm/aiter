@@ -1930,6 +1930,9 @@ def test_batch_prefill_large_kvcache(
         kv_last_page_lens=kv_last_page_lens,
         **extra_kwargs,
     )
+    # Synchronize immediately to catch async GPU faults from CK kernel
+    # before they cascade to subsequent tests and trigger GPU reset.
+    torch.cuda.synchronize()
     out = result[0] if isinstance(result, (list, tuple)) else result
 
     # Compare kernel output vs SDPA reference
