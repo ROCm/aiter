@@ -1,0 +1,113 @@
+name: Performance Parity
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"  # Weekly on Monday 6 AM UTC
+  push:
+    branches: [main]
+    paths:
+      - "aiter/**"
+      - "op_tests/perf_tests/**"
+      - ".github/workflows/perf-parity.yaml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  perf-parity:
+    runs-on: aiter-mi355-1gpu
+    needs: [check-signal]
+    env:
+      DOCKER_IMAGE: "rocm/pytorch:latest"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: "recursive"
+
+      - name: Clean up Rocm processes
+        run: ./.github/scripts/clean_up_rocm.sh
+
+      - name: Run the container
+        run: |
+          set -ex
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name perf_parity \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root perf_parity bash -c "pip config set global.default-timeout 60"
+          docker exec -u root perf_parity bash -c "pip config set global.retries 10"
+
+      - name: Setup Aiter
+        run: |
+          set -ex
+          docker exec -w /workspace perf_parity \
+            bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
+      - name: Install pytest
+        run: |
+          docker exec -w /workspace perf_parity pip install pytest
+
+      - name: Run perf parity tests
+        run: |
+          set -ex
+          docker exec -w /workspace \
+            -e AITER_PERF_MIN_SPEEDUP=0.95 \
+            -e AITER_PERF_REPORT_PATH=perf_parity_report.json \
+            perf_parity \
+            pytest -v op_tests/perf_tests/test_perf_parity.py \
+              --junitxml=test-reports/perf-parity.xml \
+              --tb=short
+
+      - name: Print report
+        if: always()
+        run: |
+          docker exec -w /workspace perf_parity \
+            cat perf_parity_report.json || true
+
+      - name: Upload perf report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-parity-report
+          path: |
+            perf_parity_report.json
+            test-reports/perf-parity.xml
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f perf_parity || true
+
+      - name: Clean up Rocm processes
+        if: always()
+        run: ./.github/scripts/clean_up_rocm.sh
