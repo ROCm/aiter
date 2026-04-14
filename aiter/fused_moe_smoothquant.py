@@ -37,11 +37,10 @@ def fused_moe_gelu_sqi8(
     w1_is_shuffled = getattr(w1, "is_shuffled", False)
     w2_is_shuffled = getattr(w2, "is_shuffled", False)
 
-    assert w1_is_shuffled == False
-    assert w2_is_shuffled == False
+    assert not w1_is_shuffled
+    assert not w2_is_shuffled
 
     block_size_M = 256
-    block_size_N = 256
 
     expert_mask = None
     num_local_tokens = None
@@ -145,7 +144,7 @@ def fused_moe_gelu_sqi8(
             "OC": output.shape[-1],
             "IC": input.shape[-1],
             "gate_up": is_gate_up,
-            "bpreshuffle": False,
+            "bpreshuffle": bpreshuffle,
             "TOPK": topk,
         }
         get_kernel(

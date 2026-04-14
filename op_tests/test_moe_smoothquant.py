@@ -1,5 +1,4 @@
 import torch
-import aiter
 from aiter import ActivationType
 from aiter.fused_moe_smoothquant import fused_moe_gelu_sqi8
 from aiter.fused_moe_bf16_asm import torch_moe

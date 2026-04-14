@@ -3,7 +3,6 @@ from ctypes.util import find_library
 import functools
 import torch
 import os
-import subprocess
 
 
 @functools.cache
