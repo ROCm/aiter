@@ -290,7 +290,7 @@ if PREBUILD_KERNELS != 0:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
-        # --- FlyDSL MoE AOT pre-compilation ---
+        # --- FlyDSL AOT pre-compilation ---
         try:
             flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
             os.makedirs(flydsl_cache_dir, exist_ok=True)
@@ -305,30 +305,60 @@ if PREBUILD_KERNELS != 0:
                     if _pkg not in sys.modules:
                         sys.modules[_pkg] = sys.modules[_name]
 
+            from aiter.aot.flydsl.common import collect_aot_jobs
+
+            def _run_flydsl_aot(label, default_csvs, parse_csv, compile_one_config):
+                jobs = collect_aot_jobs(
+                    default_csvs,
+                    parse_csv,
+                    on_missing_csv=lambda csv_path: print(
+                        f"[aiter] {label}: CSV not found: {csv_path}"
+                    ),
+                )
+                if jobs:
+                    print(
+                        f"[aiter] {label}: {len(jobs)} kernels to compile "
+                        f"(cache: {flydsl_cache_dir})"
+                    )
+                    results = []
+                    for job in jobs:
+                        results.append(compile_one_config(**job))
+                    ok = sum(
+                        1 for result in results if result["compile_time"] is not None
+                    )
+                    fail = len(results) - ok
+                    print(f"[aiter] {label}: compiled {ok} ok, {fail} failed")
+
             from aiter.aot.flydsl.moe import (
-                DEFAULT_CSVS,
-                compile_one_config,
-                parse_csv,
+                DEFAULT_CSVS as MOE_DEFAULT_CSVS,
+                compile_one_config as compile_moe_one_config,
+                parse_csv as parse_moe_csv,
             )
 
-            moe_jobs = []
-            for csv_path in DEFAULT_CSVS:
-                if os.path.isfile(csv_path):
-                    moe_jobs.extend(parse_csv(csv_path))
-                else:
-                    print(f"[aiter] FlyDSL MoE AOT: CSV not found: {csv_path}")
-            if moe_jobs:
-                print(
-                    f"[aiter] FlyDSL MoE AOT: {len(moe_jobs)} kernels to compile "
-                    f"(cache: {flydsl_cache_dir})"
-                )
-                for job in moe_jobs:
-                    compile_one_config(**job)
+            _run_flydsl_aot(
+                "FlyDSL MoE AOT",
+                MOE_DEFAULT_CSVS,
+                parse_moe_csv,
+                compile_moe_one_config,
+            )
+
+            from aiter.aot.flydsl.gemm import (
+                DEFAULT_CSVS as GEMM_DEFAULT_CSVS,
+                compile_one_config as compile_gemm_one_config,
+                parse_csv as parse_gemm_csv,
+            )
+
+            _run_flydsl_aot(
+                "FlyDSL GEMM AOT",
+                GEMM_DEFAULT_CSVS,
+                parse_gemm_csv,
+                compile_gemm_one_config,
+            )
         except Exception as e:
             import traceback
 
             traceback.print_exc()
-            print(f"[aiter] FlyDSL MoE AOT skipped: {e}")
+            print(f"[aiter] FlyDSL AOT skipped: {e}")
 
 
 class NinjaBuildExtension(build_ext):

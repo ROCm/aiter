@@ -26,6 +26,7 @@ import os
 import sys
 import time
 
+from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
@@ -54,7 +55,8 @@ def parse_csv(csv_path: str):
         kernel_name, stage, model_dim, inter_dim, experts, topk,
         doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
 
-    Deduplicates by (kernel_name, model_dim, inter_dim, experts, topk).
+    Deduplicates by
+    (kernel_name, model_dim, inter_dim, experts, topk, doweight_stage1).
     """
     jobs = []
     seen = set()
@@ -73,7 +75,15 @@ def parse_csv(csv_path: str):
                 if not name or not name.startswith("flydsl_"):
                     continue
 
-                key = (name, model_dim, inter_dim, experts, topk)
+                job = {
+                    "kernel_name": name,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "experts": experts,
+                    "topk": topk,
+                    "doweight_stage1": doweight_stage1,
+                }
+                key = job_identity(job)
                 if key in seen:
                     continue
                 seen.add(key)
@@ -83,17 +93,7 @@ def parse_csv(csv_path: str):
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
 
-                jobs.append(
-                    {
-                        "kernel_name": name,
-                        "model_dim": model_dim,
-                        "inter_dim": inter_dim,
-                        "experts": experts,
-                        "topk": topk,
-                        "doweight_stage1": doweight_stage1,
-                        **params,
-                    }
-                )
+                jobs.append({**job, **params})
 
     return jobs
 
@@ -142,9 +142,7 @@ def _precompile_to_cache(
     num_valid_ids = torch.zeros(1, device=dev, dtype=torch.int32)
     sw = torch.zeros(tokens * topk, device=dev, dtype=torch.float32)
 
-    prev = os.environ.get("COMPILE_ONLY")
-    os.environ["COMPILE_ONLY"] = "1"
-    try:
+    with compile_only_env():
         if stage == 1:
             _is_splitk = k_batch > 1
             n_in = inter_dim * 2 if is_fp4 else inter_dim
@@ -296,11 +294,6 @@ def _precompile_to_cache(
                 sort_block_m=sort_block_m,
             )
             _run_compiled(exe, args)
-    finally:
-        if prev is None:
-            os.environ.pop("COMPILE_ONLY", None)
-        else:
-            os.environ["COMPILE_ONLY"] = prev
 
 
 def compile_one_config(
@@ -358,12 +351,12 @@ def main():
             print(f"Error: CSV file not found: {csv_path}")
             sys.exit(1)
 
-    cache_dir = os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
+    cache_dir = os.path.expanduser(
+        os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
+    )
     arch = os.environ.get("ARCH", "(auto-detect)")
 
-    all_jobs = []
-    for csv_path in csv_paths:
-        all_jobs.extend(parse_csv(csv_path))
+    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
