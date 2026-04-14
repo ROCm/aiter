@@ -1716,6 +1716,7 @@ def reference_attention_kv_blockscale(
 # overflows when the within-tile page spread exceeds 2GB. K loads work (flat 64-bit).
 # Will pass once V also uses flat addressing or 64-bit offset support.
 @pytest.mark.parametrize("scatter_pages", [False, True])
+@pytest.mark.parametrize("kv_layout", ["linear", "vectorized"])
 def test_batch_prefill_large_kvcache(
     kv_cache_size_gb,
     page_size,
@@ -1725,6 +1726,7 @@ def test_batch_prefill_large_kvcache(
     causal,
     input_dtype,
     scatter_pages,
+    kv_layout,
 ):
     """
     Test that batch prefill produces correct results with large KV caches
@@ -1737,14 +1739,19 @@ def test_batch_prefill_large_kvcache(
     Args:
         scatter_pages: If True, interleave page indices so adjacent logical
             tokens map to physically distant pages (stress-tests rebase).
+        kv_layout: "linear" or "vectorized" KV cache memory layout.
     """
-    # TODO: add VECTORIZED KV layout test (different memory layout path)
     # TODO: add multi-batch test (batch_size > 1 with per-batch page ranges)
+    # page_size=1 only supports linear layout (3D tensor)
+    if page_size == 1 and kv_layout == "vectorized":
+        pytest.skip("page_size=1 does not support vectorized layout")
+
     torch.manual_seed(42)
     torch.cuda.empty_cache()
 
     is_fp8 = input_dtype == "fp8"
     dtype = torch.bfloat16
+    k_vector_size = 16 // (1 if is_fp8 else 2)  # fp8=16, bf16=8
 
     # Compute num_blocks from target KV cache size
     elem_size = 1 if is_fp8 else 2  # fp8=1 byte, bf16=2 bytes
@@ -1902,6 +1909,19 @@ def test_batch_prefill_large_kvcache(
         k_cache_kernel = k_cache_bf16
         v_cache_kernel = v_cache_bf16
         q_kernel = q_bf16
+
+    # Apply vectorized layout transformation if needed
+    if kv_layout == "vectorized" and page_size > 1:
+        kv_vector_size = 16 // k_cache_kernel.element_size()
+        k_cache_kernel, v_cache_kernel = apply_kv_layout(
+            k_cache_kernel,
+            v_cache_kernel,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            kv_vector_size,
+            "vectorized",
+        )
 
     cu_seqlens_q = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
     kv_indptr = torch.tensor([0, num_blocks], device="cuda", dtype=torch.int32)
