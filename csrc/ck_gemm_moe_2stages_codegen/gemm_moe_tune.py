@@ -409,9 +409,8 @@ class FmoeTuner(TunerCommon):
         act_type,
     ):
         act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
-        fuse_fp4 = kparams.get("fuse_fp4_quant", False)
-        fuse_fp8 = kparams.get("fuse_fp8_quant", False)
         a_scale_one = kparams.get("a_scale_one", False)
+        _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         result = flydsl_moe_stage1(
@@ -426,7 +425,7 @@ class FmoeTuner(TunerCommon):
             tile_k=kparams["tile_k"],
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
-            out_dtype=kparams["out_dtype"],
+            out_dtype=_out_dtype,
             act=act,
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
@@ -435,18 +434,14 @@ class FmoeTuner(TunerCommon):
             k_batch=kparams.get("k_batch", 1),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
-            gate_only=kparams.get("gate_only", False),
-            gate_up_interleave=kparams.get("gate_up_interleave", False),
-            fuse_fp4_quant=fuse_fp4,
-            fuse_fp8_quant=fuse_fp8,
-            fuse_sort_scale=fuse_fp4 or fuse_fp8,
+            gate_mode=kparams.get("gate_mode", "separated"),
             a_scale_one=a_scale_one,
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
         )
         if isinstance(result, tuple):
             out_raw = result[0]
-            if fuse_fp4:
+            if _out_dtype == "fp4":
                 total_fp4_bytes = token_num * topk * (inter_dim // 2)
                 fp4_flat = out_raw.view(-1).view(torch.uint8)[:total_fp4_bytes]
                 return fp4_flat.view(dtypes.fp4x2).reshape(token_num, topk, -1)
@@ -2317,19 +2312,16 @@ class FmoeTuner(TunerCommon):
                 is_splitk = kparams.get("k_batch", 1) > 1
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
-                # _fp4 (fuse_fp4_quant) and _fp8 (fuse_fp8_quant) are mutually exclusive:
-                #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations → use _fp8 only
-                #   a4w4 (a_dtype_str="fp4"): stage2 expects fp4 activations → use _fp4 only
+                # out_dtype encodes fused quant type: "fp4" or "fp8"
+                #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations → out_dtype="fp8"
+                #   a4w4 (a_dtype_str="fp4"): stage2 expects fp4 activations → out_dtype="fp4"
                 if a_dtype_str == "fp8":
-                    # a8w4: fuse fp8 quant so output fp8 matches fp8-input stage2
                     fp8_params = {
                         **kparams,
-                        "fuse_fp8_quant": True,
+                        "out_dtype": "fp8",
                         "a_scale_one": True,
-                        "gate_up_interleave": True,
+                        "gate_mode": "interleave",
                     }
-                    fp8_params.pop("gate_only", None)
-                    # Non-fused a8w4 also needs a_scale_one=True (fp8 activation has no real scale)
                     nonfused_params = {**kparams, "a_scale_one": True}
                     if is_splitk:
                         s1_variants = [(kname + "_fp8", fp8_params, False, True)]
@@ -2339,8 +2331,7 @@ class FmoeTuner(TunerCommon):
                             (kname + "_fp8", fp8_params, False, True),
                         ]
                 else:
-                    # a4w4 (or fp16): fuse fp4 quant so output fp4x2 matches fp4-input stage2
-                    fp4_params = {**kparams, "fuse_fp4_quant": True}
+                    fp4_params = {**kparams, "out_dtype": "fp4"}
                     if is_splitk:
                         s1_variants = [(kname + "_fp4", fp4_params, True, False)]
                     else:

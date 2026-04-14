@@ -26,14 +26,11 @@ def flydsl_kernel_name(
     tile_k: int,
     mode: str = "",
     sort_block_m: int = 0,
-    fuse_fp4_quant: bool = False,
 ) -> str:
-    """Construct kernel name: ``flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}][_fp4][_sbm{S}]``."""
+    """Construct kernel name: ``flydsl_moe{stage}_a{a}_w{b}_{out}_t{M}x{N}x{K}[_{mode}][_sbm{S}]``."""
     name = f"flydsl_moe{stage}_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tile_m}x{tile_n}x{tile_k}"
     if mode:
         name += f"_{mode}"
-    if fuse_fp4_quant:
-        name += "_fp4"
     if sort_block_m > 0 and sort_block_m != tile_m:
         name += f"_sbm{sort_block_m}"
     return name
@@ -51,9 +48,9 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
         if params is not None:
             extra: Dict = {}
             if m.group("fp4"):
-                extra["fuse_fp4_quant"] = True
+                extra["out_dtype"] = "fp4"
             if m.group("fp8"):
-                extra["fuse_fp8_quant"] = True
+                extra["out_dtype"] = "fp8"
                 extra["a_scale_one"] = True
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
@@ -72,8 +69,8 @@ def get_flydsl_stage1_kernels(
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [256]
     tile_ms = [32, 64, 128]
-    # waves_per_eus = [1, 2, 3, 4]
-    waves_per_eus = [1, 2]
+
+    waves_per_eus = [1, 2, 3]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
     xcd_swizzles = [0, 4]
@@ -120,8 +117,13 @@ def get_flydsl_stage1_kernels(
                                         "waves_per_eu": wpe,
                                         "k_batch": kb,
                                         "b_nt": bnt,
-                                        "gate_only": go,
-                                        "gate_up_interleave": a_dtype == "fp8",
+                                        "gate_mode": "mock_gate_only"
+                                        if go
+                                        else (
+                                            "interleave"
+                                            if a_dtype == "fp8"
+                                            else "separated"
+                                        ),
                                         "xcd_swizzle": xcd,
                                     }
     return kernels
@@ -202,15 +204,11 @@ def compile_flydsl_moe_stage1(
     out_dtype: str,
     act: str = "silu",
     persist_m: int = 1,
-    fuse_fp4_quant: bool = False,
-    fuse_fp8_quant: bool = False,
-    fuse_sort_scale: bool = False,
     use_async_copy: bool = False,
     k_batch: int = 1,
     waves_per_eu: int = 3,
     b_nt: int = 2,
-    gate_only: bool = False,
-    gate_up_interleave: bool = False,
+    gate_mode: str = "separated",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
@@ -219,7 +217,7 @@ def compile_flydsl_moe_stage1(
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
+        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1, GateMode
 
         return compile_mixed_moe_gemm1(
             model_dim=model_dim,
@@ -235,15 +233,11 @@ def compile_flydsl_moe_stage1(
             out_dtype=out_dtype,
             act=act,
             persist_m=persist_m,
-            fuse_fp4_quant=fuse_fp4_quant,
-            fuse_fp8_quant=fuse_fp8_quant,
-            fuse_sort_scale=fuse_sort_scale,
             use_async_copy=use_async_copy,
             k_batch=k_batch,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
-            gate_only=gate_only,
-            gate_up_interleave=gate_up_interleave,
+            gate_mode=GateMode(gate_mode),
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
@@ -550,15 +544,11 @@ def flydsl_moe_stage1(
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
     persist_m: int = 0,
-    fuse_fp4_quant: bool = False,
-    fuse_fp8_quant: bool = False,
-    fuse_sort_scale: bool = False,
     use_async_copy: bool = False,
     k_batch: int = 1,
     waves_per_eu: int = 3,
     b_nt: int = 0,
-    gate_only: bool = False,
-    gate_up_interleave: bool = False,
+    gate_mode: str = "separated",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     bias: Optional[torch.Tensor] = None,
@@ -573,19 +563,17 @@ def flydsl_moe_stage1(
     For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
     `shuffle_weight_a16w4(w1, 16, True)` and `shuffle_scale_a16w4(w1_scale, E, True)`.
 
-    When fuse_sort_scale=True, the kernel writes e8m0 scales in sorted tiled
-    layout directly, avoiding a separate moe_mxfp4_sort call.
+    When fuse_quant=True, the kernel fuses quantization (fp4/fp8, inferred from
+    out_dtype) and writes e8m0 scales in sorted tiled layout directly.
 
     When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
     add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
 
-    When gate_only=True (requires k_batch>1), each workgroup computes only
-    one B-tile stream (no gate/up interleaving).  The grid X doubles so
-    that by_n naturally covers both gate and up regions.
+    gate_mode controls the gate/up computation strategy (see GateMode enum).
 
     Returns:
         Basic:                      out
-        fuse_sort_scale:            (out, out_scale_sorted)
+        fuse_quant:                 (out, out_scale_sorted)
     """
     token_num = a.shape[0]
     E = w1.shape[0]
@@ -595,37 +583,33 @@ def flydsl_moe_stage1(
     if a_dtype == "fp4":
         model_dim = model_dim * 2
 
-    _fuse_any_quant = fuse_fp4_quant or fuse_fp8_quant
-    if fuse_fp4_quant:
+    _need_fp4 = out_dtype == "fp4"
+    _need_fp8 = out_dtype == "fp8"
+    _fuse_any_quant = _need_fp4 or _need_fp8
+    _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
+
+    if _need_fp4:
         torch_out_dtype = dtypes.fp4x2
-    elif fuse_fp8_quant:
+    elif _need_fp8:
         torch_out_dtype = dtypes.fp8
     else:
         torch_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
     _is_splitk = k_batch > 1
+    gate_up_interleave = gate_mode == "interleave"
 
     dev = a.device
-    _splitk_fp4 = _is_splitk and fuse_fp4_quant
+    _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
-    _gui_sk_fused = _gui_sk and (fuse_fp4_quant or fuse_fp8_quant)
+    _gui_sk_fused = _gui_sk and _fuse_any_quant
 
     if out is None:
-        if _gui_sk_fused:
-            if fuse_fp4_quant:
-                out = torch.empty(
-                    (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
-                )
-            else:
-                out = torch.empty(
-                    (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
-                )
-        elif fuse_fp4_quant:
+        if _need_fp4 or (_gui_sk_fused and _need_fp4):
             out = torch.empty(
-                (token_num, topk, inter_dim // 2), dtype=torch_out_dtype, device=dev
+                (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
-        elif fuse_fp8_quant:
+        elif _need_fp8 or (_gui_sk_fused and _need_fp8):
             out = torch.empty(
-                (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
+                (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
             )
         else:
             out = torch.empty(
@@ -633,7 +617,7 @@ def flydsl_moe_stage1(
             )
 
     if _is_splitk:
-        torch_tmp_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
+        torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
             (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
@@ -652,8 +636,8 @@ def flydsl_moe_stage1(
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
 
-    _need_quant = fuse_fp4_quant or fuse_fp8_quant or _splitk_fp4 or _gui_sk_fused
-    _need_sort = _need_quant and (fuse_sort_scale or _splitk_fp4 or _gui_sk_fused)
+    _need_quant = _fuse_any_quant or _splitk_fp4 or _gui_sk_fused
+    _need_sort = _need_quant
 
     _sort_block_m = tile_m
     _all_blks = sorted_expert_ids.shape[0]
@@ -680,9 +664,7 @@ def flydsl_moe_stage1(
 
     # split-K GEMM kernel does not fuse quant; the fused silu_and_mul_fq kernel
     # handles activation + quant + scale-sort after the GEMM completes.
-    _gemm_fp4 = fuse_fp4_quant and not _is_splitk
-    _gemm_fp8q = fuse_fp8_quant and not _is_splitk
-    _gemm_fss = fuse_sort_scale and not _is_splitk
+    _gemm_out_dtype = _base_out_dtype if _is_splitk else out_dtype
 
     _kernel_out = tmp_out if _is_splitk else out
     is_fp4 = b_dtype == "fp4"
@@ -736,18 +718,14 @@ def flydsl_moe_stage1(
         doweight_stage1=(sorted_weights is not None),
         a_dtype=a_dtype,
         b_dtype=b_dtype,
-        out_dtype=out_dtype,
+        out_dtype=_gemm_out_dtype,
         act=act,
         persist_m=_persist_m,
-        fuse_fp4_quant=_gemm_fp4,
-        fuse_fp8_quant=_gemm_fp8q,
-        fuse_sort_scale=_gemm_fss,
         use_async_copy=use_async_copy,
         k_batch=k_batch,
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
-        gate_only=gate_only,
-        gate_up_interleave=gate_up_interleave,
+        gate_mode=gate_mode,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         enable_bias=(bias is not None),
@@ -758,7 +736,7 @@ def flydsl_moe_stage1(
 
     num_sorted_rows = sorted_token_ids.shape[0]
     if _gui_sk_fused:
-        _quant_mode = "fp4" if fuse_fp4_quant else "fp8"
+        _quant_mode = "fp4" if _need_fp4 else "fp8"
         _silu_fused_k = _get_compiled_silu_fused(
             inter_dim, topk, _quant_mode, gui_layout=True
         )
@@ -812,7 +790,7 @@ def flydsl_moe_stage1(
 
         silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
 
-    if (fuse_fp4_quant or fuse_fp8_quant) and _need_sort:
+    if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
 
         out_scale_sorted = out_scale_sorted_flat.view(fp8_e8m0).view(

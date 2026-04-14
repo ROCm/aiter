@@ -442,9 +442,9 @@ def fused_moe_1stage(
                 num_rows=num_local_tokens,
             )
         else:
-            assert (
-                a1_scale is not None or quant_type == QuantType.No
-            ), "a1_scale must be provided for quantized input for fused_moe"
+            assert a1_scale is not None or quant_type == QuantType.No, (
+                "a1_scale must be provided for quantized input for fused_moe"
+            )
             a1 = hidden_states
             if quant_type == QuantType.per_1x128:
                 scale_t = torch.empty_like(a1_scale)
@@ -622,8 +622,7 @@ class MOEMetadata:
     run_1stage: bool = False
     has_bias: bool = False
     use_non_temporal_load: bool = True
-    fuse_fp4_quant: bool = False
-    fuse_fp8_quant: bool = False
+    fuse_quant: str = ""
 
 
 def _flydsl_stage1_wrapper(
@@ -640,8 +639,6 @@ def _flydsl_stage1_wrapper(
     w1_scale=None,
     a1_scale=None,
     sorted_weights=None,
-    fuse_fp4_quant=False,
-    fuse_sort_scale=False,
     out_scale=None,
     out_scale_sorted=None,
     bias1=None,
@@ -651,9 +648,6 @@ def _flydsl_stage1_wrapper(
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    _fq = fuse_fp4_quant or parsed.get("fuse_fp4_quant", False)
-    _fuse_fp8 = parsed.get("fuse_fp8_quant", False)
-    _fss = fuse_sort_scale or ((_fq or _fuse_fp8) and not fuse_sort_scale)
     _a_scale_one = parsed.get("a_scale_one", True)
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
@@ -673,15 +667,11 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
-        fuse_fp4_quant=_fq,
-        fuse_fp8_quant=_fuse_fp8,
-        fuse_sort_scale=_fss,
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
-        gate_only=parsed.get("gate_only", False),
-        gate_up_interleave=parsed.get("gate_up_interleave", False),
+        gate_mode=parsed.get("gate_mode", "separated"),
         bias=bias1,
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
@@ -1011,6 +1001,7 @@ def get_2stage_cfgs(
             and dtype in [dtypes.bf16, dtypes.fp16]
         )
         _s1_fp8q = is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1]
+        _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fq else "")
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -1018,8 +1009,7 @@ def get_2stage_cfgs(
             int(ksplit),
             run_1stage,
             has_bias=_has_bias,
-            fuse_fp4_quant=_s1_fq,
-            fuse_fp8_quant=_s1_fp8q,
+            fuse_quant=_fuse_quant,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -1214,7 +1204,7 @@ def fused_moe_2stages(
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
         N = a1.shape[-1]
-        if metadata.fuse_fp8_quant:
+        if metadata.fuse_quant == "fp8":
             a1_scale = torch.empty([1], dtype=dtypes.fp8_e8m0, device=a1.device)
         else:
             a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
@@ -1264,9 +1254,9 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
     else:
-        assert (
-            a1_scale is not None or quant_type == QuantType.No
-        ), "a1_scale must be provided for quantized input for fused_moe"
+        assert a1_scale is not None or quant_type == QuantType.No, (
+            "a1_scale must be provided for quantized input for fused_moe"
+        )
         a1 = hidden_states
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -1299,7 +1289,7 @@ def fused_moe_2stages(
         sorted_ids,
         sorted_expert_ids,
         num_valid_ids,
-        None if (metadata.fuse_fp4_quant or metadata.fuse_fp8_quant) else a2,
+        None if metadata.fuse_quant else a2,
         topk,
         block_m=block_size_M,
         a1_scale=a1_scale,
@@ -1309,7 +1299,7 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
     )
-    if metadata.fuse_fp4_quant and isinstance(a2, tuple):
+    if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
         _fp4_bytes = token_num * topk * (inter_dim // 2)
         a2 = (
@@ -1318,7 +1308,7 @@ def fused_moe_2stages(
             .view(dtypes.fp4x2)
             .reshape(token_num, topk, -1)
         )
-    elif metadata.fuse_fp8_quant and isinstance(a2, tuple):
+    elif metadata.fuse_quant == "fp8" and isinstance(a2, tuple):
         a2, a2_scale = a2[0], a2[1]
         a2 = a2.view(token_num, topk, -1)
     elif (

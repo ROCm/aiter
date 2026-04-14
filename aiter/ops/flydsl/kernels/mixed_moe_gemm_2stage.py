@@ -44,6 +44,25 @@ from .mfma_epilogues import c_shuffle_epilog
 from .layout_utils import crd2idx, idx2crd, get as layout_get
 
 import functools
+from enum import Enum
+
+
+class GateMode(str, Enum):
+    """Gate/Up computation strategy for stage1 GEMM.
+
+    SEPARATED:      Two separate B-tile streams (gate + up), default mode.
+    MOCK_GATE_ONLY: Single B-tile stream over full [0, 2*inter_dim), simulates
+                    gate-only by doubling grid X on top of SEPARATED layout.
+                    Requires split-K (k_batch>1).  NOT true gate-only.
+    GATE_ONLY:      Reserved for future true gate-only implementation.
+    INTERLEAVE:     Weight rows interleave gate/up (gate[0], up[0], gate[1], ...).
+                    pack_N=2 routes even/odd N subtiles.  NOT tied to split-K.
+    """
+
+    SEPARATED = "separated"
+    MOCK_GATE_ONLY = "mock_gate_only"
+    GATE_ONLY = "gate_only"
+    INTERLEAVE = "interleave"
 
 
 @contextmanager
@@ -104,15 +123,11 @@ def compile_mixed_moe_gemm1(
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     persist_m: int = 1,
-    fuse_fp4_quant: bool = False,
-    fuse_fp8_quant: bool = False,
-    fuse_sort_scale: bool = False,
     use_async_copy: bool = False,
     waves_per_eu: int = 4,
     k_batch: int = 1,
     b_nt: int = 0,
-    gate_only: bool = False,
-    gate_up_interleave: bool = False,
+    gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
 ):
@@ -125,19 +140,7 @@ def compile_mixed_moe_gemm1(
     is large, so each CTA is already compute-heavy. persist_m>1 serializes M blocks
     that the GPU can process in parallel.
 
-    When gate_only=True (requires k_batch>1), each workgroup computes
-    only one B-tile stream instead of interleaving gate and up.
-    The grid X dimension doubles (inter_in / tile_n instead of
-    inter_in / 2 / tile_n) so that by_n covers the full [0, 2*inter_dim)
-    range, naturally selecting gate or up rows by position.
-    This halves per-WG B-VMEM traffic and MFMA count, and the
-    doubled block count compensates.
-
-    When gate_up_interleave=True, the weight layout interleaves gate
-    and up rows (gate[0], up[0], gate[1], up[1], ...).  pack_N=2
-    routes even N subtiles to the gate accumulator and odd to up.
-    Grid covers 2*inter_dim // tile_n.  NOT tied to split-K.
-    Activation (silu or swiglu) is computed inline.
+    gate_mode controls the gate/up computation strategy — see GateMode enum.
     """
     gpu_arch = get_hip_arch()
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
@@ -198,9 +201,8 @@ def compile_mixed_moe_gemm1(
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
 
-    # Mutual exclusivity validation
-    if gate_only and gate_up_interleave:
-        raise ValueError("gate_only and gate_up_interleave are mutually exclusive")
+    gate_only = gate_mode is GateMode.MOCK_GATE_ONLY
+    gate_up_interleave = gate_mode is GateMode.INTERLEAVE
 
     # Padding semantics: model_dim and inter_dim INCLUDE padding.
     #   model_dim = model_dim_true + model_dim_pad   (K direction)
@@ -215,15 +217,14 @@ def compile_mixed_moe_gemm1(
         raise ValueError("gate_only requires k_batch > 1 (split-K)")
     if _is_splitk:
         _k_per_batch = model_dim // k_batch
-        assert (
-            model_dim % k_batch == 0
-        ), f"model_dim={model_dim} not divisible by k_batch={k_batch}"
-        assert (
-            _k_per_batch % tile_k == 0
-        ), f"K_per_batch={_k_per_batch} not divisible by tile_k={tile_k}"
+        assert model_dim % k_batch == 0, (
+            f"model_dim={model_dim} not divisible by k_batch={k_batch}"
+        )
+        assert _k_per_batch % tile_k == 0, (
+            f"K_per_batch={_k_per_batch} not divisible by tile_k={tile_k}"
+        )
 
-        fuse_fp4_quant = False
-        fuse_fp8_quant = False
+        out_dtype = "bf16"
     else:
         _k_per_batch = model_dim
     _k_dim = _k_per_batch
@@ -260,12 +261,10 @@ def compile_mixed_moe_gemm1(
     else:
         _use_cshuffle_epilog = bool(use_cshuffle_epilog)
 
-    if fuse_fp4_quant and fuse_fp8_quant:
-        raise ValueError("fuse_fp4_quant and fuse_fp8_quant are mutually exclusive")
-    _need_quant = fuse_fp4_quant or fuse_fp8_quant
-    _need_fp4 = fuse_fp4_quant
-    _need_fp8 = fuse_fp8_quant
-    _need_sort = _need_quant and fuse_sort_scale
+    _need_fp4 = out_dtype == "fp4"
+    _need_fp8 = out_dtype == "fp8"
+    _need_quant = _need_fp4 or _need_fp8
+    _need_sort = _need_quant
 
     if _need_quant:
         _use_cshuffle_epilog = True
@@ -2660,14 +2659,10 @@ def compile_mixed_moe_gemm1(
         inter_dim_pad,
         use_cshuffle_epilog,
         persist_m,
-        fuse_fp4_quant,
-        fuse_fp8_quant,
-        fuse_sort_scale,
         use_async_copy,
         waves_per_eu,
         k_batch,
-        gate_only,
-        gate_up_interleave,
+        gate_mode,
         a_scale_one,
         xcd_swizzle,
     )
