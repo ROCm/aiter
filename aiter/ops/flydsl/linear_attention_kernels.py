@@ -56,12 +56,18 @@ def flydsl_gdr_decode(
         state_ = state.permute(0, 1, 3, 2).contiguous()
     else:
         state_ = state
-    batch_size, seq_length, num_k_heads, head_k_dim = query.shape
+    seq_length, batch_size, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
     kwargs = get_default_kwargs(batch_size, seq_length)
+    state_stride_0, state_stride_1, state_stride_2, state_stride_3 = state.stride()
     exe = create_shuffle_gdr_decode_kernel(
+        state_stride_0,
+        state_stride_1,
+        state_stride_2,
+        state_stride_3,
         get_dtype_str(query.dtype),
+        get_dtype_str(A_log.dtype),
         seq_length,
         num_k_heads,
         num_v_heads,
@@ -70,21 +76,21 @@ def flydsl_gdr_decode(
         use_qk_l2norm,
         **kwargs,
     )
-    exe_compiled = exe.compile(
-        query,
-        key,
-        value,
-        a,
-        b,
-        dt_bias,
-        A_log,
-        indices,
-        state_,
-        out,
-        batch_size,
-        stream,
-    )
-    exe_compiled(
+    # exe_compiled = exe.compile(
+    #     query,
+    #     key,
+    #     value,
+    #     a,
+    #     b,
+    #     dt_bias,
+    #     A_log,
+    #     indices,
+    #     state_,
+    #     out,
+    #     batch_size,
+    #     stream,
+    # )
+    exe(
         query,
         key,
         value,

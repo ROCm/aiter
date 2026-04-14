@@ -29,7 +29,12 @@ fm_fast = arith.FastMathFlags.fast
 
 @functools.lru_cache(maxsize=1024)
 def create_shuffle_gdr_decode_kernel(
+    state_stride_0: int,
+    state_stride_1: int,
+    state_stride_2: int,
+    state_stride_3: int,
     dtype: str,
+    A_log_dtype: str,
     seq_length: int,
     num_k_heads: int,
     num_v_heads: int,
@@ -106,6 +111,7 @@ def create_shuffle_gdr_decode_kernel(
         softplus_threshold_ = arith.constant(softplus_threshold, type=T.f32)
 
         dtype_ = get_dtype_in_kernel(dtype)
+        A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
         # i32_0 = arith.constant(0, type=T.i32)
         f32_0 = arith.constant(0.0, type=T.f32)
         f32_1 = arith.constant(1.0, type=T.f32)
@@ -142,9 +148,12 @@ def create_shuffle_gdr_decode_kernel(
         a_tensor = GTensor(a, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
         b_tensor = GTensor(b, dtype=dtype_, shape=(-1, seq_length, num_v_heads))
         dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
-        A_log_tensor = GTensor(A_log, dtype=T.f32, shape=(num_v_heads,))
+        A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
         state_tensor = GTensor(
-            state, dtype=T.f32, shape=(-1, num_v_heads, head_v_dim, head_k_dim)
+            state,
+            dtype=T.f32,
+            shape=(-1, num_v_heads, head_v_dim, head_k_dim),
+            stride=(state_stride_0, state_stride_1, state_stride_2, state_stride_3),
         )
         out_tensor = GTensor(
             out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
@@ -168,7 +177,7 @@ def create_shuffle_gdr_decode_kernel(
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
 
-            r_A_log = A_log_tensor[hv_i]
+            r_A_log = A_log_tensor[hv_i].extf(T.f32)
             r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
