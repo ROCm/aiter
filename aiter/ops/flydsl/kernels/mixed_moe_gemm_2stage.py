@@ -954,7 +954,7 @@ def compile_mixed_moe_gemm1(
                                 elem_bytes=elem_bytes,
                             )
 
-                if use_async_copy:
+                if const_expr(use_async_copy):
                     _dma_bytes = 16
                     _wave_size = 64
                     _eff_bytes_per_buffer = (
@@ -1320,7 +1320,7 @@ def compile_mixed_moe_gemm1(
                     _abs_k_dma = k_base_idx + arith.constant(next_k_dma_py, index=True)
                     if use_async_copy and next_k_dma_py < int(_k_dim):
                         prefetch_x_to_lds(_abs_k_dma, lds_write)
-                    if not use_async_copy:
+                    if const_expr(not use_async_copy):
                         _x_regs = load_x_tile(_abs_k_dma)
 
                     # ---- Extract previous scale values ----
@@ -1352,7 +1352,7 @@ def compile_mixed_moe_gemm1(
 
                     for _p in range_constexpr(_pipe_n_phases):
                         # Scale VMEM loads (phase 0 only)
-                        if _pp_has_scale[_p]:
+                        if const_expr(_pp_has_scale[_p]):
                             _new_as_list = []
                             for _mi_p in range_constexpr(m_repeat_packed):
                                 _raw_as = buffer_ops.buffer_load(
@@ -1497,7 +1497,7 @@ def compile_mixed_moe_gemm1(
                 rocdl.sched_barrier(0)
 
                 k0 = k_base_idx
-                if use_async_copy:
+                if const_expr(use_async_copy):
                     prefetch_x_to_lds(k0, lds_x_pong)
                 else:
                     x_regs0 = load_x_tile(k0)
@@ -1524,7 +1524,7 @@ def compile_mixed_moe_gemm1(
 
                 _k1 = k_base_idx + arith.constant(tile_k, index=True)
                 rocdl.sched_barrier(0)
-                if use_async_copy:
+                if const_expr(use_async_copy):
                     prefetch_x_to_lds(_k1, lds_x_ping)
                 else:
                     _x_regs_prime = load_x_tile(_k1)
@@ -1598,7 +1598,7 @@ def compile_mixed_moe_gemm1(
                     #         rocdl.sched_dswr(1)
                     # rocdl.sched_barrier(0)
 
-                    if use_async_copy:
+                    if const_expr(use_async_copy):
                         a_vmem_load = max(1, tile_m // 32)
                         mfma_group = a_vmem_load
                         rocdl.sched_vmem(a_vmem_load)
