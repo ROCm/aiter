@@ -2635,7 +2635,7 @@ class FmoeTuner(TunerCommon):
             )
             # per_1x32 quant requires blockM >= 32 (moe_mxfp4_sort constraint)
             shape_blockMs = (
-                [m for m in blockMs if m >= 32]
+                [m for m in blockMs if m >= 16]
                 if q_type == QuantType.per_1x32
                 else blockMs
             )
