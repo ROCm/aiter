@@ -469,22 +469,9 @@ def test_mla(
         q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
         q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
 
-        # KV: zero-copy path — pass full [N, 576] buffer for both kv_c and k_pe.
-        # Kernel adds KV_PE_OFFSET to k_pe column offsets.
-        kv_flat = kv_buffer.view(-1, qk_head_dim)
-        N = kv_flat.shape[0]
-        elem_bytes = kv_flat.element_size()
-        max_byte_offset = (N - 1) * qk_head_dim * elem_bytes + (
-            qk_head_dim - 1
-        ) * elem_bytes
-        if max_byte_offset <= 2**32 - 2:
-            kv_c = kv_flat
-            k_pe = kv_flat
-            kv_pe_offset = v_head_dim
-        else:
-            kv_c = kv_flat[:, :v_head_dim].contiguous()
-            k_pe = kv_flat[:, v_head_dim:].contiguous()
-            kv_pe_offset = 0
+        # KV: flat [N, 576] buffer; the kernel uses KV_PE_OFFSET (default 512)
+        # to reach k_pe columns and picks buffer_load vs global_load internally.
+        kv_c = kv_buffer.view(-1, qk_head_dim)
 
         # Varlen=False: reshape kv_indices as block_table [batch, ctx_lens]
         # Varlen=True : pass kv_indices + kv_indptr
@@ -502,12 +489,10 @@ def test_mla(
             q_nope,
             q_pe,
             kv_c,
-            k_pe,
             out_gluon.view(batch_size, nhead, v_head_dim),
             page_table,
             seq_info,
             sm_scale,
-            kv_pe_offset=kv_pe_offset,
             use_2d_view=use_2d_view,
         )
 

@@ -19,8 +19,6 @@
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
 import triton
-import triton.language as tl
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -346,7 +344,7 @@ def _mla_decode_gluon(
         offs_n_qk = i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
         qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-        LOG2E: tl.constexpr = 1.4426950408889634
+        LOG2E: gl.constexpr = 1.4426950408889634
         re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
         p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
@@ -403,7 +401,7 @@ def _mla_decode_gluon(
     offs_n_qk = (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
     qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
     n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-    LOG2E: tl.constexpr = 1.4426950408889634
+    LOG2E: gl.constexpr = 1.4426950408889634
     re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
     p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
     e_sum = e_sum * re_scale + gl.sum(p, 1)
@@ -455,15 +453,20 @@ def _mla_decode_gluon(
 def mla_decode_gluon(
     q_nope,  # [batch, nhead, kv_lora_rank]
     q_pe,  # [batch, nhead, qk_rope_head_dim]
-    kv_c,  # [N, kv_lora_rank(+qk_rope_head_dim)] flat KV cache
-    k_pe,  # [N, qk_rope_head_dim(+...)] or same tensor as kv_c
+    # Shared: kv_c=[N, kv_lora_rank+qk_rope_head_dim], k_pe=None,              kv_pe_offset=kv_lora_rank
+    # Split:  kv_c=[N, kv_lora_rank],                k_pe=[N,qk_rope_head_dim], kv_pe_offset=0
+    kv_c,
     o,  # [batch, nhead, kv_lora_rank] output buffer
     page_table,  # 2D: block_table [batch, max_seqlen] | 1D: kv_indices [total_kv]
     seq_info,  # 2D: cache_seqlens [batch]           | 1D: kv_indptr [batch+1]
     sm_scale,
-    kv_pe_offset=0,
+    k_pe=None,
+    kv_pe_offset=512,
     use_2d_view=True,
 ):
+    if k_pe is None:
+        k_pe = kv_c
+
     batch_size, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
 
@@ -492,7 +495,7 @@ def mla_decode_gluon(
     ), f"mla_decode_gluon requires seq_len > 192, got min seq_len={seq_len}"
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
-    # For KV caches > 2 GB, fall back to global_load (64-bit pointer tensors).
+    # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
     max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
 

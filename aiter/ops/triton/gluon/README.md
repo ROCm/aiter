@@ -62,9 +62,9 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 
 ### `mla_decode_gluon.py` — MLA Decode
 
-**Function:** `mla_decode_gluon(q_nope, q_pe, kv_c, k_pe, o, page_table, seq_info, sm_scale, kv_pe_offset=0, use_2d_view=True)`
+**Function:** `mla_decode_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True)`
 
-**Description:** Multi-head Latent Attention (DeepSeek MLA) decode kernel. Single-stage (no split-K). Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache similarly has `kv_c` and `k_pe` components. Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
+**Description:** Multi-head Latent Attention (DeepSeek MLA) decode kernel. Single-stage (no split-K). Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 
@@ -85,7 +85,7 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 - `True`: `page_table = block_table [batch, max_seqlen]`, `seq_info = cache_seqlens [batch]`. Use for fixed-length or pre-padded variable-length sequences.
 - `False`: `page_table = kv_indices [total_kv]`, `seq_info = kv_indptr [batch+1]`. Use for variable-length sequences without block_table construction.
 
-**Zero-copy KV path** (`kv_pe_offset > 0`): Pass the same `[N, 576]` buffer as both `kv_c` and `k_pe`. The kernel adds `kv_pe_offset` to k_pe column offsets. The kernel auto-selects the load path via `WITHIN_2GB`: `buffer_load_to_shared` (scalar base + 32-bit offsets) when KV caches &le; 2 GB, or `global_load_to_shared` (64-bit pointer tensors) when KV caches > 2 GB.
+**KV layout**: By default `kv_c` is a flat `[N, 576]` buffer containing both the compressed latent (columns `[0, 512)`) and rope PE (columns `[512, 576)`). The kernel adds `kv_pe_offset` to k_pe column offsets — set to `kv_lora_rank` (512) when `k_pe` shares `kv_c` (default), or `0` when `k_pe` is a separate buffer. The kernel auto-selects the load instruction via `WITHIN_2GB`: `buffer_load_to_shared` (scalar base + 32-bit offsets) when KV caches &le; 2 GB, or `global_load_to_shared` (64-bit pointer tensors) when KV caches > 2 GB.
 
 **Perf** (MI350, batch=128, ctx=10000, nhead=128, bf16):
 - Gluon: ~600 TFLOPS
