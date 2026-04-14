@@ -9,7 +9,6 @@ import re
 from typing import Dict, Optional
 from aiter.utility import dtypes
 
-import flydsl.compiler as flyc
 import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
@@ -89,7 +88,9 @@ def get_flydsl_stage1_kernels(
                 for wpe in waves_per_eus:
                     for kb in k_batches if wpe == 3 and tm == 32 and is_fp4_a else [1]:
                         for bnt in b_nts:
-                            gate_onlys = [False, True] if kb > 1 and is_fp4_a else [False]
+                            gate_onlys = (
+                                [False, True] if kb > 1 and is_fp4_a else [False]
+                            )
                             for go in gate_onlys:
                                 for xcd in xcd_swizzles:
                                     name = flydsl_kernel_name(
@@ -146,32 +147,32 @@ def get_flydsl_stage2_kernels(
             for tk in tile_ks:
                 for mode in modes:
                     for bnt in b_nts:
-                      for xcd in xcd_swizzles:
-                        base_name = flydsl_kernel_name(
-                            2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
-                        )
-                        if bnt != 0:
-                            base_name += f"_bnt{bnt}"
-                        if xcd > 0:
-                            base_name += f"_xcd{xcd}"
-                        base_params = {
-                            "stage": 2,
-                            "a_dtype": a_dtype,
-                            "b_dtype": b_dtype,
-                            "out_dtype": out_dtype,
-                            "tile_m": tm,
-                            "tile_n": tn,
-                            "tile_k": tk,
-                            "mode": mode,
-                            "MPerBlock": tm,
-                            "b_nt": bnt,
-                            "xcd_swizzle": xcd,
-                        }
-                        kernels[base_name] = base_params
-                        kernels[base_name + "_persist"] = {
-                            **base_params,
-                            "persist": True,
-                        }
+                        for xcd in xcd_swizzles:
+                            base_name = flydsl_kernel_name(
+                                2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                            )
+                            if bnt != 0:
+                                base_name += f"_bnt{bnt}"
+                            if xcd > 0:
+                                base_name += f"_xcd{xcd}"
+                            base_params = {
+                                "stage": 2,
+                                "a_dtype": a_dtype,
+                                "b_dtype": b_dtype,
+                                "out_dtype": out_dtype,
+                                "tile_m": tm,
+                                "tile_n": tn,
+                                "tile_k": tk,
+                                "mode": mode,
+                                "MPerBlock": tm,
+                                "b_nt": bnt,
+                                "xcd_swizzle": xcd,
+                            }
+                            kernels[base_name] = base_params
+                            kernels[base_name + "_persist"] = {
+                                **base_params,
+                                "persist": True,
+                            }
     return kernels
 
 
@@ -435,7 +436,11 @@ def _s2_args_fp4(
     dev,
     bias=None,
 ):
-    _bias = bias.view(-1) if bias is not None else torch.empty(0, device=dev, dtype=torch.float32)
+    _bias = (
+        bias.view(-1)
+        if bias is not None
+        else torch.empty(0, device=dev, dtype=torch.float32)
+    )
     return (
         _view_safe(target),
         _view_safe(a),
@@ -501,6 +506,7 @@ def _run_compiled(exe, args):
         # Clean up leaked contexts to isolate failures.
         try:
             from flydsl._mlir import ir
+
             while ir.Context.current is not None:
                 ir.Context.current.__exit__(None, None, None)
         except Exception:
@@ -510,8 +516,10 @@ def _run_compiled(exe, args):
 
 @functools.cache
 def _get_compiled_silu_fused(
-    inter_dim: int, topk: int,
-    quant_mode: str = "fp4", gui_layout: bool = False,
+    inter_dim: int,
+    topk: int,
+    quant_mode: str = "fp4",
+    gui_layout: bool = False,
 ):
     """Compile and cache the fused silu_and_mul + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -751,7 +759,9 @@ def flydsl_moe_stage1(
     num_sorted_rows = sorted_token_ids.shape[0]
     if _gui_sk_fused:
         _quant_mode = "fp4" if fuse_fp4_quant else "fp8"
-        _silu_fused_k = _get_compiled_silu_fused(inter_dim, topk, _quant_mode, gui_layout=True)
+        _silu_fused_k = _get_compiled_silu_fused(
+            inter_dim, topk, _quant_mode, gui_layout=True
+        )
         _run_compiled(
             _silu_fused_k,
             (
@@ -766,7 +776,9 @@ def flydsl_moe_stage1(
             ),
         )
     elif _gui_sk:
-        _silu_fused_k = _get_compiled_silu_fused(inter_dim, topk, "none", gui_layout=True)
+        _silu_fused_k = _get_compiled_silu_fused(
+            inter_dim, topk, "none", gui_layout=True
+        )
         _run_compiled(
             _silu_fused_k,
             (
@@ -797,6 +809,7 @@ def flydsl_moe_stage1(
         )
     elif _is_splitk:
         from aiter.ops.activation import silu_and_mul
+
         silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
 
     if (fuse_fp4_quant or fuse_fp8_quant) and _need_sort:

@@ -989,10 +989,7 @@ def get_2stage_cfgs(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
             )
-        elif (
-            activation == ActivationType.Swiglu
-            and q_type == QuantType.per_1x32
-        ):
+        elif activation == ActivationType.Swiglu and q_type == QuantType.per_1x32:
             stage2_func = functools.partial(
                 cktile_moe_stage2,
                 n_pad_zeros=hidden_pad // 64 * 64,

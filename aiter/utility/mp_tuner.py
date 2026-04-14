@@ -221,9 +221,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
-            compare_fn = (
-                rest[2] if len(rest) > 2 and callable(rest[2]) else None
-            )
+            compare_fn = rest[2] if len(rest) > 2 and callable(rest[2]) else None
 
             work_args = (
                 gpu_id,
@@ -447,7 +445,7 @@ def mp_tuner(
                 elapsed = time.time() - task_start_times[k]
                 if verbose:
                     print(
-                        f"[Done] Task {k}/{len(rets)-1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
+                        f"[Done] Task {k}/{len(rets) - 1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
                     )
 
             except MPTimeoutError:
@@ -536,10 +534,10 @@ def mp_tuner(
         # If pool restart needed due to crash, restart pool and resubmit remaining tasks
         if pool_restart_needed and remaining_tasks:
             if verbose:
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print("? Pool restart needed due to crash. Restarting pool...")
                 print(f"Remaining tasks: {len(remaining_tasks)}")
-                print(f"{'='*60}\n")
+                print(f"{'=' * 60}\n")
 
             # Terminate old pool
             try:
@@ -601,14 +599,14 @@ def mp_tuner(
         timeout_count = sum(1 for _, reason in failed_tasks if reason == "timeout")
         crash_count = len(failed_tasks) - timeout_count
         summary = (
-            f"\n{'='*60}\n"
+            f"\n{'=' * 60}\n"
             f"Tuning Summary:\n"
             f"  Total tasks: {len(rets)}\n"
             f"  Successful: {len(rets) - len(failed_tasks)}\n"
             f"  Failed: {len(failed_tasks)}\n"
             f"    - Timeouts (GPU hang): {timeout_count}\n"
             f"    - Crashes (memory fault): {crash_count}\n"
-            f"{'='*60}"
+            f"{'=' * 60}"
         )
         logger.warning(summary)
 
