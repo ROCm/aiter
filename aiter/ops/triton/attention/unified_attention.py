@@ -373,7 +373,6 @@ def unified_attention(
             segm_expsum = out  # dummy ptr
 
         if IS_DEVICE_ARCH_GFX12:
-            print(f"{K_WIDTH=}")
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](
