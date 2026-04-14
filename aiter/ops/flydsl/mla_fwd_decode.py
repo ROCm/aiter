@@ -42,11 +42,11 @@ def flydsl_mla_fwd_decode(
 
     # ----- dispatch to the right kernel based on (num_heads, dtype) -----
     if num_heads == 128 and _is_fp8(q_dtype) and _is_fp8(kv_dtype):
-        from .kernels.mla_fwd_decode_h128_fp8_fp8 import (
+        from .kernels.mla_fwd_decode_m16x8_fp8_fp8 import (
             OCCUPANCY,
             QK_HEAD_DIM,
             V_HEAD_DIM,
-            launch_mla_fwd_decode_h128_fp8_fp8,
+            launch_mla_fwd_decode_m16x8_fp8_fp8,
         )
 
         num_seqs = query.size(0)
@@ -66,7 +66,7 @@ def flydsl_mla_fwd_decode(
         num_cus = get_cu_num()
         lds_size = get_lds_size_per_cu() // OCCUPANCY
 
-        launch_mla_fwd_decode_h128_fp8_fp8(
+        launch_mla_fwd_decode_m16x8_fp8_fp8(
             query_flat,
             kv_flat,
             kv_idx_flat,

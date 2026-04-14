@@ -329,7 +329,7 @@ _set_mfma_vgpr_form()
 # Kernel
 # ---------------------------------------------------------------------------
 @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
-def kn_mla_fwd_decode_h128_fp8_fp8(
+def kn_mla_fwd_decode_m16x8_fp8_fp8(
     # --- inputs ---
     query: fx.Tensor,  # [num_seqs * num_heads, qk_head_dim]  (fp8)
     kv_buffer: fx.Tensor,  # [num_pages, qk_head_dim]  (fp8)
@@ -2572,7 +2572,7 @@ def kn_mla_fwd_decode_h128_fp8_fp8(
 # JIT launcher
 # ---------------------------------------------------------------------------
 @flyc.jit
-def launch_mla_fwd_decode_h128_fp8_fp8(
+def launch_mla_fwd_decode_m16x8_fp8_fp8(
     query: fx.Tensor,
     kv_buffer: fx.Tensor,
     kv_page_indices: fx.Tensor,
@@ -2587,7 +2587,7 @@ def launch_mla_fwd_decode_h128_fp8_fp8(
     stream: fx.Stream = fx.Stream(None),
 ):
     """JIT host function: configures grid/block and launches the kernel."""
-    kn_mla_fwd_decode_h128_fp8_fp8(
+    kn_mla_fwd_decode_m16x8_fp8_fp8(
         query,
         kv_buffer,
         kv_page_indices,
