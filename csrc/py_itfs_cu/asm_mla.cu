@@ -314,9 +314,12 @@ void mla_decode_stage1_asm_fwd(
             if((max_seqlen_q == 4) && persistent){
                 config_max_seqlen_q = 4;
                 sub_Q = 128;
+            } else if((max_seqlen_q == 2) && persistent){
+                config_max_seqlen_q = 2;
+                sub_Q = 128;
             } else {
                 AITER_CHECK(false, __func__, 
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=4 in persistent mode");
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
             }
         }
     } else if (gqa_ratio == 64){
