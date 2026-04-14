@@ -59,7 +59,7 @@ a8w8_kernels_list = {
 
 a16w16_kernels_list = {
     # ── MFMA 16x16x32, T_N=2, BS=256 (2-block/CU capable) ──
-    3:  _a16w16(256, 128, 128, 32,  2, 16, 16, 32),
+    # 3:  _a16w16(256, 128, 128, 32,  2, 16, 16, 32),  # disabled: intermittent accuracy (suspected compiler issue with VGPR=104/AGPR=64)
     4:  _a16w16(256, 128, 256, 32,  2, 16, 16, 32),
     5:  _a16w16(256, 256, 128, 32,  2, 16, 16, 32),
     # ── MFMA 16x16x32, T_N=4, BS=512 (1-block/CU) ──
