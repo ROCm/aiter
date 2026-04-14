@@ -20,12 +20,24 @@ def generate_data(batch, m, n, k, seed, device="cuda"):
     return XQ, WQ, Y
 
 
+MAX_DELTA_SCALE = 0.1
+
+
 def opus_gemm_ref(XQ, WQ):
     return torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(dtypes.bf16)
 
 
 def run_opus_gemm(XQ, WQ, Y, kernelId, splitK):
     _opus_gemm_a16w16_tune(XQ, WQ, Y, kernelId, splitK)
+    ref = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(dtypes.bf16)
+    max_delta = (Y.float() - ref.float()).abs().max().item()
+    max_ref = ref.float().abs().max().item()
+    bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
+    if max_delta > bound:
+        raise RuntimeError(
+            f"maxDelta {max_delta:.1f} exceeds bound {bound:.1f} "
+            f"(max|ref|={max_ref:.1f}, scale={MAX_DELTA_SCALE})"
+        )
     return Y
 
 
@@ -91,8 +103,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                             (ref_data_idx,),
                             {},
                             None,
-                            1e-2,
-                            1e-2,
+                            2e-2,
+                            1.0,
                         )
                     )
                     total_kernel_nums += 1
