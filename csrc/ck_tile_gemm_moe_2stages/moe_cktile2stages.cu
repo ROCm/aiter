@@ -281,7 +281,6 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     int k_batch   = split_k.has_value() ? split_k.value() : 1;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
-    at::hip::getCurrentHIPStream();
 
     // Name-based dispatch: look up kernel by name directly
     if(!kernel_name.empty())
@@ -410,7 +409,6 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     int k_batch   = split_k.has_value() ? split_k.value() : 1;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
-    at::hip::getCurrentHIPStream();
 
     // Name-based dispatch: look up kernel by name directly
     if(!kernel_name.empty())

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
-#include "ck_tile/core.hpp"
+#include "opus/opus.hpp"
 
 #ifndef AITER_WARP_SORT_USE_INLINE_ASM
 #define AITER_WARP_SORT_USE_INLINE_ASM 0
@@ -12,10 +12,10 @@ namespace aiter {
 
 template <typename T, int dpp_i, int row_mask = 0xf, int bank_mask = 0xf, bool bound_ctrl = true>
 __device__ __inline__ T mov_dpp_(T x,
-                                 ck_tile::number<dpp_i>,
-                                 ck_tile::number<row_mask>          = {},
-                                 ck_tile::number<bank_mask>         = {},
-                                 ck_tile::bool_constant<bound_ctrl> = {})
+                                 opus::number<dpp_i>,
+                                 opus::number<row_mask>          = {},
+                                 opus::number<bank_mask>         = {},
+                                 opus::bool_constant<bound_ctrl> = {})
 {
     static_assert(sizeof(T) == 4);
     return __builtin_bit_cast(
@@ -25,18 +25,27 @@ __device__ __inline__ T mov_dpp_(T x,
             __builtin_bit_cast(int, x), dpp_i, row_mask, bank_mask, bound_ctrl));
 }
 
-template<typename O, typename T, int dpp_i, int row_mask = 0xf, int bank_mask = 0xf, bool bound_ctrl = true>
-__device__ __inline__ T upd_dpp_(const O& old, T x, ck_tile::number<dpp_i>,
-                                ck_tile::number<row_mask>          = {},
-                                 ck_tile::number<bank_mask>         = {},
-                                 ck_tile::bool_constant<bound_ctrl> = {}) {
+template <typename O,
+          typename T,
+          int dpp_i,
+          int row_mask    = 0xf,
+          int bank_mask   = 0xf,
+          bool bound_ctrl = true>
+__device__ __inline__ T upd_dpp_(const O& old,
+                                 T x,
+                                 opus::number<dpp_i>,
+                                 opus::number<row_mask>          = {},
+                                 opus::number<bank_mask>         = {},
+                                 opus::bool_constant<bound_ctrl> = {})
+{
     static_assert(sizeof(T) == 4);
     return __builtin_bit_cast(T,
-                        __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, old), __builtin_bit_cast(int, x),
-                                    dpp_i,
-                                    row_mask,
-                                    bank_mask,
-                                    bound_ctrl));
+                              __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, old),
+                                                          __builtin_bit_cast(int, x),
+                                                          dpp_i,
+                                                          row_mask,
+                                                          bank_mask,
+                                                          bound_ctrl));
 }
 
 template <typename T>
@@ -63,10 +72,11 @@ __device__ __inline__ float dev_min_<float>(const float& a, const float& b)
     return __builtin_fminf(a, b);
 }
 
-template<typename T>
-__device__ __inline__ T dev_med3_(const T&a, const T&b, const T&c)
+template <typename T>
+__device__ __inline__ T dev_med3_(const T& a, const T& b, const T& c)
 {
-    if constexpr(std::is_same_v<T, float>) {
+    if constexpr(std::is_same_v<T, float>)
+    {
         return __builtin_amdgcn_fmed3f(a, b, c);
     }
 #if 0
@@ -81,442 +91,613 @@ __device__ __inline__ T dev_med3_(const T&a, const T&b, const T&c)
 
 // swap lo/hi half within a lanegroup
 template <typename T, int lanegroup_size>
-__device__ __inline__ auto warp_swap_(const T& x, int lane_idx, ck_tile::number<lanegroup_size> = {})
+__device__ __inline__ auto warp_swap_(const T& x, int lane_idx, opus::number<lanegroup_size> = {})
 {
-    if constexpr (lanegroup_size == 1) {
+    if constexpr(lanegroup_size == 1)
+    {
         // just return same value if groupsize is 1(no dpp, no permute)
         return x;
     }
-    if constexpr (lanegroup_size == 2) {
-        return mov_dpp_(x, ck_tile::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
-    } else if constexpr (lanegroup_size == 4) {
-        return mov_dpp_(x,  ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
-    } else if constexpr(lanegroup_size == 8) {
+    if constexpr(lanegroup_size == 2)
+    {
+        return mov_dpp_(x, opus::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
+    }
+    else if constexpr(lanegroup_size == 4)
+    {
+        return mov_dpp_(x, opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
+    }
+    else if constexpr(lanegroup_size == 8)
+    {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
         // this builtin require the old value, and
         // will generate a v_mov_b32 vxxx [old] before cvt, which result in unwanted ISA
         // so we prepare an uninitialized variable purposely, and turn off the warning
         //
-        // note the 2nd operation, we need it as old value to prevent compiler optimize out for multi assignement
+        // note the 2nd operation, we need it as old value to prevent compiler optimize out for
+        // multi assignement
         //
-        // NOTE: we can also use volatile, but compiler will generate scratch (it's memory operation?)
+        // NOTE: we can also use volatile, but compiler will generate scratch (it's memory
+        // operation?)
         T r;
-        r = upd_dpp_(r, x, ck_tile::number<260>{}, ck_tile::number<0xf>{}, ck_tile::number<0b0101>{}); /*row_shl:4*/
-        r = upd_dpp_(r, x, ck_tile::number<276>{}, ck_tile::number<0xf>{}, ck_tile::number<0b1010>{}); /*row_shr:4*/
+        r = upd_dpp_(
+            r, x, opus::number<260>{}, opus::number<0xf>{}, opus::number<0b0101>{}); /*row_shl:4*/
+        r = upd_dpp_(
+            r, x, opus::number<276>{}, opus::number<0xf>{}, opus::number<0b1010>{}); /*row_shr:4*/
 #pragma clang diagnostic pop
-        return  r;
-    } else if constexpr(lanegroup_size == 16) {
+        return r;
+    }
+    else if constexpr(lanegroup_size == 16)
+    {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wuninitialized"
         T r;
-        r = upd_dpp_(r, x, ck_tile::number<264>{}, ck_tile::number<0xf>{}, ck_tile::number<0b0011>{}); /*row_shl:8*/
-        r = upd_dpp_(r, x, ck_tile::number<280>{}, ck_tile::number<0xf>{}, ck_tile::number<0b1100>{}); /*row_shr:8*/
+        r = upd_dpp_(
+            r, x, opus::number<264>{}, opus::number<0xf>{}, opus::number<0b0011>{}); /*row_shl:8*/
+        r = upd_dpp_(
+            r, x, opus::number<280>{}, opus::number<0xf>{}, opus::number<0b1100>{}); /*row_shr:8*/
 #pragma clang diagnostic pop
         return r;
-    } else if constexpr(lanegroup_size == 32) {
-        return __shfl(x, lane_idx ^ 16);    // consume LDS
-    } else if constexpr(lanegroup_size == 64) {
-        return __shfl(x, lane_idx ^ 32);    // consume LDS
+    }
+    else if constexpr(lanegroup_size == 32)
+    {
+        return __shfl(x, lane_idx ^ 16); // consume LDS
+    }
+    else if constexpr(lanegroup_size == 64)
+    {
+        return __shfl(x, lane_idx ^ 32); // consume LDS
     }
 }
 
 // This is the core function to build the construct/combine stage of bitonic merge sor
-template <typename T, int lanegroup_size = ck_tile::get_warp_size(), int is_descending = 1>
-__device__ __inline__ auto warp_bitonic_merge_sort_step_(const T& x, const T& y, int lane_idx, int twiddle, ck_tile::number<lanegroup_size> = {}, ck_tile::number<is_descending> = {})
+template <typename T, int lanegroup_size = opus::get_warp_size(), int is_descending = 1>
+__device__ __inline__ auto warp_bitonic_merge_sort_step_(const T& x,
+                                                         const T& y,
+                                                         int lane_idx,
+                                                         int twiddle,
+                                                         opus::number<lanegroup_size> = {},
+                                                         opus::number<is_descending>  = {})
 {
     auto guard = [&](auto div_) {
-            if constexpr(is_descending) return  (((lane_idx / div_.value) & 1) ^ twiddle) == 0 ? INFINITY : -INFINITY;
-            else return                         (((lane_idx / div_.value) & 1) ^ twiddle) == 0 ? -INFINITY : INFINITY;
+        if constexpr(is_descending)
+            return (((lane_idx / div_.value) & 1) ^ twiddle) == 0 ? INFINITY : -INFINITY;
+        else
+            return (((lane_idx / div_.value) & 1) ^ twiddle) == 0 ? -INFINITY : INFINITY;
     };
 
     // compare and swap within lanegroup_size lo/hi half
-    auto g = guard(ck_tile::number<lanegroup_size / 2>{});
+    auto g = guard(opus::number<lanegroup_size / 2>{});
     return dev_med3_(x, y, g);
 }
 
 // this version the return value will be stored into per-lane register
-template <typename T, int lanegroup_size = ck_tile::get_warp_size(), int is_descending = 1>
-__device__ __inline__ auto warp_bitonic_merge_sort_build(const T& x, int lane_idx, ck_tile::number<lanegroup_size> = {}, ck_tile::number<is_descending> = {})
+template <typename T, int lanegroup_size = opus::get_warp_size(), int is_descending = 1>
+__device__ __inline__ auto warp_bitonic_merge_sort_build(const T& x,
+                                                         int lane_idx,
+                                                         opus::number<lanegroup_size> = {},
+                                                         opus::number<is_descending>  = {})
 {
-    if constexpr (lanegroup_size == 2) {
+    if constexpr(lanegroup_size == 2)
+    {
         // TODO:!!! if 2, always use combine, not build
         // here we just return the original value
         return x;
     }
-    else if constexpr (lanegroup_size == 4) {
-        T y =  warp_swap_(x, lane_idx, ck_tile::number<2>{});
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, (lane_idx / 2) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 4)
+    {
+        T y = warp_swap_(x, lane_idx, opus::number<2>{});
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, (lane_idx / 2) & 1, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 8) {
-        T y =  warp_swap_(x, lane_idx, ck_tile::number<2>{});
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, (lane_idx / 2) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 8)
+    {
+        T y = warp_swap_(x, lane_idx, opus::number<2>{});
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, (lane_idx / 2) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 16) {
-        T y =  warp_swap_(x, lane_idx, ck_tile::number<2>{});
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, (lane_idx / 2) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 16)
+    {
+        T y = warp_swap_(x, lane_idx, opus::number<2>{});
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, (lane_idx / 2) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 32) {
-        T y =  warp_swap_(x, lane_idx, ck_tile::number<2>{});
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, (lane_idx / 2) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 32)
+    {
+        T y = warp_swap_(x, lane_idx, opus::number<2>{});
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, (lane_idx / 2) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 64) {
-        T y =  warp_swap_(x, lane_idx, ck_tile::number<2>{});
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, (lane_idx / 2) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 64)
+    {
+        T y = warp_swap_(x, lane_idx, opus::number<2>{});
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, (lane_idx / 2) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-
-
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-
-        y   = warp_swap_(o, lane_idx, ck_tile::number<32>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<32>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<32>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<32>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
         return o;
     }
-    else if constexpr (lanegroup_size == 128) {
-        T y =  warp_swap_(x, lane_idx, ck_tile::number<2>{});
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, (lane_idx / 2) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 128)
+    {
+        T y = warp_swap_(x, lane_idx, opus::number<2>{});
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, (lane_idx / 2) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<32>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<32>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<32>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<32>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<64>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 64) & 1 , ck_tile::number<64>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<32>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 64) & 1 , ck_tile::number<32>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 64) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 64) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 64) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 64) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<64>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 64) & 1, opus::number<64>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<32>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 64) & 1, opus::number<32>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 64) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 64) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 64) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 64) & 1, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
 }
 
-template <typename T, int lanegroup_size = ck_tile::get_warp_size(), int early_stop_stage = 1, int is_descending = 4>
-__device__ __inline__ auto warp_bitonic_merge_sort_build_with_early_stop(const T& x, int lane_idx, ck_tile::number<lanegroup_size> = {}, ck_tile::number<early_stop_stage> = {}, ck_tile::number<is_descending> = {})
+template <typename T,
+          int lanegroup_size   = opus::get_warp_size(),
+          int early_stop_stage = 1,
+          int is_descending    = 4>
+__device__ __inline__ auto
+warp_bitonic_merge_sort_build_with_early_stop(const T& x,
+                                              int lane_idx,
+                                              opus::number<lanegroup_size>   = {},
+                                              opus::number<early_stop_stage> = {},
+                                              opus::number<is_descending>    = {})
 {
     // TODO: only support 64 (whole wave)
-    if constexpr (lanegroup_size == 64) {
-        T y =  warp_swap_(x, lane_idx, ck_tile::number<2>{});
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, (lane_idx / 2) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-        if constexpr (early_stop_stage == 4)    // stop at sort-4
+    if constexpr(lanegroup_size == 64)
+    {
+        T y = warp_swap_(x, lane_idx, opus::number<2>{});
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, (lane_idx / 2) & 1, opus::number<2>{}, opus::number<is_descending>{});
+        if constexpr(early_stop_stage == 4) // stop at sort-4
             return o;
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 4) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-        if constexpr (early_stop_stage == 8)    // stop at sort-8
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 4) & 1, opus::number<2>{}, opus::number<is_descending>{});
+        if constexpr(early_stop_stage == 8) // stop at sort-8
             return o;
 
-
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 8) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-        if constexpr (early_stop_stage == 16)    // stop at sort-16
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 8) & 1, opus::number<2>{}, opus::number<is_descending>{});
+        if constexpr(early_stop_stage == 16) // stop at sort-16
             return o;
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 16) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
-        if constexpr (early_stop_stage == 32)    // stop at sort-32
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 16) & 1, opus::number<2>{}, opus::number<is_descending>{});
+        if constexpr(early_stop_stage == 32) // stop at sort-32
             return o;
 
-        y   = warp_swap_(o, lane_idx, ck_tile::number<32>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<32>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        y   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, y, lane_idx, (lane_idx / 32) & 1 , ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<32>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<32>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<16>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<8>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<4>{}, opus::number<is_descending>{});
+        y = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, y, lane_idx, (lane_idx / 32) & 1, opus::number<2>{}, opus::number<is_descending>{});
 
         return o;
     }
 }
 
 // this version the return value will be stored into per-lane register
-template <typename T, int lanegroup_size = ck_tile::get_warp_size(), int is_descending = 1>
-__device__ __inline__ auto warp_bitonic_merge_sort_combine(const T& x, const T& y, int lane_idx, int twiddle, ck_tile::number<lanegroup_size> = {}, ck_tile::number<is_descending> = {})
+template <typename T, int lanegroup_size = opus::get_warp_size(), int is_descending = 1>
+__device__ __inline__ auto warp_bitonic_merge_sort_combine(const T& x,
+                                                           const T& y,
+                                                           int lane_idx,
+                                                           int twiddle,
+                                                           opus::number<lanegroup_size> = {},
+                                                           opus::number<is_descending>  = {})
 {
-    if constexpr (lanegroup_size == 2) {
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, twiddle, ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    if constexpr(lanegroup_size == 2)
+    {
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, twiddle, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 4) {
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, twiddle, ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        T z = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 4)
+    {
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, twiddle, opus::number<4>{}, opus::number<is_descending>{});
+        T z = warp_swap_(o, lane_idx, opus::number<2>{});
+        o   = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 8) {
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, twiddle, ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        T z = warp_swap_(o, lane_idx, ck_tile::number<4>{});
+    else if constexpr(lanegroup_size == 8)
+    {
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, twiddle, opus::number<8>{}, opus::number<is_descending>{});
+        T z = warp_swap_(o, lane_idx, opus::number<4>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<4>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 16) {
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, twiddle, ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        T z = warp_swap_(o, lane_idx, ck_tile::number<8>{});
+    else if constexpr(lanegroup_size == 16)
+    {
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, twiddle, opus::number<16>{}, opus::number<is_descending>{});
+        T z = warp_swap_(o, lane_idx, opus::number<8>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<8>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<4>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<4>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 32) {
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, twiddle, ck_tile::number<32>{}, ck_tile::number<is_descending>{});
-        T z = warp_swap_(o, lane_idx, ck_tile::number<16>{});
+    else if constexpr(lanegroup_size == 32)
+    {
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, twiddle, opus::number<32>{}, opus::number<is_descending>{});
+        T z = warp_swap_(o, lane_idx, opus::number<16>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<16>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<8>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<8>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<4>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<4>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 64) {
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, twiddle, ck_tile::number<64>{}, ck_tile::number<is_descending>{});
-        T z = warp_swap_(o, lane_idx, ck_tile::number<32>{});
+    else if constexpr(lanegroup_size == 64)
+    {
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, twiddle, opus::number<64>{}, opus::number<is_descending>{});
+        T z = warp_swap_(o, lane_idx, opus::number<32>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<32>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<32>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<16>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<16>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<8>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<8>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<4>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<4>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 128) {
-        T o = warp_bitonic_merge_sort_step_(x, y, lane_idx, twiddle, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
-        T z = warp_swap_(o, lane_idx, ck_tile::number<64>{});
+    else if constexpr(lanegroup_size == 128)
+    {
+        T o = warp_bitonic_merge_sort_step_(
+            x, y, lane_idx, twiddle, opus::number<128>{}, opus::number<is_descending>{});
+        T z = warp_swap_(o, lane_idx, opus::number<64>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<64>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<32>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<64>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<32>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<32>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<16>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<32>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<16>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<16>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<8>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<16>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<8>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<8>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<4>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<8>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<4>{});
 
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<4>{}, ck_tile::number<is_descending>{});
-        z   = warp_swap_(o, lane_idx, ck_tile::number<2>{});
-        o   = warp_bitonic_merge_sort_step_(o, z, lane_idx, twiddle, ck_tile::number<2>{}, ck_tile::number<is_descending>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<4>{}, opus::number<is_descending>{});
+        z = warp_swap_(o, lane_idx, opus::number<2>{});
+        o = warp_bitonic_merge_sort_step_(
+            o, z, lane_idx, twiddle, opus::number<2>{}, opus::number<is_descending>{});
         return o;
     }
 }
 // this version the return value will be stored into per-lane register
-template <typename T, int lanegroup_size = ck_tile::get_warp_size(), int is_descending = 1>
-__device__ __inline__ auto warp_bitonic_merge_sort_to_reg(const T& x, ck_tile::number<lanegroup_size> = {}, ck_tile::number<is_descending> = {})
+template <typename T, int lanegroup_size = opus::get_warp_size(), int is_descending = 1>
+__device__ __inline__ auto warp_bitonic_merge_sort_to_reg(const T& x,
+                                                          opus::number<lanegroup_size> = {},
+                                                          opus::number<is_descending>  = {})
 {
-    static_assert(lanegroup_size <= ck_tile::get_warp_size());
+    static_assert(lanegroup_size <= opus::get_warp_size());
     int lane_idx = threadIdx.x;
-    T c = warp_bitonic_merge_sort_build(x, lane_idx, ck_tile::number<lanegroup_size>{}, ck_tile::number<is_descending>{});
-    T r = warp_swap_(c, lane_idx, ck_tile::number<lanegroup_size>{});
+    T c          = warp_bitonic_merge_sort_build(
+        x, lane_idx, opus::number<lanegroup_size>{}, opus::number<is_descending>{});
+    T r = warp_swap_(c, lane_idx, opus::number<lanegroup_size>{});
     // if(threadIdx.x < lanegroup_size) printf("[%2d] c:%f, r:%f\n", threadIdx.x, c, r);
-    T o = warp_bitonic_merge_sort_combine(c, r, lane_idx, 0, ck_tile::number<lanegroup_size>{}, ck_tile::number<is_descending>{});
+    T o = warp_bitonic_merge_sort_combine(
+        c, r, lane_idx, 0, opus::number<lanegroup_size>{}, opus::number<is_descending>{});
     return o;
 }
 
-template <typename T, int lanegroup_size = ck_tile::get_warp_size(), int is_descending = 1>
-__device__ __inline__ auto block_bitonic_merge_sort_to_reg(void* smem, const T& x, ck_tile::number<lanegroup_size> = {}, ck_tile::number<is_descending> = {})
+template <typename T, int lanegroup_size = opus::get_warp_size(), int is_descending = 1>
+__device__ __inline__ auto block_bitonic_merge_sort_to_reg(void* smem,
+                                                           const T& x,
+                                                           opus::number<lanegroup_size> = {},
+                                                           opus::number<is_descending>  = {})
 {
     // need make sure smem before this function is ready to use
     // need guarantee smem usage, will not if...else... write smem inside this kernel
     // smem require sizeof(T) * lanegroup_size
-    static_assert(lanegroup_size > ck_tile::get_warp_size());
+    static_assert(lanegroup_size > opus::get_warp_size());
     int lane_idx = threadIdx.x;
-    if constexpr (lanegroup_size == 128) {
-        T c = warp_bitonic_merge_sort_build(x, lane_idx, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+    if constexpr(lanegroup_size == 128)
+    {
+        T c = warp_bitonic_merge_sort_build(
+            x, lane_idx, opus::number<128>{}, opus::number<is_descending>{});
 
         reinterpret_cast<T*>(smem)[lane_idx] = c;
         __syncthreads();
         T r = reinterpret_cast<T*>(smem)[lane_idx ^ 64];
 
-        T o = warp_bitonic_merge_sort_combine(c, r, lane_idx, 0, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+        T o = warp_bitonic_merge_sort_combine(
+            c, r, lane_idx, 0, opus::number<128>{}, opus::number<is_descending>{});
         return o;
     }
-    else if constexpr (lanegroup_size == 256) {
-        T c = warp_bitonic_merge_sort_build(x, lane_idx, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+    else if constexpr(lanegroup_size == 256)
+    {
+        T c = warp_bitonic_merge_sort_build(
+            x, lane_idx, opus::number<128>{}, opus::number<is_descending>{});
 
         reinterpret_cast<T*>(smem)[lane_idx] = c;
         __syncthreads();
         T r = reinterpret_cast<T*>(smem)[lane_idx ^ 64];
 
         // using combine to simulate build stage
-        T o  = warp_bitonic_merge_sort_combine(c, r, lane_idx, (lane_idx / 128) & 1, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+        T o = warp_bitonic_merge_sort_combine(c,
+                                              r,
+                                              lane_idx,
+                                              (lane_idx / 128) & 1,
+                                              opus::number<128>{},
+                                              opus::number<is_descending>{});
 
         // start to combine
         __syncthreads();
         reinterpret_cast<T*>(smem)[lane_idx] = o;
         __syncthreads();
-        r   = reinterpret_cast<T*>(smem)[lane_idx ^ 128];
-        c   = warp_bitonic_merge_sort_step_(o, r, lane_idx, 0, ck_tile::number<256>{}, ck_tile::number<is_descending>{});
+        r = reinterpret_cast<T*>(smem)[lane_idx ^ 128];
+        c = warp_bitonic_merge_sort_step_(
+            o, r, lane_idx, 0, opus::number<256>{}, opus::number<is_descending>{});
 
         __syncthreads();
         reinterpret_cast<T*>(smem)[lane_idx] = c;
         __syncthreads();
-        r   = reinterpret_cast<T*>(smem)[lane_idx ^ 64];
-        o   = warp_bitonic_merge_sort_combine(c, r, lane_idx, 0, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+        r = reinterpret_cast<T*>(smem)[lane_idx ^ 64];
+        o = warp_bitonic_merge_sort_combine(
+            c, r, lane_idx, 0, opus::number<128>{}, opus::number<is_descending>{});
 
         return o;
     }
-    else if constexpr (lanegroup_size == 512) {
+    else if constexpr(lanegroup_size == 512)
+    {
         // little bit complex
 #if 0
-        T c = warp_bitonic_merge_sort_build(x, lane_idx, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+        T c = warp_bitonic_merge_sort_build(x, lane_idx, opus::number<128>{}, opus::number<is_descending>{});
 
         reinterpret_cast<T*>(smem)[lane_idx] = c;
         __syncthreads();
         T r = reinterpret_cast<T*>(smem)[lane_idx ^ 64];
 
         // using combine to simulate build stage
-        T o  = warp_bitonic_merge_sort_combine(c, r, lane_idx, (lane_idx / 128) & 1, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+        T o  = warp_bitonic_merge_sort_combine(c, r, lane_idx, (lane_idx / 128) & 1, opus::number<128>{}, opus::number<is_descending>{});
 
         __syncthreads();
         reinterpret_cast<T*>(smem)[lane_idx] = o;
         __syncthreads();
         r   = reinterpret_cast<T*>(smem)[lane_idx ^ 128];
 
-        c   = warp_bitonic_merge_sort_step_(o, r, lane_idx, (lane_idx / 256) & 1, ck_tile::number<256>{}, ck_tile::number<is_descending>{});
+        c   = warp_bitonic_merge_sort_step_(o, r, lane_idx, (lane_idx / 256) & 1, opus::number<256>{}, opus::number<is_descending>{});
         __syncthreads();
         reinterpret_cast<T*>(smem)[lane_idx] = o;
         __syncthreads();
         r   = reinterpret_cast<T*>(smem)[lane_idx ^ 64];
-        o  = warp_bitonic_merge_sort_combine(c, r, lane_idx, (lane_idx / 128) & 1, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+        o  = warp_bitonic_merge_sort_combine(c, r, lane_idx, (lane_idx / 128) & 1, opus::number<128>{}, opus::number<is_descending>{});
 
         // using combine to simulate build stage
         __syncthreads();
@@ -525,62 +706,62 @@ __device__ __inline__ auto block_bitonic_merge_sort_to_reg(void* smem, const T& 
         r   = reinterpret_cast<T*>(smem)[lane_idx ^ 256];
 
         // start to combine
-        c   = warp_bitonic_merge_sort_step_(o, r, lane_idx, 0, ck_tile::number<512>{}, ck_tile::number<is_descending>{});
+        c   = warp_bitonic_merge_sort_step_(o, r, lane_idx, 0, opus::number<512>{}, opus::number<is_descending>{});
         __syncthreads();
         reinterpret_cast<T*>(smem)[lane_idx] = c;
         __syncthreads();
         r   = reinterpret_cast<T*>(smem)[lane_idx ^ 128];
 
-        c   = warp_bitonic_merge_sort_step_(o, r, lane_idx, 0, ck_tile::number<256>{}, ck_tile::number<is_descending>{});
+        c   = warp_bitonic_merge_sort_step_(o, r, lane_idx, 0, opus::number<256>{}, opus::number<is_descending>{});
         __syncthreads();
         reinterpret_cast<T*>(smem)[lane_idx] = c;
         __syncthreads();
 
         r   = reinterpret_cast<T*>(smem)[lane_idx ^ 64];
-        o   = warp_bitonic_merge_sort_combine(c, r, lane_idx, 0, ck_tile::number<128>{}, ck_tile::number<is_descending>{});
+        o   = warp_bitonic_merge_sort_combine(c, r, lane_idx, 0, opus::number<128>{}, opus::number<is_descending>{});
 
         return o;
 #endif
     }
 }
 
-template <typename V, int remote = ck_tile::vector_traits<ck_tile::remove_cvref_t<V>>::vector_size>
-__device__ __inline__ auto mov_dpp_vec_from_(const V& v, ck_tile::number<remote> = {})
+template <typename V, int remote = opus::vector_traits<V>::size()>
+__device__ __inline__ auto mov_dpp_vec_from_(const V& v, opus::number<remote> = {})
 {
-    using base_type = typename ck_tile::vector_traits<ck_tile::remove_cvref_t<V>>::scalar_type;
-    constexpr int vector_size = ck_tile::vector_traits<ck_tile::remove_cvref_t<V>>::vector_size;
+    using base_type           = typename opus::vector_traits<V>::dtype;
+    constexpr int vector_size = opus::vector_traits<V>::size();
     static_assert(sizeof(base_type) == 4);
 
     V r;
 
     if constexpr(remote == 1)
     {
-        ck_tile::static_for<0, vector_size, 1>{}([&](auto i_) {
-            r[i_.value] = mov_dpp_(v[i_.value], ck_tile::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
+        opus::static_for<vector_size>([&](auto i_) {
+            r[i_.value] = mov_dpp_(v[i_.value], opus::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
         });
     }
     else if constexpr(remote == 2)
     {
-        ck_tile::static_for<0, vector_size, 1>{}([&](auto i_) {
-            r[i_.value] = mov_dpp_(v[i_.value], ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
+        opus::static_for<vector_size>([&](auto i_) {
+            r[i_.value] = mov_dpp_(v[i_.value], opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
         });
     }
     else if constexpr(remote == 4)
     {
-        ck_tile::static_for<0, vector_size, 1>{}([&](auto i_) {
-            r[i_.value] = mov_dpp_(v[i_.value], ck_tile::number<0x104>{}); /* row_shl:4 */
+        opus::static_for<vector_size>([&](auto i_) {
+            r[i_.value] = mov_dpp_(v[i_.value], opus::number<0x104>{}); /* row_shl:4 */
         });
     }
     else if constexpr(remote == 8)
     {
-        ck_tile::static_for<0, vector_size, 1>{}([&](auto i_) {
-            r[i_.value] = mov_dpp_(v[i_.value], ck_tile::number<0x108>{}); /* row_shl:8 */
+        opus::static_for<vector_size>([&](auto i_) {
+            r[i_.value] = mov_dpp_(v[i_.value], opus::number<0x108>{}); /* row_shl:8 */
         });
     }
     else if constexpr(remote == 16 || remote == 32)
     {
         int src_lane = __lane_id() ^ remote;
-        ck_tile::static_for<0, vector_size, 1>{}([&](auto i_) {
+        opus::static_for<vector_size>([&](auto i_) {
             auto local  = v[i_.value];
             r[i_.value] = __builtin_bit_cast(
                 base_type,
@@ -590,78 +771,77 @@ __device__ __inline__ auto mov_dpp_vec_from_(const V& v, ck_tile::number<remote>
     return r;
 }
 
-#define DPP_MERGE_2_CMP_(x_, y_)                \
-    using vec2_t = ck_tile::ext_vector_t<T, 2>; \
-    vec2_t res2;                                \
-    res2[0] = dev_max_(x_, y_);                 \
+#define DPP_MERGE_2_CMP_(x_, y_)         \
+    using vec2_t = opus::vector_t<T, 2>; \
+    vec2_t res2;                         \
+    res2[0] = dev_max_(x_, y_);          \
     res2[1] = dev_min_(x_, y_);
 
-#define DPP_MERGE_2_DPP_() \
-    T res1_r = mov_dpp_(res1, ck_tile::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
+#define DPP_MERGE_2_DPP_() T res1_r = mov_dpp_(res1, opus::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
 
-#define DPP_ARG_MERGE_2_CMP_(x_, y_, ax_, ay_)  \
-    using vec2_t = ck_tile::ext_vector_t<T, 2>; \
-    using aec2_t = ck_tile::ext_vector_t<V, 2>; \
-    vec2_t res2;                                \
-    aec2_t arg2;                                \
-    res2[0] = x_ > y_ ? x_ : y_;                \
-    res2[1] = x_ > y_ ? y_ : x_;                \
-    arg2[0] = x_ > y_ ? ax_ : ay_;              \
+#define DPP_ARG_MERGE_2_CMP_(x_, y_, ax_, ay_) \
+    using vec2_t = opus::vector_t<T, 2>;       \
+    using aec2_t = opus::vector_t<V, 2>;       \
+    vec2_t res2;                               \
+    aec2_t arg2;                               \
+    res2[0] = x_ > y_ ? x_ : y_;               \
+    res2[1] = x_ > y_ ? y_ : x_;               \
+    arg2[0] = x_ > y_ ? ax_ : ay_;             \
     arg2[1] = x_ > y_ ? ay_ : ax_;
 
-#define DPP_ARG_MERGE_2_DPP_()                                                  \
-    T res1_r = mov_dpp_(res1, ck_tile::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/ \
-    V arg1_r = mov_dpp_(arg1, ck_tile::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
+#define DPP_ARG_MERGE_2_DPP_()                                               \
+    T res1_r = mov_dpp_(res1, opus::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/ \
+    V arg1_r = mov_dpp_(arg1, opus::number<0xb1>{}); /*quad_perm:[1,0,3,2]*/
 
-#define DPP_MERGE_4_CMP_(x_, y_)                \
-    using vec4_t = ck_tile::ext_vector_t<T, 4>; \
-    vec4_t res4;                                \
-                                                \
-    res4[0] = dev_max_(x_[0], y_[0]);           \
-    T m_1   = dev_min_(x_[0], y_[0]);           \
-                                                \
-    T m_2   = dev_max_(x_[1], y_[1]);           \
-    res4[3] = dev_min_(x_[1], y_[1]);           \
-                                                \
-    res4[1] = dev_max_(m_1, m_2);               \
+#define DPP_MERGE_4_CMP_(x_, y_)         \
+    using vec4_t = opus::vector_t<T, 4>; \
+    vec4_t res4;                         \
+                                         \
+    res4[0] = dev_max_(x_[0], y_[0]);    \
+    T m_1   = dev_min_(x_[0], y_[0]);    \
+                                         \
+    T m_2   = dev_max_(x_[1], y_[1]);    \
+    res4[3] = dev_min_(x_[1], y_[1]);    \
+                                         \
+    res4[1] = dev_max_(m_1, m_2);        \
     res4[2] = dev_min_(m_1, m_2);
 
-#define DPP_MERGE_4_DPP_()                                                          \
-    vec2_t res2_r;                                                                  \
-    res2_r[0] = mov_dpp_(res2[0], ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
-    res2_r[1] = mov_dpp_(res2[1], ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
+#define DPP_MERGE_4_DPP_()                                                       \
+    vec2_t res2_r;                                                               \
+    res2_r[0] = mov_dpp_(res2[0], opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
+    res2_r[1] = mov_dpp_(res2[1], opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
 
-#define DPP_ARG_MERGE_4_CMP_(x_, y_, ax_, ay_)  \
-    using vec4_t = ck_tile::ext_vector_t<T, 4>; \
-    using aec4_t = ck_tile::ext_vector_t<V, 4>; \
-    vec4_t res4;                                \
-    aec4_t arg4;                                \
-                                                \
-    res4[0] = x_[0] > y_[0] ? x_[0] : y_[0];    \
-    T m_1   = x_[0] > y_[0] ? y_[0] : x_[0];    \
-    arg4[0] = x_[0] > y_[0] ? ax_[0] : ay_[0];  \
-    V am_1  = x_[0] > y_[0] ? ay_[0] : ax_[0];  \
-                                                \
-    T m_2   = x_[1] > y_[1] ? x_[1] : y_[1];    \
-    res4[3] = x_[1] > y_[1] ? y_[1] : x_[1];    \
-    V am_2  = x_[1] > y_[1] ? ax_[1] : ay_[1];  \
-    arg4[3] = x_[1] > y_[1] ? ay_[1] : ax_[1];  \
-                                                \
-    res4[1] = m_1 > m_2 ? m_1 : m_2;            \
-    res4[2] = m_1 > m_2 ? m_2 : m_1;            \
-    arg4[1] = m_1 > m_2 ? am_1 : am_2;          \
+#define DPP_ARG_MERGE_4_CMP_(x_, y_, ax_, ay_) \
+    using vec4_t = opus::vector_t<T, 4>;       \
+    using aec4_t = opus::vector_t<V, 4>;       \
+    vec4_t res4;                               \
+    aec4_t arg4;                               \
+                                               \
+    res4[0] = x_[0] > y_[0] ? x_[0] : y_[0];   \
+    T m_1   = x_[0] > y_[0] ? y_[0] : x_[0];   \
+    arg4[0] = x_[0] > y_[0] ? ax_[0] : ay_[0]; \
+    V am_1  = x_[0] > y_[0] ? ay_[0] : ax_[0]; \
+                                               \
+    T m_2   = x_[1] > y_[1] ? x_[1] : y_[1];   \
+    res4[3] = x_[1] > y_[1] ? y_[1] : x_[1];   \
+    V am_2  = x_[1] > y_[1] ? ax_[1] : ay_[1]; \
+    arg4[3] = x_[1] > y_[1] ? ay_[1] : ax_[1]; \
+                                               \
+    res4[1] = m_1 > m_2 ? m_1 : m_2;           \
+    res4[2] = m_1 > m_2 ? m_2 : m_1;           \
+    arg4[1] = m_1 > m_2 ? am_1 : am_2;         \
     arg4[2] = m_1 > m_2 ? am_2 : am_1;
 
-#define DPP_ARG_MERGE_4_DPP_()                                                      \
-    vec2_t res2_r;                                                                  \
-    aec2_t arg2_r;                                                                  \
-    res2_r[0] = mov_dpp_(res2[0], ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
-    res2_r[1] = mov_dpp_(res2[1], ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
-    arg2_r[0] = mov_dpp_(arg2[0], ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
-    arg2_r[1] = mov_dpp_(arg2[1], ck_tile::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
+#define DPP_ARG_MERGE_4_DPP_()                                                   \
+    vec2_t res2_r;                                                               \
+    aec2_t arg2_r;                                                               \
+    res2_r[0] = mov_dpp_(res2[0], opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
+    res2_r[1] = mov_dpp_(res2[1], opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
+    arg2_r[0] = mov_dpp_(arg2[0], opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/ \
+    arg2_r[1] = mov_dpp_(arg2[1], opus::number<0x4e>{}); /*quad_perm:[2,3,0,1]*/
 
 #define DPP_MERGE_8_CMP_(x_, y_)                       \
-    using vec8_t = ck_tile::ext_vector_t<T, 8>;        \
+    using vec8_t = opus::vector_t<T, 8>;               \
     vec8_t res8;                                       \
                                                        \
     res8[0]      = dev_max_(x_[0], y_[0]);             \
@@ -691,18 +871,18 @@ __device__ __inline__ auto mov_dpp_vec_from_(const V& v, ck_tile::number<remote>
     res8[5] = dev_max_(res8_5_tmp_r, res8_6_tmp);      \
     res8[6] = dev_min_(res8_5_tmp_r, res8_6_tmp);
 
-#define DPP_MERGE_8_DPP_()                                                   \
-    vec4_t res4_r;                                                           \
-                                                                             \
-    /* only lane 0,1,2,3 contain valid data */                               \
-    res4_r[0] = mov_dpp_(res4[0], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    res4_r[1] = mov_dpp_(res4[1], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    res4_r[2] = mov_dpp_(res4[2], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    res4_r[3] = mov_dpp_(res4[3], ck_tile::number<0x104>{}); /* row_shl:4 */
+#define DPP_MERGE_8_DPP_()                                                \
+    vec4_t res4_r;                                                        \
+                                                                          \
+    /* only lane 0,1,2,3 contain valid data */                            \
+    res4_r[0] = mov_dpp_(res4[0], opus::number<0x104>{}); /* row_shl:4 */ \
+    res4_r[1] = mov_dpp_(res4[1], opus::number<0x104>{}); /* row_shl:4 */ \
+    res4_r[2] = mov_dpp_(res4[2], opus::number<0x104>{}); /* row_shl:4 */ \
+    res4_r[3] = mov_dpp_(res4[3], opus::number<0x104>{}); /* row_shl:4 */
 
 #define DPP_ARG_MERGE_8_CMP_(x_, y_, ax_, ay_)                           \
-    using vec8_t = ck_tile::ext_vector_t<T, 8>;                          \
-    using aec8_t = ck_tile::ext_vector_t<V, 8>;                          \
+    using vec8_t = opus::vector_t<T, 8>;                                 \
+    using aec8_t = opus::vector_t<V, 8>;                                 \
     vec8_t res8;                                                         \
     aec8_t arg8;                                                         \
                                                                          \
@@ -751,22 +931,22 @@ __device__ __inline__ auto mov_dpp_vec_from_(const V& v, ck_tile::number<remote>
     arg8[5] = res8_5_tmp_r > res8_6_tmp ? arg8_5_tmp_r : arg8_6_tmp;     \
     arg8[6] = res8_5_tmp_r > res8_6_tmp ? arg8_6_tmp : arg8_5_tmp_r;
 
-#define DPP_ARG_MERGE_8_DPP_()                                               \
-    vec4_t res4_r;                                                           \
-    aec4_t arg4_r;                                                           \
-                                                                             \
-    /* only lane 0,1,2,3 contain valid data */                               \
-    res4_r[0] = mov_dpp_(res4[0], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    res4_r[1] = mov_dpp_(res4[1], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    res4_r[2] = mov_dpp_(res4[2], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    res4_r[3] = mov_dpp_(res4[3], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    arg4_r[0] = mov_dpp_(arg4[0], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    arg4_r[1] = mov_dpp_(arg4[1], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    arg4_r[2] = mov_dpp_(arg4[2], ck_tile::number<0x104>{}); /* row_shl:4 */ \
-    arg4_r[3] = mov_dpp_(arg4[3], ck_tile::number<0x104>{}); /* row_shl:4 */
+#define DPP_ARG_MERGE_8_DPP_()                                            \
+    vec4_t res4_r;                                                        \
+    aec4_t arg4_r;                                                        \
+                                                                          \
+    /* only lane 0,1,2,3 contain valid data */                            \
+    res4_r[0] = mov_dpp_(res4[0], opus::number<0x104>{}); /* row_shl:4 */ \
+    res4_r[1] = mov_dpp_(res4[1], opus::number<0x104>{}); /* row_shl:4 */ \
+    res4_r[2] = mov_dpp_(res4[2], opus::number<0x104>{}); /* row_shl:4 */ \
+    res4_r[3] = mov_dpp_(res4[3], opus::number<0x104>{}); /* row_shl:4 */ \
+    arg4_r[0] = mov_dpp_(arg4[0], opus::number<0x104>{}); /* row_shl:4 */ \
+    arg4_r[1] = mov_dpp_(arg4[1], opus::number<0x104>{}); /* row_shl:4 */ \
+    arg4_r[2] = mov_dpp_(arg4[2], opus::number<0x104>{}); /* row_shl:4 */ \
+    arg4_r[3] = mov_dpp_(arg4[3], opus::number<0x104>{}); /* row_shl:4 */
 
 #define DPP_MERGE_16_CMP_(x_, y_)                               \
-    using vec16_t = ck_tile::ext_vector_t<T, 16>;               \
+    using vec16_t = opus::vector_t<T, 16>;                      \
     vec16_t res16;                                              \
                                                                 \
     res16[0]      = dev_max_(x_[0], y_[0]);                     \
@@ -844,21 +1024,21 @@ __device__ __inline__ auto mov_dpp_vec_from_(const V& v, ck_tile::number<remote>
     res16[13] = dev_max_(res16_13_tmp_xx, res16_14_tmp);        \
     res16[14] = dev_min_(res16_13_tmp_xx, res16_14_tmp);
 
-#define DPP_MERGE_16_DPP_()                                                  \
-    vec8_t res8_r;                                                           \
-    /* only lane 0,1,2,3 contain valid data */                               \
-    res8_r[0] = mov_dpp_(res8[0], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[1] = mov_dpp_(res8[1], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[2] = mov_dpp_(res8[2], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[3] = mov_dpp_(res8[3], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[4] = mov_dpp_(res8[4], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[5] = mov_dpp_(res8[5], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[6] = mov_dpp_(res8[6], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[7] = mov_dpp_(res8[7], ck_tile::number<0x108>{}); /* row_shl:8 */
+#define DPP_MERGE_16_DPP_()                                               \
+    vec8_t res8_r;                                                        \
+    /* only lane 0,1,2,3 contain valid data */                            \
+    res8_r[0] = mov_dpp_(res8[0], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[1] = mov_dpp_(res8[1], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[2] = mov_dpp_(res8[2], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[3] = mov_dpp_(res8[3], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[4] = mov_dpp_(res8[4], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[5] = mov_dpp_(res8[5], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[6] = mov_dpp_(res8[6], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[7] = mov_dpp_(res8[7], opus::number<0x108>{}); /* row_shl:8 */
 
 #define DPP_ARG_MERGE_16_CMP_(x_, y_, ax_, ay_)                                        \
-    using vec16_t = ck_tile::ext_vector_t<T, 16>;                                      \
-    using aec16_t = ck_tile::ext_vector_t<V, 16>;                                      \
+    using vec16_t = opus::vector_t<T, 16>;                                             \
+    using aec16_t = opus::vector_t<V, 16>;                                             \
     vec16_t res16;                                                                     \
     aec16_t arg16;                                                                     \
                                                                                        \
@@ -987,33 +1167,33 @@ __device__ __inline__ auto mov_dpp_vec_from_(const V& v, ck_tile::number<remote>
     arg16[13] = res16_13_tmp_xx > res16_14_tmp ? arg16_13_tmp_xx : arg16_14_tmp;       \
     arg16[14] = res16_13_tmp_xx > res16_14_tmp ? arg16_14_tmp : arg16_13_tmp_xx;
 
-#define DPP_ARG_MERGE_16_DPP_()                                              \
-    vec8_t res8_r;                                                           \
-    aec8_t arg8_r;                                                           \
-    /* only lane 0,1,2,3 contain valid data */                               \
-    res8_r[0] = mov_dpp_(res8[0], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[1] = mov_dpp_(res8[1], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[2] = mov_dpp_(res8[2], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[3] = mov_dpp_(res8[3], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[4] = mov_dpp_(res8[4], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[5] = mov_dpp_(res8[5], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[6] = mov_dpp_(res8[6], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    res8_r[7] = mov_dpp_(res8[7], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[0] = mov_dpp_(arg8[0], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[1] = mov_dpp_(arg8[1], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[2] = mov_dpp_(arg8[2], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[3] = mov_dpp_(arg8[3], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[4] = mov_dpp_(arg8[4], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[5] = mov_dpp_(arg8[5], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[6] = mov_dpp_(arg8[6], ck_tile::number<0x108>{}); /* row_shl:8 */ \
-    arg8_r[7] = mov_dpp_(arg8[7], ck_tile::number<0x108>{}); /* row_shl:8 */
+#define DPP_ARG_MERGE_16_DPP_()                                           \
+    vec8_t res8_r;                                                        \
+    aec8_t arg8_r;                                                        \
+    /* only lane 0,1,2,3 contain valid data */                            \
+    res8_r[0] = mov_dpp_(res8[0], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[1] = mov_dpp_(res8[1], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[2] = mov_dpp_(res8[2], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[3] = mov_dpp_(res8[3], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[4] = mov_dpp_(res8[4], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[5] = mov_dpp_(res8[5], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[6] = mov_dpp_(res8[6], opus::number<0x108>{}); /* row_shl:8 */ \
+    res8_r[7] = mov_dpp_(res8[7], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[0] = mov_dpp_(arg8[0], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[1] = mov_dpp_(arg8[1], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[2] = mov_dpp_(arg8[2], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[3] = mov_dpp_(arg8[3], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[4] = mov_dpp_(arg8[4], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[5] = mov_dpp_(arg8[5], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[6] = mov_dpp_(arg8[6], opus::number<0x108>{}); /* row_shl:8 */ \
+    arg8_r[7] = mov_dpp_(arg8[7], opus::number<0x108>{}); /* row_shl:8 */
 
 // https://en.wikipedia.org/wiki/Batcher_odd%E2%80%93even_mergesort
 // TODO: this is assuming descending order sort
 // result store to smem :)
-template <typename T, int lanegroup_size = ck_tile::get_warp_size()>
+template <typename T, int lanegroup_size = opus::get_warp_size()>
 __device__ __inline__ void
-warp_merge_sort_to_smem(T* smem, const T& x, ck_tile::number<lanegroup_size> = {})
+warp_merge_sort_to_smem(T* smem, const T& x, opus::number<lanegroup_size> = {})
 {
     static_assert(sizeof(T) == 4);
     int lane_id  = threadIdx.x % lanegroup_size;
@@ -1105,8 +1285,8 @@ warp_merge_sort_to_smem(T* smem, const T& x, ck_tile::number<lanegroup_size> = {
     }
 }
 
-template <typename T, int lanegroup_size = ck_tile::get_warp_size()>
-__device__ __inline__ auto warp_merge_sort_to_reg(const T& x, ck_tile::number<lanegroup_size> = {})
+template <typename T, int lanegroup_size = opus::get_warp_size()>
+__device__ __inline__ auto warp_merge_sort_to_reg(const T& x, opus::number<lanegroup_size> = {})
 {
     static_assert(sizeof(T) == 4);
     T res1 = x;
@@ -1114,7 +1294,7 @@ __device__ __inline__ auto warp_merge_sort_to_reg(const T& x, ck_tile::number<la
     if constexpr(lanegroup_size == 2)
     {
 #if AITER_WARP_SORT_USE_INLINE_ASM
-        using vec2_t = ck_tile::ext_vector_t<T, 2>;
+        using vec2_t = opus::vector_t<T, 2>;
         vec2_t res2;
         asm volatile("s_nop 1\n"
                      "v_max_f32 %[v_res2_0], %[v_res1], %[v_res1] quad_perm:[1,0,3,2] row_mask:0xf "
@@ -1136,7 +1316,7 @@ __device__ __inline__ auto warp_merge_sort_to_reg(const T& x, ck_tile::number<la
 #if AITER_WARP_SORT_USE_INLINE_ASM
         T tmp[4];
 
-        using vec4_t = ck_tile::ext_vector_t<T, 4>;
+        using vec4_t = opus::vector_t<T, 4>;
         vec4_t res4;
 
         asm volatile("s_nop 1\n"
@@ -1180,7 +1360,7 @@ __device__ __inline__ auto warp_merge_sort_to_reg(const T& x, ck_tile::number<la
 #if AITER_WARP_SORT_USE_INLINE_ASM
         T tmp[12];
 
-        using vec8_t = ck_tile::ext_vector_t<T, 8>;
+        using vec8_t = opus::vector_t<T, 8>;
         vec8_t res8;
 
         asm volatile("s_nop 1\n"
@@ -1265,7 +1445,7 @@ __device__ __inline__ auto warp_merge_sort_to_reg(const T& x, ck_tile::number<la
     else if constexpr(lanegroup_size == 16)
     {
 #if AITER_WARP_SORT_USE_INLINE_ASM
-        using vec16_t = ck_tile::ext_vector_t<T, 16>;
+        using vec16_t = opus::vector_t<T, 16>;
         vec16_t res16;
 
         T tmp[10];
@@ -1432,9 +1612,9 @@ __device__ __inline__ auto warp_merge_sort_to_reg(const T& x, ck_tile::number<la
 }
 
 // sort based on x, and sort v
-template <typename T, typename V, int lanegroup_size = ck_tile::get_warp_size()>
+template <typename T, typename V, int lanegroup_size = opus::get_warp_size()>
 __device__ __inline__ auto
-warp_arg_merge_sort_to_reg(const T& x, const V& v, ck_tile::number<lanegroup_size> = {})
+warp_arg_merge_sort_to_reg(const T& x, const V& v, opus::number<lanegroup_size> = {})
 {
     static_assert(sizeof(T) == 4);
     T res1 = x;
@@ -1444,7 +1624,7 @@ warp_arg_merge_sort_to_reg(const T& x, const V& v, ck_tile::number<lanegroup_siz
     {
         DPP_ARG_MERGE_2_DPP_();
         DPP_ARG_MERGE_2_CMP_(res1_r, res1, arg1_r, arg1);
-        return ck_tile::make_tuple(res2, arg2);
+        return opus::make_tuple(res2, arg2);
     }
     else if constexpr(lanegroup_size == 4)
     {
@@ -1452,7 +1632,7 @@ warp_arg_merge_sort_to_reg(const T& x, const V& v, ck_tile::number<lanegroup_siz
         DPP_ARG_MERGE_2_CMP_(res1_r, res1, arg1_r, arg1);
         DPP_ARG_MERGE_4_DPP_();
         DPP_ARG_MERGE_4_CMP_(res2_r, res2, arg2_r, arg2);
-        return ck_tile::make_tuple(res4, arg4);
+        return opus::make_tuple(res4, arg4);
     }
     else if constexpr(lanegroup_size == 8)
     {
@@ -1463,7 +1643,7 @@ warp_arg_merge_sort_to_reg(const T& x, const V& v, ck_tile::number<lanegroup_siz
         DPP_ARG_MERGE_8_DPP_();
         DPP_ARG_MERGE_8_CMP_(res4_r, res4, arg4_r, arg4);
         // TODO: only lane:1,2,3,4 within 8 lanes does not have correct result !
-        return ck_tile::make_tuple(res8, arg8);
+        return opus::make_tuple(res8, arg8);
     }
     else if constexpr(lanegroup_size == 16)
     {
@@ -1476,7 +1656,7 @@ warp_arg_merge_sort_to_reg(const T& x, const V& v, ck_tile::number<lanegroup_siz
         DPP_ARG_MERGE_16_DPP_();
         DPP_ARG_MERGE_16_CMP_(res8_r, res8, arg8_r, arg8);
         // TODO: only lane:1,2,3,4 within 16 lanes does not have correct result !
-        return ck_tile::make_tuple(res16, arg16);
+        return opus::make_tuple(res16, arg16);
     }
     else
     {
@@ -1485,11 +1665,11 @@ warp_arg_merge_sort_to_reg(const T& x, const V& v, ck_tile::number<lanegroup_siz
 }
 
 // combine 2 register and sort together, the other register buffer is from current lane
-template <typename T_vec, int lanegroup_size = ck_tile::get_warp_size()>
+template <typename T_vec, int lanegroup_size = opus::get_warp_size()>
 __device__ __inline__ auto
-warp_merge_sort_combine2(const T_vec& x, const T_vec& y, ck_tile::number<lanegroup_size> = {})
+warp_merge_sort_combine2(const T_vec& x, const T_vec& y, opus::number<lanegroup_size> = {})
 {
-    using T = typename ck_tile::vector_traits<ck_tile::remove_cvref_t<T_vec>>::scalar_type;
+    using T = typename opus::vector_traits<T_vec>::dtype;
     static_assert(sizeof(T) == 4);
 
     if constexpr(lanegroup_size == 2)
@@ -1521,38 +1701,38 @@ warp_merge_sort_combine2(const T_vec& x, const T_vec& y, ck_tile::number<lanegro
 }
 
 // combine 2 register and sort together, the other register buffer is from current lane
-template <typename T_vec, typename V_vec, int lanegroup_size = ck_tile::get_warp_size()>
+template <typename T_vec, typename V_vec, int lanegroup_size = opus::get_warp_size()>
 __device__ __inline__ auto warp_arg_merge_sort_combine2(const T_vec& x,
                                                         const T_vec& y,
                                                         const V_vec& ax,
                                                         const V_vec& ay,
-                                                        ck_tile::number<lanegroup_size> = {})
+                                                        opus::number<lanegroup_size> = {})
 {
-    using T = typename ck_tile::vector_traits<ck_tile::remove_cvref_t<T_vec>>::scalar_type;
-    using V = typename ck_tile::vector_traits<ck_tile::remove_cvref_t<V_vec>>::scalar_type;
+    using T = typename opus::vector_traits<T_vec>::dtype;
+    using V = typename opus::vector_traits<V_vec>::dtype;
     static_assert(sizeof(T) == 4 && sizeof(V) == 4);
 
     if constexpr(lanegroup_size == 2)
     {
         DPP_ARG_MERGE_2_CMP_(x, y, ax, ay);
-        return ck_tile::make_tuple(res2, arg2);
+        return opus::make_tuple(res2, arg2);
     }
     else if constexpr(lanegroup_size == 4)
     {
         DPP_ARG_MERGE_4_CMP_(x, y, ax, ay);
-        return ck_tile::make_tuple(res4, arg4);
+        return opus::make_tuple(res4, arg4);
     }
     else if constexpr(lanegroup_size == 8)
     {
         DPP_ARG_MERGE_8_CMP_(x, y, ax, ay);
         // TODO: only lane:1,2,3,4 within 8 lanes does not have correct result !
-        return ck_tile::make_tuple(res8, arg8);
+        return opus::make_tuple(res8, arg8);
     }
     else if constexpr(lanegroup_size == 16)
     {
         DPP_ARG_MERGE_16_CMP_(x, y, ax, ay);
         // TODO: only lane:1,2,3,4 within 16 lanes does not have correct result !
-        return ck_tile::make_tuple(res16, arg16);
+        return opus::make_tuple(res16, arg16);
     }
     else
     {
@@ -1579,8 +1759,8 @@ __device__ __inline__ auto warp_arg_merge_sort_combine2(const T_vec& x,
 
 // [a, b, c, d....] -> [a, a+b, a+b+c, a+b+c+d, ....]
 // NOTE: wave_size need at least be 16!! dpp 16 is one row
-template <typename data_t, int warp_size = ck_tile::get_warp_size()>
-__device__ inline void warp_cumsum(data_t& thread_data, ck_tile::number<warp_size> = {})
+template <typename data_t, int warp_size = opus::get_warp_size()>
+__device__ inline void warp_cumsum(data_t& thread_data, opus::number<warp_size> = {})
 {
     // warp_size must be power of 2
     constexpr int row_mask    = 0xf;

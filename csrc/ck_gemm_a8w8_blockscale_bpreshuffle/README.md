@@ -11,11 +11,11 @@
 
 3. Start tuning:
 Run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_blockscale_bpreshuffle_tune via jit:
-`python3 csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py -i aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`
+`python3 csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py --preshuffle -i aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv -o aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`
 You can find the results of the tuning in `aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`, like this:
-    |**cu_num**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
-    |----------|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
-    |80        |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
+    |**cu_num**|**M**|**N**|**K**|**libtype**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
+    |----------|-----|-----|-----|-----------|------------|----------|------|--------------|----------|------|------------|
+    |80        |128  |1536 |7168 |ck         |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
 
     `cu_num` means the number of compute units, and it is used to distinguish between graphics.
 
@@ -25,6 +25,8 @@ Test the performance, modify the test instance in `op_tests/test_gemm_a8w8_block
 If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `AITER_REBUILD=1` before your test cmd, such as `AITER_REBUILD=1 python3 op_tests/test_gemm_a8w8_blockscale.py`. It will rebuild kernels from `AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE`, the default one will be results merged from `aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv` and tuned fmoe csv under `aiter/configs/model_configs/xx_a8w8_blockscale_bpreshuffle_tuned_gemm_xx.csv`, the merged result is store in `/tmp/aiter_configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv`.
 
 ## More Options
+
+The tuning uses `csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py` with `--preshuffle` flag, which supports both CK and CKTile backends.
 
 ### Output Configuration
 
@@ -51,6 +53,18 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 ```
 
 ### Tuning Configuration
+
+#### `--libtype`
+- **Type**: String
+- **Default**: `both`
+- **Choices**: `ck`, `cktile`, `both`, `all`
+- **Description**: Which kernel library backends to tune. `both` tunes CK and CKTile for the preshuffle variant. `all` covers both standard and preshuffle for all backends.
+
+**Example**:
+```bash
+--libtype both    # CK + CKTile (default)
+--libtype cktile  # CKTile only
+```
 
 #### `--errRatio`
 - **Type**: Float
@@ -105,6 +119,53 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 --all
 ```
 
+#### `--run_config [TUNED_CSV]`
+- **Type**: Optional argument
+- **Default**: disabled
+- **Description**: Run production-operator benchmark only and exit (no tuning).
+  - `--run_config /path/to/tuned.csv`: read shapes from that tuned CSV and run tuned kernels from that file.
+  - `--run_config` (no path): read shapes from `-i/--untune_file` and run default kernels.
+
+**Examples**:
+```bash
+# benchmark tuned kernels from specified tuned config
+python3 csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py \
+  --run_config aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv
+
+# benchmark default kernels using shapes from -i
+python3 csrc/ck_gemm_a8w8_blockscale_bpreshuffle/gemm_a8w8_blockscale_bpreshuffle_tune.py \
+  -i aiter/configs/a8w8_blockscale_bpreshuffle_untuned_gemm.csv --run_config
+```
+
+#### `--compare`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: Run pre-tune and post-tune production benchmark, print compare results, and keep a compare candidate CSV.
+  - Pre-tune reads shapes from `-i/--untune_file`.
+  - Post-tune uses configs written to `<tune_file>.candidate.csv` during the compare run.
+  - The final tuned CSV is only updated when `--update_improved` is also set.
+  - Shapes with no valid pre-run baseline can still update when the post-tune benchmark passes.
+
+**Example**:
+```bash
+--compare
+```
+
+#### `--update_improved`
+- **Type**: Flag (boolean)
+- **Default**: `False`
+- **Description**: With `--compare`, update the final tuned CSV for shapes improved by at least `--min_improvement_pct`, or for shapes with no valid pre-run baseline when the post-tune benchmark passes.
+
+**Example**:
+```bash
+--compare --update_improved
+```
+
+#### `--min_improvement_pct`
+- **Type**: Float
+- **Default**: `3.0`
+- **Description**: With `--compare --update_improved`, the minimum percentage improvement required before a compared result replaces the final tuned CSV entry when both pre/post benchmarks are valid. Shapes with no valid pre-run baseline but passing post-tune are still allowed to update.
+
 ### Profiling Configuration
 
 #### `--warmup`
@@ -149,4 +210,4 @@ If you have built gemm_a8w8 kernels before tuning new GEMM shapes, please add `A
 -v
 ```
 ## Notes
-If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build gemm a8w8 blockscale bpreshuffle kernels in tuned gemm csv by default. If you want to use the new result of gemm_a8w8_blockscale_bpreshuffle_tune, please remove `build` and `*.so` in `aiter/jit` first, then re-install aiter after finishing tune. This can take a lot of time and is not recommended.
+If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build gemm a8w8 blockscale bpreshuffle kernels in tuned gemm csv by default. If you want to use the new tuning results, please remove `build` and `*.so` in `aiter/jit` first, then re-install aiter after finishing tune. This can take a lot of time and is not recommended.

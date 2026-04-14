@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 
@@ -8,13 +8,13 @@
 
 #define PRINT_DBG 0
 
-CK_TILE_DEVICE auto get_cost_top(const int32_t* p_cost_heap, const int32_t num_clusters)
+__device__ auto get_cost_top(const int32_t* p_cost_heap, const int32_t num_clusters)
 {
     int32_t cid_min  = -1;
     int32_t cost_min = 0x7fffffff;
 
     // Get local top
-    for(int32_t cid = ck_tile::get_lane_id(); cid < num_clusters; cid += ck_tile::get_warp_size())
+    for(int32_t cid = opus::lane_id(); cid < num_clusters; cid += opus::get_warp_size())
     {
         const int32_t cost = p_cost_heap[cid];
         if(cost < cost_min)
@@ -26,11 +26,11 @@ CK_TILE_DEVICE auto get_cost_top(const int32_t* p_cost_heap, const int32_t num_c
 
 // Get global top
 #pragma unroll
-    for(int32_t offset = (ck_tile::get_warp_size() >> 1); offset > 0; offset >>= 1)
+    for(int32_t offset = (opus::get_warp_size() >> 1); offset > 0; offset >>= 1)
     {
-        const int32_t srd_lane    = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
-        const int32_t cid_remote  = ck_tile::warp_shuffle(cid_min, srd_lane);
-        const int32_t cost_remote = ck_tile::warp_shuffle(cost_min, srd_lane);
+        const int32_t srd_lane    = (offset ^ opus::get_warp_size()) ^ opus::lane_id();
+        const int32_t cid_remote  = opus::shfl(cid_min, srd_lane);
+        const int32_t cost_remote = opus::shfl(cost_min, srd_lane);
         if((cost_remote < cost_min) || ((cost_remote == cost_min) && (cid_remote < cid_min)))
         {
             cost_min = cost_remote;
@@ -70,14 +70,14 @@ struct MlaMetadataV11Coefficients
 };
 
 // This version just follows Flashinfer
-CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v0(const int32_t cum_workload,
+__host__ __device__ int32_t cal_workload_limit_global_v0(const int32_t cum_workload,
                                                          const int32_t num_clusters,
                                                          const int32_t kv_granularity)
 {
     int32_t limit;
 
-    const int32_t avg_workload =
-        ck_tile::max(ck_tile::integer_divide_ceil(cum_workload, num_clusters), 1);
+    const int32_t avg_workload_raw = integer_divide_ceil(cum_workload, num_clusters);
+    const int32_t avg_workload = (avg_workload_raw > 1) ? avg_workload_raw : 1;
     if(avg_workload <= 8)
         limit = 32;
     else if(avg_workload <= 16)
@@ -89,10 +89,10 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v0(const int32_t cum_workl
     else
         limit = avg_workload;
 
-    return ck_tile::integer_least_multiple(limit, kv_granularity);
+    return integer_least_multiple(limit, kv_granularity);
 }
 
-CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v1(const MlaMetadataV11Coefficients& coefs,
+__host__ __device__ int32_t cal_workload_limit_global_v1(const MlaMetadataV11Coefficients& coefs,
                                                          const int32_t num_batches,
                                                          const int32_t cum_workload,
                                                          const int32_t num_clusters,
@@ -105,8 +105,9 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v1(const MlaMetadataV11Coe
 
     int32_t limit;
 
-    const int32_t avg_workload = ck_tile::max(
-        ck_tile::integer_divide_ceil(cum_workload - fixed_split_overhead, num_clusters), 1);
+    const int32_t avg_workload_raw =
+        integer_divide_ceil(cum_workload - fixed_split_overhead, num_clusters);
+    const int32_t avg_workload = (avg_workload_raw > 1) ? avg_workload_raw : 1;
     if(avg_workload <= 8)
         limit = 32;
     else if(avg_workload <= 16)
@@ -121,13 +122,13 @@ CK_TILE_HOST_DEVICE int32_t cal_workload_limit_global_v1(const MlaMetadataV11Coe
     const float split_amplifier = num_batches * coefs.workload_limit_global_0 +
                                   avg_workload * coefs.workload_limit_global_1 +
                                   coefs.workload_limit_global_2;
-    return ck_tile::integer_least_multiple(
+    return integer_least_multiple(
         int32_t(cal_cost(packed_seqlen_qo, limit) + split_overhead * split_amplifier),
         kv_granularity);
 }
 
 template <typename Traits, bool kOnlyGatherWorkCount>
-CK_TILE_DEVICE void generate_work(const int32_t batch_idx,
+__device__ void generate_work(const int32_t batch_idx,
                                   const int32_t tile_idx,
                                   const int32_t qo_len,
                                   const int32_t kv_len,
@@ -152,13 +153,13 @@ CK_TILE_DEVICE void generate_work(const int32_t batch_idx,
     int32_t remaining_kv_len = kv_len;
     int32_t kv_start_local   = 0;
 
-    const int32_t kv_len_limit_floor = ck_tile::integer_least_multiple(
-        ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
+    const int32_t kv_len_limit_floor = integer_least_multiple(
+        integer_divide_ceil(kv_len, num_clusters), kv_granularity);
     const auto [cid_top, accum_cost_top]   = get_cost_top(p_cost_heap, num_clusters);
-    const int32_t remaining_capability_top = ck_tile::max(
+    const int32_t remaining_capability_top = opus::max(
         cal_kv_len(workload_limit_global - accum_cost_top, packed_qo_tile_len), kv_len_limit_floor);
     const int32_t num_splits_estimated =
-        ck_tile::integer_divide_ceil(remaining_kv_len, remaining_capability_top);
+        integer_divide_ceil(remaining_kv_len, remaining_capability_top);
     // For the case of #splits==2, make sure that the tailing tile is smaller than
     // Traits::kSplitTolerance.
     const bool split_kv =
@@ -173,16 +174,16 @@ CK_TILE_DEVICE void generate_work(const int32_t batch_idx,
         const int32_t remaining_capability =
             cal_kv_len(workload_limit_global - accum_cost, packed_qo_tile_len);
         const int32_t kv_len_limit_local = [&]() {
-            const int32_t limit_ori = ck_tile::max(remaining_capability, kv_len_limit_floor);
+            const int32_t limit_ori = opus::max(remaining_capability, kv_len_limit_floor);
             const int32_t tail_size =
                 (remaining_kv_len > limit_ori) ? (remaining_kv_len - limit_ori) : 0x7fffffff;
             const int32_t limit_fin =
                 (tail_size <= Traits::kSplitTolerance) ? remaining_kv_len : limit_ori;
             return limit_fin;
         }();
-        const int32_t kv_len_consuming = ck_tile::min(remaining_kv_len, kv_len_limit_local);
+        const int32_t kv_len_consuming = opus::min(remaining_kv_len, kv_len_limit_local);
 
-        if(ck_tile::get_lane_id() == 0)
+        if(opus::lane_id() == 0)
         {
             const int32_t cost     = cal_cost(packed_qo_tile_len, kv_len_consuming);
             const int32_t new_cost = accum_cost + cost;
@@ -195,7 +196,7 @@ CK_TILE_DEVICE void generate_work(const int32_t batch_idx,
                 work_info.batch_idx = batch_idx;
                 work_info.qo_start  = tile_idx * qo_tile_len + qo_batch_start;
                 work_info.qo_end =
-                    ck_tile::min(work_info.qo_start + qo_tile_len, qo_batch_start + qo_len);
+                    opus::min(work_info.qo_start + qo_tile_len, qo_batch_start + qo_len);
                 work_info.kv_start  = kv_start_local + kv_batch_start;
                 work_info.kv_end    = work_info.kv_start + kv_len_consuming;
                 work_info.kv_offset = kv_batch_end - work_info.kv_end;
@@ -244,20 +245,20 @@ CK_TILE_DEVICE void generate_work(const int32_t batch_idx,
 }
 
 template <typename Traits>
-__launch_bounds__(ck_tile::get_warp_size(), 1) __global__
+__launch_bounds__(opus::get_warp_size(), 1) __global__
     void kn_get_mla_metadata_v1_1(const MlaMetadataV1KernelParameter params,
                                   const MlaMetadataV11Coefficients coefs)
 {
     extern __shared__ uint8_t p_smem[];
 
-    const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t lane_idx = opus::lane_id();
 
     // Step.0. Get sequence lengths of query/output and key/value for each batch.
     int32_t* p_lds_batch_idx = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_lds_qo_lens =
         Traits::kSortBatch ? (p_lds_batch_idx + params.num_batches) : p_lds_batch_idx;
     int32_t* p_lds_kv_lens = p_lds_qo_lens + params.num_batches;
-    for(int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < params.num_batches; bid += opus::get_warp_size())
     {
         const int32_t bid_ori = Traits::kIsSparse
                                     ? (bid / params.ori_seqlen_qo / params.qk_batch_ratio)
@@ -269,7 +270,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         const int32_t raw_seqlen_kv =
             params.p_seqlens_kv_indptr[bid_ori + 1] - params.p_seqlens_kv_indptr[bid_ori];
         p_lds_kv_lens[bid] =
-            Traits::kIsSparse ? ck_tile::min(raw_seqlen_kv, params.topk) : raw_seqlen_kv;
+            Traits::kIsSparse ? opus::min(raw_seqlen_kv, params.topk) : raw_seqlen_kv;
         p_lds_qo_lens[bid] =
             params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
     }
@@ -283,8 +284,8 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     const int32_t cluster_size = [&]() {
         const int32_t avg_qo_len = sum_qo_len / params.num_batches;
         const int32_t cluster_size =
-            ck_tile::integer_divide_ceil(avg_qo_len, Traits::kPackedQoLenPerWg);
-        return ck_tile::min(cluster_size, Traits::kMaxClusterSize);
+            integer_divide_ceil(avg_qo_len, Traits::kPackedQoLenPerWg);
+        return opus::min(cluster_size, Traits::kMaxClusterSize);
     }();
     // assert((params.num_cu % cluster_size) == 0);
     const int32_t num_clusters  = params.num_cu / cluster_size;
@@ -302,12 +303,12 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     int32_t scan_base            = 0;
     int32_t workload_sum         = 0;
     const int32_t num_loop_batch = integer_divide_ceil_power2(
-        params.num_batches, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
+        params.num_batches, opus::get_warp_size(), __builtin_ctz(opus::get_warp_size()));
     // lds pointed by p_lds_qo_tiles will be reused by p_lds_sort_workspace later
     int32_t* p_lds_qo_tiles = p_lds_num_qo_clusters_indptr + params.num_batches + 1;
     for(int32_t loop_idx = 0; loop_idx < num_loop_batch; ++loop_idx)
     {
-        const int32_t bid    = lane_idx + loop_idx * ck_tile::get_warp_size();
+        const int32_t bid    = lane_idx + loop_idx * opus::get_warp_size();
         int32_t num_qo_tiles = 0;
         int32_t workload     = 0;
 
@@ -316,9 +317,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             const int32_t kv_len        = p_lds_kv_lens[bid];
             const int32_t qo_len        = qo_state.get_seqlen(bid);
             const int32_t packed_qo_len = qo_len * params.num_heads;
-            num_qo_tiles        = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+            num_qo_tiles        = integer_divide_ceil(packed_qo_len, cluster_len_q);
             p_lds_qo_tiles[bid] = num_qo_tiles;
-            const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
+            const int32_t packed_qo_tile_len = opus::min(packed_qo_len, cluster_len_q);
 
             for(int32_t tid = 0; tid < num_qo_tiles; ++tid)
             {
@@ -333,16 +334,16 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             }
         }
 
-        const int32_t prefix_sum_qo_tiles = warp_prefix_sum(num_qo_tiles, ck_tile::get_warp_size());
+        const int32_t prefix_sum_qo_tiles = warp_prefix_sum(num_qo_tiles, opus::get_warp_size());
         const int32_t global_sum_qo_tiles = prefix_sum_qo_tiles + scan_base;
         if(bid < params.num_batches)
         {
             p_lds_num_qo_clusters_indptr[bid + 1] = global_sum_qo_tiles;
         }
-        scan_base = ck_tile::warp_shuffle(global_sum_qo_tiles, ck_tile::get_warp_size() - 1);
+        scan_base = opus::shfl(global_sum_qo_tiles, opus::get_warp_size() - 1);
 
         workload_sum +=
-            aiter::warpReduce<aiter::AddFunctor, decltype(workload), ck_tile::get_warp_size()>(
+            aiter::warpReduce<aiter::AddFunctor, decltype(workload), opus::get_warp_size()>(
                 workload);
     }
     const int32_t num_qo_tiles = scan_base;
@@ -377,7 +378,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     // Step.4.1. Initialize lds
     int32_t* p_cost_heap            = p_lds_qo_tiles;
     int32_t* p_cluster_work_counter = p_cost_heap + num_clusters + 1;
-    for(int32_t cid = lane_idx; cid < num_clusters; cid += ck_tile::get_warp_size())
+    for(int32_t cid = lane_idx; cid < num_clusters; cid += opus::get_warp_size())
     {
         p_cost_heap[cid]            = 0;
         p_cluster_work_counter[cid] = 0;
@@ -408,10 +409,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             Traits::kIsSparse ? bid_ori * params.topk : params.p_seqlens_kv_indptr[bid_ori];
         const int32_t kv_batch_end  = kv_batch_start + kv_len;
         const int32_t packed_qo_len = qo_len * params.num_heads;
-        const int32_t num_qo_tiles  = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
-        const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
+        const int32_t num_qo_tiles  = integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t packed_qo_tile_len = opus::min(packed_qo_len, cluster_len_q);
         const int32_t qo_tile_len =
-            ck_tile::integer_divide_ceil(packed_qo_tile_len, params.num_heads);
+            integer_divide_ceil(packed_qo_tile_len, params.num_heads);
 
         for(int32_t tid = 0; tid < num_qo_tiles; ++tid)
         {
@@ -450,15 +451,15 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     // Step.5.2. Re-init cost heap and cumulative sum cluster_work_tot
     scan_base                       = 0;
     const int32_t num_loop_clusters = integer_divide_ceil_power2(
-        num_clusters, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
+        num_clusters, opus::get_warp_size(), __builtin_ctz(opus::get_warp_size()));
     for(int32_t loop_idx = 0; loop_idx < num_loop_clusters; ++loop_idx)
     {
-        const int32_t cid = lane_idx + loop_idx * ck_tile::get_warp_size();
+        const int32_t cid = lane_idx + loop_idx * opus::get_warp_size();
 
         const int32_t cluster_work = (cid < num_clusters) ? p_cluster_work_counter[cid] : 0;
         const int32_t cum_cluster_work =
-            warp_prefix_sum(cluster_work, ck_tile::get_warp_size()) + scan_base;
-        scan_base = ck_tile::warp_shuffle(cum_cluster_work, ck_tile::get_warp_size() - 1);
+            warp_prefix_sum(cluster_work, opus::get_warp_size()) + scan_base;
+        scan_base = opus::shfl(cum_cluster_work, opus::get_warp_size() - 1);
 
         if(cid < num_clusters)
         {
@@ -476,7 +477,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         reinterpret_cast<MlaPartialTileInfo*>(p_cluster_work_counter + num_clusters);
     MlaPartialTileInfo* p_reduce_final_map = p_reduce_partial_map + tot_qo_tiles;
     for(int32_t cluster_q_idx = threadIdx.x; cluster_q_idx < tot_qo_tiles;
-        cluster_q_idx += ck_tile::get_warp_size())
+        cluster_q_idx += opus::get_warp_size())
     {
         p_reduce_partial_map[cluster_q_idx] = MlaPartialTileInfo{{-1, -2}};
         p_reduce_final_map[cluster_q_idx]   = MlaPartialTileInfo{{-1, -2}};
@@ -497,10 +498,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
             Traits::kIsSparse ? bid_ori * params.topk : params.p_seqlens_kv_indptr[bid_ori];
         const int32_t kv_batch_end  = kv_batch_start + kv_len;
         const int32_t packed_qo_len = qo_len * params.num_heads;
-        const int32_t num_qo_tiles  = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
-        const int32_t packed_qo_tile_len = ck_tile::min(packed_qo_len, cluster_len_q);
+        const int32_t num_qo_tiles  = integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t packed_qo_tile_len = opus::min(packed_qo_len, cluster_len_q);
         const int32_t qo_tile_len =
-            ck_tile::integer_divide_ceil(packed_qo_tile_len, params.num_heads);
+            integer_divide_ceil(packed_qo_tile_len, params.num_heads);
 
 #if PRINT_DBG
         if(lane_idx == 0)
@@ -546,10 +547,10 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     // Step.6. Output metadata for reduce kernel
     scan_base                     = 0;
     const int32_t num_loop_reduce = integer_divide_ceil_power2(
-        tot_qo_tiles, ck_tile::get_warp_size(), __builtin_ctz(ck_tile::get_warp_size()));
+        tot_qo_tiles, opus::get_warp_size(), __builtin_ctz(opus::get_warp_size()));
     for(int32_t loop_idx = 0; loop_idx < num_loop_reduce; ++loop_idx)
     {
-        const int32_t global_cluster_q_idx = lane_idx + loop_idx * ck_tile::get_warp_size();
+        const int32_t global_cluster_q_idx = lane_idx + loop_idx * opus::get_warp_size();
 
         MlaPartialTileInfo final_info;
         MlaPartialTileInfo partial_range;
@@ -569,9 +570,9 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         }
 
         const int32_t curr_cum_reduce_tiles =
-            warp_prefix_sum(num_reduce_tiles, ck_tile::get_warp_size()) + scan_base;
+            warp_prefix_sum(num_reduce_tiles, opus::get_warp_size()) + scan_base;
         const int32_t prev_cum_reduce_tiles = curr_cum_reduce_tiles - num_reduce_tiles;
-        scan_base = ck_tile::warp_shuffle(curr_cum_reduce_tiles, ck_tile::get_warp_size() - 1);
+        scan_base = opus::shfl(curr_cum_reduce_tiles, opus::get_warp_size() - 1);
 
         if(global_cluster_q_idx < tot_qo_tiles)
         {
@@ -591,7 +592,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     // reduce_indptr may be larger than #clusters.
     const int32_t num_reduce_tiles = scan_base;
     for(int32_t idx = tot_qo_tiles + 1 + lane_idx; idx < params.reduce_indptr_size;
-        idx += ck_tile::get_warp_size())
+        idx += opus::get_warp_size())
     {
         params.p_reduce_indptr[idx] = num_reduce_tiles;
     }
@@ -698,9 +699,11 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).")
 
+    const int32_t warp_size = dev_prop.warpSize;
     const int32_t lds_size_in_bytes = [&]() {
-        const int32_t qo_tile_per_batch = ck_tile::integer_divide_ceil(
-            ck_tile::max(max_seqlen_qo, 1) * num_heads, kPackedQoLenPerWg);
+        const int32_t max_sq = (max_seqlen_qo > 1) ? max_seqlen_qo : 1;
+        const int32_t qo_tile_per_batch = integer_divide_ceil(
+            max_sq * num_heads, kPackedQoLenPerWg);
         const int32_t tot_qo_tiles = num_batches * qo_tile_per_batch;
         // this is maximun #clusters
         const int32_t num_clusters = dev_prop.multiProcessorCount;
@@ -713,10 +716,10 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         lds_size += (num_batches + 1) * sizeof(int32_t);
         // LDS for sorting
         const int32_t power_2_num_batches =
-            (num_batches <= 1) ? num_batches : ck_tile::next_power_of_two(num_batches);
+            (num_batches <= 1) ? num_batches : next_power_of_two(num_batches);
         const int32_t lds_sort_size =
             lds_size +
-            ck_tile::integer_least_multiple(power_2_num_batches, ck_tile::get_warp_size()) * 2 *
+            integer_least_multiple(power_2_num_batches, warp_size) * 2 *
                 sizeof(int32_t);
         // Memory for cost. Its size should be the same as #clusters
         lds_size += num_clusters * sizeof(int32_t);
@@ -727,7 +730,7 @@ void get_mla_metadata_v1_1_device(const torch::Tensor& seqlens_qo_indptr, // [ba
         // Memory for range of output of partial memory
         lds_size += tot_qo_tiles * sizeof(MlaPartialTileInfo);
 
-        return ck_tile::max(lds_size, lds_sort_size);
+        return (lds_size > lds_sort_size) ? lds_size : lds_sort_size;
     }();
 
     TORCH_CHECK(lds_size_in_bytes <= dev_prop.maxSharedMemoryPerMultiProcessor,
