@@ -1432,12 +1432,13 @@ class AttentionProgram:
 
 
 # ============================================================================
+# Loop Variant 1:
 # Standard attention
 # Used with AsyncKVLoader, TDMKVLoader, or TDMGatherKVLoader.
 # ============================================================================
 
 @gluon.jit
-def attention_loop_double_buf(pgm, kv_loader, q, M, L, acc):
+def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
     """Double-buffered attention loop with safe/masked tile split."""
     physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
     next_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 1)
@@ -1496,13 +1497,14 @@ def attention_loop_double_buf(pgm, kv_loader, q, M, L, acc):
 
 
 # ============================================================================
-# Loop Variant 2: New-order 4-deep pipeline (from gather_new_order)
-# Used with TDMKVLoader or TDMGatherKVLoader.
+# Loop Variant 2:
+# qk / softmax1/ v LDS (1)
+# pv / softmax0 / k LDS (2)
+# branch loop
 # ============================================================================
 
 @gluon.jit
-def attention_loop_new_order(pgm, kv_loader, q, M, L, acc):
-    """4-deep pipeline: SM1+LR_V+PV / QK+SM0 / LR_K+GLDS_V / GLDS_K."""
+def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
     next_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 1)
     next2_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 2)
@@ -1601,8 +1603,14 @@ def attention_loop_new_order(pgm, kv_loader, q, M, L, acc):
 
 
 # ============================================================================
-# Loop Variant 3: Subtile split multi-buffer pipeline (from split_multi_buf)
+# Loop Variant 3: Subtile split multi-buffer pipeline
 # Used with TDMSubtileKVLoader only.
+# loop
+# qk0 / overlap k1 LDS
+# qk1 / overlap v0 LDS
+# pv0 / overlap v1 LDS
+# pv1 / overlap k1 LDS
+# branch loop
 # ============================================================================
 
 @gluon.jit
@@ -2063,13 +2071,13 @@ def kernel_unified_attention_2d(
         # Double-buffered loop (gather_shuffle style)
         gl.static_assert(NUM_BUFFERS == 2, "For loop variant 0, NUM_BUFFERS should be 2")
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
-        M, L, acc = attention_loop_double_buf(pgm, kv_loader, q, M, L, acc)
+        M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc)
 
     elif LOOP_VARIANT == 1:
         gl.static_assert(NUM_BUFFERS == 2, "For loop variant 1, NUM_BUFFERS should be 2")
         # New-order 4-deep pipeline
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
-        M, L, acc = attention_loop_new_order(pgm, kv_loader, q, M, L, acc)
+        M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
 
     elif LOOP_VARIANT == 2:
         gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 2, NUM_BUFFERS should be 2 or 3")
