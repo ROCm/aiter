@@ -21,6 +21,7 @@ def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
     O,
+    Final_lse,
     qo_indptr,
     kv_indptr,
     num_kv_splits_indptr,
@@ -29,7 +30,9 @@ def _fwd_kernel_stage2_asm(
     stride_mid_os: tl.int64,
     stride_obs: tl.int64,
     stride_oh: tl.int64,
+    stride_lse_bs: tl.int64,
     MAYBE_FINAL_OUT: tl.constexpr,
+    HAS_FINAL_LSE: tl.constexpr,
     BATCH_NUM: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -57,7 +60,6 @@ def _fwd_kernel_stage2_asm(
         if FINAL_OUT:
             input_ptr = Mid_O.to(tl.pointer_type(O.type.element_ty))
             out = tl.load(
-                # input_ptr + offs_v + stride_mid_ob * Lv,
                 input_ptr
                 + Lv * (cur_qo * stride_mid_os + cur_head * stride_mid_oh)
                 + offs_d,
@@ -96,6 +98,11 @@ def _fwd_kernel_stage2_asm(
                 acc / e_sum,
                 mask=mask_d,
             )
+            if HAS_FINAL_LSE:
+                tl.store(
+                    Final_lse + cur_qo * stride_lse_bs + cur_head,
+                    e_max + tl.log(e_sum),
+                )
 
 
 @functools.lru_cache()
@@ -277,10 +284,16 @@ def mla_decode_fwd(
         grid = (bs, nhead)
         extra_kargs = {"waves_per_eu": 4}
 
+        has_final_lse = final_lse is not None
+        final_lse_buf = final_lse if has_final_lse else torch.empty(
+            (1,), dtype=dtypes.fp32, device=device
+        )
+
         _fwd_kernel_stage2_asm[grid](
             logits,
             attn_lse,
             o,
+            final_lse_buf,
             qo_indptr,
             kv_indptr,
             num_kv_splits_indptr,
@@ -289,7 +302,9 @@ def mla_decode_fwd(
             attn_lse.stride(1),
             o.stride(0),
             o.stride(1),
+            final_lse_buf.stride(0) if has_final_lse else 0,
             MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
+            HAS_FINAL_LSE=has_final_lse,
             BATCH_NUM=bs,
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
