@@ -117,12 +117,14 @@ def get_flydsl_stage1_kernels(
                                         "waves_per_eu": wpe,
                                         "k_batch": kb,
                                         "b_nt": bnt,
-                                        "gate_mode": "mock_gate_only"
-                                        if go
-                                        else (
-                                            "interleave"
-                                            if a_dtype == "fp8"
-                                            else "separated"
+                                        "gate_mode": (
+                                            "mock_gate_only"
+                                            if go
+                                            else (
+                                                "interleave"
+                                                if a_dtype == "fp8"
+                                                else "separated"
+                                            )
                                         ),
                                         "xcd_swizzle": xcd,
                                     }

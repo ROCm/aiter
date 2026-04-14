@@ -442,9 +442,9 @@ def fused_moe_1stage(
                 num_rows=num_local_tokens,
             )
         else:
-            assert a1_scale is not None or quant_type == QuantType.No, (
-                "a1_scale must be provided for quantized input for fused_moe"
-            )
+            assert (
+                a1_scale is not None or quant_type == QuantType.No
+            ), "a1_scale must be provided for quantized input for fused_moe"
             a1 = hidden_states
             if quant_type == QuantType.per_1x128:
                 scale_t = torch.empty_like(a1_scale)
@@ -1260,9 +1260,9 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
     else:
-        assert a1_scale is not None or quant_type == QuantType.No, (
-            "a1_scale must be provided for quantized input for fused_moe"
-        )
+        assert (
+            a1_scale is not None or quant_type == QuantType.No
+        ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -1877,8 +1877,8 @@ def cktile_moe_stage2(
     k_pad_zeros=0,
     bias2=None,
 ):
-    token_num = a2.shape[0]
-    D = w2.shape[1]
+    a2.shape[0]
+    w2.shape[1]
 
     aiter.moe_cktile2stages_gemm2(
         a2,

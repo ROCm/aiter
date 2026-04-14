@@ -186,24 +186,37 @@ def c_shuffle_epilog(
             _if_g = scf.IfOp(_is_group_b)
             with ir.InsertionPoint(_if_g.then_block):
                 write_row_to_lds(
-                    mi=mi, ii=ii, row_in_tile=row_in_tile, row=row,
-                    row_base_lds=row_base_lds, col_base_local=col_base_local_b,
-                    num_acc_n=num_acc_n, lds_out=lds_out_split,
+                    mi=mi,
+                    ii=ii,
+                    row_in_tile=row_in_tile,
+                    row=row,
+                    row_base_lds=row_base_lds,
+                    col_base_local=col_base_local_b,
+                    num_acc_n=num_acc_n,
+                    lds_out=lds_out_split,
                 )
                 scf.YieldOp([])
             with ir.InsertionPoint(_if_g.else_block):
                 write_row_to_lds(
-                    mi=mi, ii=ii, row_in_tile=row_in_tile, row=row,
-                    row_base_lds=row_base_lds, col_base_local=col_base_local_a,
-                    num_acc_n=num_acc_n, lds_out=lds_out,
+                    mi=mi,
+                    ii=ii,
+                    row_in_tile=row_in_tile,
+                    row=row,
+                    row_base_lds=row_base_lds,
+                    col_base_local=col_base_local_a,
+                    num_acc_n=num_acc_n,
+                    lds_out=lds_out,
                 )
                 scf.YieldOp([])
 
         gpu.barrier()
         default_epilog(
-            arith=arith, range_constexpr=range_constexpr,
-            m_repeat=m_repeat, lane_div_16=lane_div_16,
-            bx_m=bx_m, body_row=_write_row_split,
+            arith=arith,
+            range_constexpr=range_constexpr,
+            m_repeat=m_repeat,
+            lane_div_16=lane_div_16,
+            bx_m=bx_m,
+            body_row=_write_row_split,
         )
         gpu.barrier()
 
@@ -227,7 +240,8 @@ def c_shuffle_epilog(
             row = bx_m_v + row_local
             row_ctx_raw = (
                 precompute_row(row_local=row_local, row=row)
-                if precompute_row is not None else None
+                if precompute_row is not None
+                else None
             )
             row_ctx = row_ctx_raw
             row_pred = None
@@ -265,8 +279,11 @@ def c_shuffle_epilog(
                         _is_group_b, _half_n_idx, _zero_idx
                     )
                     store_pair(
-                        row_local=row_local, row=row, row_ctx=row_ctx,
-                        col_pair0=col_pair0, col_g0=by_n_v + col_pair0,
+                        row_local=row_local,
+                        row=row,
+                        row_ctx=row_ctx,
+                        col_pair0=col_pair0,
+                        col_g0=by_n_v + col_pair0,
                         frag=frag,
                     )
 

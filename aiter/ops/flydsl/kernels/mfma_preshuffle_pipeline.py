@@ -620,12 +620,14 @@ def _cvt_scalef32_pk_bf16_fp4(packed_i32, scale_f32, byte_idx, arith, vector):
         T.vec(2, T.bf16),
         "llvm.amdgcn.cvt.scalef32.pk.bf16.fp4",
         [packed_i32, scale_f32, byte_idx_i32],
-        [], [],
+        [],
+        [],
     )
     vec1_i32_t = T.vec(1, T.i32)
     return vector.extract(
         vector.bitcast(vec1_i32_t, result_v2bf16),
-        static_position=[0], dynamic_position=[],
+        static_position=[0],
+        dynamic_position=[],
     )
 
 
@@ -679,7 +681,8 @@ def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, vector, scale_f32=None):
         is_subnorm = arith.cmpi(arith.CmpIPredicate.eq, unsigned_val, c1)
 
         f32_bits = arith.select(
-            is_zero, c_zero,
+            is_zero,
+            c_zero,
             arith.select(is_subnorm, c_half_bits, f32_norm),
         )
         f32_bits = arith.ori(f32_bits, arith.shli(sign_bit, c31))
@@ -813,8 +816,7 @@ def load_b_raw_mxfp4_dwordx4(
     return vector.bitcast(T.vec(4, T.i32), b16)
 
 
-def unpack_b_mxfp4_bf16(packed32, arith, vector, scale_f32=None,
-                        use_hw_cvt=True):
+def unpack_b_mxfp4_bf16(packed32, arith, vector, scale_f32=None, use_hw_cvt=True):
     """Unpack 8 FP4 E2M1 nibbles (packed in i32) to 2 x i64 (8 bf16).
 
     Each byte of *packed32* holds two FP4 nibbles: low nibble = K_even,
@@ -889,9 +891,20 @@ def _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32):
     return (b0, b1)
 
 
-def load_e8m0_scale_f32(buffer_ops, arith, vector, *, rsrc, scale_layout,
-                        ku, mni, lane_div_16, lane_mod_16,
-                        mn_pack=2, k_pack=2):
+def load_e8m0_scale_f32(
+    buffer_ops,
+    arith,
+    vector,
+    *,
+    rsrc,
+    scale_layout,
+    ku,
+    mni,
+    lane_div_16,
+    lane_mod_16,
+    mn_pack=2,
+    k_pack=2,
+):
     """Load E8M0 scale bytes and decode to f32 = 2^(e - 127).
 
     The scale buffer is pre-shuffled by ``shuffle_scale_a16w4`` into the
@@ -914,10 +927,12 @@ def load_e8m0_scale_f32(buffer_ops, arith, vector, *, rsrc, scale_layout,
 
     Returns a list of ``k_pack`` f32 SSA values (one per K sub-position).
     """
-    idx = (mni * scale_layout.stride_n0
-           + ku * scale_layout.stride_k0
-           + lane_div_16 * scale_layout.stride_klane
-           + lane_mod_16)
+    idx = (
+        mni * scale_layout.stride_n0
+        + ku * scale_layout.stride_k0
+        + lane_div_16 * scale_layout.stride_klane
+        + lane_mod_16
+    )
     raw_i32 = buffer_ops.buffer_load(rsrc, idx, vec_width=1, dtype=T.i32)
 
     vec4_i8 = T.i8x4

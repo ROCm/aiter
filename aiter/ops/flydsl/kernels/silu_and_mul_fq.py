@@ -153,6 +153,7 @@ def build_silu_and_mul_fq_module(
         is_valid = arith.andi(row_in_range, arith.andi(t_ok, s_ok))
 
         if _need_fp4:
+
             def _f32_to_e2m1(qx_f32):
                 qx = qx_f32.bitcast(i32)
                 s = qx & c0x80000000_i32
@@ -279,9 +280,7 @@ def build_silu_and_mul_fq_module(
                         max_i32_v = local_max.bitcast(i32)
                         max_rounded = (max_i32_v + c0x200000_i32) & c0xFF800000_i32
                         exp_field = max_rounded >> c23_i32
-                        e8m0_biased = arith.maxsi(
-                            exp_field - c_headroom_i32, c0_i32
-                        )
+                        e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(f32)
 
@@ -309,18 +308,24 @@ def build_silu_and_mul_fq_module(
                             if _pack_bytes == 1:
                                 store_val = arith.TruncIOp(T.i8, packed_i32)
                                 buffer_ops.buffer_store(
-                                    store_val, out_rsrc, out_byte_off,
+                                    store_val,
+                                    out_rsrc,
+                                    out_byte_off,
                                     offset_is_bytes=True,
                                 )
                             elif _pack_bytes == 2:
                                 store_val = arith.TruncIOp(T.i16, packed_i32)
                                 buffer_ops.buffer_store(
-                                    store_val, out_rsrc, out_byte_off,
+                                    store_val,
+                                    out_rsrc,
+                                    out_byte_off,
                                     offset_is_bytes=True,
                                 )
                             else:
                                 buffer_ops.buffer_store(
-                                    packed_i32, out_rsrc, out_byte_off,
+                                    packed_i32,
+                                    out_rsrc,
+                                    out_byte_off,
                                     offset_is_bytes=True,
                                 )
                         else:
@@ -337,19 +342,25 @@ def build_silu_and_mul_fq_module(
                                 packed_i32 = c0_i32
                                 for _w in range_constexpr(VEC // 2):
                                     packed_i32 = rocdl.cvt_pk_fp8_f32(
-                                        i32, scaled_vals[2 * _w],
+                                        i32,
+                                        scaled_vals[2 * _w],
                                         scaled_vals[2 * _w + 1],
-                                        packed_i32, _w,
+                                        packed_i32,
+                                        _w,
                                     )
                                 if VEC == 2:
                                     store_val = arith.TruncIOp(T.i16, packed_i32)
                                     buffer_ops.buffer_store(
-                                        store_val, out_rsrc, out_byte_off,
+                                        store_val,
+                                        out_rsrc,
+                                        out_byte_off,
                                         offset_is_bytes=True,
                                     )
                                 else:
                                     buffer_ops.buffer_store(
-                                        packed_i32, out_rsrc, out_byte_off,
+                                        packed_i32,
+                                        out_rsrc,
+                                        out_byte_off,
                                         offset_is_bytes=True,
                                     )
                             else:
@@ -357,20 +368,26 @@ def build_silu_and_mul_fq_module(
                                     _b = _wg * 4
                                     packed_w = c0_i32
                                     packed_w = rocdl.cvt_pk_fp8_f32(
-                                        i32, scaled_vals[_b],
+                                        i32,
+                                        scaled_vals[_b],
                                         scaled_vals[_b + 1],
-                                        packed_w, 0,
+                                        packed_w,
+                                        0,
                                     )
                                     packed_w = rocdl.cvt_pk_fp8_f32(
-                                        i32, scaled_vals[_b + 2],
+                                        i32,
+                                        scaled_vals[_b + 2],
                                         scaled_vals[_b + 3],
-                                        packed_w, 1,
+                                        packed_w,
+                                        1,
                                     )
                                     word_off = out_byte_off + arith.constant(
                                         _wg * 4, type=i32
                                     )
                                     buffer_ops.buffer_store(
-                                        packed_w, out_rsrc, word_off,
+                                        packed_w,
+                                        out_rsrc,
+                                        word_off,
                                         offset_is_bytes=True,
                                     )
 
@@ -388,13 +405,18 @@ def build_silu_and_mul_fq_module(
                             d4 = (col_s >> c2_i32) & c1_i32
                             d5 = col_s & c3_i32
                             s_byte_off = (
-                                d0 * n32_sort + d3 * c256_i32
-                                + d5 * c64_i32 + d2 * c4_i32
-                                + d4 * c2_i32 + d1
+                                d0 * n32_sort
+                                + d3 * c256_i32
+                                + d5 * c64_i32
+                                + d2 * c4_i32
+                                + d4 * c2_i32
+                                + d1
                             )
                             e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
                             buffer_ops.buffer_store(
-                                e8m0_i8, scale_rsrc, s_byte_off,
+                                e8m0_i8,
+                                scale_rsrc,
+                                s_byte_off,
                                 offset_is_bytes=True,
                             )
                             scf.YieldOp([])
@@ -419,13 +441,9 @@ def build_silu_and_mul_fq_module(
                             store_scalar = vector.extract(
                                 act_i32, static_position=[0], dynamic_position=[]
                             )
-                            buffer_ops.buffer_store(
-                                store_scalar, out_rsrc, out_dw_off
-                            )
+                            buffer_ops.buffer_store(store_scalar, out_rsrc, out_dw_off)
                         else:
-                            buffer_ops.buffer_store(
-                                act_i32, out_rsrc, out_dw_off
-                            )
+                            buffer_ops.buffer_store(act_i32, out_rsrc, out_dw_off)
 
                     scf.YieldOp([])
 
@@ -445,13 +463,18 @@ def build_silu_and_mul_fq_module(
                             d4_p = (col_s_p >> c2_i32) & c1_i32
                             d5_p = col_s_p & c3_i32
                             s_byte_off_p = (
-                                d0_p * n32_sort + d3_p * c256_i32
-                                + d5_p * c64_i32 + d2_p * c4_i32
-                                + d4_p * c2_i32 + d1_p
+                                d0_p * n32_sort
+                                + d3_p * c256_i32
+                                + d5_p * c64_i32
+                                + d2_p * c4_i32
+                                + d4_p * c2_i32
+                                + d1_p
                             )
                             c0_i8 = arith.TruncIOp(T.i8, c0_i32)
                             buffer_ops.buffer_store(
-                                c0_i8, scale_rsrc, s_byte_off_p,
+                                c0_i8,
+                                scale_rsrc,
+                                s_byte_off_p,
                                 offset_is_bytes=True,
                             )
                             scf.YieldOp([])
