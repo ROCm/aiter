@@ -34,9 +34,7 @@ def _default_cuda_device_index():
 def _get_shared_memory_per_block_cached(device_index: int, fallback_gfx: str) -> int:
     try:
         props = torch.cuda.get_device_properties(device_index)
-        shared_memory_per_block = int(
-            getattr(props, "shared_memory_per_block", 0) or 0
-        )
+        shared_memory_per_block = int(getattr(props, "shared_memory_per_block", 0) or 0)
         if shared_memory_per_block > 0:
             return shared_memory_per_block
         return addressable_lds_bytes_for_gfx(
