@@ -14,8 +14,9 @@ import torch
 from .chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_h_opt,
+    chunk_gated_delta_rule_fwd_h_opt_vk,
 )
-from .chunk_o import chunk_fwd_o, chunk_fwd_o_opt
+from .chunk_o import chunk_fwd_o, chunk_fwd_o_opt, chunk_fwd_o_opt_vk
 from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
 from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
 from ..utils import (
@@ -182,6 +183,79 @@ def chunk_gated_delta_rule_fwd_opt(
 
     # Step 4: Compute output (directly in [B, T, H, V] layout)
     o = chunk_fwd_o_opt(
+        q=q,
+        k=k,
+        v=v_new,
+        h=h,
+        g=g_cumsum,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+    )
+
+    return g_cumsum, o, final_state
+
+
+def chunk_gated_delta_rule_fwd_opt_vk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    cu_seqlens: torch.LongTensor | None = None,
+):
+    """
+    Optimized chunk gated delta rule forward with h layout [V, K].
+
+    Uses the same fused K12/K34 kernels as opt, but K5/K6 use transposed
+    h layout [V, K] instead of [K, V].
+
+    Args:
+        q: [B, T, Hg, K]
+        k: [B, T, Hg, K]
+        v: [B, T, H, V]
+        g: [B, T, H] — raw gate (pre-cumsum)
+        beta: [B, T, H]
+        scale: float
+        initial_state: [N, H, V, K] — note transposed h layout
+        output_final_state: bool
+        cu_seqlens: [N+1] optional
+
+    Returns:
+        tuple: (g_cumsum, o, final_state) where:
+            - g_cumsum: [B, T, H]
+            - o: [B, T, H, V]
+            - final_state: [N, H, V, K] if output_final_state=True, else None
+    """
+    g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
+        k=k,
+        beta=beta,
+        g=g,
+        cu_seqlens=cu_seqlens,
+    )
+
+    w, u = fused_solve_tril_recompute_w_u(
+        A_raw=A_raw,
+        k=k,
+        v=v,
+        beta=beta,
+        g_cumsum=g_cumsum,
+        cu_seqlens=cu_seqlens,
+    )
+
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
+        k=k,
+        w=w,
+        u=u,
+        g=g_cumsum,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
+
+    o = chunk_fwd_o_opt_vk(
         q=q,
         k=k,
         v=v_new,

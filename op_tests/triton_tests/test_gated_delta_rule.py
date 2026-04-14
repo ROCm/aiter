@@ -11,6 +11,7 @@ from aiter.ops.triton.gated_delta_net import (
     fused_recurrent_gated_delta_rule,
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
+    chunk_gated_delta_rule_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -718,3 +719,187 @@ def test_chunk_opt_varlen(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(
+                *test
+            ),
+        )
+        for test in [
+            (1, 63, 1, 64, 1, 1, 0, False, torch.float16),
+            (2, 500, 3, 60, 1, 1, 0, False, torch.float16),
+            (2, 1000, 3, 64, 0.1, 1, 0.5, False, torch.float16),
+            (3, 1024, 4, 100, 1, 0.1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.float16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.float16),
+            (2, 1500, 4, 128, 0.1, 10, 0, False, torch.float16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.float16),
+            (2, 500, 3, 60, 1, 1, 0, False, torch.bfloat16),
+            (2, 1000, 3, 64, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.bfloat16),
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk_opt_vk(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+):
+    torch.manual_seed(42)
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule_opt_vk is not supported on alchemist for D>128"
+        )
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    g = g * (torch.rand_like(g) > mask_p)
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    )
+
+    # opt_vk expects initial_state in [N, H, V, K] layout
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=(
+            F.normalize(q.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else q.clone()
+        ),
+        k=(
+            F.normalize(k.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else k.clone()
+        ),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone().transpose(-1, -2).contiguous(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    # ref_ht is [B, H, K, V], tri_ht is [N, H, V, K]
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "dtype"),
+    [
+        pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 60, 0, [0, 15], torch.float16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.float16),
+            (4, 64, 0.5, [0, 256, 500, 1000], torch.float16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.float16),
+            (4, 60, 0, [0, 15], torch.bfloat16),
+            (4, 64, 0, [0, 256, 500, 1000], torch.bfloat16),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_vk_varlen because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_opt_vk_varlen(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+):
+    if IS_INTEL_ALCHEMIST and D > 128:
+        pytest.skip(
+            reason="chunk_gated_delta_rule_opt_vk is not supported on alchemist for D>128"
+        )
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = g * (torch.rand_like(g) > mask_p)
+    beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
+    h0 = torch.randn((N, H, D, D), dtype=dtype)
+
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    )
+
+    # opt_vk expects initial_state in [N, H, V, K] layout
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        initial_state=h0.clone().transpose(-1, -2).contiguous(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
+            q=q[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
+
+    assert_close("o", ref, tri, 0.005)
+    # ref_ht is [N, H, K, V], tri_ht is [N, H, V, K]
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)

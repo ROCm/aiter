@@ -11,6 +11,7 @@ This module provides high-level Triton implementations for gated delta rule.
 from .gated_delta_rule import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
+    chunk_gated_delta_rule_opt_vk,
     fused_recurrent_gated_delta_rule,
 )
 
@@ -18,4 +19,5 @@ __all__ = [
     "fused_recurrent_gated_delta_rule",
     "chunk_gated_delta_rule",
     "chunk_gated_delta_rule_opt",
+    "chunk_gated_delta_rule_opt_vk",
 ]
