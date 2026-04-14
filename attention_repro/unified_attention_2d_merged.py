@@ -13,7 +13,7 @@ from triton.language.core import PropagateNan
 float8_info = torch.finfo(e4m3_dtype)
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
-_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.NONE)
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
 
 @gluon.jit
