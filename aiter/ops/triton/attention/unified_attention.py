@@ -249,10 +249,6 @@ def unified_attention(
     num_tokens, num_query_heads, head_size = q.shape
     K_WIDTH = 0
     if shuffled_kv_cache:
-        # key_cache: num_blocks, num_kv_heads, block_size, head_size
-        # value_cache: num_blocks, num_kv_heads, head_size, block_size
-        # num_blocks, num_kv_heads, block_size, _ = k.shape
-
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
         num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
@@ -312,7 +308,10 @@ def unified_attention(
             shuffled_kv_cache,
         )
         assert config["BLOCK_Q"] >= 1
-        total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
+        if ALL_DECODE:
+            total_num_q_blocks = num_seqs
+        else:
+            total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
         kernel_unified_attention_2d[
             (
