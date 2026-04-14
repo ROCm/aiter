@@ -58,6 +58,7 @@ def perftest(
                 end_evt.record()
                 end_evt.synchronize()
                 avg = start_evt.elapsed_time(end_evt) * 1000
+                torch.cuda.empty_cache()
                 return data, avg
 
             num = num_rotate_args

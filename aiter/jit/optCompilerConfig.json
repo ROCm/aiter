@@ -1,7 +1,7 @@
 {
-    "module_aiter_enum": {
+    "module_aiter_core": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/aiter_enum_pybind.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/aiter_core_pybind.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -22,9 +22,7 @@
             "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -150,18 +148,14 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'",
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
     "module_custom_all_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_communication.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -197,7 +191,6 @@
     },
     "module_gemm_common": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/gemm_common_pybind.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'"
         ],
         "flags_extra_cc": [],
@@ -420,25 +413,13 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m fp8gemm_blockscale --output_dir {{}}'"
     },
-    "module_gemm_mi350_a8w8_blockscale_asm": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mi350_a8w8_blockscale.cu'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "blob_gen_cmd": "''"
-    },
     "module_moe_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_op_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -446,6 +427,16 @@
         "extra_include": [
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
+        "verbose": "False"
+    },
+    "module_moe_topksoftmax_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_topksoftmax.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m topksoftmax --output_dir {{}}'"
@@ -569,17 +560,6 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
-    "module_asm_layernorm": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_layernorm.cu'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "verbose": "False",
-        "blob_gen_cmd": "''"
-    },
     "module_pos_encoding": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/pos_encoding_pybind.cu'",
@@ -618,6 +598,37 @@
         "flags_extra_hip": [
             "'-ffast-math'",
             "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_fused_qk_rmsnorm_group_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/fused_qk_rmsnorm_group_quant.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/fused_qk_rmsnorm_group_quant_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_gated_rmsnorm_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/gated_rmsnorm_quant_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/gated_rmsnorm_quant_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -803,9 +814,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -825,11 +834,11 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_rope_general_fwd": {
+    "module_rope_1c_uncached_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/rope_general_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_uncached_fwd_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/rope/general_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_uncached_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -838,11 +847,11 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_rope_general_bwd": {
+    "module_rope_2c_uncached_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/rope_general_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_uncached_fwd_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/rope/general_bwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_uncached_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -851,11 +860,180 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_rope_pos_fwd": {
+    "module_rope_1c_cached_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/rope_pos_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_cached_fwd_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
-            "f'{AITER_CSRC_DIR}/kernels/rope/pos_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_cached_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_thd_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_thd_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_thd_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_2d_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_2d_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_2d_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_uncached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_uncached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_uncached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_uncached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_uncached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_uncached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_cached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_cached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_2c_cached_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_thd_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_thd_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_thd_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_2d_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_general_1c_2d_bwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_2d_bwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_cached_positions_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_1c_cached_positions_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_positions_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_positions_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_2c_cached_positions_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_positions_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_1c_cached_positions_offsets_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_1c_cached_positions_offsets_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_1c_cached_positions_offsets_fwd_kernels.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rope_2c_cached_positions_offsets_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/rope_2c_cached_positions_offsets_fwd_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -1271,10 +1449,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [
-            "f'{AITER_CSRC_DIR}/include/ck_tile'",
-            "f'{AITER_CSRC_DIR}/include/opus'"
-        ],
+        "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -1295,8 +1470,11 @@
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/fused_split_gdr_update.cu'"
         ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_cc": [
+        ],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",

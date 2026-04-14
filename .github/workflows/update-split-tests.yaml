@@ -21,7 +21,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  actions: read
+  actions: write
 
 jobs:
   update:
@@ -71,6 +71,7 @@ jobs:
 
       - name: Create Pull Request
         if: steps.update_times.outputs.changed == 'true'
+        id: create_pr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ github.token }}
@@ -80,3 +81,20 @@ jobs:
           body-path: pr-body.md
           commit-message: "CI: auto-update split test FILE_TIMES"
           delete-branch: true
+
+      - name: Dispatch CI workflows
+        if: steps.update_times.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.create_pr.outputs['pull-request-branch'] || 'ci/update-split-tests-file-times' }}
+        run: |
+          set -euo pipefail
+
+          gh workflow run pre-checks.yaml --repo "${REPO}" --ref "${BRANCH}"
+
+          # Downstream workflows poll for the checks artifact, so a short
+          # delay reduces races between dispatch and artifact publication.
+          sleep 60
+
+          gh workflow run aiter-test.yaml --repo "${REPO}" --ref "${BRANCH}"
+          gh workflow run triton-test.yaml --repo "${REPO}" --ref "${BRANCH}"
