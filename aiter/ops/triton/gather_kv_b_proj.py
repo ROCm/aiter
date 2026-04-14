@@ -14,17 +14,19 @@ def gather_kv_b_proj(
     kv_indptr: torch.Tensor,  # [batch_size + 1]
     kv_indices: torch.Tensor,  # len(kv_indices) = kv_indptr[-1]
     kv_prefix_sum_context_lens: torch.Tensor,  # [batch_size + 1]
-    kv_proj_weight: torch.Tensor,  # [2 * 128 // TP * 128, 512]
+    kv_proj_weight: torch.Tensor,  # [tp_heads * (qk_nope_head_dim + v_head_dim), kv_c_dim]
     kv_proj_scale: torch.Tensor,  # [weight_n] per-output-row, or [N//128, K//128] block
     k_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim + kv_pe_dim]
-    v_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, qk_nope_head_dim]
+    v_prefix: torch.Tensor,  # [total_kv, tp_k_head_num, v_head_dim]
     weight_preshuffle: bool = False,
 ):
     num_block, block_size, hidden_dim = k_buffer.shape
     batch_size = kv_indptr.shape[0] - 1
     weight_n, weight_k = kv_proj_weight.shape
     total_kv_k, tp_k_head_num_k, qk_nope_pe_dim = k_prefix.shape
-    total_kv_v, tp_k_head_num_v, qk_nope_dim = v_prefix.shape
+    total_kv_v, tp_k_head_num_v, v_head_dim = v_prefix.shape
+
+    qk_nope_head_dim = weight_n // tp_k_head_num_k - v_head_dim
 
     per_row_scale = kv_proj_scale.dim() == 1 or (
         kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
@@ -61,9 +63,10 @@ def gather_kv_b_proj(
         v_prefix,
         KBlockSize=block_size,
         TpNumHeads=tp_k_head_num_k,
-        QkNopeHeadDim=qk_nope_dim,
+        QkNopeHeadDim=qk_nope_head_dim,
+        VHeadDim=v_head_dim,
         KV_CDim=weight_k,
-        KV_PeDim=qk_nope_pe_dim - qk_nope_dim,
+        KV_PeDim=qk_nope_pe_dim - qk_nope_head_dim,
         ChunkK=ChunkK,
         WEIGHT_PRESHUFFLE=weight_preshuffle,
         PER_ROW_SCALE=per_row_scale,
