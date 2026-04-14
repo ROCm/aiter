@@ -9,15 +9,21 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
-from aiter.ops.triton.gluon.unified_attention_3d import (
-    _unified_attention_gluon_kernel_3d,
-)
+
+try:
+    from aiter.ops.triton.gluon.unified_attention_3d import (
+        _unified_attention_gluon_kernel_3d,
+    )
+except:
+    _unified_attention_gluon_kernel_3d = None
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+if IS_DEVICE_ARCH_GFX12:
+    assert _unified_attention_gluon_kernel_3d is not None
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
