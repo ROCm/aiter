@@ -1877,9 +1877,6 @@ def cktile_moe_stage2(
     k_pad_zeros=0,
     bias2=None,
 ):
-    a2.shape[0]
-    w2.shape[1]
-
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,

@@ -3087,7 +3087,7 @@ class FmoeTuner(TunerCommon):
                     )
 
                     def _act_to_fp8(x):
-                        torch.ones(
+                        _scale_tmp = torch.ones(
                             [x.shape[0], x.shape[1] // 32],
                             dtype=dtypes.fp8_e8m0,
                             device=x.device,
