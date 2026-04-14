@@ -59,7 +59,7 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
             else:
                 actual_timeout = 10
 
-            task_result = async_result.get(timeout=actual_timeout)
+            async_result.get(timeout=actual_timeout)
             completed_this_round.append((k, async_result))
             consecutive_timeouts = 0
 
