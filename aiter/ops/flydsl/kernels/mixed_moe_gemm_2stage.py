@@ -4023,6 +4023,7 @@ def compile_mixed_moe_gemm2(
 
         n_in = arith.index_cast(T.index, i32_n_in)
         gx = n_in / arith.constant(tile_n, index=True)
+        gy = arith.constant(0, index=True)
         if _persistent:
             gy = arith.constant(_cu_num, index=True)
         else:
