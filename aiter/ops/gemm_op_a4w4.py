@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 from typing import Optional
 
 import pandas as pd
 import torch
-from torch import Tensor
-
 from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from torch import Tensor
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
@@ -32,10 +31,9 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config(M: int, N: int, K: int):
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
     if not hasattr(get_GEMM_config, "gemm_dict"):
-        gemm_dict = pd.read_csv(
-            AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
-        ).drop_duplicates()
+        gemm_dict = pd.read_csv(tuned_file).drop_duplicates()
         get_GEMM_config.gemm_dict = gemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
@@ -53,7 +51,7 @@ def get_GEMM_config(M: int, N: int, K: int):
             break
     else:
         logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in CKGEMM or asmGEMM, will use default config!"
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
     return config
 
@@ -137,36 +135,53 @@ def gemm_a4w4(
     return out[:m].view(*A.shape[:-1], n)
 
 
-def gen_gemm_a4w4_asm_fake_tensors(
+@compile_ops(
+    "module_gemm_a4w4_asm",
+    fc_name="gemm_a4w4_asm",
+    ffi_type="ctypes",
+)
+def _gemm_a4w4_asm(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: str,
+    kernelName: Optional[str] = None,
     bias: Optional[Tensor] = None,  # bias:[1, N] f32
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    log2_k_split: Optional[int] = None,
-) -> Tensor:
-    return out
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    bpreshuffle: int = 1,
+    log2_k_split: int = 0,
+) -> None: ...
 
 
-@compile_ops("module_gemm_a4w4_asm", gen_fake=gen_gemm_a4w4_asm_fake_tensors)
 def gemm_a4w4_asm(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: str,
+    kernelName: str = "",
     bias: Optional[Tensor] = None,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
     log2_k_split: Optional[int] = None,
-) -> Tensor: ...
+) -> Tensor:
+    _gemm_a4w4_asm(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        kernelName if kernelName else None,
+        bias,
+        alpha if alpha is not None else 1.0,
+        beta if beta is not None else 0.0,
+        int(bpreshuffle) if bpreshuffle is not None else 1,
+        log2_k_split if log2_k_split is not None else 0,
+    )
+    return out
 
 
 def gen_gemm_a4w4_blockscale_fake_tensors(

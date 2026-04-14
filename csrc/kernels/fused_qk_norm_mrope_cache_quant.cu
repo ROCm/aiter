@@ -45,7 +45,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(Tensor& qkv,
                                                     bool return_kv,
                                                     bool use_shuffle_layout,
                                                     int64_t block_size,
-                                                    int64_t x)
+                                                    int64_t x,
+                                                    int64_t rotary_dim)
 {
     TORCH_CHECK(mrope_section_.size() == 3);
     TORCH_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
@@ -102,7 +103,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(Tensor& qkv,
                                                              v_out_ptr,
                                                              use_shuffle_layout,
                                                              block_size,
-                                                             x);
+                                                             x,
+                                                             rotary_dim);
             }
             else
             {
@@ -145,7 +147,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(Tensor& qkv,
                         v_out_fp8_ptr,
                         use_shuffle_layout,
                         block_size,
-                        x);
+                        x,
+                        rotary_dim);
                 }
                 else if(kv_cache_dtype == at::ScalarType::Float8_e4m3fn)
                 {
@@ -185,7 +188,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(Tensor& qkv,
                         v_out_fp8_ptr,
                         use_shuffle_layout,
                         block_size,
-                        x);
+                        x,
+                        rotary_dim);
                 }
                 else
                 {

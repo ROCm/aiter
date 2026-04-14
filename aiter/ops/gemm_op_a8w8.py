@@ -20,6 +20,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+from ..ops.flydsl.utils import is_flydsl_available
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -56,6 +57,7 @@ def gen_gemm_a8w8_bpreshuffle_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor:
     return Out
 
@@ -71,6 +73,7 @@ def gemm_a8w8_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -80,6 +83,7 @@ def gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor:
     return Out
 
@@ -95,39 +99,94 @@ def gemm_a8w8_bpreshuffle_cktile(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
+    splitK: int = 0,
 ) -> Tensor: ...
 
 
-def gen_gemm_a8w8_asm_fake_tensors(
-    XQ: Tensor,  # A:[M, K] i8
-    WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(32,16)
-    x_scale: Tensor,  # A_scale:[M, 1] f32
-    w_scale: Tensor,  # B_scale:[1, N] f32
-    Out: Tensor,  # Out:[M, N] bf16
-    kernelName: str,
-    bias: Optional[Tensor],  # bias:[1, N] f32
-    bpreshuffle: Optional[bool] = True,
-    splitK: Optional[int] = None,
-) -> torch.Tensor:
+def gemm_a8w8_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+    from .flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+        kernels_list as kernels_list_flydsl,
+    )
+
+    kernel_id = config.get("kernelId")
+    if kernel_id is not None and kernel_id in kernels_list_flydsl:
+        ki = kernels_list_flydsl[kernel_id]
+        tm, tn, tk = ki.tile_m, ki.tile_n, ki.tile_k
+        lds, csh, acp, wpe = (
+            ki.lds_stage,
+            ki.use_cshuffle_epilog,
+            ki.use_async_copy,
+            ki.waves_per_eu,
+        )
+    else:
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+
+    flydsl_preshuffle_gemm_a8(
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale,
+        w_scale,
+        Out,
+        tm,
+        tn,
+        tk,
+        lds,
+        csh,
+        acp,
+        wpe,
+    )
     return Out
 
 
 @compile_ops(
     "module_gemm_a8w8_asm",
     fc_name="gemm_a8w8_asm",
-    gen_fake=gen_gemm_a8w8_asm_fake_tensors,
+    ffi_type="ctypes",
 )
-def gemm_a8w8_asm(
+def _gemm_a8w8_asm(
     XQ: Tensor,  # A:[M, K] i8
     WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(32,16)
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
-    kernelName: str,
-    bias: Optional[Tensor],  # bias:[1, N] f32
+    kernelName: Optional[str] = None,
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    bpreshuffle: bool = True,
+    splitK: int = -1,
+) -> None: ...
+
+
+def gemm_a8w8_asm(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    kernelName: str = "",
+    bias: Optional[Tensor] = None,
     bpreshuffle: Optional[bool] = True,
     splitK: Optional[int] = None,
-) -> torch.Tensor: ...
+) -> Tensor:
+    _gemm_a8w8_asm(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Out,
+        kernelName if kernelName else None,
+        bias,
+        bool(bpreshuffle) if bpreshuffle is not None else True,
+        splitK if splitK is not None else -1,
+    )
+    return Out
 
 
 def gen_gemm_a8w8_blockscale_ck_fake_tensors(
@@ -198,49 +257,48 @@ def gemm_a8w8_blockscale_bpreshuffle_cktile(
 ) -> torch.Tensor: ...
 
 
-def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
+@compile_ops(
+    "module_gemm_a8w8_blockscale_asm",
+    fc_name="flatmm_a8w8_blockscale_asm",
+    ffi_type="ctypes",
+)
+def _flatmm_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor:
-    return out
-
-
-@compile_ops(
-    "module_gemm_a8w8_blockscale_asm",
-    fc_name="flatmm_a8w8_blockscale_asm",
-    gen_fake=gen_flatmm_a8w8_blockscale_asm_fake_tensors,
-)
+) -> None: ...
 def flatmm_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor: ...
-
-
-def gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors(
-    A: Tensor,
-    B: Tensor,
-    out: Tensor,
-    A_scale: Tensor,
-    B_scale: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
-    bpreshuffle: Optional[bool] = True,
 ) -> Tensor:
+    _flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, out)
     return out
 
 
 @compile_ops(
     "module_gemm_a8w8_blockscale_bpreshuffle_asm",
     fc_name="gemm_a8w8_blockscale_bpreshuffle_asm",
-    gen_fake=gen_gemm_a8w8_blockscale_bpreshuffle_asm_fake_tensors,
+    ffi_type="ctypes",
 )
+def _gemm_a8w8_blockscale_bpreshuffle_asm(
+    A: Tensor,
+    B: Tensor,
+    out: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    splitK: int = -1,
+    kernelName: Optional[str] = None,
+    bpreshuffle: int = 1,
+    zero_bias_buf: Optional[Tensor] = None,
+) -> None: ...
+
+
 def gemm_a8w8_blockscale_bpreshuffle_asm(
     A: Tensor,
     B: Tensor,
@@ -251,31 +309,23 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     splitK: Optional[int] = None,
     kernelName: Optional[str] = None,
     bpreshuffle: Optional[bool] = True,
-) -> Tensor: ...
-
-
-def gen_gfx950_a8w8_blockscale_asm_fake_tensors(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
+    zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
+    if bias is None and zero_bias_buf is None:
+        zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
+    _gemm_a8w8_blockscale_bpreshuffle_asm(
+        A,
+        B,
+        out,
+        A_scale,
+        B_scale,
+        bias,
+        splitK if splitK is not None else -1,
+        kernelName,
+        int(bpreshuffle) if bpreshuffle is not None else 1,
+        zero_bias_buf,
+    )
     return out
-
-
-@compile_ops(
-    "module_gemm_gfx950_a8w8_blockscale_asm",
-    fc_name="gfx950_a8w8_blockscale_asm",
-    gen_fake=gen_gfx950_a8w8_blockscale_asm_fake_tensors,
-)
-def gfx950_a8w8_blockscale_asm(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-) -> Tensor: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -533,12 +583,15 @@ def gemm_a8w8_bpreshuffle(
     )
     if config is not None:
         libtype = config["libtype"]
+        splitK = int(config["splitK"])
         if libtype == "ck":
-            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
-            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
+        elif libtype == "flydsl" and is_flydsl_available():
+            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     else:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
 
 
 def gemm_a8w8_blockscale_fake(
@@ -646,6 +699,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "asm":
+            kernelName = config["kernelName"]
+            splitK = config["splitK"]
+            return gemm_a8w8_blockscale_bpreshuffle_asm(
+                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+            )
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 

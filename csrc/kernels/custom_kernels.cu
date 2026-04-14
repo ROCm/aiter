@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "hip_compat.h"
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_hip_common.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <algorithm>
@@ -2470,7 +2470,7 @@ void MMGPUKernel(float* in_a,
     dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
     dim3 dimGrid((numCColumns / TILE_WIDTH) + 1, (numCRows / TILE_WIDTH) + 1, 1);
     //@@ Launch the GPU Kernel here
-    matrixMultiplyShared<<<dimGrid, dimBlock>>>(
+    matrixMultiplyShared<<<dimGrid, dimBlock, 0, stream>>>(
         in_a, in_b, out_c, numARows, numAColumns, numBRows, numBColumns, numCRows, numCColumns);
 
     hipError_t err = hipGetLastError();

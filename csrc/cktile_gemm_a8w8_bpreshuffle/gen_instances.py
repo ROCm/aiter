@@ -13,6 +13,7 @@ from gemm_a8w8_bpreshuffle_cktile_common import (
     kernelInstance,
     kernels_list,
     default_kernels_dict,
+    kernels_by_name,
 )
 
 """
@@ -42,7 +43,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch = 1
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
@@ -79,7 +81,7 @@ torch::Tensor
             {k.MWTile}, {k.NWTile}, {k.KWTile},
             ck_tile::GemmPipelineScheduler::{k.sScheduler}>;
         // Run kernel instance.
-        return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
 """
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(
@@ -115,7 +117,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int KBatch
     );
 
 """
@@ -193,7 +196,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    int KBatch);
 """
         MAINFEST_end = """
 
@@ -234,15 +238,31 @@ def get_tune_dict(tune_dict_csv):
             cu_num = device_properties.multi_processor_count
             tune_df = tune_df[(tune_df["cu_num"] == cu_num)].reset_index()
         tune_df = tune_df[tune_df["libtype"] == "cktile"].reset_index()
+        # NOTE: Matching by kernelName (not kernelId). The kernelId column in tuned
+        # CSVs is kept but it is NOT used for kernel selection anymore.
+        # This allows instance lists to be reordered or expanded (e.g. changing
+        # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
+        use_name = "kernelName" in tune_df.columns
+        if not use_name:
+            print(
+                "[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
+            )
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
-            kid = tune_df.loc[i, "kernelId"]
-            if kid < 0 or kid >= len(kernels_list):
-                print(f"[Warning]: kernelId {kid} is out of range, skip it")
-                continue
-            tune_dict[(M, N, K)] = kernels_list[kid]
+            if use_name:
+                kname = str(tune_df.loc[i, "kernelName"])
+                if kname in kernels_by_name:
+                    tune_dict[(M, N, K)] = kernels_by_name[kname]
+                else:
+                    print(f"[Warning]: kernelName '{kname}' not found, skip it")
+            else:
+                kid = tune_df.loc[i, "kernelId"]
+                if kid < 0 or kid >= len(kernels_list):
+                    print(f"[Warning]: kernelId {kid} is out of range, skip it")
+                    continue
+                tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict
 
 

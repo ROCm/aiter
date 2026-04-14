@@ -164,6 +164,8 @@ class Model:
     dqk: int
     dv: int
     use_mla: bool = False
+    use_sink: bool = False
+    sliding_window_left: int = 0
 
     def __post_init__(self) -> None:
         assert self.name, "Model name must be non-empty."
@@ -177,6 +179,12 @@ class Model:
         assert (
             self.dqk >= self.dv
         ), f"Invalid head dimensions: dqk ({self.dqk}) < dv ({self.dv}). Expected dqk >= dv."
+        assert (
+            self.sliding_window_left >= 0
+        ), "Sliding window size must be non-negative."
+        assert not (
+            self.use_mla and (self.use_sink or self.sliding_window_left > 0)
+        ), "MLA models don't support sink or sliding window annotations."
 
     def kernel_backend_str(self) -> str:
         return "mla" if self.use_mla else "mha"
@@ -277,6 +285,8 @@ class TpModel:
             dqk=original_model.dqk,
             dv=original_model.dv,
             use_mla=original_model.use_mla,
+            use_sink=original_model.use_sink,
+            sliding_window_left=original_model.sliding_window_left,
         )
 
 
@@ -340,10 +350,23 @@ class BenchArgs:
         effective_dv: int
         effective_dqk, effective_dv = m.effective_d_qk_v(self.kernel)
 
+        # Map (kernel, layout) to bench_mha.py's -fn argument:
+        # bshd (batch-seq-head-dim): non-varlen functions
+        # thd  (token-head-dim): varlen functions with equal sequence lengths
+        is_varlen: bool = self.layout == "thd"
+        fn_map: dict[tuple[str, bool], str] = {
+            ("fwd", False): "fwd",
+            ("fwd", True): "fwd_varlen",
+            ("bwdo", False): "bwd",
+            ("bwdo", True): "bwd_varlen",
+            ("bwdf", False): "bwd",
+            ("bwdf", True): "bwd_varlen",
+        }
+        fn: str = fn_map[(self.kernel, is_varlen)]
+
         args_dict: dict[str, str] = {
-            "-mode": self.kernel[:3],
+            "-fn": fn,
             "-causal": "true",
-            "--layout": self.layout,
             "--dtype": "bf16",
             "-b": str(self.b),
             "-hq": str(m.hq),
@@ -356,6 +379,12 @@ class BenchArgs:
         }
 
         args_list: list[str] = [kv for k, v in args_dict.items() for kv in (k, v)]
+        if is_varlen:
+            args_list.append("-equal_seqlens")
+        if m.use_sink:
+            args_list.append("-sink")
+        if m.sliding_window_left > 0:
+            args_list.extend(("--window-size-left", str(m.sliding_window_left)))
         if self.kernel == "bwdf":
             args_list.append("-fused_bwd")
         args_str: str = " ".join(args_list)
@@ -392,6 +421,8 @@ class BenchArgs:
             "hkv": str(m.hkv),
             "dqk": str(m.dqk),
             "dv": str(m.dv),
+            "sink": str(m.use_sink),
+            "sliding_window_left": str(m.sliding_window_left),
             "tp": str(self.tp_model.tp),
             "b": str(self.b),
             "s": str(self.s),
@@ -411,6 +442,8 @@ class BenchArgs:
             "hkv",
             "dqk",
             "dv",
+            "sink",
+            "sliding_window_left",
             "tp",
             "b",
             "s",
@@ -429,6 +462,8 @@ class BenchArgs:
             m.hkv,
             m.dqk,
             m.dv,
+            m.use_sink,
+            m.sliding_window_left,
             self.tp_model.tp,
             self.b,
             self.s,
@@ -458,51 +493,61 @@ def get_stdout(out: str, err: str, num_out_lines: int) -> Optional[list[list[str
 def get_mha_bench_result(
     args: BenchArgs, metric: Metric, out: str, err: str
 ) -> Optional[float]:
-    """Get result from `bench_mha.py`."""
-    # Get preprocessed stdout:
-    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=3)
+    """Get result from `bench_mha.py`.
+
+    Expected stdout (4 lines):
+    Line 1 - progress: "[1/1] <model> B=... HQ=... ..."
+    Line 2 - plot name: "bench_mha:"
+    Line 3 - header: "model  BATCH  HQ  HK  N_CTX_Q  N_CTX_K  D_HEAD  D_HEAD_V  causal  function  dtype  impl  fused  <unit>"
+    Line 4 - data: "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  <d>  <dv>  <causal>  <fn>  <dtype>  <impl>  <fused>  <value>"
+    """
+    # Get preprocessed stdout (4 lines: progress + plot name + header + data):
+    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=4)
     if out_lines is None:
         return None
     l0: list[str]
     l1: list[str]
     l2: list[str]
-    l0, l1, l2 = out_lines
-    # Check stdout line #1 (benchmark name):
-    if l0 != ["bench_mha:"]:
-        logging.error("Benchmark name doesn't match: %s", l0)
+    l3: list[str]
+    l0, l1, l2, l3 = out_lines
+    # Check stdout line #1 (progress line "[counter/total] <model> B=... ..."):
+    if not (len(l0) >= 2 and l0[0].startswith("[") and l0[0].endswith("]")):
+        logging.error("Progress line doesn't match: %s", l0)
         return None
-    # Check stdout line #2 (table header):
-    kernel_header: str = {"fwd": "fwd", "bwdo": "onekernel-bwd", "bwdf": "fused-bwd"}[
-        args.kernel
-    ]
-    if l1 != [
-        "BATCH",
-        "HQ",
-        "HK",
-        "N_CTX_Q",
-        "N_CTX_K",
-        f"{kernel_header}({metric.user_unit})",
-        f"({metric.user_unit})",
-    ]:
-        logging.error("Table header doesn't match: %s", l1)
+    # Check stdout line #2 (benchmark name):
+    if not (len(l1) == 1 and l1[0].startswith("bench_mha") and l1[0].endswith(":")):
+        logging.error("Benchmark name doesn't match: %s", l1)
         return None
-    # Check stdout line #3 (table data):
+    # Check stdout line #3 (table header):
+    # x_names: model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, causal, function, dtype, impl, fused
+    # Metric column is at index 13; triton sometimes appends an extra "(unit)" annotation at index 14.
+    if not (
+        l2[:6] == ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
+        and len(l2) in (14, 15)
+        and l2[13] == metric.user_unit
+        and (len(l2) == 14 or l2[14] == f"({metric.user_unit})")
+    ):
+        logging.error("Table header doesn't match: %s", l2)
+        return None
+    # Check stdout line #4 (table data):
+    # Columns: row_idx, model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
+    #          causal, function, dtype, impl, fused, <metric> (15 tokens total).
     m: Model = args.tp_model.model
     try:
         if not all(
             [
-                len(l2) == 7,
-                l2[0] == "0",
-                int(float(l2[1])) == args.b,
-                int(float(l2[2])) == m.hq,
-                int(float(l2[3])) == m.hkv,
-                int(float(l2[4])) == args.s,
-                int(float(l2[5])) == args.s,
+                len(l3) == 15,
+                l3[0] == "0",
+                int(float(l3[2])) == args.b,
+                int(float(l3[3])) == m.hq,
+                int(float(l3[4])) == m.hkv,
+                int(float(l3[5])) == args.s,
+                int(float(l3[6])) == args.s,
             ]
         ):
-            logging.error("Table data doesn't match: %s", l2)
+            logging.error("Table data doesn't match: %s", l3)
             return None
-        return float(l2[6])
+        return float(l3[-1])
     except ValueError as e:
         logging.error(
             "Unexpected numeric conversion error. %s: %s", type(e).__name__, e
@@ -525,18 +570,23 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]
         logging.error("Benchmark name doesn't match: %s", l0)
         return None
     # Check stdout line #2 (table header):
-    if l1 != [
-        "model",
-        "B",
-        "H",
-        "S",
-        "kv_lora_rank",
-        "qk_rope_head_dim",
-        "rotary_dim",
-        "num_kv_splits",
-        "mla_decode_fwd",
-        "(ms)",
-    ]:
+    # Triton sometimes appends a "(ms)" annotation token after the last column name.
+    if not (
+        l1[:9]
+        == [
+            "model",
+            "B",
+            "H",
+            "S",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "rotary_dim",
+            "num_kv_splits",
+            "mla_decode_fwd",
+        ]
+        and len(l1) in (9, 10)
+        and (len(l1) == 9 or l1[9] == "(ms)")
+    ):
         logging.error("Table header doesn't match: %s", l1)
         return None
     # Check stdout line #3 (table data):
@@ -605,7 +655,7 @@ def run_bench(args: BenchArgs, metric: Metric) -> Optional[float]:
                 "Out of resources while benchmarking %s. %s", args.to_log_str(), e
             )
 
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         logging.error(
             "Unexpected error while benchmarking %s. %s: %s",
             args.to_log_str(),
@@ -724,6 +774,10 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                 hkv_raw: object = entry_raw.get("hkv")
                 dqk_raw: object = entry_raw.get("dqk")
                 dv_raw: object = entry_raw.get("dv")
+                use_sink_raw: object = entry_raw.get("sink", False)
+                sliding_window_left_raw: object = entry_raw.get(
+                    "sliding_window_left", 0
+                )
 
                 # In Python, bool is a subclass of int, so True/False pass `isinstance(..., int)`.
                 # We want to reject Booleans as valid values, so we explicitly check for bool.
@@ -763,6 +817,26 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                         "dv",
                     )
                     continue
+                if not isinstance(use_sink_raw, bool):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be a boolean.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "sink",
+                    )
+                    continue
+                if not isinstance(sliding_window_left_raw, int) or isinstance(
+                    sliding_window_left_raw, bool
+                ):
+                    logging.error(
+                        "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
+                        backend_name,
+                        idx,
+                        base_name,
+                        "sliding_window_left",
+                    )
+                    continue
 
                 try:
                     model = Model(
@@ -772,6 +846,8 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                         dqk=dqk_raw,
                         dv=dv_raw,
                         use_mla=use_mla,
+                        use_sink=use_sink_raw,
+                        sliding_window_left=sliding_window_left_raw,
                     )
                 except Exception as e:
                     logging.error(
@@ -833,13 +909,15 @@ def list_models() -> None:
     logging.info("Available models:")
     for model in get_models():
         logging.info(
-            "%s kernel_backend=%s hq=%d hkv=%d dqk=%d dv=%d",
+            "%s kernel_backend=%s hq=%d hkv=%d dqk=%d dv=%d sink=%s sliding_window_left=%d",
             model.name,
             model.kernel_backend_str(),
             model.hq,
             model.hkv,
             model.dqk,
             model.dv,
+            model.use_sink,
+            model.sliding_window_left,
         )
 
 
@@ -882,16 +960,29 @@ def get_bench_args(
     if tp_models is None:
         tp_models = get_tp_models()
     # MHA kernel backend:
-    bench_args: list[BenchArgs] = [
-        BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s)
-        for kernel, layout, tp_model, b, s in product(
-            kernels,
-            layouts,
-            (tp_model for tp_model in tp_models if not tp_model.model.use_mla),
-            batch_range.to_range(),
-            seq_range.to_range(),
+    bench_args: list[BenchArgs] = []
+    skipped_model_kernels: set[tuple[str, str]] = set()
+    for kernel, layout, tp_model, b, s in product(
+        kernels,
+        layouts,
+        (tp_model for tp_model in tp_models if not tp_model.model.use_mla),
+        batch_range.to_range(),
+        seq_range.to_range(),
+    ):
+        model = tp_model.model
+        if kernel == "bwdf" and (model.use_sink or model.sliding_window_left > 0):
+            skipped_key = (model.name, kernel)
+            if skipped_key not in skipped_model_kernels:
+                logging.info(
+                    "Skipping %s for model '%s': fused backward doesn't support sink or sliding window attention.",
+                    kernel,
+                    model.name,
+                )
+                skipped_model_kernels.add(skipped_key)
+            continue
+        bench_args.append(
+            BenchArgs(kernel=kernel, layout=layout, tp_model=tp_model, b=b, s=s)
         )
-    ]
     # MLA kernel backend:
     # Only forward kernel, layout option doesn't make sense.
     if "fwd" in kernels:

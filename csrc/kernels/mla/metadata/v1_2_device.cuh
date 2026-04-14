@@ -178,7 +178,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                     1;
                             }
                         }
-                        batch_tail = ck_tile::max(batch_tail, 0);
+                        batch_tail       = ck_tile::max(batch_tail, 0);
                         work_info.kv_end = ck_tile::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end - batch_tail);
@@ -320,7 +320,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                  1;
                                 }
                             }
-                            batch_tail = ck_tile::max(batch_tail, 0);
+                            batch_tail       = ck_tile::max(batch_tail, 0);
                             work_info.kv_end = ck_tile::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
@@ -442,10 +442,11 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const int32_t num_clusters = dev_prop.multiProcessorCount / num_heads_k;
     const bool is_sparse       = (topk >= 0);
 
-    int32_t num_batches    = seqlens_kv_indptr.size(0) - 1;
-    int32_t num_heads      = num_heads_k * num_heads_per_head_k;
-    int32_t qk_batch_ratio = 1;
-    int32_t uni_seqlen_qo  = ori_uni_seqlen_qo;
+    int32_t num_batches     = seqlens_kv_indptr.size(0) - 1;
+    int32_t num_heads       = num_heads_k * num_heads_per_head_k;
+    int32_t qk_batch_ratio  = 1;
+    int32_t qk_seqlen_ratio = 1;
+    int32_t uni_seqlen_qo   = ori_uni_seqlen_qo;
 
     auto arch_id = get_gpu_arch();
 
@@ -456,12 +457,33 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     const bool kv_is_fp8 =
         (kv_dtype == at::ScalarType::Float8_e4m3fnuz || kv_dtype == at::ScalarType::Float8_e4m3fn);
 
-    const bool natively_supported = (num_heads == 16) ||
-                                    ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 &&
-                                     kv_is_fp8 && (max_seqlen_qo == 4)) ||
-                                    ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
+    const bool natively_supported =
+        (num_heads == 16) ||
+        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
+         (max_seqlen_qo == 2)) ||
+        ((arch_id == "gfx950") && (num_heads == 32) && q_is_fp8 && kv_is_fp8 &&
+         (max_seqlen_qo == 4)) ||
+        ((arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 && kv_is_fp8 &&
+         (max_seqlen_qo == 1)) ||
+        ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
-    if((natively_supported == false) && (num_heads % 16 == 0))
+    const bool use_qseqlen_fold =
+        !natively_supported && (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads > 16) &&
+        ((uni_seqlen_qo * (num_heads / 16) == 4) || ((num_heads == 64) && (uni_seqlen_qo == 2)));
+
+    if(use_qseqlen_fold && (num_heads == 64) && (uni_seqlen_qo == 2))
+    {
+        qk_seqlen_ratio = num_heads / 32;
+        num_heads       = 32;
+        uni_seqlen_qo *= qk_seqlen_ratio;
+    }
+    else if(use_qseqlen_fold && (uni_seqlen_qo * (num_heads / 16) == 4))
+    {
+        qk_seqlen_ratio = num_heads / 16;
+        num_heads       = 16;
+        uni_seqlen_qo *= qk_seqlen_ratio;
+    }
+    else if(!natively_supported && (num_heads % 16 == 0))
     {
         qk_batch_ratio = num_heads / 16;
         num_heads      = 16;
@@ -469,16 +491,16 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     }
 
     TORCH_CHECK((num_heads == 16) || (num_heads == 128) ||
-                    ((num_heads == 32) && q_is_fp8 && kv_is_fp8),
+                    ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
+                    ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
+                    ((num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8),
                 __func__,
-                ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
-                "N is in [2, 8).")
+                ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
+                "N is in [2, 8), or (#head, max_seqlen_qo) = (8, 4) where q and kv are fp8.")
 
     int32_t num_splits = max_split_per_batch < 0
                              ? num_clusters
                              : min(num_clusters, max_split_per_batch * num_batches);
-
-    const bool fold_to_qh16 = !natively_supported && q_is_fp8 && kv_is_fp8;
 
     MlaMetadataV1KernelParameter params = {};
     params.p_work_metadata_ptrs         = work_metadata_ptrs.data_ptr<uint64_t>();
@@ -491,8 +513,7 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.p_seqlens_kv_indptr          = seqlens_kv_indptr.data_ptr<int32_t>();
     params.p_kv_last_page_lens          = kv_last_page_lens.data_ptr<int32_t>();
     params.num_batches                  = num_batches;
-    params.num_heads                    = fold_to_qh16 ? num_heads
-                                                       : num_heads_k * num_heads_per_head_k;
+    params.num_heads                    = num_heads;
     params.num_cu                       = num_clusters;
     params.num_splits                   = num_splits;
     params.reduce_indptr_size           = reduce_indptr.size(0);

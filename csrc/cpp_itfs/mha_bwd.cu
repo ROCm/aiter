@@ -168,6 +168,8 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* dv_ptr             */ a.dv_ptr,
         /* dbias_ptr          */ a.dbias_ptr,
         /* dq_acc_ptr         */ a.dq_acc_ptr,
+        /* sink_ptr           */ a.sink_ptr,
+        /* d_sink_ptr         */ a.d_sink_ptr,
 
         /* seqstart_q_ptr     */ a.seqstart_q_ptr,
         /* seqstart_k_ptr     */ a.seqstart_k_ptr,
@@ -208,7 +210,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* nhead_stride_randval*/ a.nhead_stride_randval,
         /* nhead_stride_do    */ a.nhead_stride_do,
         /* nhead_stride_lsed  */ a.nhead_stride_lsed,
-        /* nhead_stride_dq_acc*/ a.nhead_stride_dq_acc,
+        /* nhead_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.nhead_stride_dq_acc),
         /* nhead_stride_dq    */ a.nhead_stride_dq,
         /* nhead_stride_dk    */ a.nhead_stride_dk,
         /* nhead_stride_dv    */ a.nhead_stride_dv,
@@ -222,7 +224,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* batch_stride_randval*/ a.batch_stride_randval,
         /* batch_stride_do    */ a.batch_stride_do,
         /* batch_stride_lsed  */ a.batch_stride_lsed,
-        /* batch_stride_dq_acc*/ a.batch_stride_dq_acc,
+        /* batch_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.batch_stride_dq_acc),
         /* batch_stride_dq    */ a.batch_stride_dq,
         /* batch_stride_dk    */ a.batch_stride_dk,
         /* batch_stride_dv    */ a.batch_stride_dv,
@@ -445,9 +447,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     odo_args.ptr_o           = a.o_ptr;
     odo_args.ptr_do          = a.do_ptr;
     odo_args.ptr_d           = a.d_ptr;
-    odo_args.Hs_odo          = a.nhead_stride_o * 2;
-    odo_args.BAs_odo         = a.batch_stride_o * 2;
-    odo_args.Seqs_odo        = a.stride_o * 2;
+    odo_args.Hs_o            = a.nhead_stride_o * 2;
+    odo_args.BAs_o           = a.batch_stride_o * 2;
+    odo_args.Seqs_o          = a.stride_o * 2;
+    odo_args.Hs_do           = a.nhead_stride_do * 2;
+    odo_args.BAs_do          = a.batch_stride_do * 2;
+    odo_args.Seqs_do         = a.stride_do * 2;
     odo_args.Hs_d            = a.nhead_stride_lsed * 4;
     odo_args.BAs_d           = a.batch_stride_lsed * 4;
     odo_args.Seqs_d          = 1 * 4;
@@ -531,7 +536,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     if(mt == 3)
     {
-#if DISABLE_CK
+#if !ENABLE_CK
         bool is_top_left = (a.mask_type == static_cast<int>(mask_enum::mask_top_left) ||
                             a.mask_type == static_cast<int>(mask_enum::window_generic));
         auto [mask_y, mask_x] = compute_mask_coordinates(

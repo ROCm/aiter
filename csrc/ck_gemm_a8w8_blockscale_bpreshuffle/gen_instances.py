@@ -242,11 +242,19 @@ def get_tune_dict(tune_dict_csv):
             device_properties = torch.cuda.get_device_properties(gpu)
             cu_num = device_properties.multi_processor_count
             tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+        if "libtype" in tune_df.columns:
+            tune_df = tune_df[tune_df["libtype"] == "ck"].reset_index(drop=True)
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
+            if kid not in kernels_list:
+                print(
+                    f"[Warning]: kernelId {kid} not found in kernels_list "
+                    f"for shape ({M}, {N}, {K}), skip it"
+                )
+                continue
             tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict
 

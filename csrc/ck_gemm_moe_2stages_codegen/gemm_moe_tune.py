@@ -22,7 +22,9 @@ from aiter.fused_moe import (
     torch_moe,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_weight,
+)
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
     rearrange_4bit_elements,
@@ -149,31 +151,60 @@ class FmoeTuner(TunerCommon):
         blockM,
         q_type,
         act_type,
+        splitk=0,
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
-        out = torch.empty(
-            (token_num, topk, inter_dim),
-            dtype=dtype,
-            device=a1_qt.device,
-        )
-        out = ck_moe_stage1_fwd(
-            a1_qt,
-            w1_qt_shffle_ck,
-            w2_qt_shffle_ck,
-            sorted_ids,
-            sorted_expert_ids,
-            num_valid_ids,
-            out,
-            topk,
-            kernelName,
-            w1_scale,
-            a1_scale,
-            blockM,
-            sorted_weights,
-            q_type,
-            act_type,
-        )
+        is_splitk = q_type == QuantType.per_1x128 and splitk > 1
+        if is_splitk:
+            sorted_size = min(token_num * topk * blockM, sorted_ids.shape[0])
+            tmp_out = torch.empty(
+                (sorted_size, w1_qt_shffle_ck.shape[1]),
+                dtype=dtypes.fp32,
+                device=a1_qt.device,
+            )
+        else:
+            out = torch.empty(
+                (token_num, topk, inter_dim),
+                dtype=dtype,
+                device=a1_qt.device,
+            )
+            tmp_out = out
+        try:
+            ck_moe_stage1_fwd(
+                a1_qt,
+                w1_qt_shffle_ck,
+                w2_qt_shffle_ck,
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                tmp_out,
+                topk,
+                kernelName,
+                w1_scale,
+                a1_scale,
+                blockM,
+                sorted_weights,
+                q_type,
+                act_type,
+                splitk if is_splitk else 0,
+                dst_type=dtype if is_splitk else None,
+            )
+        except Exception:
+            raise
+        if is_splitk:
+            out = torch.empty(
+                (token_num, topk, inter_dim),
+                dtype=dtype,
+                device=a1_qt.device,
+            )
+            valid_out = tmp_out[: token_num * topk, :]
+            if act_type == ActivationType.Silu or (
+                isinstance(act_type, str) and "silu" in act_type.lower()
+            ):
+                aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+            else:
+                aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         if q_type == QuantType.per_1x128:
             quant_func = aiter.get_hip_quant(q_type)
             a2, a2_scale = quant_func(
@@ -231,12 +262,11 @@ class FmoeTuner(TunerCommon):
     def run_flydsl_stage1_out(
         a1_qt,
         w1_qt_shffle_ck,
-        w2_qt_shffle_ck,
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
         num_valid_ids,
-        w1_scale,
+        w1_scale_aiter,
         a1_scale,
         dtype,
         topk,
@@ -245,7 +275,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        return flydsl_moe_stage1(
+        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        fuse_fq = kparams.get("fuse_fp4_quant", False)
+        token_num = a1_qt.shape[0]
+        inter_dim = w1_qt_shffle_ck.shape[1] // 2
+        result = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_qt_shffle_ck,
             sorted_token_ids=sorted_ids,
@@ -258,21 +292,34 @@ class FmoeTuner(TunerCommon):
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
-            w1_scale=w1_scale,
+            act=act,
+            w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
+            use_async_copy=True,
+            k_batch=kparams.get("k_batch", 1),
+            waves_per_eu=kparams.get("waves_per_eu", 3),
+            b_nt=kparams.get("b_nt", 2),
+            gate_only=kparams.get("gate_only", False),
+            fuse_fp4_quant=fuse_fq,
+            fuse_sort_scale=fuse_fq,
         )
+        if isinstance(result, tuple):
+            out_raw = result[0]
+            total_fp4_bytes = token_num * topk * (inter_dim // 2)
+            fp4_flat = out_raw.view(-1).view(torch.uint8)[:total_fp4_bytes]
+            return fp4_flat.view(dtypes.fp4x2).reshape(token_num, topk, -1)
+        return result
 
     @staticmethod
     def run_flydsl_stage2_out(
         a2_qt,
-        w1_qt,
-        w2_shuffled,
+        w2_shuffled_flydsl,
         sorted_ids,
         sorted_expert_ids,
         sorted_weights,
         num_valid_ids,
-        w2_scale_shuffled,
+        w2_scale_shuffled_flydsl,
         a2_scale,
         moe_buf,
         dtype,
@@ -282,9 +329,14 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
+        if kparams.get("mode", "atomic") == "atomic":
+            moe_buf.zero_()
+
+        sort_block_m = kparams.get("sort_block_m", 0)
+        persist = kparams.get("persist", None)
         return flydsl_moe_stage2(
             inter_states=a2_qt,
-            w2=w2_shuffled,
+            w2=w2_shuffled_flydsl,
             sorted_token_ids=sorted_ids,
             sorted_expert_ids=sorted_expert_ids,
             num_valid_ids=num_valid_ids,
@@ -297,9 +349,11 @@ class FmoeTuner(TunerCommon):
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
             mode=kparams.get("mode", "atomic"),
-            w2_scale=w2_scale_shuffled,
+            w2_scale=w2_scale_shuffled_flydsl,
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
+            sort_block_m=sort_block_m,
+            persist=persist,
         )
 
     @staticmethod
@@ -561,6 +615,25 @@ class FmoeTuner(TunerCommon):
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
             moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
         )
+        needed = sorted_expert_ids.shape[0] * blockM
+        if sorted_ids.shape[0] < needed:
+            pad = torch.full(
+                (needed - sorted_ids.shape[0],),
+                token,
+                dtype=sorted_ids.dtype,
+                device=sorted_ids.device,
+            )
+            sorted_ids = torch.cat([sorted_ids, pad])
+            sorted_weights = torch.cat(
+                [
+                    sorted_weights,
+                    torch.zeros(
+                        pad.shape[0],
+                        dtype=sorted_weights.dtype,
+                        device=sorted_weights.device,
+                    ),
+                ]
+            )
         return (
             input,
             a1_qt,
@@ -728,6 +801,11 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_ck = w2_qt_shffle
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+
+        w1_qt_shffle_flydsl = w1_qt_shffle_ck
+        w2_qt_shffle_flydsl = w2_qt_shffle_ck
+        w1_scale_flydsl = w1_scale_aiter
+        w2_scale_flydsl = w2_scale_aiter
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
@@ -737,7 +815,7 @@ class FmoeTuner(TunerCommon):
                     sorted_ids=sorted_ids,
                     num_valid_ids=num_valid_ids,
                     token_num=token,
-                    block_size=blockM,
+                    block_size=max(32, blockM),
                 )
             else:
                 a1_scale_fp4_sort = a1_scale
@@ -758,7 +836,11 @@ class FmoeTuner(TunerCommon):
                 topk_weights,  # 12
                 topk_ids,  # 13
                 a1_scale_fp4_sort,  # 14
-                w1_scale_aiter,
+                w1_scale_aiter,  # 15
+                w1_qt_shffle_flydsl,  # 16
+                w2_qt_shffle_flydsl,  # 17
+                w1_scale_flydsl,  # 18
+                w2_scale_flydsl,  # 19
             )
         elif stage == 2:
             ref1 = FmoeTuner.run_torch_moe_stage1(
@@ -783,13 +865,10 @@ class FmoeTuner(TunerCommon):
                 ref_scale = ref_scale.view(token, -1)
                 a2_qt = ref1
                 a2_scale = ref_scale
-            else:
+                a2_scale_mxfp4_sort = a2_scale
+            elif q_type == QuantType.per_1x32:
                 torch_quant = aiter.get_torch_quant(q_type)
                 a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
-            a2_qt = a2_qt.view(token, topk, -1)
-            if doweight_stage1:
-                sorted_weights = None
-            if q_type == QuantType.per_1x32:
                 a2_scale_mxfp4_sort = moe_mxfp4_sort(
                     a2_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
@@ -798,7 +877,12 @@ class FmoeTuner(TunerCommon):
                     block_size=blockM,
                 )
             else:
+                torch_quant = aiter.get_torch_quant(q_type)
+                a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
                 a2_scale_mxfp4_sort = a2_scale
+            a2_qt = a2_qt.view(token, topk, -1)
+            if doweight_stage1:
+                sorted_weights = None
             return (
                 a2_qt,  # 0
                 w1_qt_shffle_ck,  # 1
@@ -815,7 +899,11 @@ class FmoeTuner(TunerCommon):
                 topk_weights,  # 12
                 topk_ids,  # 13
                 a2_scale_mxfp4_sort,  # 14
-                w2_scale_aiter,
+                w2_scale_aiter,  # 15
+                w1_qt_shffle_flydsl,  # 16
+                w2_qt_shffle_flydsl,  # 17
+                w1_scale_flydsl,  # 18
+                w2_scale_flydsl,  # 19
             )
 
     @staticmethod
@@ -921,11 +1009,15 @@ class FmoeTuner(TunerCommon):
         topk_ids,
         a1_scale,
         w1_scale,
-        dtype,
-        activation,
-        quant_type,
-        doweight_stage1,
-        topk,
+        sorted_ids=None,
+        num_valid_ids=None,
+        dtype=dtypes.bf16,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.No,
+        doweight_stage1=False,
+        topk=1,
+        blockM=32,
+        fuse_fq=False,
     ):
         ref1 = torch_moe_stage1(
             a1_qt,
@@ -940,6 +1032,12 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             doweight=doweight_stage1,
         )
+        token_num = a1_qt.shape[0]
+        if fuse_fq:
+            from aiter.ops.quant import per_1x32_f4_quant
+
+            a2, a2_scale = per_1x32_f4_quant(ref1, quant_dtype=dtypes.fp4x2)
+            return a2.view(token_num, topk, -1)
         if quant_type == QuantType.per_1x128:
             ref1, ref_scale = aiter.pertoken_quant(
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
@@ -1269,9 +1367,6 @@ class FmoeTuner(TunerCommon):
         nblk_n = inter_dim // blk_n
         nblk_k = model_dim // blk_k
         if fc1_scale is not None:
-            # gose to quant D_w8a8/w8a8
-            # blk_n, blk_k = scale_blks
-            # expert, nblk_n, nblk_k = fc1_scale.shape
             fc1_scale = rearrange(
                 fc1_scale.view(-1, 1)
                 .repeat(1, blk_n * blk_k)
@@ -1526,7 +1621,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_2stages_asm1_task(self, key, blockMs):
         info = key
-        # blockMs = [32, 64, 128]
         tasks = []
         (
             cu_num,
@@ -1631,7 +1725,6 @@ class FmoeTuner(TunerCommon):
         return tasks
 
     def gen_2stages_task(self, key, blockMs):
-        # blockMs = [32, 64, 128]
         info = key
         tasks_ck = []
         (
@@ -1660,6 +1753,32 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
             True,  # bpreshuffle
         )
+
+        is_fp8_blockscale = (
+            q_type == QuantType.per_1x128
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+        )
+        ck_stage1_splitk_kernels = {}
+        splitk_list = []
+        if is_fp8_blockscale:
+            tilek = 128
+            for _sk in range(2, 9):
+                if (model_dim % _sk == 0) and ((model_dim // _sk) % tilek == 0):
+                    splitk_list.append(_sk)
+            if splitk_list:
+                _, ck_stage1_splitk_kernels = get_gemm1_kernels_list(
+                    dtype2str_dict[q_dtype_a],
+                    dtype2str_dict[q_dtype_w],
+                    dtype2str_dict[dtype],
+                    False,
+                    int(q_type),
+                    str(act_type).split(".")[-1].lower(),
+                    doweight_stage1,
+                    True,  # bpreshuffle
+                    splitk=True,
+                )
+
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
@@ -1707,13 +1826,13 @@ class FmoeTuner(TunerCommon):
                             {},
                             FmoeTuner.run_torch_moe_stage1,
                             (
-                                # [a1_qt, w1_qt, w2_qt, topk_weights, topk_ids, a1_scale, w1_scale]
-                                [0, 10, 11, 12, 13, 3, 4],
+                                [0, 10, 11, 12, 13, 3, 4, 5, 8],
                                 dtype,
                                 act_type,
                                 q_type,
                                 doweight_stage1,
                                 topk,
+                                blockM,
                             ),
                             {},
                             (None),
@@ -1722,6 +1841,61 @@ class FmoeTuner(TunerCommon):
                             True,
                         )
                     )
+
+                for sk in splitk_list:
+                    for kernel in ck_stage1_splitk_kernels.values():
+                        if kernel.MPerBlock != blockM:
+                            continue
+                        tag_name = f"{kernel.name}_sk{sk}"
+                        tasks_ck.append(
+                            (
+                                (info, "stage1", tag_name, blockM),
+                                FmoeTuner.generate_data_2stages,
+                                (
+                                    token,
+                                    model_dim,
+                                    inter_dim,
+                                    expert,
+                                    topk,
+                                    act_type,
+                                    dtype,
+                                    q_dtype_a,
+                                    q_dtype_w,
+                                    q_type,
+                                    use_g1u1,
+                                    doweight_stage1,
+                                    blockM,
+                                    1,
+                                ),
+                                FmoeTuner.ck_moe_stage1_fwd_out,
+                                (
+                                    [0, 1, 2, 5, 6, 7, 8, 15, 14],
+                                    dtype,
+                                    topk,
+                                    kernel.name,
+                                    blockM,
+                                    q_type,
+                                    act_type,
+                                    sk,
+                                ),
+                                {},
+                                FmoeTuner.run_torch_moe_stage1,
+                                (
+                                    [0, 10, 11, 12, 13, 3, 4, 5, 8],
+                                    dtype,
+                                    act_type,
+                                    q_type,
+                                    doweight_stage1,
+                                    topk,
+                                    blockM,
+                                ),
+                                {},
+                                (None),
+                                0.01,
+                                0.01,
+                                True,
+                            )
+                        )
 
                 for kernel in ck_stage2_kernels.values():
                     if kernel.MPerBlock != blockM:
@@ -1806,13 +1980,9 @@ class FmoeTuner(TunerCommon):
         b_dtype_str = "fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
-        if a_dtype_str != "fp4":
-            flydsl_s1_kernels = get_flydsl_stage1_kernels(
-                a_dtype_str, b_dtype_str, out_dtype_str
-            )
-        else:
-            # TODO: stage1 support fp4
-            flydsl_s1_kernels = {}
+        flydsl_s1_kernels = get_flydsl_stage1_kernels(
+            a_dtype_str, b_dtype_str, out_dtype_str
+        )
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
         )
@@ -1821,62 +1991,85 @@ class FmoeTuner(TunerCommon):
             if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
-                if kparams["tile_m"] != blockM:
+                ktm = kparams["tile_m"]
+                if ktm != blockM and not (ktm == 16 and blockM == 32 and token <= 16):
                     continue
-                tasks_flydsl.append(
-                    (
-                        (info, "stage1", kname, blockM),
-                        FmoeTuner.generate_data_2stages,
-                        (
-                            token,
-                            model_dim,
-                            inter_dim,
-                            expert,
-                            topk,
-                            act_type,
-                            dtype,
-                            q_dtype_a,
-                            q_dtype_w,
-                            q_type,
-                            use_g1u1,
-                            doweight_stage1,
-                            blockM,
-                            1,
-                        ),
-                        FmoeTuner.run_flydsl_stage1_out,
-                        (
-                            [0, 1, 2, 5, 6, 7, 8, 15, 14],
-                            dtype,
-                            topk,
-                            kparams,
-                            blockM,
-                            q_type,
-                            act_type,
-                        ),
-                        {},
-                        FmoeTuner.run_torch_moe_stage1,
-                        (
-                            [0, 10, 11, 12, 13, 3, 4],
-                            dtype,
-                            act_type,
-                            q_type,
-                            doweight_stage1,
-                            topk,
-                        ),
-                        {},
-                        (None),
-                        0.01,
-                        0.01,
-                        True,
+
+                is_splitk = kparams.get("k_batch", 1) > 1
+
+                if is_splitk:
+                    fq_params = {**kparams, "fuse_fp4_quant": True}
+                    s1_variants = [(kname + "_fq", fq_params, True)]
+                else:
+                    s1_variants = [(kname, kparams, False)]
+                    fq_params = {**kparams, "fuse_fp4_quant": True}
+                    s1_variants.append((kname + "_fq", fq_params, True))
+
+                for s1_name, s1_params, is_fq in s1_variants:
+                    ref_args_extra = (
+                        [0, 10, 11, 12, 13, 3, 4, 5, 8],
+                        dtype,
+                        act_type,
+                        q_type,
+                        doweight_stage1,
+                        topk,
+                        blockM,
                     )
-                )
+                    if is_fq:
+                        ref_args_extra = ref_args_extra + (True,)
+                    tasks_flydsl.append(
+                        (
+                            (info, "stage1", s1_name, blockM),
+                            FmoeTuner.generate_data_2stages,
+                            (
+                                token,
+                                model_dim,
+                                inter_dim,
+                                expert,
+                                topk,
+                                act_type,
+                                dtype,
+                                q_dtype_a,
+                                q_dtype_w,
+                                q_type,
+                                use_g1u1,
+                                doweight_stage1,
+                                blockM,
+                                1,
+                            ),
+                            FmoeTuner.run_flydsl_stage1_out,
+                            (
+                                [0, 1, 5, 6, 7, 8, 15, 14],
+                                dtype,
+                                topk,
+                                s1_params,
+                                blockM,
+                                q_type,
+                                act_type,
+                            ),
+                            {},
+                            FmoeTuner.run_torch_moe_stage1,
+                            ref_args_extra,
+                            {},
+                            (None),
+                            0.01,
+                            0.01,
+                            True,
+                        )
+                    )
 
             for kname, kparams in flydsl_s2_kernels.items():
-                if kparams["tile_m"] != blockM:
+                s2_tile_m = kparams["tile_m"]
+                if blockM % s2_tile_m != 0:
                     continue
+                # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
+                if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                    continue
+                s2_kparams = {**kparams, "sort_block_m": blockM}
+                s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
                 tasks_flydsl.append(
                     (
-                        (info, "stage2", kname, blockM),
+                        (info, "stage2", s2_kname, blockM),
                         FmoeTuner.generate_data_2stages,
                         (
                             token,
@@ -1896,10 +2089,10 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 10, 2, 5, 6, 7, 8, 15, 14, 9],
+                            [0, 17, 5, 6, 7, 8, 19, 14, 9],
                             dtype,
                             topk,
-                            kparams,
+                            s2_kparams,
                             blockM,
                             q_type,
                             act_type,
@@ -1919,6 +2112,7 @@ class FmoeTuner(TunerCommon):
                         True,
                     )
                 )
+
         return tasks_flydsl
 
     def tune(
@@ -1929,9 +2123,8 @@ class FmoeTuner(TunerCommon):
     ):
         self._flydsl_fallbacks = []
         mp_num = args.mp
-        blockMs = [16, 32, 64, 128]
+        blockMs = [32, 64, 128]
         keys = self.keys
-        print(untunedf[keys])
         tasks = []
         tasks_ck = []
         task_1stage = []
@@ -1952,7 +2145,6 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             ) = line
-            # info = line
             dtype = eval(dtype)
             q_dtype_a = eval(q_dtype_a)
             q_dtype_w = eval(q_dtype_w)
@@ -2012,10 +2204,29 @@ class FmoeTuner(TunerCommon):
 
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
+
+        new_fallbacks = getattr(self, "_flydsl_fallbacks", [])
+        new_fb_keys = set()
+        if new_fallbacks:
+            new_fb_df = pd.DataFrame(new_fallbacks, columns=self.columns)
+            new_fb_keys = set(new_fb_df[self.keys].astype(str).apply(tuple, axis=1))
+
         if "_tag" in old_tunedf.columns:
-            old_tunedf = old_tunedf[
-                old_tunedf["_tag"].fillna("") != FLYDSL_FALLBACK_TAG
-            ].drop(columns=["_tag"])
+            old_fb_mask = old_tunedf["_tag"].fillna("") == FLYDSL_FALLBACK_TAG
+            if new_fb_keys:
+                old_fb_key_tuples = (
+                    old_tunedf.loc[old_fb_mask, self.keys]
+                    .astype(str)
+                    .apply(tuple, axis=1)
+                )
+                drop_mask = old_fb_mask & old_fb_key_tuples.isin(new_fb_keys)
+            else:
+                drop_mask = old_fb_mask & False
+            kept_old_fb = old_tunedf[old_fb_mask & ~drop_mask].copy()
+            old_tunedf = old_tunedf[~old_fb_mask].drop(columns=["_tag"])
+        else:
+            kept_old_fb = pd.DataFrame(columns=list(old_tunedf.columns) + ["_tag"])
+
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
         resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
@@ -2025,11 +2236,15 @@ class FmoeTuner(TunerCommon):
                 keep="last",
             )
         resultdf["_tag"] = ""
-        fallbacks = getattr(self, "_flydsl_fallbacks", [])
-        if fallbacks:
-            fb_df = pd.DataFrame(fallbacks, columns=self.columns)
-            fb_df["_tag"] = FLYDSL_FALLBACK_TAG
-            resultdf = pd.concat([resultdf, fb_df], ignore_index=True)
+
+        if new_fallbacks:
+            new_fb_df = pd.DataFrame(new_fallbacks, columns=self.columns)
+            new_fb_df["_tag"] = FLYDSL_FALLBACK_TAG
+            resultdf = pd.concat([resultdf, new_fb_df], ignore_index=True)
+
+        if len(kept_old_fb) > 0:
+            resultdf = pd.concat([resultdf, kept_old_fb], ignore_index=True)
+
         resultdf = resultdf.astype(str).drop_duplicates(
             subset=self.keys + ["_tag"], keep="last"
         )
@@ -2048,6 +2263,7 @@ class FmoeTuner(TunerCommon):
             grouped_rets[tuple(info[0])].append((info[1:], us, max_err_ratio))
         grouped_results = grouped_rets.items()
         for key, rets in grouped_results:
+            us_qs_cache = {}
             (
                 cu_num,
                 token,
@@ -2063,13 +2279,16 @@ class FmoeTuner(TunerCommon):
                 use_g1u1,
                 doweight_stage1,
             ) = key
+            import re
+
             profileDF = []
             for (stage, kernelName, block_m), us, err in rets:
-                # if us == float("inf"):
-                #    continue
-                # if err > args.errRatio:
-                #    continue
                 tflops, bw = self.calculate((key, stage, kernelName, block_m, us, err))
+                row_ksplit = 0
+                sk_match = re.search(r"_sk(\d+)$", str(kernelName))
+                if sk_match:
+                    row_ksplit = int(sk_match.group(1))
+                    kernelName = re.sub(r"_sk\d+$", "", kernelName)
                 profileDF.append(
                     [
                         stage,
@@ -2087,7 +2306,7 @@ class FmoeTuner(TunerCommon):
                         use_g1u1,
                         doweight_stage1,
                         block_m,
-                        0,
+                        row_ksplit,
                         us,
                         kernelName,
                         err,
@@ -2107,9 +2326,9 @@ class FmoeTuner(TunerCommon):
 
             ## remove invalid candidate
             profileDF = profileDF[
-                (profileDF["err"] < args.errRatio)
-                & (profileDF["us"] != float("-inf"))
+                (profileDF["us"] != float("-inf"))
                 & (profileDF["us"] != -1)
+                & (profileDF["err"] <= args.errRatio)
             ]
             # Keep best non-flydsl per (stage, block_m) for fallback before dedup
             _non_flydsl = profileDF[
@@ -2235,6 +2454,49 @@ class FmoeTuner(TunerCommon):
                 failedf = pd.DataFrame(ret, columns=self.columns)
                 self.failed = pd.concat([self.failed, failedf], axis=0)
                 continue
+            if q_type == QuantType.per_1x32:
+                from aiter.test_common import run_perftest
+                from aiter.ops.triton.quant.fused_mxfp4_quant import (
+                    fused_dynamic_mxfp4_quant_moe_sort,
+                )
+
+                us_qs_cache = {}
+                for bm in profileDF["block_m"].unique():
+                    bm_int = int(bm)
+                    block_size = max(32, bm_int)
+                    num_sorted = (
+                        (token * topk + block_size - 1) // block_size
+                    ) * block_size
+                    dummy_act = torch.randn(
+                        token * topk, inter_dim, dtype=dtype, device="cuda"
+                    )
+                    dummy_sorted_ids = torch.arange(
+                        num_sorted, dtype=torch.int32, device="cuda"
+                    )
+                    dummy_num_valid = torch.tensor(
+                        [token * topk], dtype=torch.int32, device="cuda"
+                    )
+                    _, us_qs = run_perftest(
+                        fused_dynamic_mxfp4_quant_moe_sort,
+                        dummy_act,
+                        sorted_ids=dummy_sorted_ids,
+                        num_valid_ids=dummy_num_valid,
+                        token_num=token,
+                        topk=topk,
+                        block_size=block_size,
+                    )
+                    us_qs_cache[bm] = round(us_qs, 4)
+                    print(
+                        f"  quant_sort benchmark: blockM={bm_int}, us={us_qs_cache[bm]}"
+                    )
+                profileDF["us_quant_sort"] = profileDF["block_m"].map(us_qs_cache)
+                is_fq = profileDF["kernelName1"].astype(str).str.contains("_fq")
+                profileDF.loc[~is_fq, "us1"] = (
+                    profileDF.loc[~is_fq, "us1"]
+                    + profileDF.loc[~is_fq, "us_quant_sort"]
+                )
+                profileDF.drop(columns=["us_quant_sort"], inplace=True)
+
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
@@ -2309,6 +2571,14 @@ class FmoeTuner(TunerCommon):
                 ] + ["block_m"]
                 non_flydsl_df = pd.merge(_nf_s1, _nf_s2, on=_join_keys, how="inner")
                 if len(non_flydsl_df) > 0:
+                    if q_type == QuantType.per_1x32 and us_qs_cache:
+                        non_flydsl_df["us_quant_sort"] = non_flydsl_df["block_m"].map(
+                            us_qs_cache
+                        )
+                        non_flydsl_df["us1"] = non_flydsl_df["us1"] + non_flydsl_df[
+                            "us_quant_sort"
+                        ].fillna(0)
+                        non_flydsl_df.drop(columns=["us_quant_sort"], inplace=True)
                     non_flydsl_df["us"] = round(
                         non_flydsl_df["us1"] + non_flydsl_df["us2"], 4
                     )

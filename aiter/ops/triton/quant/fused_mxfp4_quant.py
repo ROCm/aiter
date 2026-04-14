@@ -598,12 +598,17 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     # scaleN = triton.cdiv(scaleN_valid, 8) * 8
     scaleN = scaleN_valid
 
-    BLOCK_SIZE_Mx = 128
+    # Smaller quant block for small token counts reduces wasted masked work
+    # and register pressure. 128 is optimal for large M (better amortization).
+    if M <= 32:
+        BLOCK_SIZE_Mx = 32
+    else:
+        BLOCK_SIZE_Mx = 128
 
     BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
     BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
 
-    M_i, N_i = M, scaleN
+    N_i = scaleN
     M_o, N_o = sorted_ids.shape[0], N_i
     assert (N_i // 2) % 2 == 0
     assert block_size % BLOCK_SIZE_M == 0
@@ -636,7 +641,6 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         *x_fp4.stride(),
         *blockscale_e8m0_sorted.stride(),
         token_num=token_num,
-        M_i=M_i,
         N_i=N_i,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         BLOCK_SIZE_Mx=BLOCK_SIZE_Mx,

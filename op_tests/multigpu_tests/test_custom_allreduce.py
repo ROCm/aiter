@@ -117,7 +117,7 @@ def test_allreduce_custom(
 
 
 l_dtype = ["fp16", "bf16"]
-l_shape = [(128, 8192)]
+l_shape = [(2, 7168), (128, 8192)]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(

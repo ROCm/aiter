@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
@@ -83,8 +83,9 @@ def biased_grouped_topk(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
 ):
     token_num = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
     cu_num = get_cu_num()
-    if token_num <= cu_num * 212:
+    if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -209,7 +210,7 @@ def top_k_per_row_prefill(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -234,7 +235,7 @@ def top_k_per_row_decode(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes")
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
     next_n: int,

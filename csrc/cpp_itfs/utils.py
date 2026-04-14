@@ -111,8 +111,9 @@ def mp_lock(
 
 
 def get_hip_version():
+    hipconfig_home = shutil.which("hipconfig")
     version = subprocess.run(
-        "/opt/rocm/bin/hipconfig --version", shell=True, capture_output=True, text=True
+        f"{hipconfig_home} --version", shell=True, capture_output=True, text=True
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 
@@ -185,6 +186,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         cxxflags += [
             "-DUSE_ROCM",
             "-DENABLE_FP8",
+            "-DENABLE_CK=1",
             "-O3" if not AITER_DEBUG else "-O0",
             "-std=c++20",
             "-DLEGACY_HIPBLAS_DIRECT",

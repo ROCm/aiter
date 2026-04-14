@@ -24,6 +24,7 @@ echo "######## linking mha fwd"
                      -I$TOP_DIR/csrc/include \
                      -std=c++20 -O3 \
                      -DUSE_ROCM=1 \
+                     -DENABLE_CK=1 \
                      -DCK_TILE_FMHA_FWD_SPLITKV_API=$splitkv_api \
                      --offload-arch=native \
                      -L $SCRIPT_DIR -lmha_fwd \
@@ -37,6 +38,7 @@ echo "######## linking mha bwd"
                      -I$TOP_DIR/csrc/include \
                      -std=c++20 -O3 \
                      -DUSE_ROCM=1 \
+                     -DENABLE_CK=1 \
                      --offload-arch=native \
                      -L $SCRIPT_DIR -lmha_bwd \
                      $SCRIPT_DIR/benchmark_mha_bwd.cpp -o bwd.exe

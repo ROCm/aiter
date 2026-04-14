@@ -100,7 +100,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
     k_by_head = rms_norm_forward(k_by_head, kw, eps)
     k = k_by_head.view(k.shape)
 
-    cos_sin = cos_sin.view(max_positions, head_size)
+    cos_sin = cos_sin.view(cos_sin.shape[0], head_size)
     cos_sin = cos_sin[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
 
@@ -226,7 +226,7 @@ def run_torch_qk_norm_rope_cache_block_quant_shuffle(
     k_by_head = rms_norm_forward(k_by_head, kw, eps)
     k = k_by_head.view(k.shape)
 
-    cos_sin = cos_sin.view(max_positions, head_size)
+    cos_sin = cos_sin.view(cos_sin.shape[0], head_size)
     cos_sin = cos_sin[positions]
     cos, sin = cos_sin.chunk(2, dim=-1)
 
@@ -426,6 +426,7 @@ def test_qk_norm_rope_cache_quant(
     kv_cache_dtype,
     num_blocks,
     page_size,
+    max_positions: int = 10000,
 ):
     # Construct tensors inside the function
     if kv_cache_dtype == "fp8_e4m3":
@@ -543,6 +544,154 @@ def test_qk_norm_rope_cache_quant(
         + num_tokens * num_heads_v * head_size * (torch.finfo(cache_dtype).bits // 8)
     ) / (avg_cu * 1e6)
     return ret
+
+
+@benchmark()
+def test_qk_norm_rope_cache_quant_v_shuffle_layout(
+    dtype,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_size,
+    is_neox_style,
+    eps,
+    kv_cache_dtype,
+    num_blocks,
+    page_size,
+    max_positions: int = 10000,
+):
+    """5D v_cache shuffle: host must use k_cache page_size, not v.size(-1).
+
+    Two aiter runs with independent 5D shuffle buffers must match (q/k/v, caches, scales).
+    """
+    if kv_cache_dtype == "fp8_e4m3":
+        cache_dtype = get_dtype_fp8()
+    else:
+        cache_dtype = dtype
+
+    k0 = torch.zeros(
+        [num_blocks, page_size, num_heads_k, head_size],
+        dtype=dtype,
+        device="cuda",
+    ).to(cache_dtype)
+    x = 16 // k0.element_size()
+    k_cache = (
+        k0.view([num_blocks, page_size, num_heads_k, head_size // x, x])
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    v_cache_5d = (
+        torch.zeros(
+            [num_blocks, page_size, num_heads_v, head_size],
+            dtype=dtype,
+            device="cuda",
+        )
+        .to(cache_dtype)
+        .view(num_blocks, page_size // x, num_heads_v, head_size, x)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
+
+    slot_mapping = torch.randperm(num_tokens, dtype=torch.int64, device="cuda")
+    k_scale = torch.zeros(
+        [num_blocks, num_heads_k, page_size], dtype=torch.float32, device="cuda"
+    )
+    v_scale = torch.zeros(
+        [num_blocks, num_heads_v, page_size], dtype=torch.float32, device="cuda"
+    )
+    qkv = torch.randn(
+        (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    qw = torch.randn(head_size, dtype=dtype, device="cuda")
+    kw = torch.randn(head_size, dtype=dtype, device="cuda")
+    cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
+    positions = torch.randint(
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    k_scale_a = k_scale.clone()
+    v_scale_a = v_scale.clone()
+    k_scale_b = k_scale.clone()
+    v_scale_b = v_scale.clone()
+
+    (q_a, k_a, v_a, k_cache_a, v_cache_a), avg_a = (
+        run_aiter_qk_norm_rope_cache_quant_shuffle(
+            qkv.clone(),
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache.clone(),
+            v_cache_5d.clone(),
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale_a,
+            v_scale_a,
+        )
+    )
+
+    (q_b, k_b, v_b, k_cache_b, v_cache_b), avg_b = (
+        run_aiter_qk_norm_rope_cache_quant_shuffle(
+            qkv.clone(),
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache.clone(),
+            v_cache_5d.clone(),
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale_b,
+            v_scale_b,
+        )
+    )
+
+    slots_edit = torch.unique(slot_mapping // page_size)
+    cache_rtol = 5e-2 if kv_cache_dtype == "fp8_e4m3" else 1e-2
+    cache_atol = 0.05
+
+    info = (
+        f"v_shuffle dtype:{dtype}, tok:{num_tokens}, Hq:{num_heads_q}, Hkv:{num_heads_k}, "
+        f"D:{head_size}, neox:{is_neox_style}, kvd:{kv_cache_dtype}"
+    )
+    msg = f"[perf] === {info} === run_a {avg_a:.2f} us, run_b {avg_b:.2f} us"
+    checkAllclose(q_a, q_b, msg="q " + msg, rtol=1e-2, atol=0.05)
+    checkAllclose(k_a, k_b, msg="k " + msg, rtol=1e-2, atol=0.05)
+    checkAllclose(v_a, v_b, msg="v " + msg, rtol=1e-2, atol=0.05)
+    checkAllclose(
+        k_cache_a.float()[slots_edit],
+        k_cache_b.float()[slots_edit],
+        msg="k_cache 5D " + msg,
+        rtol=cache_rtol,
+        atol=cache_atol,
+    )
+    checkAllclose(
+        v_cache_a.float()[slots_edit],
+        v_cache_b.float()[slots_edit],
+        msg="v_cache 5D shuffle " + msg,
+        rtol=cache_rtol,
+        atol=cache_atol,
+    )
+    checkAllclose(k_scale_a, k_scale_b, msg="k_scale", rtol=1e-2, atol=0.05)
+    checkAllclose(v_scale_a, v_scale_b, msg="v_scale", rtol=1e-2, atol=0.05)
+    return {"v_shuffle_us_a": avg_a, "v_shuffle_us_b": avg_b}
 
 
 @perftest()
@@ -1718,6 +1867,179 @@ def test_mixed_prefill_decode_block_quant(
     return {"mixed_fused_qk_us": avg_cu, "mixed_unfused_us": avg_torch}
 
 
+def apply_partial_rotary_emb(
+    x: Tensor, cos: Tensor, sin: Tensor, rotary_dim: int, is_neox_style: bool
+) -> Tensor:
+    """Apply RoPE only to the first rotary_dim elements, pass through the rest."""
+    x_rot = x[..., :rotary_dim]
+    x_pass = x[..., rotary_dim:]
+    x_rot = apply_rotary_emb_torch(x_rot, cos, sin, is_neox_style)
+    return torch.cat((x_rot, x_pass), dim=-1)
+
+
+def ref_partial_rotary_pts_quant(
+    qkv: Tensor,
+    qw: Tensor,
+    kw: Tensor,
+    cos_sin: Tensor,
+    positions: Tensor,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+    eps: float,
+):
+    """Reference implementation: RMSNorm + partial rotary RoPE."""
+    q_size = num_heads_q * head_size
+    k_size = num_heads_k * head_size
+    v_size = num_heads_v * head_size
+    qkv_flat = qkv.view(num_tokens, q_size + k_size + v_size)
+    q, k, v = qkv_flat.split([q_size, k_size, v_size], dim=-1)
+
+    q = rms_norm_forward(q.view(num_tokens, num_heads_q, head_size), qw, eps)
+    k = rms_norm_forward(k.view(num_tokens, num_heads_k, head_size), kw, eps)
+    v = v.view(num_tokens, num_heads_v, head_size)
+
+    indexed = cos_sin[positions]
+    cos, sin = indexed.chunk(2, dim=-1)
+
+    q = apply_partial_rotary_emb(q, cos, sin, rotary_dim, is_neox_style)
+    k = apply_partial_rotary_emb(k, cos, sin, rotary_dim, is_neox_style)
+    return q, k, v
+
+
+def test_partial_rotary_pts_quant(
+    dtype,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    num_heads_v,
+    head_size,
+    rotary_dim,
+    is_neox_style,
+    eps=1e-6,
+):
+    max_pos = 4096
+    num_slots = num_tokens + 64
+
+    qkv = torch.randn(
+        (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    qw = torch.randn(head_size, dtype=dtype, device="cuda")
+    kw = torch.randn(head_size, dtype=dtype, device="cuda")
+    cos_sin = torch.randn((max_pos, rotary_dim), dtype=dtype, device="cuda")
+    positions = torch.randint(
+        0, max_pos, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    k_cache = torch.zeros(
+        (num_slots, num_heads_k, head_size), dtype=dtype, device="cuda"
+    )
+    v_cache = torch.zeros(
+        (num_slots, num_heads_v, head_size), dtype=dtype, device="cuda"
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    per_tensor_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    per_tensor_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+
+    q_out = torch.empty(
+        (num_tokens, num_heads_q, head_size), dtype=dtype, device="cuda"
+    )
+    k_out = torch.empty(
+        (num_tokens, num_heads_k, head_size), dtype=dtype, device="cuda"
+    )
+    v_out = torch.empty(
+        (num_tokens, num_heads_v, head_size), dtype=dtype, device="cuda"
+    )
+
+    q_ref, k_ref, v_ref = ref_partial_rotary_pts_quant(
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        rotary_dim,
+        is_neox_style,
+        eps,
+    )
+
+    aiter.fused_qk_norm_rope_cache_pts_quant_shuffle(
+        qkv.clone(),
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        eps,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        per_tensor_k_scale,
+        per_tensor_v_scale,
+        k_out,
+        v_out,
+        True,
+        False,
+        0,
+        0,
+        rotary_dim,
+    )
+
+    tag = (
+        f"partial_rotary dtype={dtype}, tokens={num_tokens}, "
+        f"Hq={num_heads_q}, Hk={num_heads_k}, D={head_size}, "
+        f"rotary_dim={rotary_dim}, neox={is_neox_style}"
+    )
+    checkAllclose(
+        q_ref.reshape(num_tokens, -1),
+        q_out.reshape(num_tokens, -1),
+        msg=f"q  {tag}",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        k_ref.reshape(num_tokens, -1),
+        k_out.reshape(num_tokens, -1),
+        msg=f"k  {tag}",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    checkAllclose(
+        v_ref.reshape(num_tokens, -1),
+        v_out.reshape(num_tokens, -1),
+        msg=f"v  {tag}",
+        rtol=1e-2,
+        atol=0.05,
+    )
+    print(f"[PASS] {tag}", flush=True)
+    return {
+        "dtype": str(dtype),
+        "num_tokens": num_tokens,
+        "num_heads_q": num_heads_q,
+        "num_heads_k": num_heads_k,
+        "head_size": head_size,
+        "rotary_dim": rotary_dim,
+        "is_neox_style": "1" if is_neox_style else "0",
+        "status": "PASS",
+    }
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -1884,10 +2206,28 @@ if __name__ == "__main__":
                                     kv_cache_dtype,
                                     args.num_blocks,
                                     args.page_size,
+                                    max_positions=args.max_positions,
                                 )
                                 df.append(ret)
     df = pd.DataFrame(df)
     block_df = pd.DataFrame(block_df)
+    if "per_head" in args.quant_type:
+        for is_neox_style in args.is_neox_styles:
+            for kv_cache_dtype in args.kv_cache_dtypes:
+                test_qk_norm_rope_cache_quant_v_shuffle_layout(
+                    args.dtype,
+                    127,
+                    32,
+                    4,
+                    4,
+                    128,
+                    is_neox_style,
+                    1e-6,
+                    kv_cache_dtype,
+                    args.num_blocks,
+                    args.page_size,
+                    max_positions=args.max_positions,
+                )
     df_md = df.to_markdown(index=False)
     block_df_md = block_df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_cache_quant summary (markdown):\n%s", df_md)
@@ -1942,3 +2282,29 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
+
+    # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
+    df = []
+    partial_rotary_configs = {256: 64, 128: 32, 64: 16}
+
+    for num_token in args.token:
+        for num_head, num_kv_head in args.head:
+            for head_size in args.head_sizes:
+                rotary_dim = partial_rotary_configs[head_size]
+                assert rotary_dim < head_size
+                for is_neox_style in args.is_neox_styles:
+                    ret = test_partial_rotary_pts_quant(
+                        args.dtype,
+                        num_token,
+                        num_head,
+                        num_kv_head,
+                        num_kv_head,
+                        head_size,
+                        rotary_dim,
+                        is_neox_style,
+                        eps=1e-6,
+                    )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("partial_rotary_pts_quant summary (markdown):\n%s", df_md)

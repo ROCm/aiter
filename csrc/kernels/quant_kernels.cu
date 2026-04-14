@@ -3,12 +3,9 @@
 
 #include "aiter_hip_common.h"
 #include "dispatch_utils.h"
-// #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
-#include "quant_common.cuh"
+#include "py_itfs_common.h"
 #include "rocprim/rocprim.hpp"
-#include "vec_convert.h"
-// #include "opus.hpp"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
 
@@ -42,12 +39,12 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int64_t row_offset       = blockIdx.x * groupQuantBlockSize;
     int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
     int32_t scaleN           = ori_cols / group_size;
-    int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> && shuffle_scale)
+    int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, opus::fp4_t> && shuffle_scale)
                                    ? (((scaleN + 7) / 8) * 8)
                                    : scaleN;
     int64_t x                = groupId / scaleN_pad;
     int32_t y                = groupId % scaleN_pad;
-    if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+    if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
     {
         if(x >= ori_rows || y >= scaleN)
         {
@@ -67,54 +64,49 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
 
     row_offset  = x * ori_row_stride + y * group_size;
-    using vec_i = ck_tile::vec_t<DTYPE_I, thread_data_size>;
+    using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? thread_data_size / 2 : thread_data_size;
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? thread_data_size / 2 : thread_data_size;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+        std::is_same_v<DTYPE_O, opus::fp4_t>
             ? 0.25
-            : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
+            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
-    // static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
-    // const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
     const int64_t oob_o = (ori_rows * ori_cols + ooba_o - 1) / ooba_o * ooba_o;
-    // auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(input +
-    // row_offset, oob_i); buffer_i.init_raw();
 
     auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
-    // vec_i thread_data      = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
     vec_i thread_data = input_vecs[threadIdx.x % num_thread_per_group];
     float absMax      = 1e-10f;
     for(size_t j = 0; j < thread_data_size; j++)
     {
-        absMax = max(absMax, abs(ck_tile::type_convert<float>(thread_data[j])));
+        absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
     }
     absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
 
     auto fp4_scale = [](float tmp) {
-        uint32_t u32      = ck_tile::bit_cast<uint32_t>(tmp);
+        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
         uint32_t exponent = (u32 >> 23) & 0b11111111;
         if(exponent == 0b11111111)
         {
-            return ck_tile::bit_cast<float>(exponent << 23);
+            return __builtin_bit_cast(float, exponent << 23);
         }
         if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
             exponent += 1;
-        return ck_tile::bit_cast<float>(exponent << 23);
+        return __builtin_bit_cast(float, exponent << 23);
     };
-    float inverted_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+    float inverted_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                                ? fp4_scale(absMax) * inverted_DTYPE_MAX
                                : absMax * inverted_DTYPE_MAX;
-    row_offset           = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+    row_offset           = std::is_same_v<DTYPE_O, opus::fp4_t>
                                ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
                                : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
     if(threadIdx.x % num_thread_per_group == 0)
     {
-        if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+        if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
         {
             auto* tmp        = reinterpret_cast<uint8_t*>(scale);
-            uint8_t exponent = (ck_tile::bit_cast<uint32_t>(inverted_scale) >> 23) & 0b11111111;
+            uint8_t exponent = (__builtin_bit_cast(uint32_t, inverted_scale) >> 23) & 0b11111111;
             if(shuffle_scale)
             {
                 groupId = fp4_scale_shuffle_id(scaleN_pad, x, y);
@@ -131,33 +123,21 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         }
     }
     inverted_scale =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? inverted_scale : 1.0f / inverted_scale;
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? inverted_scale : 1.0f / inverted_scale;
 
-    using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
+    using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
-    auto buffer_o =
-        ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(out_ptr, oob_o);
-    buffer_o.init_raw();
+    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_o * sizeof(DTYPE_STORE));
 
-    auto out_s =
-        ck_tile::vec_convert<DTYPE_O, DTYPE_I, thread_data_size>(thread_data, inverted_scale)
-            .template get_as<DTYPE_STORE>();
-    if constexpr(thread_data_size <= 16)
-    {
-        buffer_o.template set(row_offset, 0, true, out_s);
-    }
-    else
-    {
-        static constexpr int32_t o_step = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? 8 : 16;
-        assert(thread_data_size % 16 == 0);
-        using vecT                        = ck_tile::vec_t<DTYPE_STORE, o_step>;
-        auto vec                          = out_s.template get_as<vecT>();
-        static constexpr int32_t num_iter = thread_data_size / 16;
+    store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, thread_data, row_offset, inverted_scale);
+}
 
-        for(size_t j = 0; j < num_iter; j++)
-        {
-            buffer_o.template set(row_offset + j * o_step, 0, true, vec[j]);
-        }
+__global__ void initializeScale(float *d_data, int size, float value)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size)
+    {
+        d_data[idx] = value;
     }
 }
 
@@ -168,20 +148,20 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     static constexpr int32_t vec_size_i =
         thread_data_size == 0 ? 16 / sizeof(DTYPE_O) : thread_data_size;
     static constexpr int32_t vec_size_o =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
-    using vec_i = ck_tile::vec_t<DTYPE_I, vec_size_i>;
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? vec_size_i / 2 : vec_size_i;
+    static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4);
+    using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+        std::is_same_v<DTYPE_O, opus::fp4_t>
             ? 0.25
-            : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
+            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     const int64_t row_offset        = blockIdx.x * cols;
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input + row_offset);
     auto const* input_vecs          = reinterpret_cast<vec_i const*>(ptr_i);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
-    auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
-    buffer_i.init_raw();
+    auto buffer_i = opus::make_gmem<DTYPE_I>(ptr_i, oob_i * sizeof(DTYPE_I));
 
     // double load core loop start
     const int32_t num_elems_tail = cols % vec_size_i;
@@ -192,7 +172,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     size_t vec_stride = BlockSize;
     if(vec_idx < num_vecs)
     {
-        vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
+        vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
     }
 
     float absMax = 0.f;
@@ -201,10 +181,10 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
         vec_i vec_nxt;
         for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
         {
-            vec_nxt = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
+            vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes>(buffer_i, vec_idx * vec_size_i);
             for(size_t j = 0; j < vec_size_i; j++)
             {
-                absMax = max(absMax, abs(ck_tile::type_convert<float>(vec_cur[j])));
+                absMax = max(absMax, abs(static_cast<float>(vec_cur[j])));
             }
             vec_cur = vec_nxt;
         }
@@ -215,7 +195,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
 #pragma unroll
         for(size_t j = 0; j < vec_size_i; j++)
         {
-            absMax = max(absMax, abs(ck_tile::type_convert<float>(vec_cur[j])));
+            absMax = max(absMax, abs(static_cast<float>(vec_cur[j])));
         }
     }
     // double load core loop end
@@ -226,21 +206,32 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
 
     auto fp4_scale = [](float tmp) {
-        uint32_t u32      = ck_tile::bit_cast<uint32_t>(tmp);
+        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
         uint32_t exponent = (u32 >> 23) & 0b11111111;
         if(exponent == 0b11111111)
         {
-            return ck_tile::bit_cast<float>(exponent << 23);
+            return __builtin_bit_cast(float, exponent << 23);
         }
         if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
             exponent += 1;
-        return ck_tile::bit_cast<float>(exponent << 23);
+        return __builtin_bit_cast(float, exponent << 23);
     };
-    float row_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+    float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? fp4_scale(absMax) * inverted_DTYPE_MAX
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<DTYPE_I*>(&vec_cur));
 }
+
+__device__ __forceinline__ float atomicMaxFloat(float *addr, float value)
+  {
+    float old;
+    old = (value >= 0)
+              ? __int_as_float(atomicMax((int *)addr, __float_as_int(value)))
+              : __uint_as_float(
+                    atomicMin((unsigned int *)addr, __float_as_uint(value)));
+
+    return old;
+  }
 
 template <typename DTYPE_I, typename DTYPE_O>
 __global__ void
@@ -250,7 +241,7 @@ data_to_scale_kernel(float* __restrict__ scale, const DTYPE_I* __restrict__ inpu
     float row_scale = std::get<0>(res);
     if(threadIdx.x == 0)
     {
-        vllm::atomicMaxFloat(scale, row_scale);
+        atomicMaxFloat(scale, row_scale);
     }
 }
 
@@ -262,31 +253,27 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
 {
 
     const float inverted_scale =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : __builtin_amdgcn_rcpf(*scale);
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? (*scale) : __builtin_amdgcn_rcpf(*scale);
     static constexpr int32_t vec_size_i = 16 / sizeof(DTYPE_O);
     static constexpr int32_t vec_size_o =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? vec_size_i / 2 : vec_size_i;
 
-    using vec_i       = ck_tile::vec_t<DTYPE_I, vec_size_i>;
-    using vec_o       = ck_tile::vec_t<DTYPE_O, vec_size_o>;
-    using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
+    using vec_i       = opus::vector_t<DTYPE_I, vec_size_i>;
+    using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
 
     const int64_t row_offset        = blockIdx.x * cols;
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input + row_offset);
     auto const* input_vecs          = reinterpret_cast<vec_i const*>(ptr_i);
-    auto* ptr_o                     = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+    auto* ptr_o                     = std::is_same_v<DTYPE_O, opus::fp4_t>
                                           ? reinterpret_cast<DTYPE_STORE*>(out + row_offset / 2)
                                           : reinterpret_cast<DTYPE_STORE*>(out + row_offset);
-    auto* out_vecs                  = reinterpret_cast<vec_o*>(ptr_o);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
     static constexpr int32_t ooba_o = 4 / sizeof(DTYPE_O);
     const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
     const int32_t oob_o             = (cols + ooba_o - 1) / ooba_o * ooba_o;
 
-    auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
-    buffer_i.init_raw();
-    auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_o, oob_o);
-    buffer_o.init_raw();
+    auto buffer_i = opus::make_gmem<DTYPE_I>(ptr_i, oob_i * sizeof(DTYPE_I));
+    auto buffer_o = opus::make_gmem<DTYPE_STORE>(ptr_o, oob_o * sizeof(DTYPE_STORE));
 
     // double load core loop start
     const int32_t num_elems_tail = cols % vec_size_i;
@@ -300,29 +287,19 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
     size_t vec_stride = BlockSize;
     if(vec_idx < num_vecs)
     {
-        vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
+        vec_cur = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
     }
 
     for(vec_idx += vec_stride; vec_idx < num_vecs; vec_idx += vec_stride)
     {
-        vec_nxt = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
-        buffer_o.template set(
-            (vec_idx - vec_stride) * vec_size_o,
-            0,
-            true,
-            ck_tile::vec_convert<DTYPE_O, DTYPE_I, vec_size_i>(vec_cur, inverted_scale)
-                .template get_as<DTYPE_STORE>());
+        vec_nxt = load_vector_nbytes<DTYPE_I, vec_size_i, 16>(buffer_i, vec_idx * vec_size_i);
+        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
         vec_cur = vec_nxt;
     }
 
     if(vec_idx - vec_stride < num_vecs)
     {
-        buffer_o.template set(
-            (vec_idx - vec_stride) * vec_size_o,
-            0,
-            true,
-            ck_tile::vec_convert<DTYPE_O, DTYPE_I, vec_size_i>(vec_cur, inverted_scale)
-                .template get_as<DTYPE_STORE>());
+        store_vector<DTYPE_STORE, DTYPE_I, vec_size_i, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, vec_cur, (vec_idx - vec_stride) * vec_size_o, inverted_scale);
     }
     // double load core loop end
 }
@@ -336,18 +313,18 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
 {
 
     const float inverted_scale =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? (*scale) : __builtin_amdgcn_rcpf(*scale);
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? (*scale) : __builtin_amdgcn_rcpf(*scale);
     static constexpr int32_t vec_size_i = thread_data_size;
     static constexpr int32_t vec_size_o =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? vec_size_i / 2 : vec_size_i;
 
     using vec_i       = opus::vector_t<DTYPE_I, vec_size_i>;
-    using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>, uint8_t, DTYPE_O>;
+    using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
 
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input);
     auto const* input_vecs          = reinterpret_cast<vec_i const*>(ptr_i);
     auto* out_ptr                   = reinterpret_cast<DTYPE_O*>(out);
-    auto* ptr_o                     = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+    auto* ptr_o                     = std::is_same_v<DTYPE_O, opus::fp4_t>
                                           ? reinterpret_cast<DTYPE_STORE*>(out + out_offset / 2)
                                           : reinterpret_cast<DTYPE_STORE*>(out + out_offset);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
@@ -396,10 +373,10 @@ dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     if(threadIdx.x == 0)
     {
-        if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+        if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
         {
             auto* tmp        = reinterpret_cast<uint8_t*>(scale);
-            uint8_t exponent = (ck_tile::bit_cast<uint32_t>(row_scale) >> 23) & 0b11111111;
+            uint8_t exponent = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111;
             tmp[token_idx]   = exponent;
         }
         else
@@ -429,12 +406,12 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
     static constexpr int32_t vec_size_i =
         thread_data_size == 0 ? 16 / sizeof(DTYPE_O) : thread_data_size;
     static constexpr int32_t vec_size_o =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? vec_size_i / 2 : vec_size_i;
     using vec_s = opus::vector_t<float, vec_size_i>;
     const float inverted_DTYPE_MAX =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+        std::is_same_v<DTYPE_O, opus::fp4_t>
             ? 0.25
-            : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
+            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
 
     auto const* ptr_smscale = reinterpret_cast<float const*>(smooth_scale + smscale_map_idx * cols);
     auto const* smscale_vecs = reinterpret_cast<vec_s const*>(ptr_smscale);
@@ -447,24 +424,24 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
 #pragma unroll
     for(size_t j = 0; j < vec_size_i; j++)
     {
-        smscale_cur[j] = ck_tile::type_convert<float>(input[j]) * smscale_cur[j];
+        smscale_cur[j] = static_cast<float>(input[j]) * smscale_cur[j];
         absMax         = max(absMax, abs(smscale_cur[j]));
     }
 
     absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
     auto fp4_scale = [](float tmp) {
-        uint32_t u32      = ck_tile::bit_cast<uint32_t>(tmp);
+        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
         uint32_t exponent = (u32 >> 23) & 0b11111111;
         if(exponent == 0b11111111)
         {
-            return ck_tile::bit_cast<float>(exponent << 23);
+            return __builtin_bit_cast(float, exponent << 23);
         }
         if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
             exponent += 1;
-        return ck_tile::bit_cast<float>(exponent << 23);
+        return __builtin_bit_cast(float, exponent << 23);
     };
-    float row_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+    float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? fp4_scale(absMax) * inverted_DTYPE_MAX
                           : absMax * inverted_DTYPE_MAX;
     return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
@@ -500,12 +477,15 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#if defined(__GFX9__)
             const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
             uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
             asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+#else
+            buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#endif
         }
     }
 
@@ -529,7 +509,11 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             {
                 auto buffer_map = opus::make_gmem<int>(smooth_scale_map + chunk_start, chunk_size * sizeof(int));
                 smscale_map_idx_list = buffer_map.load(lane_idx + i)[0];
+#if defined(__gfx1250__)
+                opus::s_wait_loadcnt(opus::number<0>{});
+#else
                 opus::s_waitcnt_vmcnt(opus::number<0>{});
+#endif
                 if (i == 0)
                 {
                     __syncthreads();
@@ -555,7 +539,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         static constexpr int32_t vec_size_i =
             thread_data_size == 0 ? 16 / sizeof(DTYPE_O) : thread_data_size;
         static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16 : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4);
-        // using vec_i = ck_tile::vec_t<DTYPE_I, vec_size_i>;
+        // using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
         using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
         using vec_f = opus::vector_t<float, vec_size_i>;
 
@@ -568,7 +552,7 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
             for(int i = 0; i < vec_size_i; i++)
             {
-                vec_input_f[i] = ck_tile::type_convert<float>(vec_input[i]);
+                vec_input_f[i] = static_cast<float>(vec_input[i]);
             }
         }
         auto res = smooth_data_to_per_row_scale<float, DTYPE_O, block_size, thread_data_size>(
@@ -591,10 +575,10 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         }
         if(threadIdx.x == 0)
         {
-            if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+            if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
             {
                 auto* tmp        = reinterpret_cast<uint8_t*>(scale);
-                uint8_t exponent = (ck_tile::bit_cast<uint32_t>(row_scale) >> 23) & 0b11111111;
+                uint8_t exponent = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111;
                 tmp[out_token_idx]   = exponent;
             }
             else
@@ -621,9 +605,9 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     if(out.dtype() == torch_fp8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
+            using input_dtype = typename t2opus<scalar_t>::type;
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
+                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
                 cols);
@@ -632,9 +616,9 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     else if(out.dtype() == torch::kInt8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
+            using input_dtype = typename t2opus<scalar_t>::type;
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
                 cols);
@@ -648,7 +632,7 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
 
 #define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)      \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {              \
-        using input_dtype = typename t2ck<scalar_t>::type;                                  \
+        using input_dtype = typename t2opus<scalar_t>::type;                                  \
         aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA><<<grid, block, 0, stream>>>( \
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                     \
             scales.data_ptr<float>(),                                                       \
@@ -690,13 +674,13 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
     if(out.dtype() == torch_fp8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
-            vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
+            using input_dtype = typename t2opus<scalar_t>::type;
+            aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, FP8_TYPE><<<grid, block, 0, stream>>>(
+            aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
+                reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
                 cols);
@@ -705,13 +689,13 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
     else if(out.dtype() == torch::kInt8)
     {
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
-            vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
+            using input_dtype = typename t2opus<scalar_t>::type;
+            aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 scale.data_ptr<float>(), 1, 0.0f);
-            aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t><<<grid, block, 0, stream>>>(
+            aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
                 scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
                 cols);
@@ -757,9 +741,9 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             dim3 const block(groupQuantBlockSize);
             AITER_DISPATCH_FLOATING16_TYPES(
                 input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename t2ck<scalar_t>::type;
+                    using input_dtype = typename t2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
+                        reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                         scales.data_ptr<float>(),
                         reinterpret_cast<input_dtype*>(input.data_ptr()),
                         scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
@@ -782,9 +766,9 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             dim3 const block(groupQuantBlockSize);
             AITER_DISPATCH_FLOATING16_TYPES(
                 input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename t2ck<scalar_t>::type;
+                    using input_dtype = typename t2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                        reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                         scales.data_ptr<float>(),
                         reinterpret_cast<input_dtype*>(input.data_ptr()),
                         scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
@@ -810,9 +794,9 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             dim3 const block(groupQuantBlockSize);
             AITER_DISPATCH_FLOATING16_TYPES(
                 input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename t2ck<scalar_t>::type;
+                    using input_dtype = typename t2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                        reinterpret_cast<ck_tile::fp4x2_t*>(out.data_ptr()),
+                        reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
                         reinterpret_cast<float*>(scales.data_ptr()),
                         reinterpret_cast<input_dtype*>(input.data_ptr()),
                         scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
@@ -838,18 +822,18 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
         if(out.dtype() == torch_fp8)
         {
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-                dynamic_per_token_scaled_quant_kernel, FP8_TYPE, cols);
+                dynamic_per_token_scaled_quant_kernel, opus::fp8_t, cols);
         }
         else if(out.dtype() == torch::kInt8)
         {
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-                dynamic_per_token_scaled_quant_kernel, ck_tile::int8_t, cols);
+                dynamic_per_token_scaled_quant_kernel, opus::i8_t, cols);
         }
 #if defined(__Float4_e2m1fn_x2)
         else if(out.dtype() == torch_fp4x2)
         {
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-                dynamic_per_token_scaled_quant_kernel, ck_tile::fp4x2_t, cols);
+                dynamic_per_token_scaled_quant_kernel, opus::fp4_t, cols);
         }
 #endif
         else
@@ -896,9 +880,9 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
 #if defined(__Float4_e2m1fn_x2)
     AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
+            using input_dtype = typename t2opus<scalar_t>::type;
             aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<ck_tile::fp4x2_t*>(out.data_ptr()),
+                reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
                 reinterpret_cast<float*>(scales.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 nullptr,
@@ -917,7 +901,7 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                         \
-        using input_dtype = typename t2ck<scalar_t>::type;                                                             \
+        using input_dtype = typename t2opus<scalar_t>::type;                                                             \
         const int cu_num = get_num_cu_func();                                                                          \
         const int max_warp_per_simd = 8;                                                                               \
         const int warp_per_simd = BLOCK_SIZE / (opus::get_warp_size() * 4);                                            \
@@ -1031,18 +1015,18 @@ void smooth_per_token_scaled_quant(
     if(out.dtype() == torch_fp8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-            smooth_per_token_scaled_quant_kernel, FP8_TYPE, cols);
+            smooth_per_token_scaled_quant_kernel, opus::fp8_t, cols);
     }
     else if(out.dtype() == torch::kInt8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-            smooth_per_token_scaled_quant_kernel, ck_tile::int8_t, cols);
+            smooth_per_token_scaled_quant_kernel, opus::i8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
     else if(out.dtype() == torch_fp4x2 || out.dtype() == torch::kUInt8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
-            smooth_per_token_scaled_quant_kernel, ck_tile::fp4x2_t, cols);
+            smooth_per_token_scaled_quant_kernel, opus::fp4_t, cols);
     }
 #endif
     else
@@ -1057,15 +1041,15 @@ __global__ void partial_transpose_kernel(DTYPE* __restrict__ out,
                                          const int* __restrict__ num_rows,
                                          const int cols)
 {
-    using vec_i                     = ck_tile::vec_t<DTYPE, thread_data_size>;
+    using vec_i                     = opus::vector_t<DTYPE, thread_data_size>;
     int GRID_SIZE                   = gridDim.x;
     int ori_rows                    = *num_rows;
     int thread_per_row              = (cols + thread_data_size - 1) / thread_data_size;
     auto const* ptr_i               = reinterpret_cast<DTYPE const*>(input);
     static constexpr int32_t ooba_i = 4 / sizeof(DTYPE);
     const int32_t oob_i             = (ori_rows * cols + ooba_i - 1) / ooba_i * ooba_i;
-    auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
-    buffer_i.init_raw();
+    static constexpr int32_t load_chunk_bytes = sizeof(DTYPE) * thread_data_size % 16 == 0 ? 16 : (sizeof(DTYPE) * thread_data_size % 8 == 0 ? 8 : 4);
+    auto buffer_i = opus::make_gmem<DTYPE>(ptr_i, oob_i * sizeof(DTYPE));
     for(int i = 0; i < MAX_ITERS; i++)
     {
         int64_t y = i * GRID_SIZE * BLOCK_SIZE + blockIdx.x * BLOCK_SIZE + threadIdx.x;
@@ -1073,11 +1057,11 @@ __global__ void partial_transpose_kernel(DTYPE* __restrict__ out,
         y         = y / thread_per_row;
         if(y >= ori_rows)
             return;
-        vec_i input_vecs   = buffer_i.template get<vec_i>(y * cols + x, 0, true);
+        vec_i input_vecs   = load_vector_nbytes<DTYPE, thread_data_size, load_chunk_bytes>(buffer_i, y * cols + x);
         int64_t out_offset = x * ori_rows + y;
         // printf("blockIdx: %d, threadIdx:%d, y: %d, x: %d, ori_rows: %d, cols: %d, val:%f\n",
         // blockIdx.x, threadIdx.x, y, x, ori_rows, cols,
-        // ck_tile::type_convert<float>(input_vecs[0]));
+        // static_cast<float>(input_vecs[0]));
         for(int j = 0; j < thread_data_size; j++)
         {
             if((x + j) < cols)
@@ -1113,7 +1097,7 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 block(BlockSize);
 
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
+            using input_dtype = typename t2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1131,7 +1115,7 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 block(BlockSize);
 
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
+            using input_dtype = typename t2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1149,7 +1133,7 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 block(BlockSize);
 
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
+            using input_dtype = typename t2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1167,7 +1151,7 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 block(BlockSize);
 
         VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2ck<scalar_t>::type;
+            using input_dtype = typename t2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1210,12 +1194,15 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#if defined(__GFX9__)
             const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
             uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
             asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+#else
+            buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#endif
         }
     }
     int smscale_map_idx_list = 0;
@@ -1227,7 +1214,11 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
     auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
     vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
+#if defined(__gfx1250__)
+    opus::s_wait_loadcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
+#else
     opus::s_waitcnt_vmcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
+#endif
     __syncthreads();
     if constexpr(has_smscale_hash)
     {
@@ -1238,7 +1229,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     }
     for(int i = 0; i < vec_size_i; i++)
     {
-        vec_input_f[i] = ck_tile::type_convert<float>(vec_input[i]);
+        vec_input_f[i] = static_cast<float>(vec_input[i]);
     }
     for(int i = 0; i < m_repeat; i++)
     {
@@ -1263,10 +1254,10 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         }
         if(threadIdx.x == 0)
         {
-            if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+            if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
             {
                 auto* tmp        = reinterpret_cast<uint8_t*>(scale);
-                uint8_t exponent = (ck_tile::bit_cast<uint32_t>(row_scale) >> 23) & 0b11111111;
+                uint8_t exponent = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111;
                 tmp[out_token_idx]   = exponent;
             }
             else
@@ -1283,7 +1274,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
 
 #define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_HASH) \
     AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                         \
-        using input_dtype = typename t2ck<scalar_t>::type;                                                             \
+        using input_dtype = typename t2opus<scalar_t>::type;                                                             \
         int grid_size = rows;                                                                                          \
         dim3 const grid(grid_size);                                                                                    \
         aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01, HAS_HASH, MAX_EXPERT_SIZE> \
@@ -1371,18 +1362,18 @@ void moe_smooth_per_token_scaled_quant_v1(
     if(out.dtype() == torch_fp8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_DISPATCH(
-            moe_smooth_per_token_scaled_quant_kernel_v1, FP8_TYPE, cols);
+            moe_smooth_per_token_scaled_quant_kernel_v1, opus::fp8_t, cols);
     }
     else if(out.dtype() == torch::kInt8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_DISPATCH(
-            moe_smooth_per_token_scaled_quant_kernel_v1, ck_tile::int8_t, cols);
+            moe_smooth_per_token_scaled_quant_kernel_v1, opus::i8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
     else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_DISPATCH(
-            moe_smooth_per_token_scaled_quant_kernel_v1, ck_tile::fp4x2_t, cols);
+            moe_smooth_per_token_scaled_quant_kernel_v1, opus::fp4_t, cols);
     }
 #endif
     else
@@ -1438,9 +1429,9 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
         using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
         using vec_f = opus::vector_t<float, vec_size_i>;
         const float inverted_DTYPE_MAX =
-            std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+            std::is_same_v<DTYPE_O, opus::fp4_t>
                 ? 0.25
-                : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
+                : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
         auto buffer_smscale = opus::make_gmem<float>(smooth_scale + expert_id * cols, cols * sizeof(float));
         vec_f smscale = load_vector_nbytes<float, thread_data_size, 16>(buffer_smscale, threadIdx.x * vec_size_i);
         int token_id_list = token_id_info_list & 0xFFFFFF;
@@ -1460,7 +1451,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
             for(int i = 0; i < vec_size_i; i++)
             {
-                vec_input_f[i] = ck_tile::type_convert<float>(vec_input[i]);
+                vec_input_f[i] = static_cast<float>(vec_input[i]);
             }
             float absMax = 1e-10f;
             #pragma unroll
@@ -1472,17 +1463,17 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
 
             auto fp4_scale = [](float tmp) {
-                uint32_t u32      = ck_tile::bit_cast<uint32_t>(tmp);
+                uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
                 uint32_t exponent = (u32 >> 23) & 0b11111111;
                 if(exponent == 0b11111111)
                 {
-                    return ck_tile::bit_cast<float>(exponent << 23);
+                    return __builtin_bit_cast(float, exponent << 23);
                 }
                 if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
                     exponent += 1;
-                return ck_tile::bit_cast<float>(exponent << 23);
+                return __builtin_bit_cast(float, exponent << 23);
             };
-            float row_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+            float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                                 ? fp4_scale(absMax) * inverted_DTYPE_MAX
                                 : absMax * inverted_DTYPE_MAX;
             
@@ -1497,10 +1488,10 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
             }
             if(threadIdx.x == 0)
             {
-                if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+                if constexpr(std::is_same_v<DTYPE_O, opus::fp4_t>)
                 {
                     auto* tmp        = reinterpret_cast<uint8_t*>(scale);
-                    uint8_t exponent = (ck_tile::bit_cast<uint32_t>(row_scale) >> 23) & 0b11111111;
+                    uint8_t exponent = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111;
                     tmp[out_token_idx]   = exponent;
                 }
                 else
@@ -1515,33 +1506,33 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
 }
 
 
-#define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE) \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                         \
-        using input_dtype = typename t2ck<scalar_t>::type;                                                             \
-        int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE; \
-        int num_tg = persistent_mode? num_cu * warps_per_cu : num_blocks; \
-        dim3 const grid(num_tg);                                                                                    \
-        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA> \
-            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                                   \
-                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
-                scales.data_ptr<float>(),                                                                              \
-                reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
-                smooth_scale.data_ptr<float>(),                                                                        \
-                sorted_token_ids.data_ptr<int>(),                                                                      \
-                sorted_expert_ids.data_ptr<int>(),                                                                     \
-                num_valid_ids.data_ptr<int>(),                                                                      \
-                num_experts,                                                                                              \
-                num_tokens,                                                                                              \
-                num_blocks,                                                                                              \
-                num_tg,                                                                                                  \
-                cols,                                                                                                  \
-                topk,                                                                                                  \
-                block_m,                                                                                               \
-                block_m_log2split,                                                                                   \
-                input_stride0,                                                                                   \
-                input_stride1,                                                                                   \
-                shuffle_scale,                                                                                         \
-                transpose_out);                                                                                  \
+#define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)  \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                            \
+        using input_dtype = typename t2opus<scalar_t>::type;                                              \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                             \
+        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                               \
+        dim3 const grid(num_tg);                                                                          \
+        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>                                \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                      \
+                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                               \
+                scales.data_ptr<float>(),                                                                 \
+                reinterpret_cast<input_dtype*>(input.data_ptr()),                                         \
+                smooth_scale.data_ptr<float>(),                                                           \
+                sorted_token_ids.data_ptr<int>(),                                                         \
+                sorted_expert_ids.data_ptr<int>(),                                                        \
+                num_valid_ids.data_ptr<int>(),                                                            \
+                num_experts,                                                                              \
+                num_tokens,                                                                               \
+                num_blocks,                                                                               \
+                num_tg,                                                                                   \
+                cols,                                                                                     \
+                topk,                                                                                     \
+                block_m,                                                                                  \
+                block_m_log2split,                                                                        \
+                input_stride0,                                                                            \
+                input_stride1,                                                                            \
+                shuffle_scale,                                                                            \
+                transpose_out);                                                                           \
     });
 
 
@@ -1589,10 +1580,11 @@ void moe_smooth_per_token_scaled_quant_v2(
     int input_stride1= input.dim() == 2 ? 0 : input.stride(1);
 
     const int num_cu = get_num_cu_func();
-    int sub_block_m = 2;
-    int num_blocks = sorted_expert_ids.size(0) * (block_m / sub_block_m);
-    int block_split = block_m / sub_block_m;
+    int block_split = 16;
     int block_m_log2split = log2(block_split);
+    TORCH_CHECK(block_m % block_split == 0, __func__, " block_m is not divisible by block_split");
+    int sub_block_m = block_m >> block_m_log2split;
+    int num_blocks = sorted_expert_ids.size(0) * block_split;
     const bool persistent_mode = true;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
@@ -1601,18 +1593,18 @@ void moe_smooth_per_token_scaled_quant_v2(
     if(out.dtype() == torch_fp8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_DISPATCH(
-            moe_smooth_per_token_scaled_quant_kernel_v2, FP8_TYPE, cols);
+            moe_smooth_per_token_scaled_quant_kernel_v2, opus::fp8_t, cols);
     }
     else if(out.dtype() == torch::kInt8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_DISPATCH(
-            moe_smooth_per_token_scaled_quant_kernel_v2, ck_tile::int8_t, cols);
+            moe_smooth_per_token_scaled_quant_kernel_v2, opus::i8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
     else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_DISPATCH(
-            moe_smooth_per_token_scaled_quant_kernel_v2, ck_tile::fp4x2_t, cols);
+            moe_smooth_per_token_scaled_quant_kernel_v2, opus::fp4_t, cols);
     }
 #endif
     else
@@ -1621,5 +1613,367 @@ void moe_smooth_per_token_scaled_quant_v2(
     }
 }
 
+
+template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
+__global__ void mxfp4_quant_moe_sort_kernel(
+    DTYPE_O* __restrict__ out,
+    uint8_t* __restrict__ scale,
+    DTYPE_I const* __restrict__ input,
+    int32_t const* __restrict__ sorted_ids,
+    int32_t const* __restrict__ num_valid_ids,
+    const int32_t num_tokens,
+    const int32_t cols,
+    const int32_t group_size,
+    const int32_t tgs_per_block_m,
+    const int32_t sub_block_m,
+    const int32_t num_blocks,
+    const int32_t num_tg,
+    const int32_t topk,
+    const int32_t input_stride)
+{
+    int num_thread_per_group = group_size / thread_data_size;
+    int num_valid_ids_value  = num_valid_ids[0];
+    int block_idx            = blockIdx.x;
+    int lane_idx             = threadIdx.x % WARP_SIZE;
+    const int scale_k        = threadIdx.x / num_thread_per_group;
+    static constexpr int32_t vec_size_i =
+        thread_data_size == 0 ? 16 / sizeof(DTYPE_I) : thread_data_size;
+    static constexpr int32_t load_chunk_bytes =
+        (sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16
+                                                : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
+    using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
+    using vec_f = opus::vector_t<float, vec_size_i>;
+    const float inverted_DTYPE_MAX =
+        std::is_same_v<DTYPE_O, opus::fp4_t>
+            ? 0.25
+            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+    const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
+    const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
+
+    auto fp4_scale = [](float tmp) {
+        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
+        uint32_t exponent = (u32 >> 23) & 0b11111111;
+        if(exponent == 0b11111111)
+        {
+            return __builtin_bit_cast(float, exponent << 23);
+        }
+        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
+            exponent += 1;
+        return __builtin_bit_cast(float, exponent << 23);
+    };
+    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
+        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
+               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
+    };
+
+    for(; block_idx < num_blocks; block_idx += num_tg)
+    {
+        int sub_idx         = block_idx % tgs_per_block_m;
+        int block_m_start   = (block_idx - sub_idx) * sub_block_m;
+        int sorted_ids_base = block_m_start + sub_idx;
+        if(sorted_ids_base >= num_valid_ids_value)
+        {
+            return;
+        }
+        int token_id_info_list;
+        if (lane_idx < sub_block_m)
+        {
+            int strided_idx = sorted_ids_base + lane_idx * tgs_per_block_m;
+            token_id_info_list = (strided_idx < num_valid_ids_value)
+                ? sorted_ids[strided_idx]
+                : num_tokens;
+        }
+        int token_id_list = token_id_info_list & 0xFFFFFF;
+        int topk_id_list  = token_id_info_list >> 24;
+        for(int i = 0; i < sub_block_m; i++)
+        {
+            int token_idx = __builtin_amdgcn_readlane(token_id_list, i);
+            int topk_id   = __builtin_amdgcn_readlane(topk_id_list, i);
+            if(token_idx >= num_tokens)
+            {
+                break;
+            }
+
+            int64_t input_offset;
+            if (topk == 1)
+            {
+                input_offset = (int64_t)(token_idx) * input_stride;
+            }
+            else
+            {
+                input_offset = (int64_t)(token_idx * topk + topk_id) * input_stride;
+            }
+            auto buffer_input =
+                opus::make_gmem<DTYPE_I>(input + input_offset, cols * sizeof(DTYPE_I));
+            vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(
+                buffer_input, threadIdx.x * vec_size_i);
+            vec_f vec_input_f;
+            float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
+            float absMax       = 1e-10f;
+            #pragma unroll
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                vec_input_f[j] = static_cast<float>(vec_input[j]);
+                absMax         = max(absMax, abs(vec_input_f[j]));
+            }
+            absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+
+            float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
+                                  ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                                  : absMax * inverted_DTYPE_MAX;
+
+            const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
+            if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
+            {
+                uint8_t bs_e8m0 = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
+                int addr        = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k);
+                scale[addr]     = bs_e8m0;
+            }
+
+            if(topk_id < topk)
+            {
+                int64_t out_offset = (int64_t)(token_idx * topk + topk_id) * cols;
+                scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(
+                    out, input_f_ptr, &row_scale, cols, out_offset);
+            }
+        }
+    }
+}
+
+
+#define MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                    \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "mxfp4_quant_moe_sort_kernel", [&] { \
+        AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
+        using input_dtype = typename t2opus<scalar_t>::type;                                   \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                  \
+        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                     \
+        dim3 const grid(num_tg);                                                               \
+        mxfp4_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>             \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                           \
+                reinterpret_cast<DTYPE_O*>(output.data_ptr()),                                  \
+                reinterpret_cast<uint8_t*>(scale.data_ptr()),                                   \
+                reinterpret_cast<input_dtype const*>(input.data_ptr()),                         \
+                sorted_ids.data_ptr<int32_t>(),                                                 \
+                num_valid_ids.data_ptr<int32_t>(),                                              \
+                token_num,                                                                      \
+                cols,                                                                           \
+                group_size,                                                                     \
+                tgs_per_block_m,                                                                \
+                sub_block_m,                                                                     \
+                num_blocks,                                                                     \
+                num_tg,                                                                         \
+                topk,                                                                           \
+                input_stride);                                                                  \
+    });
+
+
+#define MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(DTYPE_O, cols_)                                   \
+    if(cols_ <= 2 * BlockSize)                                                                 \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 4)                           \
+    }                                                                                          \
+    else if(cols_ <= 4 * BlockSize)                                                            \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 2)                           \
+    }                                                                                          \
+    else if(cols_ <= 8 * BlockSize)                                                            \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize)                               \
+    }                                                                                          \
+    else if(cols_ <= 16 * BlockSize)                                                           \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 16, BlockSize)                              \
+    }                                                                                          \
+    else if(cols_ <= 16 * BlockSize * 2)                                                       \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 32, BlockSize)                              \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize)  \
+    }
+
+void fused_dynamic_mxfp4_quant_moe_sort_hip(
+    torch::Tensor& output,
+    torch::Tensor& scale,
+    torch::Tensor const& input,
+    torch::Tensor const& sorted_ids,
+    torch::Tensor const& num_valid_ids,
+    int token_num,
+    int block_m,
+    int group_size = 32
+)
+{
+    int cols = input.size(-1);
+    int topk = input.numel() / (cols * token_num);
+    int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
+    
+    const int num_cu = get_num_cu_func();
+    int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
+    TORCH_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
+    int tgs_per_block_m = block_m / sub_block_m;
+    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
+    const bool persistent_mode = false;
+    const int input_stride     = input.stride(-2);
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+#if defined(__Float4_e2m1fn_x2)
+    if(output.dtype() == torch_fp4x2 || output.dtype() == torch::kUInt8)
+    {
+        MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, ": not support output type: ", output.dtype());
+    }
+#else
+    TORCH_CHECK(false, __func__, ": not support fp4x2 on this device");
+#endif
+}
+
+template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
+__global__ void mxfp4_moe_sort_kernel(
+    uint8_t* __restrict__ out_scale,
+    uint8_t* __restrict__ scale,
+    int32_t const* __restrict__ sorted_ids,
+    int32_t const* __restrict__ num_valid_ids,
+    const int32_t num_tokens,
+    const int32_t cols,
+    const int32_t num_blocks,
+    const int32_t num_tg,
+    const int32_t topk)
+{
+    constexpr int threads_per_row = block_size / num_rows;
+    int num_valid_ids_value  = num_valid_ids[0];
+    int block_idx            = blockIdx.x;
+    int row_i                = threadIdx.x / threads_per_row;
+    int scale_k              = threadIdx.x % threads_per_row * thread_data_size;
+    const int scale_per_row = (cols + group_size - 1) / group_size;
+    static constexpr int32_t vec_size_i = thread_data_size;
+    static constexpr int32_t load_chunk_bytes =
+        (sizeof(uint8_t) * vec_size_i % 16 == 0 ? 16
+                                                : (sizeof(uint8_t) * vec_size_i % 8 == 0 ? 8 
+                                                : (sizeof(uint8_t) * vec_size_i % 4 == 0 ? 4 : 2)));
+    using vec_i = opus::vector_t<uint8_t, vec_size_i>;
+    const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
+    const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
+    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
+        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
+               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
+    };
+    auto buffer_scale =
+                opus::make_gmem<uint8_t>(scale, scale_per_row * num_tokens * topk * sizeof(uint8_t));
+    for(; block_idx < num_blocks; block_idx += num_tg)
+    {
+        int sorted_row = block_idx * num_rows + row_i;
+        int token_id_info = num_tokens;
+        if (sorted_row < num_valid_ids_value)
+        {
+            token_id_info = sorted_ids[sorted_row];
+        }
+        int token_idx = token_id_info & 0xFFFFFF;
+        int topk_id   = token_id_info >> 24;
+        if(token_idx < num_tokens && (topk == 1 || topk_id < topk))
+        {
+            int64_t scale_offset;
+            if (topk == 1)
+            {
+                scale_offset = (int64_t)(token_idx) * scale_per_row;
+            }
+            else
+            {
+                scale_offset = (int64_t)(token_idx * topk + topk_id) * scale_per_row;
+            }
+            vec_i vec_scale = load_vector_nbytes<uint8_t, vec_size_i, load_chunk_bytes, RT>(
+                buffer_scale, scale_offset + scale_k);
+
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                if((scale_k + j) < scaleN_valid)
+                {
+                    int addr = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k + j);
+                    out_scale[addr] = vec_scale[j];
+                }
+            }
+        }
+    }
+}
+
+
+#define MXFP4_MOE_SORT_KERNEL_IMPL(MAX_COL, THREAD_DATA, BLOCK_SIZE)                    \
+    constexpr int GROUP_SIZE = 32;                                                      \
+    constexpr int NUM_ROWS = BLOCK_SIZE / (MAX_COL /(GROUP_SIZE * THREAD_DATA));        \
+    TORCH_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
+    int num_blocks = (sorted_ids.size(0) + NUM_ROWS - 1) / NUM_ROWS;                    \
+    int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                               \
+    int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
+    dim3 const grid(num_tg);                                                            \
+    mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE>                \
+        <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                        \
+            reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                           \
+            reinterpret_cast<uint8_t*>(scale.data_ptr()),                               \
+            sorted_ids.data_ptr<int32_t>(),                                             \
+            num_valid_ids.data_ptr<int32_t>(),                                          \
+            token_num, cols, num_blocks, num_tg, topk); 
+
+
+#define MXFP4_MOE_SORT_KERNEL_DISPATCH(cols_)                                                  \
+    if(cols_ <= 256)                                                                           \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(256, 4, 256)                                                \
+    }                                                                                          \
+    else if(cols_ <= 512)                                                                      \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(512, 4, 256)                                                \
+    }                                                                                          \
+    else if(cols_ <= 1024)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(1024, 4, 256)                                               \
+    }                                                                                          \
+    else if(cols_ <= 2048)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(2048, 8, 256)                                               \
+    }                                                                                          \
+    else if(cols_ <= 4096)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(4096, 16, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 6144)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(6144, 24, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 8192)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(8192, 32, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 16384)                                                                    \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(16384, 32, 256)                                             \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 16384)            \
+    }
+
+void mxfp4_moe_sort_hip(
+    torch::Tensor& out_scale,
+    torch::Tensor const& scale,
+    torch::Tensor const& sorted_ids,
+    torch::Tensor const& num_valid_ids,
+    int token_num,
+    int cols
+)
+{
+    const int num_cu = get_num_cu_func();
+    const bool persistent_mode = false;
+    int topk = scale.numel() / ((cols + 31) / 32 * token_num);
+ 
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(scale));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    MXFP4_MOE_SORT_KERNEL_DISPATCH(cols);
+}
 
 } // namespace aiter
