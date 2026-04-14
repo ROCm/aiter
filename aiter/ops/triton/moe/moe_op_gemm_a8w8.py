@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w8 import (
     _moe_gemm_a8w8,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -69,7 +70,8 @@ def get_kernel_config(m, n, k, routing_data):
     num_xcds = 8
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 1
+    arch = get_arch()
+    num_stages = 1 if arch == "gfx950" else 2
 
     split_k = 1
     if block_m == 16:
