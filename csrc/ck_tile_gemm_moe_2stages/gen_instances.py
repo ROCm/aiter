@@ -237,14 +237,16 @@ template torch::Tensor
         # else:
         def fill_template(name, a_type, b_type, acc_type, c_type):
             nonlocal self
-            # Arch-aware scheduling: skip generating FP4 instances unless gfx950 is targeted
-            if "fp4" in b_type and ("gfx950" not in get_gfx_list()):
+            # Skip FP4 MoE explicit instantiations when building for arches that do not
+            # ship this path (avoids pulling pk_fp4 symbols into unrelated GPU_ARCHS blobs).
+            _fp4_moe_archs = ("gfx942", "gfx950")
+            if "fp4" in b_type and not any(
+                a in _fp4_moe_archs for a in get_gfx_list()
+            ):
                 return
             body = INSTANCE_template.format(
                 name=name, dtypes=f"{a_type}, {b_type}, {acc_type}, {c_type}"
             )
-            if "fp4" in b_type:
-                body = "#ifndef __gfx942__\n" + body + "\n#endif\n"
             Path(
                 os.path.join(
                     self.instances_path,
