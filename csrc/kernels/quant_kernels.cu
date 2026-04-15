@@ -1624,7 +1624,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     const int32_t num_tokens,
     const int32_t cols,
     const int32_t group_size,
-    const int32_t block_m,
+    const int32_t tgs_per_block_m,
     const int32_t sub_block_m,
     const int32_t num_blocks,
     const int32_t num_tg,
@@ -1668,15 +1668,20 @@ __global__ void mxfp4_quant_moe_sort_kernel(
 
     for(; block_idx < num_blocks; block_idx += num_tg)
     {
-        int sorted_ids_offset = block_idx * sub_block_m;
-        if(sorted_ids_offset >= num_valid_ids_value)
+        int sub_idx         = block_idx % tgs_per_block_m;
+        int block_m_start   = (block_idx - sub_idx) * sub_block_m;
+        int sorted_ids_base = block_m_start + sub_idx;
+        if(sorted_ids_base >= num_valid_ids_value)
         {
             return;
         }
         int token_id_info_list;
         if (lane_idx < sub_block_m)
         {
-            token_id_info_list = sorted_ids[sorted_ids_offset + lane_idx];
+            int strided_idx = sorted_ids_base + lane_idx * tgs_per_block_m;
+            token_id_info_list = (strided_idx < num_valid_ids_value)
+                ? sorted_ids[strided_idx]
+                : num_tokens;
         }
         int token_id_list = token_id_info_list & 0xFFFFFF;
         int topk_id_list  = token_id_info_list >> 24;
@@ -1717,7 +1722,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
                                   ? fp4_scale(absMax) * inverted_DTYPE_MAX
                                   : absMax * inverted_DTYPE_MAX;
 
-            const int sorted_row = sorted_ids_offset + i;
+            const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
             if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
             {
                 uint8_t bs_e8m0 = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
@@ -1753,7 +1758,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
                 token_num,                                                                      \
                 cols,                                                                           \
                 group_size,                                                                     \
-                block_m,                                                                        \
+                tgs_per_block_m,                                                                \
                 sub_block_m,                                                                     \
                 num_blocks,                                                                     \
                 num_tg,                                                                         \
@@ -1806,6 +1811,7 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
     const int num_cu = get_num_cu_func();
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
     AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
+    int tgs_per_block_m = block_m / sub_block_m;
     int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
     const bool persistent_mode = false;
     const int input_stride     = input.stride(-2);
