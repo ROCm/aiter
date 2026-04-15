@@ -50,11 +50,8 @@ if is_flydsl_available():
     from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
-<<<<<<< HEAD
         "flydsl_preshuffle_gemm_a8",
-=======
         "flydsl_mla_fwd_decode",
->>>>>>> b05b88c3f (framework of fdsl mla kn)
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_hgemm",

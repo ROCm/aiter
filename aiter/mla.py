@@ -414,10 +414,8 @@ def mla_decode_fwd(
             # and os.getenv("AITER_FLYDSL_MLA_DECODE", False)
         )
 
-        if use_flydsl:
-            from aiter.ops.flydsl import flydsl_mla_fwd_decode
-
-            flydsl_mla_fwd_decode(
+        if use_hk:
+            aiter.hk_mla_decode_fwd(
                 q,
                 kv_buffer,
                 qo_indptr,
@@ -432,8 +430,10 @@ def mla_decode_fwd(
                 attn_lse,
                 o,
             )
-        elif use_hk:
-            aiter.hk_mla_decode_fwd(
+        elif use_flydsl:
+            from aiter.ops.flydsl import flydsl_mla_fwd_decode
+
+            flydsl_mla_fwd_decode(
                 q,
                 kv_buffer,
                 qo_indptr,
