@@ -16,7 +16,7 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 @pytest.mark.parametrize("T", [1, 2, 4, 2048])
 @pytest.mark.parametrize("QH_per_KH", [1, 16])
 @pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D_pe", [128])  # For now, D is power of 2. D >= 16
+@pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
 @pytest.mark.parametrize("D_q_nope", [512])
 @pytest.mark.parametrize("D_lora", [512])
 @pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
