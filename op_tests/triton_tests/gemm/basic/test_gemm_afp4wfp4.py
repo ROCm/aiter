@@ -5,7 +5,7 @@ import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
-    gemm_afp4wfp4_nopad,
+    gemm_afp4wfp4_nopreshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
 
@@ -375,7 +375,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT"])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_mxfp4_nopad_gfx1250(
+def test_gemm_mxfp4_nopreshuffle_gfx1250(
     M: int,
     N: int,
     K: int,
@@ -385,7 +385,7 @@ def test_gemm_mxfp4_nopad_gfx1250(
 ):
     """Test the no-preshuffle variant with PaddedSharedLayout for B."""
     if DEVICE_ARCH != "gfx1250":
-        pytest.skip("nopad gfx1250 kernel only supported on gfx1250")
+        pytest.skip("nopreshuffle gfx1250 kernel only supported on gfx1250")
 
     if N % 32 > 0:
         pytest.skip(f"N = {N} is not divisible by 32")
@@ -416,7 +416,7 @@ def test_gemm_mxfp4_nopad_gfx1250(
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     # Pass raw w and raw scales — no preshuffle needed
-    triton_out = gemm_afp4wfp4_nopad(
+    triton_out = gemm_afp4wfp4_nopreshuffle(
         x, w, x_scales, w_scales, dtype,
         y if y is not None else torch.empty_like(torch_out),
     )

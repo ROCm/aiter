@@ -18,9 +18,9 @@ from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
     gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
     get_gemm_afp4wfp4_preshuffle_layouts,
 )
-from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4_nopad import (
-    gemm_mxfp4_nopad_gfx1250 as _gluon_gemm_mxfp4_nopad_gfx1250,
-    get_gemm_mxfp4_nopad_layouts,
+from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4_nopreshuffle import (
+    gemm_mxfp4_nopreshuffle_gfx1250 as _gluon_gemm_mxfp4_nopreshuffle_gfx1250,
+    get_gemm_mxfp4_nopreshuffle_layouts,
 )
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -622,7 +622,7 @@ def gemm_afp4wfp4_preshuffle(
     return y
 
 
-def gemm_afp4wfp4_nopad(
+def gemm_afp4wfp4_nopreshuffle(
     x_fp4: torch.Tensor,
     w: torch.Tensor,
     x_scales: torch.Tensor,
@@ -647,7 +647,7 @@ def gemm_afp4wfp4_nopad(
     Returns:
         y: Output tensor (M, N).
     """
-    assert arch_info.get_arch() == "gfx1250", "nopad kernel only supported on gfx1250"
+    assert arch_info.get_arch() == "gfx1250", "nopreshuffle kernel only supported on gfx1250"
 
     M, K_bytes = x_fp4.shape
     N = w.shape[0]
@@ -673,27 +673,27 @@ def gemm_afp4wfp4_nopad(
         * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    layouts = get_gemm_mxfp4_nopad_layouts(
+    layouts = get_gemm_mxfp4_nopreshuffle_layouts(
         config["num_warps"], config["BLOCK_SIZE_M"],
         config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
-    # B in (K_bytes, N) for TDM; scales must be contiguous
-    b_kn = w.T.contiguous()
+    # B stays as (N, K_bytes) — kernel stores it that way in LDS
+    # and loads with .permute((1,0)). Scales go via buffer_load.
     x_scales_c = x_scales.contiguous()
     w_scales_c = w_scales.contiguous()
 
     config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
-    _gluon_gemm_mxfp4_nopad_gfx1250[grid](
+    _gluon_gemm_mxfp4_nopreshuffle_gfx1250[grid](
         x_fp4,
-        b_kn,
+        w,
         y,
         x_scales_c,
         w_scales_c,
         M, N, K_elems,
         x_fp4.stride(0),
         x_fp4.stride(1),
-        b_kn.stride(0),
-        b_kn.stride(1),
+        w.stride(0),
+        w.stride(1),
         0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
         y.stride(-2),
         y.stride(-1),
