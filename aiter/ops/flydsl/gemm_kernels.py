@@ -524,6 +524,7 @@ def flydsl_blockscale_preshuffle_gemm(
     use_cshuffle_epilog: int = 0,
     use_async_copy: int = 0,
     waves_per_eu: int = 0,
+    xcd_swizzle: int = 0,
 ) -> Tensor:
     """Compile (cached) and run a FlyDSL blockscale preshuffle GEMM kernel.
 
@@ -555,10 +556,11 @@ def flydsl_blockscale_preshuffle_gemm(
     else:
         out_dtype = "fp16"
 
+    _xcd = int(xcd_swizzle)
     cache_key = (
         m, n, k, out_dtype,
         tile_m, tile_n, tile_k,
-        scale_block_k, use_cshuffle_epilog, use_async_copy, wpe,
+        scale_block_k, use_cshuffle_epilog, use_async_copy, wpe, _xcd,
     )
     if cache_key not in _flydsl_blockscale_kernel_cache:
         try:
@@ -570,12 +572,13 @@ def flydsl_blockscale_preshuffle_gemm(
                 use_cshuffle_epilog=bool(use_cshuffle_epilog),
                 waves_per_eu=wpe,
                 use_async_copy=bool(use_async_copy),
+                xcd_swizzle=_xcd,
             )
             _flydsl_blockscale_kernel_cache[cache_key] = exe
             logger.info(
                 f"[FlyDSL] compiled blockscale preshuffle GEMM ({m},{n},{k} "
                 f"tile={tile_m}x{tile_n}x{tile_k} sbk={scale_block_k} "
-                f"csh={use_cshuffle_epilog} acp={use_async_copy} wpe={waves_per_eu})"
+                f"csh={use_cshuffle_epilog} acp={use_async_copy} wpe={waves_per_eu} xcd={_xcd})"
             )
         except Exception as e:
             logger.warning(f"[FlyDSL] blockscale compile failed ({m},{n},{k}): {e}")

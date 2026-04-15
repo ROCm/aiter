@@ -19,6 +19,7 @@ from flydsl._mlir import ir
 
 from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl
 from flydsl.expr.arith import ArithValue
+from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
 
@@ -49,6 +50,7 @@ def compile_blockscale_preshuffle_gemm(
     use_cshuffle_epilog: bool = False,
     waves_per_eu: int = None,
     use_async_copy: bool = False,
+    xcd_swizzle: int = 0,
 ):
     """Compile blockscale preshuffle GEMM. FP8 input, per-block scales, bf16/fp16 output."""
     if out_dtype not in ("fp16", "bf16"):
@@ -126,9 +128,10 @@ def compile_blockscale_preshuffle_gemm(
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
 
+    xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     module_name = (
         f"bs_gemm_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{xcd_tag}"
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python, no MLIR ops) ────────────────────────────
@@ -194,6 +197,33 @@ def compile_blockscale_preshuffle_gemm(
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
+
+        if xcd_swizzle > 0:
+            _NUM_XCDS = 8
+            _c1 = arith.constant(1, index=True)
+            _c_tn = arith.constant(tile_n, index=True)
+            _c_tm = arith.constant(tile_m, index=True)
+            _gx = arith.constant(N // tile_n, index=True)
+            _gy = (c_m + _c_tm - _c1) / _c_tm
+
+            _linear_id = bx * _gx + by
+            _num_wgs = _gx * _gy
+
+            _c_xcds = arith.constant(_NUM_XCDS, index=True)
+            _wgs_per_xcd = _num_wgs / _c_xcds
+            _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+
+            _c_wgm = arith.constant(xcd_swizzle, index=True)
+            _num_wgid_in_group = _c_wgm * _gx
+            _group_id = _wgid / _num_wgid_in_group
+            _first_pid_m = _group_id * _c_wgm
+            _remaining_m = _gy - _first_pid_m
+            _cmp_m = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
+            _group_size_m = arith.select(_cmp_m, _remaining_m, _c_wgm)
+
+            _wgid_in_group = _wgid % _num_wgid_in_group
+            bx = _first_pid_m + (_wgid_in_group % _group_size_m)
+            by = _wgid_in_group / _group_size_m
 
         # ---- LDS (separate ping/pong buffers) ----
         base_ptr_pong = allocator_pong.get_base()

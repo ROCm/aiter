@@ -121,10 +121,12 @@ def run_gemm_a8w8_blockscale(
 
 def run_gemm_flydsl_blockscale(x, weight_shuffle, x_scale, w_scale, out, kernel_id):
     ki = kernels_list_flydsl[kernel_id]
+    xcd = getattr(ki, 'xcd_swizzle', 0)
     flydsl_blockscale_preshuffle_gemm(
         x, weight_shuffle, x_scale, w_scale, out,
         ki.tile_m, ki.tile_n, ki.tile_k,
         ki.scale_block_k, ki.use_cshuffle_epilog, ki.use_async_copy, ki.waves_per_eu,
+        xcd,
     )
     return out
 

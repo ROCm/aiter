@@ -38,10 +38,12 @@ class kernelInstance:
     use_async_copy: int         # 0 or 1
     waves_per_eu: int           # 0=no hint, 1-4
     sScheduler: str             # "Default"
+    xcd_swizzle: int = 0        # 0=off, >0=group size for XCD remap
 
     @property
     def name(self) -> str:
         dt = {"bf16": "B16", "fp16": "F16"}.get(self.out_dtype, self.out_dtype.upper())
+        xcd_tag = f"_xcd{self.xcd_swizzle}" if self.xcd_swizzle > 0 else ""
         return "_".join([
             "flydsl",
             "blockscale_bpreshuffle",
@@ -54,17 +56,19 @@ class kernelInstance:
                 self.waves_per_eu,
             ])),
             self.sScheduler.lower(),
-        ])
+        ]) + xcd_tag
 
 
 def _ki(tile_m, tile_n, tile_k,
         cshuffle=0, async_copy=0, waves_per_eu=0,
         scheduler="Default",
-        out_dtype="bf16", scale_block_k=128):
+        out_dtype="bf16", scale_block_k=128,
+        xcd_swizzle=0):
     return kernelInstance(
         tile_m, tile_n, tile_k,
         out_dtype, scale_block_k,
         cshuffle, async_copy, waves_per_eu, scheduler,
+        xcd_swizzle,
     )
 
 
@@ -90,6 +94,7 @@ _base_tiles_common = [
 _CSHUFFLE_VALS   = (0,)
 _ASYNC_COPY_VALS = (0, 1)
 _WAVES_PER_EU    = (0,)
+_XCD_SWIZZLE_VALS = (0, 4)
 # fmt: on
 
 
@@ -99,11 +104,12 @@ def _build_kernels_list(tiles):
     for wpe in _WAVES_PER_EU:
         for csh in _CSHUFFLE_VALS:
             for acp in _ASYNC_COPY_VALS:
-                for tm, tn, tk in tiles:
-                    if tk % 128 != 0:
-                        continue
-                    kl[idx] = _ki(tm, tn, tk, csh, acp, wpe)
-                    idx += 1
+                for xcd in _XCD_SWIZZLE_VALS:
+                    for tm, tn, tk in tiles:
+                        if tk % 128 != 0:
+                            continue
+                        kl[idx] = _ki(tm, tn, tk, csh, acp, wpe, xcd_swizzle=xcd)
+                        idx += 1
     return kl
 
 

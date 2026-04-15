@@ -723,13 +723,14 @@ def gemm_a8w8_blockscale_bpreshuffle_flydsl(
         csh, acp, wpe = (
             ki.use_cshuffle_epilog, ki.use_async_copy, ki.waves_per_eu,
         )
+        xcd = getattr(ki, 'xcd_swizzle', 0)
     else:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
 
     flydsl_blockscale_preshuffle_gemm(
         XQ.contiguous(), WQ.contiguous(),
         x_scale, w_scale, Out,
-        tm, tn, tk, sbk, csh, acp, wpe,
+        tm, tn, tk, sbk, csh, acp, wpe, xcd,
     )
     return Out
 
