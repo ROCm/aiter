@@ -14,7 +14,7 @@ from aiter import logger
 from operator import itemgetter
 import time
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx as _chip_get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 
 INVALID_TIME = -1
 

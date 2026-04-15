@@ -15,7 +15,7 @@ from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, get_asm_dir
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (

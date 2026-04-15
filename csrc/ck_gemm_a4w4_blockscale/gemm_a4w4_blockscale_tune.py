@@ -226,7 +226,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         mp_num = args.mp
         shape_grouped = args.shape_grouped
         errRatio = args.errRatio
-        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
         if get_gfx() not in ["gfx950"]:
             print(f"tuning is not supported in this chip {get_gfx()}")
