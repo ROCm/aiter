@@ -3,8 +3,12 @@
 Parses fly layout type strings (e.g. '(4,64):(64,1)') and computes
 idx2crd / crd2idx with plain arith ops for static layouts.
 Falls back to fly dialect ops for dynamic layouts.
+
+Optimisation: power-of-2 strides/shapes emit ``shrui`` / ``andi`` instead of
+``divui`` / ``remui``, avoiding 10-15-cycle V_DIV sequences on CDNA GPUs.
 """
 
+import math as _math
 import re
 import builtins as _builtins
 
@@ -22,6 +26,30 @@ def _wrap(v):
     if isinstance(v, ir.Value):
         return ArithValue(v)
     return v
+
+
+def _is_pow2(n):
+    """Return True when *n* is a positive power of two."""
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _div_pow2(val, divisor):
+    """Unsigned divide index *val* by a **compile-time** power-of-2 *divisor*.
+
+    Emits ``arith.shrui`` (1 VALU cycle) instead of ``arith.divui``
+    (10-15 VALU cycles on CDNA).
+    """
+    shift = _math.log2(divisor)
+    assert shift == int(shift), f"{divisor} is not a power of 2"
+    return arith.shrui(val, arith.index(int(shift)))
+
+
+def _mod_pow2(val, modulus):
+    """Unsigned remainder of index *val* by a **compile-time** power-of-2 *modulus*.
+
+    Emits ``arith.andi`` (1 VALU cycle) instead of ``arith.remui``.
+    """
+    return arith.andi(val, arith.index(modulus - 1))
 
 
 def _parse_dim(tok):
@@ -50,6 +78,7 @@ def idx2crd(idx, layout):
     """Decompose flat index into a list of coordinate values.
 
     For static layouts, computes coordinates with plain arith ops.
+    Power-of-2 strides/shapes use shift/mask instead of div/rem.
     For dynamic layouts, falls back to fx.idx2crd + fx.get.
     """
     parsed = _parse_layout(layout)
@@ -76,9 +105,17 @@ def idx2crd(idx, layout):
     coords = [None] * ndims
     remaining = idx
     for i, stride_val, size_val in ordered:
-        c = remaining / arith.index(stride_val)
+        if stride_val == 1:
+            c = remaining
+        elif _is_pow2(stride_val):
+            c = _div_pow2(remaining, stride_val)
+        else:
+            c = remaining / arith.index(stride_val)
         if size_val is not None:
-            c = c % arith.index(size_val)
+            if _is_pow2(size_val):
+                c = _mod_pow2(c, size_val)
+            else:
+                c = c % arith.index(size_val)
         coords[i] = c
     for i in range(ndims):
         if coords[i] is None:

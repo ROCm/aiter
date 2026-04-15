@@ -15,10 +15,8 @@
 #include <hiprand/hiprand_kernel.h>
 
 namespace aiter {
-const int warpSize = 64;
 template <typename DTYPE_I,
           int BlockSize = 256,
-          int WarpSize  = 64,
           int VecSize   = 4,
           bool NeedSum  = false>
 __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
@@ -155,7 +153,6 @@ __device__ void random_sample_outer_exponential_impl(const DTYPE_I* input,
 
 template <typename DTYPE_I,
           int BlockSize = 256,
-          int WarpSize  = 64,
           int VecSize   = 4,
           bool NeedSum  = false,
           typename dist_t,
@@ -295,7 +292,7 @@ __device__ void random_sample_impl(const DTYPE_I* input,
         output[m_idx] = thread_kvp.key;
 }
 
-template <typename DTYPE_I, int BlockSize = 256, int WarpSize = 64, int VecSize = 4>
+template <typename DTYPE_I, int BlockSize = 256, int VecSize = 4>
 __device__ void argmax_impl(const DTYPE_I* input, int* output, int m_idx, int N, int stride_M)
 {
     static constexpr int32_t vec_size_i = VecSize;
@@ -350,16 +347,15 @@ __device__ void argmax_impl(const DTYPE_I* input, int* output, int m_idx, int N,
         output[m_idx] = thread_kvp.key;
 }
 
-template <typename DTYPE_I, int BlockSize = 256, int WarpSize = 64, int VecSize = 4>
+template <typename DTYPE_I, int BlockSize = 256, int VecSize = 4>
 __global__ void greedy_sample_kernel(const DTYPE_I* input, int* output, int N, int stride_M)
 {
     int m_idx = blockIdx.x;
-    argmax_impl<DTYPE_I, BlockSize, WarpSize, VecSize>(input, output, m_idx, N, stride_M);
+    argmax_impl<DTYPE_I, BlockSize, VecSize>(input, output, m_idx, N, stride_M);
 }
 
 template <typename DTYPE_I,
           int BlockSize = 256,
-          int WarpSize  = 64,
           int VecSize   = 4,
           bool NeedSum  = false>
 __global__ void random_sample_outer_exponential_kernel(const DTYPE_I* input,
@@ -373,13 +369,12 @@ __global__ void random_sample_outer_exponential_kernel(const DTYPE_I* input,
 {
     int m_idx         = blockIdx.x;
     float temperature = temperatures[m_idx];
-    random_sample_outer_exponential_impl<DTYPE_I, BlockSize, WarpSize, VecSize, NeedSum>(
+    random_sample_outer_exponential_impl<DTYPE_I, BlockSize, VecSize, NeedSum>(
         input, exponentials, output, temperature, m_idx, N, stride_M, exponentials_stride0, eps);
 }
 
 template <typename DTYPE_I,
           int BlockSize = 256,
-          int WarpSize  = 64,
           int VecSize   = 4,
           bool NeedSum  = false,
           typename dist_t,
@@ -397,7 +392,7 @@ __global__ void random_sample_kernel(const DTYPE_I* input,
 {
     int m_idx         = blockIdx.x;
     float temperature = temperatures[m_idx];
-    random_sample_impl<DTYPE_I, BlockSize, WarpSize, VecSize, NeedSum>(input,
+    random_sample_impl<DTYPE_I, BlockSize, VecSize, NeedSum>(input,
                                                                        output,
                                                                        temperature,
                                                                        lambd_,
@@ -412,7 +407,6 @@ __global__ void random_sample_kernel(const DTYPE_I* input,
 
 template <typename DTYPE_I,
           int BlockSize = 256,
-          int WarpSize  = 64,
           int VecSize   = 4,
           bool NeedSum  = false>
 __global__ void mix_sample_outer_exponential_kernel(const DTYPE_I* input,
@@ -428,11 +422,11 @@ __global__ void mix_sample_outer_exponential_kernel(const DTYPE_I* input,
     float temperature = temperatures[m_idx];
     if(temperature == 0.0f)
     {
-        argmax_impl<DTYPE_I, BlockSize, WarpSize, VecSize>(input, output, m_idx, N, stride_M);
+        argmax_impl<DTYPE_I, BlockSize, VecSize>(input, output, m_idx, N, stride_M);
     }
     else
     {
-        random_sample_outer_exponential_impl<DTYPE_I, BlockSize, WarpSize, VecSize, NeedSum>(
+        random_sample_outer_exponential_impl<DTYPE_I, BlockSize, VecSize, NeedSum>(
             input,
             exponentials,
             output,
@@ -447,7 +441,6 @@ __global__ void mix_sample_outer_exponential_kernel(const DTYPE_I* input,
 
 template <typename DTYPE_I,
           int BlockSize = 256,
-          int WarpSize  = 64,
           int VecSize   = 4,
           bool NeedSum  = false,
           typename dist_t,
@@ -467,11 +460,11 @@ __global__ void mix_sample_kernel(const DTYPE_I* input,
     float temperature = temperatures[m_idx];
     if(temperature == 0.0f)
     {
-        argmax_impl<DTYPE_I, BlockSize, WarpSize, VecSize>(input, output, m_idx, N, stride_M);
+        argmax_impl<DTYPE_I, BlockSize, VecSize>(input, output, m_idx, N, stride_M);
     }
     else
     {
-        random_sample_impl<DTYPE_I, BlockSize, WarpSize, VecSize, NeedSum>(input,
+        random_sample_impl<DTYPE_I, BlockSize, VecSize, NeedSum>(input,
                                                                            output,
                                                                            temperature,
                                                                            lambd_,
@@ -504,7 +497,7 @@ void greedy_sample(torch::Tensor& out, torch::Tensor& input)
 
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "greedy_sample", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
-        greedy_sample_kernel<input_dtype, block_size, warpSize, 16><<<grid, block, 0, stream>>>(
+        greedy_sample_kernel<input_dtype, block_size, 16><<<grid, block, 0, stream>>>(
             reinterpret_cast<input_dtype*>(input.data_ptr()), out.data_ptr<int>(), N, stride_M);
     });
 }
@@ -536,7 +529,6 @@ void random_sample_outer_exponential(torch::Tensor& out,
         using input_dtype = typename t2opus<scalar_t>::type;
         random_sample_outer_exponential_kernel<input_dtype,
                                                block_size,
-                                               warpSize,
                                                unroll_factor,
                                                true>
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -575,7 +567,7 @@ void mixed_sample_outer_exponential(torch::Tensor& out,
 
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "mix_sample_outer_exponential", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
-        mix_sample_outer_exponential_kernel<input_dtype, block_size, warpSize, unroll_factor, true>
+        mix_sample_outer_exponential_kernel<input_dtype, block_size, unroll_factor, true>
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
                               exponentials.data_ptr<float>(),
                               temperatures.data_ptr<float>(),
@@ -644,7 +636,7 @@ void random_sample(torch::Tensor& out,
 
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "random_sample", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
-        random_sample_kernel<input_dtype, block_size, warpSize, unroll_factor, false>
+        random_sample_kernel<input_dtype, block_size, unroll_factor, false>
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
                               temperatures.data_ptr<float>(),
                               out.data_ptr<int>(),
@@ -705,7 +697,7 @@ void mixed_sample(torch::Tensor& out,
 
     VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "mixed_sample", [&] {
         using input_dtype = typename t2opus<scalar_t>::type;
-        mix_sample_kernel<input_dtype, block_size, warpSize, unroll_factor, false>
+        mix_sample_kernel<input_dtype, block_size, unroll_factor, false>
             <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(input.data_ptr()),
                               temperatures.data_ptr<float>(),
                               out.data_ptr<int>(),
@@ -721,7 +713,6 @@ void mixed_sample(torch::Tensor& out,
 
 template <typename DTYPE_O,
           int BlockSize = 256,
-          int WarpSize  = 64,
           int VecSize   = 4,
           typename dist_t,
           typename transform_t>
@@ -806,7 +797,7 @@ void exponential(torch::Tensor& out,
 
     VLLM_DISPATCH_FLOATING_TYPES(out.scalar_type(), "exponential_kernel", [&] {
         using out_dtype = typename t2opus<scalar_t>::type;
-        exponential_kernel<out_dtype, block_size, warpSize, unroll_factor>
+        exponential_kernel<out_dtype, block_size, unroll_factor>
             <<<grid, block, 0, stream>>>(reinterpret_cast<out_dtype*>(out.data_ptr()),
                               lambd,
                               N,
