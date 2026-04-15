@@ -492,6 +492,39 @@ def cmdGenFunc_mha_varlen_fwd(
         md_name = f"mha_varlen_fwd{suffix}"
         variants = get_mha_varlen_prebuild_variants_by_names([md_name], CK_DIR)
         blob_gen_cmd = variants[0]["blob_gen_cmd"]
+
+        # --- Tuned FMHA CSV lookup (overrides heuristic when a match exists) ---
+        batch = cu_seqlens_q.numel() - 1
+        hq = q.size(1)
+        hk = k.size(1)
+        hdim_q = q.size(2)
+        hdim_v = v.size(2)
+        tile_pattern = find_tuned_fmha_tile(
+            gfx=get_gfx(),
+            dtype=dtype_token,
+            batch=batch,
+            hq=hq,
+            hk=hk,
+            sq=max_seqlen_q,
+            sk=max_seqlen_k,
+            hdim_q=hdim_q,
+            hdim_v=hdim_v,
+        )
+        if tile_pattern:
+            _log_key = (batch, hq, hk, max_seqlen_q, max_seqlen_k, hdim_q, hdim_v, tile_pattern)
+            if _log_key not in _tuned_fmha_logged:
+                _tuned_fmha_logged.add(_log_key)
+                logger.info(
+                    "[tuned_fmha] varlen: Using CSV tile_pattern=%s for "
+                    "batch=%d hq=%d hk=%d sq=%d sk=%d hdim_q=%d hdim_v=%d",
+                    tile_pattern, batch, hq, hk, max_seqlen_q, max_seqlen_k, hdim_q, hdim_v,
+                )
+            md_name += f"_tunedfmha_{tile_pattern}"
+            new_filter = f"*{tile_pattern}*"
+            blob_gen_cmd[0] = (
+                f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+                f"--receipt 200 --filter {new_filter} --output_dir {{}}"
+            )
     else:
         md_name = "mha_varlen_fwd"
         filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
