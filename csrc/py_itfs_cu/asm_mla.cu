@@ -254,7 +254,7 @@ void mla_decode_stage1_asm_fwd(
     // Get kernel using config dispatch
     std::string arch_id = get_gpu_arch();
     CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
@@ -351,13 +351,9 @@ void mla_decode_stage1_asm_fwd(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-        
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
@@ -506,7 +502,7 @@ void mla_prefill_ps_asm_fwd(
         AITER_CHECK(false, __func__, ": fp8 mla persistent prefill is not supported on gfx942");
     }
     CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
     int ps = 1; // ps_prefill always uses persistent scheduling
     int prefill = 1; // prefill stage
@@ -526,12 +522,9 @@ void mla_prefill_ps_asm_fwd(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
@@ -620,7 +613,7 @@ void mla_prefill_asm_fwd(
 
     std::string arch_id = get_gpu_arch();
     CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
     int ps = 0; // prefill without persistent scheduling
     int prefill = 1; // prefill stage
@@ -638,12 +631,9 @@ void mla_prefill_asm_fwd(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
