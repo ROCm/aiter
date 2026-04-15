@@ -3,7 +3,7 @@ from aiter import ActivationType
 from aiter.fused_moe_smoothquant import fused_moe_gelu_sqi8
 from aiter.fused_moe_bf16_asm import torch_moe
 from aiter.test_common import run_perftest
-
+from aiter import get_gfx
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double(), y.double()
@@ -28,6 +28,10 @@ def smooth_quant_w(
 
 def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
     device = "cuda"
+
+    if get_gfx() != "gfx950":
+        print("skip tests for unsupported platform")
+        return
 
     x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device)
 
@@ -95,10 +99,14 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
         fc2_smooth_scale,
     )
 
+    logits_diff0 = calc_diff(ref0, ret)
+    logits_diff1 = calc_diff(ref1, ret)
     print(
-        f"{num_tokens=} {model_dim=} {inter_dim=} {num_experts=} {topk=} {calc_diff(ref0, ret)=:.6f}, {calc_diff(ref1, ret)=:.6f}, {dt:.0f} us"
+        f"{num_tokens=} {model_dim=} {inter_dim=} {num_experts=} {topk=} {logits_diff0=:.6f}, {logits_diff1=:.6f}, {dt:.0f} us"
     )
 
+    assert logits_diff0 < 0.001
+    assert logits_diff1 < 0.001
 
 if __name__ == "__main__":
     torch.set_default_device("cuda")
