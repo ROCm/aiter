@@ -7,6 +7,7 @@
 #include "aiter_dispatch.h"
 #include "hip_float8.h"
 #include "aiter_stream.h"
+#include <numeric>
 
 #ifdef __HIP_DEVICE_COMPILE__
 #include "opus/opus.hpp"
