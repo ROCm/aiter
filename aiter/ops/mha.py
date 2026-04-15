@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Any, Optional, Tuple
+import csv
+import functools
+import logging
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
+from ..jit.core import CK_DIR, AITER_META_DIR, AITER_CONFIGS, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
@@ -14,6 +18,122 @@ from ..jit.utils.mha_recipes import (
     get_mha_varlen_prebuild_variants_by_names,
 )
 from ..utility import dtypes
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tuned FMHA CSV lookup table helpers
+# ---------------------------------------------------------------------------
+
+_FmhaKey = Tuple[str, str, int, int, int, int, int, int, int]
+_tuned_fmha_logged: set = set()  # track already-logged matches (log once per key)
+
+
+def _iter_non_comment_csv_lines(path: str):
+    """Yield lines from *path*, skipping blank lines and ``#`` comments."""
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                yield line
+
+
+def _to_int(value: str) -> int:
+    """Robust string → int (handles ``'130.0'`` ➜ ``130``)."""
+    return int(float(value))
+
+
+def _normalize_gfx(value: str) -> str:
+    """Lowercase, strip, remove colon-suffix (e.g. ``gfx950:sramecc+`` → ``gfx950``)."""
+    return value.strip().lower().split(":")[0]
+
+
+@functools.lru_cache(maxsize=8)
+def _load_tuned_fmha_table_cached(
+    csv_path: str, _mtime_ns: int
+) -> Dict[_FmhaKey, str]:
+    """Parse *csv_path* into a dict keyed on the 9-field FMHA tuple.
+
+    ``_mtime_ns`` is used only as a cache-invalidation sentinel so that
+    edits to the CSV are picked up without restarting the process.
+    """
+    table: Dict[_FmhaKey, str] = {}
+    reader = csv.DictReader(_iter_non_comment_csv_lines(csv_path))
+    for row in reader:
+        # Normalise values coming from CSV
+        row = {
+            k.strip().lstrip("\ufeff"): (v.strip() if v else "")
+            for k, v in row.items()
+            if k is not None
+        }
+        tile_pattern = row.get("tile_pattern", "").strip()
+        if not tile_pattern:
+            continue
+        try:
+            key: _FmhaKey = (
+                _normalize_gfx(row["gfx"]),
+                row["dtype"].strip().lower(),
+                _to_int(row["batch"]),
+                _to_int(row["hq"]),
+                _to_int(row["hk"]),
+                _to_int(row["sq"]),
+                _to_int(row["sk"]),
+                _to_int(row["hdim_q"]),
+                _to_int(row["hdim_v"]),
+            )
+        except (KeyError, ValueError) as exc:
+            logger.warning("Skipping malformed tuned_fmha row %s: %s", row, exc)
+            continue
+        table[key] = tile_pattern
+    return table
+
+
+def load_tuned_fmha_table() -> Dict[_FmhaKey, str]:
+    """Return the tuned FMHA lookup dict (cached, auto-refreshes on file change)."""
+    csv_path = AITER_CONFIGS.AITER_CONFIG_FMHA_FILE
+    if not csv_path or not os.path.isfile(csv_path):
+        if csv_path:
+            logger.warning(
+                "AITER_CONFIG_FMHA points to non-existent file: %s — "
+                "FMHA tuned lookup disabled.",
+                csv_path,
+            )
+        return {}
+    mtime_ns = os.stat(csv_path).st_mtime_ns
+    return _load_tuned_fmha_table_cached(csv_path, mtime_ns)
+
+
+def find_tuned_fmha_tile(
+    gfx: str,
+    dtype: str,
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    hdim_q: int,
+    hdim_v: int,
+) -> Optional[str]:
+    """Look up a tuned tile_pattern for the given FMHA problem shape.
+
+    Returns the ``tile_pattern`` string if an exact match is found in
+    ``tuned_fmha.csv``, or ``None`` to fall back to the heuristic.
+    """
+    table = load_tuned_fmha_table()
+    if not table:
+        return None
+    key: _FmhaKey = (
+        _normalize_gfx(gfx),
+        dtype.strip().lower(),
+        int(batch),
+        int(hq),
+        int(hk),
+        int(sq),
+        int(sk),
+        int(hdim_q),
+        int(hdim_v),
+    )
+    return table.get(key)
 
 
 def cmdGenFunc_mha_fwd(
@@ -39,7 +159,8 @@ def cmdGenFunc_mha_fwd(
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ):
-    _, seqlen_q, _, _ = q.shape
+    batch, seqlen_q, hq, hdim_q = q.shape
+    _, sk, hk, hdim_v = v.shape
     # causal=true is the same as causal=false in this case
     causal = is_causal
     if seqlen_q == 1 and alibi_slopes is None:
@@ -48,17 +169,22 @@ def cmdGenFunc_mha_fwd(
     md_name = "mha_fwd"
     filter = "*"
     if q.dtype == dtypes.fp16:
+        dtype_str = "fp16"
         md_name += "_fp16"
         filter += "_fp16*"
     elif q.dtype == dtypes.bf16:
+        dtype_str = "bf16"
         md_name += "_bf16"
         filter += "_bf16*"
     elif q.dtype == dtypes.fp8:
         if out is None or out.dtype == dtypes.bf16:
+            dtype_str = "fp8bf16"
             md_name += "_fp8bf16"
             filter += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
+    else:
+        dtype_str = ""
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
@@ -93,6 +219,30 @@ def cmdGenFunc_mha_fwd(
         # only support per-tensor quantization for now
         md_name += "_pertensor"
         filter += "_pertensor*"
+
+    # --- Tuned FMHA CSV lookup (overrides heuristic when a match exists) ---
+    tile_pattern = find_tuned_fmha_tile(
+        gfx=get_gfx(),
+        dtype=dtype_str,
+        batch=batch,
+        hq=hq,
+        hk=hk,
+        sq=seqlen_q,
+        sk=sk,
+        hdim_q=hdim_q,
+        hdim_v=hdim_v,
+    )
+    if tile_pattern:
+        _log_key = (batch, hq, hk, seqlen_q, sk, hdim_q, hdim_v, tile_pattern)
+        if _log_key not in _tuned_fmha_logged:
+            _tuned_fmha_logged.add(_log_key)
+            logger.info(
+                "[tuned_fmha] Using CSV tile_pattern=%s for "
+                "batch=%d hq=%d hk=%d sq=%d sk=%d hdim_q=%d hdim_v=%d",
+                tile_pattern, batch, hq, hk, seqlen_q, sk, hdim_q, hdim_v,
+            )
+        md_name += f"_tunedfmha_{tile_pattern}"
+        filter = f"*{tile_pattern}*"
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
