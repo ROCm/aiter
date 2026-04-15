@@ -255,19 +255,13 @@ def mla_decode_fwd(
     q_descale,
     kv_descale,
     out_scale,
-    use_gluon: bool,
     shuffled_kv_cache: bool,
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
-    if shuffled_kv_cache:
-        assert IS_DEVICE_ARCH_GFX12, "Shuffled kv cache is only supported on gfx12"
-        assert use_gluon, "Shuffled kv cache is only supported with gluon"
-
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
     if shuffled_kv_cache:
         num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
-        # block_size = block_size * 16
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
     num_seqs = len(seqused_k)
@@ -341,7 +335,7 @@ def mla_decode_fwd(
         device=q.device,
     )
 
-    if use_gluon:
+    if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
             impl = gluon_mla_decode_fwd_kernel
         else:
@@ -401,13 +395,16 @@ def mla_decode_fwd(
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2),
+            stride_kv_buffer_2=kv_buffer.stride(2) * (16 if shuffled_kv_cache else 1),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            IS_Q_FP8=(q_dtype == e4m3_dtype),
+            IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
             **attn_config,
         )
     if skip_reduce:

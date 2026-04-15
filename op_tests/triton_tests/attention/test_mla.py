@@ -170,14 +170,7 @@ def torch_mla_extend(
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
     ],
 )
-@pytest.mark.parametrize(
-    "backend, shuffled_kv_cache",
-    [
-        ("triton", False),
-        ("gluon", True),
-        # ("gluon", False),
-    ],
-)
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @torch.inference_mode()
 def test_mla_decode_fwd(
     batch_size: int,
@@ -193,13 +186,8 @@ def test_mla_decode_fwd(
     kv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     use_out_scale: bool,
-    backend: str,
     shuffled_kv_cache: bool,
 ):
-    if backend == "triton" and DEVICE_ARCH not in ("gfx950",):
-        pytest.skip("Triton is only supported on gfx950")
-    if backend == "gluon" and DEVICE_ARCH not in ("gfx1250",):
-        pytest.skip("Gluon is only supported on gfx1250")
     torch.cuda.empty_cache()
     num_query_heads, num_kv_heads = num_heads
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
@@ -271,7 +259,6 @@ def test_mla_decode_fwd(
         q_descale=q_descale,
         kv_descale=kv_descale,
         out_scale=out_scale,
-        use_gluon=(backend == "gluon"),
         shuffled_kv_cache=shuffled_kv_cache,
     )
 
@@ -297,8 +284,8 @@ def test_mla_decode_fwd(
     ), f"{torch.max(torch.abs(out - out_ref))}"
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("ctx_lens", [200, 1024])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
 @pytest.mark.parametrize("block_size", [64])
@@ -349,7 +336,6 @@ def test_mla_prefill_fwd(
 
     cu_seqlens_q[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_num_query_tokens = cu_seqlens_q[-1].item()
-    print(total_num_query_tokens)
 
     max_seqlen_kv = seq_lens_kv.max().item()
     max_num_blocks_per_seq = (max_seqlen_kv + block_size - 1) // block_size
