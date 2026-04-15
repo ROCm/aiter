@@ -252,20 +252,18 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
 
         load_idx += 1
 
-        # Pre-load NEXT tile's operands into registers before the next WMMA
-        next_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_A.index((compute_idx + 1) % NUM_BUFFERS), layout=dot_a_layout)
-        next_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_B.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]), layout=dot_b_layout)
-        next_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_AS.index((compute_idx + 1) % NUM_BUFFERS), layout=a_scale_layout)
-        next_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            smem_BS.index((compute_idx + 1) % NUM_BUFFERS), layout=b_scale_layout)
-
-        cur_A = next_A
-        cur_B = next_B
-        cur_AS = next_AS
-        cur_BS = next_BS
+        # Pre-load NEXT tile — static_range gives compile-time slot → ds_load_b128
+        next_slot = (compute_idx + 1) % NUM_BUFFERS
+        for buf_i in gl.static_range(NUM_BUFFERS):
+            if next_slot == buf_i:
+                cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    smem_A.index(buf_i), layout=dot_a_layout)
+                cur_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    smem_B.index(buf_i).permute([1, 0]), layout=dot_b_layout)
+                cur_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    smem_AS.index(buf_i), layout=a_scale_layout)
+                cur_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    smem_BS.index(buf_i), layout=b_scale_layout)
         compute_idx += 1
 
     # ---- Epilogue ---- no more TDM; drain remaining NUM_BUFFERS-1 tiles.
