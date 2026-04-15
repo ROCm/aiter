@@ -139,7 +139,7 @@ def get_flydsl_stage2_kernels(
     is_fp4 = b_dtype == "fp4"
     tile_ns = [128, 256] if is_fp4 else [128]
     tile_ks = [256] if is_fp4 else [128]
-    tile_ms = [32, 64, 128] if is_fp4 else [32, 64, 128]
+    tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
 
     b_nts = [0, 2]
