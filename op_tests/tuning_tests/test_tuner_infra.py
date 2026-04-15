@@ -15,6 +15,7 @@ import pandas as pd
 
 class _StubTuner:
     """Lazy-init helper — avoids importing aiter at module level."""
+
     _cls = None
 
     @classmethod
@@ -23,9 +24,14 @@ class _StubTuner:
             from aiter.utility.base_tuner import GemmCommonTuner
 
             class Stub(GemmCommonTuner):
-                def _setup_specific_arguments(self): pass
-                def tune(self, *a, **kw): pass
-                def getKernelName(self, kid): return f"k{kid}"
+                def _setup_specific_arguments(self):
+                    pass
+
+                def tune(self, *a, **kw):
+                    pass
+
+                def getKernelName(self, kid):
+                    return f"k{kid}"
 
             cls._cls = Stub
         return cls._cls("test")
@@ -35,6 +41,7 @@ class TestReadCSV(unittest.TestCase):
 
     def test_strips_whitespace(self):
         from aiter.utility.base_tuner import _read_csv
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             f.write(" M , N , K \n 1 , 2 , 3 \n 4 , 5 , 6 \n")
             path = f.name
@@ -47,6 +54,7 @@ class TestReadCSV(unittest.TestCase):
 
     def test_drops_unnamed_columns(self):
         from aiter.utility.base_tuner import _read_csv
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             f.write("M,N,K,Unnamed: 0\n1,2,3,\n")
             path = f.name
@@ -58,6 +66,7 @@ class TestReadCSV(unittest.TestCase):
 
     def test_drops_all_na_rows(self):
         from aiter.utility.base_tuner import _read_csv
+
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             f.write("M,N,K\n1,2,3\n,,\n4,5,6\n")
             path = f.name
@@ -72,32 +81,72 @@ class TestUpdateTunedf(unittest.TestCase):
 
     def test_merges_existing_key(self):
         tuner = _StubTuner.get()
-        old = pd.DataFrame({
-            "cu_num": [304], "M": [1], "N": [1024], "K": [512],
-            "kernelId": [0], "splitK": [0], "us": [100.0],
-            "kernelName": ["old"], "tflops": [1.0], "bw": [1.0], "errRatio": [0.01],
-        })
-        new = pd.DataFrame({
-            "cu_num": [304], "M": [1], "N": [1024], "K": [512],
-            "kernelId": [1], "splitK": [0], "us": [50.0],
-            "kernelName": ["new"], "tflops": [2.0], "bw": [2.0], "errRatio": [0.005],
-        })
+        old = pd.DataFrame(
+            {
+                "cu_num": [304],
+                "M": [1],
+                "N": [1024],
+                "K": [512],
+                "kernelId": [0],
+                "splitK": [0],
+                "us": [100.0],
+                "kernelName": ["old"],
+                "tflops": [1.0],
+                "bw": [1.0],
+                "errRatio": [0.01],
+            }
+        )
+        new = pd.DataFrame(
+            {
+                "cu_num": [304],
+                "M": [1],
+                "N": [1024],
+                "K": [512],
+                "kernelId": [1],
+                "splitK": [0],
+                "us": [50.0],
+                "kernelName": ["new"],
+                "tflops": [2.0],
+                "bw": [2.0],
+                "errRatio": [0.005],
+            }
+        )
         merged = tuner.update_tunedf(old, new)
         self.assertEqual(len(merged), 1)
         self.assertEqual(float(merged.iloc[0]["us"]), 50.0)
 
     def test_appends_new_key(self):
         tuner = _StubTuner.get()
-        old = pd.DataFrame({
-            "cu_num": [304], "M": [1], "N": [1024], "K": [512],
-            "kernelId": [0], "splitK": [0], "us": [100.0],
-            "kernelName": ["k0"], "tflops": [1.0], "bw": [1.0], "errRatio": [0.01],
-        })
-        new = pd.DataFrame({
-            "cu_num": [304], "M": [32], "N": [2048], "K": [1024],
-            "kernelId": [2], "splitK": [0], "us": [200.0],
-            "kernelName": ["k2"], "tflops": [3.0], "bw": [3.0], "errRatio": [0.02],
-        })
+        old = pd.DataFrame(
+            {
+                "cu_num": [304],
+                "M": [1],
+                "N": [1024],
+                "K": [512],
+                "kernelId": [0],
+                "splitK": [0],
+                "us": [100.0],
+                "kernelName": ["k0"],
+                "tflops": [1.0],
+                "bw": [1.0],
+                "errRatio": [0.01],
+            }
+        )
+        new = pd.DataFrame(
+            {
+                "cu_num": [304],
+                "M": [32],
+                "N": [2048],
+                "K": [1024],
+                "kernelId": [2],
+                "splitK": [0],
+                "us": [200.0],
+                "kernelName": ["k2"],
+                "tflops": [3.0],
+                "bw": [3.0],
+                "errRatio": [0.02],
+            }
+        )
         merged = tuner.update_tunedf(old, new)
         self.assertEqual(len(merged), 2)
 
@@ -106,12 +155,21 @@ class TestSortResults(unittest.TestCase):
 
     def test_deduplicates(self):
         tuner = _StubTuner.get()
-        df = pd.DataFrame({
-            "cu_num": [304, 304], "M": [1, 1], "N": [1024, 1024], "K": [512, 512],
-            "kernelId": [0, 1], "splitK": [0, 0], "us": [100.0, 50.0],
-            "kernelName": ["k0", "k1"], "tflops": [1.0, 2.0],
-            "bw": [1.0, 2.0], "errRatio": [0.01, 0.005],
-        })
+        df = pd.DataFrame(
+            {
+                "cu_num": [304, 304],
+                "M": [1, 1],
+                "N": [1024, 1024],
+                "K": [512, 512],
+                "kernelId": [0, 1],
+                "splitK": [0, 0],
+                "us": [100.0, 50.0],
+                "kernelName": ["k0", "k1"],
+                "tflops": [1.0, 2.0],
+                "bw": [1.0, 2.0],
+                "errRatio": [0.01, 0.005],
+            }
+        )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             df.to_csv(f.name, index=False)
             path = f.name
@@ -217,8 +275,9 @@ class TestPostProcess(unittest.TestCase):
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         shape_b_rows = resultdf[resultdf["M"] == 32]
-        self.assertGreaterEqual(len(shape_b_rows), 1,
-                                "Shape B should have results even if Shape A has none")
+        self.assertGreaterEqual(
+            len(shape_b_rows), 1, "Shape B should have results even if Shape A has none"
+        )
         self.assertEqual(float(shape_b_rows.iloc[0]["us"]), 8.0)
 
     def test_topk_not_shrink_across_shapes(self):
@@ -236,8 +295,11 @@ class TestPostProcess(unittest.TestCase):
         ]
         resultdf = tuner.post_process(rets, args, topk=2)
         shape_b_rows = resultdf[resultdf["M"] == 32]
-        self.assertGreaterEqual(len(shape_b_rows), 2,
-                                "Shape B should get topk=2 results even though Shape A only had 1")
+        self.assertGreaterEqual(
+            len(shape_b_rows),
+            2,
+            "Shape B should get topk=2 results even though Shape A only had 1",
+        )
 
     def test_all_shapes_fail(self):
         """When all kernels for all shapes fail, should still produce fallback entries."""
