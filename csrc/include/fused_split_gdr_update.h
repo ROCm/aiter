@@ -3,11 +3,10 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_tensor.h"
-#include <optional>
 
 namespace aiter {
 
-AiterTensor fused_split_gdr_update(
+void fused_split_gdr_update(
     const aiter_tensor_t& mixed_qkv,
     const aiter_tensor_t& A_log,
     const aiter_tensor_t& a,
@@ -20,10 +19,10 @@ AiterTensor fused_split_gdr_update(
     int num_heads_qk,
     int num_heads_v,
     int head_dim,
+    const aiter_tensor_t& output,
     float softplus_beta,
     float softplus_threshold,
     float scale,
-    bool use_qk_l2norm_in_kernel,
-    std::optional<aiter_tensor_t> output);
+    bool use_qk_l2norm_in_kernel);
 
 } // namespace aiter

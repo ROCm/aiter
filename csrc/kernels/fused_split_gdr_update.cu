@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
 
 #include "fused_split_gdr_update.h"
 
@@ -29,13 +30,13 @@ __device__ __forceinline__ float hip_sigmoid(float x) {
 
 __device__ __forceinline__ void load_bf16x2(
     float* __restrict__ smem,
-    const __hip_bfloat16* __restrict__ src,
+    const hip_bfloat16* __restrict__ src,
     int base,
     int K,
     int BK) {
     if (base + 1 < K) {
         const uint32_t packed = *reinterpret_cast<const uint32_t*>(src + base);
-        const __hip_bfloat16* v = reinterpret_cast<const __hip_bfloat16*>(&packed);
+        const hip_bfloat16* v = reinterpret_cast<const hip_bfloat16*>(&packed);
         smem[base] = static_cast<float>(v[0]);
         smem[base + 1] = static_cast<float>(v[1]);
     } else if (base < K) {
@@ -61,26 +62,26 @@ __device__ __forceinline__ int lds_padded_idx(int idx) {
 template <int CHUNK>
 __device__ __forceinline__ void load_bf16x2_padded_fast(
     float* __restrict__ smem,
-    const __hip_bfloat16* __restrict__ src,
+    const hip_bfloat16* __restrict__ src,
     int base) {
     const int p0 = lds_padded_idx<CHUNK>(base);
     const int p1 = lds_padded_idx<CHUNK>(base + 1);
     const uint32_t packed = *reinterpret_cast<const uint32_t*>(src + base);
-    const __hip_bfloat16* v = reinterpret_cast<const __hip_bfloat16*>(&packed);
+    const hip_bfloat16* v = reinterpret_cast<const hip_bfloat16*>(&packed);
     smem[p0] = static_cast<float>(v[0]);
     smem[p1] = static_cast<float>(v[1]);
 }
 
 template <int BK, int BV, bool USE_INITIAL_STATE, bool USE_QK_L2NORM>
 __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
-    const __hip_bfloat16* __restrict__ mixed_qkv,
+    const hip_bfloat16* __restrict__ mixed_qkv,
     const float* __restrict__ A_log,
-    const __hip_bfloat16* __restrict__ a,
-    const __hip_bfloat16* __restrict__ dt_bias,
+    const hip_bfloat16* __restrict__ a,
+    const hip_bfloat16* __restrict__ dt_bias,
     float softplus_beta,
     float softplus_threshold,
-    const __hip_bfloat16* __restrict__ b_gate,
-    __hip_bfloat16* __restrict__ o,
+    const hip_bfloat16* __restrict__ b_gate,
+    hip_bfloat16* __restrict__ o,
     float* __restrict__ h0_source,
     const int32_t* __restrict__ h0_indices,
     int T,
@@ -156,18 +157,18 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
     const int k_dim_off = key_dim + i_h * K;
     const int v_dim_off = 2 * key_dim + i_hv * V_dim;
 
-    const __hip_bfloat16* x_base =
+    const hip_bfloat16* x_base =
         mixed_qkv + static_cast<int64_t>(i_n) * stride_x_batch;
-    const __hip_bfloat16* p_a = a + static_cast<int64_t>(i_n) * T * HV + i_hv;
-    const __hip_bfloat16* p_b =
+    const hip_bfloat16* p_a = a + static_cast<int64_t>(i_n) * T * HV + i_hv;
+    const hip_bfloat16* p_b =
         b_gate + static_cast<int64_t>(i_n) * T * HV + i_hv;
-    __hip_bfloat16* p_o = o + static_cast<int64_t>(i_n) * stride_o_batch +
+    hip_bfloat16* p_o = o + static_cast<int64_t>(i_n) * stride_o_batch +
                           static_cast<int64_t>(i_hv) * stride_o_head;
 
     const bool use_vec2 = (stride_x_dim == 1);
 
     for (int t = 0; t < T; t++) {
-        const __hip_bfloat16* x_t = x_base + static_cast<int64_t>(t) * stride_x_seq;
+        const hip_bfloat16* x_t = x_base + static_cast<int64_t>(t) * stride_x_seq;
 
         if (use_vec2) {
             const int base = 2 * lane;
@@ -194,10 +195,10 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
             }
         }
 
-        const __hip_bfloat16 v_raw =
+        const hip_bfloat16 v_raw =
             x_t[static_cast<int64_t>(v_dim_off + v_col) * stride_x_dim];
-        const __hip_bfloat16 a_raw = p_a[static_cast<int64_t>(t) * HV];
-        const __hip_bfloat16 b_raw = p_b[static_cast<int64_t>(t) * HV];
+        const hip_bfloat16 a_raw = p_a[static_cast<int64_t>(t) * HV];
+        const hip_bfloat16 b_raw = p_b[static_cast<int64_t>(t) * HV];
 
         __syncthreads();
 
@@ -305,7 +306,7 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
             if (k_split == 0) {
                 p_o[static_cast<int64_t>(t) * stride_o_seq +
                     static_cast<int64_t>(v_col) * stride_o_dim] =
-                    static_cast<__hip_bfloat16>(o_local);
+                    static_cast<hip_bfloat16>(o_local);
             }
         }
     }
@@ -333,16 +334,16 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
         dim3(block),                                                                   \
         0,                                                                             \
         stream,                                                                        \
-        reinterpret_cast<const __hip_bfloat16*>(mixed_qkv.data_ptr()),                \
-        A_log.data_ptr<float>(),                                                       \
-        reinterpret_cast<const __hip_bfloat16*>(a.data_ptr()),                        \
-        reinterpret_cast<const __hip_bfloat16*>(dt_bias.data_ptr()),                  \
+        reinterpret_cast<const hip_bfloat16*>(mixed_qkv.data_ptr()),                  \
+        reinterpret_cast<const float*>(A_log.data_ptr()),                              \
+        reinterpret_cast<const hip_bfloat16*>(a.data_ptr()),                          \
+        reinterpret_cast<const hip_bfloat16*>(dt_bias.data_ptr()),                    \
         softplus_beta,                                                                 \
         softplus_threshold,                                                            \
-        reinterpret_cast<const __hip_bfloat16*>(b_gate.data_ptr()),                   \
-        reinterpret_cast<__hip_bfloat16*>(o.data_ptr()),                              \
-        use_initial_state ? initial_state_source.data_ptr<float>() : nullptr,         \
-        initial_state_indices_ptr.data_ptr<int32_t>(),                                \
+        reinterpret_cast<const hip_bfloat16*>(b_gate.data_ptr()),                     \
+        reinterpret_cast<hip_bfloat16*>(o.data_ptr()),                                \
+        use_initial_state ? reinterpret_cast<float*>(initial_state_source.data_ptr()) : nullptr, \
+        reinterpret_cast<const int32_t*>(initial_state_indices_ptr.data_ptr()),        \
         T,                                                                             \
         key_dim,                                                                       \
         value_dim,                                                                     \
@@ -371,7 +372,7 @@ __global__ __launch_bounds__(BV) void fused_split_gdr_update_kernel(
         LAUNCH_KS(BK_CT, false, false);                              \
     }
 
-AiterTensor fused_split_gdr_update(
+void fused_split_gdr_update(
     const aiter_tensor_t& mixed_qkv,
     const aiter_tensor_t& A_log,
     const aiter_tensor_t& a,
@@ -384,11 +385,11 @@ AiterTensor fused_split_gdr_update(
     int num_heads_qk,
     int num_heads_v,
     int head_dim,
+    const aiter_tensor_t& output,
     float softplus_beta,
     float softplus_threshold,
     float scale,
-    bool use_qk_l2norm_in_kernel,
-    std::optional<aiter_tensor_t> output) {
+    bool use_qk_l2norm_in_kernel) {
     AITER_CHECK(mixed_qkv.dtype() == AITER_DTYPE_bf16, "mixed_qkv must be bfloat16");
     AITER_CHECK(A_log.dtype() == AITER_DTYPE_fp32, "A_log must be float32");
     AITER_CHECK(a.dtype() == AITER_DTYPE_bf16, "a must be bfloat16");
@@ -434,18 +435,12 @@ AiterTensor fused_split_gdr_update(
         scale = 1.0f / std::sqrt(static_cast<float>(K));
     }
 
-    std::optional<AiterTensor> o_storage;
-    aiter_tensor_t o{};
-    if (output.has_value()) {
-        o = output.value();
-        AITER_CHECK(o.dtype() == AITER_DTYPE_bf16, "output must be bfloat16");
-        AITER_CHECK(
-            o.size(0) == B && o.size(1) == T && o.size(2) == HV && o.size(3) == V,
-            "output shape mismatch");
-    } else {
-        o_storage.emplace(AiterTensor::empty({B, T, HV, V}, mixed_qkv.dtype(), mixed_qkv.device_id));
-        o = static_cast<aiter_tensor_t&>(*o_storage);
-    }
+    const aiter_tensor_t& o = output;
+    AITER_CHECK(o.data_ptr() != nullptr, "output must be allocated");
+    AITER_CHECK(o.dtype() == AITER_DTYPE_bf16, "output must be bfloat16");
+    AITER_CHECK(
+        o.size(0) == B && o.size(1) == T && o.size(2) == HV && o.size(3) == V,
+        "output shape mismatch");
 
     std::optional<AiterTensor> initial_state_indices_storage;
     aiter_tensor_t initial_state_indices_ptr = initial_state_indices;
@@ -488,7 +483,6 @@ AiterTensor fused_split_gdr_update(
         AITER_CHECK(false, "Unsupported BK: ", bk_runtime);
     }
 
-    return o_storage.has_value() ? std::move(*o_storage) : AiterTensor(o);
 }
 
 #undef DISPATCH_KS_BOOL

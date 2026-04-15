@@ -10,7 +10,32 @@ from ..jit.core import compile_ops
 MD_NAME = "module_fused_split_gdr_update"
 
 
-@compile_ops("module_fused_split_gdr_update", develop=True)
+@compile_ops(
+    "module_fused_split_gdr_update",
+    develop=True,
+    fc_name="fused_split_gdr_update",
+)
+def _fused_split_gdr_update_kernel(
+    mixed_qkv: Tensor,
+    A_log: Tensor,
+    a: Tensor,
+    dt_bias: Tensor,
+    b_gate: Tensor,
+    initial_state_source: Tensor,
+    initial_state_indices: Tensor,
+    key_dim: int,
+    value_dim: int,
+    num_heads_qk: int,
+    num_heads_v: int,
+    head_dim: int,
+    output: Tensor,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    scale: float = -1.0,
+    use_qk_l2norm_in_kernel: bool = True,
+) -> None: ...
+
+
 def fused_split_gdr_update(
     mixed_qkv: Tensor,
     A_log: Tensor,
@@ -42,4 +67,28 @@ def fused_split_gdr_update(
         initial_state_source: [N, HV, K/4, V, 4], float32 swizzled state, updated in-place.
         initial_state_indices: [B], int32 indices into initial_state_source.
     """
-    ...
+    if output is None:
+        output = mixed_qkv.new_empty(
+            (mixed_qkv.size(0), mixed_qkv.size(2), num_heads_v, head_dim)
+        )
+
+    _fused_split_gdr_update_kernel(
+        mixed_qkv=mixed_qkv,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b_gate=b_gate,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        num_heads_qk=num_heads_qk,
+        num_heads_v=num_heads_v,
+        head_dim=head_dim,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        output=output,
+    )
+    return output
