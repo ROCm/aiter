@@ -92,7 +92,7 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
         # TODO: need to tune
         block_n = 128
         block_k = 512
-        num_warps = 8
+        num_warps = 4
     else:
         if block_m == 16:
             block_n = 128
