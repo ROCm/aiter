@@ -21,7 +21,7 @@ void hk_mla_decode_fwd(
 {
     const int32_t num_head = query.size(1);
 
-    if (num_head == 128)
+    if ((num_head * max_seqlen_q) == 128)
     {
         hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
             query,

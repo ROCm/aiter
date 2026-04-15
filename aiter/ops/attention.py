@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 from typing import Optional, Tuple
 
 from aiter.ops.enum import QuantType, Enum
@@ -943,6 +944,14 @@ def get_mla_metadata_info_v1(
             and num_head_qo == 128
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
+        )
+        or (
+            get_gfx() == "gfx942"
+            and num_head_qo in (16, 32, 64)
+            and num_head_qo * effective_seqlen_qo == 128
+            and kv_dtype == dtypes.fp8
+            and q_dtype == dtypes.fp8
+            and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
         )
         or (
             get_gfx() == "gfx950"
