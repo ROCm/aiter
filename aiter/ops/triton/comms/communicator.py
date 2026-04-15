@@ -64,8 +64,11 @@ class AiterCommunicator:
         self._buf_shape = None
         self._buf_dtype = None
 
-        # Zero-copy cache: data_ptr -> (sym_tensor, workspace)
-        self._sym_cache: dict[int, tuple[torch.Tensor, Optional[object]]] = {}
+        # Zero-copy cache: (``data_ptr``, ``shape``, ``dtype``) -> (sym_tensor, workspace)
+        self._sym_cache: dict[
+            tuple[int, tuple[int, ...], torch.dtype],
+            tuple[torch.Tensor, Optional[object]],
+        ] = {}
         self._allocator_type: str = allocator_type
 
         if not _rocm_arch_available():
@@ -132,21 +135,16 @@ class AiterCommunicator:
     def _get_or_import(self, inp: torch.Tensor):
         """Return cached (sym_tensor, workspace) for *inp*.
 
-        On first call for a given ``data_ptr``, imports *inp* into the
-        symmetric heap via DMA-BUF (``as_symmetric``).
+        On first call for a given (``data_ptr``, ``shape``, ``dtype``), imports
+        *inp* into the symmetric heap via DMA-BUF (``as_symmetric``).
         ``refresh_peer_access()`` is called once inside ``as_symmetric``
         — this is a collective, so all ranks must hit this together
         (safe because every rank executes the same allreduce in lockstep).
         """
         ptr = inp.data_ptr()
-        entry = self._sym_cache.get(ptr)
+        cache_key = (ptr, tuple(inp.shape), inp.dtype)
+        entry = self._sym_cache.get(cache_key)
         if entry is not None:
-            sym_tensor, _ = entry
-            # Detect stale cache: data_ptr reused with different shape/dtype
-            assert sym_tensor.shape == inp.shape and sym_tensor.dtype == inp.dtype, (
-                f"Stale sym_cache: cached shape={tuple(sym_tensor.shape)} dtype={sym_tensor.dtype} "
-                f"vs input shape={tuple(inp.shape)} dtype={inp.dtype} at ptr={ptr:#x}"
-            )
             return entry
 
         if torch.cuda.is_current_stream_capturing():
@@ -176,7 +174,7 @@ class AiterCommunicator:
         )
         _dbg("all_reduce_preamble OK", rank=rank)
         entry = (sym_tensor, workspace)
-        self._sym_cache[ptr] = entry
+        self._sym_cache[cache_key] = entry
         return entry
 
     def _all_reduce_zerocopy(self, inp: torch.Tensor) -> torch.Tensor:
@@ -192,7 +190,8 @@ class AiterCommunicator:
         )
         _dbg("all_reduce zerocopy OK", rank=rank)
 
-        self._sym_cache[inp.data_ptr()] = (sym_tensor, workspace)
+        cache_key = (inp.data_ptr(), tuple(inp.shape), inp.dtype)
+        self._sym_cache[cache_key] = (sym_tensor, workspace)
         return inp
 
     # ------------------------------------------------------------------
