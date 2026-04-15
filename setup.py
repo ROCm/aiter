@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 
 from setuptools import Distribution, setup
@@ -10,6 +11,9 @@ from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
+
+FLYDSL_VERSION = "flydsl==0.1.3.1"
+
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
@@ -46,6 +50,24 @@ def is_develop_mode():
         elif "editable" in arg:
             return True
     return False
+
+
+if not IS_WINDOWS and is_develop_mode():
+    try:
+        from importlib.metadata import version as pkg_version
+
+        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+            raise ImportError("version mismatch")
+    except Exception:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                FLYDSL_VERSION,
+            ]
+        )
 
 
 def write_install_mode():
@@ -268,6 +290,76 @@ if PREBUILD_KERNELS != 0:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
+        # --- FlyDSL AOT pre-compilation ---
+        try:
+            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+            os.makedirs(flydsl_cache_dir, exist_ok=True)
+            os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = flydsl_cache_dir
+
+            # setup.py loads `jit.core` via sys.path (line 134-135).
+            # Map those modules into the `aiter.*` namespace so that
+            # `import aiter.jit.core` reuses the same instances.
+            for _name in list(sys.modules):
+                if _name == "jit" or _name.startswith("jit."):
+                    _pkg = f"aiter.{_name}"
+                    if _pkg not in sys.modules:
+                        sys.modules[_pkg] = sys.modules[_name]
+
+            from aiter.aot.flydsl.common import collect_aot_jobs
+
+            def _run_flydsl_aot(label, default_csvs, parse_csv, compile_one_config):
+                jobs = collect_aot_jobs(
+                    default_csvs,
+                    parse_csv,
+                    on_missing_csv=lambda csv_path: print(
+                        f"[aiter] {label}: CSV not found: {csv_path}"
+                    ),
+                )
+                if jobs:
+                    print(
+                        f"[aiter] {label}: {len(jobs)} kernels to compile "
+                        f"(cache: {flydsl_cache_dir})"
+                    )
+                    results = []
+                    for job in jobs:
+                        results.append(compile_one_config(**job))
+                    ok = sum(
+                        1 for result in results if result["compile_time"] is not None
+                    )
+                    fail = len(results) - ok
+                    print(f"[aiter] {label}: compiled {ok} ok, {fail} failed")
+
+            from aiter.aot.flydsl.moe import (
+                DEFAULT_CSVS as MOE_DEFAULT_CSVS,
+                compile_one_config as compile_moe_one_config,
+                parse_csv as parse_moe_csv,
+            )
+
+            _run_flydsl_aot(
+                "FlyDSL MoE AOT",
+                MOE_DEFAULT_CSVS,
+                parse_moe_csv,
+                compile_moe_one_config,
+            )
+
+            from aiter.aot.flydsl.gemm import (
+                DEFAULT_CSVS as GEMM_DEFAULT_CSVS,
+                compile_one_config as compile_gemm_one_config,
+                parse_csv as parse_gemm_csv,
+            )
+
+            _run_flydsl_aot(
+                "FlyDSL GEMM AOT",
+                GEMM_DEFAULT_CSVS,
+                parse_gemm_csv,
+                compile_gemm_one_config,
+            )
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            print(f"[aiter] FlyDSL AOT skipped: {e}")
+
 
 class NinjaBuildExtension(build_ext):
     """Custom build_ext that defers expensive operations until run() is called."""
@@ -315,7 +407,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        "flydsl==0.1.1.dev409",
+        FLYDSL_VERSION,
     ]
 
 setup(
