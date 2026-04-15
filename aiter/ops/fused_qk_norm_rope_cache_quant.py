@@ -93,7 +93,40 @@ def fused_qk_norm_rope_cache_block_quant_shuffle(
 ) -> None: ...
 
 
-@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)
+@compile_ops(
+    "module_fused_qk_norm_rope_cache_quant_shuffle",
+    develop=True,
+    fc_name="fused_qk_norm_rope_cache_pts_quant_shuffle",
+)
+def _fused_qk_norm_rope_cache_pts_quant_shuffle_kernel(
+    qkv: Tensor,
+    qw: Tensor,
+    kw: Tensor,
+    cos_sin: Tensor,
+    positions: Tensor,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_size: int,
+    is_neox_style: bool,
+    eps: float,
+    q_out: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    slot_mapping: Tensor,
+    per_tensor_k_scale: float,
+    per_tensor_v_scale: float,
+    k_out: Optional[Tensor],
+    v_out: Optional[Tensor],
+    return_kv: bool,
+    use_shuffle_layout: bool,
+    block_size: int,
+    x: int,
+    rotary_dim: int = 0,
+) -> None: ...
+
+
 def fused_qk_norm_rope_cache_pts_quant_shuffle(
     qkv: Tensor,
     qw: Tensor,
@@ -120,7 +153,34 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     block_size: int,
     x: int,
     rotary_dim: int = 0,
-) -> None: ...
+) -> None:
+    _fused_qk_norm_rope_cache_pts_quant_shuffle_kernel(
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        eps,
+        q_out,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        float(per_tensor_k_scale.item()),
+        float(per_tensor_v_scale.item()),
+        k_out,
+        v_out,
+        return_kv,
+        use_shuffle_layout,
+        block_size,
+        x,
+        rotary_dim,
+    )
 
 
 @compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle", develop=True)

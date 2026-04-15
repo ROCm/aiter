@@ -3,6 +3,9 @@
 #include "aiter_stream.h"
 #include "aiter_dispatch.h"
 #include "rope/rope_common.h"
+#include <array>
+#include <optional>
+#include <vector>
 
 void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                     const aiter_tensor_t& qw,
@@ -22,8 +25,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                     const aiter_tensor_t& k_cache,
                                                     const aiter_tensor_t& v_cache,
                                                     const aiter_tensor_t& slot_mapping,
-                                                    const aiter_tensor_t& per_tensor_k_scale,
-                                                    const aiter_tensor_t& per_tensor_v_scale,
+                                                    float per_tensor_k_scale,
+                                                    float per_tensor_v_scale,
                                                     std::optional<aiter_tensor_t> k_out,
                                                     std::optional<aiter_tensor_t> v_out,
                                                     bool return_kv,
@@ -39,12 +42,11 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
     mrope_section[2] = mrope_section_[2];
     HipDeviceGuard device_guard(qkv.device_id);
     auto stream         = aiter::getCurrentHIPStream();
-    auto pos_strides    = positions.strides();
+    AITER_CHECK(positions.dim() == 2, "positions must be 2D");
+    int64_t position_stride_0 = positions.stride(0);
+    int64_t position_stride_1 = positions.stride(1);
     auto kv_cache_dtype = k_cache.dtype();
     auto qkv_dtype      = qkv.dtype();
-    AITER_CHECK(pos_strides.size() == 2);
-    float per_tensor_k_scale_ = reinterpret_cast<float*>(per_tensor_k_scale.data_ptr())[0];
-    float per_tensor_v_scale_ = reinterpret_cast<float*>(per_tensor_v_scale.data_ptr())[0];
     AITER_DISPATCH_FLOATING(qkv_dtype, "fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", [&] {
             using T = scalar_t;
 
@@ -61,8 +63,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                              reinterpret_cast<T*>(kw.data_ptr()),
                                                              reinterpret_cast<T*>(cos_sin.data_ptr()),
                                                              reinterpret_cast<int64_t*>(positions.data_ptr()),
-                                                             pos_strides[0],
-                                                             pos_strides[1],
+                                                             position_stride_0,
+                                                             position_stride_1,
                                                              num_tokens,
                                                              num_heads_q,
                                                              num_heads_k,
@@ -77,8 +79,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                              reinterpret_cast<T*>(v_cache.data_ptr()),
                                                              reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
                                                              stream,
-                                                             per_tensor_k_scale_,
-                                                             per_tensor_v_scale_,
+                                                             per_tensor_k_scale,
+                                                             per_tensor_v_scale,
                                                              k_out_ptr,
                                                              v_out_ptr,
                                                              use_shuffle_layout,
@@ -102,8 +104,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                         reinterpret_cast<T*>(kw.data_ptr()),
                         reinterpret_cast<T*>(cos_sin.data_ptr()),
                         reinterpret_cast<int64_t*>(positions.data_ptr()),
-                        pos_strides[0],
-                        pos_strides[1],
+                        position_stride_0,
+                        position_stride_1,
                         num_tokens,
                         num_heads_q,
                         num_heads_k,
@@ -118,8 +120,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                         reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_cache.data_ptr()),
                         reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
                         stream,
-                        per_tensor_k_scale_,
-                        per_tensor_v_scale_,
+                        per_tensor_k_scale,
+                        per_tensor_v_scale,
                         k_out_fp8_ptr,
                         v_out_fp8_ptr,
                         use_shuffle_layout,

@@ -1647,8 +1647,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                 const aiter_tensor_t& k_cache,
                                                 const aiter_tensor_t& v_cache,
                                                 const aiter_tensor_t& slot_mapping,
-                                                const aiter_tensor_t& per_tensor_k_scale,
-                                                const aiter_tensor_t& per_tensor_v_scale,
+                                                float per_tensor_k_scale,
+                                                float per_tensor_v_scale,
                                                 std::optional<aiter_tensor_t> k_out,
                                                 std::optional<aiter_tensor_t> v_out,
                                                 bool return_kv,
@@ -1663,8 +1663,6 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
     int64_t position_stride = positions.stride(0);
     auto kv_cache_dtype = k_cache.dtype();
     auto qkv_dtype      = qkv.dtype();
-    float per_tensor_k_scale_ = reinterpret_cast<float*>(per_tensor_k_scale.data_ptr())[0];
-    float per_tensor_v_scale_ = reinterpret_cast<float*>(per_tensor_v_scale.data_ptr())[0];
     AITER_DISPATCH_FLOATING(qkv_dtype, "fused_qk_norm_rope_cache_pts_quant_shuffle", [&] {
             using T = scalar_t;
             if(kv_cache_dtype == qkv_dtype)
@@ -1694,8 +1692,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                          reinterpret_cast<T*>(v_cache.data_ptr()),
                                                          reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
                                                          stream,
-                                                         per_tensor_k_scale_,
-                                                         per_tensor_v_scale_,
+                                                         per_tensor_k_scale,
+                                                         per_tensor_v_scale,
                                                          k_out_ptr,
                                                          v_out_ptr,
                                                          use_shuffle_layout,
@@ -1733,8 +1731,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                         reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(v_cache.data_ptr()),
                         reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
                         stream,
-                        per_tensor_k_scale_,
-                        per_tensor_v_scale_,
+                        per_tensor_k_scale,
+                        per_tensor_v_scale,
                         k_out_fp8_ptr,
                         v_out_fp8_ptr,
                         use_shuffle_layout,
