@@ -190,7 +190,7 @@ class AITER_CONFIG(object):
 
         for i, path in enumerate(path_list):
             if not os.path.exists(path):
-                logger.info(f"path {i+1}: {path} (not exist)")
+                logger.info(f"path {i + 1}: {path} (not exist)")
                 continue
 
             df = pd.read_csv(path)
@@ -791,6 +791,17 @@ def build_module(
         if not any("ENABLE_CK" in f for f in flags_extra_cc):
             flags_cc.append(f"-DENABLE_CK={enable_ck}")
 
+        enable_rope_positions_int32 = int(
+            os.environ.get("ENABLE_ROPE_POSITIONS_INT32", "0")
+        )
+        if not any("ENABLE_ROPE_POSITIONS_INT32" in f for f in flags_extra_cc):
+            flags_cc.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
+            flags_hip.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -905,7 +916,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
-            f"\033[32mfinish build [{md_name}], cost {time.perf_counter()-startTS:.1f}s \033[0m"
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -1119,6 +1130,8 @@ def _ctypes_call(func, fc_name, md_name):
 
     _cache = {}
     _arg_checked = False
+    _sig = inspect.signature(func)
+    _hints = typing.get_type_hints(func)
 
     def _ensure_loaded():
         if _cache:
@@ -1144,10 +1157,25 @@ def _ctypes_call(func, fc_name, md_name):
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
 
-        hints = typing.get_type_hints(func)
+        def _opt_sym(name, argtypes=(), restype=None):
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.argtypes = list(argtypes)
+                fn.restype = restype
+            return fn
 
-        ret_hint = hints.get("return")
-        if ret_hint is int:
+        abi_fn = _opt_sym("aiter_ctypes_abi_version", restype=ctypes.c_int)
+        ctypes_abi_version = abi_fn() if abi_fn else 1
+        ctypes_status_mode = ctypes_abi_version >= 2
+        err_getter = _opt_sym("aiter_get_last_error", restype=ctypes.c_char_p)
+        err_clear = _opt_sym("aiter_clear_last_error")
+
+        ret_hint = _hints.get("return")
+        ctypes_data_return = ctypes_status_mode and ret_hint is int
+
+        if ctypes_status_mode:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is int:
             c_func.restype = ctypes.c_int
         elif ret_hint is float:
             c_func.restype = ctypes.c_float
@@ -1156,8 +1184,8 @@ def _ctypes_call(func, fc_name, md_name):
 
         argtypes = []
         has_tensor = False
-        for pname in inspect.signature(func).parameters:
-            hint = hints.get(pname)
+        for pname in _sig.parameters:
+            hint = _hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
@@ -1186,6 +1214,10 @@ def _ctypes_call(func, fc_name, md_name):
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
+        _cache["err_getter"] = err_getter
+        _cache["err_clear"] = err_clear
+        _cache["ctypes_status_mode"] = ctypes_status_mode
+        _cache["ctypes_data_return"] = ctypes_data_return
         _cache["has_tensor"] = has_tensor
 
     def _check_args_before_convert(bound_args, hints):
@@ -1221,20 +1253,17 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is str:
                 if not isinstance(value, str):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects str, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects str, got {type(value).__name__}"
                     )
             elif hint is bool:
                 if not isinstance(value, (bool, int)):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects bool, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects bool, got {type(value).__name__}"
                     )
             elif hint is int:
                 if not isinstance(value, int):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects int, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects int, got {type(value).__name__}"
                     )
             elif hint is float:
                 if not isinstance(value, (float, int)):
@@ -1247,18 +1276,20 @@ def _ctypes_call(func, fc_name, md_name):
         nonlocal _arg_checked
         _ensure_loaded()
         c_func = _cache["c_func"]
+        err_getter = _cache.get("err_getter")
+        err_clear = _cache.get("err_clear")
+        ctypes_status_mode = _cache.get("ctypes_status_mode", False)
+        ctypes_data_return = _cache.get("ctypes_data_return", False)
 
         if AITER_LOG_MORE == 2:
             from ..test_common import log_args
 
             log_args(func, *args, **kwargs)
-        sig = inspect.signature(func)
-        bound = sig.bind(*args, **kwargs)
+        bound = _sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        hints = typing.get_type_hints(func)
 
         if not _arg_checked:
-            _check_args_before_convert(bound.arguments, hints)
+            _check_args_before_convert(bound.arguments, _hints)
             _arg_checked = True
 
         c_args = []
@@ -1266,7 +1297,7 @@ def _ctypes_call(func, fc_name, md_name):
         tensor_device = None
 
         for pname, value in bound.arguments.items():
-            hint = hints.get(pname)
+            hint = _hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
 
@@ -1300,11 +1331,30 @@ def _ctypes_call(func, fc_name, md_name):
             else:
                 c_args.append(value)
 
-        if _cache.get("has_tensor"):
-            c_args.append(
-                ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-            )
-        return c_func(*c_args)
+        c_args.append(
+            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+        )
+        if err_clear is not None:
+            err_clear()
+        ret = c_func(*c_args)
+
+        err_msg = None
+        if ctypes_status_mode and not ctypes_data_return and ret != 0:
+            err_msg = f"ctypes status={ret}"
+        if err_getter is not None:
+            raw = err_getter()
+            if raw:
+                err_msg = raw.decode(errors="replace")
+        if err_msg is not None:
+            if err_clear is not None:
+                err_clear()
+            raise RuntimeError(f"{fc_name} failed: {err_msg}")
+
+        if ctypes_data_return:
+            return ret
+        if ctypes_status_mode:
+            return None
+        return ret
 
     return caller
 
@@ -1489,11 +1539,79 @@ def compile_ops(
                         func_hints = typing.get_type_hints(func)
                         if ann["return"] is None:
                             func_hints["return"] = None
-                        if ann != func_hints:
+
+                        tensor_like_types = {torch.Tensor}
+                        if aiter_tensor_t is not object:
+                            tensor_like_types.add(aiter_tensor_t)
+
+                        def canonicalize_hint(hint):
+                            if hint in tensor_like_types:
+                                return ("tensor",)
+
+                            origin = typing.get_origin(hint)
+                            if origin in (list, List):
+                                return (
+                                    "list",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin is tuple:
+                                return (
+                                    "tuple",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin in (typing.Union, types.UnionType):
+                                return (
+                                    "union",
+                                    tuple(
+                                        sorted(
+                                            (
+                                                canonicalize_hint(arg)
+                                                for arg in typing.get_args(hint)
+                                            ),
+                                            key=repr,
+                                        )
+                                    ),
+                                )
+                            return hint
+
+                        canonical_ann = {
+                            key: canonicalize_hint(value) for key, value in ann.items()
+                        }
+                        canonical_func_hints = {
+                            key: canonicalize_hint(value)
+                            for key, value in func_hints.items()
+                        }
+
+                        if canonical_ann != canonical_func_hints:
                             logger.warning(
                                 f"type hints mismatch, override to --> {doc_str}"
                             )
                     return True
+
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, …).
+                if develop:
+                    import torch
+
+                    from ..utility.dtypes import torch_to_aiter_pybind
+
+                    args = tuple(
+                        torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a
+                        for a in args
+                    )
+                    kwargs = {
+                        k: (
+                            torch_to_aiter_pybind(v)
+                            if isinstance(v, torch.Tensor)
+                            else v
+                        )
+                        for k, v in kwargs.items()
+                    }
 
                 if not func.arg_checked:
                     func.arg_checked = check_args()
@@ -1504,8 +1622,6 @@ def compile_ops(
                     log_args(func, *args, **kwargs)
 
                 if develop:
-                    import torch
-
                     module._set_current_hip_stream(
                         torch.cuda.current_stream().cuda_stream
                     )

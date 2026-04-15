@@ -20,6 +20,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+from ..ops.flydsl.utils import is_flydsl_available
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -100,6 +101,56 @@ def gemm_a8w8_bpreshuffle_cktile(
     out: Tensor,
     splitK: int = 0,
 ) -> Tensor: ...
+
+
+def _parse_flydsl_kernel_name(kernel_name: str):
+    """Parse tile config from flydsl kernelName, e.g.
+    'flydsl_bpreshuflle_128x64x256_F8_F8_B16_2x0x1x1_default'
+    -> (tile_m=128, tile_n=64, tile_k=256, lds_stage=2, cshuffle=0, async_copy=1, wpe=1)
+    Returns None on parse failure.
+    """
+    import re
+
+    m = re.match(
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)x(\d+)x(\d+)",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    return tuple(int(m.group(i)) for i in range(1, 8))
+
+
+def gemm_a8w8_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    kernel_name = config.get("kernelName", "")
+    parsed = _parse_flydsl_kernel_name(str(kernel_name))
+    if parsed is None:
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+    tm, tn, tk, lds, csh, acp, wpe = parsed
+
+    flydsl_preshuffle_gemm_a8(
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale,
+        w_scale,
+        Out,
+        tm,
+        tn,
+        tk,
+        lds,
+        csh,
+        acp,
+        wpe,
+    )
+    return Out
 
 
 @compile_ops(
@@ -267,6 +318,8 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     bpreshuffle: Optional[bool] = True,
     zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
+    if bias is None and zero_bias_buf is None:
+        zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
     _gemm_a8w8_blockscale_bpreshuffle_asm(
         A,
         B,
@@ -442,8 +495,9 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert bias is not None, "Use asm gemm must give bias, please give a \
-            bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        assert (
+            bias is not None
+        ), "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -542,6 +596,8 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
+        elif libtype == "flydsl" and is_flydsl_available():
+            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     else:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
 
@@ -651,6 +707,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "asm":
+            kernelName = config["kernelName"]
+            splitK = config["splitK"]
+            return gemm_a8w8_blockscale_bpreshuffle_asm(
+                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+            )
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
