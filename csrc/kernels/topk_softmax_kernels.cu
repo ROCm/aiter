@@ -36,12 +36,6 @@
 namespace vllm {
 namespace moe {
 
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
-static constexpr int kLaunchBoundsWarpSize = 64;
-#else
-static constexpr int kLaunchBoundsWarpSize = 32;
-#endif
-
 // Enum for shared expert scoring functions
 enum class SharedExpertScoringFunc
 {
@@ -228,7 +222,7 @@ template <typename DTYPE,
           bool need_renorm,
           int NUM_SHARED_EXPERTS = 0,
           SharedExpertScoringFunc SCORING_FUNC = SharedExpertScoringFunc::NONE>
-__launch_bounds__(WARPS_PER_CTA * kLaunchBoundsWarpSize) __global__
+__launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     void topkGatingSoftmax(const DTYPE* input,
                            const bool* finished,
                            float* output,
@@ -247,7 +241,7 @@ __launch_bounds__(WARPS_PER_CTA * kLaunchBoundsWarpSize) __global__
     static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
     static_assert(BYTES_PER_LDG == (BYTES_PER_LDG & -BYTES_PER_LDG),
                   "BYTES_PER_LDG must be power of 2");
-    static_assert(BYTES_PER_LDG <= 32, "BYTES_PER_LDG must be leq 32");
+    // static_assert(BYTES_PER_LDG <= 32, "BYTES_PER_LDG must be leq 32");
 
     // Number of bytes each thread pulls in per load
     static constexpr int ELTS_PER_LDG    = BYTES_PER_LDG / sizeof(DTYPE);
@@ -506,7 +500,7 @@ __launch_bounds__(WARPS_PER_CTA * kLaunchBoundsWarpSize) __global__
     }
 }
 
-namespace detail {
+namespace topk_detail {
 // Constructs some constants needed to partition the work across threads at compile time.
 template <typename DTYPE, int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants
@@ -515,12 +509,12 @@ struct TopkConstants
     static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 ||
                       EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0,
                   "");
-    static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
+    // AITER_CHECK(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) > 1, "not supported");
+    static constexpr int VECs_PER_THREAD = 1;
     static constexpr int VPT             = VECs_PER_THREAD * ELTS_PER_LDG;
     static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
-    static constexpr int ROWS_PER_WARP   = WARP_SIZE / THREADS_PER_ROW;
 };
-} // namespace detail
+} // namespace topk_detail
 
 template <typename DTYPE,
           int EXPERTS,
@@ -542,14 +536,15 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const bool need_renorm,
                                      hipStream_t stream)
 {
-    static constexpr std::size_t MAX_BYTES_PER_LDG = 32;
+    static constexpr std::size_t MAX_BYTES_PER_LDG = EXPERTS < 512 ? 32 : 64;
 
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(DTYPE) * EXPERTS);
-    using Constants                    = detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
+    using Constants                    = topk_detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
+    AITER_CHECK(EXPERTS / (Constants::ELTS_PER_LDG * WARP_SIZE) <= 1, "EXPERTS:", EXPERTS, " not supported");
     static constexpr int VPT           = Constants::VPT;
-    static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
-    const int num_warps                = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-    const int num_blocks               = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
+    int ROWS_PER_WARP   = get_warp_size_func() / Constants::THREADS_PER_ROW;
+    int num_warps                = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+    int num_blocks               = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     if(need_renorm)

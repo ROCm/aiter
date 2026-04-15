@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
 #include "asm_fp8gemm_blockscale_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -151,45 +152,39 @@ struct KernelSelector {
         }
     };
 
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash> heuristic_cache;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> kernel_cache;
+    static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash> heuristic_cache;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> kernel_cache;
 
-    static std::tuple<std::string, int> select_kernel(
-        int M,
-        int N,
-        int K,
-        const std::string& arch_id,
-        std::optional<int> splitK,
-        std::optional<bool> bpreshuffle,
-        const char* kernelName,
-        CFG* config_map) {
+    static std::tuple<std::string, int> select_kernel(int M,
+                                                      int N,
+                                                      int K,
+                                                      const std::string& arch_id,
+                                                      std::optional<int> splitK,
+                                                      std::optional<bool> bpreshuffle,
+                                                      const char* kernelName,
+                                                      CFG* config_map)
+    {
         if (kernelName && kernelName[0] != 0) {
             return std::make_tuple(arch_id + kernelName, splitK.value_or(0) ?: 1);
         }
 
         DictKey key(M, N, K, splitK, bpreshuffle);
-        auto it = heuristic_cache.find(key);
-        if (it != heuristic_cache.end()) {
-            return it->second;  // find it and return
-        }
-        auto result = get_heuristic_fp8_kernel(M, N, K, arch_id, splitK, bpreshuffle, config_map);
-        heuristic_cache[key] = result;
-        return result;
+
+        return heuristic_cache.get_or_create(key, [&]() {
+            return get_heuristic_fp8_kernel(M, N, K, arch_id, splitK, bpreshuffle, config_map);
+        });
     }
 
     static AiterAsmKernel* get_kernel(const std::string& kernel_name, const std::string& co_name) {
-        auto result = kernel_cache.emplace(kernel_name, nullptr);
-        if (result.second) {
-            result.first->second = std::make_unique<AiterAsmKernel>(kernel_name.c_str(), co_name.c_str());
-        }
-        return result.first->second.get();
+        return &kernel_cache.get_or_create(
+            kernel_name, [&]() { return AiterAsmKernel(kernel_name.c_str(), co_name.c_str()); });
     }
 };
 
 
-std::unordered_map<KernelSelector::DictKey, std::tuple<std::string, int>, KernelSelector::SimpleHash>
+SynchronizedCache<KernelSelector::DictKey, std::tuple<std::string, int>, KernelSelector::SimpleHash>
     KernelSelector::heuristic_cache;
-std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> KernelSelector::kernel_cache;
+SynchronizedCache<std::string_view, AiterAsmKernel> KernelSelector::kernel_cache;
 
 static KernelArgs setup_kernel_args(
     aiter_tensor_t* A,
@@ -252,7 +247,11 @@ static void print_debug_info(const KernelArgs& args, const std::string& selected
     printf("==========================================\n");
 }
 
-AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    gemm_a8w8_blockscale_bpreshuffle_asm,
+    (
     aiter_tensor_t* A,
     aiter_tensor_t* B,
     aiter_tensor_t* out,
@@ -263,7 +262,8 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
     const char*  kernelName,
     int          bpreshuffle,
     aiter_tensor_t* zero_bias_buf,
-    hipStream_t  stream)
+    hipStream_t  stream),
+    (A, B, out, A_scale, B_scale, bias, splitK, kernelName, bpreshuffle, zero_bias_buf, stream))
 {
     validate_inputs(A, B, out, A_scale, B_scale);
     int Mdim = A->size(0);
@@ -294,21 +294,36 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
     constexpr int TileK = 128;
 
     if (cfg.splitK == 1 && selectedsplitK > 0) {
+        // Step 1: Validate or auto-correct splitK for TileK alignment.
+        //   - Heuristic path: auto-correct to the nearest valid splitK.
+        //   - Explicit path (tuned config): reject misaligned splitK.
         int k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
         int k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
         int actual_ksplit = (Kdim + k_per_split_aligned - 1) / k_per_split_aligned;
-        if (actual_ksplit != selectedsplitK) {
-            printf("warning: change splitK form %d to %d to make sure every block deals with "
-                   "128x k\n",
-                   selectedsplitK,
-                   actual_ksplit);
-            selectedsplitK = actual_ksplit;
+        if (!opt_splitK.has_value()) {
+            if (actual_ksplit != selectedsplitK) {
+                AITER_LOG_WARNING("change splitK from " << selectedsplitK << " to "
+                       << actual_ksplit << " to make sure every block deals with 128x k");
+                selectedsplitK = actual_ksplit;
+            }
+        } else {
+            AITER_CHECK(
+                selectedsplitK == actual_ksplit,
+                __func__,
+                " Kdim alignment check failed for splitK! Kdim=", Kdim,
+                ", selectedsplitK=", selectedsplitK,
+                ", k_per_split_aligned=", k_per_split_aligned,
+                ", actual_ksplit=", actual_ksplit);
         }
+
+        // Step 2: Sanity check — verify the final partition is valid.
         k_per_split = (Kdim + selectedsplitK - 1) / selectedsplitK;
         k_per_split_aligned = ((k_per_split + TileK - 1) / TileK) * TileK;
         AITER_CHECK(Kdim % k_per_split_aligned == 0 ||
                    (Kdim / k_per_split_aligned) == (selectedsplitK - 1),
                    __func__, " Kdim alignment check failed for splitK!");
+
+        // Step 3: Zero output buffer for atomic accumulation across splits.
         if (selectedsplitK > 1) {
             HIP_CALL(hipMemsetAsync(out->ptr, 0, out->numel() * out->element_size(), stream));
         }
@@ -340,4 +355,5 @@ AITER_C_ITFS void gemm_a8w8_blockscale_bpreshuffle_asm(
         print_debug_info(args, selectedKernelName, selectedsplitK, gdx, gdy, gdz, stream, bias);
     }
     impl_ptr->launch_kernel({&args, &arg_size, gdx / blockSizeX, gdy, gdz, blockSizeX, 1, 1, stream});
+
 }

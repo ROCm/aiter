@@ -19,16 +19,16 @@ import functools
 import os
 from typing import Optional
 
-import pandas as pd
 import aiter
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.gemm_op_common import get_padded_m
 from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -126,11 +126,8 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} , not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config!"
-        )
         if bpreshuffle:
-            default_config["bpreshuflle"] = True
+            default_config["bpreshuffle"] = True
             if get_gfx() == "gfx942":
                 default_config["libtype"] = "hipblaslt"
                 default_config["solidx"] = -1
@@ -166,7 +163,7 @@ def get_GEMM_A16W16_config(
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
         logger.info(
-            f"using {default_config['libtype']} solution:{default_config['solidx']} for {M=} {N=} {K=} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
+            f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=}, not found tuned config in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, will use default config! using {default_config['libtype']} solution:{default_config['solidx']}"
         )
         return default_config
 
@@ -443,11 +440,8 @@ def flydsl_gemm(
         split_k=config["split_k"],
         block_m_warps=config["block_m_warps"],
         block_n_warps=config["block_n_warps"],
-        stages=config["stage"],
-        async_copy=config["async_copy"],
         b_to_lds=config["b_to_lds"],
         b_preshuffle=config["b_preshuffle"],
-        c_to_lds=config["c_to_lds"],
     )
     if otype is not None and out.dtype != otype:
         out = out.to(otype)

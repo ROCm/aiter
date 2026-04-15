@@ -840,6 +840,7 @@ freq_dtype: {freqs.dtype}, \
 dim_input: {str(input.shape):<20}, \
 dim_freqs: {str(freqs.shape):<20}, \
 dim_positions: {str(positions.shape):<20}, \
+positions_dtype: {positions.dtype}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
 rotate_style: {rotate_style.value}, \
 reuse_freqs_front_part: {reuse_freqs_front_part}, \
@@ -914,6 +915,7 @@ freq_dtype: {freqs.dtype}, \
 dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
 dim_freqs: {str(freqs.shape):<20}, \
 dim_positions: {str(positions.shape):<20}, \
+positions_dtype: {positions.dtype}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
 rotate_style: {rotate_style.value}, \
 reuse_freqs_front_part: {reuse_freqs_front_part}, \
@@ -1008,6 +1010,7 @@ freq_dtype: {freqs.dtype}, \
 dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
 dim_freqs: {str(freqs.shape):<20}, \
 dim_positions: {str(positions.shape):<20}, \
+positions_dtype: {positions.dtype}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
 rotate_style: {rotate_style.value}, \
 nope_first: {nope_first}
@@ -1408,6 +1411,16 @@ if __name__ == "__main__":
           or -rr 4  # for (0.5, True, True)
           or -rr 5  # for (0.5, False, True)""",
     )
+    parser.add_argument(
+        "-pd",
+        "--positions-dtype",
+        type=str,
+        choices=("int32", "int64"),
+        default="int64",
+        help="""dtype for `positions` in cached-positions RoPE tests. int32 requires
+    ENABLE_ROPE_POSITIONS_INT32=1; int64 requires ENABLE_ROPE_POSITIONS_INT32=0 (default build).
+    e.g.: --positions-dtype int32""",
+    )
 
     args = parser.parse_args()
     if args.dtype is None:
@@ -1417,6 +1430,10 @@ if __name__ == "__main__":
 
     args.rotate_style = [d_rs[rs] for rs in args.rotate_style]
     args.rotary_percent_and_reuse = [d_rr[rr] for rr in args.rotary_percent_and_reuse]
+
+    positions_torch_dtype = (
+        torch.int64 if args.positions_dtype == "int64" else torch.int32
+    )
 
     # Test sbhd format for both cached and uncached
     if not args.no_check:
@@ -1526,6 +1543,7 @@ if __name__ == "__main__":
                     b,
                 ),
                 device="cuda",
+                dtype=positions_torch_dtype,
             )
             offsets = (
                 torch.randint(
@@ -1620,6 +1638,7 @@ if __name__ == "__main__":
                     b,
                 ),
                 device="cuda",
+                dtype=positions_torch_dtype,
             )
             offsets = (
                 torch.randint(
