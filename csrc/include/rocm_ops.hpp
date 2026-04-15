@@ -1881,8 +1881,8 @@ namespace py = pybind11;
           py::arg("bias"),                                                     \
           py::arg("out"),                                                      \
           py::arg("use_silu"),                                                 \
-          py::arg("cache_seqlens")      = torch::Tensor(),                     \
-          py::arg("conv_state_indices") = torch::Tensor(),                     \
+          py::arg("cache_seqlens")      = nullptr,                             \
+          py::arg("conv_state_indices") = nullptr,                             \
           py::arg("pad_slot_id")        = -1);
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
