@@ -5,6 +5,7 @@ import torch
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffle,
+    gemm_afp4wfp4_nopad,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
 
@@ -183,6 +184,7 @@ def get_x_vals():
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
+    x_vals += [(2048, 8192, 4096)]
     return x_vals
 
 
@@ -247,11 +249,11 @@ def test_gemm_afp4_wfp4(
     skip_reduce,
     impl,
 ):
+    dtype = torch.bfloat16
     if impl == "gluon" and not arch_info.is_gluon_avail():
         pytest.skip(
             "Gluon implementation is not supported on this GPU."
         )
-    dtype = torch.bfloat16
     # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950
     elif impl == "gluon":
         pytest.skip("Gluon tests temporarily disabled.")
@@ -363,6 +365,59 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
 
     triton_out = gemm_afp4wfp4_preshuffle(
         x, w_preshuf, x_scales_shuffled, w_scales_shuffled, dtype,
+        y if y is not None else torch.empty_like(torch_out),
+    )
+
+    torch.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN", "TT"])
+@pytest.mark.parametrize("output", [True, False])
+def test_gemm_mxfp4_nopad_gfx1250(
+    M: int,
+    N: int,
+    K: int,
+    dtype,
+    layout,
+    output,
+):
+    """Test the no-preshuffle variant with PaddedSharedLayout for B."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("nopad gfx1250 kernel only supported on gfx1250")
+
+    if N % 32 > 0:
+        pytest.skip(f"N = {N} is not divisible by 32")
+    if K % 256 > 0:
+        pytest.skip(f"K = {K} is not divisible by 256")
+
+    (
+        x,
+        w,
+        w_preshuf,
+        x_scales,
+        w_scales,
+        x_scales_shuffled,
+        w_scales_shuffled,
+        out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        layout=layout,
+        output=output,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+
+    # Pass raw w and raw scales — no preshuffle needed
+    triton_out = gemm_afp4wfp4_nopad(
+        x, w, x_scales, w_scales, dtype,
         y if y is not None else torch.empty_like(torch_out),
     )
 

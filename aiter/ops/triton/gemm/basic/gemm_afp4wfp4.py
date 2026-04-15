@@ -18,6 +18,10 @@ from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4 import (
     gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
     get_gemm_afp4wfp4_preshuffle_layouts,
 )
+from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_mxfp4_nopad import (
+    gemm_mxfp4_nopad_gfx1250 as _gluon_gemm_mxfp4_nopad_gfx1250,
+    get_gemm_mxfp4_nopad_layouts,
+)
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
@@ -615,6 +619,91 @@ def gemm_afp4wfp4_preshuffle(
             triton.next_power_of_2(config["NUM_KSPLIT"]),
         )
 
+    return y
+
+
+def gemm_afp4wfp4_nopad(
+    x_fp4: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+) -> torch.Tensor:
+    """
+    MXFP4 GEMM without preshuffling — uses PaddedSharedLayout for bank
+    conflict avoidance instead of preshuffle.
+
+    Args:
+        x_fp4: FP4 E2M1 activations, shape (M, K//2).
+        w: FP4 E2M1 weights, shape (N, K//2) — raw, not preshuffled.
+        x_scales: E8M0 scales, shape (M, K//32) — raw, contiguous.
+        w_scales: E8M0 scales, shape (N, K//32) — raw, contiguous.
+        dtype: Output dtype (BF16 or FP16).
+        y: Optional pre-allocated output (M, N).
+        config: Kernel tuning parameters.
+
+    Returns:
+        y: Output tensor (M, N).
+    """
+    assert arch_info.get_arch() == "gfx1250", "nopad kernel only supported on gfx1250"
+
+    M, K_bytes = x_fp4.shape
+    N = w.shape[0]
+    K_elems = 2 * K_bytes
+    K_cfg = K_bytes
+
+    if config is None:
+        config, _ = _get_config(M, N, K_cfg, True)
+
+    config["SPLITK_BLOCK_SIZE"] = K_elems
+    config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
+
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)
+
+    if config["BLOCK_SIZE_K"] >= K_elems:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(K_elems)
+        config["SPLITK_BLOCK_SIZE"] = K_elems
+
+    grid = lambda META: (
+        META["NUM_KSPLIT"]
+        * triton.cdiv(M, META["BLOCK_SIZE_M"])
+        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    layouts = get_gemm_mxfp4_nopad_layouts(
+        config["num_warps"], config["BLOCK_SIZE_M"],
+        config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
+
+    # B in (K_bytes, N) for TDM; scales must be contiguous
+    b_kn = w.T.contiguous()
+    x_scales_c = x_scales.contiguous()
+    w_scales_c = w_scales.contiguous()
+
+    config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
+    _gluon_gemm_mxfp4_nopad_gfx1250[grid](
+        x_fp4,
+        b_kn,
+        y,
+        x_scales_c,
+        w_scales_c,
+        M, N, K_elems,
+        x_fp4.stride(0),
+        x_fp4.stride(1),
+        b_kn.stride(0),
+        b_kn.stride(1),
+        0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
+        y.stride(-2),
+        y.stride(-1),
+        x_scales_c.stride(0),
+        x_scales_c.stride(1),
+        w_scales_c.stride(0),
+        w_scales_c.stride(1),
+        **config,
+        **layouts,
+    )
     return y
 
 
