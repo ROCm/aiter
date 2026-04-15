@@ -11,6 +11,7 @@ from torch_guard import torch_compile_guard
 
 from build_targets import (  # noqa: F401 — re-exported for callers
     GFX_MAP,
+    _parse_gpu_archs_env,
     filter_tune_df,
     get_build_targets_env,
 )
@@ -98,7 +99,7 @@ def get_gfx_list() -> list[str]:
         except RuntimeError:
             gfxs = ["cpu"]
     else:
-        gfxs = [g.strip() for g in gfx_env.split(";") if g.strip()]
+        gfxs = _parse_gpu_archs_env(gfx_env)
     os.environ["AITER_GPU_ARCHS"] = ";".join(gfxs)
 
     return gfxs

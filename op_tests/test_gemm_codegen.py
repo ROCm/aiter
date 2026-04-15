@@ -137,13 +137,22 @@ def test_get_build_targets():
             raised = True
         _check("GPU_ARCHS=gfx999 → RuntimeError", raised)
 
-        # 1.6 GFX_CU_NUM_MAP covers at least the two known production targets
+        # 1.6 Separator-only GPU_ARCHS raises RuntimeError
+        os.environ["GPU_ARCHS"] = " ; "
+        raised = False
+        try:
+            get_build_targets_env()
+        except RuntimeError:
+            raised = True
+        _check("GPU_ARCHS=' ; ' → RuntimeError", raised)
+
+        # 1.7 GFX_CU_NUM_MAP covers at least the two known production targets
         _check(
             "GFX_CU_NUM_MAP contains gfx942 and gfx950",
             "gfx942" in GFX_CU_NUM_MAP and "gfx950" in GFX_CU_NUM_MAP,
         )
 
-        # 1.7 Live GPU fallback — requires torch and a GPU; skipped otherwise
+        # 1.8 Live GPU fallback — requires torch and a GPU; skipped otherwise
         del os.environ["GPU_ARCHS"]
         try:
             from aiter.jit.utils.chip_info import get_build_targets

@@ -42,6 +42,22 @@ GFX_CU_NUM_MAP = {
 }
 
 
+def _parse_gpu_archs_env(gfx_env: str) -> list[str]:
+    """Split a GPU_ARCHS string into a list of non-empty architecture names.
+
+    Raises RuntimeError if no valid architecture names remain after splitting
+    on ';' and stripping whitespace — e.g. GPU_ARCHS=" ; " would otherwise
+    silently produce an empty target list and fall back to heuristic kernels.
+    """
+    archs = [g.strip() for g in gfx_env.split(";") if g.strip()]
+    if not archs:
+        raise RuntimeError(
+            f"GPU_ARCHS={gfx_env!r} contains no valid architecture names after splitting on ';'. "
+            f"Known targets: {list(GFX_CU_NUM_MAP.keys())}"
+        )
+    return archs
+
+
 def get_build_targets_env() -> list[tuple[str, int]]:
     """Resolve build targets from GPU_ARCHS env var only.  No live GPU detection.
 
@@ -56,7 +72,7 @@ def get_build_targets_env() -> list[tuple[str, int]]:
             "Set GPU_ARCHS=gfx942 (or similar) to resolve build targets without a GPU."
         )
     targets = []
-    for gfx in [g.strip() for g in gfx_env.split(";") if g.strip()]:
+    for gfx in _parse_gpu_archs_env(gfx_env):
         if gfx not in GFX_CU_NUM_MAP:
             raise RuntimeError(
                 f"Unknown gfx '{gfx}' in GPU_ARCHS — add it to "
