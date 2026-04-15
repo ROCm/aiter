@@ -3,6 +3,8 @@
 
 from typing import List
 
+import torch
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_custom_all_reduce"
@@ -23,8 +25,8 @@ def init_custom_ar(
 @compile_ops("module_custom_all_reduce", develop=True)
 def all_reduce(
     _fa: int,
-    inp,
-    out,
+    inp: torch.Tensor,
+    out: torch.Tensor,
     use_new: bool,
     open_fp8_quant: bool,
     reg_inp_ptr: int,
@@ -35,8 +37,8 @@ def all_reduce(
 @compile_ops("module_custom_all_reduce", develop=True)
 def reduce_scatter(
     _fa: int,
-    inp,
-    out,
+    inp: torch.Tensor,
+    out: torch.Tensor,
     reg_ptr: int,
     reg_bytes: int,
 ) -> None: ...
@@ -45,8 +47,8 @@ def reduce_scatter(
 @compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_reg(
     _fa: int,
-    inp,
-    out,
+    inp: torch.Tensor,
+    out: torch.Tensor,
     dim: int,
 ) -> None: ...
 
@@ -54,9 +56,9 @@ def all_gather_reg(
 @compile_ops("module_custom_all_reduce", develop=True)
 def all_gather_unreg(
     _fa: int,
-    inp,
+    inp: torch.Tensor,
     reg_buffer: int,
-    out,
+    out: torch.Tensor,
     reg_bytes: int,
     dim: int,
 ) -> None: ...
@@ -65,11 +67,11 @@ def all_gather_unreg(
 @compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm(
     _fa: int,
-    inp,
-    res_inp,
-    res_out,
-    out,
-    w,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
     eps: float,
     reg_ptr: int,
     reg_bytes: int,
@@ -80,12 +82,12 @@ def fused_allreduce_rmsnorm(
 @compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm_quant(
     _fa: int,
-    inp,
-    res_inp,
-    res_out,
-    out,
-    scale_out,
-    w,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    scale_out: torch.Tensor,
+    w: torch.Tensor,
     eps: float,
     reg_ptr: int,
     reg_bytes: int,

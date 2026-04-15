@@ -1,0 +1,112 @@
+name: OPUS Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+
+  workflow_dispatch:
+  schedule:
+    - cron: '0 22 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DOCKER_IMAGE: "rocm/pytorch:latest"
+
+jobs:
+  check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download and check signal artifact
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  opus:
+    if: >-
+      (!github.event.pull_request || github.event.pull_request.draft == false) &&
+      github.event.action != 'labeled'
+    name: OPUS Tests (${{ matrix.label }})
+    needs: check-signal
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-aiter-mi35x-1
+            label: MI35X
+          - runner: aiter-1gpu-runner
+            label: MI325
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: aiter_opus_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          --network=host \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_opus_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Show OPUS test environment
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_opus_test \
+          bash -lc "python3 -c \"import torch; print(torch.__version__)\" && hipcc --version"
+
+      - name: OPUS tests
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_opus_test \
+          bash -lc "set -o pipefail && ./op_tests/opus/run_tests.sh 2>&1 | tee latest_test.log"
+
+      - name: Upload OPUS test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: opus-test-log-${{ matrix.runner }}
+          path: latest_test.log
+          if-no-files-found: warn
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_opus_test || true

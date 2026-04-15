@@ -4,6 +4,11 @@ from dataclasses import dataclass
 import math
 import os
 
+from aiter.ops.flydsl.utils import (
+    addressable_lds_bytes_for_gfx as _addressable_lds_bytes_for_gfx,
+    get_shared_memory_per_block,
+)
+
 
 def get_gfx():
     """Detect GPU arch: honour GPU_ARCHS env, fall back to chip_info, default gfx942."""
@@ -165,26 +170,13 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
     )
 
 
-# Per-kernel LDS cap for tune filtering (must match LLVM AMDGPU
-# getAddressableLocalMemorySize for the compile target).
-# When arch cannot be parsed (no GPU, bad string), stay conservative for CDNA.
-_FALLBACK_MAX_LDS_BYTES = 65536
-
-
 def addressable_lds_bytes_for_gfx(gfx: str) -> int:
-    g = (gfx or "").strip().lower().split(":")[0]
-    if not g.startswith("gfx"):
-        return _FALLBACK_MAX_LDS_BYTES
-    if g.startswith("gfx950"):
-        return 163840
-    if g.startswith("gfx7") or g.startswith("gfx8"):
-        return 32768
-    return 65536
+    return _addressable_lds_bytes_for_gfx(gfx)
 
 
 def max_lds_bytes_for_tune() -> int:
-    """Addressable LDS limit for current target (from ``get_gfx()``)."""
-    return addressable_lds_bytes_for_gfx(get_gfx())
+    """Addressable LDS limit for current target."""
+    return get_shared_memory_per_block(fallback_gfx=get_gfx())
 
 
 # fmt: off
@@ -267,21 +259,23 @@ def _vgpr_per_simd(gfx: str) -> int:
     return 512
 
 
+_MFMA_M = 16
+_MFMA_N = 16
+_THREADS_PER_TG = _WAVES_PER_WG * 64
+
+
 def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
     """Estimate max achievable waves_per_eu from C-accumulator VGPR pressure.
 
-    Each workgroup has _WAVES_PER_WG waves sharing the output tile.
-    Per-wave VGPR ≈ (accum share) * 1.5 (pipeline overhead for A/B buffers).
+    Preshuffle GEMM always uses 16x16 MFMA (4 VGPRs per thread per block).
+    Per-thread accum VGPRs = round_up(tile_m, 16) * round_up(tile_n, 16) / 256.
+    Estimated total ~= accum * 1.5 (pipeline overhead for A/B buffers).
     Returns the max waves_per_eu that the register file can support.
     """
-    mfma_m = 16 if tile_m < 32 else 32
-    mfma_n = 16 if tile_n < 32 else 32
-    vgpr_per_mfma = 16 if (mfma_m >= 32 and mfma_n >= 32) else 4
-    blocks_m = math.ceil(tile_m / mfma_m)
-    blocks_n = math.ceil(tile_n / mfma_n)
-    c_vgprs_total = blocks_m * blocks_n * vgpr_per_mfma
-    c_per_wave = c_vgprs_total / _WAVES_PER_WG
-    est_per_wave = c_per_wave * 1.5
+    padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
+    padded_n = math.ceil(tile_n / _MFMA_N) * _MFMA_N
+    c_per_thread = padded_m * padded_n // _THREADS_PER_TG
+    est_per_wave = c_per_thread * 1.5
     return int(total_vgpr / max(est_per_wave, 1))
 
 
