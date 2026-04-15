@@ -62,7 +62,6 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch_k_pe = k_pe
 
     torch_kv_cache = kv_cache.clone()
-    torch_k_pe_og_dtype = torch_k_pe.clone()
     if cache_dtype == torch.uint8:
         torch_kv_cache = torch_kv_cache.view(cache_dtype_actual)
         torch_k_lora = (torch_k_lora.to(torch.float32) / k_scale).to(cache_dtype_actual)

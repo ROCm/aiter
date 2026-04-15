@@ -22,7 +22,7 @@ try:
     from aiter.ops.triton.gluon.mla import (
         _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
     )
-except:
+except:  # noqa: E722
     gluon_mla_prefill_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None

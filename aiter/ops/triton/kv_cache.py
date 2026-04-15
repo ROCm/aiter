@@ -1,9 +1,5 @@
 import torch
-import triton
-from typing import Tuple
-from aiter.ops.triton._triton_kernels.kv_cache import (
-    _cat_and_cache_mla_kernel,
-)
+from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
