@@ -190,7 +190,7 @@ class AITER_CONFIG(object):
 
         for i, path in enumerate(path_list):
             if not os.path.exists(path):
-                logger.info(f"path {i+1}: {path} (not exist)")
+                logger.info(f"path {i + 1}: {path} (not exist)")
                 continue
 
             df = pd.read_csv(path)
@@ -429,9 +429,9 @@ def validate_and_update_archs():
     ]
 
     # Validate if each element in archs is in allowed_archs
-    assert all(
-        arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported"
+    assert all(arch in allowed_archs for arch in archs), (
+        f"One of GPU archs of {archs} is invalid or not supported"
+    )
     return archs
 
 
@@ -916,7 +916,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
-            f"\033[32mfinish build [{md_name}], cost {time.perf_counter()-startTS:.1f}s \033[0m"
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -1253,20 +1253,17 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is str:
                 if not isinstance(value, str):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects str, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects str, got {type(value).__name__}"
                     )
             elif hint is bool:
                 if not isinstance(value, (bool, int)):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects bool, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects bool, got {type(value).__name__}"
                     )
             elif hint is int:
                 if not isinstance(value, int):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects int, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects int, got {type(value).__name__}"
                     )
             elif hint is float:
                 if not isinstance(value, (float, int)):
