@@ -1,0 +1,19 @@
+# Tuned FMHA kernel lookup table
+# For each (gfx, dtype, batch, hq, hk, sq, sk, hdim_q, hdim_v) combination,
+# specifies the CK tile_pattern to use instead of the default heuristic.
+# Lines starting with '#' are comments. Blank lines are ignored.
+#
+# gfx       - GPU architecture, e.g. gfx942, gfx950
+# dtype     - Data type: bf16, fp16, fp8bf16
+# batch     - Batch size
+# hq        - Number of Q (query) heads
+# hk        - Number of K (key) heads
+# sq        - Sequence length Q
+# sk        - Sequence length K
+# hdim_q    - Head dimension Q
+# hdim_v    - Head dimension V
+# tile_pattern - CK tile configuration string, e.g. b32x32x128x128x32x128
+#
+gfx,dtype,batch,hq,hk,sq,sk,hdim_q,hdim_v,tile_pattern
+gfx950,bf16,130,2,2,16,2048,128,128,b32x32x128x128x32x128
+gfx942,bf16,130,2,2,16,2048,128,128,b16x128x64x128x32x128
