@@ -1187,143 +1187,6 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                 ).result
         return result
 
-    # ---- Helper: output bf16 (simplified direct write, no LDS reshape) ----
-    def _write_output_bf16(oaccu, qo_start_i32, p_lds_o_base_idx):
-        """Write normalized oaccu to final_output as bf16.
-
-        Simplified version: each lane directly converts f32->bf16 and writes
-        via buffer_store. MFMA layout: lane%16 = row (Q head),
-        (lane/16)*4 + elem = col within sub-tile.
-        """
-
-        # MFMA layout: row = lane%16, col_base = (lane/16)*4
-        mfma_row = lane_idx % arith.index(16)
-        mfma_col_base = (lane_idx / arith.index(16)) * arith.index(4)
-        qo_start_idx = arith.index_cast(T.index, qo_start_i32)
-        # VRAM row = mfma_row + qo_start*128 + warp*16
-        row_vram = (
-            mfma_row
-            + qo_start_idx * arith.index(NUM_QO_HEADS)
-            + warp_idx * arith.index(16)
-        )
-
-        for tile_idx in range_constexpr(NUM_PV_ITERS * 2):
-            col_offset = tile_idx * MFMA_N  # 0, 16, 32, ... 496
-
-            # Convert v4f32 -> v4bf16
-            bf16_vals = _std_arith.TruncFOp(T.bf16x4, _raw(oaccu[tile_idx])).result
-
-            # Bitcast v4bf16 (8 bytes) -> v2i32 for buffer_store_dwordx2
-            # Actually v4bf16 -> i64 -> use i64 store directly
-            # Or: cast v4bf16 to v4i16, then to v2i32
-            # Simplest: store v4bf16 as-is using f16 buffer format
-
-            # Cast v4bf16 -> v4i16 -> v2i32 for buffer_store
-            i16_vals = _std_arith.BitcastOp(T.i16x4, bf16_vals).result
-
-            # Shuffle i16 pairs into i32: [i16_0, i16_1] -> i32_0, [i16_2, i16_3] -> i32_1
-            i16_0 = vector.extract(i16_vals, static_position=[0], dynamic_position=[])
-            i16_1 = vector.extract(i16_vals, static_position=[1], dynamic_position=[])
-            i16_2 = vector.extract(i16_vals, static_position=[2], dynamic_position=[])
-            i16_3 = vector.extract(i16_vals, static_position=[3], dynamic_position=[])
-
-            # Pack i16 pairs to i32
-            lo_0 = _std_arith.ExtUIOp(T.i32, i16_0).result
-            hi_0 = _std_arith.ExtUIOp(T.i32, i16_1).result
-            c16 = _raw(arith.constant(16, type=T.i32))
-            dw0 = _std_arith.OrIOp(lo_0, _std_arith.ShLIOp(hi_0, c16).result).result
-
-            lo_1 = _std_arith.ExtUIOp(T.i32, i16_2).result
-            hi_1 = _std_arith.ExtUIOp(T.i32, i16_3).result
-            dw1 = _std_arith.OrIOp(lo_1, _std_arith.ShLIOp(hi_1, c16).result).result
-
-            # buffer_store_dwordx2 to final_output
-            # Byte offset: (row * V_HEAD_DIM + col_offset + mfma_col_base) * sizeof(bf16)
-            offset_i32 = _index_cast_to_i32(
-                (
-                    row_vram * arith.index(V_HEAD_DIM)
-                    + mfma_col_base
-                    + arith.index(col_offset)
-                )
-                * arith.index(2)
-            )
-            v2i32_vals = vector.from_elements(T.i32x2, [dw0, dw1])
-            buffer_ops.buffer_store(
-                v2i32_vals,
-                final_output_rsrc,
-                offset_i32,
-                offset_is_bytes=True,
-            )
-
-    # ---- Helper: output f32 split (direct write, no LDS reshape) ----
-    def _write_output_split(
-        oaccu, partial_qo_loc_i32, row_max, row_sum_e, p_lds_o_base_idx
-    ):
-        """Write normalized oaccu to split_output as f32 + write LSE.
-
-        Direct write: each lane writes its 4 f32 values per sub-tile
-        using MFMA layout: row = lane%16, col_base = (lane/16)*4.
-        """
-        pqo_idx = arith.index_cast(T.index, partial_qo_loc_i32)
-        mfma_row = lane_idx % arith.index(16)
-        mfma_col_base = (lane_idx / arith.index(16)) * arith.index(4)
-        row_vram = (
-            mfma_row + pqo_idx * arith.index(NUM_QO_HEADS) + warp_idx * arith.index(16)
-        )
-
-        for tile_idx in range_constexpr(NUM_PV_ITERS * 2):
-            col_offset = tile_idx * MFMA_N  # 0, 16, 32, ..., 496
-
-            # buffer_store_dwordx4 to split_output
-            # Byte offset: (row * V_HEAD_DIM + col_offset + mfma_col_base) * sizeof(f32)
-            offset_i32 = _index_cast_to_i32(
-                (
-                    row_vram * arith.index(V_HEAD_DIM)
-                    + mfma_col_base
-                    + arith.index(col_offset)
-                )
-                * arith.index(4)  # sizeof(f32)
-            )
-            buffer_ops.buffer_store(
-                oaccu[tile_idx],
-                split_output_rsrc,
-                offset_i32,
-                offset_is_bytes=True,
-            )
-
-        # Write LSE: lse = row_max + ln(row_sum_e) / log2e
-        # Only first 16 lanes per warp write (one per MFMA result row)
-        if arith.cmpi(CmpIPredicate.ult, lane_idx_i32, arith.constant(16, type=T.i32)):
-            # ln(sum_e) = log2(sum_e) * inv_log2e
-            # math.log2 lowers to a single v_log_f32 instruction on AMD.
-            log2_sum = _math.log2(_raw(row_sum_e))
-            ln_sum = _std_arith.MulFOp(
-                log2_sum, _raw(c_inv_log2e), fastmath=fm_fast
-            ).result
-            lse = _std_arith.AddFOp(
-                _raw(row_max),
-                ln_sum,
-                fastmath=fm_fast,
-            ).result
-            row_idx_i32 = _std_arith.AddIOp(
-                _std_arith.AddIOp(
-                    _raw(lane_idx_i32),
-                    _std_arith.MulIOp(
-                        _raw(warp_idx_i32),
-                        _raw(arith.constant(16, type=T.i32)),
-                    ).result,
-                ).result,
-                _std_arith.MulIOp(
-                    _raw(partial_qo_loc_i32),
-                    _raw(arith.constant(NUM_QO_HEADS, type=T.i32)),
-                ).result,
-            ).result
-            buffer_ops.buffer_store(
-                lse,
-                split_lse_rsrc,
-                row_idx_i32,
-            )
-
     # ---- Helper: process one KV tile (GEMM1 + softmax + V + GEMM2) ----
     # Interleaves async prefetch of the NEXT tile's KV data
     # into the GEMM1 NoPE loop (1 block per iteration, 9 total).
@@ -2587,6 +2450,9 @@ def launch_mla_fwd_decode_m16x8_fp8_fp8(
     stream: fx.Stream = fx.Stream(None),
 ):
     """JIT host function: configures grid/block and launches the kernel."""
+    assert (
+        TOTAL_LDS_BYTES <= lds_size
+    ), f"Kernel requires {TOTAL_LDS_BYTES} bytes LDS but CU budget is {lds_size}"
     kn_mla_fwd_decode_m16x8_fp8_fp8(
         query,
         kv_buffer,
