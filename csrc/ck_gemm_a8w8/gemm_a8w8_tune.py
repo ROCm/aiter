@@ -109,6 +109,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8",
     }
 
     def getKernelName(self, kernelId):
@@ -116,11 +117,62 @@ class GemmA8W8Tuner(GemmCommonTuner):
             return None
         return kernels_list[kernelId].name
 
+    def _clear_op_caches(self):
+        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+
+        get_GEMM_config_with_quant_type.cache_clear()
+        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
+            get_GEMM_config_with_quant_type.file_cache.clear()
+
     def _setup_specific_arguments(self):
         pass
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            q_dtype_w = untunedf.loc[i, "q_dtype_w"]
+            shape_str = f"({M}, {N}, {K}, {q_dtype_w})"
+            try:
+                x, weight, x_scale, w_scale, out = generate_data(
+                    M, N, K, 0, dtypes.bf16, eval(q_dtype_w)
+                )
+                out, us = run_perftest(
+                    gemm_a8w8,
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = gemm_a8w8_ref(
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    dtype=dtypes.bf16,
+                    q_dtype_w=eval(q_dtype_w),
+                )
+                err_ratio = checkAllclose(
+                    out.to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
+                )
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+        return results
 
     def tune(
         self,
@@ -130,7 +182,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
     ):
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
         gfx = self.get_gfx()

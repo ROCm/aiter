@@ -19,7 +19,7 @@ from aiter.jit.utils.chip_info import get_gfx
 
 from ..shuffle import shuffle_weight
 from .kernels.splitk_hgemm import compile_hgemm_kernel
-from .utils import is_flydsl_available
+from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "flydsl_hgemm",
@@ -27,7 +27,6 @@ __all__ = [
 
 SPLIT_K_COUNTER_MAX_LEN = 128
 SPLIT_K_SIGNAL_STATE_COUNT = 3
-MAX_LDS_BYTES = 163840
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
@@ -255,7 +254,7 @@ def _validate_hgemm_tiling(
         )
     if pack_n != 1:
         raise ValueError(
-            "Current kernel only supports `pack_n=1`; " f"got pack_n={pack_n}"
+            f"Current kernel only supports `pack_n=1`; got pack_n={pack_n}"
         )
 
     warp_atom_m = 16
@@ -333,10 +332,11 @@ def _validate_hgemm_tiling(
         stages=stages,
         b_to_lds=b_to_lds,
     )
-    if lds_bytes > MAX_LDS_BYTES:
+    lds_limit = get_shared_memory_per_block(fallback_gfx=get_gfx())
+    if lds_bytes > lds_limit:
         raise ValueError(
             "Invalid tile combination: estimated LDS usage "
-            f"{lds_bytes} exceeds the hardware limit {MAX_LDS_BYTES}"
+            f"{lds_bytes} exceeds the hardware limit {lds_limit}"
         )
 
 
@@ -664,7 +664,6 @@ def flydsl_hgemm(
 
 _flydsl_compile_fn = None
 _flydsl_import_done = False
-_flydsl_kernel_cache: dict = {}
 
 
 def _get_compile_fn():
@@ -702,7 +701,7 @@ def flydsl_preshuffle_gemm_a8(
     use_async_copy: int = 0,
     waves_per_eu: int = 0,
 ) -> Tensor:
-    """Compile (cached) and run a FlyDSL preshuffle GEMM kernel."""
+    """Compile (cached via lru_cache) and run a FlyDSL preshuffle GEMM kernel."""
     compile_fn = _get_compile_fn()
     if compile_fn is None:
         raise RuntimeError("[FlyDSL] compile function not available")
@@ -739,49 +738,19 @@ def flydsl_preshuffle_gemm_a8(
             f"[FlyDSL] unsupported output dtype {Out.dtype}; expected torch.bfloat16 or torch.float16"
         )
 
-    cache_key = (
-        m,
-        n,
-        k,
-        in_dtype,
-        out_dtype,
-        tile_m,
-        tile_n,
-        tile_k,
-        lds_stage,
-        use_cshuffle_epilog,
-        use_async_copy,
-        wpe,
+    exe = compile_fn(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        lds_stage=lds_stage,
+        use_cshuffle_epilog=bool(use_cshuffle_epilog),
+        use_async_copy=bool(use_async_copy),
+        waves_per_eu=wpe,
     )
-    if cache_key not in _flydsl_kernel_cache:
-        try:
-            exe = compile_fn(
-                M=m,
-                N=n,
-                K=k,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                in_dtype=in_dtype,
-                out_dtype=out_dtype,
-                lds_stage=lds_stage,
-                use_cshuffle_epilog=bool(use_cshuffle_epilog),
-                use_async_copy=bool(use_async_copy),
-                waves_per_eu=wpe,
-            )
-            _flydsl_kernel_cache[cache_key] = exe
-            logger.info(
-                f"[FlyDSL] compiled preshuffle GEMM ({m},{n},{k} {in_dtype} "
-                f"tile={tile_m}x{tile_n}x{tile_k} lds={lds_stage} csh={use_cshuffle_epilog} "
-                f"acp={use_async_copy} wpe={waves_per_eu})"
-            )
-        except Exception as e:
-            logger.warning(f"[FlyDSL] compile failed ({m},{n},{k} {in_dtype}): {e}")
-            _flydsl_kernel_cache[cache_key] = None
-
-    exe = _flydsl_kernel_cache[cache_key]
-    if exe is None:
-        raise RuntimeError(f"[FlyDSL] kernel compile returned None for ({m},{n},{k})")
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t

@@ -374,24 +374,35 @@ class MhaKernelHandler(KernelHandler):
 
     def build_args(self) -> str:
         shape = self._shape
-        return (
-            f"-mode fwd -causal true --layout {self._mha_layout} --dtype bf16 -b {self._batch_size} "
+        # bshd (batch-seq-head-dim) - fwd
+        # thd (token-head-dim) - fwd_varlen with equal seq lens
+        fn = "fwd_varlen" if self._mha_layout == "thd" else "fwd"
+        args = (
+            f"-fn {fn} -causal true --dtype bf16 -b {self._batch_size} "
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
             f"-d {shape['dqk']} -dv {shape['dv']} -metric {self._metric}"
         )
+        if fn == "fwd_varlen":
+            args += " -equal_seqlens"
+        return args
 
     def parse_stdout(self, stdout: str) -> float:
+        # Expected output (4 lines):
+        #   [0] "[1/1] <model> B=... HQ=... ..."   (progress)
+        #   [1] "bench_mha:"
+        #   [2] "model  BATCH  HQ  HK  N_CTX_Q  N_CTX_K  D_HEAD  D_HEAD_V  ..."   (header)
+        #   [3] "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  ...  <value>"   (data)
         lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
-        if len(lines) < 3:
+        if len(lines) < 4:
             raise ValueError(
-                f"Unexpected MHA bench output: expected at least 3 lines, got {len(lines)}"
+                f"Unexpected MHA bench output: expected at least 4 lines, got {len(lines)}"
             )
-        if lines[0] != ["bench_mha:"]:
-            raise ValueError(f"Unexpected MHA bench output: first line {lines[0]!r}")
-        data = lines[2]
-        if len(data) < 7:
+        if lines[1] != ["bench_mha:"]:
+            raise ValueError(f"Unexpected MHA bench output: second line {lines[1]!r}")
+        data = lines[3]
+        if len(data) < 15:
             raise ValueError(f"Unexpected MHA bench data line: {data!r}")
-        return float(data[6])
+        return float(data[-1])
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -519,7 +530,7 @@ def call_function(
         else:
             print("Out of resources while benchmarking %s. %s" % (handler.to_str(), e))
 
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         print(
             "Unexpected error while benchmarking %s. %s: %s"
             % (

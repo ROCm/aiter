@@ -12,6 +12,7 @@ on:
       - ".github/workflows/amd-ci-job-monitor.yml"
       - ".github/scripts/list_jobs.py"
       - ".github/scripts/query_job_status.py"
+      - ".github/runner-config.yml"
   workflow_dispatch:
     inputs:
       hours:
@@ -201,7 +202,7 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: pip install requests tabulate
+        run: pip install requests tabulate pyyaml
 
       - name: Download actions snapshot
         uses: actions/download-artifact@v4

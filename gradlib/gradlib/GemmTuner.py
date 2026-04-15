@@ -28,10 +28,25 @@ import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
+
+FLYDSL_TUNE_ERROR = None
+try:
+    if is_flydsl_available():
+        from aiter.ops.flydsl.gemm_kernels import (
+            flydsl_hgemm,
+            get_flydsl_splitk_hgemm_kernels,
+        )
+    else:
+        raise ImportError("flydsl package is not installed")
+except ImportError as exc:
+    flydsl_hgemm = None
+    get_flydsl_splitk_hgemm_kernels = None
+    FLYDSL_TUNE_ERROR = str(exc)
 
 
 @lru_cache(maxsize=1)
@@ -75,6 +90,48 @@ def run_gemm_bf16_asm(
 
 def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
+
+
+def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
+    if flydsl_hgemm is None:
+        raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
+    if config is None:
+        raise ValueError("flydsl tuning requires a kernel config")
+    out = flydsl_hgemm(
+        input,
+        weight,
+        tile_m=config["tile_m"],
+        tile_n=config["tile_n"],
+        tile_k=config["tile_k"],
+        split_k=config["split_k"],
+        block_m_warps=config["block_m_warps"],
+        block_n_warps=config["block_n_warps"],
+        stages=config["stage"],
+        async_copy=config["async_copy"],
+        b_to_lds=config["b_to_lds"],
+        b_preshuffle=config["b_preshuffle"],
+        auto_shuffle_b=False,
+        c_to_lds=config["c_to_lds"],
+    )
+    if otype is not None and out.dtype != otype:
+        out = out.to(otype)
+    if bias is not None:
+        if bias.dtype != out.dtype:
+            bias = bias.to(out.dtype)
+        out = out + bias
+    return out
+
+
+@lru_cache(maxsize=1)
+def get_flydsl_bf16_catalog():
+    if get_flydsl_splitk_hgemm_kernels is None:
+        return []
+    kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16")
+    catalog = [
+        (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
+    ]
+    logger.info(f"FlyDSL bf16 catalog size: {len(catalog)} kernels")
+    return catalog
 
 
 @functools.lru_cache(maxsize=1024)
@@ -432,6 +489,8 @@ class Gemm:
 
     def run_asm_triton_sols(self):
         tasks = []
+        if "all" in self.libtype or "flydsl" in self.libtype:
+            tasks.extend(self.flydsl_gemm_all_sols())
         if "all" in self.libtype or "triton" in self.libtype:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
@@ -447,6 +506,90 @@ class Gemm:
             tasks, in_data, self.mp, False, timeout=self.timeout, verbose=self.verbose
         )
         return ret
+
+    def flydsl_gemm_all_sols(self):
+        if flydsl_hgemm is None or get_flydsl_splitk_hgemm_kernels is None:
+            logger.warning(
+                f"FlyDSL is not available for tuning, skip flydsl tuning. reason: {FLYDSL_TUNE_ERROR}"
+            )
+            return []
+        if self.scaleAB or self.indtype != dtypes.bf16:
+            logger.warning(
+                f"FlyDSL hgemm only supports indtype=bf16 and no scaleAB, but actual indtype is {self.indtype}, scaleAB is {self.scaleAB}"
+            )
+            return []
+
+        task = []
+        flydsl_catalog = get_flydsl_bf16_catalog()
+        weight_idx = 6 if self.is_shuffle else 1
+        for solidx, kernel_name, config in flydsl_catalog:
+            if config["b_preshuffle"] != self.is_shuffle:
+                continue
+            if self.n < config["tile_n"] or self.n % config["tile_n"] != 0:
+                continue
+            if self.k % config["split_k"] != 0:
+                continue
+            ks = self.k // config["split_k"]
+            if ks < config["tile_k"] or ks % config["tile_k"] != 0:
+                continue
+            if config["split_k"] > 1:
+                counters = ((self.m + config["tile_m"] - 1) // config["tile_m"]) * (
+                    self.n // config["tile_n"]
+                )
+                if counters > 128:
+                    continue
+
+            info = (
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    self.has_bias,
+                    str(self.indtype),
+                    str(self.outdtype),
+                    self.scaleAB,
+                    self.is_shuffle,
+                ),
+                solidx,
+                config["split_k"],
+                "flydsl",
+                kernel_name,
+            )
+            task.append(
+                (
+                    info,
+                    generate_data,
+                    (
+                        self.m,
+                        self.n,
+                        self.k,
+                        self.indtype,
+                        self.outdtype,
+                        self.scaleAB,
+                        self.is_shuffle,
+                        0,
+                        self.has_bias,
+                    ),
+                    run_flydsl_gemm_bf16,
+                    ([0, weight_idx, 3], self.outdtype, config),
+                    {
+                        "num_warmup": self.num_warmup,
+                        "num_iters": 101,
+                    },
+                    get_gemm_ref,
+                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                    {},
+                    None,
+                    self.rtol,
+                    self.atol,
+                )
+            )
+        logger.info(
+            "FlyDSL candidate count for "
+            f"M={self.m}, N={self.n}, K={self.k}, outdtype={self.outdtype}, "
+            f"bpreshuffle={self.is_shuffle}: {len(task)}/{len(flydsl_catalog)}"
+        )
+        return task
 
     def triton_gemm_all_sols(self):
         if (
@@ -662,7 +805,7 @@ class Gemm:
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "hipblaslt", "triton"]:
+        if value not in ["all", "asm", "hipblaslt", "triton", "flydsl"]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 
@@ -673,6 +816,7 @@ class GemmTuner(GemmCommonTuner):
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
         "batch": 1,
+        "config_env_name": "AITER_CONFIG_GEMM_BF16",
     }
 
     def _setup_specific_arguments(self):
@@ -720,7 +864,7 @@ class GemmTuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton']",
+            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl']",
         )
 
     def __init__(
@@ -761,6 +905,78 @@ class GemmTuner(GemmCommonTuner):
         self.gfx = self.get_gfx()
         self.gemmobj = None
         self.num_warmup = 10
+
+    def _clear_op_caches(self):
+        from aiter.tuned_gemm import get_GEMM_A16W16_config_, get_GEMM_A16W16_config
+
+        get_GEMM_A16W16_config_.cache_clear()
+        get_GEMM_A16W16_config.cache_clear()
+
+    def run_config(self, args):
+        from aiter.tuned_gemm import gemm_a16w16
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            bias = untunedf.loc[i, "bias"]
+            indtype = str(untunedf.loc[i, "dtype"])
+            outdtype = str(untunedf.loc[i, "outdtype"])
+            scaleAB = untunedf.loc[i, "scaleAB"]
+            bpreshuffle = untunedf.loc[i, "bpreshuffle"]
+            shape_str = f"({M}, {N}, {K}, {indtype}, bias={bias})"
+            try:
+                inp, weights, _, bias_tensor, x_scale, _, shuffleweights, w_scale = (
+                    generate_data(
+                        M,
+                        N,
+                        K,
+                        eval(indtype),
+                        eval(outdtype),
+                        scaleAB,
+                        bpreshuffle,
+                        0,
+                        bias,
+                    )
+                )
+                w = shuffleweights if bpreshuffle else weights
+                scale_a = x_scale if scaleAB else None
+                scale_b = w_scale if scaleAB else None
+                out, us = run_perftest(
+                    gemm_a16w16,
+                    inp,
+                    w,
+                    bias=bias_tensor,
+                    otype=eval(outdtype),
+                    scale_a=scale_a,
+                    scale_b=scale_b,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = get_gemm_ref(
+                    inp,
+                    weights,
+                    bias_tensor,
+                    x_scale,
+                    w_scale,
+                    eval(indtype),
+                    eval(outdtype),
+                )
+                _atol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                _rtol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                err_ratio = checkAllclose(
+                    out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
+                )
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+        return results
 
     def calculate_perf(
         self,
@@ -989,16 +1205,29 @@ class GemmTuner(GemmCommonTuner):
             best_gtimedf = gtimedf_dic[key].sort_values(by="us")
 
             if len(gtimedf_dic[key]) == 0:
-                print(">>> No  hipblas or asm solutions found!", flush=True)
+                candidate_libtypes = sorted(
+                    df["libtype"].dropna().astype(str).unique().tolist()
+                )
+                if candidate_libtypes:
+                    print(
+                        f">>> No valid solutions found for libtypes: {', '.join(candidate_libtypes)}!",
+                        flush=True,
+                    )
+                else:
+                    print(">>> No valid solutions found!", flush=True)
                 failedf = df.iloc[0:1]
                 self.failed = pd.concat([self.failed, failedf], ignore_index=True)
                 continue
-            asm_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "asm"]
-            hibs_gtimedf = gtimedf_dic[key][gtimedf_dic[key]["libtype"] == "hipblaslt"]
-            if len(hibs_gtimedf) == 0:
-                print(">>>Only asm solutions found!", flush=True)
-            elif len(asm_gtimedf) == 0:
-                print(">>>Only hipblas solutions found!", flush=True)
+            valid_libtypes = sorted(
+                gtimedf_dic[key]["libtype"].dropna().astype(str).unique().tolist()
+            )
+            if len(valid_libtypes) == 1:
+                print(f">>> Only {valid_libtypes[0]} solutions found!", flush=True)
+            elif len(valid_libtypes) > 1:
+                print(
+                    f">>> Valid solutions found from libtypes: {', '.join(valid_libtypes)}",
+                    flush=True,
+                )
             resultdf1 = best_gtimedf.head(1).reset_index(drop=True)
             kernal_name = (
                 aiter.getHipblasltKernelName(int(resultdf1.iloc[0]["solidx"]))

@@ -35,7 +35,7 @@ on:
       docker_username:
         description: 'Docker username for docker login'
         required: true
-        default: 'rocmshard'
+        default: 'rocmshared'
       gpu_archs:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
@@ -43,18 +43,16 @@ on:
       runner:
         description: 'Select build host'
         required: true
-        default: 'aiter-k8s-build'
+        default: 'aiter-1gpu-runner'
         type: choice
         options:
-          - build-only-aiter
-          - aiter-mi300-1gpu
-          - aiter-mi325-1gpu
-          - linux-aiter-mi355-1
           - aiter-1gpu-runner
+          - build-only-aiter
+          - linux-aiter-mi35x-1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build_whl_package:
@@ -129,7 +127,16 @@ jobs:
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 -r requirements.txt
-      
+
+      - name: Pin setuptools_scm
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -e
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          pip install --timeout=60 --retries=10 "setuptools_scm<10"
+
       - name: Install ninja
         if: ${{ matrix.build_enabled }}
         run: |
