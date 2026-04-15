@@ -101,6 +101,7 @@ def select_3d_config(
     q_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
     shuffled_kv_cache: bool = False,
+    NUM_BLOCKS_GATHER_PER_TILE: int = 1,
 ):
     reduce_num_warps = 2
     attn_warps = 2
@@ -174,6 +175,16 @@ def select_3d_config(
         TILE_SIZE = block_size
     elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
         TILE_SIZE = max(32, TILE_SIZE)
+
+    if NUM_BLOCKS_GATHER_PER_TILE > 1:
+        assert NUM_BLOCKS_GATHER_PER_TILE in [
+            4,
+            8,
+        ], "Only NUM_BLOCKS_GATHER_PER_TILE = 4 or 8 is supported"
+        attn_warps = 2
+        waves_per_eu = 1
+        num_segments = max(1, num_segments // NUM_BLOCKS_GATHER_PER_TILE)
+        TILE_SIZE = block_size * NUM_BLOCKS_GATHER_PER_TILE
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -367,6 +378,7 @@ def unified_attention(
         )
 
     else:
+        NUM_BLOCKS_GATHER_PER_TILE = 1
         attn_config, reduce_config = select_3d_config(
             head_size,
             block_size,
@@ -376,6 +388,7 @@ def unified_attention(
             q_dtype,
             kv_cache_dtype,
             shuffled_kv_cache,
+            NUM_BLOCKS_GATHER_PER_TILE,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
@@ -462,7 +475,7 @@ def unified_attention(
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
                 K_WIDTH=K_WIDTH,
                 WARP_SIZE=WARP_SIZE,
-                NUM_BLOCKS_GATHER_PER_TILE=1,
+                NUM_BLOCKS_GATHER_PER_TILE=NUM_BLOCKS_GATHER_PER_TILE,
                 IS_Q_FP8=(q_dtype == e4m3_dtype),
                 IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
                 **attn_config,
