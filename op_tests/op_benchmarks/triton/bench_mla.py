@@ -40,7 +40,6 @@ def benchmark(args):
     skip_reduce = args.skip_reduce
 
     if shuffled_kv_cache:
-        assert IS_DEVICE_ARCH_GFX12, "Gluon Unified Attention only supports gfx1250"
         assert BLOCK_SIZE >= 16, "Block size must be at least 16 for shuffled KV cache"
 
     configs = []
@@ -210,8 +209,8 @@ def benchmark(args):
                 q_descale=q_descale,
                 kv_descale=kv_descale,
                 out_scale=out_scale,
-                use_gluon=(backend == "gluon"),
                 shuffled_kv_cache=shuffled_kv_cache,
+                skip_reduce=skip_reduce,
             )
         else:
             out = mla_prefill_fwd(
@@ -229,7 +228,6 @@ def benchmark(args):
                 q_descale=q_descale,
                 kv_descale=kv_descale,
                 out_scale=out_scale,
-                use_gluon=(backend == "gluon"),
                 shuffled_kv_cache=shuffled_kv_cache,
             )
 
@@ -272,7 +270,6 @@ def benchmark(args):
                     q_descale=q_descale,
                     kv_descale=kv_descale,
                     out_scale=out_scale,
-                    use_gluon=(backend == "gluon"),
                     shuffled_kv_cache=shuffled_kv_cache,
                 )
             else:
@@ -291,7 +288,6 @@ def benchmark(args):
                     q_descale=q_descale,
                     kv_descale=kv_descale,
                     out_scale=out_scale,
-                    use_gluon=(backend == "gluon"),
                     shuffled_kv_cache=shuffled_kv_cache,
                 )
 

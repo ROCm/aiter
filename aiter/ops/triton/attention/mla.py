@@ -72,18 +72,23 @@ def select_3d_config(
     waves_per_eu = 1
     num_segments = 0
     if shuffled_kv_cache:
-        if kv_dtype == torch.bfloat16:
-            if num_2d_prgms >= 64:
-                num_segments = 1
+        if IS_DEVICE_ARCH_GFX12:
+            if kv_dtype == torch.bfloat16:
+                if num_2d_prgms >= 64:
+                    num_segments = 1
+                else:
+                    num_segments = 2
             else:
-                num_segments = 2
+                if num_2d_prgms >= 64:
+                    num_segments = 1
+                else:
+                    num_segments = 2
         else:
-            if num_2d_prgms >= 64:
-                num_segments = 1
-            else:
-                num_segments = 2
+            attn_warps = 2
+            waves_per_eu = 1
 
     TILE_SIZE = block_size
+
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if num_segments == 0:
         num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
@@ -128,15 +133,12 @@ def mla_prefill_fwd(
     q_descale,
     kv_descale,
     out_scale,
-    use_gluon: bool,
     shuffled_kv_cache: bool,
 ):
     assert causal, "Only causal attention is supported"
     assert (
         not shuffled_kv_cache
     ), "Shuffled kv cache is not supported in mla_prefill_fwd"
-    if use_gluon:
-        assert IS_DEVICE_ARCH_GFX12, "Gluon is only supported on gfx12"
 
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
     num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
@@ -174,7 +176,7 @@ def mla_prefill_fwd(
         num_2d_prgms,
     )
 
-    if use_gluon:
+    if IS_DEVICE_ARCH_GFX12:
         gluon_mla_prefill_fwd_kernel_non_pipelined[(num_kv_heads, total_num_q_blocks)](
             output_ptr=out,
             query_ptr=q,

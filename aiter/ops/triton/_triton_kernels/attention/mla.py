@@ -122,7 +122,6 @@ def _mla_prefill_fwd_kernel(
 
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    # tl.device_print("cur_batch_query_len", cur_batch_query_len)
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
 
@@ -313,7 +312,11 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "BLOCK_M",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
+        "waves_per_eu",
         "num_stages",
+        "SHUFFLED_KV_CACHE",
+        "IS_Q_FP8",
+        "IS_KV_FP8",
     ],
 )
 
@@ -348,6 +351,7 @@ def _mla_decode_fwd_kernel(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     num_warps: tl.constexpr,  # int
+    waves_per_eu: tl.constexpr,  # int
     num_stages: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
@@ -537,6 +541,7 @@ def _mla_decode_fwd_kernel(
                 )
                 .permute((0, 1, 4, 2, 3, 5))
                 .reshape((TILE_SIZE, KV_LORA_RANK))
+                .permute((1, 0))
             )
             K_rope = (
                 K_rope.reshape(
@@ -556,13 +561,11 @@ def _mla_decode_fwd_kernel(
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        S_lora = tl.dot(Q_lora, KV_lora.trans(1, 0).to(Q_lora.dtype))
-        S_rope = tl.dot(Q_rope, K_rope.to(Q_lora.dtype))
+        S_lora = tl.dot(Q_lora, KV_lora)
+        S_rope = tl.dot(Q_rope, K_rope)
         S = qk_factor * (S_lora + S_rope)
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
+        S = tl.where(seq_mask, S, float("-inf"))
 
         # compute running maximum
         # m_j : (BLOCK_M,)
@@ -589,7 +592,7 @@ def _mla_decode_fwd_kernel(
         M = m_j
 
         # acc : (BLOCK_M, KV_LORA_RANK)
-        acc += tl.dot(P.to(KV_lora.dtype), KV_lora)
+        acc += tl.dot(P.to(KV_lora.dtype), KV_lora.permute((1, 0)))
         seq_offset += TILE_SIZE
 
     if kv_scale_ptr is not None:
