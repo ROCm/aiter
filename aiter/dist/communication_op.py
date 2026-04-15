@@ -329,3 +329,20 @@ def custom_all_gather(
     """
     _assert_has_custom_group()
     return get_custom_group(group).all_gather(input_, use_custom, dim)
+
+
+def custom_reduce_scatter(
+    input_: torch.Tensor,
+    use_custom: bool = True,
+    dim: int = 0,
+    group: Optional[str] = None,
+) -> torch.Tensor:
+    """Reduce-scatter the input tensor across the user-specified custom group.
+
+    Args:
+        group: Name of the custom group. When only one custom group is
+            initialized this can be omitted. When multiple groups exist,
+            pass the group name to select which one to use.
+    """
+    _assert_has_custom_group()
+    return get_custom_group(group).reduce_scatter_tensor(input_, use_custom, dim)

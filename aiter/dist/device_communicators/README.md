@@ -18,7 +18,7 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
-from aiter.dist.communication_op import custom_all_reduce, custom_all_gather
+from aiter.dist.communication_op import custom_all_reduce, custom_all_gather, custom_reduce_scatter
 ```
 
 ### `CustomGroupConfig` Class
@@ -49,7 +49,9 @@ Perform allreduce on a custom group. When only one group exists, `group` can be 
 
 Perform allgather on a custom group. When only one group exists, `group` can be omitted. When multiple groups exist, pass the group name.
 
-> **Note:** For multi-group functionality, only `allreduce` and `allgather` operations are currently supported.
+### `custom_reduce_scatter(input_, ..., group=None)`
+
+Perform reduce-scatter on a custom group. When only one group exists, `group` can be omitted. When multiple groups exist, pass the group name.
 
 ## Config Dict Format
 
