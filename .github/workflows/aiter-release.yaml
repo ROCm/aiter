@@ -108,12 +108,6 @@ on:
       wheel_names:
         description: 'Space-separated list of built wheel filenames'
         value: ${{ jobs.collect.outputs.wheel_names }}
-        default: 'aiter-1gpu-runner'
-        type: choice
-        options:
-          - aiter-1gpu-runner
-          - build-only-aiter
-          - linux-aiter-mi35x-1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
