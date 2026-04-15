@@ -222,7 +222,23 @@ def grouped_topk_torch(
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
-@compile_ops("module_top_k_per_row", develop=True)
+@compile_ops(
+    "module_top_k_per_row",
+    develop=True,
+    fc_name="top_k_per_row_prefill",
+)
+def _top_k_per_row_prefill_kernel(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    values: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -232,7 +248,17 @@ def top_k_per_row_prefill(
     numRows: int,
     stride0: int,
     stride1: int,
-) -> None: ...
+) -> None:
+    _top_k_per_row_prefill_kernel(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+        values,
+    )
 
 
 @compile_ops("module_top_k_per_row", ffi_type="ctypes", develop=True)

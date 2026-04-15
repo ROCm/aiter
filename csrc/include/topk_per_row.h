@@ -4,15 +4,16 @@
 
 #include "aiter_tensor.h"
 #include <cstdint>
+#include <optional>
 
 void top_k_per_row_prefill(const aiter_tensor_t& logits,
                            const aiter_tensor_t& rowStarts,
                            const aiter_tensor_t& rowEnds,
                            const aiter_tensor_t& indices,
-                           const aiter_tensor_t* values,
                            int64_t numRows,
                            int64_t stride0,
-                           int64_t stride1);
+                           int64_t stride1,
+                           std::optional<aiter_tensor_t> values = std::nullopt);
 
 void top_k_per_row_decode(const aiter_tensor_t& logits,
                           int64_t next_n,

@@ -1672,10 +1672,10 @@ namespace py = pybind11;
           py::arg("rowStarts"),    \
           py::arg("rowEnds"),      \
           py::arg("indices"),      \
-          py::arg("values"),       \
           py::arg("numRows"),      \
           py::arg("stride0"),      \
-          py::arg("stride1"));     \
+          py::arg("stride1"),      \
+          py::arg("values") = std::nullopt); \
     m.def("top_k_per_row_decode",  \
           &top_k_per_row_decode,   \
           py::arg("logits"),       \
@@ -1781,8 +1781,8 @@ namespace py = pybind11;
           py::arg("topk_out"),                    \
           py::arg("topk"),                        \
           py::arg("largest")   = true,            \
-          py::arg("rowStarts") = torch::Tensor(), \
-          py::arg("rowEnds")   = torch::Tensor(), \
+          py::arg("rowStarts") = nullptr,         \
+          py::arg("rowEnds")   = nullptr,         \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1);
 

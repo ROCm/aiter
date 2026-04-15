@@ -2473,10 +2473,10 @@ void top_k_per_row_prefill(const aiter_tensor_t& logits,
                            const aiter_tensor_t& rowStarts,
                            const aiter_tensor_t& rowEnds,
                            const aiter_tensor_t& indices,
-                           const aiter_tensor_t* values,
                            int64_t numRows,
                            int64_t stride0,
-                           int64_t stride1)
+                           int64_t stride1,
+                           std::optional<aiter_tensor_t> values)
 {
     size_t buf_size = 0; // will be overwritten by the kernel
 
@@ -2487,7 +2487,7 @@ void top_k_per_row_prefill(const aiter_tensor_t& logits,
     int64_t workspace_size   = invokeComputeTopkLastDimWorkspaceSize<float>(numRows, stride0);
     auto workspace = AiterTensor::empty({workspace_size}, AITER_DTYPE_u8, logits.device_id);
 
-    if(values != nullptr)
+    if(values.has_value())
     {
         aiter::standalone_stable_radix_11bits<float, int, true, true>(
             workspace.data_ptr(),
