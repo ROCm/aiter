@@ -139,7 +139,7 @@ class FmoeTuner(TunerCommon):
             weight_qt, weight_scale = aiter.pertoken_quant(
                 weight, quant_dtype=dtypes.i8, dtypeMax=7
             )
-        elif qType == QuantType.per_1x32_i4:
+        elif qType == QuantType.per_1x32 and quant_dtype == dtypes.i4x2:
             # a16wi4: groupwise quantize to int4 [-7, 7] with group_size=32
             group_size = 32
             w_groups = weight.view(E, dim1, dim2 // group_size, group_size)
@@ -630,7 +630,7 @@ class FmoeTuner(TunerCommon):
         ):  # a16w4
             a1_qt = input.to(dtype)
             a1_scale = None
-        elif q_type == QuantType.per_1x32_i4:  # a16wi4
+        elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:  # a16wi4
             a1_qt = input.to(dtypes.bf16)
             a1_scale = None
         else:
@@ -831,8 +831,16 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
-        if q_type == QuantType.per_1x32_i4:
-            # Int4 FlyDSL path: pack int8 → int4, shuffle scales
+        if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
+            # per_1x32 fp4 path: shuffle e8m0 scales, reuse CK-shuffled weights for FlyDSL
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+            w1_qt_shffle_flydsl = w1_qt_shffle_ck
+            w2_qt_shffle_flydsl = w2_qt_shffle_ck
+            w1_scale_flydsl = w1_scale_aiter
+            w2_scale_flydsl = w2_scale_aiter
+        elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+            # a16wi4 int4 FlyDSL path: pack int8 -> int4, shuffle scales
             E1 = w1_qt.shape[0]
             N1, K1 = w1_qt.shape[1], w1_qt.shape[2]
             w1_qt_shffle_flydsl = pack_int8_to_packed_int4(
@@ -854,12 +862,9 @@ class FmoeTuner(TunerCommon):
             w1_scale_aiter = w1_scale
             w2_scale_aiter = w2_scale
         else:
-            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
-            w1_qt_shffle_flydsl = w1_qt_shffle_ck
-            w2_qt_shffle_flydsl = w2_qt_shffle_ck
-            w1_scale_flydsl = w1_scale_aiter
-            w2_scale_flydsl = w2_scale_aiter
+            raise ValueError(
+                f"Unsupported quant_type={q_type}, q_dtype_w={q_dtype_w}"
+            )
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
@@ -911,7 +916,7 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1=doweight_stage1,
                 topk=topk,
             )
-            if q_type == QuantType.per_1x32_i4:
+            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                 # a16wi4: bf16 passthrough, no inter-stage quant
                 a2_qt = ref1
                 a2_scale = None
@@ -1802,8 +1807,8 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        # CK kernels don't support per_1x32_i4; skip to FlyDSL path
-        if q_type == QuantType.per_1x32_i4:
+        # CK kernels don't support a16wi4 (per_1x32 + i4x2); skip to FlyDSL path
+        if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
             return tasks_ck
 
         _, ck_stage1_kernels = get_gemm1_kernels_list(
@@ -2198,7 +2203,7 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32_i4:
+        if not (q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2):
             return tasks_flydsl
 
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
@@ -2419,7 +2424,7 @@ class FmoeTuner(TunerCommon):
                         if w2_scale is not None
                         else None
                     )
-                elif q_type == QuantType.per_1x32_i4:
+                elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                     w1_qt_fmoe = pack_int8_to_packed_int4(
                         shuffle_weight(w1_qt_fmoe, (16, 16))
                     ).view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
@@ -2477,7 +2482,7 @@ class FmoeTuner(TunerCommon):
                     )
                     a1_qt = a1_qt.view(token, model_dim)
                     a1_scale = a1_scale.squeeze(-1)
-                elif q_type == QuantType.per_1x32_i4:
+                elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                     a1_qt = hidden.to(dtypes.bf16)
                     a1_scale = None
                 elif (
@@ -2578,7 +2583,7 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32, aiter.QuantType.per_1x32_i4]:
+            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
                 print(f"{q_type} is not supported on {get_gfx()}")
                 return []
             if not use_g1u1:

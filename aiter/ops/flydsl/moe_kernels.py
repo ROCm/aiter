@@ -286,19 +286,12 @@ def compile_flydsl_moe_stage1(
             b_nt=b_nt,
             gate_only=gate_only,
         )
-    else:
+    elif a_dtype == "bf16" and b_dtype == "int4":
+        # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
-        in_dtype = a_dtype
-        group_size = -1
-        _use_cshuffle = None
-        _scale_is_bf16 = False
-        if b_dtype == "int4":
-            in_dtype = "int4_bf16"
-            group_size = 32
-            # split-K needs cshuffle (None → auto-enable); non-split-K uses direct epilog
-            _use_cshuffle = None if k_batch > 1 else False
-            _scale_is_bf16 = True
+        # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
+        _use_cshuffle = None if k_batch > 1 else False
 
         return compile_moe_gemm1(
             model_dim=model_dim,
@@ -309,12 +302,16 @@ def compile_flydsl_moe_stage1(
             tile_n=tile_n,
             tile_k=tile_k,
             doweight_stage1=doweight_stage1,
-            in_dtype=in_dtype,
-            group_size=group_size,
+            in_dtype="int4_bf16",
+            group_size=32,
             out_dtype=out_dtype,
             use_cshuffle_epilog=_use_cshuffle,
-            scale_is_bf16=_scale_is_bf16,
+            scale_is_bf16=True,
             k_batch=k_batch,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
         )
 
 
@@ -354,16 +351,9 @@ def compile_flydsl_moe_stage2(
             persist_m=persist_m,
             sort_block_m=sort_block_m,
         )
-    else:
+    elif a_dtype == "bf16" and b_dtype == "int4":
+        # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
-
-        in_dtype = a_dtype
-        group_size = -1
-        _scale_is_bf16 = False
-        if b_dtype == "int4":
-            in_dtype = "int4_bf16"
-            group_size = 32
-            _scale_is_bf16 = True
 
         return compile_moe_gemm2(
             model_dim=model_dim,
@@ -374,11 +364,15 @@ def compile_flydsl_moe_stage2(
             tile_n=tile_n,
             tile_k=tile_k,
             doweight_stage2=doweight_stage2,
-            in_dtype=in_dtype,
-            group_size=group_size,
+            in_dtype="int4_bf16",
+            group_size=32,
             out_dtype=out_dtype,
             accumulate=accumulate,
-            scale_is_bf16=_scale_is_bf16,
+            scale_is_bf16=True,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported stage2 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
         )
 
 
@@ -659,7 +653,7 @@ def flydsl_moe_stage1(
     _need_quant = fuse_fp4_quant or _splitk_fq
     _need_sort = _need_quant and (fuse_sort_scale or _splitk_fq)
 
-    _sort_block_m = tile_m
+    _sort_block_m = max(32, tile_m)
     _all_blks = sorted_expert_ids.shape[0]
     _dense_blks = (
         min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])

@@ -21,7 +21,6 @@ enum class QuantType : int
     per_128x128,
     per_256x128,
     per_1024x128,
-    per_1x32_i4,
 };
 typedef enum
 {
