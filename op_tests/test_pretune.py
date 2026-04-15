@@ -9,6 +9,7 @@ logic only.  Run with:
 """
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -31,6 +32,8 @@ from utility.pretune import (  # noqa: E402
 
 with open(CFG_PATH) as f:
     CFG = json.load(f)
+
+logging.getLogger("aiter").addHandler(logging.StreamHandler(sys.stdout))
 
 # ── expected resolution table ────────────────────────────────────────────────
 # (tune_module, expected_script_suffix_from_repo_root, expected_config_attr, expect_skip)
