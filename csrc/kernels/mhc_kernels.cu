@@ -208,8 +208,8 @@ namespace aiter {
     }
 
 #define MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(block_size, tile_n, tile_k) \
-    AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_pre_gemm_sqrsum", [&] { \
-        using DTYPE_I = typename t2opus<scalar_t>::type; \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(x.dtype(), "mhc_pre_gemm_sqrsum", [&] { \
+        using DTYPE_I = typename hip2opus<scalar_t>::type; \
         const int tile_m = m_per_block; \
         AITER_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
         AITER_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
@@ -502,8 +502,8 @@ namespace aiter {
     dim3 block(block_size); \
     AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
     AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
-    AITER_DISPATCH_FLOATING16_TYPES(layer_input.scalar_type(), "mhc_pre_big_fuse", [&] { \
-        using DTYPE_I = typename t2opus<scalar_t>::type; \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(layer_input.dtype(), "mhc_pre_big_fuse", [&] { \
+        using DTYPE_I = typename hip2opus<scalar_t>::type; \
         mhc_pre_big_fuse_kernel<DTYPE_I, block_size, hc_mult, num_rows, residual_block><<<grid, block, 0, stream>>>( \
             reinterpret_cast<float*>(post_mix.data_ptr()), \
             reinterpret_cast<float*>(comb_mix.data_ptr()), \
@@ -816,8 +816,8 @@ namespace aiter {
     const int block_size = 4 * 64; \
     dim3 grid(m); \
     dim3 block(block_size); \
-    AITER_DISPATCH_FLOATING16_TYPES(x.scalar_type(), "mhc_post", [&] { \
-        using DTYPE_I = typename t2opus<scalar_t>::type; \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(x.dtype(), "mhc_post", [&] { \
+        using DTYPE_I = typename hip2opus<scalar_t>::type; \
         kernel_name<DTYPE_I, block_size, 4, residual_block><<<grid, block, 0, stream>>>( \
             reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \

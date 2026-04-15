@@ -102,13 +102,14 @@
 // ---------------------------------------------------------------------------
 
 // fp16, bf16
-#define AITER_DISPATCH_CASE_REDUCED_FLOATING(...)        \
+// Temporary transition name; drop the "_xxx" suffix after migration is complete.
+#define AITER_DISPATCH_CASE_FLOATING16_TYPES_xxx(...)   \
     AITER_DISPATCH_CASE_FP16(__VA_ARGS__)                \
     AITER_DISPATCH_CASE_BF16(__VA_ARGS__)
 
-#define AITER_DISPATCH_REDUCED_FLOATING(DTYPE, NAME, ...) \
-    AITER_DISPATCH_SWITCH(DTYPE, NAME,                   \
-        AITER_DISPATCH_CASE_REDUCED_FLOATING(__VA_ARGS__))
+#define AITER_DISPATCH_FLOATING16_TYPES_xxx(DTYPE, NAME, ...) \
+    AITER_DISPATCH_SWITCH(DTYPE, NAME,                         \
+        AITER_DISPATCH_CASE_FLOATING16_TYPES_xxx(__VA_ARGS__))
 
 // fp16, bf16, fp32
 #define AITER_DISPATCH_CASE_FLOATING(...)                \

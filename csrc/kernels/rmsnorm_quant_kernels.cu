@@ -291,7 +291,7 @@ __global__ void add_rmsnorm_quant_kernel(
     }
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave) \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "quant_kernel", [&] {                    \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "quant_kernel", [&] {               \
     using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;                              \
     using DTYPE_OO = std::conditional_t<FUSE_QUANT, DTYPE_O, DTYPE_I>; \
     AITER_CHECK(group_size >= 0 && (group_size % thread_data_size == 0 && group_size <= WARP_SIZE * thread_data_size), __func__, " group_size not support: ", group_size); \

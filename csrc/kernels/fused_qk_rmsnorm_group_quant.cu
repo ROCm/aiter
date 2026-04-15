@@ -410,7 +410,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 }
 
 #define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, interleave) \
-    AITER_DISPATCH_REDUCED_FLOATING(inp1.dtype(), "fused_qk_rmsnorm_group_quant_kernel", [&] {                                   \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(inp1.dtype(), "fused_qk_rmsnorm_group_quant_kernel", [&] {                              \
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;                                                                 \
         using DTYPE_OO = DTYPE_O;                                                                                                 \
         dim3 grid(m, grid_y);                                                                                                     \

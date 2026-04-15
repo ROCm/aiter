@@ -386,7 +386,7 @@ void LLGemm1(void* in_a,
     int NUM_BLOCKS = M / rows_per_block;
 
     // call the kernel function...
-    AITER_DISPATCH_REDUCED_FLOATING(scalar_type, "LLGemm1", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(scalar_type, "LLGemm1", [&] {
         scalar_t* a_ptr = reinterpret_cast<scalar_t*>(in_a);
         scalar_t* b_ptr = reinterpret_cast<scalar_t*>(in_b);
         scalar_t* c_ptr = reinterpret_cast<scalar_t*>(out_c);
@@ -1690,7 +1690,7 @@ void wv_splitk_small_fp16_bf16(void* in_a,
                                const AiterDtype scalar_type)
 {
     dim3 grid(CuCount);
-    AITER_DISPATCH_REDUCED_FLOATING(scalar_type, "wv_splitk_small_fp16_bf16", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(scalar_type, "wv_splitk_small_fp16_bf16", [&] {
         using fptype      = typename scalar<scalar_t>::type;
         fptype* af4       = reinterpret_cast<fptype*>(in_a);
         const fptype* bf4 = reinterpret_cast<const fptype*>(in_b);
@@ -1743,7 +1743,7 @@ void wvSplitK_(void* in_a,
         }                                                                                  \
     }
 
-    AITER_DISPATCH_REDUCED_FLOATING(scalar_type, "wvSplitK", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(scalar_type, "wvSplitK", [&] {
         using fptype      = typename scalar<scalar_t>::type;
         fptype* af4       = reinterpret_cast<fptype*>(in_a);
         const fptype* bf4 = reinterpret_cast<const fptype*>(in_b);
@@ -2233,7 +2233,7 @@ void wvSplitKQ_(void* in_a,
     }
 
     dim3 grid(CuCount);
-    AITER_DISPATCH_REDUCED_FLOATING(c_scalar_type, "wvSplitKQ", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(c_scalar_type, "wvSplitKQ", [&] {
         using fptype = typename scalar<scalar_t>::type;
         auto c_ptr   = reinterpret_cast<fptype*>(out_c);
         {

@@ -137,7 +137,7 @@ __global__ void fused_qk_rmsnorm_kernel(
 
 // 2D grid fused kernel: grid = (ceil(m/num_row), 2), Q and K run in parallel
 #define FUSED_QK_RMSNORM_KERNEL_IMPL_(BlockSize, thread_data_size, interleave, num_row)               \
-    AITER_DISPATCH_REDUCED_FLOATING(q.dtype(), "fused_qk_rmsnorm_kernel", [&] {                       \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(q.dtype(), "fused_qk_rmsnorm_kernel", [&] {                  \
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;                                       \
         dim3 grid((m + (num_row) - 1) / (num_row), 2);                                                \
         dim3 block(BlockSize);                                                                         \

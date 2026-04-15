@@ -604,7 +604,7 @@ void static_per_tensor_quant(const aiter_tensor_t& out,         // [..., d]
     const hipStream_t stream = aiter::getCurrentHIPStream();
     if(out.dtype() == AITER_DTYPE_fp8)
     {
-        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "scaled_quant_kernel", [&] {
+        AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
@@ -615,7 +615,7 @@ void static_per_tensor_quant(const aiter_tensor_t& out,         // [..., d]
     }
     else if(out.dtype() == AITER_DTYPE_i8)
     {
-        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "scaled_quant_kernel", [&] {
+        AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::i8_t*>(out.data_ptr()),
@@ -631,7 +631,7 @@ void static_per_tensor_quant(const aiter_tensor_t& out,         // [..., d]
 }
 
 #define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)      \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "quant_kernel", [&] {              \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "quant_kernel", [&] {          \
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                  \
         aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA><<<grid, block, 0, stream>>>( \
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                     \
@@ -673,7 +673,7 @@ void dynamic_per_tensor_quant(const aiter_tensor_t& out,         // [..., d]
     const hipStream_t stream = aiter::getCurrentHIPStream();
     if(out.dtype() == AITER_DTYPE_fp8)
     {
-        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "scaled_quant_kernel", [&] {
+        AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
@@ -688,7 +688,7 @@ void dynamic_per_tensor_quant(const aiter_tensor_t& out,         // [..., d]
     }
     else if(out.dtype() == AITER_DTYPE_i8)
     {
-        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "scaled_quant_kernel", [&] {
+        AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
                 reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
@@ -739,7 +739,7 @@ void dynamic_per_token_scaled_quant(const aiter_tensor_t& out,         // [..., 
             int num_group = rows;
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_REDUCED_FLOATING(
+            AITER_DISPATCH_FLOATING16_TYPES_xxx(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -764,7 +764,7 @@ void dynamic_per_token_scaled_quant(const aiter_tensor_t& out,         // [..., 
             int num_group = rows;
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_REDUCED_FLOATING(
+            AITER_DISPATCH_FLOATING16_TYPES_xxx(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -792,7 +792,7 @@ void dynamic_per_token_scaled_quant(const aiter_tensor_t& out,         // [..., 
             // 8) : rows;
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_REDUCED_FLOATING(
+            AITER_DISPATCH_FLOATING16_TYPES_xxx(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -878,7 +878,7 @@ void dynamic_per_group_scaled_quant_fp4(const aiter_tensor_t& out,         // [.
     dim3 const block(groupQuantBlockSize);
 
 #if defined(__Float4_e2m1fn_x2)
-    AITER_DISPATCH_REDUCED_FLOATING(
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(
         input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
             using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -900,7 +900,7 @@ void dynamic_per_group_scaled_quant_fp4(const aiter_tensor_t& out,         // [.
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "quant_kernel", [&] {                                         \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "quant_kernel", [&] {                                     \
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                                             \
         const int cu_num = get_num_cu_func();                                                                          \
         const int max_warp_per_simd = 8;                                                                               \
@@ -1273,7 +1273,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
 
 
 #define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_HASH) \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "quant_kernel", [&] {                                         \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "quant_kernel", [&] {                                     \
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                                             \
         int grid_size = rows;                                                                                          \
         dim3 const grid(grid_size);                                                                                    \
@@ -1507,7 +1507,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
 
 
 #define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE) \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "quant_kernel", [&] {                                   \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "quant_kernel", [&] {                               \
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                      \
         int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                              \
         int num_tg        = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                        \
@@ -1742,7 +1742,7 @@ __global__ void mxfp4_quant_moe_sort_kernel(
 
 
 #define MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                    \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "mxfp4_quant_moe_sort_kernel", [&] {       \
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(input.dtype(), "mxfp4_quant_moe_sort_kernel", [&] {   \
         AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                          \
         int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                  \
