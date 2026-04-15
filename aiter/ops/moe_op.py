@@ -236,8 +236,8 @@ def cmdGenFunc_ck_moe_stage(
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
-    is_splitk = splitk > 1 and kernelName is None
-    is_splitk = is_splitk or "Splitk" in kernelName
+    is_splitk = splitk > 1 and not kernelName
+    is_splitk = is_splitk or (bool(kernelName) and "Splitk" in kernelName)
     outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
