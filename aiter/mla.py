@@ -20,7 +20,7 @@ import os
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,
+    O,  # noqa: E741
     Final_lse,
     qo_indptr,
     kv_indptr,
@@ -277,7 +277,8 @@ def mla_decode_fwd(
         if num_kv_splits == 1 and (
             q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
         ):
-            return logits.view(total_s, nhead, v_head_dim), attn_lse
+            lse = final_lse if return_lse else attn_lse
+            return logits.view(total_s, nhead, v_head_dim), lse
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
@@ -533,11 +534,10 @@ def mla_prefill_fwd(
     num_kv_splits=None,  # for experts only!!!
 ):
     device = q.device
+    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
-
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     bs, nhead, v_head_dim = o.shape
 
     num_kv_splits = 1
