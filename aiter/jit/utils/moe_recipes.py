@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+# mypy: allow-untyped-defs
+
 import csv
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
