@@ -429,9 +429,9 @@ def validate_and_update_archs():
     ]
 
     # Validate if each element in archs is in allowed_archs
-    assert all(arch in allowed_archs for arch in archs), (
-        f"One of GPU archs of {archs} is invalid or not supported"
-    )
+    assert all(
+        arch in allowed_archs for arch in archs
+    ), f"One of GPU archs of {archs} is invalid or not supported"
     return archs
 
 
