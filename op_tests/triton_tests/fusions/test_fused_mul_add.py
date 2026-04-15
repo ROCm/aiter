@@ -3,7 +3,9 @@ import pytest
 from aiter.ops.triton.fusions.fused_mul_add import fused_mul_add
 
 
-def generate_fused_mul_add_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype, seed=33):
+def generate_fused_mul_add_inputs(
+    shape, a_type_is_scalar, b_type_is_scalar, dtype, seed=33
+):
     torch.manual_seed(seed)
     x = torch.randn(*shape, dtype=dtype, device="cuda")
 
