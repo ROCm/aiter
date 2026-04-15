@@ -62,8 +62,8 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
 FLYDSL_FALLBACK_TAG = "flydsl_fallback"
-FLYDSL_TUNE_MOE_EXPERT_BALANCE = (
-    os.environ.get("FLYDSL_TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
+TUNE_MOE_EXPERT_BALANCE = (
+    os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
 
 COS_DIFF_THRESHOLD = 1e-1
@@ -741,7 +741,7 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-        if FLYDSL_TUNE_MOE_EXPERT_BALANCE:
+        if TUNE_MOE_EXPERT_BALANCE:
             score = torch.zeros((token, expert), dtype=dtype)
             start_col = 0
             end_col = topk
