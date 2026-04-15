@@ -243,7 +243,9 @@ class TestKeyErrorHandling(unittest.TestCase):
 
         new_remaining = [(k, ar) for k, ar in remaining if k not in completed_ids]
         self.assertEqual(len(new_remaining), 1)
-        self.assertEqual(new_remaining[0][0], 0, "Only KeyError task remains for resubmit")
+        self.assertEqual(
+            new_remaining[0][0], 0, "Only KeyError task remains for resubmit"
+        )
 
     def test_keyerror_no_restart_without_root_cause(self):
         """If only KeyError tasks remain, no restart, they keep polling."""
