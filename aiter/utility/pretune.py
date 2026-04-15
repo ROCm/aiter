@@ -202,20 +202,15 @@ def run_pretune(
     repo_dir: str,
     build_one_module=None,
     libtype: str = "all",
-    retune_all: bool = True,
-    target_shapes: list | None = None,
 ) -> None:
     """
     Pretune cycle for one tune module.
 
     When build_one_module is provided (setup.py / PRETUNE_MODULES path):
       1. Build the tune .so  (gen_instances.py --tune → all candidate kernels).
-      2. Write a temp untune CSV with shape keys to benchmark.  When target_shapes
-         is provided, only those shapes are written; otherwise all unique shapes
-         from the merged tune CSV are used.
-      3. Run the tune script.  When retune_all=True (default) --all is passed so
-         every shape is re-benchmarked; when retune_all=False only shapes not yet
-         tuned for the live GPU are benchmarked.
+      2. Write a temp untune CSV with all unique shape keys from the merged tune CSV,
+         no gfx/cu_num — the tuner auto-fills those from the live GPU.
+      3. Run the tune script with --all so every shape is re-benchmarked.
       4. Rebuild the inference .so  (gen_instances.py --tune_file → winners only).
 
     When build_one_module is None (standalone / direct path):
@@ -278,22 +273,7 @@ def run_pretune(
     # auto-tags rows with live GPU's gfx/cu_num, re-benchmarks shapes already
     # in tune_file, and tunes shapes not yet present for this GPU.
     shape_keys = ["B", "M", "N", "K"]
-    if target_shapes is not None:
-        import pandas as pd  # deferred: absent during CI metadata-only phase
-
-        shape_cols = (
-            ["M", "N", "K"] if len(target_shapes[0]) == 3 else ["B", "M", "N", "K"]
-        )
-        df = pd.DataFrame(target_shapes, columns=shape_cols).drop_duplicates()
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".csv", prefix="aiter_pretune_", delete=False
-        )
-        df.to_csv(tmp.name, index=False)
-        tmp.close()
-        _log(f"[pretune] {len(df)} targeted shapes → {tmp.name}")
-        untune_csv = tmp.name
-    else:
-        untune_csv = _make_untune_csv(tune_file, shape_keys)
+    untune_csv = _make_untune_csv(tune_file, shape_keys)
 
     try:
         # ── 3. Run tuner ───────────────────────────────────────────────────
@@ -310,9 +290,8 @@ def run_pretune(
             write_tune_file,
             "--libtype",
             libtype,
+            "--all",
         ]
-        if retune_all:
-            cmd.append("--all")
         _log(f"[pretune] running: {' '.join(cmd)}")
         result = subprocess.run(cmd, env=env)
         if result.returncode != 0:
@@ -395,266 +374,6 @@ def run_pretune_modules(
             logger.warning(
                 f"[pretune] {mod} failed: {exc}. Continuing with remaining modules."
             )
-
-
-def check_tuning_coverage(
-    module_name: str,
-    cfg: dict,
-    csrc_dir: str,
-    repo_dir: str,
-    gfx: str | None = None,
-    cu_num: int | None = None,
-) -> dict:
-    """
-    Return tuning coverage statistics for one tune module on the live GPU.
-
-    Reads the merged CSV for module_name, counts how many unique (M, N, K) shapes
-    have a tuned entry for the live GPU (gfx + cu_num), and returns:
-
-        {
-            "module":   str,            # module_name
-            "gfx":      str,            # e.g. "gfx942"
-            "cu_num":   int,            # e.g. 304
-            "total":    int,            # unique (M, N, K) shapes in the merged CSV
-            "tuned":    int,            # shapes that have at least one tuned row
-            "coverage": float,          # tuned / total (0.0–1.0)
-        }
-
-    Raises RuntimeError if no GPU is available (rocminfo fails).
-    Raises FileNotFoundError if the CSV cannot be read.
-    """
-    import pandas as pd  # deferred: absent during CI metadata-only phase
-
-    if gfx is None or cu_num is None:
-        # Both functions live in aiter/jit/utils/chip_info.py.
-        # Import directly from file to avoid triggering aiter/__init__.py.
-        chip_info_path = os.path.join(repo_dir, "aiter", "jit", "utils", "chip_info.py")
-        import importlib.util as _ilu
-
-        _spec = _ilu.spec_from_file_location("chip_info", chip_info_path)
-        _chip_info = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
-        _spec.loader.exec_module(_chip_info)  # type: ignore[union-attr]
-        if gfx is None:
-            gfx = _chip_info.get_gfx_runtime()
-        if cu_num is None:
-            cu_num = _chip_info.get_cu_num()
-
-    _, config_attr = _resolve(module_name, cfg, csrc_dir)
-    if config_attr is None:
-        raise ValueError(f"[pretune] {module_name}: cannot determine CSV config attr.")
-
-    # Load core to get the merged tune file path.
-    # Import directly from file to avoid triggering aiter/__init__.py.
-    sys.path.insert(0, os.path.join(repo_dir, "aiter"))
-    from jit import core  # noqa: PLC0415
-
-    tune_file = getattr(core.AITER_CONFIGS, config_attr)
-    paths = [p for p in tune_file.split(os.pathsep) if p]
-    dfs = [pd.read_csv(p) for p in paths if os.path.exists(p)]
-
-    if not dfs:
-        raise FileNotFoundError(f"[pretune] No CSV files found for: {tune_file}")
-
-    merged = pd.concat(dfs, ignore_index=True)
-
-    shape_cols = [c for c in ["B", "M", "N", "K"] if c in merged.columns]
-    all_shapes = merged[shape_cols].drop_duplicates()
-    total = len(all_shapes)
-
-    # Rows tuned for this specific GPU (gfx + cu_num both present in CSV).
-    tuned_mask = pd.Series(True, index=merged.index)
-    if "gfx" in merged.columns:
-        tuned_mask &= merged["gfx"] == gfx
-    if "cu_num" in merged.columns:
-        tuned_mask &= merged["cu_num"] == cu_num
-
-    tuned_shapes = merged[tuned_mask][shape_cols].drop_duplicates()
-    tuned = len(tuned_shapes)
-    coverage = tuned / total if total > 0 else 1.0
-
-    return {
-        "module": module_name,
-        "gfx": gfx,
-        "cu_num": cu_num,
-        "total": total,
-        "tuned": tuned,
-        "coverage": coverage,
-    }
-
-
-def warn_if_undertuned(
-    module_names: list[str],
-    cfg: dict,
-    csrc_dir: str,
-    repo_dir: str,
-    threshold: float = 0.9,
-) -> list[dict]:
-    """
-    Warn via logger if any module's tuning coverage is below threshold.
-
-    Returns a list of coverage dicts (one per module) for all modules that are
-    below the threshold.  Modules that raise (e.g. no GPU) are logged and skipped.
-    """
-    undertuned = []
-    for mod in module_names:
-        try:
-            cov = check_tuning_coverage(mod, cfg, csrc_dir, repo_dir)
-        except Exception as exc:
-            logger.warning(f"[pretune] {mod}: coverage check failed: {exc}")
-            continue
-        pct = cov["coverage"] * 100
-        if cov["coverage"] < threshold:
-            logger.warning(
-                f"[pretune] {mod}: only {cov['tuned']}/{cov['total']} shapes tuned "
-                f"for {cov['gfx']}/cu_num={cov['cu_num']} ({pct:.1f}% < "
-                f"{threshold * 100:.0f}% threshold). "
-                "Run: python3 aiter/utility/pretune.py " + mod
-            )
-            undertuned.append(cov)
-        else:
-            logger.info(
-                f"[pretune] {mod}: {cov['tuned']}/{cov['total']} shapes tuned "
-                f"({pct:.1f}%) — OK"
-            )
-    return undertuned
-
-
-def warmup(
-    shapes: list[tuple[int, ...]],
-    module_name: str,
-    *,
-    cfg: dict | None = None,
-    csrc_dir: str | None = None,
-    repo_dir: str | None = None,
-    auto_tune: bool = False,
-) -> dict:
-    """
-    Ensure the GEMM kernel for module_name is tuned for every shape in shapes.
-
-    shapes: list of (M, N, K) or (B, M, N, K) tuples — the shapes the model
-        will actually use at runtime.
-
-    Returns a coverage summary dict:
-        {
-            "module":    str,
-            "total":     int,   # unique shapes in the full CSV
-            "tuned":     int,   # shapes with a tuned entry for this GPU
-            "coverage":  float,
-            "missing":   int,   # shapes from `shapes` arg not in tuned CSV
-        }
-
-    When auto_tune=False (default): logs a warning if any requested shape is
-    not covered, but does not run the tuner.
-
-    When auto_tune=True: runs run_pretune() with retune_all=False so that only
-    the missing shapes are benchmarked and written to the CSV, then rebuilds the
-    inference .so.
-    """
-    # Auto-detect paths from this file's location when not provided.
-    _this_dir = os.path.dirname(os.path.abspath(__file__))
-    _default_repo = os.path.dirname(os.path.dirname(_this_dir))
-
-    if repo_dir is None:
-        repo_dir = _default_repo
-    if csrc_dir is None:
-        csrc_dir = os.path.join(repo_dir, "csrc")
-    if cfg is None:
-        cfg_path = os.path.join(repo_dir, "aiter", "jit", "optCompilerConfig.json")
-        with open(cfg_path, "r", encoding="utf-8") as _f:
-            cfg = json.load(_f)
-
-    # Get coverage for all shapes in the CSV.
-    try:
-        cov = check_tuning_coverage(module_name, cfg, csrc_dir, repo_dir)
-    except Exception as exc:
-        logger.warning(
-            f"[pretune] warmup: coverage check failed for {module_name}: {exc}"
-        )
-        return {
-            "module": module_name,
-            "total": 0,
-            "tuned": 0,
-            "coverage": 0.0,
-            "missing": len(shapes),
-        }
-
-    # Check which of the requested shapes are missing.
-    import pandas as pd  # deferred
-
-    # Reload the CSV to check requested shapes specifically.
-    _, config_attr = _resolve(module_name, cfg, csrc_dir)
-    sys.path.insert(0, os.path.join(repo_dir, "aiter"))
-    from jit import core  # noqa: PLC0415
-
-    tune_file = getattr(core.AITER_CONFIGS, config_attr)
-    paths = [p for p in tune_file.split(os.pathsep) if p]
-    dfs = [pd.read_csv(p) for p in paths if os.path.exists(p)]
-    merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-
-    shape_cols = [
-        c for c in ["B", "M", "N", "K"] if not merged.empty and c in merged.columns
-    ]
-
-    # Build a set of tuned shape keys for this GPU.
-    tuned_set: set[tuple] = set()
-    if not merged.empty and shape_cols:
-        tuned_mask = pd.Series(True, index=merged.index)
-        if "gfx" in merged.columns:
-            tuned_mask &= merged["gfx"] == cov["gfx"]
-        if "cu_num" in merged.columns:
-            tuned_mask &= merged["cu_num"] == cov["cu_num"]
-        tuned_rows = merged[tuned_mask][shape_cols].drop_duplicates()
-        tuned_set = {tuple(row) for row in tuned_rows.itertuples(index=False)}
-
-    # Determine whether the module uses B dimension (batched GEMM).
-    _has_b = "B" in shape_cols
-    missing_shapes = []
-    for s in shapes:
-        if _has_b:
-            key = tuple(s)  # already (B, M, N, K)
-        else:
-            key = tuple(s[-3:]) if len(s) >= 3 else tuple(s)  # take last 3 as (M, N, K)
-        if key not in tuned_set:
-            missing_shapes.append(s)
-
-    missing = len(missing_shapes)
-    if missing == 0:
-        logger.info(
-            f"[pretune] warmup: {module_name} — all {len(shapes)} shapes covered."
-        )
-    elif auto_tune:
-        logger.info(
-            f"[pretune] warmup: {module_name} — {missing}/{len(shapes)} shapes missing. "
-            "Running tuner (auto_tune=True)."
-        )
-        try:
-            run_pretune(
-                module_name,
-                cfg,
-                core,
-                csrc_dir,
-                repo_dir,
-                build_one_module=None,
-                retune_all=False,
-                target_shapes=missing_shapes,
-            )
-        except Exception as exc:
-            logger.warning(f"[pretune] warmup: tuner failed for {module_name}: {exc}")
-    else:
-        logger.warning(
-            f"[pretune] warmup: {module_name} — {missing}/{len(shapes)} shapes NOT tuned "
-            f"for {cov['gfx']}/cu_num={cov['cu_num']}. "
-            "Call warmup(..., auto_tune=True) to tune missing shapes, or run: "
-            "python3 aiter/utility/pretune.py " + module_name
-        )
-
-    return {
-        "module": module_name,
-        "total": cov["total"],
-        "tuned": cov["tuned"],
-        "coverage": cov["coverage"],
-        "missing": missing,
-    }
 
 
 def _main() -> None:
