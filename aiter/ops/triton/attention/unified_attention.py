@@ -617,35 +617,24 @@ def unified_attention(
             target_num_prgms,
             num_2d_prgms,
         )
-        NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
-        segm_output = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            triton.next_power_of_2(head_size_v),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        segm_max = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        segm_expsum = torch.empty(
-            q.shape[0],
-            num_query_heads,
-            NUM_SEGMENTS,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        grid_3d = (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
-
+        HEAD_SIZE_V_PADDED = triton.next_power_of_2(head_size_v)
         reduce_grid = (q.shape[0], num_query_heads)
 
         global _3d_tune_cfg, _reduce_tune_cfg
         if UNIFIED_ATTN_AUTOTUNE and _3d_tune_cfg is None:
+            MAX_SEGMENTS = 128
+            segm_output = torch.empty(
+                q.shape[0], num_query_heads, MAX_SEGMENTS,
+                HEAD_SIZE_V_PADDED, dtype=torch.float32, device=q.device,
+            )
+            segm_max = torch.empty(
+                q.shape[0], num_query_heads, MAX_SEGMENTS,
+                dtype=torch.float32, device=q.device,
+            )
+            segm_expsum = torch.empty(
+                q.shape[0], num_query_heads, MAX_SEGMENTS,
+                dtype=torch.float32, device=q.device,
+            )
             _3d_kwargs = dict(
                 segm_output_ptr=segm_output, segm_max_ptr=segm_max,
                 segm_expsum_ptr=segm_expsum, query_ptr=q,
@@ -664,7 +653,7 @@ def unified_attention(
                 BLOCK_SIZE=block_size, HEAD_SIZE=head_size_qk,
                 HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
                 HEAD_SIZE_V=head_size_v,
-                HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
+                HEAD_SIZE_V_PADDED=HEAD_SIZE_V_PADDED,
                 USE_ALIBI_SLOPES=use_alibi_slopes, USE_QQ_BIAS=use_qq_bias,
                 USE_SOFTCAP=(softcap > 0), USE_SINKS=(sinks is not None),
                 SLIDING_WINDOW=SLIDING_WINDOW,
@@ -679,11 +668,30 @@ def unified_attention(
                 query_start_len_ptr=cu_seqlens_q,
                 key_start_len_ptr=cu_seqlens_k,
                 BLOCK_Q=BLOCK_Q, num_seqs=num_seqs, BLOCK_M=BLOCK_M,
+                segm_out_stride_tok=segm_output.stride(0),
+                segm_out_stride_head=segm_output.stride(1),
+                segm_stat_stride_tok=segm_max.stride(0),
+                segm_stat_stride_head=segm_max.stride(1),
                 ALL_DECODE=ALL_DECODE, SAGE_MXFP4=sage_mxfp4,
                 HAS_ROPE=HAS_ROPE, ROPE_SIZE=rope_size,
                 ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
                 IS_CAUSAL=causal, KV_LAYOUT_IS_THD=(kv_layout == "thd"),
             )
+            attn_filtered = {k: v for k, v in attn_config.items()
+                             if k not in _AUTOTUNE_3D_PARAMS}
+            _3d_autotuner[
+                lambda meta: (total_num_q_blocks, num_kv_heads,
+                              meta["NUM_SEGMENTS_PER_SEQ"])
+            ](**_3d_kwargs, **attn_filtered)
+            best_attn = _3d_autotuner.best_config
+            _3d_tune_cfg = dict(attn_config)
+            _3d_tune_cfg.update(best_attn.kwargs)
+            _3d_tune_cfg["num_warps"] = best_attn.num_warps
+            _3d_tune_cfg["num_stages"] = best_attn.num_stages
+
+            tuned_reduce = dict(reduce_config)
+            tuned_reduce["TILE_SIZE"] = _3d_tune_cfg["TILE_SIZE"]
+            tuned_reduce["NUM_SEGMENTS_PER_SEQ"] = _3d_tune_cfg["NUM_SEGMENTS_PER_SEQ"]
             _reduce_kwargs = dict(
                 output_ptr=out, v_scale=v_descale,
                 segm_output_ptr=segm_output, segm_max_ptr=segm_max,
@@ -696,22 +704,15 @@ def unified_attention(
                 stride_v_cache_scale_1=stride_v_cache_scale_1,
                 block_table_stride=block_table_stride_0,
                 HEAD_SIZE=head_size_v,
-                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_v),
+                HEAD_SIZE_PADDED=HEAD_SIZE_V_PADDED,
                 query_start_len_ptr=cu_seqlens_q,
                 BLOCK_Q=BLOCK_Q, OUTPUT_FP8=output_scale is not None,
+                segm_out_stride_tok=segm_output.stride(0),
+                segm_out_stride_head=segm_output.stride(1),
+                segm_stat_stride_tok=segm_max.stride(0),
+                segm_stat_stride_head=segm_max.stride(1),
                 SAGE_MXFP4=sage_mxfp4,
             )
-            attn_filtered = {k: v for k, v in attn_config.items()
-                             if k not in _AUTOTUNE_3D_PARAMS}
-            _3d_autotuner[grid_3d](**_3d_kwargs, **attn_filtered)
-            best_attn = _3d_autotuner.best_config
-            _3d_tune_cfg = dict(attn_config)
-            _3d_tune_cfg.update(best_attn.kwargs)
-            _3d_tune_cfg["num_warps"] = best_attn.num_warps
-            _3d_tune_cfg["num_stages"] = best_attn.num_stages
-
-            tuned_reduce = dict(reduce_config)
-            tuned_reduce["TILE_SIZE"] = _3d_tune_cfg["TILE_SIZE"]
             reduce_filtered = {k: v for k, v in tuned_reduce.items()
                                if k not in _AUTOTUNE_REDUCE_PARAMS}
             _reduce_autotuner[reduce_grid](**_reduce_kwargs, **reduce_filtered)
@@ -721,6 +722,21 @@ def unified_attention(
             _reduce_tune_cfg["num_stages"] = best_reduce.num_stages
         else:
             eff_attn = _3d_tune_cfg if _3d_tune_cfg is not None else attn_config
+            eff_reduce = _reduce_tune_cfg if _reduce_tune_cfg is not None else reduce_config
+            NUM_SEGMENTS = eff_attn["NUM_SEGMENTS_PER_SEQ"]
+            segm_output = torch.empty(
+                q.shape[0], num_query_heads, NUM_SEGMENTS,
+                HEAD_SIZE_V_PADDED, dtype=torch.float32, device=q.device,
+            )
+            segm_max = torch.empty(
+                q.shape[0], num_query_heads, NUM_SEGMENTS,
+                dtype=torch.float32, device=q.device,
+            )
+            segm_expsum = torch.empty(
+                q.shape[0], num_query_heads, NUM_SEGMENTS,
+                dtype=torch.float32, device=q.device,
+            )
+            grid_3d = (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             kernel_unified_attention_3d[grid_3d](
                 segm_output_ptr=segm_output,
                 segm_max_ptr=segm_max,
@@ -750,7 +766,7 @@ def unified_attention(
                 HEAD_SIZE=head_size_qk,
                 HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
                 HEAD_SIZE_V=head_size_v,
-                HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
+                HEAD_SIZE_V_PADDED=HEAD_SIZE_V_PADDED,
                 USE_ALIBI_SLOPES=use_alibi_slopes,
                 USE_QQ_BIAS=use_qq_bias,
                 USE_SOFTCAP=(softcap > 0),
@@ -773,6 +789,10 @@ def unified_attention(
                 BLOCK_Q=BLOCK_Q,
                 num_seqs=num_seqs,
                 BLOCK_M=BLOCK_M,
+                segm_out_stride_tok=segm_output.stride(0),
+                segm_out_stride_head=segm_output.stride(1),
+                segm_stat_stride_tok=segm_max.stride(0),
+                segm_stat_stride_head=segm_max.stride(1),
                 ALL_DECODE=ALL_DECODE,
                 SAGE_MXFP4=sage_mxfp4,
                 HAS_ROPE=HAS_ROPE,
@@ -782,7 +802,6 @@ def unified_attention(
                 KV_LAYOUT_IS_THD=(kv_layout == "thd"),
                 **eff_attn,
             )
-            eff_reduce = _reduce_tune_cfg if _reduce_tune_cfg is not None else reduce_config
             reduce_segments[reduce_grid](
                 output_ptr=out,
                 v_scale=v_descale,
@@ -800,9 +819,13 @@ def unified_attention(
                 stride_v_cache_scale_1=stride_v_cache_scale_1,
                 block_table_stride=block_table_stride_0,
                 HEAD_SIZE=head_size_v,
-                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_v),
+                HEAD_SIZE_PADDED=HEAD_SIZE_V_PADDED,
                 query_start_len_ptr=cu_seqlens_q,
                 BLOCK_Q=BLOCK_Q,
+                segm_out_stride_tok=segm_output.stride(0),
+                segm_out_stride_head=segm_output.stride(1),
+                segm_stat_stride_tok=segm_max.stride(0),
+                segm_stat_stride_head=segm_max.stride(1),
                 OUTPUT_FP8=output_scale is not None,
                 SAGE_MXFP4=sage_mxfp4,
                 **eff_reduce,

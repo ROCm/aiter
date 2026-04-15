@@ -21,9 +21,16 @@ UNIFIED_ATTN_AUTOTUNE = os.environ.get(
 
 # Parameters managed by @triton.autotune — callers must NOT pass these when
 # the decorator is active.
-_AUTOTUNE_2D_PARAMS = frozenset({"TILE_SIZE", "PRELOAD_V", "num_warps", "num_stages"})
-_AUTOTUNE_3D_PARAMS = frozenset({"TILE_SIZE", "PRELOAD_V", "num_warps", "num_stages"})
-_AUTOTUNE_REDUCE_PARAMS = frozenset({"num_warps", "num_stages"})
+_AUTOTUNE_2D_PARAMS = frozenset({
+    "TILE_SIZE", "PRELOAD_V", "waves_per_eu", "num_warps", "num_stages",
+})
+_AUTOTUNE_3D_PARAMS = frozenset({
+    "TILE_SIZE", "PRELOAD_V", "NUM_SEGMENTS_PER_SEQ", "waves_per_eu",
+    "num_warps", "num_stages",
+})
+_AUTOTUNE_REDUCE_PARAMS = frozenset({
+    "waves_per_eu", "num_warps", "num_stages",
+})
 
 
 def _get_2d_autotune_configs():
@@ -32,10 +39,12 @@ def _get_2d_autotune_configs():
         for pv in [False, True]:
             for nw in [4, 8]:
                 for ns in [1, 2, 3]:
-                    configs.append(triton.Config(
-                        {"TILE_SIZE": ts, "PRELOAD_V": pv},
-                        num_warps=nw, num_stages=ns,
-                    ))
+                    for wpe in [1, 2, 4]:
+                        configs.append(triton.Config(
+                            {"TILE_SIZE": ts, "PRELOAD_V": pv,
+                             "waves_per_eu": wpe},
+                            num_warps=nw, num_stages=ns,
+                        ))
     return configs
 
 
@@ -43,12 +52,16 @@ def _get_3d_autotune_configs():
     configs = []
     for ts in [32, 64]:
         for pv in [False, True]:
-            for nw in [2, 4, 8]:
-                for ns in [1, 2, 3]:
-                    configs.append(triton.Config(
-                        {"TILE_SIZE": ts, "PRELOAD_V": pv},
-                        num_warps=nw, num_stages=ns,
-                    ))
+            for nseg in [8, 16, 32, 64, 128]:
+                for nw in [2, 4, 8]:
+                    for ns in [1, 2, 3]:
+                        for wpe in [1, 2, 4]:
+                            configs.append(triton.Config(
+                                {"TILE_SIZE": ts, "PRELOAD_V": pv,
+                                 "NUM_SEGMENTS_PER_SEQ": nseg,
+                                 "waves_per_eu": wpe},
+                                num_warps=nw, num_stages=ns,
+                            ))
     return configs
 
 
@@ -56,9 +69,11 @@ def _get_reduce_autotune_configs():
     configs = []
     for nw in [1, 2, 4]:
         for ns in [1, 2]:
-            configs.append(triton.Config(
-                {}, num_warps=nw, num_stages=ns,
-            ))
+            for wpe in [1, 2, 4]:
+                configs.append(triton.Config(
+                    {"waves_per_eu": wpe},
+                    num_warps=nw, num_stages=ns,
+                ))
     return configs
 
 
@@ -1152,6 +1167,10 @@ def kernel_unified_attention_3d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    segm_out_stride_tok: tl.constexpr,  # segm_output.stride(0)
+    segm_out_stride_head: tl.constexpr,  # segm_output.stride(1)
+    segm_stat_stride_tok: tl.constexpr,  # segm_max.stride(0)
+    segm_stat_stride_head: tl.constexpr,  # segm_max.stride(1)
     ALL_DECODE: tl.constexpr = False,  # bool
     SAGE_MXFP4: tl.constexpr = False,  # bool
     PRELOAD_V: tl.constexpr = True,  # bool
@@ -1502,9 +1521,8 @@ def kernel_unified_attention_3d(
         )
 
     segm_output_offset = (
-        query_offset_0[:, None].to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
-        + query_offset_1[:, None] * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_V_PADDED)
+        query_offset_0[:, None].to(tl.int64) * segm_out_stride_tok
+        + query_offset_1[:, None] * segm_out_stride_head
         + segm_idx * HEAD_SIZE_V_PADDED
         + tl.arange(0, HEAD_SIZE_V_PADDED)[None, :]
     )
@@ -1514,8 +1532,8 @@ def kernel_unified_attention_3d(
         mask=dim_mask_v[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
     )
     segm_offset = (
-        query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+        query_offset_0.to(tl.int64) * segm_stat_stride_tok
+        + query_offset_1 * segm_stat_stride_head
         + segm_idx
     )
     tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
@@ -1546,6 +1564,10 @@ def reduce_segments(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+    segm_out_stride_tok: tl.constexpr,  # segm_output.stride(0)
+    segm_out_stride_head: tl.constexpr,  # segm_output.stride(1)
+    segm_stat_stride_tok: tl.constexpr,  # segm_max.stride(0)
+    segm_stat_stride_head: tl.constexpr,  # segm_max.stride(1)
     OUTPUT_FP8: tl.constexpr,  # bool
     SAGE_MXFP4: tl.constexpr = False,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
@@ -1579,8 +1601,8 @@ def reduce_segments(
 
     # load segment maxima
     segm_offset = (
-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+        query_token_idx.to(tl.int64) * segm_stat_stride_tok
+        + query_head_idx * segm_stat_stride_head
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
@@ -1593,9 +1615,8 @@ def reduce_segments(
 
     # load, rescale, and add segment attention outputs
     segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        query_token_idx.to(tl.int64) * segm_out_stride_tok
+        + query_head_idx * segm_out_stride_head
         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
         + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
     )
@@ -1643,12 +1664,14 @@ def reduce_segments(
 if UNIFIED_ATTN_AUTOTUNE:
     _2d_autotuner = triton.autotune(
         configs=_get_2d_autotune_configs(),
-        key=["HEAD_SIZE", "HEAD_SIZE_V", "BLOCK_SIZE", "ALL_DECODE"],
+        key=["HEAD_SIZE", "HEAD_SIZE_V", "BLOCK_SIZE", "ALL_DECODE",
+             "BLOCK_M", "BLOCK_Q"],
     )(kernel_unified_attention_2d)
 
     _3d_autotuner = triton.autotune(
         configs=_get_3d_autotune_configs(),
-        key=["HEAD_SIZE", "HEAD_SIZE_V", "BLOCK_SIZE"],
+        key=["HEAD_SIZE", "HEAD_SIZE_V", "BLOCK_SIZE",
+             "BLOCK_M", "BLOCK_Q"],
     )(kernel_unified_attention_3d)
 
     _reduce_autotuner = triton.autotune(
