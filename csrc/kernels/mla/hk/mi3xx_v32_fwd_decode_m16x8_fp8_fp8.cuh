@@ -127,7 +127,7 @@ __device__ __forceinline__ comp_t max_8()
 
 template <typename T>
 __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
-    amdgpu_num_vgpr(72))) void kn_mla_v32_fwd_decode_h128_fp8_fp8(HkMlaDecodeFwdParams<T> params)
+    amdgpu_num_vgpr(72))) void kn_mla_v32_fwd_decode_m16x8_fp8_fp8(HkMlaDecodeFwdParams<T> params)
 {
     using q_t     = T::q_t;
     using kv_t    = T::kv_t;
@@ -693,19 +693,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 }
 
 template <typename Traits>
-void mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
-                                     torch::Tensor& kv_buffer,
-                                     const torch::Tensor& qo_indptr,
-                                     const torch::Tensor& kv_indptr,
-                                     const torch::Tensor& kv_page_indices,
-                                     const torch::Tensor& kv_last_page_lens,
-                                     const torch::Tensor& work_indptr,
-                                     const torch::Tensor& work_info_set,
-                                     const int max_seqlen_q,
-                                     const float softmax_scale,
-                                     torch::Tensor& split_output,
-                                     torch::Tensor& split_lse,
-                                     torch::Tensor& final_output)
+void mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
+                                      torch::Tensor& kv_buffer,
+                                      const torch::Tensor& qo_indptr,
+                                      const torch::Tensor& kv_indptr,
+                                      const torch::Tensor& kv_page_indices,
+                                      const torch::Tensor& kv_last_page_lens,
+                                      const torch::Tensor& work_indptr,
+                                      const torch::Tensor& work_info_set,
+                                      const int max_seqlen_q,
+                                      const float softmax_scale,
+                                      torch::Tensor& split_output,
+                                      torch::Tensor& split_lse,
+                                      torch::Tensor& final_output)
 {
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
@@ -756,23 +756,23 @@ void mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
     const dim3 grid        = dim3(dev_prop.multiProcessorCount);
     const int32_t lds_size = dev_prop.maxSharedMemoryPerMultiProcessor / Traits::kOccupancy;
 
-    kn_mla_v32_fwd_decode_h128_fp8_fp8<Traits>
+    kn_mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>
         <<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
 }
 
-void hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
-                                              torch::Tensor& kv_buffer,
-                                              const torch::Tensor& qo_indptr,
-                                              const torch::Tensor& kv_indptr,
-                                              const torch::Tensor& kv_page_indices,
-                                              const torch::Tensor& kv_last_page_lens,
-                                              const torch::Tensor& work_indptr,
-                                              const torch::Tensor& work_info_set,
-                                              const int max_seqlen_q,
-                                              const float softmax_scale,
-                                              torch::Tensor& split_output,
-                                              torch::Tensor& split_lse,
-                                              torch::Tensor& final_output)
+void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
+                                               torch::Tensor& kv_buffer,
+                                               const torch::Tensor& qo_indptr,
+                                               const torch::Tensor& kv_indptr,
+                                               const torch::Tensor& kv_page_indices,
+                                               const torch::Tensor& kv_last_page_lens,
+                                               const torch::Tensor& work_indptr,
+                                               const torch::Tensor& work_info_set,
+                                               const int max_seqlen_q,
+                                               const float softmax_scale,
+                                               torch::Tensor& split_output,
+                                               torch::Tensor& split_lse,
+                                               torch::Tensor& final_output)
 {
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(final_output));
 
@@ -786,24 +786,24 @@ void hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(torch::Tensor& query,
     if(q_is_fp8 && kv_is_fp8)
     {
         using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16, 128>;
-        mla_v32_fwd_decode_h128_fp8_fp8<Traits>(query,
-                                                kv_buffer,
-                                                qo_indptr,
-                                                kv_indptr,
-                                                kv_page_indices,
-                                                kv_last_page_lens,
-                                                work_indptr,
-                                                work_info_set,
-                                                max_seqlen_q,
-                                                softmax_scale,
-                                                split_output,
-                                                split_lse,
-                                                final_output);
+        mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>(query,
+                                                 kv_buffer,
+                                                 qo_indptr,
+                                                 kv_indptr,
+                                                 kv_page_indices,
+                                                 kv_last_page_lens,
+                                                 work_indptr,
+                                                 work_info_set,
+                                                 max_seqlen_q,
+                                                 softmax_scale,
+                                                 split_output,
+                                                 split_lse,
+                                                 final_output);
     }
     else
     {
         TORCH_CHECK(false,
-                    "hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8 doesn't support q type ",
+                    "hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8 doesn't support q type ",
                     toString(query.scalar_type()),
                     " and kv type",
                     toString(kv_buffer.scalar_type()),

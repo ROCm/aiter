@@ -2,7 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "mla.h"
-#include "hk/mi3xx_v32_fwd_decode_h128_fp8_fp8.cuh"
+#include "hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh"
 
 void hk_mla_decode_fwd(
     torch::Tensor& query,
@@ -23,7 +23,7 @@ void hk_mla_decode_fwd(
 
     if (num_head == 128)
     {
-        hk_mi3xx_mla_v32_fwd_decode_h128_fp8_fp8(
+        hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
             query,
             kv_buffer,
             qo_indptr,
