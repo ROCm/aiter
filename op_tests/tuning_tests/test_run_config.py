@@ -18,7 +18,9 @@ import csv
 import subprocess
 import unittest
 
-AITER_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+AITER_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
 MODEL_CONFIGS_DIR = os.path.join(CONFIGS_DIR, "model_configs")
 
@@ -35,6 +37,7 @@ TUNE_TEST_CONFIG = os.environ.get("TUNE_TEST_CONFIG")
 def _gpu_available():
     try:
         import torch
+
         return torch.cuda.is_available() and torch.cuda.device_count() > 0
     except ImportError:
         return False
@@ -47,7 +50,12 @@ def _find_tuned_csvs(pattern):
         if not os.path.isdir(d):
             continue
         for f in sorted(os.listdir(d)):
-            if pattern in f and "tuned" in f and "untuned" not in f and f.endswith(".csv"):
+            if (
+                pattern in f
+                and "tuned" in f
+                and "untuned" not in f
+                and f.endswith(".csv")
+            ):
                 found.append(os.path.join(d, f))
     return found
 
@@ -57,20 +65,31 @@ def _merge_config_paths(csv_list):
     return os.pathsep.join(csv_list)
 
 
-def _run_config(script, config_csv, timeout=600):
+def _run_config(script, config_csv, timeout=600, extra_args=None):
     """Run tuner with --run_config <tuned_csv> and return result."""
     cmd = [
-        sys.executable, os.path.join(AITER_ROOT, script),
-        "--run_config", config_csv,
-        "--warmup", "2", "--iters", "5",
+        sys.executable,
+        os.path.join(AITER_ROOT, script),
+        "--run_config",
+        config_csv,
+        "--warmup",
+        "2",
+        "--iters",
+        "5",
     ]
+    if extra_args:
+        cmd.extend(extra_args)
     env = os.environ.copy()
     script_dir = os.path.dirname(os.path.join(AITER_ROOT, script))
     env["PYTHONPATH"] = script_dir + ":" + env.get("PYTHONPATH", "")
     try:
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=AITER_ROOT, env=env,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=AITER_ROOT,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise AssertionError(
@@ -90,12 +109,23 @@ TUNER_FAMILIES = {
     "a8w8_bpreshuffle": {
         "script": "csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py",
         "csv_pattern": "a8w8_bpreshuffle_tuned_gemm",
-        "exclude_patterns": [],
+        "exclude_patterns": ["blockscale"],
     },
     "a8w8_blockscale": {
         "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
         "csv_pattern": "a8w8_blockscale_tuned_gemm",
         "exclude_patterns": ["bpreshuffle", "fmoe"],
+    },
+    "a8w8_blockscale_bpreshuffle": {
+        "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
+        "csv_pattern": "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        "exclude_patterns": ["fmoe"],
+        "extra_args": ["--preshuffle"],
+    },
+    "a4w4_blockscale": {
+        "script": "csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py",
+        "csv_pattern": "a4w4_blockscale_tuned_gemm",
+        "exclude_patterns": [],
     },
     "batched_a8w8": {
         "script": "csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py",
@@ -127,15 +157,20 @@ class TestRunConfig(unittest.TestCase):
         timeout = cfg.get("timeout", 600)
 
         csvs = _find_tuned_csvs(pattern)
-        csvs = [c for c in csvs if not any(ex in os.path.basename(c) for ex in excludes)]
+        csvs = [
+            c for c in csvs if not any(ex in os.path.basename(c) for ex in excludes)
+        ]
 
         if not csvs:
             self.skipTest(f"No tuned CSVs found for {name} (pattern={pattern})")
 
         merged = _merge_config_paths(csvs)
         csv_names = [os.path.basename(c) for c in csvs]
+        extra_args = cfg.get("extra_args", None)
 
-        result = _run_config(cfg["script"], merged, timeout=timeout)
+        result = _run_config(
+            cfg["script"], merged, timeout=timeout, extra_args=extra_args
+        )
 
         output = result.stdout + result.stderr
         if result.returncode != 0:
@@ -144,8 +179,9 @@ class TestRunConfig(unittest.TestCase):
             print(f"STDOUT (last 2000):\n{result.stdout[-2000:]}")
             print(f"STDERR (last 2000):\n{result.stderr[-2000:]}")
 
-        self.assertEqual(result.returncode, 0,
-                         f"{name} run_config failed (csvs={csv_names})")
+        self.assertEqual(
+            result.returncode, 0, f"{name} run_config failed (csvs={csv_names})"
+        )
 
         # Parse benchmark result lines from the table output.
         # Status column shows: OK, ERROR, MISMATCH
@@ -164,16 +200,19 @@ class TestRunConfig(unittest.TestCase):
         failures = []
         if error_shapes:
             failures.append(
-                f"Errors ({len(error_shapes)} shapes):\n" +
-                "\n".join(error_shapes[:20]))
+                f"Errors ({len(error_shapes)} shapes):\n" + "\n".join(error_shapes[:20])
+            )
         if mismatch_shapes:
             failures.append(
-                f"Accuracy mismatches ({len(mismatch_shapes)} shapes):\n" +
-                "\n".join(mismatch_shapes[:20]))
+                f"Accuracy mismatches ({len(mismatch_shapes)} shapes):\n"
+                + "\n".join(mismatch_shapes[:20])
+            )
 
-        self.assertEqual(len(failures), 0,
-                         f"{name} run_config issues (csvs={csv_names}):\n" +
-                         "\n".join(failures))
+        self.assertEqual(
+            len(failures),
+            0,
+            f"{name} run_config issues (csvs={csv_names}):\n" + "\n".join(failures),
+        )
 
     def test_a8w8(self):
         self._test_family("a8w8")
@@ -183,6 +222,12 @@ class TestRunConfig(unittest.TestCase):
 
     def test_a8w8_blockscale(self):
         self._test_family("a8w8_blockscale")
+
+    def test_a8w8_blockscale_bpreshuffle(self):
+        self._test_family("a8w8_blockscale_bpreshuffle")
+
+    def test_a4w4_blockscale(self):
+        self._test_family("a4w4_blockscale")
 
     def test_batched_a8w8(self):
         self._test_family("batched_a8w8")
@@ -195,8 +240,10 @@ class TestRunConfig(unittest.TestCase):
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
-@unittest.skipUnless(TUNE_TEST_FAMILY and TUNE_TEST_CONFIG,
-                     "Set TUNE_TEST_FAMILY and TUNE_TEST_CONFIG to run")
+@unittest.skipUnless(
+    TUNE_TEST_FAMILY and TUNE_TEST_CONFIG,
+    "Set TUNE_TEST_FAMILY and TUNE_TEST_CONFIG to run",
+)
 class TestRunConfigCustom(unittest.TestCase):
     """Run --run_config with user-specified family and config CSV.
 
@@ -214,8 +261,11 @@ class TestRunConfigCustom(unittest.TestCase):
     def test_custom(self):
         family = TUNE_TEST_FAMILY
         config = TUNE_TEST_CONFIG
-        self.assertIn(family, TUNER_FAMILIES,
-                      f"Unknown family '{family}'. Available: {list(TUNER_FAMILIES.keys())}")
+        self.assertIn(
+            family,
+            TUNER_FAMILIES,
+            f"Unknown family '{family}'. Available: {list(TUNER_FAMILIES.keys())}",
+        )
         cfg = TUNER_FAMILIES[family]
         timeout = cfg.get("timeout", 600)
 
@@ -231,7 +281,9 @@ class TestRunConfigCustom(unittest.TestCase):
             resolved.append(p)
         merged = os.pathsep.join(resolved)
 
-        print(f"\nRunning {family} --run_config with: {[os.path.basename(p) for p in resolved]}")
+        print(
+            f"\nRunning {family} --run_config with: {[os.path.basename(p) for p in resolved]}"
+        )
         result = _run_config(cfg["script"], merged, timeout=timeout)
 
         output = result.stdout + result.stderr
@@ -255,15 +307,17 @@ class TestRunConfigCustom(unittest.TestCase):
         failures = []
         if error_shapes:
             failures.append(
-                f"Errors ({len(error_shapes)} shapes):\n" +
-                "\n".join(error_shapes[:20]))
+                f"Errors ({len(error_shapes)} shapes):\n" + "\n".join(error_shapes[:20])
+            )
         if mismatch_shapes:
             failures.append(
-                f"Accuracy mismatches ({len(mismatch_shapes)} shapes):\n" +
-                "\n".join(mismatch_shapes[:20]))
+                f"Accuracy mismatches ({len(mismatch_shapes)} shapes):\n"
+                + "\n".join(mismatch_shapes[:20])
+            )
 
-        self.assertEqual(len(failures), 0,
-                         f"{family} run_config issues:\n" + "\n".join(failures))
+        self.assertEqual(
+            len(failures), 0, f"{family} run_config issues:\n" + "\n".join(failures)
+        )
 
 
 if __name__ == "__main__":

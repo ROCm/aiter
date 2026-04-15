@@ -12,6 +12,22 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes, verify output CSV |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
 
+## Tuner family coverage
+
+| Family | Tuner script | Tuned CSVs validated | run_config | pipeline |
+|--------|-------------|---------------------|------------|----------|
+| `a8w8` | `csrc/ck_gemm_a8w8/gemm_a8w8_tune.py` | `a8w8_tuned_gemm.csv` | ✓ | ✓ (int8+fp8) |
+| `a8w8_bpreshuffle` | `csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py` | `a8w8_bpreshuffle_tuned_gemm*.csv` | ✓ | ✓ (int8+fp8) |
+| `a8w8_blockscale` | `csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py` | `a8w8_blockscale_tuned_gemm*.csv` | ✓ | ✓ + shape_grouped |
+| `a8w8_blockscale_bpreshuffle` | same + `--preshuffle` | `a8w8_blockscale_bpreshuffle_tuned_gemm*.csv` | ✓ | — |
+| `a4w4_blockscale` | `csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py` | `a4w4_blockscale_tuned_gemm*.csv` | ✓ | — |
+| `batched_a8w8` | `csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py` | `a8w8_tuned_batched_gemm.csv` | ✓ | ✓ |
+| `batched_bf16` | `csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py` | `bf16_tuned_batched_gemm.csv` | ✓ | ✓ + shape_grouped |
+| `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
+| `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | — | ✓ (hipBLASLt/ASM/FlyDSL) |
+
+`test_run_config` auto-discovers tuned CSVs from both `aiter/configs/` and `aiter/configs/model_configs/`, merges them per family.
+
 ## Running
 
 ```bash
@@ -50,12 +66,12 @@ TUNE_TEST_FAMILY=fmoe \
 TUNE_TEST_CONFIG="aiter/configs/tuned_fmoe.csv" \
 python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
 
-# bpreshuffle with model-specific config
-TUNE_TEST_FAMILY=a8w8_bpreshuffle \
-TUNE_TEST_CONFIG="aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv:aiter/configs/a8w8_bpreshuffle_tuned_gemm1.csv" \
+# blockscale with preshuffle
+TUNE_TEST_FAMILY=a8w8_blockscale_bpreshuffle \
+TUNE_TEST_CONFIG="aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv" \
 python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
 ```
 
-Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`
+Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`
 
 The test checks both **exit code** and **per-shape status** — shapes with `ERROR` (kernel crash) or `MISMATCH` (accuracy exceeded errRatio) will fail the test.

@@ -15,12 +15,15 @@ import subprocess
 import unittest
 import pandas as pd
 
-AITER_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+AITER_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 
 
 def _gpu_available():
     try:
         import torch
+
         return torch.cuda.is_available() and torch.cuda.device_count() > 0
     except ImportError:
         return False
@@ -30,6 +33,7 @@ def _get_platform_dtypes():
     """Return (fp8_str, quant_type_str) based on GPU arch."""
     try:
         from aiter.jit.utils.chip_info import get_gfx
+
         gfx = get_gfx()
     except Exception:
         gfx = "gfx942"
@@ -49,9 +53,18 @@ def _write_csv(path, header, rows):
 
 def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300):
     cmd = [
-        sys.executable, os.path.join(AITER_ROOT, script),
-        "-i", untuned, "-o", tuned,
-        "--mp", "1", "--warmup", "2", "--iters", "5",
+        sys.executable,
+        os.path.join(AITER_ROOT, script),
+        "-i",
+        untuned,
+        "-o",
+        tuned,
+        "--mp",
+        "1",
+        "--warmup",
+        "2",
+        "--iters",
+        "5",
     ]
     if extra_args:
         cmd.extend(extra_args)
@@ -60,8 +73,12 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300):
     env["PYTHONPATH"] = script_dir + ":" + env.get("PYTHONPATH", "")
     try:
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            cwd=AITER_ROOT, env=env,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=AITER_ROOT,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise AssertionError(
@@ -119,43 +136,133 @@ class TestTunePipeline(unittest.TestCase):
             "fmoe": {
                 "script": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
                 "header": [
-                    "token", "model_dim", "inter_dim", "expert", "topk",
-                    "act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type",
-                    "use_g1u1", "doweight_stage1",
+                    "token",
+                    "model_dim",
+                    "inter_dim",
+                    "expert",
+                    "topk",
+                    "act_type",
+                    "dtype",
+                    "q_dtype_a",
+                    "q_dtype_w",
+                    "q_type",
+                    "use_g1u1",
+                    "doweight_stage1",
                 ],
                 "shapes": [
                     # bf16 (no quant)
-                    (512, 6144, 4096, 8, 2,
-                     "ActivationType.Silu", "torch.bfloat16",
-                     "torch.bfloat16", "torch.bfloat16", "QuantType.No", 1, 0),
+                    (
+                        512,
+                        6144,
+                        4096,
+                        8,
+                        2,
+                        "ActivationType.Silu",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "QuantType.No",
+                        1,
+                        0,
+                    ),
                     # fp8 per-token (platform-aware)
-                    (16, 7168, 256, 256, 8,
-                     "ActivationType.Silu", "torch.bfloat16",
-                     fp8, fp8, qtype, 1, 0),
+                    (
+                        16,
+                        7168,
+                        256,
+                        256,
+                        8,
+                        "ActivationType.Silu",
+                        "torch.bfloat16",
+                        fp8,
+                        fp8,
+                        qtype,
+                        1,
+                        0,
+                    ),
                     # int8 per-tensor
-                    (512, 6144, 4096, 8, 2,
-                     "ActivationType.Silu", "torch.bfloat16",
-                     "torch.int8", "torch.int8", "QuantType.per_Tensor", 1, 0),
+                    (
+                        512,
+                        6144,
+                        4096,
+                        8,
+                        2,
+                        "ActivationType.Silu",
+                        "torch.bfloat16",
+                        "torch.int8",
+                        "torch.int8",
+                        "QuantType.per_Tensor",
+                        1,
+                        0,
+                    ),
                     # Gelu activation + doweight_stage1
-                    (4, 2304, 1536, 8, 2,
-                     "ActivationType.Gelu", "torch.bfloat16",
-                     fp8, fp8, qtype, 1, 1),
+                    (
+                        4,
+                        2304,
+                        1536,
+                        8,
+                        2,
+                        "ActivationType.Gelu",
+                        "torch.bfloat16",
+                        fp8,
+                        fp8,
+                        qtype,
+                        1,
+                        1,
+                    ),
                 ],
                 "keys": [
-                    "cu_num", "token", "model_dim", "inter_dim", "expert", "topk",
-                    "act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type",
-                    "use_g1u1", "doweight_stage1",
+                    "cu_num",
+                    "token",
+                    "model_dim",
+                    "inter_dim",
+                    "expert",
+                    "topk",
+                    "act_type",
+                    "dtype",
+                    "q_dtype_a",
+                    "q_dtype_w",
+                    "q_type",
+                    "use_g1u1",
+                    "doweight_stage1",
                 ],
                 "timeout": 600,
             },
             "gradlib_bf16": {
                 "script": "gradlib/gradlib/gemm_tuner.py",
-                "header": ["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB", "bpreshuffle"],
+                "header": [
+                    "M",
+                    "N",
+                    "K",
+                    "bias",
+                    "dtype",
+                    "outdtype",
+                    "scaleAB",
+                    "bpreshuffle",
+                ],
                 "shapes": [
                     # decode (M=1): hipBLASLt/ASM typically wins
-                    (1, 1024, 512, "False", "torch.bfloat16", "torch.float32", "False", "False"),
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
                     # prefill (large M): FlyDSL has a chance to win
-                    (512, 5120, 1280, "False", "torch.bfloat16", "torch.bfloat16", "False", "False"),
+                    (
+                        512,
+                        5120,
+                        1280,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "False",
+                        "False",
+                    ),
                 ],
                 "keys": ["M", "N", "K"],
                 "timeout": 600,
@@ -174,14 +281,20 @@ class TestTunePipeline(unittest.TestCase):
             if result.returncode != 0:
                 print(f"\n=== {name} STDOUT ===\n{result.stdout[-2000:]}")
                 print(f"\n=== {name} STDERR ===\n{result.stderr[-2000:]}")
-            self.assertEqual(result.returncode, 0,
-                             f"{name} tuner exited with code {result.returncode}")
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"{name} tuner exited with code {result.returncode}",
+            )
             self.assertTrue(os.path.exists(tuned), f"{name}: tuned CSV not created")
 
             df = pd.read_csv(tuned)
             df.columns = df.columns.str.strip()
-            self.assertGreaterEqual(len(df), len(cfg["shapes"]),
-                                    f"{name}: expected >= {len(cfg['shapes'])} rows")
+            self.assertGreaterEqual(
+                len(df),
+                len(cfg["shapes"]),
+                f"{name}: expected >= {len(cfg['shapes'])} rows",
+            )
             for key in cfg["keys"]:
                 self.assertIn(key, df.columns, f"{name}: missing column {key}")
             for _, row in df.iterrows():
@@ -258,27 +371,39 @@ class TestShapeGrouped(unittest.TestCase):
             profile = os.path.join(tmp, "profile.csv")
             _write_csv(untuned, cfg["header"], cfg["shapes"])
 
-            r_ref = _run_tuner(cfg["script"], untuned, tuned_ref,
-                               extra_args=["-o2", profile_ref])
-            self.assertEqual(r_ref.returncode, 0,
-                             f"{name} ref tuner failed:\n{r_ref.stderr[-1000:]}")
+            r_ref = _run_tuner(
+                cfg["script"], untuned, tuned_ref, extra_args=["-o2", profile_ref]
+            )
+            self.assertEqual(
+                r_ref.returncode, 0, f"{name} ref tuner failed:\n{r_ref.stderr[-1000:]}"
+            )
 
-            r = _run_tuner(cfg["script"], untuned, tuned,
-                           extra_args=["--shape_grouped", "-o2", profile])
+            r = _run_tuner(
+                cfg["script"],
+                untuned,
+                tuned,
+                extra_args=["--shape_grouped", "-o2", profile],
+            )
             if r.returncode != 0:
                 print(f"\n=== {name} grouped STDERR ===\n{r.stderr[-2000:]}")
             self.assertEqual(r.returncode, 0, f"{name} grouped tuner failed")
 
             df = pd.read_csv(tuned)
             df.columns = df.columns.str.strip()
-            self.assertEqual(len(df), num_shapes,
-                             f"{name}: expected {num_shapes} tuned rows, got {len(df)}")
+            self.assertEqual(
+                len(df),
+                num_shapes,
+                f"{name}: expected {num_shapes} tuned rows, got {len(df)}",
+            )
 
             if os.path.exists(profile) and os.path.exists(profile_ref):
                 prof = pd.read_csv(profile)
                 prof_ref = pd.read_csv(profile_ref)
-                self.assertEqual(len(prof), len(prof_ref),
-                                 f"{name}: profile rows grouped={len(prof)} vs ref={len(prof_ref)}")
+                self.assertEqual(
+                    len(prof),
+                    len(prof_ref),
+                    f"{name}: profile rows grouped={len(prof)} vs ref={len(prof_ref)}",
+                )
 
     def test_a8w8_blockscale(self):
         self._run_grouped_vs_ref("a8w8_blockscale")
