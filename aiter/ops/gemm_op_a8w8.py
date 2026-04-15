@@ -497,8 +497,7 @@ def gemm_a8w8_ASM(
     ):
         assert (
             bias is not None
-        ), "Use asm gemm must give bias, please give a \
-            bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        ), "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
