@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""AOT pre-compilation for FlyDSL GEMM kernels from aiter tuned CSV configs.
+
+Reads tuned GEMM CSV config files, extracts all unique FlyDSL kernel entries,
+and pre-compiles them into the FlyDSL cache.
+
+Supported kernel families:
+  - ``flydsl_gemm2_*``           split-K HGEMM kernels
+  - ``flydsl_bpreshuflle_*``     a8w8 preshuffle GEMM kernels
+
+Usage:
+    # Compile all unique FlyDSL GEMM kernels from default CSVs
+    python -m aiter.aot.flydsl.gemm
+
+    # Custom CSV file(s)
+    python -m aiter.aot.flydsl.gemm --csv /path/to/config1.csv /path/to/config2.csv
+
+Environment variables:
+    FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
+    GPU_ARCHS / ARCH          Target GPU architecture information for logging.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+import time
+from typing import Dict, Optional
+
+from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+from aiter.ops.flydsl.kernels.splitk_hgemm import compile_hgemm_kernel
+
+_CONFIGS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "../../configs/model_configs"
+)
+_ROOT_CONFIGS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "../../configs"
+)
+
+DEFAULT_CSVS = [
+    os.path.join(_ROOT_CONFIGS_DIR, "a8w8_bpreshuffle_tuned_gemm.csv"),
+    os.path.join(_CONFIGS_DIR, "a8w8_bpreshuffle_tuned_gemm_dsv3.csv"),
+    os.path.join(_CONFIGS_DIR, "kimik2_bf16_tuned_gemm.csv"),
+]
+
+_PRESHUFFLE_RE = re.compile(
+    r"^flydsl_bpreshuflle_"
+    r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
+    r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
+    r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)_"
+    r"(?P<scheduler>[A-Za-z0-9_]+)$"
+)
+_HGEMM_RE = re.compile(
+    r"^flydsl_gemm(?P<stage>\d+)_"
+    r"a(?P<a_dtype>[a-z0-9]+)_w(?P<w_dtype>[a-z0-9]+)_(?P<out_dtype>[a-z0-9]+)_"
+    r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
+    r"split_k(?P<split_k>\d+)_"
+    r"block_m_warp(?P<block_m_warps>\d+)_"
+    r"block_n_warp(?P<block_n_warps>\d+)_"
+    r"async_copy(?P<async_copy>True|False)_"
+    r"b_to_lds(?P<b_to_lds>True|False)_"
+    r"b_preshuffle(?P<b_preshuffle>True|False)_"
+    r"c_to_lds(?P<c_to_lds>True|False)_"
+    r"(?P<target_gfx>gfx[0-9a-z]+)$"
+)
+_SHORT_DTYPE = {
+    "F8": "fp8",
+    "I8": "int8",
+    "B16": "bf16",
+    "F16": "fp16",
+}
+
+
+def _parse_bool(value: str) -> bool:
+    if value == "True":
+        return True
+    if value == "False":
+        return False
+    raise ValueError(f"Expected True/False, got {value!r}")
+
+
+def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
+    m = _PRESHUFFLE_RE.fullmatch(name)
+    if m is None:
+        return None
+
+    qa = _SHORT_DTYPE.get(m.group("qa"))
+    qw = _SHORT_DTYPE.get(m.group("qw"))
+    out = _SHORT_DTYPE.get(m.group("out"))
+    if qa is None or qw is None or out is None:
+        return None
+    if qa != qw:
+        raise ValueError(
+            f"Unsupported mixed preshuffle input dtypes in {name!r}: {qa} vs {qw}"
+        )
+
+    return {
+        "kind": "preshuffle",
+        "tile_m": int(m.group("tile_m")),
+        "tile_n": int(m.group("tile_n")),
+        "tile_k": int(m.group("tile_k")),
+        "in_dtype": qa,
+        "out_dtype": out,
+        "lds_stage": int(m.group("lds_stage")),
+        "use_cshuffle_epilog": int(m.group("cshuffle")),
+        "use_async_copy": int(m.group("async_copy")),
+        "waves_per_eu": int(m.group("waves_per_eu")),
+        "scheduler": m.group("scheduler"),
+    }
+
+
+def _parse_hgemm_kernel_name(name: str) -> Optional[Dict]:
+    m = _HGEMM_RE.fullmatch(name)
+    if m is None:
+        return None
+
+    a_dtype = m.group("a_dtype")
+    w_dtype = m.group("w_dtype")
+    if a_dtype != w_dtype:
+        raise ValueError(
+            f"Unsupported mixed HGEMM input dtypes in {name!r}: {a_dtype} vs {w_dtype}"
+        )
+
+    return {
+        "kind": "hgemm",
+        "stage": int(m.group("stage")),
+        "dtype": a_dtype,
+        "out_dtype": m.group("out_dtype"),
+        "tile_m": int(m.group("tile_m")),
+        "tile_n": int(m.group("tile_n")),
+        "tile_k": int(m.group("tile_k")),
+        "split_k": int(m.group("split_k")),
+        "block_m_warps": int(m.group("block_m_warps")),
+        "block_n_warps": int(m.group("block_n_warps")),
+        "async_copy": _parse_bool(m.group("async_copy")),
+        "b_to_lds": _parse_bool(m.group("b_to_lds")),
+        "b_preshuffle": _parse_bool(m.group("b_preshuffle")),
+        "c_to_lds": _parse_bool(m.group("c_to_lds")),
+        "target_gfx": m.group("target_gfx"),
+    }
+
+
+def parse_csv(csv_path: str):
+    """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
+    jobs = []
+    seen = set()
+
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            kernel_name = row.get("kernelName", "").strip()
+            libtype = row.get("libtype", "").strip()
+            if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
+                continue
+
+            m = int(row["M"])
+            n = int(row["N"])
+            k = int(row["K"])
+
+            if kernel_name.startswith("flydsl_bpreshuflle_"):
+                params = _parse_preshuffle_kernel_name(kernel_name)
+            elif kernel_name.startswith("flydsl_gemm"):
+                params = _parse_hgemm_kernel_name(kernel_name)
+            else:
+                params = None
+
+            if params is None:
+                print(
+                    f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
+                )
+                continue
+
+            job = {
+                "kernel_name": kernel_name,
+                "m": m,
+                "n": n,
+                "k": k,
+                **params,
+            }
+            key = job_identity(job)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            jobs.append(job)
+
+    return jobs
+
+
+def _torch_dtype_for_kernel(dtype_name: str):
+    import torch
+
+    mapping = {
+        "bf16": torch.bfloat16,
+        "f16": torch.float16,
+        "fp16": torch.float16,
+    }
+    if dtype_name not in mapping:
+        raise ValueError(f"Unsupported torch dtype name for GEMM AOT: {dtype_name!r}")
+    return mapping[dtype_name]
+
+
+def _compile_executable_to_cache(exe, *args) -> None:
+    compile_fn = getattr(exe, "compile", None)
+    if compile_fn is None:
+        import flydsl.compiler as flyc
+
+        compile_fn = flyc.compile
+        args = (exe, *args)
+    with compile_only_env():
+        compile_fn(*args)
+
+
+def _compile_hgemm_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    dtype: str,
+    out_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    split_k: int,
+    block_m_warps: int,
+    block_n_warps: int,
+    async_copy: bool,
+    b_to_lds: bool,
+    b_preshuffle: bool,
+    c_to_lds: bool,
+    target_gfx: str,
+    **kwargs,
+):
+    del kwargs, out_dtype
+
+    import torch
+
+    dev = torch.device("cuda")
+    torch_dtype = _torch_dtype_for_kernel(dtype)
+
+    current_gfx = get_gfx()
+    if target_gfx != current_gfx:
+        print(
+            f"  [WARN] Kernel targets {target_gfx} but current target is {current_gfx}; "
+            "compiling with current target parameters"
+        )
+
+    out = torch.empty((m, n), device=dev, dtype=torch_dtype)
+    a = torch.empty((m, k), device=dev, dtype=torch_dtype)
+    b = torch.empty((n, k), device=dev, dtype=torch_dtype)
+    counter = torch.zeros(
+        (128 * 3,),
+        device=dev,
+        dtype=torch.int32,
+    )
+    stream = torch.cuda.current_stream(device=dev)
+
+    exe = compile_hgemm_kernel(
+        dtype,
+        n,
+        k,
+        TILE_M=tile_m,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        SPLIT_K=split_k,
+        BLOCK_M_WARPS=block_m_warps,
+        BLOCK_N_WARPS=block_n_warps,
+        B_PRE_SHUFFLE=b_preshuffle,
+        B_TO_LDS=b_to_lds,
+    )
+    _compile_executable_to_cache(exe, out, a, b, m, counter, 0, stream)
+
+
+def _compile_preshuffle_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    in_dtype: str,
+    out_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    lds_stage: int,
+    use_cshuffle_epilog: int,
+    use_async_copy: int,
+    waves_per_eu: int,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    dev = torch.device("cuda")
+    out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
+
+    # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
+    a = torch.empty((m * k,), device=dev, dtype=torch.int8)
+    b = torch.empty((n * k,), device=dev, dtype=torch.int8)
+    out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
+    scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
+    scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    stream = torch.cuda.current_stream(device=dev)
+
+    exe = compile_preshuffle_gemm_a8(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype=in_dtype,
+        out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
+        lds_stage=lds_stage,
+        use_cshuffle_epilog=bool(use_cshuffle_epilog),
+        use_async_copy=bool(use_async_copy),
+        waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+    )
+    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, m, n, stream)
+
+
+def compile_one_config(
+    kernel_name: str, kind: str, m: int, n: int, k: int, **kwargs
+) -> dict:
+    """Compile one GEMM kernel configuration and save it to cache."""
+    shape_str = f"{kernel_name}  M={m} N={n} K={k}"
+    result = {
+        "kernel_name": kernel_name,
+        "kind": kind,
+        "shape": shape_str,
+        "compile_time": None,
+    }
+
+    t0 = time.time()
+    try:
+        if kind == "hgemm":
+            _compile_hgemm_to_cache(m=m, n=n, k=k, **kwargs)
+        elif kind == "preshuffle":
+            _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+        else:
+            raise ValueError(f"Unknown GEMM AOT kind: {kind}")
+
+        elapsed = time.time() - t0
+        result["compile_time"] = elapsed
+        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}")
+    except Exception as e:
+        print(f"  [FAIL] compile  {shape_str}: {e}")
+
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AOT pre-compile FlyDSL GEMM kernels from aiter CSV config",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        nargs="+",
+        default=DEFAULT_CSVS,
+        help="Path(s) to tuned CSV config file(s)",
+    )
+    args = parser.parse_args()
+
+    csv_paths = [os.path.abspath(p) for p in args.csv]
+    for csv_path in csv_paths:
+        if not os.path.isfile(csv_path):
+            print(f"Error: CSV file not found: {csv_path}")
+            sys.exit(1)
+
+    cache_dir = os.path.expanduser(
+        os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
+    )
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or get_gfx()
+
+    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
+
+    hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
+    preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
+
+    print("=" * 72)
+    print("FlyDSL GEMM AOT Pre-compilation")
+    print("=" * 72)
+    for csv_path in csv_paths:
+        print(f"  CSV:              {csv_path}")
+    print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
+    print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
+    print(f"  Total jobs:       {len(all_jobs)}")
+    print(f"  Cache dir:        {cache_dir}")
+    print(f"  Target arch:      {arch}")
+    print("=" * 72)
+
+    total_t0 = time.time()
+    results = []
+
+    if hgemm_jobs:
+        print(f"\n--- HGEMM ({len(hgemm_jobs)} kernels) ---")
+        for i, job in enumerate(hgemm_jobs, 1):
+            print(f"\n[{i}/{len(hgemm_jobs)}] ", end="")
+            results.append(compile_one_config(**job))
+
+    if preshuffle_jobs:
+        print(f"\n--- Preshuffle GEMM ({len(preshuffle_jobs)} kernels) ---")
+        for i, job in enumerate(preshuffle_jobs, 1):
+            print(f"\n[{i}/{len(preshuffle_jobs)}] ", end="")
+            results.append(compile_one_config(**job))
+
+    total_elapsed = time.time() - total_t0
+
+    ok = sum(1 for r in results if r["compile_time"] is not None)
+    fail = sum(1 for r in results if r["compile_time"] is None)
+
+    print("\n" + "=" * 72)
+    print("Summary")
+    print("=" * 72)
+    print(f"  Total time:   {total_elapsed:.1f}s")
+    print(f"  Compiled:     {ok} ok, {fail} failed")
+    print(f"  Cache dir:    {cache_dir}")
+    print()
+
+    exit_code = 0
+    if fail > 0:
+        print("Some compilations failed. Check output above for details.")
+        exit_code = 1
+    else:
+        print("All compilations succeeded. Cache is ready.")
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

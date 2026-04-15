@@ -74,11 +74,11 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
     def __call__(self, a_frag, b_frag, c_frag):
         if self.dtype == "bf16":
             return rocdl.mfma_f32_16x16x32_bf16(
-                T.vec(self.WMMA_C_FRAG_VALUES, T.f32), a_frag, b_frag, c_frag, 0, 0, 0
-            ).res
+                T.vec(self.WMMA_C_FRAG_VALUES, T.f32), [a_frag, b_frag, c_frag, 0, 0, 0]
+            )
         return rocdl.mfma_f32_16x16x32_f16(
-            T.vec(self.WMMA_C_FRAG_VALUES, T.f32), a_frag, b_frag, c_frag, 0, 0, 0
-        ).res
+            T.vec(self.WMMA_C_FRAG_VALUES, T.f32), [a_frag, b_frag, c_frag, 0, 0, 0]
+        )
 
 
 class OnlineScheduler:
