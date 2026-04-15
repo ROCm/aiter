@@ -146,9 +146,9 @@ def get_build_targets() -> list[tuple[str, int]]:
     Priority:
       1. GPU_ARCHS set to an explicit non-empty target list → delegate to
          get_build_targets_env() (no GPU needed).
-      2. GPU_ARCHS unset, empty/whitespace, or "native" → detect the live GPU
-         and use actual (gfx, cu_num) from rocminfo, which correctly reflects
-         partition mode and binned variants.
+      2. GPU_ARCHS unset, empty/whitespace, or "native" → call get_gfx()
+         (GPU_ARCHS-aware; falls back to rocminfo when GPU_ARCHS is unset) and
+         get_cu_num(), which correctly reflect partition mode and binned variants.
       3. Neither → raise RuntimeError with a clear message.
     """
     gpu_archs = os.getenv("GPU_ARCHS")

@@ -228,6 +228,8 @@ class AITER_CONFIG(object):
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
                 keys.append("cu_num")
+            if "gfx" in merge_df.columns and "gfx" not in keys:
+                keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():

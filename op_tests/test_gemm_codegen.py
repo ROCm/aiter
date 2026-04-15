@@ -376,6 +376,7 @@ def test_runtime_dispatch_key():
         )
 
     finally:
+        get_CKGEMM_config.cache_clear()
         _mod._CKGEMM_CONFIG_CACHE = {}
         _mod._CKGEMM_HAS_GFX = {}
         for path in [csv_with_gfx, wrong_gfx_csv, old_csv]:

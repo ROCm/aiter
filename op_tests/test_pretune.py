@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(REPO_DIR, "aiter"))
 from utility.pretune import (  # noqa: E402
     _all_tune_modules,
     _make_untune_csv,
+    _parse_module_list,
     _resolve,
     _SCRIPT_FALLBACK,
 )
@@ -333,13 +334,20 @@ def test_parse_pretune_modules():
         ),
     ]
     for env_value, expected in cases:
-        modules = [m.strip() for m in env_value.split(",") if m.strip()]
+        modules = _parse_module_list(env_value, CFG)
         check(f"parse {env_value.strip()!r}", modules == expected, f"got {modules}")
 
-    # "all" expands to every _tune module
+    # "all" expands to every _tune module, excluding _unsupported entries
     all_modules = _all_tune_modules(CFG)
     check("all: count matches EXPECTED", len(all_modules) == len(EXPECTED))
     check("all: set matches EXPECTED", set(all_modules) == {e[0] for e in EXPECTED})
+    _unsupported = {m for m, v in _SCRIPT_FALLBACK.items() if v is None}
+    all_parsed = _parse_module_list("all", CFG)
+    check(
+        "all: _unsupported modules excluded",
+        not any(m in _unsupported for m in all_parsed),
+        f"unsupported in result: {[m for m in all_parsed if m in _unsupported]}",
+    )
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
