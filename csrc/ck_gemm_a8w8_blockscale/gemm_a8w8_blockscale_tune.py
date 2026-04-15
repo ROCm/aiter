@@ -183,11 +183,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         super().__init__(name, keys, resultList, description)
 
     def _clear_op_caches(self):
-        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+        from aiter.ops import gemm_op_a8w8 as _op
 
-        get_GEMM_config_with_quant_type.cache_clear()
-        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
-            get_GEMM_config_with_quant_type.file_cache.clear()
+        _op.get_CKGEMM_config.cache_clear()
+        _op._CKGEMM_CONFIG_CACHE.clear()
+        _op._CKGEMM_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         """

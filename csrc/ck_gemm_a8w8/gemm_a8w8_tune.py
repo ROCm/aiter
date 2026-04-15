@@ -118,11 +118,11 @@ class GemmA8W8Tuner(GemmCommonTuner):
         return kernels_list[kernelId].name
 
     def _clear_op_caches(self):
-        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+        from aiter.ops import gemm_op_a8w8 as _op
 
-        get_GEMM_config_with_quant_type.cache_clear()
-        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
-            get_GEMM_config_with_quant_type.file_cache.clear()
+        _op.get_GEMM_config_with_quant_type.cache_clear()
+        _op._GEMM_QUANT_TYPE_CACHE.clear()
+        _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         pass
