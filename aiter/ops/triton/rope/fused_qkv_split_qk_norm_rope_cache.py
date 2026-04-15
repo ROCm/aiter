@@ -53,6 +53,7 @@ def fused_qkv_split_qk_norm_rope_cache(
     # Logic for dimension splitting
     BLOCK_D = head_dim
     BLOCK_D_HALF = head_dim // 2
+    ROTARY_DIM_HALF = cos.shape[-1]
 
     BLOCK_T = 32
     num_warps = 4
@@ -107,6 +108,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCK_D=BLOCK_D,
         BLOCK_D_HALF=BLOCK_D_HALF,
         BLOCK_SIZE=block_size,
+        ROTARY_DIM_HALF=ROTARY_DIM_HALF,
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
         num_warps=num_warps,

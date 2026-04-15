@@ -25,6 +25,68 @@ def _rms_norm(
 
 
 @triton.jit
+def _rms_norm_returning_inv(
+    tensor,
+    weight,
+    BLOCK_D,
+    eps,
+):
+    tensor_f32 = tensor.to(tl.float32)
+    tensor_sq = tensor_f32 * tensor_f32
+    variance = tl.sum(tensor_sq, axis=1) / BLOCK_D
+
+    inv_rms = tl.rsqrt(variance + eps)[:, None]
+    tensor_normed = tensor_f32 * inv_rms
+
+    w_f32 = weight.to(tl.float32)
+    tensor_final = tensor_normed * (1.0 + w_f32[None, :])
+
+    return tensor_final.to(tensor.dtype), inv_rms
+
+
+@triton.jit
+def _partial_neox_rotated(
+    inv_rms,
+    weight_ptr,
+    qkv_ptr,
+    t_offs,
+    d_offs,
+    stride_qkv_t,
+    stride_qkv_d,
+    head_d_offset,
+    x_mask,
+    ROTARY_DIM_HALF: tl.constexpr,
+):
+    """Compute the neox-rotated+normed vector for partial rotation.
+
+    Re-loads from qkv at the swapped dim positions and applies the same
+    inv_rms with the weight at the swapped position, then the neox sign.
+    For dims beyond rotary_dim this produces 0 (rot_sign = 0).
+    """
+    ROTARY_DIM: tl.constexpr = ROTARY_DIM_HALF * 2
+    swap_d = tl.where(
+        d_offs < ROTARY_DIM_HALF,
+        d_offs + ROTARY_DIM_HALF,
+        tl.where(d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, d_offs),
+    )
+    rot_sign = tl.where(
+        d_offs < ROTARY_DIM_HALF, -1.0,
+        tl.where(d_offs < ROTARY_DIM, 1.0, 0.0),
+    )
+
+    swap_offs = (
+        t_offs[:, None] * stride_qkv_t
+        + (head_d_offset + swap_d)[None, :] * stride_qkv_d
+    )
+    swapped = tl.load(qkv_ptr + swap_offs, mask=x_mask)
+
+    swap_w = tl.load(weight_ptr + swap_d).to(tl.float32)
+    rotated = swapped.to(tl.float32) * inv_rms * (1.0 + swap_w[None, :])
+    rotated = rotated * rot_sign[None, :]
+    return rotated
+
+
+@triton.jit
 def _fused_qkv_split_qk_norm_rope_cache_kernel(
     qkv_ptr,
     q_weight_ptr,
@@ -74,6 +136,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # PagedAttention block size
+    ROTARY_DIM_HALF: tl.constexpr = 0,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
 ):
@@ -88,6 +151,11 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     tl.assume(stride_kv_t > 0)
     tl.assume(stride_kv_h > 0)
     tl.assume(stride_kv_d > 0)
+
+    EFFECTIVE_RDH: tl.constexpr = (
+        ROTARY_DIM_HALF if ROTARY_DIM_HALF > 0 else BLOCK_D_HALF
+    )
+    PARTIAL_ROTATION: tl.constexpr = EFFECTIVE_RDH < BLOCK_D_HALF
 
     pid_t = tl.program_id(0)
     hq = tl.program_id(1)
@@ -114,22 +182,26 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         if IS_NEOX:
             d_cos_offs = d_offs
             d_cos_offs = tl.where(
-                (d_cos_offs < BLOCK_D_HALF),
+                (d_cos_offs < EFFECTIVE_RDH),
                 d_cos_offs,
-                d_cos_offs - BLOCK_D_HALF,
+                d_cos_offs - EFFECTIVE_RDH,
             ).to(d_cos_offs.dtype)
-            d_cos_mask = d_cos_offs < BLOCK_D_HALF
+            d_cos_mask = d_cos_offs < EFFECTIVE_RDH
         else:
             d_cos_offs = tl.arange(0, BLOCK_D) // 2
-            d_cos_mask = d_cos_offs < BLOCK_D_HALF
+            d_cos_mask = d_cos_offs < EFFECTIVE_RDH
     else:
         d_cos_offs = d_offs
-        d_cos_mask = d_cos_offs < BLOCK_D
+        d_cos_mask = d_cos_offs < EFFECTIVE_RDH * 2
 
     cos_mask = t_mask[:, None] & d_cos_mask[None, :]
     cos_offs = t_cos_offs[:, None] * stride_cos_t + d_cos_offs[None, :] * stride_cos_d
-    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+    if PARTIAL_ROTATION:
+        cos = tl.load(cos_ptr + cos_offs, mask=cos_mask, other=1.0)
+        sin = tl.load(sin_ptr + cos_offs, mask=cos_mask, other=0.0)
+    else:
+        cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
+        sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
 
     x_mask = t_mask[:, None] & (d_offs < BLOCK_D)[None, :]
 
@@ -138,23 +210,29 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     else:
         qk_rotated_mask = (d_offs % 2 == 0)[None, :]
 
-    H_OFFS_SIZE = hq * BLOCK_D
+    if ENABLE_GATED_Q:
+        Q_HEAD_STRIDE: tl.constexpr = 2 * BLOCK_D
+    else:
+        Q_HEAD_STRIDE: tl.constexpr = BLOCK_D
+    Q_IN_OFFS = hq * Q_HEAD_STRIDE
     q_in_offs = (
-        t_offs[:, None] * stride_qkv_t + (H_OFFS_SIZE + d_offs)[None, :] * stride_qkv_d
+        t_offs[:, None] * stride_qkv_t + (Q_IN_OFFS + d_offs)[None, :] * stride_qkv_d
     )
     q = tl.load(qkv_ptr + q_in_offs, mask=x_mask)
 
     q_weight_offs = d_offs
     q_weight = tl.load(q_weight_ptr + q_weight_offs)
-    q = _rms_norm(q, q_weight, BLOCK_D, eps)
+    if PARTIAL_ROTATION:
+        q, inv_rms_q = _rms_norm_returning_inv(q, q_weight, BLOCK_D, eps)
+    else:
+        q = _rms_norm(q, q_weight, BLOCK_D, eps)
 
     if ENABLE_GATED_Q:
-        Q_SIZE = QH * BLOCK_D
         d_gate_offs = tl.arange(0, BLOCK_D)
         x_gate_mask = t_mask[:, None] & (d_gate_offs < BLOCK_D)[None, :]
         gate_in_offs = (
             t_offs[:, None] * stride_qkv_t
-            + (Q_SIZE + H_OFFS_SIZE + d_gate_offs)[None, :] * stride_qkv_d
+            + (Q_IN_OFFS + BLOCK_D + d_gate_offs)[None, :] * stride_qkv_d
         )
         gate = tl.load(qkv_ptr + gate_in_offs, mask=x_gate_mask)
         gate_out_offs = (
@@ -164,7 +242,13 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         )
         tl.store(gate_ptr + gate_out_offs, gate, mask=x_gate_mask)
 
-    if IS_NEOX:
+    if PARTIAL_ROTATION:
+        q_rotated = _partial_neox_rotated(
+            inv_rms_q, q_weight_ptr, qkv_ptr,
+            t_offs, d_offs, stride_qkv_t, stride_qkv_d,
+            Q_IN_OFFS, x_mask, EFFECTIVE_RDH,
+        )
+    elif IS_NEOX:
         q_rotated = _get_neox_rotated_x(
             q, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
         )
@@ -190,35 +274,40 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         else:
             v_scale = 1
 
-        Q_HEAD_DIM_STRIDE_MULT = 1
-        if ENABLE_GATED_Q:
-            Q_HEAD_DIM_STRIDE_MULT = 2
-        Q_HEAD_SIZE_IN = BLOCK_D * Q_HEAD_DIM_STRIDE_MULT
-        Q_SIZE = QH * Q_HEAD_SIZE_IN
+        Q_SIZE = QH * Q_HEAD_STRIDE
         KV_SIZE = KVH * BLOCK_D
+        KV_HEAD_OFFS = hq * BLOCK_D
         k_in_offs = (
             t_offs[:, None] * stride_qkv_t
-            + ((Q_SIZE + H_OFFS_SIZE) + d_offs)[None, :] * stride_qkv_d
+            + ((Q_SIZE + KV_HEAD_OFFS) + d_offs)[None, :] * stride_qkv_d
         )
         v_in_offs = (
             t_offs[:, None] * stride_qkv_t
-            + ((Q_SIZE + KV_SIZE + H_OFFS_SIZE) + d_offs)[None, :] * stride_qkv_d
+            + ((Q_SIZE + KV_SIZE + KV_HEAD_OFFS) + d_offs)[None, :] * stride_qkv_d
         )
         k = tl.load(qkv_ptr + k_in_offs, mask=x_mask)
         v = tl.load(qkv_ptr + v_in_offs, mask=x_mask)
 
         k_weight_offs = d_offs
         k_weight = tl.load(k_weight_ptr + k_weight_offs)
-        k = _rms_norm(k, k_weight, BLOCK_D, eps)
-
-        if IS_NEOX:
-            k_rotated = _get_neox_rotated_x(
-                k, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
+        if PARTIAL_ROTATION:
+            k, inv_rms_k = _rms_norm_returning_inv(k, k_weight, BLOCK_D, eps)
+            K_HEAD_D_OFFSET = Q_SIZE + KV_HEAD_OFFS
+            k_rotated = _partial_neox_rotated(
+                inv_rms_k, k_weight_ptr, qkv_ptr,
+                t_offs, d_offs, stride_qkv_t, stride_qkv_d,
+                K_HEAD_D_OFFSET, x_mask, EFFECTIVE_RDH,
             )
         else:
-            k_rotated = _get_gptj_rotated_x(
-                k, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
-            )
+            k = _rms_norm(k, k_weight, BLOCK_D, eps)
+            if IS_NEOX:
+                k_rotated = _get_neox_rotated_x(
+                    k, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
+                )
+            else:
+                k_rotated = _get_gptj_rotated_x(
+                    k, qk_rotated_mask, BLOCK_T, BLOCK_D, BLOCK_D_HALF
+                )
 
         k = k * cos + k_rotated * sin
 
