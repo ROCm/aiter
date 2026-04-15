@@ -1543,7 +1543,56 @@ def compile_ops(
                         func_hints = typing.get_type_hints(func)
                         if ann["return"] is None:
                             func_hints["return"] = None
-                        if ann != func_hints:
+
+                        tensor_like_types = {torch.Tensor}
+                        if aiter_tensor_t is not object:
+                            tensor_like_types.add(aiter_tensor_t)
+
+                        def canonicalize_hint(hint):
+                            if hint in tensor_like_types:
+                                return ("tensor",)
+
+                            origin = typing.get_origin(hint)
+                            if origin in (list, List):
+                                return (
+                                    "list",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin is tuple:
+                                return (
+                                    "tuple",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin in (typing.Union, types.UnionType):
+                                return (
+                                    "union",
+                                    tuple(
+                                        sorted(
+                                            (
+                                                canonicalize_hint(arg)
+                                                for arg in typing.get_args(hint)
+                                            ),
+                                            key=repr,
+                                        )
+                                    ),
+                                )
+                            return hint
+
+                        canonical_ann = {
+                            key: canonicalize_hint(value) for key, value in ann.items()
+                        }
+                        canonical_func_hints = {
+                            key: canonicalize_hint(value)
+                            for key, value in func_hints.items()
+                        }
+
+                        if canonical_ann != canonical_func_hints:
                             logger.warning(
                                 f"type hints mismatch, override to --> {doc_str}"
                             )
