@@ -21,6 +21,12 @@ from op_tests.triton_tests.attention.test_unified_attention import (
 )
 from aiter.ops.triton.utils.types import e4m3_dtype
 
+try:
+    from aiter.mla import mla_decode_fwd as _mla_decode_fwd
+    _HAS_MLA = True
+except ImportError:
+    _HAS_MLA = False
+
 
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
@@ -182,16 +188,25 @@ def create_benchmark_configs(custom, args):
     }
 
     if args.metric == "all":
-        line_vals = [v[0] for v in all_metrics.values()]
+        base_line_vals = [v[0] for v in all_metrics.values()]
         ylabel = ""
     elif args.metric == "throughput":
-        line_vals = [all_metrics["throughput"][0], all_metrics["tok/s"][0]]
+        base_line_vals = [all_metrics["throughput"][0], all_metrics["tok/s"][0]]
         ylabel = ""
     elif args.metric in all_metrics:
-        line_vals = [all_metrics[args.metric][0]]
+        base_line_vals = [all_metrics[args.metric][0]]
         ylabel = all_metrics[args.metric][1]
     else:
         raise ValueError("Unknown metric: " + args.metric)
+
+    compare_mla = getattr(args, "compare_mla", False) and _HAS_MLA
+    if compare_mla:
+        line_vals = []
+        for v in base_line_vals:
+            line_vals.append(f"UA-{v}")
+            line_vals.append(f"MLA-{v}")
+    else:
+        line_vals = base_line_vals
 
     configs.append(
         triton.testing.Benchmark(
@@ -200,7 +215,12 @@ def create_benchmark_configs(custom, args):
             line_arg="provider",
             line_vals=line_vals,
             line_names=line_vals,
-            styles=[("red", "-"), ("green", "-"), ("blue", "-"), ("orange", "-")],
+            styles=[
+                ("red", "-"), ("red", "--"),
+                ("green", "-"), ("green", "--"),
+                ("blue", "-"), ("blue", "--"),
+                ("orange", "-"), ("orange", "--"),
+            ],
             ylabel=ylabel,
             plot_name=plot_name,
             args=extra_args,
@@ -263,6 +283,64 @@ def run_benchmark(custom, args):
         num_blocks = (
             args.num_blocks if args.num_blocks else max(min_required_blocks * 4, 2048)
         )
+
+        is_mla = getattr(args, "compare_mla", False) and _HAS_MLA and provider.startswith("MLA-")
+        if is_mla:
+            scale = D_HEAD ** -0.5
+            page_size = block_size
+            num_page = num_blocks
+            total_q = int(seqlens_q.sum().item())
+
+            q_mla = torch.randn(total_q, HQ, D_HEAD, dtype=dtype, device="cuda")
+            kv_4d = torch.randn(num_page, page_size, HK, D_HEAD, dtype=dtype, device="cuda")
+
+            qo_indptr = torch.zeros(BATCH + 1, dtype=torch.int32, device="cuda")
+            qo_indptr[1:] = torch.cumsum(seqlens_q, dim=0)
+
+            pages_per_req = ((seqlens_k + page_size - 1) // page_size).to(torch.int32)
+            kv_indptr = torch.zeros(BATCH + 1, dtype=torch.int32, device="cuda")
+            kv_indptr[1:] = torch.cumsum(pages_per_req, dim=0)
+
+            total_pages = int(kv_indptr[-1].item())
+            kv_indices = torch.randint(0, num_page, (total_pages,), dtype=torch.int32, device="cuda")
+            kv_last_page_lens = (seqlens_k - (pages_per_req - 1) * page_size).to(torch.int32)
+
+            max_seqlen_q_mla = int(seqlens_q.max().item())
+
+            head_repeat = 16 // HQ if HQ < 16 else 1
+            padded_heads = 16 if HQ < 16 else HQ
+            q_in = q_mla.repeat_interleave(head_repeat, dim=1) if head_repeat > 1 else q_mla
+            o_mla = torch.empty(total_q, padded_heads, D_HEAD_V, dtype=dtype, device="cuda")
+
+            fn_mla = lambda: _mla_decode_fwd(
+                q_in, kv_4d, o_mla,
+                qo_indptr, kv_indptr, kv_indices, kv_last_page_lens,
+                max_seqlen_q_mla,
+                page_size=page_size, nhead_kv=HK,
+                sm_scale=scale, logit_cap=0.0,
+            )
+
+            ms = triton.testing.do_bench(fn_mla)
+
+            total_num_tokens_q = total_q
+            total_num_tokens_k = int(seqlens_k.sum().item())
+            total_flops = 0.0
+            for i in range(BATCH):
+                total_flops += seqlens_q[i].item() * seqlens_k[i].item() * HQ * (D_HEAD + D_HEAD_V) * 2.0
+            q_bytes = total_num_tokens_q * HQ * D_HEAD * q_mla.element_size()
+            kv_bytes = total_num_tokens_k * HK * D_HEAD * kv_4d.element_size()
+            o_bytes = total_num_tokens_q * HQ * D_HEAD_V * q_mla.element_size()
+            mem = q_bytes + kv_bytes + o_bytes
+
+            if "ms" in provider:
+                return ms
+            elif "TFLOPS" in provider:
+                return total_flops / ms * 1e-9
+            elif "GB/s" in provider:
+                return mem / ms * 1e-6
+            elif "tok/s" in provider:
+                return total_num_tokens_q / (ms * 1e-3)
+            return ms
 
         (
             query,
@@ -593,6 +671,11 @@ def parse_args():
         help="Write performance results to CSV file",
     )
 
+    parser.add_argument(
+        "-compare_mla", action="store_true", default=False,
+        help="Include aiter.mla.mla_decode_fwd as a comparison baseline in the results table",
+    )
+
     return parser.parse_args()
 
 
@@ -606,6 +689,9 @@ arg_to_torch_dtype = {
 def main():
     args = parse_args()
     args.layout = "thd"
+    if getattr(args, "compare_mla", False) and not _HAS_MLA:
+        print("WARNING: -compare_mla requested but aiter.mla could not be imported; "
+              "MLA columns will be omitted.")
     if args.model:
         if args.causal is None:  # User didn't specify -causal
             args.causal = True
