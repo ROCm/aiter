@@ -112,6 +112,50 @@ def unshuffle_mx_scale_gfx1250(
 
 
 @gluon.jit
+def load_operands_from_slot(
+    smem_A,
+    smem_B,
+    smem_ASraw,
+    smem_BSraw,
+    slot: gl.constexpr,
+    dot_a_layout: gl.constexpr,
+    dot_b_layout: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_K_BYTES: gl.constexpr,
+    K_GROUPS: gl.constexpr,
+    PRESHUFFLE_FACTOR: gl.constexpr,
+    SCALE_KWIDTH: gl.constexpr,
+):
+    A = gl.amd.cdna4.async_copy.load_shared_relaxed(
+        smem_A.index(slot), layout=dot_a_layout)
+
+    B = gl.amd.cdna4.async_copy.load_shared_relaxed(
+        depreshuffle_b_raw_to_kn(
+            smem_B.index(slot), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
+        ), layout=dot_b_layout)
+
+    if BLOCK_SIZE_M < 32:
+        AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            smem_ASraw.index(slot), layout=a_scale_layout)
+    else:
+        AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            unshuffle_mx_scale_gfx1250(
+                smem_ASraw.index(slot), BLOCK_SIZE_M, K_GROUPS,
+                PRESHUFFLE_FACTOR, SCALE_KWIDTH,
+            ), layout=a_scale_layout)
+    BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
+        unshuffle_mx_scale_gfx1250(
+            smem_BSraw.index(slot), BLOCK_SIZE_N, K_GROUPS,
+            PRESHUFFLE_FACTOR, SCALE_KWIDTH,
+        ), layout=b_scale_layout)
+
+    return A, B, AS, BS
+
+
+@gluon.jit
 def store_c_tile(
     c_ptr,
     tile_m,
@@ -316,23 +360,22 @@ def gemm_mxfp4_preshuffle_gfx1250(
         layout=shared_S,
     )
 
-    k_tile_load_idx = 0
-    k_tile_compute_idx = 0
+    load_idx = 0
+    compute_idx = 0
 
-    # ---- Prologue ---- stage (NUM_BUFFERS - 1) K-tiles into LDS
+    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_acc_layout)
+
+    # ---- TDM Prologue ---- stage (NUM_BUFFERS - 1) K-tiles into LDS
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        if k_tile_load_idx < k_tiles:
-            slot_p = k_tile_load_idx
-            k_tile_p = k_tile_load_idx
+        if load_idx < k_tiles:
+            slot_p = load_idx % NUM_BUFFERS
+            k_tile_p = load_idx
 
-            # A/B offsets (bytes-domain for A_fp4 and B_preshuf raw)
             a_offs = [tile_m * BLOCK_SIZE_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
             b_offs = [
                 tile_n * (BLOCK_SIZE_N // 16),
                 (split_k0_bytes + k_tile_p * BLOCK_K_BYTES) * 16,
             ]
-
-            # Scale offsets in preshuffled domain
             g0 = split_k0_groups + k_tile_p * K_GROUPS
             if BLOCK_SIZE_M < 32:
                 as_offs = [tile_m * BLOCK_SIZE_M, g0]
@@ -345,94 +388,66 @@ def gemm_mxfp4_preshuffle_gfx1250(
             gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
             gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
 
-        k_tile_load_idx += 1
+        load_idx += 1
 
-    # accumulator is in vGPR for the whole C tile
-    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_acc_layout)
+    # Register pre-load prologue: wait for tile 0
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
 
-    # ---- Main pipeline ----
-    main_iters: gl.constexpr = k_tiles - (NUM_BUFFERS - 1)
-    for _ in range(main_iters):
-        # Load: advance pointers for this k_tile
-        # HBM -> vGPR -> LDS
-        slot_p = k_tile_load_idx % NUM_BUFFERS
-        k_tile_p = k_tile_load_idx
+    # LDS -> vGPR (tile 0 in slot 0)
+    cur_A, cur_B, cur_AS, cur_BS = load_operands_from_slot(
+        smem_A, smem_B, smem_ASraw, smem_BSraw, 0,
+        dot_a_layout, dot_b_layout, a_scale_layout, b_scale_layout,
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_K_BYTES, K_GROUPS,
+        PRESHUFFLE_FACTOR, SCALE_KWIDTH,
+    )
 
-        a_offs = [tile_m * BLOCK_SIZE_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
-        b_offs = [
-            tile_n * (BLOCK_SIZE_N // 16),
-            (split_k0_bytes + k_tile_p * BLOCK_K_BYTES) * 16,
-        ]
-        g0 = split_k0_groups + k_tile_p * K_GROUPS
-        if BLOCK_SIZE_M < 32:
-            as_offs = [tile_m * BLOCK_SIZE_M, g0]
+    for _ in range(k_tiles - 1):
+
+        acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
+
+        # Issue TDM only while there are still tiles to fetch
+        if load_idx < k_tiles:
+            slot_p = load_idx % NUM_BUFFERS
+            k_tile_p = load_idx
+
+            a_offs = [tile_m * BLOCK_SIZE_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
+            b_offs = [
+                tile_n * (BLOCK_SIZE_N // 16),
+                (split_k0_bytes + k_tile_p * BLOCK_K_BYTES) * 16,
+            ]
+            g0 = split_k0_groups + k_tile_p * K_GROUPS
+            if BLOCK_SIZE_M < 32:
+                as_offs = [tile_m * BLOCK_SIZE_M, g0]
+            else:
+                as_offs = [tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
+            bs_offs = [tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
+
+            gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
+            load_idx += 1
+            gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 4)
         else:
-            as_offs = [tile_m * (BLOCK_SIZE_M // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
-        bs_offs = [tile_n * (BLOCK_SIZE_N // PRESHUFFLE_FACTOR), g0 * PRESHUFFLE_FACTOR]
-
-        gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
-        gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
-        gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_ASraw.index(slot_p), pred=1)
-        gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BSraw.index(slot_p), pred=1)
-
-        k_tile_load_idx += 1
-        # Wait for current tile’s data (4 TDM ops per tile)
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 4)
-
-        slot_c = k_tile_compute_idx % NUM_BUFFERS
-
-        # LDS -> vGPR
-        A = smem_A.index(slot_c).load(layout=dot_a_layout)
-
-        # B operand (raw unshuffle -> logical)
-        B = depreshuffle_b_raw_to_kn(
-                smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
-            ).load(layout=dot_b_layout)
-
-        # scales: unswizzle -> load with wmma scale layouts
-        if BLOCK_SIZE_M < 32:
-            AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
-        else:
-            AS = unshuffle_mx_scale_gfx1250(
-                smem_ASraw.index(slot_c), BLOCK_SIZE_M, K_GROUPS,
-                PRESHUFFLE_FACTOR, SCALE_KWIDTH,
-            ).load(layout=a_scale_layout)
-        BS = unshuffle_mx_scale_gfx1250(
-            smem_BSraw.index(slot_c), BLOCK_SIZE_N, K_GROUPS,
-            PRESHUFFLE_FACTOR, SCALE_KWIDTH,
-        ).load(layout=b_scale_layout)
-
-        acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
-        k_tile_compute_idx += 1
-
-    # ---- Drain ----
-    for _ in gl.static_range(NUM_BUFFERS - 1):
-        if k_tile_compute_idx < k_tiles:
-            slot_c = k_tile_compute_idx % NUM_BUFFERS
-
             gl.amd.gfx1250.tdm.async_wait(0)
 
-            A = smem_A.index(slot_c).load(layout=dot_a_layout)
-
-            B = depreshuffle_b_raw_to_kn(
-                smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
-            ).load(layout=dot_b_layout)
-
-            if BLOCK_SIZE_M < 32:
-                AS = smem_ASraw.index(slot_c).load(layout=a_scale_layout)
-            else:
-                AS = unshuffle_mx_scale_gfx1250(
-                    smem_ASraw.index(slot_c), BLOCK_SIZE_M, K_GROUPS,
+        # Hacky Unrolling 
+        next_slot = (compute_idx + 1) % NUM_BUFFERS
+        for buf_i in gl.static_range(NUM_BUFFERS):
+            if next_slot == buf_i:
+                cur_A, cur_B, cur_AS, cur_BS = load_operands_from_slot(
+                    smem_A, smem_B, smem_ASraw, smem_BSraw, buf_i,
+                    dot_a_layout, dot_b_layout, a_scale_layout, b_scale_layout,
+                    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_K_BYTES, K_GROUPS,
                     PRESHUFFLE_FACTOR, SCALE_KWIDTH,
-                ).load(layout=a_scale_layout)
-            BS = unshuffle_mx_scale_gfx1250(
-                smem_BSraw.index(slot_c), BLOCK_SIZE_N, K_GROUPS,
-                PRESHUFFLE_FACTOR, SCALE_KWIDTH,
-            ).load(layout=b_scale_layout)
+                )
+        compute_idx += 1
 
-            acc = gl.amd.gfx1250.wmma_scaled(A, AS, "e2m1", B, BS, "e2m1", acc)
+    # Final WMMA
+    acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
 
-        k_tile_compute_idx += 1
+    if NUM_BUFFERS > 2:
+        gl.amd.sched_barrier(0)
 
     # Store C tile
     store_c_tile(

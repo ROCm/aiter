@@ -183,6 +183,7 @@ def get_x_vals():
     x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
+    x_vals += [(2048,8192,4096)]
     return x_vals
 
 
@@ -253,7 +254,7 @@ def test_gemm_afp4_wfp4(
         )
     dtype = torch.bfloat16
     # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950
-    elif impl == "gluon":
+    if impl == "gluon":
         pytest.skip("Gluon tests temporarily disabled.")
 
     if impl == "gluon" and shuffle_weight_scales:
