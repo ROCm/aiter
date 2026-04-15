@@ -302,6 +302,38 @@ DINLINE P* get_tmp_buf(volatile Signal* sg)
     return (P*)(((Signal*)sg) + 1);
 }
 
+// ---------------------------------------------------------------------------
+// MI300 (USE_ROCM) helpers: non-temporal (streaming) load/store for 16-byte
+// packed vectors that are read or written exactly once (peer memory buffers,
+// output tiles).  Falls back to a plain load/store on CUDA so other
+// architectures are unaffected.
+// ---------------------------------------------------------------------------
+#ifdef USE_ROCM
+template <typename P>
+DINLINE P nt_load(const P* __restrict__ addr)
+{
+    return __builtin_nontemporal_load(addr);
+}
+
+template <typename P>
+DINLINE void nt_store(P* __restrict__ addr, P val)
+{
+    __builtin_nontemporal_store(val, addr);
+}
+#else
+template <typename P>
+DINLINE P nt_load(const P* __restrict__ addr)
+{
+    return *addr;
+}
+
+template <typename P>
+DINLINE void nt_store(P* __restrict__ addr, P val)
+{
+    *addr = val;
+}
+#endif
+
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankData* _input_dp,
                                                                            RankData* _output_dp,
@@ -408,9 +440,12 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     int buf  = 0;
     int idx0 = start;
 
+    // Initial fill of buffer 0: each warp (one per GPU) reads from that GPU's
+    // peer memory.  Non-temporal load avoids polluting L1/L2 with data that
+    // will be consumed once and then discarded.
     if(idx0 < size)
     {
-        P val                                       = ((const P**)&dp.ptrs[0])[warp_id][idx0];
+        P val = nt_load(&((const P**)&dp.ptrs[0])[warp_id][idx0]);
         tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
     }
     __syncthreads();
@@ -454,12 +489,13 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
         }
 
         // =======================================================
-        // 2. ALL warps prefetch NEXT buffer
-        //    (including warp 0; safe to issue after reduction)
+        // 2. ALL warps prefetch NEXT buffer from remote GPU peer memory
+        //    (including warp 0; safe to issue after reduction completes).
+        //    Non-temporal load: each packed element is read exactly once.
         // =======================================================
         if(next_idx < size)
         {
-            P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
+            P nxt = nt_load(&((const P**)&dp.ptrs[0])[warp_id][next_idx]);
             tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
         }
 
@@ -506,9 +542,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
     // stage 1: reduce scatter
+    // Each thread reads its chunk from a remote GPU's input buffer (peer memory,
+    // read exactly once) via a non-temporal load to avoid polluting L1/L2 cache.
     for(int idx = start + tid; idx < end; idx += stride)
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = nt_load(&ptrs[warp_id][idx]);
         __syncthreads();
         // cal add in first 64 threads
         if(warp_id == 0)
@@ -536,7 +574,10 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
             {
                 write_reg[i] = downcast_s<T>(add_reg[i]);
             }
-            tmp_out[idx - start] = write_reg;
+            // Write reduced result into our tmp buffer (other GPUs will read it
+            // once during allgather).  Non-temporal store avoids cache pollution
+            // for this write-once streaming buffer.
+            nt_store(&tmp_out[idx - start], write_reg);
         }
         __syncthreads();
     }
@@ -547,10 +588,12 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     // between threads that have the same tid. If thread i computes the sum of
     // start + i in the first stage, then thread i also gathers start + i from all
     // ranks.
+    // Each warp reads from a different remote GPU's tmp buffer (peer memory,
+    // read exactly once) — non-temporal load avoids cache pollution.
     for(int idx = tid; idx < largest_part; idx += stride)
     {
         int dst_idx           = (warp_id + rank) % ngpus * part + idx;
-        ((P*)result)[dst_idx] = tmps[warp_id][idx];
+        ((P*)result)[dst_idx] = nt_load(&tmps[warp_id][idx]);
     }
 }
 
