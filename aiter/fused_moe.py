@@ -716,6 +716,7 @@ def _flydsl_stage2_wrapper(
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
         sort_block_m=parsed.get("sort_block_m", 0),
+        persist=parsed.get("persist"),
     )
 
 
@@ -895,7 +896,7 @@ def get_2stage_cfgs(
             if (run_1stage)
             else (
                 get_ksplit(token, topk, expert, inter_dim, model_dim)
-                if q_type in [QuantType.per_1x128, QuantType.per_1x32]
+                if q_type in [QuantType.per_1x128, QuantType.per_1x32, QuantType.per_1x32_i4]
                 else ksplit
             )
         )
@@ -997,9 +998,12 @@ def get_2stage_cfgs(
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128
         _tile_k = 128
+        _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
+        if _ksplit > 1:
+            kn1 += f"_kb{_ksplit}"
         kn2 = flydsl_kernel_name(2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic")
         return MOEMetadata(
             functools.partial(
@@ -1012,7 +1016,7 @@ def get_2stage_cfgs(
                 kernelName=kn2,
             ),
             _tile_m,
-            0,
+            _ksplit,
             False,
         )
     if (

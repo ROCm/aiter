@@ -159,22 +159,29 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [64, 128]
+    k_batches = [1, 2, 4, 7, 14]
 
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
-                name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
-                kernels[name] = {
-                    "stage": 1,
-                    "a_dtype": a_dtype,
-                    "b_dtype": b_dtype,
-                    "out_dtype": out_dtype,
-                    "tile_m": tm,
-                    "tile_n": tn,
-                    "tile_k": tk,
-                    "MPerBlock": tm,
-                    "in_dtype": "int4_bf16",
-                }
+                for kb in k_batches:
+                    name = flydsl_kernel_name(
+                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                    )
+                    if kb != 1:
+                        name += f"_kb{kb}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "int4_bf16",
+                        "k_batch": kb,
+                    }
     return kernels
 
 
@@ -289,7 +296,8 @@ def compile_flydsl_moe_stage1(
         if b_dtype == "int4":
             in_dtype = "int4_bf16"
             group_size = 32
-            _use_cshuffle = False
+            # split-K needs cshuffle (None → auto-enable); non-split-K uses direct epilog
+            _use_cshuffle = None if k_batch > 1 else False
             _scale_is_bf16 = True
 
         return compile_moe_gemm1(

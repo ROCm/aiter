@@ -292,10 +292,13 @@ def compile_moe_gemm1(
     # - ping-pong X tiles (2 * tile_m * lds_stride bytes)
     # - optional epilogue CShuffle tile (tile_m * tile_n f16 -> 2 * tile_m * tile_n bytes)
     _use_cshuffle_epilog = bool(use_cshuffle_epilog)
-    # Split-K requires CShuffle epilogue (f32 atomic adds via store_pair callback)
+    # Split-K requires CShuffle epilogue (atomic adds via store_pair callback)
     if _is_splitk:
         _use_cshuffle_epilog = True
-    _cshuffle_elem_bytes = 4 if _is_splitk else 2  # f32 for split-K, f16 otherwise
+    # bf16 split-K: use bf16 atomics (halves bandwidth, gfx950 has buffer_atomic_pk_add_bf16).
+    # Other dtypes keep f32 for precision.
+    _splitk_use_bf16 = _is_splitk and is_bf16
+    _cshuffle_elem_bytes = 2 if (not _is_splitk or _splitk_use_bf16) else 4
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
     lds_out_bytes = _cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes)
@@ -425,8 +428,11 @@ def compile_moe_gemm1(
                 )
                 lds_x = lds_x_ptr.get()
                 # Alias LDS bytes for optional CShuffle epilogue.
-                # Split-K uses f32 (4B) per element for atomic accumulation; normal uses f16 (2B).
-                _lds_out_elem_type = T.f32 if _is_splitk else T.f16
+                # bf16 split-K uses bf16 (2B); other split-K uses f32 (4B); normal uses f16/bf16 (2B).
+                _lds_out_elem_type = (
+                    T.f32 if (_is_splitk and not _splitk_use_bf16)
+                    else (T.bf16 if is_bf16 else T.f16)
+                )
                 lds_out = (
                     SmemPtr(base_ptr, lds_x_ptr.byte_offset, _lds_out_elem_type, shape=(tile_m * tile_n,)).get()
                     if _use_cshuffle_epilog
@@ -446,8 +452,9 @@ def compile_moe_gemm1(
 
                 w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=False)
 
-                # OUT: normal=[tokens, topk, inter] f16/bf16, split-K=[tokens*topk, 2*inter] f32
-                out_elem_bytes = 4 if _is_splitk else 2
+                # OUT: normal=[tokens, topk, inter] f16/bf16,
+                #      split-K=[tokens*topk, 2*inter] f32 (or bf16 for bf16 split-K)
+                out_elem_bytes = 4 if (_is_splitk and not _splitk_use_bf16) else 2
                 if _is_splitk:
                     out_nbytes_idx = tokens_in * c_topk * inter_in * fx.Index(2 * out_elem_bytes)
                 else:
@@ -1262,14 +1269,18 @@ def compile_moe_gemm1(
                 # Uses EVec=4 (buffer store "x4" of fp16 elements).
                 use_cshuffle_epilog_flag = _use_cshuffle_epilog
 
-                # ─── Split-K epilogue: two-pass gate/up with f32 atomic fadd ───
+                # ─── Split-K epilogue: two-pass gate/up with atomic fadd ───
+                # bf16 split-K uses bf16 atomics; other dtypes use f32 atomics.
                 if _is_splitk:
                     if lds_out is None:
                         raise RuntimeError("Split-K epilogue requires lds_out (CShuffle)")
 
+                    _has_buffer_atomic_bf16_s1 = str(gpu_arch).startswith(("gfx95", "gfx12"))
+                    _needs_global_atomic_bf16_s1 = _splitk_use_bf16 and not _has_buffer_atomic_bf16_s1
+
                     out_base_idx = buffer_ops.extract_base_index(arg_out)
                     _split_k_out_row_stride = inter_dim * 2 * out_elem_bytes  # bytes per row
-                    _split_k_e_vec = 2  # f32 vec2 for atomic fadd
+                    _split_k_e_vec = 2  # vec2 for atomic fadd (f32 or bf16)
 
                     # Mutable slot: 0 for gate pass, inter_dim for up pass
                     _split_k_n_offset = [0]
@@ -1277,6 +1288,9 @@ def compile_moe_gemm1(
                     # Mutable slots for two-pass gate/up selection
                     _split_k_acc = [acc_gate]
                     _split_k_sw_vals = [sw_gate_vals]
+
+                    _splitk_lds_elem = T.bf16 if _splitk_use_bf16 else T.f32
+                    _splitk_lds_align = 2 if _splitk_use_bf16 else 4
 
                     def write_row_to_lds_splitk(
                         *,
@@ -1289,7 +1303,7 @@ def compile_moe_gemm1(
                         num_acc_n: int,
                         lds_out,
                     ):
-                        """Write scaled f32 partial sums to LDS (no silu, no doweight)."""
+                        """Write scaled partial sums to LDS (no silu, no doweight)."""
                         _acc = _split_k_acc[0]
                         _sw = _split_k_sw_vals[0]
                         # Load per-row scale_x (sx) — same logic as normal epilogue.
@@ -1327,9 +1341,11 @@ def compile_moe_gemm1(
                             if is_int8:
                                 v = arith.sitofp(T.f32, v)
                             v = v * sx * _sw[ni]
+                            if _splitk_use_bf16:
+                                v = arith.trunc_f(T.bf16, v)
                             lds_idx = row_base_lds + col_local
-                            v1 = vector.from_elements(T.vec(1, T.f32), [v])
-                            vector.store(v1, lds_out, [lds_idx], alignment=4)
+                            v1 = vector.from_elements(T.vec(1, _splitk_lds_elem), [v])
+                            vector.store(v1, lds_out, [lds_idx], alignment=_splitk_lds_align)
 
                     def precompute_row_splitk(*, row_local, row):
                         fused2 = buffer_ops.buffer_load(sorted_rsrc, row, vec_width=1, dtype=T.i32)
@@ -1339,28 +1355,64 @@ def compile_moe_gemm1(
                         t_idx = arith.index_cast(T.index, t2)
                         s_idx = arith.index_cast(T.index, s2)
                         ts_idx = t_idx * arith.index(topk) + s_idx
-                        row_byte_base = out_base_idx + ts_idx * arith.index(_split_k_out_row_stride)
-                        return (row_byte_base, t_ok)
+                        if _splitk_use_bf16 and not _needs_global_atomic_bf16_s1:
+                            # For buffer atomics: compute relative byte offset from buffer base
+                            row_byte_off = ts_idx * arith.index(_split_k_out_row_stride)
+                            return (row_byte_off, t_ok)
+                        else:
+                            # For global atomics: compute absolute address
+                            row_byte_base = out_base_idx + ts_idx * arith.index(_split_k_out_row_stride)
+                            return (row_byte_base, t_ok)
+
+                    _splitk_zero_i32 = [None]
 
                     def store_pair_splitk(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                        row_byte_base = row_ctx
+                        row_byte_ctx = row_ctx
                         col_idx = col_g0 + arith.index(_split_k_n_offset[0])
                         byte_off_col = col_idx * arith.index(out_elem_bytes)
-                        ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr = buffer_ops.create_llvm_ptr(ptr_addr_idx, address_space=1)
-                        out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
-                        frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.fadd,
-                            out_ptr_v,
-                            frag_v,
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="agent",
-                            alignment=_split_k_e_vec * out_elem_bytes,
-                        )
+                        if _splitk_use_bf16:
+                            if _splitk_zero_i32[0] is None:
+                                _splitk_zero_i32[0] = fx.Int32(0)
+                            _z = _splitk_zero_i32[0]
+                            if _needs_global_atomic_bf16_s1:
+                                # gfx942: global atomicrmw fadd for bf16
+                                ptr_addr_idx = row_byte_ctx + byte_off_col
+                                out_ptr = buffer_ops.create_llvm_ptr(ptr_addr_idx, address_space=1)
+                                out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
+                                frag_v = frag._value if hasattr(frag, "_value") else frag
+                                llvm.AtomicRMWOp(
+                                    llvm.AtomicBinOp.fadd,
+                                    out_ptr_v,
+                                    frag_v,
+                                    llvm.AtomicOrdering.monotonic,
+                                    syncscope="agent",
+                                    alignment=_split_k_e_vec * out_elem_bytes,
+                                )
+                            else:
+                                # gfx950+: buffer_atomic_pk_add_bf16
+                                byte_off_i32 = arith.index_cast(T.i32, row_byte_ctx + byte_off_col)
+                                rocdl.raw_ptr_buffer_atomic_fadd(
+                                    frag, out_rsrc, byte_off_i32, _z, _z,
+                                )
+                        else:
+                            # f32 atomic: global atomicrmw fadd
+                            ptr_addr_idx = row_byte_ctx + byte_off_col
+                            out_ptr = buffer_ops.create_llvm_ptr(ptr_addr_idx, address_space=1)
+                            out_ptr_v = out_ptr._value if hasattr(out_ptr, "_value") else out_ptr
+                            frag_v = frag._value if hasattr(frag, "_value") else frag
+                            llvm.AtomicRMWOp(
+                                llvm.AtomicBinOp.fadd,
+                                out_ptr_v,
+                                frag_v,
+                                llvm.AtomicOrdering.monotonic,
+                                syncscope="agent",
+                                alignment=_split_k_e_vec * out_elem_bytes,
+                            )
 
                     _cshuffle_nlane_splitk = min(32, tile_n // _split_k_e_vec)
-                    _splitk_frag_elem = ir.F32Type.get()
+                    _splitk_frag_elem = (
+                        ir.BF16Type.get() if _splitk_use_bf16 else ir.F32Type.get()
+                    )
 
                     # Pass 1: gate (offset=0)
                     _split_k_acc[0] = acc_gate
