@@ -119,10 +119,12 @@ def create_benchmark_configs(custom, args):
     }
 
     if custom:
+        b_vals = args.b if isinstance(args.b, list) else [args.b]
         sq_vals = args.sq if isinstance(args.sq, list) else [args.sq]
         sk_vals = sk if isinstance(sk, list) else [sk]
         x_vals_list = [
-            (args.b, args.hq, hk, sq_val, sk_val, head_size, head_size_v)
+            (b_val, args.hq, hk, sq_val, sk_val, head_size, head_size_v)
+            for b_val in b_vals
             for sq_val in sq_vals
             for sk_val in sk_vals
         ]
@@ -427,7 +429,7 @@ def run_benchmark(custom, args):
             return total_num_tokens_q / (ms * 1e-3)
         return ms
 
-    bench_mha.run(None, print_data=True)
+    bench_mha.run(save_path="." if args.o else None, print_data=True)
 
 
 def supported_layouts():
@@ -452,15 +454,15 @@ def str2bool(v):
 def parse_args():
     parser = get_parser(kernel_name="UnifiedAttention")
 
-    parser.add_argument("-b", type=int, default=0)
-    parser.add_argument("-hq", type=int, default=0)
-    parser.add_argument("-hk", type=int, default=0)
-
     def parse_int_or_list(value):
         if "," in value:
             return [int(x) for x in value.split(",")]
         else:
             return int(value)
+
+    parser.add_argument("-b", type=parse_int_or_list, default=0)
+    parser.add_argument("-hq", type=int, default=0)
+    parser.add_argument("-hk", type=int, default=0)
 
     parser.add_argument(
         "-sq",
@@ -584,6 +586,11 @@ def parse_args():
         choices=["time", "throughput", "bandwidth", "tok/s", "all"],
         default=None,
         help="Metrics for the kernel benchmark.",
+    )
+
+    parser.add_argument(
+        "-o", action="store_true", default=False,
+        help="Write performance results to CSV file",
     )
 
     return parser.parse_args()
