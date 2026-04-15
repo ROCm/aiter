@@ -19,7 +19,7 @@ from aiter.jit.utils.chip_info import get_gfx
 
 from ..shuffle import shuffle_weight
 from .kernels.splitk_hgemm import compile_hgemm_kernel
-from .utils import is_flydsl_available
+from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "flydsl_hgemm",
@@ -27,7 +27,6 @@ __all__ = [
 
 SPLIT_K_COUNTER_MAX_LEN = 128
 SPLIT_K_SIGNAL_STATE_COUNT = 3
-MAX_LDS_BYTES = 163840
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
@@ -333,10 +332,11 @@ def _validate_hgemm_tiling(
         stages=stages,
         b_to_lds=b_to_lds,
     )
-    if lds_bytes > MAX_LDS_BYTES:
+    lds_limit = get_shared_memory_per_block(fallback_gfx=get_gfx())
+    if lds_bytes > lds_limit:
         raise ValueError(
             "Invalid tile combination: estimated LDS usage "
-            f"{lds_bytes} exceeds the hardware limit {MAX_LDS_BYTES}"
+            f"{lds_bytes} exceeds the hardware limit {lds_limit}"
         )
 
 
