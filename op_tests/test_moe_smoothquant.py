@@ -5,6 +5,7 @@ from aiter.fused_moe_bf16_asm import torch_moe
 from aiter.test_common import run_perftest
 from aiter import get_gfx
 
+
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
@@ -107,6 +108,7 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
 
     assert logits_diff0 < 0.001
     assert logits_diff1 < 0.001
+
 
 if __name__ == "__main__":
     torch.set_default_device("cuda")
