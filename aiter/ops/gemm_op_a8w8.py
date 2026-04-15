@@ -37,7 +37,9 @@ def gen_gemm_a8w8_ck_fake_tensors(
     return Out
 
 
-@compile_ops("module_gemm_a8w8", fc_name="gemm_a8w8", gen_fake=gen_gemm_a8w8_ck_fake_tensors)
+@compile_ops(
+    "module_gemm_a8w8", fc_name="gemm_a8w8", gen_fake=gen_gemm_a8w8_ck_fake_tensors
+)
 def gemm_a8w8_ck(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -357,7 +359,9 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
         _CKGEMM_CONFIG_CACHE = {}
     if tuned_file not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(["cu_num", "M", "N", "K"]).to_dict("index")
+        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+            ["cu_num", "M", "N", "K"]
+        ).to_dict("index")
 
     cu_num = get_cu_num()
     padded_M = M
@@ -372,7 +376,9 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
                 )
             break
     if config is None:
-        logger.info(f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!")
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+        )
     return config
 
 
@@ -391,9 +397,11 @@ def get_GEMM_config_with_quant_type(
     # Load file if not cached
     if tuned_file not in get_GEMM_config_with_quant_type.file_cache:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_GEMM_config_with_quant_type.file_cache[tuned_file] = asmGemmDictDf.set_index(
-            ["cu_num", "M", "N", "K", "q_dtype_w"]
-        ).to_dict("index")
+        get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
+            asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
+                "index"
+            )
+        )
 
     cu_num = get_cu_num()
     padded_M = M
@@ -487,12 +495,16 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert bias is not None, "Use asm gemm must give bias, please give a \
+        assert (
+            bias is not None
+        ), "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-        return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=splitK)
+        return gemm_a8w8_asm(
+            XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=splitK
+        )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, kernelName, bias, splitK=1)
 
@@ -515,7 +527,9 @@ def gemm_a8w8_CK(
     k = XQ.shape[-1]
 
     q_dtype_w = WQ.dtype if WQ.dtype in [dtypes.fp8, dtypes.i8] else dtypes.i8
-    ck_config = get_GEMM_config_with_quant_type(m, n, k, q_dtype_w, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE)
+    ck_config = get_GEMM_config_with_quant_type(
+        m, n, k, q_dtype_w, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
+    )
     if splitK is None:
         if ck_config is not None:
             splitK = ck_config["splitK"]
@@ -628,7 +642,9 @@ def gemm_a8w8_blockscale(
         else:
             assert 0, "asm kernel only support B preshuffle and m >= 16"
     else:
-        config = get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE)
+        config = get_CKGEMM_config(
+            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE
+        )
         if config is not None:
             libtype = config["libtype"]
             if libtype == "ck":
@@ -682,7 +698,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
-    config = get_CKGEMM_config(m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE)
+    config = get_CKGEMM_config(
+        m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    )
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
