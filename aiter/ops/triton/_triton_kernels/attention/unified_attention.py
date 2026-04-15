@@ -1,5 +1,7 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
+
 import triton
 import triton.language as tl
 import torch
@@ -9,6 +11,55 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 )
 
 float8_info = torch.finfo(e4m3_dtype)
+
+# ---------------------------------------------------------------------------
+# Autotune configuration
+# ---------------------------------------------------------------------------
+UNIFIED_ATTN_AUTOTUNE = os.environ.get(
+    "UNIFIED_ATTENTION_AUTOTUNE", "0"
+).lower() in ("1", "true", "yes", "on")
+
+# Parameters managed by @triton.autotune — callers must NOT pass these when
+# the decorator is active.
+_AUTOTUNE_2D_PARAMS = frozenset({"TILE_SIZE", "PRELOAD_V", "num_warps", "num_stages"})
+_AUTOTUNE_3D_PARAMS = frozenset({"TILE_SIZE", "PRELOAD_V", "num_warps", "num_stages"})
+_AUTOTUNE_REDUCE_PARAMS = frozenset({"num_warps", "num_stages"})
+
+
+def _get_2d_autotune_configs():
+    configs = []
+    for ts in [32, 64]:
+        for pv in [False, True]:
+            for nw in [4, 8]:
+                for ns in [1, 2, 3]:
+                    configs.append(triton.Config(
+                        {"TILE_SIZE": ts, "PRELOAD_V": pv},
+                        num_warps=nw, num_stages=ns,
+                    ))
+    return configs
+
+
+def _get_3d_autotune_configs():
+    configs = []
+    for ts in [32, 64]:
+        for pv in [False, True]:
+            for nw in [2, 4, 8]:
+                for ns in [1, 2, 3]:
+                    configs.append(triton.Config(
+                        {"TILE_SIZE": ts, "PRELOAD_V": pv},
+                        num_warps=nw, num_stages=ns,
+                    ))
+    return configs
+
+
+def _get_reduce_autotune_configs():
+    configs = []
+    for nw in [1, 2, 4]:
+        for ns in [1, 2]:
+            configs.append(triton.Config(
+                {}, num_warps=nw, num_stages=ns,
+            ))
+    return configs
 
 
 @triton.jit
@@ -1581,3 +1632,30 @@ def reduce_segments(
         + tl.arange(0, HEAD_SIZE_PADDED)
     )
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
+
+
+# ---------------------------------------------------------------------------
+# Autotuner wrappers (for profiling only).  The raw @triton.jit kernels above
+# are always exported unchanged; the autotuners are separate objects whose
+# .best_config is extracted after the first call and then the raw JIT kernels
+# are called directly with that config (zero decorator overhead).
+# ---------------------------------------------------------------------------
+if UNIFIED_ATTN_AUTOTUNE:
+    _2d_autotuner = triton.autotune(
+        configs=_get_2d_autotune_configs(),
+        key=["HEAD_SIZE", "HEAD_SIZE_V", "BLOCK_SIZE", "ALL_DECODE"],
+    )(kernel_unified_attention_2d)
+
+    _3d_autotuner = triton.autotune(
+        configs=_get_3d_autotune_configs(),
+        key=["HEAD_SIZE", "HEAD_SIZE_V", "BLOCK_SIZE"],
+    )(kernel_unified_attention_3d)
+
+    _reduce_autotuner = triton.autotune(
+        configs=_get_reduce_autotune_configs(),
+        key=["HEAD_SIZE", "NUM_SEGMENTS_PER_SEQ"],
+    )(reduce_segments)
+else:
+    _2d_autotuner = None
+    _3d_autotuner = None
+    _reduce_autotuner = None

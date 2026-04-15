@@ -7,6 +7,7 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.unified_attention import unified_attention, predict_kernel_path
+from aiter.ops.triton._triton_kernels.attention.unified_attention import UNIFIED_ATTN_AUTOTUNE
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -353,8 +354,11 @@ def run_benchmark(custom, args):
             force_kernel=args.force_kernel,
         )
 
+        if UNIFIED_ATTN_AUTOTUNE:
+            fn()
+            torch.cuda.synchronize()
+
         ms = triton.testing.do_bench(fn)
-        # ms *= 80 // simulate 80 layers for GLM5
 
         run_correctness = args.test
         if run_correctness:
