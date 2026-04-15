@@ -17,13 +17,13 @@ from .enum import ActivationType, QuantType
 from ..jit.utils.chip_info import get_cu_num
 
 
-@compile_ops("module_smoothquant", develop=True)
+@compile_ops("module_smoothquant")
 def smoothquant_fwd(
     out: Tensor, input: Tensor, x_scale: Tensor, y_scale: Tensor
 ) -> None: ...
 
 
-@compile_ops("module_smoothquant", develop=True)
+@compile_ops("module_smoothquant")
 def moe_smoothquant_fwd(
     out: Tensor, input: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
 ) -> None: ...

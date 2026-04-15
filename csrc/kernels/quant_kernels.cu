@@ -912,7 +912,7 @@ void dynamic_per_group_scaled_quant_fp4(const aiter_tensor_t& out,         // [.
                 reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
                 reinterpret_cast<float*>(scales.data_ptr()),                                                                              \
                 reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
-                smooth_reinterpret_cast<float*>(scale.data_ptr()),                                                                        \
+                reinterpret_cast<float*>(smooth_scale.data_ptr()),                                                                        \
                 smooth_scale_map_ptr,                                                                                  \
                 smooth_scale_map_hash_ptr,                                                                             \
                 grid_size,                                                                                             \
@@ -963,7 +963,7 @@ void dynamic_per_group_scaled_quant_fp4(const aiter_tensor_t& out,         // [.
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize) \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize); \
     }
 
 void smooth_per_token_scaled_quant(
@@ -1277,12 +1277,12 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                                             \
         int grid_size = rows;                                                                                          \
         dim3 const grid(grid_size);                                                                                    \
-        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01, HAS_HASH, MAX_EXPERT_SIZE> \
+        quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01, HAS_HASH, MAX_EXPERT_SIZE>        \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                                   \
                 reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
                 reinterpret_cast<float*>(scales.data_ptr()),                                                                              \
                 reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
-                smooth_reinterpret_cast<float*>(scale.data_ptr()),                                                                        \
+                reinterpret_cast<float*>(smooth_scale.data_ptr()),                                                                        \
                 smooth_scale_map_ptr,                                                                                  \
                 smooth_scale_map_hash_ptr,                                                                             \
                 rows,                                                                                                  \
@@ -1328,7 +1328,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize) \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize); \
     }
 
 void moe_smooth_per_token_scaled_quant_v1(
@@ -1506,32 +1506,33 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
 }
 
 
-#define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)  \
-    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "quant_kernel", [&] {                            \                                            \
-        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                             \
-        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                               \
-        dim3 const grid(num_tg);                                                                          \
-        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>                                \
-            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                      \
-                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                               \
-                reinterpret_cast<float*>(scales.data_ptr()),                                                                 \
-                reinterpret_cast<input_dtype*>(input.data_ptr()),                                         \
-                smooth_reinterpret_cast<float*>(scale.data_ptr()),                                                           \
-                reinterpret_cast<int*>(sorted_token_ids.data_ptr()),                                                         \
-                reinterpret_cast<int*>(sorted_expert_ids.data_ptr()),                                                        \
-                reinterpret_cast<int*>(num_valid_ids.data_ptr()),                                                            \
-                num_experts,                                                                              \
-                num_tokens,                                                                               \
-                num_blocks,                                                                               \
-                num_tg,                                                                                   \
-                cols,                                                                                     \
-                topk,                                                                                     \
-                block_m,                                                                                  \
-                block_m_log2split,                                                                        \
-                input_stride0,                                                                            \
-                input_stride1,                                                                            \
-                shuffle_scale,                                                                            \
-                transpose_out);                                                                           \
+#define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE) \
+    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "quant_kernel", [&] {                                   \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                      \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                              \
+        int num_tg        = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                        \
+        dim3 const grid(num_tg);                                                                           \
+        quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>                                       \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                       \
+                reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                \
+                reinterpret_cast<float*>(scales.data_ptr()),                                               \
+                reinterpret_cast<input_dtype*>(input.data_ptr()),                                          \
+                reinterpret_cast<float*>(smooth_scale.data_ptr()),                                         \
+                reinterpret_cast<int*>(sorted_token_ids.data_ptr()),                                       \
+                reinterpret_cast<int*>(sorted_expert_ids.data_ptr()),                                      \
+                reinterpret_cast<int*>(num_valid_ids.data_ptr()),                                          \
+                num_experts,                                                                                \
+                num_tokens,                                                                                 \
+                num_blocks,                                                                                 \
+                num_tg,                                                                                     \
+                cols,                                                                                       \
+                topk,                                                                                       \
+                block_m,                                                                                    \
+                block_m_log2split,                                                                          \
+                input_stride0,                                                                              \
+                input_stride1,                                                                              \
+                shuffle_scale,                                                                              \
+                transpose_out);                                                                             \
     });
 
 
@@ -1554,7 +1555,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize) \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize); \
     }
 
 
@@ -1736,19 +1737,19 @@ __global__ void mxfp4_quant_moe_sort_kernel(
 
 
 #define MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                    \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "mxfp4_quant_moe_sort_kernel", [&] { \
+    AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "mxfp4_quant_moe_sort_kernel", [&] {       \
         AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
-        using input_dtype = typename t2opus<scalar_t>::type;                                   \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                          \
         int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                  \
         int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                     \
         dim3 const grid(num_tg);                                                               \
         mxfp4_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>             \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                           \
                 reinterpret_cast<DTYPE_O*>(output.data_ptr()),                                  \
-                reinterpret_cast<uint8_t*>(scale.data_ptr()),                                   \
+                reinterpret_cast<uint8_t*>(scales.data_ptr()),                                  \
                 reinterpret_cast<input_dtype const*>(input.data_ptr()),                         \
-                sorted_ids.data_ptr<int32_t>(),                                                 \
-                num_valid_ids.data_ptr<int32_t>(),                                              \
+                reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                              \
+                reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                           \
                 token_num,                                                                      \
                 cols,                                                                           \
                 group_size,                                                                     \
@@ -1784,15 +1785,15 @@ __global__ void mxfp4_quant_moe_sort_kernel(
     }                                                                                          \
     else                                                                                       \
     {                                                                                          \
-        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize)  \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
     }
 
 void fused_dynamic_mxfp4_quant_moe_sort_hip(
-    torch::Tensor& output,
-    torch::Tensor& scale,
-    torch::Tensor const& input,
-    torch::Tensor const& sorted_ids,
-    torch::Tensor const& num_valid_ids,
+    const aiter_tensor_t& output,
+    const aiter_tensor_t& scales,
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& sorted_ids,
+    const aiter_tensor_t& num_valid_ids,
     int token_num,
     int block_m,
     int group_size = 32
@@ -1804,25 +1805,25 @@ void fused_dynamic_mxfp4_quant_moe_sort_hip(
     
     const int num_cu = get_num_cu_func();
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
-    TORCH_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
+    AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
     int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
     const bool persistent_mode = false;
     const int input_stride     = input.stride(-2);
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
 #if defined(__Float4_e2m1fn_x2)
-    if(output.dtype() == torch_fp4x2 || output.dtype() == torch::kUInt8)
+    if(output.dtype() == AITER_DTYPE_fp4x2 || output.dtype() == AITER_DTYPE_u8)
     {
         MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
     }
     else
     {
-        TORCH_CHECK(false, __func__, ": not support output type: ", output.dtype());
+        AITER_CHECK(false, __func__, ": not support output type: ", output.dtype());
     }
 #else
-    TORCH_CHECK(false, __func__, ": not support fp4x2 on this device");
+    AITER_CHECK(false, __func__, ": not support fp4x2 on this device");
 #endif
 }
 
@@ -1898,7 +1899,7 @@ __global__ void mxfp4_moe_sort_kernel(
 #define MXFP4_MOE_SORT_KERNEL_IMPL(MAX_COL, THREAD_DATA, BLOCK_SIZE)                    \
     constexpr int GROUP_SIZE = 32;                                                      \
     constexpr int NUM_ROWS = BLOCK_SIZE / (MAX_COL /(GROUP_SIZE * THREAD_DATA));        \
-    TORCH_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
+    AITER_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
     int num_blocks = (sorted_ids.size(0) + NUM_ROWS - 1) / NUM_ROWS;                    \
     int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                               \
     int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
@@ -1907,8 +1908,8 @@ __global__ void mxfp4_moe_sort_kernel(
         <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                        \
             reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                           \
             reinterpret_cast<uint8_t*>(scale.data_ptr()),                               \
-            sorted_ids.data_ptr<int32_t>(),                                             \
-            num_valid_ids.data_ptr<int32_t>(),                                          \
+            reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                          \
+            reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                       \
             token_num, cols, num_blocks, num_tg, topk); 
 
 
@@ -1947,14 +1948,14 @@ __global__ void mxfp4_moe_sort_kernel(
     }                                                                                          \
     else                                                                                       \
     {                                                                                          \
-        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 16384)            \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 16384);            \
     }
 
 void mxfp4_moe_sort_hip(
-    torch::Tensor& out_scale,
-    torch::Tensor const& scale,
-    torch::Tensor const& sorted_ids,
-    torch::Tensor const& num_valid_ids,
+    const aiter_tensor_t& out_scale,
+    const aiter_tensor_t& scale,
+    const aiter_tensor_t& sorted_ids,
+    const aiter_tensor_t& num_valid_ids,
     int token_num,
     int cols
 )
@@ -1963,8 +1964,8 @@ void mxfp4_moe_sort_hip(
     const bool persistent_mode = false;
     int topk = scale.numel() / ((cols + 31) / 32 * token_num);
  
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(scale));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(scale.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     MXFP4_MOE_SORT_KERNEL_DISPATCH(cols);
 }

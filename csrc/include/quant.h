@@ -69,19 +69,19 @@ void moe_smooth_per_token_scaled_quant_v2(const aiter_tensor_t& out,         // 
                                           bool shuffle_scale = false,
                                           bool transpose_out = false);
 
-void fused_dynamic_mxfp4_quant_moe_sort_hip(torch::Tensor& out,         // [token_num * topk, d / 2]
-                                            torch::Tensor& scales,      // swizzled e8m0 bytes
-                                            torch::Tensor const& input, // [token_num * topk, d]
-                                            torch::Tensor const& sorted_ids,
-                                            torch::Tensor const& num_valid_ids,
+void fused_dynamic_mxfp4_quant_moe_sort_hip(const aiter_tensor_t& out,         // [token_num * topk, d / 2]
+                                            const aiter_tensor_t& scales,      // swizzled e8m0 bytes
+                                            const aiter_tensor_t& input, // [token_num * topk, d]
+                                            const aiter_tensor_t& sorted_ids,
+                                            const aiter_tensor_t& num_valid_ids,
                                             int token_num,
                                             int block_m,
                                             int group_size = 32);
 
-void mxfp4_moe_sort_hip(torch::Tensor& out_scale,
-                         torch::Tensor const& scale,
-                         torch::Tensor const& sorted_ids,
-                         torch::Tensor const& num_valid_ids,
-                         int token_num,
-                         int cols);
+void mxfp4_moe_sort_hip(const aiter_tensor_t& out_scale,
+                        const aiter_tensor_t& scale,
+                        const aiter_tensor_t& sorted_ids,
+                        const aiter_tensor_t& num_valid_ids,
+                        int token_num,
+                        int cols);
 } // namespace aiter
