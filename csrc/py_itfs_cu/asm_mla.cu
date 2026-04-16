@@ -346,9 +346,13 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q % 128 == 0)){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
+        args.s_Q_Bs = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q % 64 == 0)){
+        config_max_seqlen_q = 1;
+        config_gqa_ratio = 64;
         args.s_Q_Bs = gqa_ratio;
     }
     int lse_flag = (lse != nullptr) ? 1 : 0;

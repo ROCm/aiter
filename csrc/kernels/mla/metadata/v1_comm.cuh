@@ -6,8 +6,8 @@
 #include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 #include "mla.h"
-#include "pa.h"
 #include "opus/opus.hpp"
+#include "pa.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/python.h>
@@ -28,10 +28,14 @@ __host__ __device__ constexpr T integer_least_multiple(T x, T y)
 template <typename T>
 __host__ __device__ constexpr T next_power_of_two(T x)
 {
-    if(x <= 1) return 1;
+    if(x <= 1)
+        return 1;
     --x;
-    x |= x >> 1; x |= x >> 2; x |= x >> 4;
-    x |= x >> 8; x |= x >> 16;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
     return x + 1;
 }
 
@@ -138,8 +142,8 @@ __device__ void warp_sort(int32_t* p_batch_idx,
 {
     const int32_t lane_idx = opus::lane_id();
 
-    const int32_t num_batches_padded = integer_least_multiple(
-        next_power_of_two(num_batches), opus::get_warp_size());
+    const int32_t num_batches_padded =
+        integer_least_multiple(next_power_of_two(num_batches), opus::get_warp_size());
     const int32_t warp_loops = num_batches_padded / opus::get_warp_size();
     int32_t* p_costs         = p_workspace;
     int32_t* p_indices       = p_costs + num_batches_padded;
@@ -247,7 +251,7 @@ __host__ __device__ int32_t cal_packed_causal_kv_len(const int32_t qo_len,
         const int kv_len_slop =
             integer_divide_ceil((qo_tile_idx + 1) * packed_qo_tile_len, num_heads);
         const int sum = kv_len_init + kv_len_slop;
-        result = (sum < kv_len) ? sum : kv_len;
+        result        = (sum < kv_len) ? sum : kv_len;
     }
 
     return result;
@@ -258,9 +262,9 @@ class QoState
 {
     public:
     __device__ explicit QoState(const int32_t uni_seqlen_qo,
-                                    const int32_t ori_seqlen_qo,
-                                    const int32_t* p_lds_seqlens_qo,
-                                    const int32_t* p_seqlens_qo_indptr)
+                                const int32_t ori_seqlen_qo,
+                                const int32_t* p_lds_seqlens_qo,
+                                const int32_t* p_seqlens_qo_indptr)
         : uni_seqlen_qo_(uni_seqlen_qo),
           ori_seqlen_qo_(ori_seqlen_qo),
           p_lds_seqlens_qo_(p_lds_seqlens_qo),
@@ -363,33 +367,53 @@ class QoState
     }                                                 \
     }
 
-#define MLA_METADATA_DISPATCHER(                                                         \
-    MAX_PACKED_SEQLEN_QO, PACKED_QO_LEN_PER_WG, UNI_SEQLEN_QO, TOPK, ...)                \
-    if(((MAX_PACKED_SEQLEN_QO) > 0) && ((MAX_PACKED_SEQLEN_QO) <= PACKED_QO_LEN_PER_WG)) \
-    {                                                                                    \
-        constexpr bool kQoSplits = false;                                                \
-        if((TOPK) < 0)                                                                   \
-        {                                                                                \
-            constexpr bool kIsSparse = false;                                            \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
-        else                                                                             \
-        {                                                                                \
-            constexpr bool kIsSparse = true;                                             \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
-    }                                                                                    \
-    else                                                                                 \
-    {                                                                                    \
-        constexpr bool kQoSplits = true;                                                 \
-        if((TOPK) < 0)                                                                   \
-        {                                                                                \
-            constexpr bool kIsSparse = false;                                            \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
-        else                                                                             \
-        {                                                                                \
-            constexpr bool kIsSparse = true;                                             \
-            MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                     \
-        }                                                                                \
+#define MLA_PACKED_QO_LEN_PER_WG_CASE(C_PACKED_QO_LEN_PER_WG, ...)    \
+    case C_PACKED_QO_LEN_PER_WG: {                                    \
+        constexpr int32_t kPackedQoLenPerWg = C_PACKED_QO_LEN_PER_WG; \
+        __VA_ARGS__;                                                  \
+        break;                                                        \
     }
+
+#define MLA_PACKED_QO_LEN_PER_WG_DISPATCHER(PACKED_QO_LEN_PER_WG, ...) \
+    switch(PACKED_QO_LEN_PER_WG)                                       \
+    {                                                                  \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(128, __VA_ARGS__);               \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(64, __VA_ARGS__);                \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(32, __VA_ARGS__);                \
+        MLA_PACKED_QO_LEN_PER_WG_CASE(16, __VA_ARGS__);                \
+    default: {                                                         \
+        constexpr int32_t kPackedQoLenPerWg = 128;                     \
+        __VA_ARGS__;                                                   \
+        break;                                                         \
+    }                                                                  \
+    }
+
+#define MLA_METADATA_DISPATCHER(                                                            \
+    MAX_PACKED_SEQLEN_QO, PACKED_QO_LEN_PER_WG, UNI_SEQLEN_QO, TOPK, ...)                   \
+    MLA_PACKED_QO_LEN_PER_WG_DISPATCHER(                                                    \
+        PACKED_QO_LEN_PER_WG,                                                               \
+        if(((MAX_PACKED_SEQLEN_QO) > 0) && ((MAX_PACKED_SEQLEN_QO) <= kPackedQoLenPerWg)) { \
+            constexpr bool kQoSplits = false;                                               \
+            if((TOPK) < 0)                                                                  \
+            {                                                                               \
+                constexpr bool kIsSparse = false;                                           \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+            else                                                                            \
+            {                                                                               \
+                constexpr bool kIsSparse = true;                                            \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+        } else {                                                                            \
+            constexpr bool kQoSplits = true;                                                \
+            if((TOPK) < 0)                                                                  \
+            {                                                                               \
+                constexpr bool kIsSparse = false;                                           \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+            else                                                                            \
+            {                                                                               \
+                constexpr bool kIsSparse = true;                                            \
+                MLA_UNI_SEQLEN_DISPATCHER((UNI_SEQLEN_QO), __VA_ARGS__);                    \
+            }                                                                               \
+        })
