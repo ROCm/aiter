@@ -272,7 +272,7 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
     };
     int qTile = 0;
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     std::string kernelName = (kernelName_ != nullptr) ? arch_id + std::string(kernelName_) : "";
     int ps = 0;
     if (kernelName.empty())
@@ -290,12 +290,9 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
@@ -451,7 +448,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
                 ") exceeds maximum available qTile. Please reduce gqa_ratio or max_qlen.");
 
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
     std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
         get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, config_map);
@@ -469,12 +466,9 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
         if(cfg.ps)
         {
             gdx = get_num_cu_func();
