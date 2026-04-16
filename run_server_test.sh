@@ -84,14 +84,80 @@ SERVER_MODEL_PATH=${SERVER_MODEL_PATH:-/shared_inference/models/gpt-oss-120b/}
 SERVER_TP=${SERVER_TP:-8}
 SERVER_PORT=${SERVER_PORT:-8000}
 
+print_help() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Kernel optimization harness for worktree build + benchmark runs.
+Configuration is primarily via environment variables.
+
+Options:
+  -h, --help    Show this help message and exit.
+
+Common environment variables:
+  OPTIMIZE_MODE   accumulative | individual (default: individual)
+  RUN_PHASE       build_only | benchmarks_only | build_and_benchmarks (default: build_and_benchmarks)
+  OUT_DIR         results root (default: ./kernel_optimization_results/<timestamp>)
+  PROMPTS_DIR     prompt files directory (default: ./optimization_prompts)
+  WORKTREE_ROOT   parent directory for git worktrees
+  BASELINE_REF    git start point for new worktrees (default: HEAD)
+  CLEAN_OUTPUT_BEFORE_BUILD
+                  0 or 1; if 1, remove prior OUT_DIR contents + related worktrees before build
+  SKIP_CLAUDE     set to skip Claude CLI in build phase
+  CLAUDE_MODEL    optional model passed to Claude CLI
+  CLAUDE_BIN      Claude executable path (default: claude)
+  SERVER_READY_TIMEOUT_SEC
+                  server startup wait timeout in seconds (default: 300)
+  SERVER_READY_LINE
+                  log substring that indicates server readiness
+  SERVER_MODEL_PATH
+                  model path used by OpenAI server
+  SERVER_TP       tensor parallel size used by OpenAI server (default: 8)
+  SERVER_PORT     OpenAI server port (default: 8000)
+
+Examples:
+  RUN_PHASE=build_only OPTIMIZE_MODE=individual bash $(basename "$0")
+  RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash $(basename "$0")
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown argument: $1" >&2
+      echo "Run with --help to see usage." >&2
+      exit 1
+      ;;
+  esac
+done
+
 mkdir -p "$OUT_DIR/baseline" "$OUT_DIR/optimized/accumulative" "$OUT_DIR/optimized/individual"
 
 module_under_test="module_custom_all_reduce"
 
-# Remove JIT artefacts for module_under_test under a given checkout (main repo or worktree path).
+# Seed a worktree's aiter/jit/ with pre-built .so files from the main repo, then
+# remove the module under test so it is rebuilt from the worktree's source.
+#
+# Without this, git worktree add produces an empty aiter/jit/ (compiled .so files are
+# not tracked). The server JIT-builds some modules during startup, but others (e.g.
+# module_moe_sorting) are only needed during the first inference warmup pass, at which
+# point the import fails with ModuleNotFoundError because no .so exists and no build
+# was triggered for them.  Seeding from the baseline ensures every module except the
+# one being optimised is available immediately, matching the baseline environment.
 clean_jit() {
   local checkout_root=$1
   local jit_dir="$checkout_root/aiter/jit"
+  local src_jit_dir="$REPO_ROOT/aiter/jit"
+  # Copy all pre-built .so files from the main repo into the worktree.
+  for so_file in "$src_jit_dir"/*.so; do
+    [[ -f "$so_file" ]] || continue
+    cp "$so_file" "$jit_dir/" 2>/dev/null || true
+  done
+  # Remove only the module under test so it gets freshly compiled from the worktree's code.
   local jit_so="$jit_dir/$module_under_test.so"
   local build_dir="$jit_dir/build/$module_under_test"
   rm -f "$jit_so"
@@ -124,7 +190,12 @@ start_openai_server_bg() {
   echo $!
 }
 
-# Wait until server_log contains SERVER_READY_LINE or timeout; return 0 on ready, 1 on timeout, 2 if server_pid died first.
+# Wait until server_log contains SERVER_READY_LINE or timeout.
+# Returns:
+#   0 — server ready
+#   1 — timeout
+#   2 — server process exited before ready
+#   3 — fatal engine error detected in log ("[atom] Engine Core: load model runner failed")
 wait_for_server_ready() {
   local server_log=$1
   local server_pid=$2
@@ -137,6 +208,10 @@ wait_for_server_ready() {
   while true; do
     if grep -qF "$SERVER_READY_LINE" "$server_log" 2>/dev/null; then
       return 0
+    fi
+    if grep -qF "[atom] Engine Core: load model runner failed" "$server_log" 2>/dev/null; then
+      echo "ERROR: Fatal engine error detected in server log: [atom] Engine Core: load model runner failed" >&2
+      return 3
     fi
     if ! kill -0 "$server_pid" 2>/dev/null; then
       return 2
@@ -157,26 +232,82 @@ wait_for_server_ready() {
 stop_openai_server() {
   local server_pid=$1
   [[ -z "${server_pid:-}" ]] && return 0
-  if kill -0 "$server_pid" 2>/dev/null; then
-    kill -TERM "$server_pid" 2>/dev/null || true
-    local w=0
-    while kill -0 "$server_pid" 2>/dev/null && [[ $w -lt 40 ]]; do
-      sleep 0.25
-      w=$((w + 1))
+
+  # Collect ALL descendant PIDs via BFS before killing (they re-parent to PID 1
+  # once the parent dies, making them untrackable afterwards).
+  # With -tp 8 the server spawns 8 GPU worker processes that may form their own
+  # process groups; we must track them explicitly to ensure GPU memory is released.
+  local -a all_pids=("$server_pid")
+  local -a queue=("$server_pid")
+  while [[ ${#queue[@]} -gt 0 ]]; do
+    local head=${queue[0]}
+    queue=("${queue[@]:1}")
+    local -a children
+    mapfile -t children < <(pgrep -P "$head" 2>/dev/null || true)
+    for child in "${children[@]}"; do
+      all_pids+=("$child")
+      queue+=("$child")
     done
-    kill -KILL "$server_pid" 2>/dev/null || true
+  done
+
+  # SIGTERM the server's process group and every collected descendant.
+  # This allows Python/C++ destructors to run, which is required for HIP IPC
+  # shared memory (used by custom all-reduce) to be properly released by the KFD.
+  # SIGKILL bypasses destructors and leaves IPC mappings alive in the KFD,
+  # permanently holding VRAM until the driver session is reset.
+  local pgid
+  pgid=$(ps -o pgid= -p "$server_pid" 2>/dev/null | tr -d ' ') || true
+  kill -TERM "$server_pid" 2>/dev/null || true
+  [[ -n "$pgid" && "$pgid" != "$$" ]] && kill -TERM -- "-$pgid" 2>/dev/null || true
+  for pid in "${all_pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+
+  # Wait up to 60s for graceful exit (destructors release HIP IPC handles).
+  # Only SIGKILL if the process tree hasn't exited by then.
+  local grace_deadline=$(( $(date +%s) + 60 ))
+  local -a grace_remaining=("${all_pids[@]}")
+  while [[ ${#grace_remaining[@]} -gt 0 && $(date +%s) -lt $grace_deadline ]]; do
+    local -a still_alive=()
+    for pid in "${grace_remaining[@]}"; do
+      kill -0 "$pid" 2>/dev/null && still_alive+=("$pid")
+    done
+    grace_remaining=("${still_alive[@]}")
+    [[ ${#grace_remaining[@]} -gt 0 ]] && sleep 1
+  done
+  if [[ ${#grace_remaining[@]} -gt 0 ]]; then
+    echo "  Graceful shutdown incomplete after 60s; sending SIGKILL to ${#grace_remaining[@]} process(es)." >&2
+    [[ -n "$pgid" && "$pgid" != "$$" ]] && kill -KILL -- "-$pgid" 2>/dev/null || true
+    for pid in "${grace_remaining[@]}"; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
   fi
-  local c
-  for c in $(pgrep -P "$server_pid" 2>/dev/null || true); do
-    kill -TERM "$c" 2>/dev/null || true
+
+  # After SIGKILL, wait up to 10s for all remaining processes to fully exit
+  # so the KFD releases their HIP contexts before the next server starts.
+  local deadline=$(( $(date +%s) + 10 ))
+  local -a remaining=("${grace_remaining[@]}")
+  while [[ ${#remaining[@]} -gt 0 && $(date +%s) -lt $deadline ]]; do
+    local -a still_alive=()
+    for pid in "${remaining[@]}"; do
+      kill -0 "$pid" 2>/dev/null && still_alive+=("$pid")
+    done
+    remaining=("${still_alive[@]}")
+    [[ ${#remaining[@]} -gt 0 ]] && sleep 1
   done
-  sleep 0.5
-  for c in $(pgrep -P "$server_pid" 2>/dev/null || true); do
-    kill -KILL "$c" 2>/dev/null || true
+  if [[ ${#remaining[@]} -gt 0 ]]; then
+    echo "WARN: ${#remaining[@]} server process(es) still alive after SIGKILL; next server start may OOM. PIDs: ${remaining[*]}" >&2
+  fi
+
+  # Wait for the port to be free so the next server can bind.
+  local elapsed=0
+  while ss -tlnp 2>/dev/null | grep -q ":${SERVER_PORT} " && [[ $elapsed -lt 30 ]]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
   done
-  pkill -9 python3
-  sleep 2
-  ps -al
+  if [[ $elapsed -ge 30 ]]; then
+    echo "WARN: port $SERVER_PORT still in use after 30s — next server start may fail." >&2
+  fi
 }
 
 # Run benchmark workload; optional third arg is checkout directory (worktree) for cwd when invoking the bench script.
@@ -187,7 +318,8 @@ run_benchmarks() {
   mkdir -p "$log_dir"
   local log="$log_dir/benchmark_${tag}.log"
   local model="$SERVER_MODEL_PATH"
-  local isl=8192 osl=1024 conc=8 port=$SERVER_PORT
+  local -a isl_osl_pairs=("1024,1024" "1024,8192" "8192,1024")
+  local conc=8 port=$SERVER_PORT
   local server_log="$log_dir/openai_server_${tag}.log"
   local server_pid
 
@@ -213,7 +345,7 @@ run_benchmarks() {
     printf 'cd %q && PYTHONUNBUFFERED=1 python3 -m atom.entrypoints.openai_server \\\n' "$work_dir"
     printf '  --model %q -tp %s --kv_cache_dtype fp8 --host 0.0.0.0 --port %s\n' \
       "$SERVER_MODEL_PATH" "$SERVER_TP" "$SERVER_PORT"
-    echo "===== benchmark ${tag}: OpenAI server pid will be recorded below (shared across runs 1–4) ====="
+    echo "===== benchmark ${tag}: OpenAI server pid will be recorded below (shared across ${#isl_osl_pairs[@]} ISL/OSL pairs × 4 runs each) ====="
   } >>"$log"
 
   server_pid=$(start_openai_server_bg "$work_dir" "$server_log")
@@ -227,61 +359,72 @@ run_benchmarks() {
   set -e
   if [[ "$wr" -ne 0 ]]; then
     stop_openai_server "$server_pid"
+    local wr_reason
+    case "$wr" in
+      1) wr_reason="timeout after ${SERVER_READY_TIMEOUT_SEC}s" ;;
+      2) wr_reason="server process exited before ready" ;;
+      3) wr_reason="fatal engine error: [atom] Engine Core: load model runner failed" ;;
+      *) wr_reason="unknown (exit ${wr})" ;;
+    esac
     {
-      echo "ERROR: OpenAI server did not become ready for tag=${tag} (wait exit ${wr}: 1=timeout ${SERVER_READY_TIMEOUT_SEC}s, 2=process exited early). Skipping all benchmark runs for this tag. See: $server_log"
+      echo "ERROR: OpenAI server did not become ready for tag=${tag} (${wr_reason}). Skipping all benchmark runs for this tag. See: $server_log"
     } | tee -a "$log" >&2
     return 1
   fi
 
   {
-    echo "Server ready (${SERVER_READY_LINE}); running benchmark_serving runs 1–4"
+    echo "Server ready (${SERVER_READY_LINE}); running benchmark_serving ${#isl_osl_pairs[@]} ISL/OSL pairs × 4 runs each"
   } >>"$log"
 
   local bench_rc=0
-  for i in $(seq 1 4); do
-    local result_fn="result_${tag}_isl${isl}_conc${conc}_run${i}.json"
-    {
-      echo "===== benchmark ${tag} run ${i}/4 ====="
-      echo "cwd: $work_dir"
-      echo "test command line:"
-      printf 'cd %q && \\\n' "$work_dir"
-      printf 'python %q \\\n' "$BENCH_SCRIPT"
-      printf '  --backend=vllm --base-url=%q --endpoint=/v1/completions \\\n' "http://localhost:$port"
-      printf '  --model=%q \\\n' "$model"
-      echo '  --dataset-name=random \'
-      echo "  --random-input-len=$isl --random-output-len=$osl \\"
-      echo "  --num-prompts=$((conc * 4)) \\"
-      echo "  --max-concurrency=$conc \\"
-      echo '  --random-range-ratio 1.0 \'
-      echo '  --request-rate=inf --ignore-eos \'
-      echo '  --save-result --percentile-metrics=ttft,tpot,itl,e2el \'
-      printf '  --result-dir=%q \\\n' "$log_dir"
-      printf '  --result-filename=%q\n' "$result_fn"
-      echo "single line (paths shell-escaped):"
-      printf 'cd %q && python %q --backend=vllm --base-url=%q --endpoint=/v1/completions --model=%q --dataset-name=random --random-input-len=%s --random-output-len=%s --num-prompts=%s --max-concurrency=%s --random-range-ratio 1.0 --request-rate=inf --ignore-eos --save-result --percentile-metrics=ttft,tpot,itl,e2el --result-dir=%q --result-filename=%q\n' \
-        "$work_dir" "$BENCH_SCRIPT" "http://localhost:$port" "$model" "$isl" "$osl" "$((conc * 4))" "$conc" "$log_dir" "$result_fn"
-      echo "--- output ---"
-    } >>"$log"
-    echo "Running test $i ($tag) cwd=$work_dir → $log"
-    set +e
-    (cd "$work_dir" && python "$BENCH_SCRIPT" \
-      --backend=vllm --base-url="http://localhost:$port" --endpoint=/v1/completions \
-      --model="$model" \
-      --dataset-name=random \
-      --random-input-len="$isl" --random-output-len="$osl" \
-      --num-prompts=$((conc * 4)) \
-      --max-concurrency="$conc" \
-      --random-range-ratio 1.0 \
-      --request-rate=inf --ignore-eos \
-      --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
-      --result-dir="$log_dir" --result-filename="$result_fn" \
-      >>"$log" 2>&1)
-    local st=$?
-    set -e
-    if [[ $st -ne 0 ]]; then
-      bench_rc=$st
-      echo "ERROR: benchmark_serving exited $st for ${tag} run ${i} (see $log)" | tee -a "$log" >&2
-    fi
+  for pair in "${isl_osl_pairs[@]}"; do
+    local isl=${pair%%,*}
+    local osl=${pair##*,}
+    for i in $(seq 1 4); do
+      local result_fn="result_${tag}_isl${isl}_osl${osl}_conc${conc}_run${i}.json"
+      {
+        echo "===== benchmark ${tag} isl=${isl} osl=${osl} run ${i}/4 ====="
+        echo "cwd: $work_dir"
+        echo "test command line:"
+        printf 'cd %q && \\\n' "$work_dir"
+        printf 'python %q \\\n' "$BENCH_SCRIPT"
+        printf '  --backend=vllm --base-url=%q --endpoint=/v1/completions \\\n' "http://localhost:$port"
+        printf '  --model=%q \\\n' "$model"
+        echo '  --dataset-name=random \'
+        echo "  --random-input-len=$isl --random-output-len=$osl \\"
+        echo "  --num-prompts=$((conc * 4)) \\"
+        echo "  --max-concurrency=$conc \\"
+        echo '  --random-range-ratio 1.0 \'
+        echo '  --request-rate=inf --ignore-eos \'
+        echo '  --save-result --percentile-metrics=ttft,tpot,itl,e2el \'
+        printf '  --result-dir=%q \\\n' "$log_dir"
+        printf '  --result-filename=%q\n' "$result_fn"
+        echo "single line (paths shell-escaped):"
+        printf 'cd %q && python %q --backend=vllm --base-url=%q --endpoint=/v1/completions --model=%q --dataset-name=random --random-input-len=%s --random-output-len=%s --num-prompts=%s --max-concurrency=%s --random-range-ratio 1.0 --request-rate=inf --ignore-eos --save-result --percentile-metrics=ttft,tpot,itl,e2el --result-dir=%q --result-filename=%q\n' \
+          "$work_dir" "$BENCH_SCRIPT" "http://localhost:$port" "$model" "$isl" "$osl" "$((conc * 4))" "$conc" "$log_dir" "$result_fn"
+        echo "--- output ---"
+      } >>"$log"
+      echo "Running isl=${isl} osl=${osl} run ${i}/4 ($tag) cwd=$work_dir → $log"
+      set +e
+      (cd "$work_dir" && python "$BENCH_SCRIPT" \
+        --backend=vllm --base-url="http://localhost:$port" --endpoint=/v1/completions \
+        --model="$model" \
+        --dataset-name=random \
+        --random-input-len="$isl" --random-output-len="$osl" \
+        --num-prompts=$((conc * 4)) \
+        --max-concurrency="$conc" \
+        --random-range-ratio 1.0 \
+        --request-rate=inf --ignore-eos \
+        --save-result --percentile-metrics="ttft,tpot,itl,e2el" \
+        --result-dir="$log_dir" --result-filename="$result_fn" \
+        >>"$log" 2>&1)
+      local st=$?
+      set -e
+      if [[ $st -ne 0 ]]; then
+        bench_rc=$st
+        echo "ERROR: benchmark_serving exited $st for ${tag} isl=${isl} osl=${osl} run ${i} (see $log)" | tee -a "$log" >&2
+      fi
+    done
   done
 
   stop_openai_server "$server_pid"
@@ -322,13 +465,21 @@ run_claude_prompt() {
   else
     perm_flags=(--dangerously-skip-permissions --allowedTools "Read,Edit,Bash")
   fi
+  echo "[$(date '+%T')] Claude CLI started: $(basename "$prompt_file") (workspace: $workspace)" >&2
+  echo "[$(date '+%T')] Live output below — also logged to: $agent_log" >&2
   set +e
-  (cd "$workspace" && "$claude_bin" -p "$prompt_text" \
+  # stdbuf -oL forces line-buffered output through the pipe so each line appears
+  # immediately on the terminal rather than being held until the buffer fills.
+  # Falls back gracefully if stdbuf is not installed.
+  local _stdbuf=()
+  command -v stdbuf >/dev/null 2>&1 && _stdbuf=(stdbuf -oL)
+  (cd "$workspace" && "${_stdbuf[@]}" "$claude_bin" -p "$prompt_text" \
     "${perm_flags[@]}" \
     "${model_flag[@]}" \
-    >>"$agent_log" 2>&1)
-  local st=$?
+    2>&1) | tee -a "$agent_log"
+  local st=${PIPESTATUS[0]}
   set -e
+  echo "[$(date '+%T')] Claude CLI finished (exit $st): $(basename "$prompt_file")" >&2
   if [[ $st -ne 0 ]]; then
     echo "ERROR: Claude CLI exited $st (see $agent_log). Check API auth; as root, ensure the log does not show a permissions-flag error (use CLAUDE_PERMISSION_FLAGS if needed)." >&2
     exit $st
@@ -549,6 +700,161 @@ benchmark_phase() {
   done <"$MANIFEST"
 }
 
+# Read OPTIMIZE_MODE from a manifest file (fallback: $OPTIMIZE_MODE global).
+read_opt_subdir_from_manifest() {
+  local manifest_path=$1
+  local val
+  val=$(grep '^OPTIMIZE_MODE=' "$manifest_path" 2>/dev/null | head -1 | cut -d= -f2-)
+  echo "${val:-$OPTIMIZE_MODE}"
+}
+
+# Print a side-by-side comparison table of all benchmark tags (baseline + worktrees).
+# Averages runs 1-4 per tag; cells show N/A when no JSON results exist.
+# Output goes to stdout (terminal) and $out_dir/results_summary.txt.
+print_results_table() {
+  local out_dir=$1
+  local opt_subdir=$2
+  echo ""
+  echo "=== Benchmark Results Summary ==="
+  python3 - "$out_dir" "$opt_subdir" <<'PYEOF'
+import glob, json, os, re, sys
+
+out_dir    = sys.argv[1]
+opt_subdir = sys.argv[2]
+
+# Tuple: (json_key, column_label, format_str, higher_is_better)
+METRICS = [
+    ("output_throughput",      "Out tok/s",    "{:.1f}",  True),
+    ("total_token_throughput", "Total tok/s",  "{:.1f}",  True),
+    ("mean_ttft_ms",           "TTFT mean ms", "{:.1f}",  False),
+    ("median_ttft_ms",         "TTFT p50 ms",  "{:.1f}",  False),
+    ("mean_tpot_ms",           "TPOT mean ms", "{:.2f}",  False),
+    ("median_tpot_ms",         "TPOT p50 ms",  "{:.2f}",  False),
+    ("mean_itl_ms",            "ITL mean ms",  "{:.2f}",  False),
+    ("p99_itl_ms",             "ITL p99 ms",   "{:.2f}",  False),
+    ("mean_e2el_ms",           "E2EL mean ms", "{:.1f}",  False),
+]
+
+def load_tag(pattern):
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return None
+    rows = [json.load(open(f)) for f in files]
+    result = {}
+    for key, _, _, higher_is_better in METRICS:
+        vals = [r[key] for r in rows if key in r and r[key] is not None]
+        if len(vals) > 1:
+            # Drop the slowest sample: lowest value for throughput, highest for latency.
+            vals = sorted(vals)[:-1] if higher_is_better else sorted(vals)[1:]
+        result[key] = sum(vals) / len(vals) if vals else None
+    result["_runs"] = len(files)
+    result["_completed"] = sum(r.get("completed", 0) for r in rows)
+    return result
+
+# Discover ISL/OSL pairs from result filenames across all directories.
+ISL_OSL_RE = re.compile(r"_isl(\d+)_osl(\d+)_")
+def find_isl_osl_pairs(search_dirs):
+    pairs = []
+    seen = set()
+    for d in search_dirs:
+        for f in glob.glob(os.path.join(d, "result_*.json")):
+            m = ISL_OSL_RE.search(os.path.basename(f))
+            if m:
+                pair = (int(m.group(1)), int(m.group(2)))
+                if pair not in seen:
+                    seen.add(pair)
+                    pairs.append(pair)
+    pairs.sort()
+    return pairs
+
+search_dirs = [
+    os.path.join(out_dir, "baseline"),
+    os.path.join(out_dir, "optimized", opt_subdir),
+]
+isl_osl_pairs = find_isl_osl_pairs(search_dirs)
+# Fallback for old-format results (no osl in filename).
+if not isl_osl_pairs:
+    isl_osl_pairs = [(8192, 1024)]
+
+# Collect ordered tag names from manifest.
+tag_names = ["baseline"]
+manifest = os.path.join(out_dir, "kernel_opt_worktrees.manifest")
+past_header = False
+if os.path.exists(manifest):
+    for line in open(manifest):
+        line = line.rstrip("\r\n")
+        if not past_header:
+            if line == "---":
+                past_header = True
+            continue
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t", 1)
+        if len(parts) == 2:
+            tag_names.append(parts[0])
+
+col_w    = max(16, max(len(t) for t in tag_names))
+metric_w = 14
+
+def build_subtable(isl, osl):
+    # Load results for each tag for this ISL/OSL pair.
+    data = {}
+    data["baseline"] = load_tag(
+        os.path.join(out_dir, "baseline", f"result_baseline_isl{isl}_osl{osl}_*.json")
+    )
+    # Fallback: old filename format without osl field.
+    if data["baseline"] is None:
+        data["baseline"] = load_tag(
+            os.path.join(out_dir, "baseline", f"result_baseline_isl{isl}_*.json")
+        )
+    for tag in tag_names[1:]:
+        data[tag] = load_tag(
+            os.path.join(out_dir, "optimized", opt_subdir, f"result_{tag}_isl{isl}_osl{osl}_*.json")
+        )
+        if data[tag] is None:
+            data[tag] = load_tag(
+                os.path.join(out_dir, "optimized", opt_subdir, f"result_{tag}_isl{isl}_*.json")
+            )
+
+    header_row = f"{'Metric':<{metric_w}}" + "".join(f"  {t:>{col_w}}" for t in tag_names)
+    sep = "-" * len(header_row)
+    lines = [f"  ISL={isl}  OSL={osl}", sep, header_row, sep]
+    for key, label, fmt, _ in METRICS:
+        row = f"{label:<{metric_w}}"
+        for tag in tag_names:
+            d = data[tag]
+            if d is None or d.get(key) is None:
+                row += f"  {'N/A':>{col_w}}"
+            else:
+                row += f"  {fmt.format(d[key]):>{col_w}}"
+        lines.append(row)
+    lines.append(sep)
+    row = f"{'Runs/Completed':<{metric_w}}"
+    for tag in tag_names:
+        d = data[tag]
+        if d is None:
+            row += f"  {'N/A':>{col_w}}"
+        else:
+            row += f"  {str(d['_runs'])+'r/'+str(d['_completed'])+'req':>{col_w}}"
+    lines.append(row)
+    lines.append(sep)
+    return lines
+
+all_lines = []
+for isl, osl in isl_osl_pairs:
+    all_lines.extend(build_subtable(isl, osl))
+    all_lines.append("")
+
+table = "\n".join(all_lines)
+print(table)
+
+summary = os.path.join(out_dir, "results_summary.txt")
+with open(summary, "w") as f:
+    f.write(table + "\n")
+print(f"Results summary written to: {summary}", file=sys.stderr)
+PYEOF
+}
+
 # --- main ---
 case "$OPTIMIZE_MODE" in
   accumulative|individual) ;;
@@ -580,6 +886,7 @@ echo "Mode: $OPTIMIZE_MODE  Run phase: $RUN_PHASE"
 
 if [[ "$RUN_PHASE" == "benchmarks_only" ]]; then
   benchmark_phase
+  print_results_table "$OUT_DIR" "$(read_opt_subdir_from_manifest "$MANIFEST")"
   echo "Done. Benchmarks under: $OUT_DIR"
   exit 0
 fi
@@ -597,4 +904,5 @@ if [[ "$RUN_PHASE" == "build_only" ]]; then
 fi
 
 benchmark_phase
+print_results_table "$OUT_DIR" "$OPTIMIZE_MODE"
 echo "Done. Benchmarks, Claude CLI logs, and manifest under: $OUT_DIR"
