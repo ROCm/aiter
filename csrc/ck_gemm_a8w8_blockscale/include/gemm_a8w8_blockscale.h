@@ -9,7 +9,8 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
                                    torch::Tensor& WQ,
                                    torch::Tensor& x_scale,
                                    torch::Tensor& w_scale,
-                                   torch::Tensor& Y);
+                                   torch::Tensor& Y,
+                                   int splitK = 0);
 
 torch::Tensor gemm_a8w8_blockscale_tune(torch::Tensor& XQ,
                                         torch::Tensor& WQ,
