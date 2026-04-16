@@ -452,8 +452,6 @@ def gemm_afp4wfp4_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K_cfg, True)
 
-    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
-
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K_elems, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -474,6 +472,8 @@ def gemm_afp4wfp4_preshuffle(
     else:
         config["SPLITK_BLOCK_SIZE"] = K_elems
         y_pp = None
+
+    return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x_fp4.device)
@@ -507,23 +507,6 @@ def gemm_afp4wfp4_preshuffle(
     if use_gluon:
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
-        # Gluon kernel loads scales via buffer_load in logical (rows, K_GROUPS) layout.
-        # Input scales are preshuffled — unshuffle to logical format.
-        def _unshuffle_scale(s, pf=32):
-            r, c = s.shape
-            rows = r * pf
-            cols = c // pf
-            kw = 4 if cols >= 4 else cols
-            return (s.reshape(r, cols // kw, pf // 4, 4, kw)
-                     .permute(0, 3, 2, 1, 4).contiguous()
-                     .reshape(rows, cols))
-
-        if M >= 32:
-            xs_log = _unshuffle_scale(x_scales)
-        else:
-            xs_log = x_scales.contiguous()
-        ws_log = _unshuffle_scale(w_scales)
-
         config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
         x_fp4,
@@ -541,11 +524,10 @@ def gemm_afp4wfp4_preshuffle(
         0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
         y.stride(-2),
         y.stride(-1),
-        xs_log.stride(0),
-        xs_log.stride(1),
-        ws_log.stride(0),
-        ws_log.stride(1),
-        NUM_BUFFERS=2,
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
         **config,
         **layouts,
         )

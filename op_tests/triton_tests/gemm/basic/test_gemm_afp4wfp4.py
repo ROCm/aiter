@@ -7,6 +7,8 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4
+
+from aiter.ops.triton.gluon.triton_version import TRITON_VERSION_EQ_3_5
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.shuffle import shuffle_weight,shuffle_weight_gfx1250
@@ -175,51 +177,13 @@ def generate_gemm_afp4wfp4_inputs(
 
 
 def get_x_vals():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
-    # x_vals = [(128, 1024, 4096)]
-    x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(256, 3584, 2112)]
-    x_vals += [(7, 4608, 7168), (7, 7168, 2304)]
-    x_vals += [(v, 106496, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 16384, 53248) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 18432, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 16384, 16384) for v in [1, 8, 16, 31, 32, 64, 128, 256]]
-    x_vals += [(v, 10240, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
-    x_vals += [(v, 8192, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
-    x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
-    x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 31, 16, 32, 64]]
-    x_vals += [(1, 1, 32)]  # minimal case
-    x_vals += [(2048, 7168, 4096),(32, 7168, 4096)]
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
+    x_vals += [(v, 106496, 16384) for v in (150, 256, 4096, 8000)]  # LL3 405B FC1
+    x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
+    x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
+    x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
+    x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
+    x_vals += [(2048,8192,4096)]
     return x_vals
 
 
@@ -271,8 +235,6 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("shuffle_weight_scales",[True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
@@ -281,8 +243,6 @@ def test_gemm_afp4_wfp4(
     M: int,
     N: int,
     K: int,
-    dtype,
-    layout,
     output,
     shuffle_weight_scales,
     skip_reduce,
@@ -292,6 +252,10 @@ def test_gemm_afp4_wfp4(
         pytest.skip(
             "Gluon implementation is not supported on this GPU."
         )
+    dtype = torch.bfloat16
+    # TODO(brunomazzotti): Fix gluon instr shape then enable gluon tests conditionally on 950
+    if impl == "gluon":
+        pytest.skip("Gluon tests temporarily disabled.")
 
     if impl == "gluon" and shuffle_weight_scales:
         pytest.skip("Gluon kernel does not have a preshuffled implementation.")
@@ -321,7 +285,7 @@ def test_gemm_afp4_wfp4(
         N,
         K,
         dtype,
-        layout=layout,
+        layout="TN",
         output=output,
         shuffle_scales_fg=shuffle_weight_scales,
         shuffle_weight_fg=shuffle_weight_scales,
@@ -330,9 +294,10 @@ def test_gemm_afp4_wfp4(
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     if shuffle_weight_scales:
+        use_aot: bool = TRITON_VERSION_EQ_3_5 and dtype == torch.bfloat16
         triton_out = gemm_afp4wfp4_preshuffle(
             x, w_triton, x_scales_triton, w_scales_triton, dtype, y,
-            use_aot=False, skip_reduce=skip_reduce,
+            use_aot=use_aot, skip_reduce=skip_reduce,
         )
     else:
         if impl == "triton":

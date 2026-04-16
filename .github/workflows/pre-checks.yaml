@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   check-ck:
@@ -50,6 +51,8 @@ jobs:
       - name: Run ruff with reviewdog
         env:
           REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEWDOG_REPORTER: ${{ github.event_name == 'pull_request' && 'github-pr-review' || 'github-check' }}
+          REVIEWDOG_FILTER_MODE: ${{ github.event_name == 'pull_request' && 'diff_context' || 'nofilter' }}
         run: |
           ruff check . \
             --output-format=rdjson \
@@ -58,8 +61,8 @@ jobs:
           | reviewdog \
             -f=rdjson \
             -name="ruff" \
-            -reporter=github-pr-review \
-            -filter-mode=diff_context \
+            -reporter="${REVIEWDOG_REPORTER}" \
+            -filter-mode="${REVIEWDOG_FILTER_MODE}" \
             -fail-on-error=true
 
   upload-success-artifact:
@@ -75,6 +78,7 @@ jobs:
         with:
           name: checks-signal-${{ github.sha }}
           path: checks_signal.txt
+          retention-days: 1
 
   upload-failure-artifact:
     name: Upload Failure Signal
@@ -100,3 +104,4 @@ jobs:
         with:
           name: checks-signal-${{ github.sha }}
           path: checks_signal.txt
+          retention-days: 1

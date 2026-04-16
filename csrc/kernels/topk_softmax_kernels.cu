@@ -19,10 +19,10 @@
  * limitations under the License.
  */
 #include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
+#include "aiter_opus_plus.h"
 #include "py_itfs_common.h"
-#include "vec_convert.h"
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
@@ -222,7 +222,7 @@ template <typename DTYPE,
           bool need_renorm,
           int NUM_SHARED_EXPERTS = 0,
           SharedExpertScoringFunc SCORING_FUNC = SharedExpertScoringFunc::NONE>
-__launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
+__launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
     void topkGatingSoftmax(const DTYPE* input,
                            const bool* finished,
                            float* output,
@@ -241,7 +241,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
     static_assert(BYTES_PER_LDG == (BYTES_PER_LDG & -BYTES_PER_LDG),
                   "BYTES_PER_LDG must be power of 2");
-    static_assert(BYTES_PER_LDG <= 32, "BYTES_PER_LDG must be leq 32");
+    // static_assert(BYTES_PER_LDG <= 32, "BYTES_PER_LDG must be leq 32");
 
     // Number of bytes each thread pulls in per load
     static constexpr int ELTS_PER_LDG    = BYTES_PER_LDG / sizeof(DTYPE);
@@ -304,8 +304,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     // param. In theory, this can support all powers of 2 up to 16. NOTE(woosuk): The original
     // implementation uses CUTLASS aligned array here. We defined our own aligned array and use it
     // here to avoid the dependency on CUTLASS.
-    using AccessType = ck_tile::vec_t<DTYPE, ELTS_PER_LDG>;
-    using ChunkType  = ck_tile::vec_t<float, ELTS_PER_LDG>;
+    using AccessType = opus::vector_t<DTYPE, ELTS_PER_LDG>;
+    using ChunkType  = opus::vector_t<float, ELTS_PER_LDG>;
     using kvp        = hipcub::KeyValuePair<int, float>;
     // hipcub::ArgMax arg_max;
     // hipcub::ArgMin arg_min;
@@ -317,8 +317,11 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
 #pragma unroll
     for(int ii = 0; ii < LDG_PER_THREAD; ++ii)
     {
-        row_chunk_vec_ptr[ii] = ck_tile::vec_convert<float, DTYPE, ELTS_PER_LDG>(
-            vec_thread_read_ptr[ii * THREADS_PER_ROW]);
+        AccessType vec = vec_thread_read_ptr[ii * THREADS_PER_ROW];
+        for(int jj = 0; jj < ELTS_PER_LDG; ++jj)
+        {
+            row_chunk_vec_ptr[ii][jj] = static_cast<float>(vec[jj]);
+        }
     }
 
     // Process shared experts: use the thread subgroup working on this row
@@ -497,7 +500,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     }
 }
 
-namespace detail {
+namespace topk_detail {
 // Constructs some constants needed to partition the work across threads at compile time.
 template <typename DTYPE, int EXPERTS, int BYTES_PER_LDG>
 struct TopkConstants
@@ -506,12 +509,12 @@ struct TopkConstants
     static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 ||
                       EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0,
                   "");
-    static constexpr int VECs_PER_THREAD = MAX(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
+    // AITER_CHECK(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) > 1, "not supported");
+    static constexpr int VECs_PER_THREAD = 1;
     static constexpr int VPT             = VECs_PER_THREAD * ELTS_PER_LDG;
     static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
-    static constexpr int ROWS_PER_WARP   = WARP_SIZE / THREADS_PER_ROW;
 };
-} // namespace detail
+} // namespace topk_detail
 
 template <typename DTYPE,
           int EXPERTS,
@@ -533,14 +536,15 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const bool need_renorm,
                                      hipStream_t stream)
 {
-    static constexpr std::size_t MAX_BYTES_PER_LDG = 32;
+    static constexpr std::size_t MAX_BYTES_PER_LDG = EXPERTS < 512 ? 32 : 64;
 
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(DTYPE) * EXPERTS);
-    using Constants                    = detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
+    using Constants                    = topk_detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
+    AITER_CHECK(EXPERTS / (Constants::ELTS_PER_LDG * WARP_SIZE) <= 1, "EXPERTS:", EXPERTS, " not supported");
     static constexpr int VPT           = Constants::VPT;
-    static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
-    const int num_warps                = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-    const int num_blocks               = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
+    int ROWS_PER_WARP   = get_warp_size_func() / Constants::THREADS_PER_ROW;
+    int num_warps                = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
+    int num_blocks               = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
     dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
     if(need_renorm)
@@ -742,7 +746,7 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out,         // [..., d]
 #pragma unroll
         for(int k = 0; k < TOPK; ++k)
         {
-            x += VLLM_LDG(&input[token_idx * TOPK * d + k * d + idx]);
+            x += *(&input[token_idx * TOPK * d + k * d + idx]);
         }
         out[token_idx * d + idx] = x;
     }
@@ -790,7 +794,7 @@ void topk_softmax(torch::Tensor& topk_weights,         // [num_tokens, topk + nu
 
     // Process routing experts with softmax + topk, and shared experts with sigmoid in one kernel
     VLLM_DISPATCH_FLOATING_TYPES(gating_output.scalar_type(), "topk_softmax", [&] {
-        using input_dtype = typename t2ck<scalar_t>::type;
+        using input_dtype = typename t2opus<scalar_t>::type;
         vllm::moe::topkGatingSoftmaxKernelLauncher(
             reinterpret_cast<input_dtype*>(gating_output.data_ptr()),
             topk_weights.data_ptr<float>(),

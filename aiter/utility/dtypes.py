@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
+from ..jit.core import compile_ops
 from ..ops.enum import QuantType, ActivationType
-from .aiter_types import aiter_dtypes, AiterTensor
+from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
 
 defaultDtypes = {
@@ -40,13 +41,43 @@ globals().update({f"AITER_DTYPE_{name}": idx for name, idx in aiter_dtypes.items
 _torch_to_aiter_dtype = {globals()[name]: idx for name, idx in aiter_dtypes.items()}
 
 
-def torch_to_aiter(tensor: torch.Tensor) -> AiterTensor:
-    """torch.Tensor -> AiterTensor, zero-copy, points to the same GPU memory."""
-    assert tensor.is_cuda, "AiterTensor only supports CUDA tensors"
-    assert tensor.ndim <= 8, f"AiterTensor supports at most 8 dims, got {tensor.ndim}"
+def torch_to_aiter_pybind(tensor: torch.Tensor):
+    """Convert torch.Tensor to pybind aiter_tensor_t for passing to C++ ops.
+
+    Unlike torch_to_aiter() which returns a ctypes aiter_tensor_t struct,
+    this function constructs a *pybind11* aiter_tensor_t via
+    module_aiter_core.  The two types are not interchangeable.
+    """
+    assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
+    assert (
+        tensor.ndim <= 8
+    ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
     assert tensor.dtype in _torch_to_aiter_dtype, f"Unsupported dtype: {tensor.dtype}"
 
-    at = AiterTensor()
+    from ..jit.core import get_module
+
+    aiter_tensor_cls = get_module("module_aiter_core").aiter_tensor_t
+    return aiter_tensor_cls(
+        tensor.data_ptr(),
+        tensor.numel(),
+        tensor.ndim,
+        list(tensor.shape),
+        list(tensor.stride()),
+        _torch_to_aiter_dtype[tensor.dtype],
+        tensor.device.index or 0,
+    )
+
+
+def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
+    """This is for ctypes binding.
+    torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
+    assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
+    assert (
+        tensor.ndim <= 8
+    ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
+    assert tensor.dtype in _torch_to_aiter_dtype, f"Unsupported dtype: {tensor.dtype}"
+
+    at = aiter_tensor_t()
     at.ptr = tensor.data_ptr()
     at.numel_ = tensor.numel()
     at.ndim = tensor.ndim

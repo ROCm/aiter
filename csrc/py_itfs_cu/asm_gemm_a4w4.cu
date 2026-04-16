@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_hip_common.h"
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_tensor.h"
+#include "aiter_ctypes_error.h"
 #include "asm_f4gemm_configs.hpp"
 #include <cmath>
 #include <memory>
@@ -152,19 +153,24 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
 
 // A4W4 asm gemm kernel
 // D=A*B*alpha+beta*C
-extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
-    AiterTensor* A,       // A:[M, K/2] f4x2
-    AiterTensor* B,       // B:[N, K/2] f4x2
-    AiterTensor* A_scale, // A_scale:[M, K/32] e8m0 paded
-    AiterTensor* B_scale, // B_scale:[N, K/32] e8m0 paded
-    AiterTensor* out,     // Out:[M, N] bf16
+AITER_CTYPES_ERROR_DEF
+
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    gemm_a4w4_asm,
+    (
+    aiter_tensor_t* A,       // A:[M, K/2] f4x2
+    aiter_tensor_t* B,       // B:[N, K/2] f4x2
+    aiter_tensor_t* A_scale, // A_scale:[M, K/32] e8m0 padded
+    aiter_tensor_t* B_scale, // B_scale:[N, K/32] e8m0 padded
+    aiter_tensor_t* out,     // Out:[M, N] bf16
     const char*  kernelName,
-    AiterTensor* bias,    // bias:[M, N] f32, can be nullptr
+    aiter_tensor_t* bias,    // bias:[M, N] f32, can be nullptr
     float        alpha,
     float        beta,
     int          bpreshuffle,
     int          log2_k_split,
-    hipStream_t  stream)
+    hipStream_t  stream),
+    (A, B, A_scale, B_scale, out, kernelName, bias, alpha, beta, bpreshuffle, log2_k_split, stream))
 {
     AITER_CHECK(
         out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
@@ -205,12 +211,12 @@ extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
                    std::hash<int>()(log2) ^ std::hash<int>()(shuffle);
         }
     };
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
+    static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash>
         heuristic_kernel_dict;
 
     AITER_CHECK(!config_map->empty(), __func__, " no kernel support a4w4 for this gpu arch");
 
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     std::string arch_id = get_gpu_arch();
     std::string kname   = (kernelName && kernelName[0] != 0) ? (arch_id + kernelName) : "";
@@ -218,23 +224,11 @@ extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
     int selectedksplit = (log2_k_split >= 0) ? log2_k_split : 0;
     if(kname.empty())
     {
-        auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle));
-        if(it != heuristic_kernel_dict.end())
-        {
-            auto res       = it->second;
-            kname          = std::get<0>(res);
-            selectedksplit = std::get<1>(res);
-        }
-        else
-        {
-            auto it = get_heuristic_kernel(
-                Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
-
-            kname          = std::get<0>(it);
-            selectedksplit = std::get<1>(it);
-            heuristic_kernel_dict[{Mdim, Ndim, Kdim, log2_k_split, bpreshuffle}] =
-                std::make_tuple(kname, selectedksplit);
-        }
+        std::tie(kname, selectedksplit) = heuristic_kernel_dict.get_or_create(
+            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle), [&]() {
+                return get_heuristic_kernel(
+                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
+            });
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -263,12 +257,8 @@ extern "C" __attribute__((visibility("default"))) void gemm_a4w4_asm(
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
         }
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel " + kname);

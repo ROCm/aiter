@@ -47,7 +47,7 @@ def test_fmoe(
     doweight_stage1=False,
     hidden_pad=0,
     intermediate_pad=0,
-    preshuffle=False,
+    preshuffle=True,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -372,7 +372,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=8,
+    default=257,
     help="""Number of experts.
     e.g.: -e 8""",
 )
@@ -381,7 +381,7 @@ parser.add_argument(
     "-k",
     "--topk",
     type=int,
-    default=2,
+    default=9,
     help="""Number of top experts.
     e.g.: -k 2""",
 )
@@ -391,7 +391,7 @@ parser.add_argument(
     "--preshuffle",
     type=dtypes.str2bool,
     nargs="*",
-    default=[False, True],
+    default=[True],
     help="""Whether to use pre-shuffle weight mode. Default is [False, True].
     -p f    # False.
     -p t    # True.""",

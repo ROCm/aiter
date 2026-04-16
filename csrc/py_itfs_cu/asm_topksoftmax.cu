@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 #include "asm_topksoftmax_configs.hpp"
 #include <memory>
 
@@ -59,11 +59,11 @@ std::pair<std::string, int> get_heuristic_kernel_topksoftmax(std::string arch_id
     return {kernelName, subm};
 }
 
-extern "C" __attribute__((visibility("default")))
-void topk_softmax_asm(AiterTensor* topk_weights,         // [num_tokens, topk]
-                      AiterTensor* topk_indices,         // [num_tokens, topk]
-                      AiterTensor* token_expert_indices, // [num_tokens, topk]
-                      AiterTensor* gating_output,        // [num_tokens, num_experts]
+AITER_C_ITFS
+void topk_softmax_asm(aiter_tensor_t* topk_weights,         // [num_tokens, topk]
+                      aiter_tensor_t* topk_indices,         // [num_tokens, topk]
+                      aiter_tensor_t* token_expert_indices, // [num_tokens, topk]
+                      aiter_tensor_t* gating_output,        // [num_tokens, num_experts]
                       int need_renorm, hipStream_t stream)
 {
     std::string arch_id = get_gpu_arch();
@@ -93,7 +93,7 @@ void topk_softmax_asm(AiterTensor* topk_weights,         // [num_tokens, topk]
     args.out_stride  = out_stride * 4;
 
     CFG* config_map = &cfg_topksoftmax;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = nullptr;
     auto [kernelName, subm] = get_heuristic_kernel_topksoftmax(arch_id, dtype, MAX_SUBM, num_experts, topk, config_map);
 
@@ -103,20 +103,15 @@ void topk_softmax_asm(AiterTensor* topk_weights,         // [num_tokens, topk]
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel " + kernelName);
 
 
-    int prev_device;
-    HIP_CALL(hipGetDevice(&prev_device));
-    HIP_CALL(hipSetDevice(gating_output->device_id));
+    const HipDeviceGuard device_guard(gating_output->device_id);
 
     uint gdx = (num_tokens + subm - 1) / subm;
     AITER_CHECK(gdx >> 31 == 0, "num_tokens too large: ", num_tokens);
@@ -129,5 +124,4 @@ void topk_softmax_asm(AiterTensor* topk_weights,         // [num_tokens, topk]
                              1,                     // bdy
                              1,                     // bdz
                              stream});
-    HIP_CALL(hipSetDevice(prev_device));
 }

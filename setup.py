@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 
 from setuptools import Distribution, setup
@@ -10,9 +11,16 @@ from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 PACKAGE_NAME = "amd-aiter"
+
+FLYDSL_VERSION = "flydsl==0.1.3.1"
+
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    ENABLE_CK = False
+    PREBUILD_KERNELS = False
 
 
 def getMaxJobs():
@@ -44,6 +52,24 @@ def is_develop_mode():
     return False
 
 
+if not IS_WINDOWS and is_develop_mode():
+    try:
+        from importlib.metadata import version as pkg_version
+
+        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+            raise ImportError("version mismatch")
+    except Exception:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                FLYDSL_VERSION,
+            ]
+        )
+
+
 def write_install_mode():
     """Write install_mode so core.py uses aiter_meta/ (install) vs repo root (develop).
 
@@ -63,7 +89,10 @@ def prepare_packaging():
         shutil.copytree("3rdparty", "aiter_meta/3rdparty")
     else:
         os.makedirs("aiter_meta/3rdparty", exist_ok=True)
-    shutil.copytree("hsa", "aiter_meta/hsa")
+    if not IS_WINDOWS:
+        shutil.copytree("hsa", "aiter_meta/hsa")
+    else:
+        os.makedirs("aiter_meta/hsa", exist_ok=True)
     shutil.copytree("gradlib", "aiter_meta/gradlib")
     shutil.copytree("csrc", "aiter_meta/csrc")
     open("aiter_meta/__init__.py", "w").close()
@@ -98,7 +127,7 @@ def _is_metadata_only():
 
 
 # Defer heavy imports until build time
-if not _is_metadata_only():
+if not _is_metadata_only() and not IS_WINDOWS:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
@@ -149,7 +178,7 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
                 "module_fmha_v3_fwd",
@@ -157,24 +186,16 @@ def get_exclude_ops():
             ]:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 2:
-            # Exclude _bwd, _tune, and specific module
-            if (
-                "_bwd" in module
-                or "_tune" in module
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            # Exclude _bwd and _tune
+            if "_bwd" in module or "_tune" in module:
                 exclude_ops.append(module)
         elif PREBUILD_KERNELS == 3:
-            # Keep only module_fmha_v3* and module_aiter_enum
-            if not (
-                module.startswith("module_fmha_v3")
-                or module == "module_aiter_enum"
-                or module == "module_gemm_mi350_a8w8_blockscale_asm"
-            ):
+            # Keep only module_fmha_v3*
+            if not module.startswith("module_fmha_v3"):
                 exclude_ops.append(module)
         else:
-            # Default behavior: exclude tunes and specific mi350 module
-            if "_tune" in module or module == "module_gemm_mi350_a8w8_blockscale_asm":
+            # Default behavior: exclude tunes
+            if "_tune" in module:
                 exclude_ops.append(module)
 
     return exclude_ops
@@ -196,10 +217,35 @@ if PREBUILD_KERNELS != 0:
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
+        from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
         import glob
 
         exclude_ops = get_exclude_ops()
         all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
+
+        moe_base_args = None
+        filtered_opts_args_build = []
+        for one_opt_args in all_opts_args_build:
+            if one_opt_args["md_name"] == "module_moe_ck2stages":
+                moe_base_args = one_opt_args
+                continue
+            filtered_opts_args_build.append(one_opt_args)
+        all_opts_args_build = filtered_opts_args_build
+
+        if ENABLE_CK and moe_base_args is not None:
+            moe_variants = get_moe_ck2stages_prebuild_variants(core.AITER_CSRC_DIR)
+            for v in moe_variants:
+                all_opts_args_build.append(
+                    {
+                        "md_name": v["md_name"],
+                        "srcs": moe_base_args["srcs"],
+                        "flags_extra_cc": moe_base_args["flags_extra_cc"],
+                        "flags_extra_hip": moe_base_args["flags_extra_hip"],
+                        "extra_include": moe_base_args["extra_include"],
+                        "blob_gen_cmd": v["blob_gen_cmd"],
+                        "third_party": moe_base_args["third_party"],
+                    }
+                )
 
         if PREBUILD_KERNELS == 1 and ENABLE_CK:
             extra_args_build = []
@@ -269,6 +315,76 @@ if PREBUILD_KERNELS != 0:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
+        # --- FlyDSL AOT pre-compilation ---
+        try:
+            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+            os.makedirs(flydsl_cache_dir, exist_ok=True)
+            os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = flydsl_cache_dir
+
+            # setup.py loads `jit.core` via sys.path (line 134-135).
+            # Map those modules into the `aiter.*` namespace so that
+            # `import aiter.jit.core` reuses the same instances.
+            for _name in list(sys.modules):
+                if _name == "jit" or _name.startswith("jit."):
+                    _pkg = f"aiter.{_name}"
+                    if _pkg not in sys.modules:
+                        sys.modules[_pkg] = sys.modules[_name]
+
+            from aiter.aot.flydsl.common import collect_aot_jobs
+
+            def _run_flydsl_aot(label, default_csvs, parse_csv, compile_one_config):
+                jobs = collect_aot_jobs(
+                    default_csvs,
+                    parse_csv,
+                    on_missing_csv=lambda csv_path: print(
+                        f"[aiter] {label}: CSV not found: {csv_path}"
+                    ),
+                )
+                if jobs:
+                    print(
+                        f"[aiter] {label}: {len(jobs)} kernels to compile "
+                        f"(cache: {flydsl_cache_dir})"
+                    )
+                    results = []
+                    for job in jobs:
+                        results.append(compile_one_config(**job))
+                    ok = sum(
+                        1 for result in results if result["compile_time"] is not None
+                    )
+                    fail = len(results) - ok
+                    print(f"[aiter] {label}: compiled {ok} ok, {fail} failed")
+
+            from aiter.aot.flydsl.moe import (
+                DEFAULT_CSVS as MOE_DEFAULT_CSVS,
+                compile_one_config as compile_moe_one_config,
+                parse_csv as parse_moe_csv,
+            )
+
+            _run_flydsl_aot(
+                "FlyDSL MoE AOT",
+                MOE_DEFAULT_CSVS,
+                parse_moe_csv,
+                compile_moe_one_config,
+            )
+
+            from aiter.aot.flydsl.gemm import (
+                DEFAULT_CSVS as GEMM_DEFAULT_CSVS,
+                compile_one_config as compile_gemm_one_config,
+                parse_csv as parse_gemm_csv,
+            )
+
+            _run_flydsl_aot(
+                "FlyDSL GEMM AOT",
+                GEMM_DEFAULT_CSVS,
+                parse_gemm_csv,
+                compile_gemm_one_config,
+            )
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            print(f"[aiter] FlyDSL AOT skipped: {e}")
+
 
 class NinjaBuildExtension(build_ext):
     """Custom build_ext that defers expensive operations until run() is called."""
@@ -306,6 +422,19 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
+if IS_WINDOWS:
+    install_requires = ["einops", "packaging", "psutil"]
+else:
+    install_requires = [
+        "pybind11>=3.0.1",
+        "ninja",
+        "pandas",
+        "einops",
+        "psutil",
+        "packaging",
+        FLYDSL_VERSION,
+    ]
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -321,15 +450,7 @@ setup(
     ],
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=[
-        "pybind11>=3.0.1",
-        "ninja",
-        "pandas",
-        "einops",
-        "psutil",
-        "packaging",
-        "flydsl==0.1.1.dev409",
-    ],
+    install_requires=install_requires,
     extras_require={
         # Triton-based communication using Iris
         # Note: Iris is not available on PyPI and must be installed separately

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 #include "asm_mla_configs.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -93,29 +93,29 @@ std::string get_heuristic_kernel_mla(std::string q_type,
     return "";
 }
 
-extern "C" __attribute__((visibility("default")))
+AITER_C_ITFS
 void mla_decode_stage1_asm_fwd(
-    AiterTensor* Q,                    //   [num_seqs, num_heads, head_size]
-    AiterTensor* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
-    AiterTensor* qo_indptr,            //   [batch_size+1]
-    AiterTensor* kv_indptr,            //   [batch_size+1]
-    AiterTensor* kv_page_indices,      //   [num_page_used]
-    AiterTensor* kv_last_page_lens,    //   [batch_size]
-    AiterTensor* num_kv_splits_indptr, //   metadata (nullable)
-    AiterTensor* work_meta_data,       //   metadata addr (nullable)
-    AiterTensor* work_indptr,          //   metadata (nullable)
-    AiterTensor* work_info_set,        //   [batch_size+1] (nullable)
+    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+    aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size] or [num_page, page_size*(nhead_kv*(kv_lora_rank+scale_dim+qk_rope_head_dim))]
+    aiter_tensor_t* qo_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_page_indices,      //   [num_page_used]
+    aiter_tensor_t* kv_last_page_lens,    //   [batch_size]
+    aiter_tensor_t* num_kv_splits_indptr, //   metadata (nullable)
+    aiter_tensor_t* work_meta_data,       //   metadata addr (nullable)
+    aiter_tensor_t* work_indptr,          //   metadata (nullable)
+    aiter_tensor_t* work_info_set,        //   [batch_size+1] (nullable)
     int max_seqlen_q,
     int page_size,
     int nhead_kv,
     float softmax_scale,
     // following are output
-    AiterTensor* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
-    AiterTensor* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
-    AiterTensor* output,               //   [batch_size, num_heads, v_head_dim]
-    AiterTensor* lse,                  //   [batch_size, num_heads] (nullable)
-    AiterTensor* q_scale,              //   [1] (nullable)
-    AiterTensor* kv_scale,             //   [1] (nullable)
+    aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+    aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
+    aiter_tensor_t* output,               //   [batch_size, num_heads, v_head_dim]
+    aiter_tensor_t* lse,                  //   [batch_size, num_heads] (nullable)
+    aiter_tensor_t* q_scale,              //   [1] (nullable)
+    aiter_tensor_t* kv_scale,             //   [1] (nullable)
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -133,7 +133,7 @@ void mla_decode_stage1_asm_fwd(
     int stride_Page    = KV->stride(0) * KV->element_size();
     uint32_t log2_page = (uint32_t)log2f(page_size);
 
-    KernelArgs args;
+    KernelArgs args = {};
     size_t arg_size  = sizeof(args);
     args.ptr_R       = splitData->data_ptr();
     args.ptr_LSE     = splitLse->data_ptr();
@@ -149,10 +149,17 @@ void mla_decode_stage1_asm_fwd(
     args.s_Q_Bs      = stride_Q;
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
-    args.out_16_nosplit = kv_split;
+    args.ptr_LSEP = nullptr;
+    if (lse != nullptr)
+    {
+        args.ptr_LSEP = lse->data_ptr();
+    }
 
     if (persistent)
     {
+        args.out_16_nosplit = kv_split;
+        args.ptr_RP = output->data_ptr();
+
         if (work_meta_data != nullptr)
         {
             args.ptr_STP = work_meta_data->data_ptr();
@@ -178,13 +185,9 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
+        args.out_16_nosplit = 0;
+        args.ptr_RP = nullptr;
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
-    }
-    args.ptr_RP = output->data_ptr(); //final output
-    args.ptr_LSEP = nullptr;
-    if (lse != nullptr)
-    {
-        args.ptr_LSEP = lse->data_ptr(); //final lse
     }
 
     // std::cout << "mla args" << std::endl;
@@ -254,7 +257,7 @@ void mla_decode_stage1_asm_fwd(
     // Get kernel using config dispatch
     std::string arch_id = get_gpu_arch();
     CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
@@ -314,16 +317,30 @@ void mla_decode_stage1_asm_fwd(
             if((max_seqlen_q == 4) && persistent){
                 config_max_seqlen_q = 4;
                 sub_Q = 128;
+            } else if((max_seqlen_q == 2) && persistent){
+                config_max_seqlen_q = 2;
+                sub_Q = 128;
             } else {
                 AITER_CHECK(false, __func__, 
-                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=4 in persistent mode");
+                    ": fp8/fp8 with gqa_ratio=32 only supports decode_qlen=2,4 in persistent mode");
             }
         }
     } else if (gqa_ratio == 64){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                config_max_seqlen_q = 0;
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                } else {
+                    config_max_seqlen_q = 0;
+                }
                 sub_Q = 64;
+            }
+        } else if (q_type == "fp8" && kv_type == "fp8"){
+            if (persistent && max_seqlen_q == 1){
+                config_max_seqlen_q = 1;
+            } else {
+                AITER_CHECK(false, __func__,
+                    ": fp8/fp8 with gqa_ratio=64 only supports decode_qlen=1 in persistent mode");
             }
         }
     }
@@ -341,13 +358,9 @@ void mla_decode_stage1_asm_fwd(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
-        
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
@@ -421,25 +434,25 @@ struct __attribute__((packed)) PsKernelArgs
 };
 
 
-extern "C" __attribute__((visibility("default")))
+AITER_C_ITFS
 void mla_prefill_ps_asm_fwd(
-    AiterTensor* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
-    AiterTensor* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
-    AiterTensor* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
-    AiterTensor* qo_indptr,            //   [batch_size+1], int
-    AiterTensor* kv_indptr,            //   [batch_size+1], int
-    AiterTensor* kv_page_indices,      //   [num_page_used], int
-    AiterTensor* work_indptr,          //   [available_tgs+1], int (nullable)
-    AiterTensor* work_info_set,        //   [max_works], int (nullable)
+    aiter_tensor_t* Q,                    //  [num_seqs, num_q_heads, qk_hetad_size], fp8
+    aiter_tensor_t* K,                    //   [num_page, num_kv_heads, qk_head_size], fp8
+    aiter_tensor_t* V,                    //   [num_page, num_kv_heads, v_head_size], fp8
+    aiter_tensor_t* qo_indptr,            //   [batch_size+1], int
+    aiter_tensor_t* kv_indptr,            //   [batch_size+1], int
+    aiter_tensor_t* kv_page_indices,      //   [num_page_used], int
+    aiter_tensor_t* work_indptr,          //   [available_tgs+1], int (nullable)
+    aiter_tensor_t* work_info_set,        //   [max_works], int (nullable)
     int max_seqlen_q,
     float softmax_scale,
     int is_causal,
-    AiterTensor* splitData,            //   [num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
-    AiterTensor* splitLse,             //   [num_q_heads, num_seqs, max_kv_split,  1], fp32
-    AiterTensor* output,               //   [num_seqs, num_q_heads, v_head_dim], bf16
-    AiterTensor* q_scale,              //   fp32, scalar (nullable)
-    AiterTensor* k_scale,              //   fp32, scalar (nullable)
-    AiterTensor* v_scale,              //   fp32, scalar (nullable)
+    aiter_tensor_t* splitData,            //   [num_q_heads, num_seqs, max_kv_split, v_head_dim], fp32
+    aiter_tensor_t* splitLse,             //   [num_q_heads, num_seqs, max_kv_split,  1], fp32
+    aiter_tensor_t* output,               //   [num_seqs, num_q_heads, v_head_dim], bf16
+    aiter_tensor_t* q_scale,              //   fp32, scalar (nullable)
+    aiter_tensor_t* k_scale,              //   fp32, scalar (nullable)
+    aiter_tensor_t* v_scale,              //   fp32, scalar (nullable)
     hipStream_t stream)
 {
     int num_q_tokens  = Q->size(0);
@@ -496,7 +509,7 @@ void mla_prefill_ps_asm_fwd(
         AITER_CHECK(false, __func__, ": fp8 mla persistent prefill is not supported on gfx942");
     }
     CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
     int ps = 1; // ps_prefill always uses persistent scheduling
     int prefill = 1; // prefill stage
@@ -516,12 +529,9 @@ void mla_prefill_ps_asm_fwd(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
@@ -541,18 +551,18 @@ void mla_prefill_ps_asm_fwd(
 }
 
 
-extern "C" __attribute__((visibility("default")))
+AITER_C_ITFS
 void mla_prefill_asm_fwd(
-    AiterTensor* Q,                    //   [num_seqs, num_heads, head_size]
-    AiterTensor* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
-    AiterTensor* qo_indptr,            //   [batch_size+1]
-    AiterTensor* kv_indptr,            //   [batch_size+1]
-    AiterTensor* kv_page_indices,      //   [num_page_used]
-    AiterTensor* kv_last_page_lens,    //   [batch_size]
+    aiter_tensor_t* Q,                    //   [num_seqs, num_heads, head_size]
+    aiter_tensor_t* KV,                   //   [num_page, page_size, num_kv_heads, head_size]
+    aiter_tensor_t* qo_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_indptr,            //   [batch_size+1]
+    aiter_tensor_t* kv_page_indices,      //   [num_page_used]
+    aiter_tensor_t* kv_last_page_lens,    //   [batch_size]
     int max_seqlen_q,
     float softmax_scale,
-    AiterTensor* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
-    AiterTensor* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
+    aiter_tensor_t* splitData,            //   [batch_size, num_kv_splits, num_heads, v_head_dim]
+    aiter_tensor_t* splitLse,             //   [batch_size, num_kv_splits, num_heads,  1]
     hipStream_t stream)
 {
     int sub_Q           = 128;
@@ -610,7 +620,7 @@ void mla_prefill_asm_fwd(
 
     std::string arch_id = get_gpu_arch();
     CFG* config_map = &cfg_mla_asm;
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     
     int ps = 0; // prefill without persistent scheduling
     int prefill = 1; // prefill stage
@@ -628,12 +638,9 @@ void mla_prefill_asm_fwd(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
