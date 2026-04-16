@@ -76,7 +76,7 @@ Each value can be:
 config = {"tp_group": [0, 1, 2, 3, 4, 5, 6, 7]}
 
 ensure_model_parallel_initialized(
-    tensor_model_parallel_size=8,
+    tensor_model_parallel_size=1,
     pipeline_model_parallel_size=1,
     custom_group_config=config,
 )
@@ -91,7 +91,7 @@ out = custom_all_reduce(x)  # group name can be omitted for single group
 config = {"tp_group": [[0, 1, 2, 3], [4, 5, 6, 7]]}
 
 ensure_model_parallel_initialized(
-    tensor_model_parallel_size=8,
+    tensor_model_parallel_size=1,
     pipeline_model_parallel_size=1,
     custom_group_config=config,
 )
@@ -110,7 +110,7 @@ config.add_group("tp_group", [[0, 1, 2, 3], [4, 5, 6, 7]])
 config.add_group("dp_group", [[0, 4], [1, 5], [2, 6], [3, 7]])
 
 ensure_model_parallel_initialized(
-    tensor_model_parallel_size=8,
+    tensor_model_parallel_size=1,
     pipeline_model_parallel_size=1,
     custom_group_config=config.data(),
 )
@@ -131,7 +131,7 @@ config = {
 }
 
 ensure_model_parallel_initialized(
-    tensor_model_parallel_size=8,
+    tensor_model_parallel_size=1,
     pipeline_model_parallel_size=1,
     custom_group_config=config,
 )
@@ -177,6 +177,14 @@ Custom groups and standard parallel group interfaces are **mutually exclusive**:
 - When `custom_group_config` is **not set**, use `tensor_model_parallel_all_reduce()`, `data_parallel_all_reduce()`, and other standard interfaces. Calling `custom_all_reduce()` will raise an error.
 - When `custom_group_config` **is set**, only `custom_all_reduce()` is available. Calling any standard interface (e.g., `tensor_model_parallel_all_reduce()`) will raise an error.
 
+### Automatic Buffer Management
+
+When `custom_group_config` is provided, the standard TP/PP/DP/EP groups **automatically skip** `CudaCommunicator` creation. This means:
+
+- **No redundant memory allocation**: only the custom groups allocate communication buffers (~3 GB per group). Standard groups exist only as lightweight `GroupCoordinator` wrappers without GPU buffers.
+- **`tp_size` / `dp_size` do not affect GPU memory**: you can pass any valid values (e.g., `tp_size=1` or `tp_size=8`) — the standard groups will never allocate expensive buffers when custom groups are present.
+- **Recommended**: set `tensor_model_parallel_size=1` and `pipeline_model_parallel_size=1` when all communication is handled by custom groups. This is the simplest and most explicit configuration.
+
 ### Validation Rules
 
 The following checks are enforced during initialization:
@@ -193,7 +201,12 @@ set_custom_all_reduce(True)
 init_distributed_environment(world_size=8, rank=rank_id, ...)
 
 # 2. Initialize model parallel with custom groups
-ensure_model_parallel_initialized(tp_size, pp_size, custom_group_config=config)
+# tp_size and pp_size can be set to 1 when all communication uses custom groups
+ensure_model_parallel_initialized(
+    tensor_model_parallel_size=1,
+    pipeline_model_parallel_size=1,
+    custom_group_config=config,
+)
 
 # 3. Use custom_all_reduce() during training/inference
 out = custom_all_reduce(x, group="tp_group")

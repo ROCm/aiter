@@ -1003,6 +1003,7 @@ def init_model_parallel_group(
     group_ranks: List[List[int]],
     local_rank: int,
     backend: str,
+    use_device_communicator: bool = True,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
 ) -> GroupCoordinator:
@@ -1010,7 +1011,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_device_communicator=True,
+        use_device_communicator=use_device_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
     )
@@ -1287,6 +1288,11 @@ def initialize_model_parallel(
         -1, data_parallel_size, pipeline_model_parallel_size, tensor_model_parallel_size
     )  # noqa
 
+    # When custom groups are provided, all communication goes through them
+    # (standard ops assert via _assert_no_custom_group). Skip expensive
+    # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
+    need_std_comm = custom_group_config is None
+
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
@@ -1298,6 +1304,7 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
+        use_device_communicator=need_std_comm,
         use_message_queue_broadcaster=True,
         group_name="tp",
     )
@@ -1327,7 +1334,11 @@ def initialize_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pp"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="pp",
     )
 
     global _DP
@@ -1335,7 +1346,11 @@ def initialize_model_parallel(
     group_ranks = all_ranks.transpose(1, 3).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     _DP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="dp"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="dp",
     )
 
     global _EP
@@ -1347,7 +1362,11 @@ def initialize_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
     _EP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="ep"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="ep",
     )
 
     # Build the custom allreduce group(s) (optional).

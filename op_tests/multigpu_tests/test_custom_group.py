@@ -37,6 +37,7 @@ set_start_method("spawn", force=True)
 # Returns per-op timing: (out_ar, us_ar, out_ag, us_ag, out_rs, us_rs)
 # ============================================================
 def custom_group_worker(
+    world_size,
     tp_size,
     dp_size,
     rankID,
@@ -50,7 +51,6 @@ def custom_group_worker(
 ):
     device = torch.device(f"cuda:{deviceID}")
     torch.cuda.set_device(device)
-    world_size = tp_size * dp_size
     logger.info(
         f"RANK: {rankID} device: {deviceID} "
         f"custom group worker init_process_group..."
@@ -130,6 +130,11 @@ def custom_group_worker(
         out_ag, us_ag = run_ag(x_ag)
         out_rs, us_rs = run_rs(x_rs)
 
+    # move tensors to CPU before destroying distributed env,
+    # otherwise CUDA IPC serialization fails with invalid argument
+    out_ar = out_ar.cpu()
+    out_ag = out_ag.cpu()
+    out_rs = out_rs.cpu()
     results = (out_ar, us_ar, out_ag, us_ag, out_rs, us_rs)
 
     # destroy
@@ -181,7 +186,7 @@ def multi_group_worker(
     for gname, ranks in MULTI_GROUP_CONFIG.items():
         config.add_group(gname, ranks)
     ensure_model_parallel_initialized(
-        world_size,
+        1,
         1,
         custom_group_config=config.data(),
     )
@@ -249,7 +254,7 @@ def multi_group_worker(
             out_ag, us_ag = run_ag(x_ag)
             out_rs, us_rs = run_rs(x_rs)
 
-        results[gname] = (out_ar, us_ar, out_ag, us_ag, out_rs, us_rs)
+        results[gname] = (out_ar.cpu(), us_ar, out_ag.cpu(), us_ag, out_rs.cpu(), us_rs)
 
     if dist.is_initialized():
         destroy_model_parallel()
@@ -315,6 +320,7 @@ def test_custom_tp(
             pool.apply_async(
                 custom_group_worker,
                 args=(
+                    world_size,
                     tp_size,
                     dp_size,
                     i,
@@ -396,6 +402,7 @@ def test_custom_dp(
             pool.apply_async(
                 custom_group_worker,
                 args=(
+                    world_size,
                     tp_size,
                     dp_size,
                     i,
@@ -460,7 +467,7 @@ def test_custom_2d(
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
     world_size = 8
-    tp_size = world_size
+    tp_size = 1
     dp_size = 1
     subgroups = [[0, 1, 2, 3], [4, 5, 6, 7]]
     config = {"default": subgroups}
@@ -487,6 +494,7 @@ def test_custom_2d(
             pool.apply_async(
                 custom_group_worker,
                 args=(
+                    world_size,
                     tp_size,
                     dp_size,
                     i,
