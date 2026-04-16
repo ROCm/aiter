@@ -217,10 +217,35 @@ if PREBUILD_KERNELS != 0:
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
+        from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
         import glob
 
         exclude_ops = get_exclude_ops()
         all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
+
+        moe_base_args = None
+        filtered_opts_args_build = []
+        for one_opt_args in all_opts_args_build:
+            if one_opt_args["md_name"] == "module_moe_ck2stages":
+                moe_base_args = one_opt_args
+                continue
+            filtered_opts_args_build.append(one_opt_args)
+        all_opts_args_build = filtered_opts_args_build
+
+        if ENABLE_CK and moe_base_args is not None:
+            moe_variants = get_moe_ck2stages_prebuild_variants(core.AITER_CSRC_DIR)
+            for v in moe_variants:
+                all_opts_args_build.append(
+                    {
+                        "md_name": v["md_name"],
+                        "srcs": moe_base_args["srcs"],
+                        "flags_extra_cc": moe_base_args["flags_extra_cc"],
+                        "flags_extra_hip": moe_base_args["flags_extra_hip"],
+                        "extra_include": moe_base_args["extra_include"],
+                        "blob_gen_cmd": v["blob_gen_cmd"],
+                        "third_party": moe_base_args["third_party"],
+                    }
+                )
 
         if PREBUILD_KERNELS == 1 and ENABLE_CK:
             extra_args_build = []
