@@ -263,6 +263,7 @@ jobs:
         with:
           name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_accuracy_output.txt
           path: atom_accuracy_output.txt
+          retention-days: 7
 
       - name: Clean Up
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()

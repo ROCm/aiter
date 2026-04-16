@@ -229,6 +229,7 @@ jobs:
             benchmark_fa_triton_${{ matrix.label }}.log
             benchmark_mha_daoai_${{ matrix.label }}.log
             bench_dao_ai_${{ matrix.label }}/
+          retention-days: 7
 
       - name: Clean Up
         if: always()

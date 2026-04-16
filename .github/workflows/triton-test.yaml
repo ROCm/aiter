@@ -53,6 +53,7 @@ jobs:
         with:
           name: triton_shards
           path: triton_shard_*.list
+          retention-days: 7
 
   # Build Triton wheel once, shared by all shard jobs via artifact
   build-triton:
@@ -107,6 +108,7 @@ jobs:
         with:
           name: triton-wheel
           path: triton-wheels/*.whl
+          retention-days: 7
 
   # Step 2: MI325 matrix jobs (always runs)
   triton:
@@ -234,6 +236,7 @@ jobs:
         with:
           name: triton-test-shard-${{ matrix.shard }}
           path: test-reports/triton.xml
+          retention-days: 7
 
       - name: Cleanup container
         if: always()
@@ -344,6 +347,7 @@ jobs:
         with:
           name: triton-test-mi35x-shard-${{ matrix.shard }}
           path: test-reports/triton.xml
+          retention-days: 7
 
       - name: Cleanup container
         if: always()
