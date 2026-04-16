@@ -1874,12 +1874,6 @@ void fused_qk_norm_rope_cache_block_quant_shuffle(
      CHECK_INPUT(q_weight);
      CHECK_INPUT(k_weight);
      CHECK_INPUT(cos_sin_cache);
-     CHECK_INPUT(k_cache);
-     CHECK_INPUT(v_cache);
-     CHECK_INPUT(slot_mapping);
-     CHECK_TYPE(cu_q_len, AITER_DTYPE_i64);
-     CHECK_TYPE(position_ids, AITER_DTYPE_i64);
-     CHECK_TYPE(slot_mapping, AITER_DTYPE_i64);
      AITER_CHECK(qkv.dim() == 2,
                  "QKV tensor must be 2D: [num_tokens, "
                  "(num_heads_q+num_heads_k+num_heads_v)*head_dim]");
