@@ -27,10 +27,7 @@ def gen_layer_norm_fake_tensors(
 
 
 @compile_ops(
-    "module_norm",
-    develop=True,
-    fc_name="layernorm2d_fwd",
-    gen_fake=gen_layer_norm_fake_tensors,
+    "module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors
 )
 def layer_norm(
     input: Tensor,
@@ -43,10 +40,7 @@ def layer_norm(
 
 
 @compile_ops(
-    "module_norm",
-    develop=True,
-    fc_name="layernorm2d_fwd",
-    gen_fake=gen_layer_norm_fake_tensors,
+    "module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors
 )
 def layernorm2d_fwd(
     input: Tensor,
@@ -58,7 +52,7 @@ def layernorm2d_fwd(
 ) -> Tensor: ...
 
 
-@compile_ops("module_norm", develop=True)
+@compile_ops("module_norm")
 def layernorm2d_fwd_with_add(
     out: Tensor,
     input: Tensor,
@@ -71,7 +65,7 @@ def layernorm2d_fwd_with_add(
 ) -> None: ...
 
 
-@compile_ops("module_norm", develop=True)
+@compile_ops("module_norm")
 def layernorm2d_fwd_with_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -84,7 +78,7 @@ def layernorm2d_fwd_with_smoothquant(
 ) -> None: ...
 
 
-@compile_ops("module_norm", develop=True)
+@compile_ops("module_norm")
 def layernorm2d_fwd_with_add_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -99,7 +93,7 @@ def layernorm2d_fwd_with_add_smoothquant(
 ) -> None: ...
 
 
-# @compile_ops("module_norm", develop=True)
+# @compile_ops("module_norm")
 # def layernorm2d_fwd_with_dynamicquant(
 #     out: Tensor,
 #     input: Tensor,
@@ -110,7 +104,7 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     x_bias: Optional[Tensor] = None,):...
 
 
-# @compile_ops("module_norm", develop=True)
+# @compile_ops("module_norm")
 # def layernorm2d_fwd_with_add_dynamicquant(
 #     out: Tensor,
 #     input: Tensor,
