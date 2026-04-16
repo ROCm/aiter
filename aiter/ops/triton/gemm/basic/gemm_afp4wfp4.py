@@ -407,6 +407,16 @@ def gemm_afp4wfp4_preshuffled_scales(
     return y
 
 
+def _unshuffle_scale(s, pf=32):
+    r, c = s.shape
+    rows = r * pf
+    cols = c // pf
+    kw = 4 if cols >= 4 else cols
+    return (s.reshape(r, cols // kw, pf // 4, 4, kw)
+             .permute(0, 3, 2, 1, 4).contiguous()
+             .reshape(rows, cols))
+
+
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
@@ -508,6 +518,15 @@ def gemm_afp4wfp4_preshuffle(
         layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
 
         config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
+
+        # Unshuffle scales on host: convert preshuffled layout to row-major
+        # for direct buffer_load into WMMA scale registers
+        if M >= 32:
+            x_scales = _unshuffle_scale(x_scales)
+        else:
+            x_scales = x_scales.contiguous()
+        w_scales = _unshuffle_scale(w_scales)
+
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
         x_fp4,
         w_preshuf,
