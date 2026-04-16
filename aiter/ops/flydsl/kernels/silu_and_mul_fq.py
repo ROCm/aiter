@@ -19,7 +19,7 @@ Compile options:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, vector, range_constexpr
+from flydsl.expr import arith, vector, range_constexpr, const_expr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -152,7 +152,7 @@ def build_silu_and_mul_fq_module(
         s_ok = arith.cmpi(CmpIPredicate.ult, slot_id, topk_i32)
         is_valid = arith.andi(row_in_range, arith.andi(t_ok, s_ok))
 
-        if _need_fp4:
+        if const_expr(_need_fp4):
 
             def _f32_to_e2m1(qx_f32):
                 qx = qx_f32.bitcast(i32)
@@ -192,7 +192,7 @@ def build_silu_and_mul_fq_module(
 
                     vec_dw = VEC * elem_bytes_bf16 // 4
 
-                    if gui_layout:
+                    if const_expr(gui_layout):
                         # Block-interleaved (block=16):
                         #   [gate_0:16, up_0:16, gate_16:32, up_16:32, ...]
                         c16_i32 = arith.constant(16, type=i32)
@@ -217,7 +217,7 @@ def build_silu_and_mul_fq_module(
                     vec_bf16_ty = T.vec(VEC, T.bf16)
                     vec_f32_ty = T.vec(VEC, f32)
 
-                    if vec_dw == 1:
+                    if const_expr(vec_dw == 1):
                         vec1_i32_ty = T.vec(1, i32)
                         gate_raw = buffer_ops.buffer_load(
                             in_rsrc, gate_dw, vec_width=1, dtype=i32
@@ -264,7 +264,7 @@ def build_silu_and_mul_fq_module(
                         )
                         act_vals.append(g * sig * u)
 
-                    if _need_quant:
+                    if const_expr(_need_quant):
                         local_max = c0_f32
                         for vi in range_constexpr(VEC):
                             abs_v = llvm.call_intrinsic(
@@ -284,7 +284,7 @@ def build_silu_and_mul_fq_module(
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(f32)
 
-                        if _need_fp4:
+                        if const_expr(_need_fp4):
                             out_row_byte_base = in_row * arith.constant(
                                 inter_dim // 2, type=i32
                             )
@@ -305,7 +305,7 @@ def build_silu_and_mul_fq_module(
                                 )
 
                             _pack_bytes = VEC // 2
-                            if _pack_bytes == 1:
+                            if const_expr(_pack_bytes == 1):
                                 store_val = arith.TruncIOp(T.i8, packed_i32)
                                 buffer_ops.buffer_store(
                                     store_val,
@@ -313,7 +313,7 @@ def build_silu_and_mul_fq_module(
                                     out_byte_off,
                                     offset_is_bytes=True,
                                 )
-                            elif _pack_bytes == 2:
+                            elif const_expr(_pack_bytes == 2):
                                 store_val = arith.TruncIOp(T.i16, packed_i32)
                                 buffer_ops.buffer_store(
                                     store_val,
@@ -338,7 +338,7 @@ def build_silu_and_mul_fq_module(
                             for vi in range_constexpr(VEC):
                                 scaled_vals.append(act_vals[vi] * quant_scale)
 
-                            if VEC <= 4:
+                            if const_expr(VEC <= 4):
                                 packed_i32 = c0_i32
                                 for _w in range_constexpr(VEC // 2):
                                     packed_i32 = rocdl.cvt_pk_fp8_f32(
@@ -348,7 +348,7 @@ def build_silu_and_mul_fq_module(
                                         packed_i32,
                                         _w,
                                     )
-                                if VEC == 2:
+                                if const_expr(VEC == 2):
                                     store_val = arith.TruncIOp(T.i16, packed_i32)
                                     buffer_ops.buffer_store(
                                         store_val,
@@ -437,7 +437,7 @@ def build_silu_and_mul_fq_module(
                             T.vec(VEC * elem_bytes_bf16 // 4, i32), act_bf16_vec
                         )
                         vec_dw_out = VEC * elem_bytes_bf16 // 4
-                        if vec_dw_out == 1:
+                        if const_expr(vec_dw_out == 1):
                             store_scalar = vector.extract(
                                 act_i32, static_position=[0], dynamic_position=[]
                             )
@@ -448,7 +448,7 @@ def build_silu_and_mul_fq_module(
                     scf.YieldOp([])
 
                 with ir.InsertionPoint(_if_valid.else_block):
-                    if _need_quant:
+                    if const_expr(_need_quant):
                         lane_in_blk_p = col0 & c31_i32
                         _if_sw_p = scf.IfOp(
                             arith.cmpi(CmpIPredicate.eq, lane_in_blk_p, c0_i32)
