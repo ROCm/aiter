@@ -2,7 +2,7 @@
 
 ## Overview
 
-Custom communication groups allow users to define arbitrary GPU groupings for collective operations (e.g., allreduce), instead of relying on the default TP/DP/PP/EP layout. This is useful when different stages of a model require different parallelism configurations — for example, attention computed with tp4dp2 while MLP communication uses tp8.
+Custom communication groups allow users to define arbitrary GPU groupings for collective operations (e.g., allreduce, allgather, reduce_scatter), instead of relying on the default TP/DP/PP/EP layout. This is useful when different stages of a model require different parallelism configurations — for example, attention computed with TP4 (two independent groups) while MLP communication uses TP8.
 
 The system supports **single group** and **multi-group** modes. Multiple groups can be initialized upfront and selected by name at runtime, avoiding expensive destroy/reinit during inference.
 
@@ -28,7 +28,7 @@ A builder for constructing the config dict passed to `ensure_model_parallel_init
 | Method | Description |
 |--------|-------------|
 | `__init__()` | Create an empty config |
-| `add_group(name, tp_group=, dp_group=)` | Add a named group with TP and/or DP rank lists |
+| `add_group(name, ranks)` | Add a named group with a rank list (1D or 2D) |
 | `data() -> dict` | Return the config dict for passing to init functions |
 
 ### `get_custom_group(name=None)`
@@ -59,29 +59,24 @@ Whether built via `CustomGroupConfig` or written manually, the config dict has t
 
 ```python
 {
-    "group_name": {
-        "tp_group": <List[int] or List[List[int]]>,
-        "dp_group": <List[int] or List[List[int]]>   # optional, can be omitted or []
-    },
+    "group_name": <List[int] or List[List[int]]>,
     ...
 }
 ```
 
-- `tp_group` (1D list): all ranks form a single TP group, e.g. `[0,1,2,3,4,5,6,7]`
-- `tp_group` (2D list): multiple TP subgroups, e.g. `[[0,1,2,3],[4,5,6,7]]`
-- `dp_group` (1D list): all ranks form a single DP group
-- `dp_group` (2D list): multiple DP subgroups
-- When both `tp_group` and `dp_group` are provided (both 2D), EP groups are derived automatically
+Each value can be:
+- **1D `List[int]`**: all ranks form a single communication group, e.g. `[0,1,2,3,4,5,6,7]` → one TP8 group
+- **2D `List[List[int]]`**: multiple independent subgroups, e.g. `[[0,1,2,3],[4,5,6,7]]` → two independent TP4 groups that operate without interfering with each other
 
 ## Usage Examples
 
-### Example 1: Single Custom TP Group (tp4 on GPUs [0,2,4,6])
+### Example 1: Single Custom Group (TP8)
 
 ```python
-config = {"default": {"tp_group": [0, 1, 2, 3]}}
+config = {"tp_group": [0, 1, 2, 3, 4, 5, 6, 7]}
 
 ensure_model_parallel_initialized(
-    tensor_model_parallel_size=4,
+    tensor_model_parallel_size=8,
     pipeline_model_parallel_size=1,
     custom_group_config=config,
 )
@@ -90,40 +85,29 @@ ensure_model_parallel_initialized(
 out = custom_all_reduce(x)  # group name can be omitted for single group
 ```
 
-### Example 2: Custom TP+DP (tp4dp2, derives EP group)
+### Example 2: Two Independent TP4 Groups
 
 ```python
-config = {
-    "default": {
-        "tp_group": [[0, 1, 2, 3], [4, 5, 6, 7]],
-        "dp_group": [[0, 4], [1, 5], [2, 6], [3, 7]],
-    }
-}
+config = {"tp_group": [[0, 1, 2, 3], [4, 5, 6, 7]]}
 
 ensure_model_parallel_initialized(
-    tensor_model_parallel_size=4,
+    tensor_model_parallel_size=8,
     pipeline_model_parallel_size=1,
     custom_group_config=config,
 )
 
+# Devices 0-3 allreduce among themselves, devices 4-7 allreduce among themselves
 out = custom_all_reduce(x)
 ```
 
-### Example 3: Multi-Group (attention tp4dp2 + communication tp8)
+### Example 3: Multi-Group (TP4x2 + DP2x4)
 
 Using `CustomGroupConfig` builder:
 
 ```python
 config = CustomGroupConfig()
-config.add_group(
-    "attn",
-    tp_group=[[0, 1, 2, 3], [4, 5, 6, 7]],
-    dp_group=[[0, 4], [1, 5], [2, 6], [3, 7]],
-)
-config.add_group(
-    "comm",
-    tp_group=[0, 1, 2, 3, 4, 5, 6, 7],
-)
+config.add_group("tp_group", [[0, 1, 2, 3], [4, 5, 6, 7]])
+config.add_group("dp_group", [[0, 4], [1, 5], [2, 6], [3, 7]])
 
 ensure_model_parallel_initialized(
     tensor_model_parallel_size=8,
@@ -131,24 +115,19 @@ ensure_model_parallel_initialized(
     custom_group_config=config.data(),
 )
 
-# Phase 1: attention — allreduce on the "attn" group
-out_attn = custom_all_reduce(x, group="attn")
+# Phase 1: TP allreduce within subgroups of 4
+out_tp = custom_all_reduce(x, group="tp_group")
 
-# Phase 2: communication — allreduce on the "comm" group
-out_comm = custom_all_reduce(out_attn, group="comm")
+# Phase 2: DP allreduce within subgroups of 2
+out_dp = custom_all_reduce(out_tp, group="dp_group")
 ```
 
 Or equivalently, using a raw dict:
 
 ```python
 config = {
-    "attn": {
-        "tp_group": [[0, 1, 2, 3], [4, 5, 6, 7]],
-        "dp_group": [[0, 4], [1, 5], [2, 6], [3, 7]],
-    },
-    "comm": {
-        "tp_group": [0, 1, 2, 3, 4, 5, 6, 7],
-    },
+    "tp_group": [[0, 1, 2, 3], [4, 5, 6, 7]],
+    "dp_group": [[0, 4], [1, 5], [2, 6], [3, 7]],
 }
 
 ensure_model_parallel_initialized(
@@ -166,22 +145,22 @@ group = get_custom_group()
 dist.all_reduce(tensor, group=group.device_group)
 
 # Multiple groups — get by name
-attn_group = get_custom_group("attn")
-comm_group = get_custom_group("comm")
+tp_group = get_custom_group("tp_group")
+dp_group = get_custom_group("dp_group")
 
 # Or get the full dict
-all_groups = get_custom_group()  # returns {"attn": ..., "comm": ...}
+all_groups = get_custom_group()  # returns {"tp_group": ..., "dp_group": ...}
 ```
 
 ### Example 5: CUDA Graph Capture with Custom Groups
 
 ```python
-attn_group = get_custom_group("attn")
+tp_group = get_custom_group("tp_group")
 
 graph = torch.cuda.CUDAGraph()
-with attn_group.graph_capture() as gc:
+with tp_group.graph_capture() as gc:
     with torch.cuda.graph(graph, stream=gc.stream):
-        out = custom_all_reduce(x, group="attn")
+        out = custom_all_reduce(x, group="tp_group")
 ```
 
 ## Important Notes
@@ -202,11 +181,9 @@ Custom groups and standard parallel group interfaces are **mutually exclusive**:
 
 The following checks are enforced during initialization:
 
-1. **Consistent GPU count**: All groups in the config must use the same total number of GPUs (equal to `world_size`).
-2. **No duplicate group names**: Each group name must be unique within the config. `CustomGroupConfig.add_group()` enforces this automatically.
-3. **Rank coverage**: Every rank `0..world_size-1` must appear exactly once in `tp_group` (and `dp_group` if provided). No duplicates, no missing ranks.
-4. **TP/DP grid consistency** (when both provided): Ranks within the same TP subgroup must be in different DP subgroups — i.e., TP and DP groupings must form a valid grid.
-5. **At least one of `tp_group` or `dp_group`** must be provided for each group entry.
+1. **Rank coverage**: Every rank `0..world_size-1` must appear exactly once across all subgroups. No duplicates, no missing ranks.
+2. **Uniform subgroup size** (for 2D lists): All subgroups must have the same size.
+3. **No duplicate group names**: Each group name must be unique within the config. `CustomGroupConfig.add_group()` enforces this automatically.
 
 ### Initialization and Lifecycle
 
@@ -219,7 +196,7 @@ init_distributed_environment(world_size=8, rank=rank_id, ...)
 ensure_model_parallel_initialized(tp_size, pp_size, custom_group_config=config)
 
 # 3. Use custom_all_reduce() during training/inference
-out = custom_all_reduce(x, group="attn")
+out = custom_all_reduce(x, group="tp_group")
 
 # 4. Cleanup
 destroy_model_parallel()
