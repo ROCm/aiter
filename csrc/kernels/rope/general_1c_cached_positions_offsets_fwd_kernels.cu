@@ -21,12 +21,12 @@ using namespace aiter;
  * @param nope_first   If true, back part in last dimension of input is rotated. Otherwise, the front part is rotated.
  */
 void rope_cached_positions_offsets_fwd_impl(
-    aiter_tensor_t&       output,
-    const aiter_tensor_t& input,
-    const aiter_tensor_t& cos,
-    const aiter_tensor_t& sin,
-    const aiter_tensor_t& positions,
-    const aiter_tensor_t& offsets,
+    torch::Tensor&       output,
+    const torch::Tensor& input,
+    const torch::Tensor& cos,
+    const torch::Tensor& sin,
+    const torch::Tensor& positions,
+    const torch::Tensor& offsets,
     const int32_t        rotate_style,
     const bool           reuse_freqs_front_part,
     const bool           nope_first)
@@ -50,7 +50,7 @@ void rope_cached_positions_offsets_fwd_impl(
     const int32_t stride_o_h = output.stride(2);
     const int32_t stride_o_d = output.stride(3);
 
-    AITER_CHECK(stride_i_d == 1 && stride_o_d == 1,
+    TORCH_CHECK(stride_i_d == 1 && stride_o_d == 1,
                 "rope_cached_positions_offsets_fwd_impl requires all stride_d to be 1");
 
     // Get strides of positions and offsets
@@ -58,22 +58,22 @@ void rope_cached_positions_offsets_fwd_impl(
     assert(1 == offsets.stride(1)   && 2 == offsets.dim());
     const int32_t max_position = cos.size(0);
 
-    HipDeviceGuard device_guard(input.device_id);
-    DISPATCH_ROPE_TYPES_PARAMS(
-        input.dtype(),
-        cos.dtype(),
-        positions.dtype(),
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(
+        input.scalar_type(),
+        cos.scalar_type(),
+        positions.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
         "dispatch_1c_sbhd_cached_indirect2<OpCachedFwd, ...>",
         dispatch_1c_sbhd_cached_indirect2<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-            reinterpret_cast<scalar_t_0*>(output.data_ptr()),
-            reinterpret_cast<scalar_t_0*>(input.data_ptr()),
-            reinterpret_cast<scalar_t_1*>(cos.data_ptr()),
-            reinterpret_cast<scalar_t_1*>(sin.data_ptr()),
-            reinterpret_cast<int64_t*>(positions.data_ptr()),
-            reinterpret_cast<int64_t*>(offsets.data_ptr()),
+            output.data_ptr<scalar_t_0>(),
+            input.data_ptr<scalar_t_0>(),
+            cos.data_ptr<scalar_t_1>(),
+            sin.data_ptr<scalar_t_1>(),
+            positions.data_ptr<pos_t>(),
+            offsets.data_ptr<int64_t>(),
             max_position,
             size_s, size_b, size_h, size_d,
             size_f, // size of last dimension of freqs.

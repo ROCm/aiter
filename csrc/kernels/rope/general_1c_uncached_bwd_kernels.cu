@@ -5,9 +5,9 @@
 using namespace aiter;
 
 void rope_bwd_impl(
-    aiter_tensor_t&       input_grads,   // [s, b, h, d]
-    const aiter_tensor_t& output_grads,  // [s, b, h, d]
-    const aiter_tensor_t& freqs,         // [s, 1, 1, d]
+    torch::Tensor&       input_grads,   // [s, b, h, d]
+    const torch::Tensor& output_grads,  // [s, b, h, d]
+    const torch::Tensor& freqs,         // [s, 1, 1, d]
     const int32_t        rotate_style,
     const bool           reuse_freqs_front_part,
     const bool           nope_first)
@@ -26,21 +26,21 @@ void rope_bwd_impl(
     const int32_t stride_i_h = input_grads.stride(2);
     const int32_t stride_i_d = input_grads.stride(3);
 
-    AITER_CHECK(stride_i_d == 1 && stride_o_d == 1,
+    TORCH_CHECK(stride_i_d == 1 && stride_o_d == 1,
                 "rope_bwd_impl requires all stride_d to be 1");
 
-    HipDeviceGuard device_guard(input_grads.device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input_grads));
     DISPATCH_ROPE_TYPES_PARAMS(
-        output_grads.dtype(),
-        freqs.dtype(),
+        output_grads.scalar_type(),
+        freqs.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
         "dispatch_1c_sbhd_uncached<OpUncachedBwd, ...>",
         dispatch_1c_sbhd_uncached<OpUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-            reinterpret_cast<scalar_t_0*>(input_grads.data_ptr()),
-            reinterpret_cast<scalar_t_0*>(output_grads.data_ptr()),
-            reinterpret_cast<scalar_t_1*>(freqs.data_ptr()),
+            input_grads.data_ptr<scalar_t_0>(),
+            output_grads.data_ptr<scalar_t_0>(),
+            freqs.data_ptr<scalar_t_1>(),
             size_s, size_b, size_h, size_d,
             size_f,
             stride_o_s, stride_o_b, stride_o_h, stride_o_d,

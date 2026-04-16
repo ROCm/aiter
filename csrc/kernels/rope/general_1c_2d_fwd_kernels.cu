@@ -5,12 +5,12 @@
 using namespace aiter;
 
 void rope_2d_fwd_impl(
-    aiter_tensor_t&       output,
-    const aiter_tensor_t& input,
-    const aiter_tensor_t& cos_h,
-    const aiter_tensor_t& sin_h,
-    const aiter_tensor_t& cos_w,
-    const aiter_tensor_t& sin_w,
+    torch::Tensor&       output,
+    const torch::Tensor& input,
+    const torch::Tensor& cos_h,
+    const torch::Tensor& sin_h,
+    const torch::Tensor& cos_w,
+    const torch::Tensor& sin_w,
     const int32_t        img_height,
     const int32_t        img_width,
     const int32_t        rotate_style,
@@ -30,25 +30,25 @@ void rope_2d_fwd_impl(
     const int stride_o_h = output.stride(2);
     const int stride_o_d = output.stride(3);
 
-    AITER_CHECK(size_s == img_height * img_width, "rope_2d_fwd_impl - input tensor shape doesn't match image size.");
-    AITER_CHECK(stride_i_d == 1 && stride_o_d == 1,
+    TORCH_CHECK(size_s == img_height * img_width, "rope_2d_fwd_impl - input tensor shape doesn't match image size.");
+    TORCH_CHECK(stride_i_d == 1 && stride_o_d == 1,
                 "rope_2d_fwd_impl requires all stride_d to be 1");
 
-    HipDeviceGuard device_guard(input.device_id);
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
     DISPATCH_ROPE_TYPES_PARAMS(
-        input.dtype(),
-        cos_h.dtype(),
+        input.scalar_type(),
+        cos_h.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
         "dispatch_1c_2d_cached<OpCachedFwd, ...>",
         dispatch_1c_2d_cached<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-            reinterpret_cast<scalar_t_0*>(output.data_ptr()),
-            reinterpret_cast<scalar_t_0*>(input.data_ptr()),
-            reinterpret_cast<scalar_t_1*>(cos_h.data_ptr()),
-            reinterpret_cast<scalar_t_1*>(sin_h.data_ptr()),
-            reinterpret_cast<scalar_t_1*>(cos_w.data_ptr()),
-            reinterpret_cast<scalar_t_1*>(sin_w.data_ptr()),
+            output.data_ptr<scalar_t_0>(),
+            input.data_ptr<scalar_t_0>(),
+            cos_h.data_ptr<scalar_t_1>(),
+            sin_h.data_ptr<scalar_t_1>(),
+            cos_w.data_ptr<scalar_t_1>(),
+            sin_w.data_ptr<scalar_t_1>(),
             img_height, img_width,
             size_b, size_h, size_d,
             stride_i_b, stride_i_s, stride_i_h, stride_i_d,

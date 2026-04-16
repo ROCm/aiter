@@ -4,10 +4,9 @@
 #pragma once
 
 #include "aiter_hip_common.h"
-#include "aiter_dispatch.h"
+#include "dispatch_utils.h"
 #include "hip_float8.h"
-#include "aiter_stream.h"
-#include <numeric>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #ifdef __HIP_DEVICE_COMPILE__
 #include "opus/opus.hpp"
@@ -283,26 +282,26 @@ __device__ __forceinline__ void store_payload(o_scalar_t* p_buffer,
 }
 
 #ifdef __HIP_DEVICE_COMPILE__
-// Map HIP scalar types to opus-compatible types for ext_vector_type
+// Map torch/c10 types to opus-compatible types for ext_vector_type
 template <typename T>
 struct opus_type_map
 {
     using type = T;
 };
 template <>
-struct opus_type_map<__half>
+struct opus_type_map<c10::Half>
 {
     using type = opus::fp16_t;
 };
 template <>
-struct opus_type_map<hip_bfloat16>
+struct opus_type_map<c10::BFloat16>
 {
     using type = opus::bf16_t;
 };
 template <typename T>
 using opus_type_t = typename opus_type_map<T>::type;
 
-// Helper to create opus gmem accessor with automatic pointer cast to opus types
+// Helper to create opus gmem accessor with automatic pointer cast from c10 types to opus types
 template <typename T>
 __device__ __forceinline__ auto opus_gmem(const T* ptr)
 {
@@ -4556,7 +4555,7 @@ void dispatch_1c_sbhd_uncached(scalar_t* __restrict__ p_output,
                                const int32_t stride_o_h,
                                const int32_t stride_o_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -4714,7 +4713,7 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                const int32_t stride_oy_h,
                                const int32_t stride_oy_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -4920,7 +4919,7 @@ void dispatch_1c_sbhd_cached(scalar_t* __restrict__ p_output,
                              const int32_t stride_o_h,
                              const int32_t stride_o_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -5082,7 +5081,7 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                              const int32_t stride_oy_h,
                              const int32_t stride_oy_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -5294,7 +5293,7 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                       const int32_t stride_o_h,
                                       const int32_t stride_o_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -5469,7 +5468,7 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                       const int32_t stride_oy_h,
                                       const int32_t stride_oy_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -5692,7 +5691,7 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                        const int32_t stride_o_h,
                                        const int32_t stride_o_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -5874,7 +5873,7 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                        const int32_t stride_oy_h,
                                        const int32_t stride_oy_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 =
         (stride_ix_d == 1) && (stride_iy_d == 1) && (stride_ox_d == 1) && (stride_oy_d == 1);
@@ -6097,7 +6096,7 @@ void dispatch_1c_thd_uncached(scalar_t* __restrict__ p_output,
                               const int32_t stride_o_h,
                               const int32_t stride_o_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -6243,7 +6242,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                            const int32_t stride_o_h,
                            const int32_t stride_o_d)
 {
-    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     const bool all_stride_d_eq_1 = (stride_i_d == 1) && (stride_o_d == 1);
     auto [grid, block, vec_pairs, threads_per_sb] =
@@ -6433,11 +6432,11 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
     TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
     switch((TYPE0))                                                               \
     {                                                                             \
-    case AITER_DTYPE_fp32: {                                                 \
+    case at::ScalarType::Float: {                                                 \
         using scalar_t_0 = float;                                                 \
         switch((TYPE1))                                                           \
         {                                                                         \
-        case AITER_DTYPE_fp32: {                                             \
+        case at::ScalarType::Float: {                                             \
             using scalar_t_1 = float;                                             \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
@@ -6472,7 +6471,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6511,7 +6510,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6519,8 +6518,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case AITER_DTYPE_fp16: {                                              \
-            using scalar_t_1 = __half;                                          \
+        case at::ScalarType::Half: {                                              \
+            using scalar_t_1 = at::Half;                                          \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6554,7 +6553,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6593,7 +6592,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6601,8 +6600,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case AITER_DTYPE_bf16: {                                          \
-            using scalar_t_1 = hip_bfloat16;                                      \
+        case at::ScalarType::BFloat16: {                                          \
+            using scalar_t_1 = at::BFloat16;                                      \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6636,7 +6635,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6675,7 +6674,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6684,20 +6683,20 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             break;                                                                \
         }                                                                         \
         default:                                                                  \
-            AITER_CHECK(false,                                                    \
+            TORCH_CHECK(false,                                                    \
                         NAME " does't support ",                                  \
-                        AiterDtype_to_str((TYPE0)),                                        \
+                        toString((TYPE0)),                                        \
                         " with ",                                                 \
-                        AiterDtype_to_str((TYPE1)),                                        \
+                        toString((TYPE1)),                                        \
                         ".");                                                     \
         }                                                                         \
         break;                                                                    \
     }                                                                             \
-    case AITER_DTYPE_fp16: {                                                  \
-        using scalar_t_0 = __half;                                              \
+    case at::ScalarType::Half: {                                                  \
+        using scalar_t_0 = at::Half;                                              \
         switch((TYPE1))                                                           \
         {                                                                         \
-        case AITER_DTYPE_fp32: {                                             \
+        case at::ScalarType::Float: {                                             \
             using scalar_t_1 = float;                                             \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
@@ -6732,7 +6731,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6771,7 +6770,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6779,8 +6778,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case AITER_DTYPE_fp16: {                                              \
-            using scalar_t_1 = __half;                                          \
+        case at::ScalarType::Half: {                                              \
+            using scalar_t_1 = at::Half;                                          \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6814,7 +6813,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6853,7 +6852,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6861,8 +6860,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case AITER_DTYPE_bf16: {                                          \
-            using scalar_t_1 = hip_bfloat16;                                      \
+        case at::ScalarType::BFloat16: {                                          \
+            using scalar_t_1 = at::BFloat16;                                      \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -6896,7 +6895,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6935,7 +6934,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -6944,20 +6943,20 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             break;                                                                \
         }                                                                         \
         default:                                                                  \
-            AITER_CHECK(false,                                                    \
+            TORCH_CHECK(false,                                                    \
                         NAME " does't support ",                                  \
-                        AiterDtype_to_str((TYPE0)),                                        \
+                        toString((TYPE0)),                                        \
                         " with ",                                                 \
-                        AiterDtype_to_str((TYPE1)),                                        \
+                        toString((TYPE1)),                                        \
                         ".");                                                     \
         }                                                                         \
         break;                                                                    \
     }                                                                             \
-    case AITER_DTYPE_bf16: {                                              \
-        using scalar_t_0 = hip_bfloat16;                                          \
+    case at::ScalarType::BFloat16: {                                              \
+        using scalar_t_0 = at::BFloat16;                                          \
         switch((TYPE1))                                                           \
         {                                                                         \
-        case AITER_DTYPE_fp32: {                                             \
+        case at::ScalarType::Float: {                                             \
             using scalar_t_1 = float;                                             \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
@@ -6992,7 +6991,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7031,7 +7030,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7039,8 +7038,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case AITER_DTYPE_fp16: {                                              \
-            using scalar_t_1 = __half;                                          \
+        case at::ScalarType::Half: {                                              \
+            using scalar_t_1 = at::Half;                                          \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -7074,7 +7073,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7113,7 +7112,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7121,8 +7120,8 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             }                                                                     \
             break;                                                                \
         }                                                                         \
-        case AITER_DTYPE_bf16: {                                          \
-            using scalar_t_1 = hip_bfloat16;                                      \
+        case at::ScalarType::BFloat16: {                                          \
+            using scalar_t_1 = at::BFloat16;                                      \
             if((REUSE_FREQS_FRONT_PART))                                          \
             {                                                                     \
                 constexpr bool ReuseFreqsFrontPart = true;                        \
@@ -7156,7 +7155,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7195,7 +7194,7 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
                 }                                                                 \
                 else                                                              \
                 {                                                                 \
-                    AITER_CHECK(false,                                            \
+                    TORCH_CHECK(false,                                            \
                                 NAME " does't support rotate type ",              \
                                 std::to_string((ROTATE_STYLE)),                   \
                                 ".");                                             \
@@ -7204,16 +7203,16 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
             break;                                                                \
         }                                                                         \
         default:                                                                  \
-            AITER_CHECK(false,                                                    \
+            TORCH_CHECK(false,                                                    \
                         NAME " does't support ",                                  \
-                        AiterDtype_to_str((TYPE0)),                                        \
+                        toString((TYPE0)),                                        \
                         " with ",                                                 \
-                        AiterDtype_to_str((TYPE1)),                                        \
+                        toString((TYPE1)),                                        \
                         ".");                                                     \
         }                                                                         \
         break;                                                                    \
     }                                                                             \
-    default: AITER_CHECK(false, NAME " does't support ", AiterDtype_to_str((TYPE0)), "."); \
+    default: TORCH_CHECK(false, NAME " does't support ", toString((TYPE0)), "."); \
     }
 
 namespace mrope_utils {
@@ -7845,10 +7844,10 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             int64_t x                = 0,
                             int64_t rotary_dim       = 0)
 {
-    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     auto expected_half = rotary_dim > 0 ? rotary_dim / 2 : head_size / 2;
-    AITER_CHECK(dim == expected_half,
+    TORCH_CHECK(dim == expected_half,
                 "mrope_section sum (",
                 dim,
                 ") must equal rotary_dim/2 (",
@@ -7973,7 +7972,7 @@ void fused_rope_rms_set_kv(const T* qkv,
                            int64_t x                = 0,
                            int64_t rotary_dim       = 0)
 {
-    AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     constexpr int THREAD_BLOCK_SIZE = 256;
     auto total_warps                = num_tokens * (num_heads_q + num_heads_k + num_heads_v);
     auto num_warps_per_block        = THREAD_BLOCK_SIZE / WARP_SIZE;
