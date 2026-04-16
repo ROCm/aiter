@@ -163,6 +163,7 @@ jobs:
         with:
           name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
+          retention-days: 14
 
       - name: Cleanup container
         if: always()
