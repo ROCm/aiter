@@ -114,6 +114,10 @@ def fused_gemm_a8w8_blockscale_a16w16(
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_fp8_scale.shape[0]))
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N_fp8, w_fp8_scale.shape[1]))
 
+    if M >= 4096 and config.get("num_stages", 1) > 1:
+        config = dict(config)
+        config["num_stages"] = 1
+
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
         (
