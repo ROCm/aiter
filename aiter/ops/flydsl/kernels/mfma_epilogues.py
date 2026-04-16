@@ -31,6 +31,7 @@ from typing import Callable
 
 from flydsl._mlir import ir
 import flydsl.expr as fx
+from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
 
@@ -111,6 +112,12 @@ def c_shuffle_epilog(
     write_row_to_lds: Callable,
     precompute_row: Callable | None = None,
     store_pair: Callable,
+    # When LDS overflows, split lds_out across two buffers by wave-group.
+    # Pass the second buffer here; first buffer is `lds_out`.
+    lds_out_split=None,
+    # Row offset in lds_out for 8-wave mode (MLIR index value).
+    # Shifts both write and read LDS indices by lds_row_offset * tile_n elements.
+    lds_row_offset=None,
 ):
     """LDS CShuffle epilogue skeleton.
 
@@ -137,14 +144,173 @@ def c_shuffle_epilog(
             f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane*e_vec}, got tile_n={tile_n}"
         )
 
+    # ===================== Split-LDS mode (early return) =====================
+    # When lds_out_split is provided, waves are divided into two groups:
+    #   Group A (waves 0..N/2-1) uses lds_out,  columns [0, tile_n/2)
+    #   Group B (waves N/2..N-1) uses lds_out_split, columns [tile_n/2, tile_n)
+    # Each group writes/reads independently; same barriers synchronise all waves.
+    if lds_out_split is not None:
+        if scf is None:
+            raise ValueError("scf module is required for split-LDS cshuffle")
+
+        _half_n = int(tile_n) // 2
+        _half_threads = int(block_size) // 2
+        EVec = int(e_vec)
+
+        CShuffleNLane_s = min(int(cshuffle_nlane), _half_n // EVec)
+        if _half_threads % CShuffleNLane_s != 0:
+            raise ValueError(
+                f"half_threads={_half_threads} not divisible by CShuffleNLane_split={CShuffleNLane_s}"
+            )
+        CShuffleMLane_s = _half_threads // CShuffleNLane_s
+        if int(tile_m) % CShuffleMLane_s != 0:
+            raise ValueError(
+                f"tile_m={tile_m} not divisible by CShuffleMLane_split={CShuffleMLane_s}"
+            )
+        m_reps_s = int(tile_m) // CShuffleMLane_s
+        n_reps_s = _half_n // (CShuffleNLane_s * EVec)
+
+        _half_n_idx = arith.constant(_half_n, index=True)
+        _half_thr_idx = arith.constant(_half_threads, index=True)
+        _zero_idx = arith.constant(0, index=True)
+
+        _is_group_b = arith.cmpi(CmpIPredicate.uge, tx, _half_thr_idx)
+
+        # -- write phase (all waves, each to its group's LDS buffer) --
+        n_tile_base_v = n_tile_base
+        col_base_local_a = n_tile_base_v + lane_mod_16
+        col_base_local_b = col_base_local_a - _half_n_idx
+
+        def _write_row_split(mi: int, ii: int, row_in_tile, row):
+            row_base_lds = row_in_tile * _half_n_idx
+            _if_g = scf.IfOp(_is_group_b)
+            with ir.InsertionPoint(_if_g.then_block):
+                write_row_to_lds(
+                    mi=mi,
+                    ii=ii,
+                    row_in_tile=row_in_tile,
+                    row=row,
+                    row_base_lds=row_base_lds,
+                    col_base_local=col_base_local_b,
+                    num_acc_n=num_acc_n,
+                    lds_out=lds_out_split,
+                )
+                scf.YieldOp([])
+            with ir.InsertionPoint(_if_g.else_block):
+                write_row_to_lds(
+                    mi=mi,
+                    ii=ii,
+                    row_in_tile=row_in_tile,
+                    row=row,
+                    row_base_lds=row_base_lds,
+                    col_base_local=col_base_local_a,
+                    num_acc_n=num_acc_n,
+                    lds_out=lds_out,
+                )
+                scf.YieldOp([])
+
+        gpu.barrier()
+        default_epilog(
+            arith=arith,
+            range_constexpr=range_constexpr,
+            m_repeat=m_repeat,
+            lane_div_16=lane_div_16,
+            bx_m=bx_m,
+            body_row=_write_row_split,
+        )
+        gpu.barrier()
+
+        # -- read phase (each group reads from its own LDS buffer) --
+        tx_local = tx - arith.select(_is_group_b, _half_thr_idx, _zero_idx)
+        c_nlane_s = arith.constant(CShuffleNLane_s, index=True)
+        m_lane_s = tx_local / c_nlane_s
+        n_lane_s = tx_local % c_nlane_s
+        c_evec = arith.constant(EVec, index=True)
+
+        if frag_elem_type is None:
+            frag_elem_type = T.f16
+        vec_frag = T.vec(EVec, frag_elem_type)
+        bx_m_v = bx_m
+        by_n_v = by_n
+
+        _precomputed_rows_s = []
+        for mr in range_constexpr(m_reps_s):
+            row_base_m = arith.constant(mr * CShuffleMLane_s, index=True)
+            row_local = row_base_m + m_lane_s
+            row = bx_m_v + row_local
+            row_ctx_raw = (
+                precompute_row(row_local=row_local, row=row)
+                if precompute_row is not None
+                else None
+            )
+            row_ctx = row_ctx_raw
+            row_pred = None
+            if (
+                scf is not None
+                and row_ctx_raw is not None
+                and isinstance(row_ctx_raw, tuple)
+                and len(row_ctx_raw) == 2
+            ):
+                row_ctx, row_pred = row_ctx_raw
+            _precomputed_rows_s.append((row_local, row, row_ctx, row_pred))
+
+        for mr in range_constexpr(m_reps_s):
+            row_local, row, row_ctx, row_pred = _precomputed_rows_s[mr]
+
+            def _do_store_row_split():
+                row_base_lds = row_local * _half_n_idx
+                for nr in range_constexpr(n_reps_s):
+                    col_base_nr = arith.constant(
+                        nr * (CShuffleNLane_s * EVec), index=True
+                    )
+                    col_pair0_local = col_base_nr + (n_lane_s * c_evec)
+                    lds_idx = row_base_lds + col_pair0_local
+
+                    _if_ld = scf.IfOp(_is_group_b, [vec_frag])
+                    with ir.InsertionPoint(_if_ld.then_block):
+                        fb = vector.load_op(vec_frag, lds_out_split, [lds_idx])
+                        scf.YieldOp([fb])
+                    with ir.InsertionPoint(_if_ld.else_block):
+                        fa = vector.load_op(vec_frag, lds_out, [lds_idx])
+                        scf.YieldOp([fa])
+                    frag = _if_ld.results[0]
+
+                    col_pair0 = col_pair0_local + arith.select(
+                        _is_group_b, _half_n_idx, _zero_idx
+                    )
+                    store_pair(
+                        row_local=row_local,
+                        row=row,
+                        row_ctx=row_ctx,
+                        col_pair0=col_pair0,
+                        col_g0=by_n_v + col_pair0,
+                        frag=frag,
+                    )
+
+            if row_pred is not None:
+                _if_row = scf.IfOp(row_pred)
+                with _if_then(_if_row, scf):
+                    _do_store_row_split()
+            else:
+                _do_store_row_split()
+
+        return  # split path complete
+
+    # ===================== Standard (non-split) path below =====================
+
     # ---------------- Step 1: write C tile to LDS (row-major, fp16) ----------------
     tile_n_idx = arith.constant(int(tile_n), index=True)
     n_tile_base_v = n_tile_base
     col_base_local = n_tile_base_v + lane_mod_16  # index within [0,tile_n)
 
+    _lds_row_base_offset = (
+        lds_row_offset * tile_n_idx if lds_row_offset is not None else None
+    )
+
     def _write_row(mi: int, ii: int, row_in_tile, row):
-        # row_base_lds = row_in_tile * tile_n
         row_base_lds = row_in_tile * tile_n_idx
+        if _lds_row_base_offset is not None:
+            row_base_lds = row_base_lds + _lds_row_base_offset
         write_row_to_lds(
             mi=mi,
             ii=ii,
@@ -189,6 +355,10 @@ def c_shuffle_epilog(
     bx_m_v = bx_m
     by_n_v = by_n
 
+    # Batch-precompute all row contexts (sorted_idx loads) before the store loop.
+    # This issues all buffer_load instructions upfront so the compiler can pipeline
+    # them instead of serializing each load with s_waitcnt vmcnt(0).
+    _precomputed_rows = []
     for mr in range_constexpr(m_reps_shuffle):
         row_base_m = arith.constant(mr * CShuffleMLane, index=True)
         row_local = row_base_m + m_lane
@@ -212,8 +382,16 @@ def c_shuffle_epilog(
         ):
             row_ctx, row_pred = row_ctx_raw
 
+        _precomputed_rows.append((row_local, row, row_ctx, row_pred))
+
+    # Now perform LDS reads and stores using the pre-fetched row contexts.
+    for mr in range_constexpr(m_reps_shuffle):
+        row_local, row, row_ctx, row_pred = _precomputed_rows[mr]
+
         def _do_store_row():
             row_base_lds = row_local * tile_n_idx
+            if _lds_row_base_offset is not None:
+                row_base_lds = row_base_lds + _lds_row_base_offset
             for nr in range_constexpr(n_reps_shuffle):
                 col_base_nr = arith.constant(nr * (CShuffleNLane * EVec), index=True)
                 col_pair0 = col_base_nr + (n_lane * c_evec)  # even col within tile
