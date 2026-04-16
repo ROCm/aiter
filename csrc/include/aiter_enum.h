@@ -24,7 +24,9 @@ enum class QuantType : int
 };
 typedef enum
 {
-    AITER_DTYPE_fp8,
+    AITER_DTYPE_fp8, // Ambiguous dtype, use the corresponding type per device.
+    AITER_DTYPE_fp8_e4m3fn,
+    AITER_DTYPE_fp8_e4m3fnuz,
     AITER_DTYPE_fp8_e8m0,
     AITER_DTYPE_fp16,
     AITER_DTYPE_bf16,
@@ -45,6 +47,8 @@ static inline size_t AiterDtype_element_size(AiterDtype dtype)
     switch(dtype)
     {
     case AITER_DTYPE_fp8:
+    case AITER_DTYPE_fp8_e4m3fn:
+    case AITER_DTYPE_fp8_e4m3fnuz:
     case AITER_DTYPE_fp8_e8m0:
     case AITER_DTYPE_i4x2:
     case AITER_DTYPE_fp4x2:
@@ -67,6 +71,8 @@ static inline std::string AiterDtype_to_str(int dtype)
     switch(dtype)
     {
     case AITER_DTYPE_fp8: return "fp8";
+    case AITER_DTYPE_fp8_e4m3fn: return "fp8_e4m3fn";
+    case AITER_DTYPE_fp8_e4m3fnuz: return "fp8_e4m3fnuz";
     case AITER_DTYPE_fp8_e8m0: return "fp8_e8m0";
     case AITER_DTYPE_fp16: return "fp16";
     case AITER_DTYPE_bf16: return "bf16";

@@ -36,6 +36,9 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                     int64_t rotary_dim)
 {
     AITER_CHECK(mrope_section_.size() == 3);
+    AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
+                cos_sin.is_contiguous());
+    AITER_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && slot_mapping.is_contiguous());
     std::array<int64_t, 3> mrope_section;
     mrope_section[0] = mrope_section_[0];
     mrope_section[1] = mrope_section_[1];
@@ -88,8 +91,10 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                              x,
                                                              rotary_dim);
             }
-            else if(kv_cache_dtype == AITER_DTYPE_fp8)
+            else
             {
+                if(kv_cache_dtype == AITER_DTYPE_fp8_e4m3fnuz)
+                {
                     mrope_utils::fp8e4m3fnuz* k_out_fp8_ptr =
                         (return_kv && k_out.has_value())
                             ? reinterpret_cast<mrope_utils::fp8e4m3fnuz*>(k_out.value().data_ptr())
@@ -128,10 +133,52 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                         block_size,
                         x,
                         rotary_dim);
-            }
-            else
-            {
-                AITER_CHECK(false, "Unsupported KV cache dtype: ", AiterDtype_to_str(kv_cache_dtype));
+                }
+                else if(kv_cache_dtype == AITER_DTYPE_fp8_e4m3fn)
+                {
+                    mrope_utils::fp8e4m3fn* k_out_fp8_ptr =
+                        (return_kv && k_out.has_value())
+                            ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(k_out.value().data_ptr())
+                            : nullptr;
+                    mrope_utils::fp8e4m3fn* v_out_fp8_ptr =
+                        (return_kv && v_out.has_value())
+                            ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(v_out.value().data_ptr())
+                            : nullptr;
+                    mrope_utils::fused_mrope_rms_set_kv<T, 3, mrope_utils::fp8e4m3fn>(
+                        reinterpret_cast<T*>(qkv.data_ptr()),
+                        reinterpret_cast<T*>(qw.data_ptr()),
+                        reinterpret_cast<T*>(kw.data_ptr()),
+                        reinterpret_cast<T*>(cos_sin.data_ptr()),
+                        reinterpret_cast<int64_t*>(positions.data_ptr()),
+                        position_stride_0,
+                        position_stride_1,
+                        num_tokens,
+                        num_heads_q,
+                        num_heads_k,
+                        num_heads_v,
+                        head_size,
+                        is_neox_style,
+                        eps,
+                        mrope_section,
+                        is_interleaved,
+                        reinterpret_cast<T*>(q_out.data_ptr()),
+                        reinterpret_cast<mrope_utils::fp8e4m3fn*>(k_cache.data_ptr()),
+                        reinterpret_cast<mrope_utils::fp8e4m3fn*>(v_cache.data_ptr()),
+                        reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),
+                        stream,
+                        per_tensor_k_scale,
+                        per_tensor_v_scale,
+                        k_out_fp8_ptr,
+                        v_out_fp8_ptr,
+                        use_shuffle_layout,
+                        block_size,
+                        x,
+                        rotary_dim);
+                }
+                else
+                {
+                    AITER_CHECK(false, "Unsupported KV cache dtype: ", AiterDtype_to_str(kv_cache_dtype));
+                }
             }
         });
 }

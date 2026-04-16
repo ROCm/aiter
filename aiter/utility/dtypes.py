@@ -23,6 +23,8 @@ def get_dtype_fp8():
 i4x2 = getattr(torch, "int4", _8bit_fallback)
 fp4x2 = getattr(torch, "float4_e2m1fn_x2", _8bit_fallback)
 fp8 = get_dtype_fp8()
+fp8_e4m3fn = torch.float8_e4m3fn
+fp8_e4m3fnuz = torch.float8_e4m3fnuz
 fp8_e8m0 = getattr(torch, "float8_e8m0fnu", _8bit_fallback)
 fp16 = torch.float16
 bf16 = torch.bfloat16
