@@ -12,6 +12,29 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
+last_dispatch_info = {}
+
+
+def predict_kernel_path(
+    num_seqs, num_q_heads, num_kv_heads, max_seqlen_q, max_seqlen_k,
+    total_q_tokens, sliding_window=None, force_kernel=None,
+):
+    """Predict the 2D/3D dispatch without running the kernel."""
+    if force_kernel is not None:
+        return force_kernel.upper()
+    num_queries_per_kv = num_q_heads // num_kv_heads
+    BLOCK_M = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    total_q_blocks = total_q_tokens // BLOCK_Q + num_seqs
+    num_2d_prgms = total_q_blocks * num_kv_heads
+    SLIDING_WINDOW = 1 + (sliding_window - 1 if sliding_window else -1)
+    target = get_num_sms() * 4
+    is_2d = use_2d_kernel(
+        0, SLIDING_WINDOW, max_seqlen_q == 1,
+        max_seqlen_q, max_seqlen_k, target, num_2d_prgms,
+    )
+    return "2D" if is_2d else "3D"
+
 
 def select_2d_config(
     block_size,
@@ -22,34 +45,53 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    is_quantized=False,
 ):
     arch = get_arch()
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-
-    TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
+    # TILE_SIZE >= 32 is required: TILE_SIZE=16 causes Triton compiler
+    # crashes for FP8/MXFP4 on gfx950 (unsupported 16x16 FP8 MFMA) and
+    # correctness failures for BF16 with BLOCK_M=16.
+    TILE_SIZE = 16
+    # TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
     waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
+
+    # TILE_SIZE = 64
+    # # in case head_size is large
+    # max_num_stages_2d = 4
+    # if head_size > 128:
+    #     max_num_stages_2d = 2
+    # if not all_decode:
+    #     num_stages_2d = 1
+    #     num_warps = 2
+    # else:
+    #     num_stages_2d = 3
+    #     num_warps = 2
+    #     TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
 
     max_num_stages_2d = 2 if head_size > 128 else 4
 
     # base prefill, for short cases
     if not all_decode:
-        num_stages_2d, num_warps = 1, 2
+        num_stages_2d, num_warps = 3, 8
     # pure decode config
     else:
         # to not have masking when loading KV
-        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
-            num_stages_2d, num_warps = 3, 2
+            num_stages_2d, num_warps = 3, 8
 
     # large prefill config
     if max_seqlen_q >= 256:
         BLOCK_M = 64 if arch.is_rdna else 128
-        num_stages_2d, num_warps = 1, 4
+        if is_quantized and not arch.is_rdna:
+            TILE_SIZE = 128
+        num_stages_2d, num_warps = 3, 8
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
@@ -67,14 +109,15 @@ def select_2d_config(
 def select_3d_config(
     head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
 ):
-    reduce_num_warps = 2
+    reduce_num_warps = 4
     attn_warps = 2
-    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
+    # MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
+    MIN_SEGMENTS = 8
     num_segments = max(num_segments, MIN_SEGMENTS)
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
@@ -111,11 +154,74 @@ def use_2d_kernel(
     )
 
 
-def unified_attention(
+def check_mxfp4_quant_args_get_strides(
     q,
+    q_descale,
     k,
+    k_descale,
     v,
-    out,
+    v_descale,
+):
+    """
+    qkv has shapes:
+        - q,  # [num_tokens, num_query_heads, head_size]
+        - k,  # [num_blks, blk_size, num_kv_heads, head_size]
+        - v,  # [num_blks, blk_size, num_kv_heads, head_size]
+    we expect the scales to have shapes:
+        - q_scale,  # [num_tokens, num_kv_heads, head_size // 32] if sage_mxfp4
+        - k_scale,  # [num_blks, blk_size, num_kv_heads, head_size // 32] if sage_mxfp4
+        - v_scale,  # [num_kv_heads, head_size]
+    """
+    num_tokens, num_query_heads, head_size_qk = q.shape
+    num_blks, blk_size, num_kv_heads, head_size_v = v.shape
+    head_size_qk *= 2
+    expected_q_descale_shape = (num_tokens, num_query_heads, head_size_qk // 32)
+    assert (
+        q_descale.shape == expected_q_descale_shape
+    ), f"expect q_descale to have shape {expected_q_descale_shape}, got {q_descale.shape}"
+    expected_k_descale_shape = (
+        num_blks,
+        blk_size,
+        num_kv_heads,
+        head_size_qk // 32,
+    )
+    assert (
+        k_descale.shape == expected_k_descale_shape
+    ), f"expect k_descale to have shape {expected_k_descale_shape}, got {k_descale.shape}"
+    expected_v_descale_shape = (num_kv_heads, head_size_v)
+    assert (
+        v_descale.shape == expected_v_descale_shape
+    ), f"expect v_descale to have shape {expected_v_descale_shape}, got {v_descale.shape}"
+
+    (
+        stride_k_cache_scale_0,
+        stride_k_cache_scale_1,
+        stride_k_cache_scale_2,
+        stride_k_cache_scale_3,
+    ) = k_descale.stride()
+    query_scale_stride_0, query_scale_stride_1, query_scale_stride_2 = (
+        q_descale.stride()
+    )
+    stride_v_cache_scale_0, stride_v_cache_scale_1 = v_descale.stride()
+
+    return (
+        query_scale_stride_0,
+        query_scale_stride_1,
+        query_scale_stride_2,
+        stride_k_cache_scale_0,
+        stride_k_cache_scale_1,
+        stride_k_cache_scale_2,
+        stride_k_cache_scale_3,
+        stride_v_cache_scale_0,
+        stride_v_cache_scale_1,
+    )
+
+
+def unified_attention(
+    q,  # t,h,d+r
+    k,  # num_blks, blk_size, hk, d+r if kv_layout=="cache", else t,hk,d+r
+    v,  # num_blks, blk_size, hk, dv if kv_layout=="cache", else t,hk,dv
+    out,  # t,h,dv
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
@@ -123,32 +229,192 @@ def unified_attention(
     softmax_scale,
     causal,
     window_size,
-    block_table,
     softcap,
-    q_descale,
-    k_descale,
-    v_descale,
+    q_descale, # None (no quantization) or float32 scalar (fp8 per tensor) or (*q.shape[:-1], (d+r) // 32) (MXFP4)
+    k_descale, # None (no quantization) or float32 scalar (fp8 per tensor) or (*k.shape[:-1], (d+r) // 32) (MXFP4)
+    v_descale, # None (no quantization) or float32 scalar (fp8 per tensor) or (*k.shape[:-1], dv // 32) (MXFP4)
+    block_table=None,  # num_seqs, cdiv(max_seqlen_k, block_size), required if kv_layout=="cache"
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
     # Optional tensor for sinks
     sinks=None,
+    sage_mxfp4=False,
+    kv_layout="cache",  # "cache" or "thd"
+    cu_seqlens_k=None,  # required if kv_layout=="thd"
+    rope_size=None, # if set, r part of the head dim is processed separately. Set to 0 if you want to disable the handling of the rope separately.
+    force_kernel=None, # None = auto dispatch, "2d" = force 2D kernel, "3d" = force 3D kernel
 ):
-    assert causal, "Only causal attention is supported"
+    """
+    Compute unified multi-head attention with Triton kernels, supporting paged KV-cache and THD layouts,
+    optional quantization (FP8 / MXFP4), ALiBi, sliding-window attention, softcap, sinks, and split RoPE heads.
+    This function dispatches to either a 2D fused kernel or a 3D segmented kernel + reduction based on
+    problem size and hardware occupancy heuristics. Results are written in-place to ``out``.
+    Args:
+        q (torch.Tensor):
+            Query tensor of shape ``(Tq, Hq, Dqk_total)`` where ``Dqk_total = d + r``.
+        k (torch.Tensor):
+            Key tensor.
+            - If ``kv_layout="cache"``: shape ``(num_blks, blk_size, Hkv, Dqk_total)``
+            - If ``kv_layout="thd"``: shape ``(Tk, Hkv, Dqk_total)``
+        v (torch.Tensor):
+            Value tensor.
+            - If ``kv_layout="cache"``: shape ``(num_blks, blk_size, Hkv, Dv)``
+            - If ``kv_layout="thd"``: shape ``(Tk, Hkv, Dv)``
+        out (torch.Tensor):
+            Output tensor of shape ``(Tq, Hq, Dv)``. Filled in-place.
+        cu_seqlens_q (torch.Tensor):
+            Cumulative query sequence lengths, shape ``(num_seqs + 1,)``.
+        max_seqlen_q (int):
+            Maximum query sequence length in the batch.
+        seqused_k (torch.Tensor):
+            Per-sequence effective key lengths, shape ``(num_seqs,)``.
+        max_seqlen_k (int):
+            Maximum key sequence length in the batch.
+        softmax_scale (float | None):
+            Scale factor applied to attention logits. If ``None`` in 2D path, defaults to ``1.0``.
+        causal (bool):
+            Whether to apply causal masking.
+        window_size (tuple[int, int] | list[int]):
+            Sliding-window configuration. Effective left window uses ``1 + window_size[0]``.
+        softcap (float):
+            Optional logit soft-capping value; disabled when ``<= 0``.
+        q_descale (None | torch.Tensor | float):
+            Query dequant scale:
+            - ``None``: no quantization
+            - scalar float32: per-tensor FP8 scale
+            - tensor for MXFP4: shape ``(*q.shape[:-1], Dqk_total // 32)``
+        k_descale (None | torch.Tensor | float):
+            Key dequant scale:
+            - ``None``: no quantization
+            - scalar float32: per-tensor FP8 scale
+            - tensor for MXFP4: shape compatible with key layout, last dim ``Dqk_total // 32``
+        v_descale (None | torch.Tensor | float):
+            Value dequant scale:
+            - ``None``: no quantization
+            - scalar float32: per-tensor FP8 scale
+            - tensor for MXFP4: shape compatible with value layout, last dim ``Dv // 32``
+        block_table (torch.Tensor | None, optional):
+            Block mapping table of shape ``(num_seqs, ceil(max_seqlen_k / block_size))``.
+            Required when ``kv_layout="cache"``.
+        alibi_slopes (torch.Tensor | None, optional):
+            ALiBi slopes tensor. Enables ALiBi bias when provided.
+        output_scale (float | None, optional):
+            If provided, output is scaled by ``1 / output_scale`` (used for FP8 output path).
+        qq_bias (torch.Tensor | None, optional):
+            Optional per-query bias tensor used by kernel when provided.
+        sinks (torch.Tensor | None, optional):
+            Optional sink scores/tensor. First dimension must equal ``num_query_heads``.
+        sage_mxfp4 (bool, optional):
+            Enables SageAttention MXFP4-specific path and stride handling.
+        kv_layout (str, optional):
+            KV memory layout: ``"cache"`` (paged/cache layout) or ``"thd"`` (token-head-dim layout).
+        cu_seqlens_k (torch.Tensor | None, optional):
+            Cumulative key sequence lengths, required when ``kv_layout="thd"``.
+        rope_size (int | None, optional):
+            Size of RoPE portion within Q/K head dimension.
+            - ``None``: inferred split if head size is not power-of-two.
+            - ``0``: disable inferred split. Can lead to suboptimal masked loads and compute if head size is not power-of-two.
+            - ``r``: separate RoPE handling of size ``r`` within head dimension ``Dqk_total = d + r``, processed with dedicated logic in kernel.
+    Behavior:
+        - Validates required layout-dependent inputs.
+        - Derives head sizes, RoPE partition, and quantization strides.
+        - Chooses between:
+          1) single-pass 2D attention kernel, or
+          2) segmented 3D attention kernel followed by reduction.
+        - Supports grouped-query attention via ``num_queries_per_kv = Hq // Hkv``.
+    Returns:
+        None. The result is written into ``out``.
+    Raises:
+        AssertionError:
+            If required tensors/shapes are missing or inconsistent (e.g., missing ``block_table`` for cache layout,
+            missing ``cu_seqlens_k`` for THD, invalid sinks head count).
+        ValueError:
+            If ``kv_layout`` is not one of ``{"cache", "thd"}``.
+    Notes:
+        - ``Hq`` must be divisible by ``Hkv``.
+        - Internal kernel launch geometry is selected heuristically for occupancy/performance.
+        - In THD mode, K/V are temporarily reshaped to emulate cache-style kernel expectations.
+    """
+    
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+
+    head_size_v = v.shape[-1]
+    head_size_qk = k.shape[-1]
+    if sage_mxfp4:
+        head_size_qk *= 2
+
+    if rope_size is not None:
+        head_size_qk -= rope_size
+    else:    
+        rope_size = 0
+        is_head_size_pow2 = head_size_qk & (head_size_qk - 1) == 0
+        if not is_head_size_pow2:
+            lora = triton.next_power_of_2(head_size_qk) // 2
+            rope_size = head_size_qk - lora
+            head_size_qk = lora
+
+    HAS_ROPE = rope_size > 0
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    block_size = v.shape[1]
+    if kv_layout == "thd":
+        assert (
+            cu_seqlens_k is not None
+        ), "cu_seqlens_k is required when kv_layout is 'thd'"
+        # emulate cache layout which the kernel expects
+        block_size = max_seqlen_k
+        k = k.unsqueeze(1)  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
+        v = v.unsqueeze(1)  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size"
+        if sage_mxfp4:
+            k_descale = k_descale.unsqueeze(
+                1
+            )  # thd into "num_blks, 1, blk_size, num_kv_heads, head_size // 32"
+        block_table_stride_0 = 0
+    elif kv_layout == "cache":
+        assert (
+            block_table is not None
+        ), "block_table is required when kv_layout is 'cache'"
+        block_size = v.shape[1]
+        block_table_stride_0 = block_table.stride(0)
+    else:
+        raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
+
+    num_kv_heads = k.shape[-2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
+
+    if sage_mxfp4:
+        (
+            query_scale_stride_0,
+            query_scale_stride_1,
+            query_scale_stride_2,
+            stride_k_cache_scale_0,
+            stride_k_cache_scale_1,
+            stride_k_cache_scale_2,
+            stride_k_cache_scale_3,
+            stride_v_cache_scale_0,
+            stride_v_cache_scale_1,
+        ) = check_mxfp4_quant_args_get_strides(
+            q,
+            q_descale,
+            k,
+            k_descale,
+            v,
+            v_descale,
+        )
+    else:
+        query_scale_stride_0 = query_scale_stride_1 = query_scale_stride_2 = 0
+        stride_k_cache_scale_0 = stride_k_cache_scale_1 = stride_k_cache_scale_2 = (
+            stride_k_cache_scale_3
+        ) = 0
+        stride_v_cache_scale_0 = stride_v_cache_scale_1 = 0
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -169,26 +435,42 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
-    # if batch contains a prefill
-    if use_2d_kernel(
-        head_size,
+    is_quantized = sage_mxfp4 or q_descale is not None
+
+    _auto_2d = use_2d_kernel(
+        head_size_qk,
         SLIDING_WINDOW,
         ALL_DECODE,
         max_seqlen_q,
         max_seqlen_k,
         target_num_prgms,
         num_2d_prgms,
-    ):
+    )
+    if force_kernel is not None:
+        _dispatch_2d = force_kernel == "2d"
+    else:
+        _dispatch_2d = _auto_2d
+
+    last_dispatch_info["kernel"] = "2D" if _dispatch_2d else "3D"
+    last_dispatch_info["auto"] = "2D" if _auto_2d else "3D"
+    last_dispatch_info["num_2d_prgms"] = num_2d_prgms
+    last_dispatch_info["target_prgms"] = target_num_prgms
+    last_dispatch_info["forced"] = force_kernel is not None
+
+    if _dispatch_2d:
         config = select_2d_config(
             block_size,
-            head_size,
+            head_size_qk,
             SLIDING_WINDOW,
             ALL_DECODE,
             max_seqlen_q,
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
+            is_quantized=is_quantized,
         )
+
+        BLOCK_M = config["BLOCK_M"]
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
@@ -207,23 +489,28 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            q_descale_ptr=q_descale,
-            k_descale_ptr=k_descale,
-            v_descale_ptr=v_descale,
-            out_scale_ptr=output_scale,
+            scale=softmax_scale if softmax_scale is not None else 1.0,
+            q_scale=q_descale,
+            k_scale=k_descale,
+            v_scale=v_descale,
+            out_scale=1 / output_scale if output_scale is not None else 1.0,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
+            block_table_stride=block_table_stride_0,
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scale_stride_0=query_scale_stride_0,
+            query_scale_stride_1=query_scale_stride_1,
+            query_scale_stride_2=query_scale_stride_2,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE=head_size_qk,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
+            HEAD_SIZE_V=head_size_v,
+            HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -237,15 +524,29 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_k_cache_scale_0=stride_k_cache_scale_0,
+            stride_k_cache_scale_1=stride_k_cache_scale_1,
+            stride_k_cache_scale_2=stride_k_cache_scale_2,
+            stride_k_cache_scale_3=stride_k_cache_scale_3,
+            stride_v_cache_scale_0=stride_v_cache_scale_0,
+            stride_v_cache_scale_1=stride_v_cache_scale_1,
             query_start_len_ptr=cu_seqlens_q,
+            key_start_len_ptr=cu_seqlens_k,
             num_seqs=num_seqs,
+            OUTPUT_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
+            SAGE_MXFP4=sage_mxfp4,
+            HAS_ROPE=HAS_ROPE,
+            ROPE_SIZE=rope_size,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
+            IS_CAUSAL=causal,
+            KV_LAYOUT_IS_THD=(kv_layout == "thd"),
             **config,
         )
 
     else:
         attn_config, reduce_config = select_3d_config(
-            head_size,
+            head_size_qk,
             block_size,
             q.element_size(),
             max_seqlen_k,
@@ -257,7 +558,7 @@ def unified_attention(
             q.shape[0],
             num_query_heads,
             NUM_SEGMENTS,
-            triton.next_power_of_2(head_size),
+            triton.next_power_of_2(head_size_v),
             dtype=torch.float32,
             device=q.device,
         )
@@ -289,19 +590,23 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
-            q_descale_ptr=q_descale,
-            k_descale_ptr=k_descale,
-            v_descale_ptr=v_descale,
+            q_scale=q_descale,
+            k_scale=k_descale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
+            block_table_stride=block_table_stride_0,
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scale_stride_0=query_scale_stride_0,
+            query_scale_stride_1=query_scale_stride_1,
+            query_scale_stride_2=query_scale_stride_2,
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE=head_size_qk,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
+            HEAD_SIZE_V=head_size_v,
+            HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -315,28 +620,45 @@ def unified_attention(
             stride_v_cache_1=v.stride(1),
             stride_v_cache_2=v.stride(2),
             stride_v_cache_3=v.stride(3),
+            stride_k_cache_scale_0=stride_k_cache_scale_0,
+            stride_k_cache_scale_1=stride_k_cache_scale_1,
+            stride_k_cache_scale_2=stride_k_cache_scale_2,
+            stride_k_cache_scale_3=stride_k_cache_scale_3,
             query_start_len_ptr=cu_seqlens_q,
+            key_start_len_ptr=cu_seqlens_k,
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SAGE_MXFP4=sage_mxfp4,
+            HAS_ROPE=HAS_ROPE,
+            ROPE_SIZE=rope_size,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
+            IS_CAUSAL=causal,
+            KV_LAYOUT_IS_THD=(kv_layout == "thd"),
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
+            v_scale=v_descale,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
-            out_scale_ptr=output_scale,
+            num_queries_per_kv=num_queries_per_kv,
+            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
-            block_table_stride=block_table.stride(0),
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            stride_v_cache_scale_0=stride_v_cache_scale_0,
+            stride_v_cache_scale_1=stride_v_cache_scale_1,
+            block_table_stride=block_table_stride_0,
+            HEAD_SIZE=head_size_v,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_v),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
+            OUTPUT_FP8=output_scale is not None,
+            SAGE_MXFP4=sage_mxfp4,
             **reduce_config,
         )
