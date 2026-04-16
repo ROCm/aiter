@@ -62,16 +62,22 @@ jobs:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
 
-      - name: Clone sglang repo
+      - name: Prepare sglang workspace
         run: |
-          git clone --depth 1 -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
+          set -ex
+          SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-downstream"
+          rm -rf "${SGLANG_WORKSPACE}"
+          git clone --depth 1 -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git "${SGLANG_WORKSPACE}"
+          test -d "${SGLANG_WORKSPACE}/sgl-kernel"
+          test -d "${SGLANG_WORKSPACE}/python"
+          echo "SGLANG_WORKSPACE=${SGLANG_WORKSPACE}" >> "${GITHUB_ENV}"
 
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
       - name: Patch sglang CI scripts for aiter runners
         run: |
-          cd sglang
+          cd "${SGLANG_WORKSPACE}"
           python3 - <<'PY'
           from pathlib import Path
 
@@ -148,11 +154,9 @@ jobs:
         run: |
           set -ex
           docker rm -f ci_sglang || true
-          cd sglang
-          bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${SGL_IMAGE}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}/sglang
-          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          cd "${SGLANG_WORKSPACE}"
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${SGL_IMAGE}"
+          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python'
 
       - name: Setup pip config
         run: |
@@ -161,7 +165,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          cd sglang
+          cd "${SGLANG_WORKSPACE}"
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
 
       - name: Install aiter under test
@@ -185,7 +189,7 @@ jobs:
         timeout-minutes: 120
         run: |
           set -ex
-          cd sglang
+          cd "${SGLANG_WORKSPACE}"
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" python3 -c 'import os; print({k: os.environ.get(k) for k in ("GPU_ARCHS", "SGLANG_USE_AITER")})'
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER=0 python3 registered/eval/test_eval_accuracy_large.py
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/quant/test_eval_fp8_accuracy.py
@@ -194,5 +198,5 @@ jobs:
       - name: Clean Up
         if: always()
         run: |
-          docker exec -u root ci_sglang bash -c "rm -rf /sglang-checkout/sgl-kernel /sglang-checkout/python" || true
           docker rm -f ci_sglang || true
+          rm -rf "${SGLANG_WORKSPACE}" || true
