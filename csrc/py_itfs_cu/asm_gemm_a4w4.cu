@@ -211,12 +211,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                    std::hash<int>()(log2) ^ std::hash<int>()(shuffle);
         }
     };
-    static std::unordered_map<DictKey, std::tuple<std::string, int>, SimpleHash>
+    static SynchronizedCache<DictKey, std::tuple<std::string, int>, SimpleHash>
         heuristic_kernel_dict;
 
     AITER_CHECK(!config_map->empty(), __func__, " no kernel support a4w4 for this gpu arch");
 
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     std::string arch_id = get_gpu_arch();
     std::string kname   = (kernelName && kernelName[0] != 0) ? (arch_id + kernelName) : "";
@@ -224,23 +224,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int selectedksplit = (log2_k_split >= 0) ? log2_k_split : 0;
     if(kname.empty())
     {
-        auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle));
-        if(it != heuristic_kernel_dict.end())
-        {
-            auto res       = it->second;
-            kname          = std::get<0>(res);
-            selectedksplit = std::get<1>(res);
-        }
-        else
-        {
-            auto it = get_heuristic_kernel(
-                Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
-
-            kname          = std::get<0>(it);
-            selectedksplit = std::get<1>(it);
-            heuristic_kernel_dict[{Mdim, Ndim, Kdim, log2_k_split, bpreshuffle}] =
-                std::make_tuple(kname, selectedksplit);
-        }
+        std::tie(kname, selectedksplit) = heuristic_kernel_dict.get_or_create(
+            DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle), [&]() {
+                return get_heuristic_kernel(
+                    Mdim, Ndim, Kdim, arch_id, log2_k_split, bpreshuffle, config_map);
+            });
     }
 
     AiterAsmKernel* impl_ptr = nullptr;
@@ -269,12 +257,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
         }
 
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
-        {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
-        impl_ptr = result.first->second.get();
+        impl_ptr =
+            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel " + kname);

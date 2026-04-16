@@ -47,7 +47,7 @@ def test_fmoe(
     doweight_stage1=False,
     hidden_pad=0,
     intermediate_pad=0,
-    preshuffle=False,
+    preshuffle=True,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -391,7 +391,7 @@ parser.add_argument(
     "--preshuffle",
     type=dtypes.str2bool,
     nargs="*",
-    default=[False, True],
+    default=[True],
     help="""Whether to use pre-shuffle weight mode. Default is [False, True].
     -p f    # False.
     -p t    # True.""",

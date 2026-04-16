@@ -9,6 +9,14 @@ from aiter import dtypes
 from aiter import logger
 
 
+def _is_mapping_error(exc: BaseException) -> bool:
+    return isinstance(exc, KeyError)
+
+
+def _is_accelerator_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "AcceleratorError"
+
+
 def worker(
     gpu_id,
     info,
@@ -36,7 +44,7 @@ def worker(
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
 
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
             us = -1  # not support or error
             max_err_ratio = 1.0
@@ -50,6 +58,8 @@ def worker(
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
         torch.cuda.synchronize()
+        if us == -1 or res is None:
+            return info, us, round(max_err_ratio, 4)
         if ref is not None:
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
@@ -448,14 +458,13 @@ def mp_tuner(
             except Exception as e:
                 # Check if it's a process crash (segfault, memory fault, etc.)
                 error_type = type(e).__name__
-
-                # Special handling for KeyError (PID mapping issue)
-                is_mapping_error = error_type == "KeyError"
+                is_mapping_error = _is_mapping_error(e)
+                is_accelerator_error = _is_accelerator_error(e)
                 # not restart as this is not root use
                 if is_mapping_error:
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
-                elif error_type == "AcceleratorError":
+                elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
                     # more tasks on the same bad GPU. Break immediately to trigger restart and
