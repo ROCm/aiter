@@ -130,7 +130,7 @@ _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_gemm_mxfp4_preshuffle_gfx1250_repr)
+@gluon.jit(repr=_gemm_mxfp4_preshuffle_gfx1250_repr, loop_carried_load_percent=0)
 def gemm_mxfp4_preshuffle_gfx1250(
     a_fp4_ptr,
     b_preshuf_ptr,
@@ -395,6 +395,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
     # --- 5. Final WMMA ---
     acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
+
+    if NUM_BUFFERS > 2:
+        gl.amd.sched_barrier(0)
 
     # =====================================================================
     # Store output
