@@ -10,10 +10,6 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
-from aiter.ops.triton.attention.mha_v3 import (
-    flash_attn_fp8_func,
-    flash_attn_varlen_fp8_func,
-)
 from aiter.test_mha_common import (
     attention_ref,
     generate_random_padding_mask,
@@ -22,91 +18,12 @@ from aiter.test_mha_common import (
 from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 
 arch = get_arch()
-_supports_fp8 = arch in FP8_ARCHS
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
-
-
-def _attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
-    """Run attention reference and compute adaptive tolerances.
-
-    Follows the upstream flash attention tolerance pattern
-    (see tests/test_flash_attn.py in Dao-AILab/flash-attention). Runs two
-    PyTorch references (upcast and non-upcast) and uses the gap between them as
-    a baseline for tolerance.
-
-    Returns (out, (dq, dk, dv), fwd_tol, [dq_tol, dk_tol, dv_tol])
-    where each tol is (atol, rtol).
-    """
-    has_dropout = kwargs.get("dropout_p", 0.0) > 0.0
-
-    def _run_ref(upcast, reorder_ops=False):
-        q_ = q.detach().clone().requires_grad_(True)
-        k_ = k.detach().clone().requires_grad_(True)
-        v_ = v.detach().clone().requires_grad_(True)
-        with torch.enable_grad():
-            out, _, _ = attention_ref(
-                q_, k_, v_, upcast=upcast, reorder_ops=reorder_ops, **kwargs
-            )
-        dq, dk, dv = torch.autograd.grad(out, (q_, k_, v_), do)
-        return out, dq, dk, dv
-
-    def _tol(ref_val, pt_val, is_forward=False):
-        baseline = (pt_val - ref_val).abs().max().item()
-        if is_fp8:
-            mult = 4
-            atol_floor = 3e-1 if is_forward else 1.0
-            rtol_floor = 1e-1
-        elif has_dropout:
-            # Dropout scaling (1/(1-p)) amplifies precision errors in the
-            # fused kernel differently than in the reference. The baseline
-            # between two references uses the same mask so it underestimates
-            # the kernel-vs-reference gap.
-            mult = 2
-            atol_floor = 1e-1 if is_forward else 2.0
-            rtol_floor = 1e-1
-        else:
-            mult = 2
-            atol_floor = 1e-2 if is_forward else 1.5e-2
-            rtol_floor = 1e-5
-        atol = max(mult * baseline, atol_floor)
-        return atol, rtol_floor
-
-    out, dq, dk, dv = _run_ref(upcast=True)
-    out_pt, dq_pt, dk_pt, dv_pt = _run_ref(upcast=False, reorder_ops=True)
-
-    fwd_tol = _tol(out, out_pt, is_forward=True)
-    bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
-
-    return out, (dq, dk, dv), fwd_tol, bwd_tols
-
-
-def assert_cosine_similarity(actual, expected, threshold=0.96, norm_floor=1e-3):
-    """Assert that two tensors have high cosine similarity."""
-    a = actual.float().flatten()
-    b = expected.float().flatten()
-    # NOTE: cosine similarity is unstable for near-zero tensors
-    if b.norm().item() > norm_floor:
-        cos_sim = torch.nn.functional.cosine_similarity(
-            a.unsqueeze(0), b.unsqueeze(0)
-        ).item()
-        assert cos_sim >= threshold, f"Cosine similarity {cos_sim:.6f} < {threshold}"
-
-
-def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
-    """FP8 quality check: max absolute error + cosine similarity."""
-    a = tensor_a.float().flatten()
-    b = tensor_b.float().flatten()
-
-    max_abs = (a - b).abs().max().item()
-    assert max_abs <= atol, f"Max absolute error {max_abs:.4f} > {atol}"
-
-    assert_cosine_similarity(tensor_a, tensor_b, cos_sim_threshold)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -122,7 +39,6 @@ def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True), (False)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -134,7 +50,6 @@ def test_mha(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    FP8: bool,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
@@ -143,30 +58,15 @@ def test_mha(
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
 
     dropout_mask = None
-    if FP8:
-        if not _supports_fp8:
-            pytest.skip(f"FP8 not supported on {arch}")
-        if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
-            pytest.skip(
-                "FP8 mode does not support dropout_p, return_lse, or return_attn_probs"
-            )
-
-        triton_out = flash_attn_fp8_func(
-            q,
-            k,
-            v,
-            causal=CAUSAL,
-        )
-    else:
-        triton_out = flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
+    triton_out = flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     if RETURN_LSE:
         assert len(triton_out) > 1
@@ -203,10 +103,7 @@ def test_mha(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    if FP8:
-        fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
-    else:
-        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 # LLaMA 3 405B config
@@ -322,7 +219,6 @@ def test_mha_int64_strides(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(False), (True)])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -334,7 +230,6 @@ def test_mha_varlen(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    FP8: bool,
     dtype=torch.float16,
 ):
     torch.set_printoptions(threshold=10000)
@@ -383,38 +278,19 @@ def test_mha_varlen(
         print(f"max_seqlens_k={max_seqlen_k }")
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
-    if FP8:
-        if not _supports_fp8:
-            pytest.skip(f"FP8 not supported on {arch}")
-        if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
-            pytest.skip(
-                "FP8 varlen mode does not support dropout_p, return_lse, or return_attn_probs"
-            )
-
-        triton_out = flash_attn_varlen_fp8_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            causal=CAUSAL,
-        )
-    else:
-        triton_out = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
+    triton_out = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     if RETURN_LSE:
         assert len(triton_out) > 1
@@ -472,12 +348,9 @@ def test_mha_varlen(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    if FP8:
-        fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
-    else:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
-        )
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
+    )
 
 
 # Production shapes based on real models:
@@ -493,7 +366,6 @@ def test_mha_varlen(
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("FUSED", [False, True])
-@pytest.mark.parametrize("FP8", [True, False])
 def test_mha_backward(
     BATCH: int,
     SEQLEN_Q: int,
@@ -504,19 +376,14 @@ def test_mha_backward(
     CAUSAL: bool,
     DROPOUT: float,
     FUSED: bool,
-    FP8: bool,
     dtype=torch.float16,
 ):
     HAS_DROPOUT = DROPOUT > 0.0
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
-    if FP8 and not _supports_fp8:
-        pytest.skip(f"FP8 not supported on {arch}")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
-    if FP8 and HAS_DROPOUT:
-        pytest.skip("FP8 does not support dropout")
     if CAUSAL and HAS_DROPOUT:
         pytest.skip("CAUSAL+DROPOUT backward results in NaNs")
 
@@ -531,49 +398,48 @@ def test_mha_backward(
 
     # Triton forward + backward
     with torch.enable_grad():
-        if FP8:
-            triton_out = flash_attn_fp8_func(q, k, v, causal=CAUSAL)
-            dropout_mask = None
+        triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=DROPOUT,
+            causal=CAUSAL,
+            return_lse=HAS_DROPOUT,
+            return_attn_probs=HAS_DROPOUT,
+        )
+        if HAS_DROPOUT:
+            dropout_mask = triton_out[2] >= 0
+            triton_out = triton_out[0]
         else:
-            triton_out = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=DROPOUT,
-                causal=CAUSAL,
-                return_lse=HAS_DROPOUT,
-                return_attn_probs=HAS_DROPOUT,
-            )
-            if HAS_DROPOUT:
-                dropout_mask = triton_out[2] >= 0
-                triton_out = triton_out[0]
-            else:
-                dropout_mask = None
+            dropout_mask = None
     triton_dq, triton_dk, triton_dv = torch.autograd.grad(
         triton_out, (q, k, v), do.clone()
     )
 
-    # Reference forward + backward with adaptive tolerances
-    torch_out, torch_grads, fwd_tol, bwd_tols = _attention_ref_with_tol(
-        q,
-        k,
-        v,
-        do,
-        is_fp8=FP8,
-        dropout_p=DROPOUT,
-        dropout_mask=dropout_mask,
-        causal=CAUSAL,
+    # Reference forward + backward
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    with torch.enable_grad():
+        torch_out, _, _ = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            dropout_p=DROPOUT,
+            dropout_mask=dropout_mask,
+            causal=CAUSAL,
+        )
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        torch_out, (q_ref, k_ref, v_ref), do.clone()
     )
-    torch_dq, torch_dk, torch_dv = torch_grads
 
     # Check quality
-    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
-    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
-    tols = [fwd_tol] + bwd_tols
-    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
-        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
-        if FP8:
-            assert_cosine_similarity(tri, ref)
+    bwd_atol = 1e-1 if HAS_DROPOUT else 1.5e-2
+    bwd_rtol = 1e-1 if HAS_DROPOUT else 1e-5
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(triton_dq, torch_dq, atol=bwd_atol, rtol=bwd_rtol)
+    torch.testing.assert_close(triton_dk, torch_dk, atol=bwd_atol, rtol=bwd_rtol)
+    torch.testing.assert_close(triton_dv, torch_dv, atol=bwd_atol, rtol=bwd_rtol)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4])
@@ -585,7 +451,6 @@ def test_mha_backward(
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("FUSED", [False, True])
-@pytest.mark.parametrize("FP8", [True, False])
 def test_mha_backward_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -596,19 +461,14 @@ def test_mha_backward_varlen(
     CAUSAL: bool,
     DROPOUT: float,
     FUSED: bool,
-    FP8: bool,
     dtype=torch.float16,
 ):
     HAS_DROPOUT = DROPOUT > 0.0
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
-    if FP8 and not _supports_fp8:
-        pytest.skip(f"FP8 not supported on {arch}")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
-    if FP8 and HAS_DROPOUT:
-        pytest.skip("FP8 does not support dropout")
     if CAUSAL and HAS_DROPOUT:
         pytest.skip("CAUSAL+DROPOUT backward results in NaNs")
 
@@ -649,49 +509,36 @@ def test_mha_backward_varlen(
 
     # Triton varlen forward + backward
     with torch.enable_grad():
-        if FP8:
-            triton_out = flash_attn_varlen_fp8_func(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                causal=CAUSAL,
-            )
-            dropout_mask = None
-        else:
-            triton_out = flash_attn_varlen_func(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p=DROPOUT,
-                causal=CAUSAL,
-                return_lse=HAS_DROPOUT,
-                return_attn_probs=HAS_DROPOUT,
-            )
-            if HAS_DROPOUT:
-                dropout_mask = (
-                    pad_rearrange_dropout_mask(
-                        triton_out[2] >= 0,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        SEQLEN_Q,
-                        SEQLEN_K,
-                        NUM_Q_HEADS,
-                    )
-                    > 0
+        triton_out = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=DROPOUT,
+            causal=CAUSAL,
+            return_lse=HAS_DROPOUT,
+            return_attn_probs=HAS_DROPOUT,
+        )
+        if HAS_DROPOUT:
+            dropout_mask = (
+                pad_rearrange_dropout_mask(
+                    triton_out[2] >= 0,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    SEQLEN_Q,
+                    SEQLEN_K,
+                    NUM_Q_HEADS,
                 )
-                triton_out = triton_out[0]
-            else:
-                dropout_mask = None
+                > 0
+            )
+            triton_out = triton_out[0]
+        else:
+            dropout_mask = None
     triton_out = output_pad_fn(triton_out)
     triton_dq, triton_dk, triton_dv = torch.autograd.grad(
         triton_out, (q_unpad, k_unpad, v_unpad), do.clone()
@@ -700,29 +547,32 @@ def test_mha_backward_varlen(
     triton_dk = dk_pad_fn(triton_dk)
     triton_dv = dk_pad_fn(triton_dv)
 
-    # Reference forward + backward with adaptive tolerances
-    torch_out, torch_grads, fwd_tol, bwd_tols = _attention_ref_with_tol(
-        q,
-        k,
-        v,
-        do,
-        is_fp8=FP8,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-        dropout_p=DROPOUT,
-        dropout_mask=dropout_mask,
-        causal=CAUSAL,
+    # Reference forward + backward
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    with torch.enable_grad():
+        torch_out, _, _ = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            dropout_p=DROPOUT,
+            dropout_mask=dropout_mask,
+            causal=CAUSAL,
+        )
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        torch_out, (q_ref, k_ref, v_ref), do.clone()
     )
-    torch_dq, torch_dk, torch_dv = torch_grads
 
     # Check quality
-    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
-    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
-    tols = [fwd_tol] + bwd_tols
-    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
-        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
-        if FP8:
-            assert_cosine_similarity(tri, ref)
+    bwd_atol = 1e-1 if HAS_DROPOUT else 1.5e-2
+    bwd_rtol = 1e-1 if HAS_DROPOUT else 1e-5
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(triton_dq, torch_dq, atol=bwd_atol, rtol=bwd_rtol)
+    torch.testing.assert_close(triton_dk, torch_dk, atol=bwd_atol, rtol=bwd_rtol)
+    torch.testing.assert_close(triton_dv, torch_dv, atol=bwd_atol, rtol=bwd_rtol)
 
 
 # Run PE tests with:

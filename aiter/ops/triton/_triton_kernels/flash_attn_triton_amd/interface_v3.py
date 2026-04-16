@@ -290,6 +290,7 @@ def fwd(
             rotary_sin=rotary_sin,
             rotary_interleaved=rotary_interleaved,
             seqlens_rotary=seqlens_rotary,
+            max_seqlen_k=max_seqlen_k,
         )
     else:
         if DEBUG:

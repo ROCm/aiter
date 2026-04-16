@@ -400,6 +400,7 @@ def flash_attn_with_kvcache_fake_tensor(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     return_softmax_lse: bool = False,
     page_table: Optional[torch.Tensor] = None,
     kv_batch_idx: Optional[torch.Tensor] = None,
@@ -474,6 +475,7 @@ def _flash_attn_with_kvcache(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     return_softmax_lse: bool = False,
     page_table: Optional[torch.Tensor] = None,
     kv_batch_idx: Optional[torch.Tensor] = None,
@@ -499,7 +501,7 @@ def _flash_attn_with_kvcache(
         None,  # seqused_q
         cache_seqlens,  # seqused_k
         max_seqlen_q,
-        None,  # max_seqlen_k
+        max_seqlen_k,
         page_table,
         kv_batch_idx,
         leftpad_k,
@@ -544,6 +546,7 @@ def flash_attn_with_kvcache(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     return_softmax_lse: bool = False,
     page_table: Optional[torch.Tensor] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
@@ -627,6 +630,7 @@ def flash_attn_with_kvcache(
         k_descale,
         v_descale,
         max_seqlen_q,
+        max_seqlen_k,
         return_softmax_lse,
         page_table,
         kv_batch_idx,
@@ -1155,11 +1159,9 @@ class _FlashAttnVarlenFP8Wrapper(torch.autograd.Function):
         sm_margin: int,
     ):
         # Determine heads and head_dim from input shapes
-        total_q = q.shape[0]
         num_q_heads = q.shape[1]
         head_dim = q.shape[2]
 
-        total_k = k.shape[0]
         num_kv_heads = k.shape[1]
 
         # Quantize inputs to FP8 using _quantize_thd for varlen tensors
