@@ -814,7 +814,7 @@ class FmoeTuner(TunerCommon):
             blockM,
             device,
         )
-        if q_dtype_w == torch.int4:
+        if q_dtype_w == torch.int4 and q_type != QuantType.per_1x32:
             w1_qt_shffle_ck = rearrange_4bit_elements(
                 convert_int8_to_uint32_int4(
                     shuffle_weight(w1_qt, (16, 16), use_int4=True)
@@ -868,7 +868,7 @@ class FmoeTuner(TunerCommon):
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
-            if q_type == QuantType.per_1x32:
+            if q_type == QuantType.per_1x32 and q_dtype_w != dtypes.i4x2:
                 a1_scale_fp4_sort = moe_mxfp4_sort(
                     a1_scale,  # a1_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
@@ -1083,6 +1083,10 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fq=False,
     ):
+        # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
+        if quant_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8 and w1_scale is not None and w1_scale.dtype == dtypes.bf16:
+            w1_qt = w1_qt.view(dtypes.i4x2)
+            w2_qt = w2_qt.view(dtypes.i4x2)
         ref1 = torch_moe_stage1(
             a1_qt,
             w1_qt,
@@ -1122,6 +1126,10 @@ class FmoeTuner(TunerCommon):
         quant_type,
         doweight_stage1,
     ):
+        # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
+        if quant_type == QuantType.per_1x32 and w2_qt.dtype == dtypes.i8 and w2_scale is not None and w2_scale.dtype == dtypes.bf16:
+            w1_qt = w1_qt.view(dtypes.i4x2)
+            w2_qt = w2_qt.view(dtypes.i4x2)
         return torch_moe_stage2(
             a2_qt,
             w1_qt,
@@ -2403,7 +2411,20 @@ class FmoeTuner(TunerCommon):
                 w2_qt_fmoe = w2_qt
                 w1_scale_fmoe = w1_scale
                 w2_scale_fmoe = w2_scale
-                if q_dtype_w == torch.int4:
+                if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+                    w1_qt_fmoe = pack_int8_to_packed_int4(
+                        shuffle_weight(w1_qt_fmoe, (16, 16))
+                    ).view(w1.shape[0], w1.shape[1], w1.shape[2] // 2).view(dtypes.i4x2)
+                    w2_qt_fmoe = pack_int8_to_packed_int4(
+                        shuffle_weight(w2_qt_fmoe, (16, 16))
+                    ).view(w2.shape[0], w2.shape[1], w2.shape[2] // 2).view(dtypes.i4x2)
+                    w1_scale_fmoe = shuffle_scale_for_int4(
+                        w1_scale, group_size=32
+                    ).view(-1).contiguous()
+                    w2_scale_fmoe = shuffle_scale_for_int4(
+                        w2_scale, group_size=32
+                    ).view(-1).contiguous()
+                elif q_dtype_w == torch.int4:
                     w1_qt_fmoe = rearrange_4bit_elements(
                         convert_int8_to_uint32_int4(
                             shuffle_weight(w1_qt_fmoe, (16, 16), use_int4=True)
@@ -2424,19 +2445,6 @@ class FmoeTuner(TunerCommon):
                         if w2_scale is not None
                         else None
                     )
-                elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                    w1_qt_fmoe = pack_int8_to_packed_int4(
-                        shuffle_weight(w1_qt_fmoe, (16, 16))
-                    ).view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
-                    w2_qt_fmoe = pack_int8_to_packed_int4(
-                        shuffle_weight(w2_qt_fmoe, (16, 16))
-                    ).view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-                    w1_scale_fmoe = shuffle_scale_for_int4(
-                        w1_scale, group_size=32
-                    ).view(-1).contiguous()
-                    w2_scale_fmoe = shuffle_scale_for_int4(
-                        w2_scale, group_size=32
-                    ).view(-1).contiguous()
                 elif (
                     q_type == QuantType.per_1x32
                     and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
@@ -2887,7 +2895,7 @@ class FmoeTuner(TunerCommon):
                 failedf = pd.DataFrame(ret, columns=self.columns)
                 self.failed = pd.concat([self.failed, failedf], axis=0)
                 continue
-            if q_type == QuantType.per_1x32:
+            if q_type == QuantType.per_1x32 and q_dtype_w != dtypes.i4x2:
                 from aiter.test_common import run_perftest
                 from aiter.ops.triton.quant.fused_mxfp4_quant import (
                     fused_dynamic_mxfp4_quant_moe_sort,

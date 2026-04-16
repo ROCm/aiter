@@ -827,6 +827,8 @@ def flydsl_moe_stage2(
         out = alloc_fn(
             (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
         )
+    elif accumulate:
+        out.fill_(0)
 
     dev = inter_states.device
     flat_a_scale = (
