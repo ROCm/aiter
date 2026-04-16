@@ -80,7 +80,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                 )
                 ref = run_torch(x, weight)
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = "ok" if err_ratio <= args.errRatio else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(

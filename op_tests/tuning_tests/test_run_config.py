@@ -99,6 +99,81 @@ def _run_config(script, config_csv, timeout=600, extra_args=None):
         ) from None
 
 
+def _parse_benchmark_results(lines):
+    """Parse benchmark output lines. Returns (errors, mismatches, ok_count, skip_count).
+    ERROR/MISMATCH entries include the reason from the following line if present."""
+    error_shapes = []
+    mismatch_shapes = []
+    ok_count = 0
+    skip_count = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if "| " not in stripped:
+            continue
+        reason = ""
+        for j in range(i + 1, min(i + 4, len(lines))):
+            if lines[j].strip().startswith("reason:"):
+                reason = " | " + lines[j].strip()
+                break
+        if stripped.endswith("ERROR"):
+            error_shapes.append(stripped + reason)
+        elif stripped.endswith("MISMATCH"):
+            mismatch_shapes.append(stripped + reason)
+        elif stripped.endswith("OK"):
+            ok_count += 1
+        elif stripped.endswith("SKIP"):
+            skip_count += 1
+    return error_shapes, mismatch_shapes, ok_count, skip_count
+
+
+def _extract_repro_and_reasons(lines):
+    """Extract Repro CSV block from tuner output."""
+    parts = []
+    repro = []
+    in_repro = False
+    for line in lines:
+        if "Repro CSV" in line:
+            in_repro = True
+        if in_repro:
+            repro.append(line)
+    if repro:
+        parts.append("\n" + "\n".join(repro))
+    return "\n".join(parts)
+
+
+REPORT_DIR = "/tmp/tuning_test_reports"
+
+
+def _format_failures(name, error_shapes, mismatch_shapes, skip_count=0, output_lines=None):
+    """Write detailed report to file, return short summary for AssertionError."""
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    report_file = os.path.join(REPORT_DIR, f"{name}_run_config_report.txt")
+
+    with open(report_file, "w") as f:
+        f.write(f"=== {name} run_config report ===\n\n")
+        if error_shapes:
+            f.write(f"Errors ({len(error_shapes)} shapes):\n")
+            f.write("\n".join(error_shapes) + "\n\n")
+        if mismatch_shapes:
+            f.write(f"Accuracy mismatches ({len(mismatch_shapes)} shapes):\n")
+            f.write("\n".join(mismatch_shapes) + "\n\n")
+        if output_lines:
+            repro = _extract_repro_and_reasons(output_lines)
+            if repro:
+                f.write(repro + "\n")
+
+    parts = []
+    if error_shapes:
+        parts.append(f"Errors: {len(error_shapes)} shapes")
+    if mismatch_shapes:
+        parts.append(f"Mismatches: {len(mismatch_shapes)} shapes")
+    if skip_count > 0:
+        parts.append(f"Skipped: {skip_count} shapes")
+    if error_shapes or mismatch_shapes:
+        parts.append(f"\nFull report: {report_file}")
+    return parts
+
+
 TUNER_FAMILIES = {
     "a8w8": {
         "script": "csrc/ck_gemm_a8w8/gemm_a8w8_tune.py",
@@ -182,35 +257,16 @@ class TestRunConfig(unittest.TestCase):
             result.returncode, 0, f"{name} run_config failed (csvs={csv_names})"
         )
 
-        # Parse benchmark result lines from the table output.
-        # Status column shows: OK, ERROR, MISMATCH
         lines = output.split("\n")
-        error_shapes = []
-        mismatch_shapes = []
-        for line in lines:
-            stripped = line.strip()
-            if "| " not in stripped:
-                continue
-            if stripped.endswith("ERROR"):
-                error_shapes.append(stripped)
-            elif stripped.endswith("MISMATCH"):
-                mismatch_shapes.append(stripped)
+        error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(lines)
 
-        failures = []
-        if error_shapes:
-            failures.append(
-                f"Errors ({len(error_shapes)} shapes):\n" + "\n".join(error_shapes[:20])
-            )
-        if mismatch_shapes:
-            failures.append(
-                f"Accuracy mismatches ({len(mismatch_shapes)} shapes):\n"
-                + "\n".join(mismatch_shapes[:20])
-            )
-
+        failures = _format_failures(name, error_shapes, mismatch_shapes, skip_count, lines)
         self.assertEqual(
             len(failures),
             0,
-            f"{name} run_config issues (csvs={csv_names}):\n" + "\n".join(failures),
+            f"{name} run_config: {ok_count} OK, {skip_count} SKIP, "
+            f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH\n"
+            + "\n".join(failures),
         )
 
     def test_a8w8(self):
@@ -292,30 +348,14 @@ class TestRunConfigCustom(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"{family} run_config failed")
 
         lines = output.split("\n")
-        error_shapes = []
-        mismatch_shapes = []
-        for line in lines:
-            stripped = line.strip()
-            if "| " not in stripped:
-                continue
-            if stripped.endswith("ERROR"):
-                error_shapes.append(stripped)
-            elif stripped.endswith("MISMATCH"):
-                mismatch_shapes.append(stripped)
+        error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(lines)
 
-        failures = []
-        if error_shapes:
-            failures.append(
-                f"Errors ({len(error_shapes)} shapes):\n" + "\n".join(error_shapes[:20])
-            )
-        if mismatch_shapes:
-            failures.append(
-                f"Accuracy mismatches ({len(mismatch_shapes)} shapes):\n"
-                + "\n".join(mismatch_shapes[:20])
-            )
-
+        failures = _format_failures(family, error_shapes, mismatch_shapes, skip_count, lines)
         self.assertEqual(
-            len(failures), 0, f"{family} run_config issues:\n" + "\n".join(failures)
+            len(failures), 0,
+            f"{family} run_config: {ok_count} OK, {skip_count} SKIP, "
+            f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH\n"
+            + "\n".join(failures)
         )
 
 

@@ -2150,7 +2150,12 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
-            shape_str = f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk})"
+            shape_str = (
+                f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
+                f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
+                f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
+                f"dw_s1={doweight_stage1})"
+            )
             kernel_us = None
             if "us" in row and pd.notna(row["us"]):
                 try:
@@ -2302,8 +2307,15 @@ class FmoeTuner(TunerCommon):
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
                 )
-                err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                    status = "error:output is all zeros (kernel produced no output)"
+                    err_ratio = 1.0
+                else:
+                    err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                    if err_ratio <= args.errRatio:
+                        status = "ok"
+                    else:
+                        status = f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
                 results.append(
                     {
                         "shape": shape_str,
@@ -2321,6 +2333,8 @@ class FmoeTuner(TunerCommon):
                         "status": f"error:{e}",
                     }
                 )
+            finally:
+                torch.cuda.empty_cache()
         return results
 
     def tune(
