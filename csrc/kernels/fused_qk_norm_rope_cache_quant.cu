@@ -1704,7 +1704,7 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                                                          x,
                                                          rotary_dim);
             }
-            else 
+            else
             {
                 if(kv_cache_dtype == AITER_DTYPE_fp8_e4m3fnuz)
                 {
@@ -1749,8 +1749,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(const aiter_tensor_t& qkv,
                 {
                     mrope_utils::fp8e4m3fn* k_out_fp8_ptr =
                         (return_kv && k_out.has_value())
-                        ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(k_out.value().data_ptr())
-                        : nullptr;
+                            ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(k_out.value().data_ptr())
+                            : nullptr;
                     mrope_utils::fp8e4m3fn* v_out_fp8_ptr =
                         (return_kv && v_out.has_value())
                             ? reinterpret_cast<mrope_utils::fp8e4m3fn*>(v_out.value().data_ptr())
