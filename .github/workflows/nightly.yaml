@@ -2,7 +2,6 @@ name: Nightly Build
 
 on:
   schedule:
-    # Run daily at 3 AM UTC
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
@@ -26,16 +25,35 @@ on:
         description: 'Skip promote job (build + test only)'
         type: boolean
         default: false
+      # ── Integration test suite selection ──
+      run_sglang:
+        description: 'Run SGLang integration tests'
+        type: boolean
+        default: false
+      run_vllm:
+        description: 'Run vLLM integration tests'
+        type: boolean
+        default: false
+      run_atom:
+        description: 'Run ATOM integration tests'
+        type: boolean
+        default: false
+      sglang_job_filter:
+        description: 'SGLang scout filter (nightly-amd, pr-test-amd, etc.)'
+        type: string
+        required: false
+        default: 'all'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  # ── Stage 1: Build wheels ────────────────────────────────────────────
   build:
     uses: ./.github/workflows/aiter-release.yaml
     with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'nightlies' || 'devreleases' }}
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
       docker_image_py310: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1' }}
       docker_image_py312: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
       build_py310: ${{ github.event.inputs.python_version == '' || github.event.inputs.python_version == '3.10' }}
@@ -48,25 +66,181 @@ jobs:
       contents: read
       actions: read
 
+  # ── Stage 2: Wheel smoke tests ──────────────────────────────────────
   test:
     needs: build
     if: ${{ !(github.event.inputs.skip_tests || false) }}
     uses: ./.github/workflows/test-whl.yaml
     with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'nightlies' || 'devreleases' }}
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
       wheel_names: ${{ needs.build.outputs.wheel_names }}
     permissions:
       contents: read
       actions: read
 
-  promote:
+  # ── Stage 3: Integration tests (opt-in via workflow_dispatch) ───────
+  sglang:
+    name: "SGLang Scout"
     needs: [build, test]
+    if: ${{ github.event.inputs.run_sglang == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run SGLang Scout
+        env:
+          GH_TOKEN: ${{ secrets.SGLANG_PAT }}
+        run: |
+          bash .github/scripts/run_sglang.sh \
+            "${{ github.sha }}" \
+            "${{ github.event.inputs.sglang_job_filter || 'all' }}"
+
+  vllm:
+    name: "vLLM (${{ matrix.label }}, ${{ matrix.model_name }}, ${{ matrix.kv }})"
+    needs: [build, test]
+    if: ${{ github.event.inputs.run_vllm == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── MI325X 1-GPU (gfx942) ──
+          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
+            model_name: Mistral-7B
+            kv: default
+            tp: 1
+            runner: aiter-1gpu-runner
+            label: MI325-1gpu
+          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
+            model_name: Mistral-7B
+            kv: fp8
+            tp: 1
+            runner: aiter-1gpu-runner
+            label: MI325-1gpu
+          # ── MI325X 8-GPU (gfx942) ──
+          - model: 'mistralai/Mixtral-8x7B-Instruct-v0.1'
+            model_name: Mixtral-8x7B
+            kv: default
+            tp: 8
+            runner: aiter-8gpu-runner
+            label: MI325-8gpu
+          - model: 'mistralai/Mixtral-8x7B-Instruct-v0.1'
+            model_name: Mixtral-8x7B
+            kv: fp8
+            tp: 8
+            runner: aiter-8gpu-runner
+            label: MI325-8gpu
+          - model: 'deepseek-ai/DeepSeek-R1'
+            model_name: DeepSeek-R1
+            kv: default
+            tp: 8
+            runner: aiter-8gpu-runner
+            label: MI325-8gpu
+          # ── MI35X 1-GPU (gfx950) ──
+          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
+            model_name: Mistral-7B
+            kv: default
+            tp: 1
+            runner: linux-aiter-mi35x-1
+            label: MI35X-1gpu
+          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
+            model_name: Mistral-7B
+            kv: fp8
+            tp: 1
+            runner: linux-aiter-mi35x-1
+            label: MI35X-1gpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run vLLM benchmark
+        timeout-minutes: 45
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+        run: |
+          bash .github/scripts/run_vllm.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.model }}" \
+            "${{ matrix.tp }}" \
+            "${{ matrix.kv }}"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-${{ matrix.label }}-${{ matrix.model_name }}-${{ matrix.kv }}
+          path: vllm_nightly_*.log
+
+  atom:
+    name: "ATOM (${{ matrix.label }}, ${{ matrix.model_name }})"
+    needs: [build, test]
+    if: ${{ github.event.inputs.run_atom == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── MI325X 8-GPU (gfx942) ──
+          - model_name: DeepSeek-R1-0528
+            model_path: 'deepseek-ai/DeepSeek-R1-0528'
+            extra_args: '--kv_cache_dtype fp8 -tp 8'
+            threshold: '0.94'
+            env_vars: ''
+            runner: aiter-8gpu-runner
+            label: MI325-8gpu
+          # ── MI35X 8-GPU (gfx950) ──
+          - model_name: DeepSeek-R1-0528
+            model_path: 'deepseek-ai/DeepSeek-R1-0528'
+            extra_args: '--kv_cache_dtype fp8 -tp 8'
+            threshold: '0.94'
+            env_vars: ''
+            runner: linux-aiter-mi35x-8
+            label: MI35X-8gpu
+          # ── MI35X 1-GPU (gfx950) ──
+          - model_name: gpt-oss-120b
+            model_path: 'openai/gpt-oss-120b'
+            extra_args: '--kv_cache_dtype fp8 --gpu-memory-utilization 0.3'
+            threshold: '0.38'
+            env_vars: 'ATOM_GPT_OSS_MODEL=1'
+            runner: linux-aiter-mi35x-1
+            label: MI35X-1gpu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run ATOM accuracy test
+        timeout-minutes: 45
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          ATOM_ENV_VARS: ${{ matrix.env_vars }}
+        run: |
+          bash .github/scripts/run_atom.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.model_path }}" \
+            "${{ matrix.threshold }}" \
+            "${{ matrix.extra_args }}"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-${{ matrix.label }}-${{ matrix.model_name }}
+          path: atom_nightly_*.txt
+
+  # ── Stage 4: Promote (only on schedule, after all tests) ────────────
+  promote:
+    needs: [build, test, sglang, vllm, atom]
     if: >-
-      ${{ github.repository_owner == 'ROCm'
-          && !(github.event.inputs.skip_promote || false) }}
+      always() &&
+      github.repository_owner == 'ROCm' &&
+      !(github.event.inputs.skip_promote || false) &&
+      needs.build.result == 'success' &&
+      needs.test.result == 'success' &&
+      (needs.sglang.result == 'success' || needs.sglang.result == 'skipped') &&
+      (needs.vllm.result == 'success' || needs.vllm.result == 'skipped') &&
+      (needs.atom.result == 'success' || needs.atom.result == 'skipped')
     uses: ./.github/workflows/promote.yaml
     with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'nightlies' || 'devreleases' }}
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
       wheel_names: ${{ needs.build.outputs.wheel_names }}
     permissions:
       id-token: write
