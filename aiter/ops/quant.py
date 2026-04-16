@@ -672,7 +672,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     group_size: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     token_num_quant_moe_sort_switch = [
-        8 * 384 / topk,  # stage1
+        8 * 256 / topk,  # stage1
         8 * 1024 / topk,  # stage2
     ]
     M, N = input.view(-1, input.shape[-1]).shape
