@@ -6,7 +6,9 @@
 """AOT pre-compilation for FlyDSL GEMM kernels from aiter tuned CSV configs.
 
 Reads tuned GEMM CSV config files, extracts all unique FlyDSL kernel entries,
-and pre-compiles them into the FlyDSL cache.
+and pre-compiles them into the FlyDSL cache. The default CSV set is resolved
+through ``AITER_CONFIGS`` so model-specific tuned CSVs can be merged the same
+way as runtime JIT config lookup.
 
 Supported kernel families:
   - ``flydsl_gemm2_*``           split-K HGEMM kernels
@@ -35,21 +37,21 @@ import time
 from typing import Dict, Optional
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 from aiter.ops.flydsl.kernels.splitk_hgemm import compile_hgemm_kernel
 
-_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "../../configs/model_configs"
-)
-_ROOT_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "../../configs"
-)
-
+# Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
-    os.path.join(_ROOT_CONFIGS_DIR, "a8w8_bpreshuffle_tuned_gemm.csv"),
-    os.path.join(_CONFIGS_DIR, "a8w8_bpreshuffle_tuned_gemm_dsv3.csv"),
-    os.path.join(_CONFIGS_DIR, "kimik2_bf16_tuned_gemm.csv"),
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
+    AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
 ]
 
 _PRESHUFFLE_RE = re.compile(
@@ -367,7 +369,7 @@ def main():
         type=str,
         nargs="+",
         default=DEFAULT_CSVS,
-        help="Path(s) to tuned CSV config file(s)",
+        help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
     )
     args = parser.parse_args()
 
