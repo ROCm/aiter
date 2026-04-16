@@ -14,7 +14,7 @@ try:
     from aiter.ops.triton.gluon.unified_attention_3d import (
         _unified_attention_gluon_kernel_3d,
     )
-except:
+except: # noqa: E722
     _unified_attention_gluon_kernel_3d = None
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
