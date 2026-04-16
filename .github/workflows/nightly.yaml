@@ -25,7 +25,6 @@ on:
         description: 'Skip promote job (build + test only)'
         type: boolean
         default: false
-      # ── Integration test suite selection ──
       run_sglang:
         description: 'Run SGLang integration tests'
         type: boolean
@@ -49,7 +48,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Stage 1: Build wheels ────────────────────────────────────────────
+  # ── Build ────────────────────────────────────────────────────────────
   build:
     uses: ./.github/workflows/aiter-release.yaml
     with:
@@ -66,7 +65,7 @@ jobs:
       contents: read
       actions: read
 
-  # ── Stage 2: Wheel smoke tests ──────────────────────────────────────
+  # ── Wheel smoke tests ───────────────────────────────────────────────
   test:
     needs: build
     if: ${{ !(github.event.inputs.skip_tests || false) }}
@@ -78,7 +77,25 @@ jobs:
       contents: read
       actions: read
 
-  # ── Stage 3: Integration tests (opt-in via workflow_dispatch) ───────
+  # ── Load model configs ──────────────────────────────────────────────
+  load-configs:
+    needs: [build, test]
+    if: >-
+      github.event.inputs.run_vllm == 'true' ||
+      github.event.inputs.run_atom == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      vllm_matrix: ${{ steps.load.outputs.vllm_matrix }}
+      atom_matrix: ${{ steps.load.outputs.atom_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load model configs from JSON
+        id: load
+        run: |
+          echo "vllm_matrix=$(cat .github/configs/vllm_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "atom_matrix=$(cat .github/configs/atom_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
+
+  # ── SGLang Scout ────────────────────────────────────────────────────
   sglang:
     name: "SGLang Scout"
     needs: [build, test]
@@ -94,61 +111,17 @@ jobs:
             "${{ github.sha }}" \
             "${{ github.event.inputs.sglang_job_filter || 'all' }}"
 
+  # ── vLLM Benchmarks ────────────────────────────────────────────────
   vllm:
     name: "vLLM (${{ matrix.label }}, ${{ matrix.model_name }}, ${{ matrix.kv }})"
-    needs: [build, test]
+    needs: load-configs
     if: ${{ github.event.inputs.run_vllm == 'true' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # ── MI325X 1-GPU (gfx942) ──
-          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
-            model_name: Mistral-7B
-            kv: default
-            tp: 1
-            runner: aiter-1gpu-runner
-            label: MI325-1gpu
-          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
-            model_name: Mistral-7B
-            kv: fp8
-            tp: 1
-            runner: aiter-1gpu-runner
-            label: MI325-1gpu
-          # ── MI325X 8-GPU (gfx942) ──
-          - model: 'mistralai/Mixtral-8x7B-Instruct-v0.1'
-            model_name: Mixtral-8x7B
-            kv: default
-            tp: 8
-            runner: aiter-8gpu-runner
-            label: MI325-8gpu
-          - model: 'mistralai/Mixtral-8x7B-Instruct-v0.1'
-            model_name: Mixtral-8x7B
-            kv: fp8
-            tp: 8
-            runner: aiter-8gpu-runner
-            label: MI325-8gpu
-          - model: 'deepseek-ai/DeepSeek-R1'
-            model_name: DeepSeek-R1
-            kv: default
-            tp: 8
-            runner: aiter-8gpu-runner
-            label: MI325-8gpu
-          # ── MI35X 1-GPU (gfx950) ──
-          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
-            model_name: Mistral-7B
-            kv: default
-            tp: 1
-            runner: linux-aiter-mi35x-1
-            label: MI35X-1gpu
-          - model: 'mistralai/Mistral-7B-Instruct-v0.3'
-            model_name: Mistral-7B
-            kv: fp8
-            tp: 1
-            runner: linux-aiter-mi35x-1
-            label: MI35X-1gpu
+        include: ${{ fromJson(needs.load-configs.outputs.vllm_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - name: Docker login
@@ -170,46 +143,23 @@ jobs:
           name: vllm-${{ matrix.label }}-${{ matrix.model_name }}-${{ matrix.kv }}
           path: vllm_nightly_*.log
 
+  # ── ATOM Accuracy ──────────────────────────────────────────────────
   atom:
-    name: "ATOM (${{ matrix.label }}, ${{ matrix.model_name }})"
-    needs: [build, test]
+    name: "ATOM (${{ matrix.model_name }})"
+    needs: load-configs
     if: ${{ github.event.inputs.run_atom == 'true' }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # ── MI325X 8-GPU (gfx942) ──
-          - model_name: DeepSeek-R1-0528
-            model_path: 'deepseek-ai/DeepSeek-R1-0528'
-            extra_args: '--kv_cache_dtype fp8 -tp 8'
-            threshold: '0.94'
-            env_vars: ''
-            runner: aiter-8gpu-runner
-            label: MI325-8gpu
-          # ── MI35X 8-GPU (gfx950) ──
-          - model_name: DeepSeek-R1-0528
-            model_path: 'deepseek-ai/DeepSeek-R1-0528'
-            extra_args: '--kv_cache_dtype fp8 -tp 8'
-            threshold: '0.94'
-            env_vars: ''
-            runner: linux-aiter-mi35x-8
-            label: MI35X-8gpu
-          # ── MI35X 1-GPU (gfx950) ──
-          - model_name: gpt-oss-120b
-            model_path: 'openai/gpt-oss-120b'
-            extra_args: '--kv_cache_dtype fp8 --gpu-memory-utilization 0.3'
-            threshold: '0.38'
-            env_vars: 'ATOM_GPT_OSS_MODEL=1'
-            runner: linux-aiter-mi35x-1
-            label: MI35X-1gpu
+        include: ${{ fromJson(needs.load-configs.outputs.atom_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       - name: Run ATOM accuracy test
-        timeout-minutes: 45
+        timeout-minutes: 90
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           ATOM_ENV_VARS: ${{ matrix.env_vars }}
@@ -223,10 +173,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: atom-${{ matrix.label }}-${{ matrix.model_name }}
+          name: atom-${{ matrix.model_name }}
           path: atom_nightly_*.txt
 
-  # ── Stage 4: Promote (only on schedule, after all tests) ────────────
+  # ── Promote ────────────────────────────────────────────────────────
   promote:
     needs: [build, test, sglang, vllm, atom]
     if: >-
