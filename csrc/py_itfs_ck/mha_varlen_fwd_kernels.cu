@@ -384,7 +384,8 @@ mha_varlen_fwd(
     std::optional<at::Generator> gen_,
     std::optional<const at::Tensor> cu_seqlens_q_padded_, // [b+1] physical starts with PAD
     std::optional<const at::Tensor> cu_seqlens_k_padded_, // [b+1]
-    std::optional<const at::Tensor> sink_ptr)
+    std::optional<const at::Tensor> sink_ptr,
+    int num_splits)
 {
     auto q_dtype = q.scalar_type();
     bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
@@ -630,6 +631,54 @@ mha_varlen_fwd(
         else
         {
             TORCH_CHECK(cu_seqlens_k.has_value(), "cu_seqlens_k must be provided if paged_KV is false");
+            if (num_splits > 1) {
+                // Non-paged split-KV path
+                TORCH_CHECK(p_dropout == 0.0f, "split-KV does not support dropout");
+                TORCH_CHECK(!return_dropout_randval, "split-KV does not support return_dropout_randval");
+                TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
+
+                auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
+                auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
+
+                auto args =
+                    get_ck_fmha_varlen_fwd_splitkv_args(
+                        has_lse,
+                        mask,
+                        batch_size,
+                        max_seqlen_q,
+                        num_heads,
+                        num_heads_k,
+                        head_size_q,
+                        head_size_v,
+                        0, // page_block_size (non-paged)
+                        num_splits,
+                        softmax_scale,
+                        logits_soft_cap,
+                        q,
+                        k,
+                        v,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        seqlens_k,
+                        std::optional<const at::Tensor>(std::nullopt), // block_table (non-paged)
+                        bias_,
+                        alibi_slopes_,
+                        out,
+                        softmax_lse,
+                        softmax_lse_accum,
+                        out_accum,
+                        sink_ptr);
+                float t = aiter::mha_fwd_splitkv(args,
+                                                 stream_config,
+                                                 dtype_str,
+                                                 true, // is_group_mode
+                                                 mask.type,
+                                                 bias_type,
+                                                 has_lse,
+                                                 has_sink);
+                TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
+            }
+            else {
             auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
             auto args =
                 get_ck_fmha_varlen_fwd_args(
@@ -669,6 +718,7 @@ mha_varlen_fwd(
                     sink_ptr);
             float t = aiter::mha_fwd(args, stream_config);     // how_v3_bf16_cvt
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+            }
         }
     }
     else {

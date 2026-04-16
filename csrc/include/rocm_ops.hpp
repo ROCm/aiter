@@ -869,7 +869,8 @@ namespace py = pybind11;
           py::arg("k_descale")     = std::nullopt, \
           py::arg("v_descale")     = std::nullopt, \
           py::arg("sink_ptr")      = std::nullopt, \
-          py::arg("gen")           = std::nullopt);
+          py::arg("gen")           = std::nullopt, \
+          py::arg("num_splits")    = 1);
 
 #define LIBMHA_FWD_PYBIND                          \
     m.def("libmha_fwd",                            \
@@ -893,7 +894,8 @@ namespace py = pybind11;
           py::arg("q_descale")     = std::nullopt, \
           py::arg("k_descale")     = std::nullopt, \
           py::arg("v_descale")     = std::nullopt, \
-          py::arg("gen")           = std::nullopt);
+          py::arg("gen")           = std::nullopt, \
+          py::arg("num_splits")    = 1);
 
 #define MHA_VARLEN_FWD_ASM_PYBIND                        \
     m.def("fmha_v3_varlen_fwd",                          \
@@ -1077,7 +1079,8 @@ namespace py = pybind11;
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt, \
-          py::arg("sink_ptr")            = std::nullopt);
+          py::arg("sink_ptr")            = std::nullopt, \
+          py::arg("num_splits")          = 1);
 
 #define MHA_BATCH_PREFILL_PYBIND                       \
     m.def("mha_batch_prefill",                         \

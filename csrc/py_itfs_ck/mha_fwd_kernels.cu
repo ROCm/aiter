@@ -198,7 +198,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         std::optional<const at::Tensor> k_descale_,    // [1]
         std::optional<const at::Tensor> v_descale_,    // [1]
         std::optional<const at::Tensor> sink_ptr,      // [hq]
-        std::optional<at::Generator> gen_)
+        std::optional<at::Generator> gen_,
+        int num_splits)
 {
     auto q_dtype = q.scalar_type();
     bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
@@ -352,6 +353,111 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
 
+        if (num_splits > 1) {
+            // Split-KV path: two-kernel launch (split + combine)
+            TORCH_CHECK(p_dropout == 0.0f, "split-KV does not support dropout");
+            TORCH_CHECK(!return_dropout_randval, "split-KV does not support return_dropout_randval");
+
+            auto softmax_lse_accum = torch::empty(
+                {batch_size, num_heads, num_splits, seqlen_q}, opts.dtype(at::kFloat));
+            auto out_accum = torch::empty(
+                {batch_size, num_heads, num_splits, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
+
+            fmha_fwd_splitkv_args skv_args;
+            skv_args.q_ptr           = q.data_ptr();
+            skv_args.k_ptr           = k.data_ptr();
+            skv_args.v_ptr           = v.data_ptr();
+            skv_args.bias_ptr        = nullptr;
+            skv_args.lse_acc_ptr     = softmax_lse_accum.data_ptr();
+            skv_args.o_acc_ptr       = out_accum.data_ptr();
+            skv_args.lse_ptr         = has_lse ? softmax_lse.data_ptr() : nullptr;
+            skv_args.o_ptr           = out.data_ptr();
+
+            skv_args.block_table_ptr         = nullptr;
+            skv_args.batch_stride_block_table = 0;
+            skv_args.page_block_size         = 0;
+            skv_args.is_gappy                = false;
+            skv_args.cache_batch_idx         = nullptr;
+
+            skv_args.seqstart_q_ptr = nullptr;
+            skv_args.seqstart_k_ptr = nullptr;
+            skv_args.seqlen_k_ptr   = nullptr;
+            skv_args.sink_ptr       = sink_ptr.has_value() ? sink_ptr.value().data_ptr() : nullptr;
+
+            skv_args.batch       = batch_size;
+            skv_args.seqlen_q    = seqlen_q;
+            skv_args.seqlen_k    = seqlen_k;
+            skv_args.max_seqlen_q = seqlen_q;
+            skv_args.hdim_q      = head_size_q;
+            skv_args.hdim_v      = head_size_v;
+            skv_args.nhead_q     = num_heads;
+            skv_args.nhead_k     = num_heads_k;
+            skv_args.num_splits  = num_splits;
+            skv_args.sink_size   = mask.sink;
+
+            skv_args.scale_s     = softmax_scale;
+            skv_args.scale_p     = 1;
+            skv_args.scale_o     = 1;
+            skv_args.logits_soft_cap = 0.0;
+
+            // q: [b, sq, hq, d]
+            skv_args.batch_stride_q  = q.stride(0);
+            skv_args.stride_q        = q.stride(1);
+            skv_args.nhead_stride_q  = q.stride(2);
+            // k: [b, sk, hk, d]
+            skv_args.batch_stride_k  = k.stride(0);
+            skv_args.stride_k        = k.stride(1);
+            skv_args.nhead_stride_k  = k.stride(2);
+            // v: [b, sk, hk, dv]
+            skv_args.batch_stride_v  = v.stride(0);
+            skv_args.stride_v        = v.stride(1);
+            skv_args.nhead_stride_v  = v.stride(2);
+            // o: [b, sq, hq, dv]
+            skv_args.batch_stride_o  = out.stride(0);
+            skv_args.stride_o        = out.stride(1);
+            skv_args.nhead_stride_o  = out.stride(2);
+
+            skv_args.batch_stride_bias  = 0;
+            skv_args.stride_bias        = 0;
+            skv_args.nhead_stride_bias  = 0;
+
+            // lse: [b, hq, sq]
+            skv_args.batch_stride_lse   = has_lse ? softmax_lse.stride(0) : 0;
+            skv_args.nhead_stride_lse   = has_lse ? softmax_lse.stride(1) : 0;
+
+            // lse_acc: [b, hq, splits, sq]
+            skv_args.batch_stride_lse_acc  = softmax_lse_accum.stride(0);
+            skv_args.nhead_stride_lse_acc  = softmax_lse_accum.stride(1);
+            skv_args.split_stride_lse_acc  = softmax_lse_accum.stride(2);
+
+            // o_acc: [b, hq, splits, sq, dv]
+            skv_args.batch_stride_o_acc  = out_accum.stride(0);
+            skv_args.nhead_stride_o_acc  = out_accum.stride(1);
+            skv_args.split_stride_o_acc  = out_accum.stride(2);
+            skv_args.stride_o_acc        = out_accum.stride(3);
+
+            if (alibi_slopes_.has_value()) {
+                auto alibi_slopes = alibi_slopes_.value();
+                skv_args.bias_ptr    = alibi_slopes.data_ptr();
+                skv_args.stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
+            }
+
+            skv_args.window_size_left  = mask.left;
+            skv_args.window_size_right = mask.right;
+            skv_args.mask_type = static_cast<ck_tile::index_t>(mask.type);
+
+            bool has_sink = mask.sink > 0;
+            float t = aiter::mha_fwd_splitkv(skv_args,
+                                             stream_config,
+                                             dtype_str,
+                                             false, // is_group_mode (batch mode)
+                                             mask.type,
+                                             bias_type,
+                                             has_lse,
+                                             has_sink);
+            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
+        }
+        else {
         auto args =
             get_ck_fmha_fwd_args(
                 has_lse,
@@ -387,6 +493,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
 
         float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
+        }
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
