@@ -241,7 +241,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
                 smem_B.index(slot), pred=1)
         load_idx += 1
 
-    # --- 2. Pre-load tile 0 from LDS ---
+    # --- 2. Pre-load tile 0 from LDS into registers ---
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
     slot_c = compute_idx % NUM_BUFFERS
     cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_A.index(slot_c), layout=dot_a_layout)
