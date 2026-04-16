@@ -66,6 +66,7 @@ jobs:
       DOCKER_IMAGE: "rocm/pytorch:latest"
       TRITON_COMMIT: "d1660454"
       TRITON_VERSION: "3.7.0"
+      ROCM_VERSION: "rocm7.2.0"
       PYTHON_VERSION: "cp312"
     steps:
       - name: Checkout code
@@ -96,7 +97,7 @@ jobs:
         run: |
           set -x
           mkdir -p triton-wheels
-          WHEEL_NAME="triton-${{ env.TRITON_VERSION }}+amd.git${{ env.TRITON_COMMIT }}-${{ env.PYTHON_VERSION }}-${{ env.PYTHON_VERSION }}-linux_x86_64.whl"
+          WHEEL_NAME="triton-${{ env.TRITON_VERSION }}+${{ env.ROCM_VERSION }}.git${{ env.TRITON_COMMIT }}-${{ env.PYTHON_VERSION }}-${{ env.PYTHON_VERSION }}-linux_x86_64.whl"
           WHEEL_URL="https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/triton/${WHEEL_NAME}"
           echo "Attempting to download: ${WHEEL_URL}"
           if curl -fSL --retry 3 --retry-delay 5 -o "triton-wheels/${WHEEL_NAME}" "${WHEEL_URL}"; then
