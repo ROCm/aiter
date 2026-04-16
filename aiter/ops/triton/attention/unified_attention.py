@@ -258,7 +258,6 @@ def unified_attention(
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
     num_tokens, num_query_heads, head_size = q.shape
-    K_WIDTH = 0
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
@@ -266,6 +265,7 @@ def unified_attention(
     else:
         # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
         num_blocks, block_size, num_kv_heads, _ = k.shape
+        K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
