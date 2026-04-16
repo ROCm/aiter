@@ -62,11 +62,13 @@ def flydsl_gdr_decode(
     kwargs = get_default_kwargs(batch_size, seq_length)
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
+        get_dtype_str(A_log.dtype),
         seq_length,
         num_k_heads,
         num_v_heads,
         head_k_dim,
         head_v_dim,
+        state.stride(),
         use_qk_l2norm,
         **kwargs,
     )

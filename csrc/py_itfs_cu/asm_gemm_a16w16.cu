@@ -175,7 +175,7 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
                                    unsigned int& SUBM,
                                    unsigned int& SUBN)
 {
-    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     auto it_kl = config_map->find(selectedKernelName);
     AITER_CHECK(it_kl != config_map->end(), __func__, " not find kernel~ " + selectedKernelName);
@@ -186,11 +186,7 @@ AiterAsmKernel* get_or_load_kernel(const std::string& selectedKernelName,
     SUBM                = cfg.tileM;
     SUBN                = cfg.tileN;
 
-    auto result = impl_ptr_map.emplace(name, nullptr);
-    if(result.second)
-        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-
-    return result.first->second.get();
+    return &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
 }
 
 AITER_CTYPES_ERROR_DEF
