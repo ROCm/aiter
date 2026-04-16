@@ -64,6 +64,9 @@ jobs:
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
+      TRITON_COMMIT: "d1660454"
+      TRITON_VERSION: "3.7.0"
+      PYTHON_VERSION: "cp312"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -88,11 +91,26 @@ jobs:
           echo "Docker login failed after 3 attempts, continuing anyway"
           exit 0
 
-      - name: Build Triton wheel in Docker
+      - name: Try downloading pre-built Triton wheel
+        id: download_wheel
+        run: |
+          set -x
+          mkdir -p triton-wheels
+          WHEEL_NAME="triton-${{ env.TRITON_VERSION }}+amd.git${{ env.TRITON_COMMIT }}-${{ env.PYTHON_VERSION }}-${{ env.PYTHON_VERSION }}-linux_x86_64.whl"
+          WHEEL_URL="https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/triton/${WHEEL_NAME}"
+          echo "Attempting to download: ${WHEEL_URL}"
+          if curl -fSL --retry 3 --retry-delay 5 -o "triton-wheels/${WHEEL_NAME}" "${WHEEL_URL}"; then
+            echo "Successfully downloaded pre-built wheel"
+            echo "wheel_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Pre-built wheel not available, will build from source"
+            echo "wheel_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Triton wheel from source
+        if: steps.download_wheel.outputs.wheel_found != 'true'
         run: |
           set -ex
-          mkdir -p triton-wheels
-
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
           else
@@ -111,10 +129,9 @@ jobs:
               set -ex
               pip config set global.default-timeout 60
               pip config set global.retries 10
-              TRITON_COMMIT=${TRITON_COMMIT:-756afc06}
               git clone https://github.com/triton-lang/triton
               cd triton
-              git checkout "$TRITON_COMMIT"
+              git checkout "${{ env.TRITON_COMMIT }}"
               pip install -r python/requirements.txt
               MAX_JOBS=64 pip wheel --no-deps -w /workspace/triton-wheels .
             '
