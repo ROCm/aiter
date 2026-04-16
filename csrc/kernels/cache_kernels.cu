@@ -3034,7 +3034,7 @@ void reshape_and_cache_with_pertoken_quant(
     using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 
     float dtypeMax;
-    if(key_cache.dtype() == AITER_DTYPE_fp8)
+    if(key_cache.dtype() == AITER_DTYPE_fp8 || key_cache.dtype() == AITER_DTYPE_fp8_e4m3fn || key_cache.dtype() == AITER_DTYPE_fp8_e4m3fnuz)
     {
         if(key.dtype() == AITER_DTYPE_fp32)
         {
