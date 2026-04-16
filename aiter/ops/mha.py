@@ -303,9 +303,10 @@ def cmdGenFunc_mha_fwd(
             # Non-split fwd is the active path: apply tile_pattern to fwd filter
             filter = f"*{tile_pattern}*"
 
+    fwd_receipt = 150 if tile_pattern else 100
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        f"--receipt {fwd_receipt} --filter {filter} --output_dir {{}}",
     ]
     # Always include split-KV support so the same module handles any num_splits
     csrc = f"{AITER_META_DIR}/csrc"
@@ -317,9 +318,10 @@ def cmdGenFunc_mha_fwd(
         f"{csrc}/cpp_itfs/mha_fwd_split.cu",
     ]
     filter_splitkv = f"{filter_skv_combine}@{filter_skv_split}"
+    skv_receipt = 150 if tile_pattern else 100
     blob_gen_cmd.append(
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter_splitkv)
+        f"--receipt {skv_receipt} --filter {filter_splitkv} --output_dir {{}}"
     )
     import os as _os
     return {
@@ -628,12 +630,12 @@ def cmdGenFunc_mha_varlen_fwd(
                 new_filter = f"*{tile_pattern}*"
                 blob_gen_cmd[0] = (
                     f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-                    f"--receipt 200 --filter {new_filter} --output_dir {{}}"
+                    f"--receipt 250 --filter {new_filter} --output_dir {{}}"
                 )
             filter_splitkv = f"{_skv_combine}@{_skv_split}"
             blob_gen_cmd[1] = (
                 f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-                f"--receipt 200 --filter {filter_splitkv} --output_dir {{}}"
+                f"--receipt 250 --filter {filter_splitkv} --output_dir {{}}"
             )
     else:
         md_name = "mha_varlen_fwd"
