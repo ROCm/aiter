@@ -51,13 +51,15 @@ def _normalize_gfx(value: str) -> str:
 @functools.lru_cache(maxsize=8)
 def _load_tuned_fmha_table_cached(
     csv_path: str, _mtime_ns: int
-) -> Dict[_FmhaKey, str]:
+) -> Dict[_FmhaKey, Tuple[str, int]]:
     """Parse *csv_path* into a dict keyed on the 9-field FMHA tuple.
 
     ``_mtime_ns`` is used only as a cache-invalidation sentinel so that
     edits to the CSV are picked up without restarting the process.
+
+    Each value is ``(tile_pattern, num_splits)``.
     """
-    table: Dict[_FmhaKey, str] = {}
+    table: Dict[_FmhaKey, Tuple[str, int]] = {}
     reader = csv.DictReader(_iter_non_comment_csv_lines(csv_path))
     for row in reader:
         # Normalise values coming from CSV
@@ -81,15 +83,19 @@ def _load_tuned_fmha_table_cached(
                 _to_int(row["hdim_q"]),
                 _to_int(row["hdim_v"]),
             )
+            num_splits = int(row.get("num_splits", "1").strip() or "1")
         except (KeyError, ValueError) as exc:
             logger.warning("Skipping malformed tuned_fmha row %s: %s", row, exc)
             continue
-        table[key] = tile_pattern
+        table[key] = (tile_pattern, num_splits)
     return table
 
 
-def load_tuned_fmha_table() -> Dict[_FmhaKey, str]:
-    """Return the tuned FMHA lookup dict (cached, auto-refreshes on file change)."""
+def load_tuned_fmha_table() -> Dict[_FmhaKey, Tuple[str, int]]:
+    """Return the tuned FMHA lookup dict (cached, auto-refreshes on file change).
+
+    Each value is ``(tile_pattern, num_splits)``.
+    """
     csv_path = AITER_CONFIGS.AITER_CONFIG_FMHA_FILE
     if not csv_path or not os.path.isfile(csv_path):
         if csv_path:
@@ -103,7 +109,7 @@ def load_tuned_fmha_table() -> Dict[_FmhaKey, str]:
     return _load_tuned_fmha_table_cached(csv_path, mtime_ns)
 
 
-def find_tuned_fmha_tile(
+def find_tuned_fmha_config(
     gfx: str,
     dtype: str,
     batch: int,
@@ -113,10 +119,10 @@ def find_tuned_fmha_tile(
     sk: int,
     hdim_q: int,
     hdim_v: int,
-) -> Optional[str]:
-    """Look up a tuned tile_pattern for the given FMHA problem shape.
+) -> Optional[Tuple[str, int]]:
+    """Look up a tuned config for the given FMHA problem shape.
 
-    Returns the ``tile_pattern`` string if an exact match is found in
+    Returns ``(tile_pattern, num_splits)`` if an exact match is found in
     ``tuned_fmha.csv``, or ``None`` to fall back to the heuristic.
     """
     table = load_tuned_fmha_table()
@@ -134,6 +140,22 @@ def find_tuned_fmha_tile(
         int(hdim_v),
     )
     return table.get(key)
+
+
+def find_tuned_fmha_tile(
+    gfx: str,
+    dtype: str,
+    batch: int,
+    hq: int,
+    hk: int,
+    sq: int,
+    sk: int,
+    hdim_q: int,
+    hdim_v: int,
+) -> Optional[str]:
+    """Backward-compat wrapper — returns only the tile_pattern string."""
+    result = find_tuned_fmha_config(gfx, dtype, batch, hq, hk, sq, sk, hdim_q, hdim_v)
+    return result[0] if result else None
 
 
 def cmdGenFunc_mha_fwd(
@@ -158,6 +180,7 @@ def cmdGenFunc_mha_fwd(
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    num_splits: int = 1,
 ):
     batch, seqlen_q, hq, hdim_q = q.shape
     _, sk, hk, hdim_v = v.shape
@@ -168,19 +191,28 @@ def cmdGenFunc_mha_fwd(
 
     md_name = "mha_fwd"
     filter = "*"
+    # Split-KV filters: combine (dtype only) and split (dtype+bias+mask+lse)
+    filter_skv_combine = "*"
+    filter_skv_split = "*"
     if q.dtype == dtypes.fp16:
         dtype_str = "fp16"
         md_name += "_fp16"
         filter += "_fp16*"
+        filter_skv_combine += "_fp16*"
+        filter_skv_split += "_fp16*"
     elif q.dtype == dtypes.bf16:
         dtype_str = "bf16"
         md_name += "_bf16"
         filter += "_bf16*"
+        filter_skv_combine += "_bf16*"
+        filter_skv_split += "_bf16*"
     elif q.dtype == dtypes.fp8:
         if out is None or out.dtype == dtypes.bf16:
             dtype_str = "fp8bf16"
             md_name += "_fp8bf16"
             filter += "_fp8bf16*"
+            filter_skv_combine += "_fp8bf16*"
+            filter_skv_split += "_fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
     else:
@@ -188,24 +220,31 @@ def cmdGenFunc_mha_fwd(
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
+        filter_skv_split += "_bias*"
     elif alibi_slopes is not None:
         md_name += "_alibi"
         filter += "_alibi*"
+        filter_skv_split += "_alibi*"
     else:
         md_name += "_nbias"
         filter += "_nbias*"
+        filter_skv_split += "_nbias*"
     if not causal and window_size_left == -1 and window_size_right == -1:
         md_name += "_nmask"
         filter += "_nmask*"
+        filter_skv_split += "_nmask*"
     else:
         md_name += "_mask"
         filter += "_m*"
+        filter_skv_split += "_m*"
     if return_softmax_lse:
         md_name += "_lse"
         filter += "_lse*"
+        filter_skv_split += "_lse*"
     else:
         md_name += "_nlse"
         filter += "_nlse*"
+        filter_skv_split += "_nlse*"
     if dropout_p == 0:
         md_name += "_ndropout"
         filter += "_ndropout*"
@@ -221,7 +260,7 @@ def cmdGenFunc_mha_fwd(
         filter += "_pertensor*"
 
     # --- Tuned FMHA CSV lookup (overrides heuristic when a match exists) ---
-    tile_pattern = find_tuned_fmha_tile(
+    fmha_config = find_tuned_fmha_config(
         gfx=get_gfx(),
         dtype=dtype_str,
         batch=batch,
@@ -232,25 +271,66 @@ def cmdGenFunc_mha_fwd(
         hdim_q=hdim_q,
         hdim_v=hdim_v,
     )
+    tile_pattern = fmha_config[0] if fmha_config else None
+    csv_num_splits = fmha_config[1] if fmha_config else 1
+    # Use the caller's num_splits if provided (e.g. CLI override); fall back to CSV value
+    if num_splits <= 1:
+        num_splits = csv_num_splits
     if tile_pattern:
         _log_key = (batch, hq, hk, seqlen_q, sk, hdim_q, hdim_v, tile_pattern)
         if _log_key not in _tuned_fmha_logged:
             _tuned_fmha_logged.add(_log_key)
             logger.info(
-                "[tuned_fmha] Using CSV tile_pattern=%s for "
+                "[tuned_fmha] Using CSV tile_pattern=%s num_splits=%d for "
                 "batch=%d hq=%d hk=%d sq=%d sk=%d hdim_q=%d hdim_v=%d",
-                tile_pattern, batch, hq, hk, seqlen_q, sk, hdim_q, hdim_v,
+                tile_pattern, num_splits, batch, hq, hk, seqlen_q, sk, hdim_q, hdim_v,
             )
         md_name += f"_tunedfmha_{tile_pattern}"
-        filter = f"*{tile_pattern}*"
+        if num_splits > 1:
+            # Split-KV is the active path: apply tile_pattern to split-KV filter
+            # Insert tile_pattern after dtype in the split filter so blob names must match it
+            dtype_marker = f"_{dtype_str}*"
+            idx = filter_skv_split.find(dtype_marker)
+            if idx >= 0:
+                insert_pos = idx + len(dtype_marker)
+                filter_skv_split = (
+                    filter_skv_split[:insert_pos]
+                    + f"{tile_pattern}*"
+                    + filter_skv_split[insert_pos:]
+                )
+            # fwd filter stays as the default (heuristic) — not filtered by tile_pattern
+        else:
+            # Non-split fwd is the active path: apply tile_pattern to fwd filter
+            filter = f"*{tile_pattern}*"
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
         "--receipt 100 --filter {} --output_dir {{}}".format(filter),
     ]
+    # Always include split-KV support so the same module handles any num_splits
+    csrc = f"{AITER_META_DIR}/csrc"
+    srcs = [
+        f"{csrc}/kernels/mha_common.cu",
+        f"{csrc}/py_itfs_ck/mha_fwd_kernels.cu",
+        f"{csrc}/pybind/mha_fwd_pybind.cu",
+        f"{csrc}/cpp_itfs/mha_fwd.cu",
+        f"{csrc}/cpp_itfs/mha_fwd_split.cu",
+    ]
+    filter_splitkv = f"{filter_skv_combine}@{filter_skv_split}"
+    blob_gen_cmd.append(
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+        "--receipt 100 --filter {} --output_dir {{}}".format(filter_splitkv)
+    )
+    import os as _os
     return {
         "md_name": md_name,
+        "srcs": srcs,
         "blob_gen_cmd": blob_gen_cmd,
+        "flags_extra_hip": [
+            "-fbracket-depth=1024",
+            "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
+            f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={_os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 2)}",
+        ],
     }
 
 
@@ -333,6 +413,7 @@ def gen_mha_fwd_fake_tensors(
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[torch.Generator] = None,
+    num_splits: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
         q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
@@ -367,6 +448,7 @@ def mha_fwd(
     v_descale: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    num_splits: int = 1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -450,6 +532,7 @@ def cmdGenFunc_mha_varlen_fwd(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[torch.Tensor] = None,
+    num_splits: int = 1,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -499,7 +582,7 @@ def cmdGenFunc_mha_varlen_fwd(
         hk = k.size(1)
         hdim_q = q.size(2)
         hdim_v = v.size(2)
-        tile_pattern = find_tuned_fmha_tile(
+        fmha_config = find_tuned_fmha_config(
             gfx=get_gfx(),
             dtype=dtype_token,
             batch=batch,
@@ -510,20 +593,47 @@ def cmdGenFunc_mha_varlen_fwd(
             hdim_q=hdim_q,
             hdim_v=hdim_v,
         )
+        tile_pattern = fmha_config[0] if fmha_config else None
+        csv_num_splits = fmha_config[1] if fmha_config else 1
+        # Use the caller's num_splits if provided (e.g. CLI override); fall back to CSV value
+        if num_splits <= 1:
+            num_splits = csv_num_splits
         if tile_pattern:
             _log_key = (batch, hq, hk, max_seqlen_q, max_seqlen_k, hdim_q, hdim_v, tile_pattern)
             if _log_key not in _tuned_fmha_logged:
                 _tuned_fmha_logged.add(_log_key)
                 logger.info(
-                    "[tuned_fmha] varlen: Using CSV tile_pattern=%s for "
+                    "[tuned_fmha] varlen: Using CSV tile_pattern=%s num_splits=%d for "
                     "batch=%d hq=%d hk=%d sq=%d sk=%d hdim_q=%d hdim_v=%d",
-                    tile_pattern, batch, hq, hk, max_seqlen_q, max_seqlen_k, hdim_q, hdim_v,
+                    tile_pattern, num_splits, batch, hq, hk, max_seqlen_q, max_seqlen_k, hdim_q, hdim_v,
                 )
             md_name += f"_tunedfmha_{tile_pattern}"
-            new_filter = f"*{tile_pattern}*"
-            blob_gen_cmd[0] = (
-                f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-                f"--receipt 200 --filter {new_filter} --output_dir {{}}"
+        # Split-KV blobs always present (varlen default has them; tuned narrows the split filter)
+        if tile_pattern:
+            # Build narrowed split-KV filter from feature flags
+            _skv_combine = f"*{dtype_token}*"
+            _skv_split = f"*{dtype_token}*"
+            _skv_split += "_bias*" if has_bias else ("_alibi*" if has_alibi else "_nbias*")
+            _skv_split += "_mask*" if use_mask else "_nmask*"
+            _skv_split += "_lse*" if return_lse else "_nlse*"
+            if num_splits > 1:
+                # Split-KV is the active path: apply tile_pattern to split-KV filter
+                _skv_split = f"*{dtype_token}*{tile_pattern}*"
+                _skv_split += "_bias*" if has_bias else ("_alibi*" if has_alibi else "_nbias*")
+                _skv_split += "_mask*" if use_mask else "_nmask*"
+                _skv_split += "_lse*" if return_lse else "_nlse*"
+                # fwd filter stays as default (not filtered by tile_pattern)
+            else:
+                # Non-split fwd is the active path: apply tile_pattern to fwd filter
+                new_filter = f"*{tile_pattern}*"
+                blob_gen_cmd[0] = (
+                    f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+                    f"--receipt 200 --filter {new_filter} --output_dir {{}}"
+                )
+            filter_splitkv = f"{_skv_combine}@{_skv_split}"
+            blob_gen_cmd[1] = (
+                f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+                f"--receipt 200 --filter {filter_splitkv} --output_dir {{}}"
             )
     else:
         md_name = "mha_varlen_fwd"
@@ -613,6 +723,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    num_splits: int = 1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     device = q.device
     dtype = q.dtype
@@ -683,6 +794,7 @@ def mha_varlen_fwd(
     cu_seqlens_q_padded: Optional[torch.Tensor] = None,
     cu_seqlens_k_padded: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    num_splits: int = 1,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -1521,7 +1633,11 @@ def _flash_attn_forward(
             None,
         )
     else:
-        out, softmax_lse, S_dmask, rng_state = mha_fwd(
+        # Look up CSV for num_splits
+        _dtype_str = "bf16" if q.dtype == dtypes.bf16 else ("fp16" if q.dtype == dtypes.fp16 else "fp8bf16")
+        _cfg = find_tuned_fmha_config(get_gfx(), _dtype_str, batch_size, nhead_q, nhead_k, seqlen_q, seqlen_k, hdim_q, hdim_v)
+        _num_splits = _cfg[1] if _cfg else 1
+        out_, softmax_lse, S_dmask, rng_state = mha_fwd(
             q,
             k,
             v,
@@ -1543,9 +1659,10 @@ def _flash_attn_forward(
             v_descale,
             sink_ptr,
             None,
+            _num_splits,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
-    return out, softmax_lse, S_dmask, rng_state
+    return out_, softmax_lse, S_dmask, rng_state
 
 
 # @torch_compile_guard(mutates_args=[])
@@ -2292,6 +2409,10 @@ def _flash_attn_varlen_forward(
             _validate("cu_seqlens_q_padded", cu_seqlens_q_padded)
         if cu_seqlens_k_padded is not None:
             _validate("cu_seqlens_k_padded", cu_seqlens_k_padded)
+        # Look up CSV for num_splits
+        _dtype_str = "bf16" if q.dtype == dtypes.bf16 else ("fp16" if q.dtype == dtypes.fp16 else "fp8bf16")
+        _cfg = find_tuned_fmha_config(get_gfx(), _dtype_str, batch_size, nhead_q, nhead_k, max_seqlen_q, max_seqlen_k, hdim_q, hdim_v)
+        _num_splits = _cfg[1] if _cfg else 1
         out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
             q,
             k,
@@ -2322,6 +2443,7 @@ def _flash_attn_varlen_forward(
             cu_seqlens_q_padded=cu_seqlens_q_padded,
             cu_seqlens_k_padded=cu_seqlens_k_padded,
             sink_ptr=sink_ptr,
+            num_splits=_num_splits,
         )
     return out, softmax_lse, S_dmask, rng_state
 

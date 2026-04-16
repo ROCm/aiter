@@ -30,7 +30,7 @@ logger = logging.getLogger("test_tuned_fmha_fwd")
 import aiter
 from aiter.ops.mha import mha_fwd
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.mha import find_tuned_fmha_tile
+from aiter.ops.mha import find_tuned_fmha_config
 
 # ---------------------------------------------------------------------------
 
@@ -54,7 +54,9 @@ def run_batch_fwd(batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str, causal=True)
     scale = hdim_q ** -0.5
 
     gfx = get_gfx()
-    tile = find_tuned_fmha_tile(gfx, dtype_str, batch, hq, hk, sq, sk, hdim_q, hdim_v)
+    cfg = find_tuned_fmha_config(gfx, dtype_str, batch, hq, hk, sq, sk, hdim_q, hdim_v)
+    tile = cfg[0] if cfg else None
+    num_splits = cfg[1] if cfg else 1
     if tile is None:
         logger.warning(
             "No CSV match for gfx=%s dtype=%s b=%d hq=%d hk=%d sq=%d sk=%d "
@@ -62,7 +64,7 @@ def run_batch_fwd(batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str, causal=True)
             gfx, dtype_str, batch, hq, hk, sq, sk, hdim_q, hdim_v,
         )
     else:
-        logger.info("CSV match: tile_pattern=%s", tile)
+        logger.info("CSV match: tile_pattern=%s  num_splits=%d", tile, num_splits)
 
     q = torch.randn(batch, sq, hq, hdim_q, device="cuda", dtype=torch_dtype)
     k = torch.randn(batch, sk, hk, hdim_q, device="cuda", dtype=torch_dtype)
@@ -78,6 +80,7 @@ def run_batch_fwd(batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str, causal=True)
         sink_size=0,
         return_softmax_lse=True,
         return_dropout_randval=False,
+        num_splits=num_splits,
     )
 
     # Warmup + sanity
@@ -98,7 +101,7 @@ def run_batch_fwd(batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str, causal=True)
         "dtype=%-4s  %8.4f ms (%8.1f us)  %7.1f TFLOP/s  [%s]",
         batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str,
         avg_ms, avg_ms * 1000, tflops,
-        f"tile={tile}" if tile else "heuristic",
+        f"tile={tile} splits={num_splits}" if tile else "heuristic",
     )
     return True
 
@@ -113,7 +116,9 @@ def run_varlen_fwd(batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str, causal=True
     scale = hdim_q ** -0.5
 
     gfx = get_gfx()
-    tile = find_tuned_fmha_tile(gfx, dtype_str, batch, hq, hk, sq, sk, hdim_q, hdim_v)
+    cfg = find_tuned_fmha_config(gfx, dtype_str, batch, hq, hk, sq, sk, hdim_q, hdim_v)
+    tile = cfg[0] if cfg else None
+    num_splits = cfg[1] if cfg else 1
     if tile is None:
         logger.warning(
             "No CSV match for gfx=%s dtype=%s b=%d hq=%d hk=%d sq=%d sk=%d "
@@ -121,7 +126,7 @@ def run_varlen_fwd(batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str, causal=True
             gfx, dtype_str, batch, hq, hk, sq, sk, hdim_q, hdim_v,
         )
     else:
-        logger.info("CSV match: tile_pattern=%s", tile)
+        logger.info("CSV match: tile_pattern=%s  num_splits=%d", tile, num_splits)
 
     # Build 4D then flatten to 3D — same as bench_fmha_varlen.py -> bench_varlen
     q = torch.randn(batch, sq, hq, hdim_q, device="cuda", dtype=torch_dtype)
@@ -157,7 +162,7 @@ def run_varlen_fwd(batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str, causal=True
         "dtype=%-4s  %8.4f ms (%8.1f us)  %7.1f TFLOP/s  [%s]",
         batch, hq, hk, sq, sk, hdim_q, hdim_v, dtype_str,
         avg_ms, avg_ms * 1000, tflops,
-        f"tile={tile}" if tile else "heuristic",
+        f"tile={tile} splits={num_splits}" if tile else "heuristic",
     )
     return True
 

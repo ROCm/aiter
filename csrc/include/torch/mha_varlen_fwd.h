@@ -34,6 +34,7 @@ mha_varlen_fwd(at::Tensor& q,                                 // [total_q, hq, d
                std::optional<at::Generator> gen,
                std::optional<const at::Tensor> cu_seqlens_q_padded = std::nullopt,
                std::optional<const at::Tensor> cu_seqlens_k_padded = std::nullopt,
-               std::optional<const at::Tensor> sink_ptr = std::nullopt);
+               std::optional<const at::Tensor> sink_ptr = std::nullopt,
+               int num_splits = 1);
 } // namespace torch_itfs
 } // namespace aiter
