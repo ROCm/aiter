@@ -185,34 +185,24 @@ def _gemm_a8w8_blockscale_kernel(
     """
 
     # TDM stats
-    NUM_BUFFERS: gl.constexpr = 2
+    NUM_BUFFERS: gl.constexpr = 3
     L2_PREFETCH_DISTANCE: gl.constexpr = 1
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid_unified = gl.program_id(axis=0)
-    pid_k = pid_unified % NUM_KSPLIT
-    pid = pid_unified // NUM_KSPLIT
+    pid_k = pid_unified
+    pid = pid_unified
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
-    # NOTE: there is no instruction i can see in the shader guide for int8 or fp8 wmma so i've put a temporary cast.
-    # if i find a better way to do this that would be better, but should be noted
-
     # Setup
-    if NUM_KSPLIT == 1:
-        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
-    else:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    
+    threads_per_elem_mk: gl.constexpr = 1
+    threads_per_elem_kn: gl.constexpr = 1
 
-    threads_per_elem_mk: gl.constexpr = 1#triton.cdiv(
-    #     BLOCK_SIZE_M * BLOCK_SIZE_K // (NUM_WARPS * 64), 16
-    # )
-    threads_per_elem_kn: gl.constexpr = 1#triton.cdiv(
-    #     BLOCK_SIZE_K * BLOCK_SIZE_N // (NUM_WARPS * 64), 16
-    # )
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[threads_per_elem_mk, 16],
         threads_per_warp=[4, 8], # 32 bc its 32 threads in a warp
@@ -237,10 +227,10 @@ def _gemm_a8w8_blockscale_kernel(
     
     # unswizzled scales
     shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
+        vec=16, per_phase=1, max_phase=1, order=[0]
     )
     shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[0]
+        vec=16, per_phase=1, max_phase=1, order=[0]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=wmma_layout, k_width=8
@@ -250,7 +240,6 @@ def _gemm_a8w8_blockscale_kernel(
     )
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
-        #SPLITK_BLOCK_SIZE = gl.cdiv(K, NUM_KSPLIT)
         num_k_iter = gl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         # Create pointers for first block of A and B input matrices
@@ -358,7 +347,7 @@ def _gemm_a8w8_blockscale_kernel(
             issue_l2_prefetches(L2_PREFETCH_DISTANCE - 1, producer, a_desc, b_desc, 0, 0, BLOCK_SIZE_K, False)
 
             # WMMA but the legit way. Clear zeros afterwards.
-            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, 2, NUM_BUFFERS, False)
+            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, (NUM_BUFFERS - 1) * 2, NUM_BUFFERS, False)
             acc += zeros * cur_a_scale[:, None] * cur_b_scale[None, :]
             zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
 
@@ -372,7 +361,7 @@ def _gemm_a8w8_blockscale_kernel(
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
         for i in gl.static_range(NUM_BUFFERS - 1):
-            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, 0, NUM_BUFFERS, False)
+            consumer, zeros = issue_wmma(consumer, tdm_smem_a, dot_a_layout, tdm_smem_b, dot_b_layout, zeros, (NUM_BUFFERS - 2 - i) * 2, NUM_BUFFERS, False)
             acc += zeros * cur_a_scale[:, None] * cur_b_scale[None, :]
             zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout)
 
