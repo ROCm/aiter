@@ -264,7 +264,10 @@ def fused_moe_(
     ):
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = 512
-    if quant_type == QuantType.per_1x32:
+    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+        # a16wi4: bf16 activations, int4 weights with groupwise scale
+        q_dtype_a = dtypes.bf16
+    elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
@@ -272,9 +275,6 @@ def fused_moe_(
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
-    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        q_dtype_a = dtypes.bf16
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -1218,6 +1218,10 @@ def fused_moe_2stages(
         N = a1.shape[-1]
         a1_scale = torch.ones([M, N // 32], dtype=dtypes.fp8_e8m0, device=a1.device)
 
+    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
+        # a16wi4: bf16 activations, int4 weights; no activation quantization needed
+        a1 = hidden_states.to(dtype)
+        a1_scale = None
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
@@ -1240,10 +1244,6 @@ def fused_moe_2stages(
                 block_size=block_size_M,
                 num_rows=num_local_tokens,
             )
-    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
-        # a16wi4: checked after per_1x32 paths; no activation quantization needed
-        a1 = hidden_states.to(dtype)
-        a1_scale = None
     elif hidden_states.dtype != q_dtype_a:
         if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
             quant_func = functools.partial(quant_func, transpose_scale=True)
@@ -1329,6 +1329,9 @@ def fused_moe_2stages(
     ):
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
+    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
+        # a16wi4: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
@@ -1341,9 +1344,6 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
         a2 = a2.view(token_num, topk, -1)
-    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
-        # a16wi4: checked after per_1x32 paths; stage1 output is bf16, no inter-stage quantization
-        a2_scale = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
         a2_scale = (
@@ -1589,6 +1589,17 @@ def torch_moe_stage1(
         hidden_states = hidden_states * a1_scale
     elif quant_type == QuantType.No:
         pass
+    elif quant_type == QuantType.per_1x32 and w1_scale is not None and w1_scale.dtype == dtypes.bf16:
+        # a16wi4: groupwise dequant int4 weights with scale [E, K//32, N]
+        group_size = 32
+        num_groups = model_dim // group_size
+        w1_shape = w1.shape
+        # w1: [E, N, K] -> apply scale per group of K
+        w1 = w1.reshape(E, N, num_groups, group_size) * w1_scale.reshape(
+            E, num_groups, N
+        ).permute(0, 2, 1).unsqueeze(-1)
+        w1 = w1.reshape(w1_shape)
+        # activations are bf16, no scaling needed
     elif quant_type == QuantType.per_1x32:
         w1_shape = w1.shape
         w1 = w1.view(E, N, model_dim // 32, 32) * w1_scale.view(
@@ -1604,17 +1615,6 @@ def torch_moe_stage1(
                 a1_shape[0], a1_shape[1] // 32, 1
             )
         hidden_states = hidden_states.view(a1_shape)
-    elif quant_type == QuantType.per_1x32 and w1_scale is not None and w1_scale.dtype == dtypes.bf16:
-        # a16wi4: groupwise dequant int4 weights with scale [E, K//32, N]
-        group_size = 32
-        num_groups = model_dim // group_size
-        w1_shape = w1.shape
-        # w1: [E, N, K] -> apply scale per group of K
-        w1 = w1.view(E, N, num_groups, group_size) * w1_scale.view(
-            E, num_groups, N
-        ).permute(0, 2, 1).unsqueeze(-1)
-        w1 = w1.view(w1_shape)
-        # activations are bf16, no scaling needed
     else:
         assert False, f"Unsupported quant_type: {quant_type}"
 
@@ -1704,6 +1704,18 @@ def torch_moe_stage2(
             w2_scale.shape[0], w2.shape[1] // 128, 1, w2.shape[2] // 128, 1
         )
         w2 = w2.view(w2_shape)
+    elif quant_type == QuantType.per_1x32 and w2_scale is not None and w2_scale.dtype == dtypes.bf16:
+        # a16wi4: groupwise dequant int4 weights with scale
+        # w2: [E, model_dim, inter_dim], w2_scale is [E, inter_dim//32, model_dim]
+        group_size = 32
+        num_groups = inter_dim // group_size
+        w2_shape = w2.shape
+        # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
+        w2 = w2.reshape(E, model_dim, num_groups, group_size) * w2_scale.reshape(
+            E, num_groups, model_dim
+        ).permute(0, 2, 1).unsqueeze(-1)
+        w2 = w2.reshape(w2_shape)
+        # activations are bf16, no scaling
     elif quant_type == QuantType.per_1x32:
         a2_shape = hidden_states.shape
         if a2_scale is not None:
@@ -1719,18 +1731,6 @@ def torch_moe_stage2(
             E, model_dim, inter_dim // 32, 1
         )
         w2 = w2.view(w2_shape)
-    elif quant_type == QuantType.per_1x32 and w2_scale is not None and w2_scale.dtype == dtypes.bf16:
-        # a16wi4: groupwise dequant int4 weights with scale
-        # w2: [E, model_dim, inter_dim], w2_scale is [E, inter_dim//32, model_dim]
-        group_size = 32
-        num_groups = inter_dim // group_size
-        w2_shape = w2.shape
-        # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
-        w2 = w2.view(E, model_dim, num_groups, group_size) * w2_scale.view(
-            E, num_groups, model_dim
-        ).permute(0, 2, 1).unsqueeze(-1)
-        w2 = w2.view(w2_shape)
-        # activations are bf16, no scaling
 
     out = torch.zeros(
         (token_num, topk, model_dim),
