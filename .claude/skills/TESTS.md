@@ -62,7 +62,7 @@ Recommended prompts (one per skill):
 | `aiter-triton-kernel` | "Add a Triton a8w8 GEMM kernel under `aiter/ops/triton/gemm`." | `get_gemm_config`, `make_kernel_repr`, arch string `gfx9xx`, config CSV with `M_LEQ_x/M_GEQ_x/any`. |
 | `aiter-ck-tune` | "Tune a8w8 GEMM for shape (8192, 8192, 8192) on gfx942." | Edits `aiter/configs/untuned_gemm_a8w8.csv`, runs `csrc/ck_gemm_a8w8/gemm_a8w8_tune.py`, then `AITER_REBUILD=1`. |
 | `debug-aiter-op` | "`op_tests/test_rmsnorm.py` returns NaN for a new shape." | Systematic order: backend check → stride → dtype → all-ones test → logging env vars. |
-| `benchmark-aiter-op` | "Benchmark `aiter.gemm_a16w16` at 4096³ vs `torch.matmul`, give roofline." | Uses `@perftest(num_rotate_args=…)`, reports TFLOPS and % of peak. |
+| `benchmark-aiter-op` | "Benchmark `aiter.gemm_a16w16` at 4096³ vs `torch.matmul`, give roofline." | Uses the right idiom for the target file — `triton.testing.do_bench` for bench drivers, `@perftest(num_rotate_args=…)` inside `op_tests/test_*.py`; reports TFLOPS and % of peak. |
 | `aiter-moe-tuning` | "Tune Mixtral-8x7B fused MoE in bf16 on gfx942." | Edits `aiter/configs/untuned_fmoe.csv`, runs `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py`, then `AITER_REBUILD=1` and `op_tests/test_moe.py::test_fmoe`. |
 | `format-code` | "Format the 5 files I just edited before committing." | `black==26.3.0`, `ruff==0.15.7`, `clang-format-18`, copyright-year bump, `git diff` filtering. |
 | `capture-kernel-trace` | "Capture an ATT trace of `aiter.gemm_a16w16`." | `rocprofv3 --att --kernel-include-regex ... --kernel-iteration-range "[1]"`. |
@@ -88,3 +88,38 @@ should be pruned or merged into a neighboring skill.
   gets renamed again, the MoE skill needs updating).
 - **Layer 3** whenever you rewrite a skill substantially, or whenever
   a teammate reports "the agent didn't help with X".
+
+## Baseline — Layer 3 A/B results (2026-04, rev: PR #2769)
+
+Raw A/B results from two rounds of parallel `explore`-subagent trials
+(constrained `WITHOUT` vs skill-reading `WITH`, scored by marker count +
+qualitative delta). Prompts are the ones in the table above; full
+transcripts live in the PR conversation.
+
+| Skill                    | Markers WITHOUT | Markers WITH | Δ  | Qualitative delta | Verdict |
+|--------------------------|:---------------:|:------------:|:--:|-------------------|---------|
+| `build-aiter`            | 3/3             | 3/3          | 0  | WITHOUT picked a better `PREBUILD_KERNELS` mode (the skill's recommendation was sub-optimal). | Slimmed to a pointer+gotchas hook. |
+| `aiter-add-operator`     | 3/5             | 3/5          | 0  | WITH produced measurably cleaner/idiomatic code: correct headers, `extra_include` in JSON, parameterized tests. | Kept. Cross-file workflow is the real value. |
+| `aiter-ck-tune`          | 3/3             | 3/3          | 0  | Both agents independently matched the `csrc/ck_gemm_a8w8/README.md`. | Slimmed to a pointer+gotchas hook. |
+| `aiter-triton-kernel`    | 4/4             | 4/4          | 0  | TIE on markers; WITH avoided re-exploring `gemm_a8w8` as a template (faster). | Kept as-is. |
+| `benchmark-aiter-op`     | 2/3             | 2/3          | 0  | **Both agents ignored the skill's `@perftest` recommendation** and used `triton.testing.do_bench` instead, because that's what every driver in `op_tests/op_benchmarks/triton/` actually uses. | Skill rewritten to cover both idioms and steer agents to the one matching the host file. |
+| `debug-aiter-op`         | 4/5             | 5/5          | +1 | WITH answer is strictly more structured (explicit order: shape-boundary → contiguity → dtype AT_DISPATCH → all-ones → logging). | Kept. Small but real win. |
+
+Untested in this round (all cross-file workflows, deferred to next round):
+`aiter-jit-debug`, `aiter-moe-tuning`, `capture-kernel-trace`,
+`kernel-trace-analysis`, `bisect-perf-regression`, `format-code`.
+
+### Key takeaways / skill-design rules learned
+
+1. A skill that just restates a single authoritative doc (`setup.py`,
+   per-op `README.md`) adds zero marker-count and risks drifting out of
+   sync. Collapse it into a "pointer + gotchas" hook.
+2. A skill that bridges **multiple files / tools** (codegen + JIT config +
+   Python wrapper + test; trace capture → analysis → PC-mapping; bench
+   driver + rooflines + comparison) reliably lifts either marker count
+   *or* answer structure. Keep those.
+3. When a skill contradicts live code, the agent follows the code and
+   ignores the skill — so contradictions show up as a `Δ=0` even when
+   the skill was read. Use that as a correctness signal. (This round's
+   `benchmark-aiter-op` `@perftest`-vs-`do_bench` mismatch was caught
+   exactly this way.)

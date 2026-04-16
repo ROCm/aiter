@@ -2,36 +2,40 @@
 name: benchmark-aiter-op
 description: >
  Benchmark an AITER operator and compare it against a reference (torch) or an
- alternative backend (CK vs Triton vs ASM vs FlyDSL). Covers `@perftest` usage
- from `aiter/test_common.py`, the prebuilt benchmark drivers under
- `op_tests/op_benchmarks/triton/bench_*.py` and `op_tests/op_benchmarks/hip/`,
- L2 cache rotation, correct warmup, and producing a roofline-style report
- (latency / TFLOPS / bandwidth / % of peak). Use when the user asks to
- benchmark an op, compare backends, generate a perf table for a PR, or
- reproduce a published number.
+ alternative backend (CK vs Triton vs ASM vs FlyDSL). Covers the two parallel
+ AITER benchmarking idioms — `@perftest` from `aiter/test_common.py` (used
+ inside `op_tests/test_*.py`) and `triton.testing.do_bench` (used by the
+ dedicated drivers in `op_tests/op_benchmarks/triton/bench_*.py` and
+ `op_tests/op_benchmarks/hip/`) — plus L2 cache rotation, correct warmup,
+ and producing a roofline-style report (latency / TFLOPS / bandwidth / %
+ of peak). Use when the user asks to benchmark an op, compare backends,
+ generate a perf table for a PR, or reproduce a published number.
  Usage: /benchmark-aiter-op  [--dtype ] [--shape M,N,K]
 allowed-tools: Bash Read Edit Grep Glob
 ---
 
 # Benchmark an AITER Operator
 
-AITER has three layers of benchmarking:
+AITER has two parallel benchmarking idioms — **pick the one that matches
+the host file**, don't mix them:
 
-1. **`op_tests/test_*.py`** — correctness first, includes `@perftest` timing
-   next to each call. Good for quick A/B checks.
-2. **`op_tests/op_benchmarks/hip/` and `.../triton/`** — dedicated bench
-   drivers with richer sweeps. Use these for PR tables.
-3. **`rocprofv3`** — instruction-level traces. Covered by the
-   `capture-kernel-trace` and `kernel-trace-analysis` skills.
+| Use case | Idiom | Where it lives |
+|----------|-------|----------------|
+| Correctness tests with a quick perf number | `@perftest` | `op_tests/test_*.py` |
+| Dedicated bench driver for a PR table | `triton.testing.do_bench` | `op_tests/op_benchmarks/triton/bench_*.py`, `op_tests/op_benchmarks/hip/` |
+| Instruction-level hotspot analysis | `rocprofv3` ATT | See `capture-kernel-trace` / `kernel-trace-analysis` |
+
+Every existing driver under `op_tests/op_benchmarks/triton/` uses
+`triton.testing.do_bench`. **Do not introduce `@perftest` there** — it
+breaks the shape / backend / json-export scaffolding the drivers share.
 
 ## 1. Pick the right entry point
 
 | Goal | Command |
 |------|---------|
-| Quick latency of an op against reference | `python3 op_tests/test_.py` |
-| Full sweep for PR | `python3 op_tests/op_benchmarks/triton/bench_.py` |
-| Compare CK vs Triton vs ASM for the same shape | Call each backend from a small driver script (see §4) |
-| Instruction-level hotspot analysis | Capture rocprof ATT — see `capture-kernel-trace` |
+| Quick latency of an op next to a correctness check | `python3 op_tests/test_<op>.py` |
+| Full sweep for PR | `python3 op_tests/op_benchmarks/triton/bench_<op>.py` |
+| Compare CK vs Triton vs ASM for the same shape | Small ad-hoc driver — see §4 |
 
 List available bench drivers:
 
@@ -44,7 +48,7 @@ Existing drivers include `bench_gemm_a8w8.py`, `bench_gemm_a16w16.py`,
 `bench_rmsnorm.py`, `bench_extend_attention.py`, `bench_fp8_mqa_logits.py`,
 `bench_topk_topp_sampling.py`, and many more.
 
-## 2. Using `@perftest`
+## 2. Idiom A — `@perftest` (inside `op_tests/test_*.py`)
 
 `aiter/test_common.py` provides `@perftest(num_iters=101, num_warmup=2,
 testGraph=False, num_rotate_args=0, needTrace=False)`. Decorated functions
@@ -82,32 +86,55 @@ For memory-bound ops (normalization, quant, elementwise) `num_rotate_args=0`
 (auto-computed based on free memory + L2 size) is usually correct. The
 default logic picks enough rotations to flush L2 between iterations.
 
-## 3. Structure of a bench driver
+## 3. Idiom B — `triton.testing.do_bench` (inside `op_tests/op_benchmarks/.../bench_*.py`)
+
+`do_bench` is what every driver under `op_tests/op_benchmarks/triton/`
+actually uses (grep any file there to confirm). It handles warmup and
+returns median ms per call.
+
+```python
+import torch
+import triton
+import triton.testing
+
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+
+M = N = K = 4096
+x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+w = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+
+ms = triton.testing.do_bench(
+    lambda: gemm_a16w16(x, w),
+    warmup=25,   # ms of warmup (NOT number of iters)
+    rep=100,     # ms of timed region
+    return_mode="median",
+)
+
+flops = 2 * M * N * K
+print(f"{ms*1e3:.1f} us   {flops / (ms*1e-3) / 1e12:.1f} TFLOPS")
+```
+
+Key flags: `warmup` and `rep` are in **milliseconds**, not iterations.
+Typical values are `warmup=25, rep=100`. For a full worked example,
+read `op_tests/op_benchmarks/triton/bench_gemm_a16w16.py`.
+
+## 4. Structure of a bench driver
 
 The existing drivers under `op_tests/op_benchmarks/triton/` follow this
-pattern:
+pattern (built on `do_bench`, reusing shared argparse + json helpers in
+`op_tests/op_benchmarks/triton/utils/`):
 
 ```python
 # op_tests/op_benchmarks/triton/bench_my_op.py
 import argparse, json, torch
+import triton.testing
 from aiter.ops.triton.category.my_op import my_op
-from aiter.test_common import perftest, checkAllclose
 
 
 def gen_inputs(M, N, K, dtype):
     x = torch.randn(M, K, dtype=dtype, device="cuda")
     w = torch.randn(N, K, dtype=dtype, device="cuda")
     return x, w
-
-
-@perftest(num_rotate_args=5)
-def bench_aiter(x, w):
-    return my_op(x, w)
-
-
-@perftest(num_rotate_args=5)
-def bench_ref(x, w):
-    return x @ w.T
 
 
 def main():
@@ -121,19 +148,25 @@ def main():
     M, N, K = map(int, args.shape.split(","))
     x, w = gen_inputs(M, N, K, dtype)
 
-    y_aiter, us_aiter = bench_aiter(x, w)
-    y_ref,   us_ref   = bench_ref(x, w)
-    checkAllclose(y_aiter, y_ref, rtol=1e-2, atol=1e-2)
+    # Correctness first
+    y_aiter = my_op(x, w)
+    y_ref   = x @ w.T
+    torch.testing.assert_close(y_aiter, y_ref, rtol=1e-2, atol=1e-2)
+
+    ms_aiter = triton.testing.do_bench(lambda: my_op(x, w), warmup=25, rep=100,
+                                       return_mode="median")
+    ms_ref   = triton.testing.do_bench(lambda: x @ w.T,    warmup=25, rep=100,
+                                       return_mode="median")
 
     flops   = 2 * M * N * K
     bytes_  = (M*K + N*K + M*N) * x.element_size()
-    tflops  = flops / us_aiter / 1e6
-    bw      = bytes_ / us_aiter / 1e3   # GB/s
+    tflops  = flops / (ms_aiter * 1e-3) / 1e12
+    bw      = bytes_ / (ms_aiter * 1e-3) / 1e9   # GB/s
 
     row = {"M": M, "N": N, "K": K, "dtype": args.dtype,
-           "us_aiter": us_aiter, "us_ref": us_ref,
+           "us_aiter": ms_aiter * 1e3, "us_ref": ms_ref * 1e3,
            "tflops": tflops, "bw_GBps": bw,
-           "speedup": us_ref / us_aiter}
+           "speedup": ms_ref / ms_aiter}
     print(json.dumps(row, indent=2))
     if args.json:
         with open(args.json, "a") as f: f.write(json.dumps(row) + "\n")
@@ -151,7 +184,7 @@ for mnk in 1024,1024,1024 2048,2048,2048 4096,4096,4096 8192,8192,8192; do
 done
 ```
 
-## 4. Comparing backends (CK vs Triton vs ASM vs torch)
+## 5. Comparing backends (CK vs Triton vs ASM vs torch)
 
 Many AITER ops have multiple backends selected by a Python dispatcher. To
 force a particular backend, call it directly:
@@ -180,7 +213,10 @@ y_ref,  us_ref  = _torch(*inputs)
 Report: pick whichever wins at a given shape; the winner often changes between
 small-M and large-M regimes.
 
-## 5. Roofline numbers
+Inside a dedicated bench driver, swap the `@perftest` calls above for
+`triton.testing.do_bench` calls (same lambdas).
+
+## 6. Roofline numbers
 
 For a PR table, report at minimum:
 
@@ -206,7 +242,7 @@ e.g. MI300X FP16: 380 / 5.3 = ~72 FLOP/byte
 Anything below ~72 FLOP/byte is memory-bound → report GB/s utilization.
 Above → report TFLOPS utilization.
 
-## 6. PR-ready table format
+## 7. PR-ready table format
 
 Lifted from `CONTRIBUTE.md`:
 
@@ -223,19 +259,20 @@ Lifted from `CONTRIBUTE.md`:
 - Kernel: `_gemm_a16_w16_kernel_BLOCK_SIZE_M_64_BLOCK_SIZE_N_128_...` (from trace)
 ```
 
-## 7. Typical gotchas
+## 8. Typical gotchas
 
 | Issue | Fix |
 |-------|-----|
-| First call is 10–100x slower | JIT / autotune compile. Use warmup iters, and ignore the first call in manual timers. |
-| Two consecutive benches give very different numbers | L2 pollution — set `num_rotate_args=5` (or higher) on `@perftest`. |
+| First call is 10–100x slower | JIT / autotune compile. Use warmup iters, and ignore the first call in manual timers. `do_bench` already warms up by default. |
+| Two consecutive benches give very different numbers | L2 pollution — for `@perftest` set `num_rotate_args=5` (or higher); for `do_bench` pass `grad_to_none=[...]` or rotate inputs manually. |
+| Mixed `@perftest` + `do_bench` in one file | Don't. Dedicated bench drivers use `do_bench`; unit-test files use `@perftest`. Timing semantics differ (`warmup`/`rep` are iters vs ms). |
 | Torch ref is faster than AITER at small M | Expected; AITER kernels are tuned for throughput, torch calls cuBLAS which has a highly tuned small-M path. |
 | Numbers vary ±5% between runs | Normal GPU jitter. Run 3 times and report the median. |
 | `torch.profiler` prints are empty | Need `needTrace=True` on `@perftest`, OR wrap manually in `torch.profiler.profile(...)`. |
 | Bench driver crashes on first iter | Correctness bug; run the `test_.py` first to confirm. |
 | Suspicious 2–3x speedup | Check that both paths produce matching output with `checkAllclose`. |
 
-## 8. When to escalate to rocprofv3
+## 9. When to escalate to rocprofv3
 
 If AITER is slower than expected **and** `checkAllclose` passes, collect an
 ATT trace and hand off to `kernel-trace-analysis`:
