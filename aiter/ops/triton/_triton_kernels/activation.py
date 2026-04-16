@@ -78,7 +78,7 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
 @triton.jit
 def _act_mul_and_dynamic_mxfp4_quant_kernel(
     x_ptr,
-    x_fp4_ptr,
+    x_out_ptr,
     bs_ptr,
     stride_x_m_in,
     stride_x_n_in,
@@ -100,6 +100,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
     scaleM_pad: tl.constexpr,
     scaleN_pad: tl.constexpr,
     SHUFFLE: tl.constexpr,
+    DO_QUANT: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -134,61 +135,74 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             ).to(tl.float32)
 
         x = _apply_activation_from_str(a, ACTIVATION) * b
-
-        out_tensor, bs_e8m0 = _mxfp4_quant_op(
-            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-        )
-
-        out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
-        out_offs = (
-            out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
-        )
-
-        if EVEN_M_N:
-            tl.store(x_fp4_ptr + out_offs, out_tensor)
-        else:
-            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
-            tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
-
-        bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-        if SHUFFLE:
-            bs_offs_0 = bs_offs_m[:, None] // 32
-            bs_offs_1 = bs_offs_m[:, None] % 32
-            bs_offs_2 = bs_offs_1 % 16
-            bs_offs_1 = bs_offs_1 // 16
-            bs_offs_3 = bs_offs_n[None, :] // 8
-            bs_offs_4 = bs_offs_n[None, :] % 8
-            bs_offs_5 = bs_offs_4 % 4
-            bs_offs_4 = bs_offs_4 // 4
-            bs_offs = (
-                bs_offs_1
-                + bs_offs_4 * 2
-                + bs_offs_2 * 2 * 2
-                + bs_offs_5 * 2 * 2 * 16
-                + bs_offs_3 * 2 * 2 * 16 * 4
-                + bs_offs_0 * 2 * 16 * scaleN
+        if DO_QUANT:
+            out_tensor, bs_e8m0 = _mxfp4_quant_op(
+                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
             )
-            bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-            bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[
-                None, :
-            ]
-            bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
-        else:
-            bs_offs = (
-                bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-            )
-            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-        if EVEN_M_N:
-            tl.store(bs_ptr + bs_offs, bs_e8m0)
-        else:
 
-            tl.store(
-                bs_ptr + bs_offs,
-                bs_e8m0,
-                mask=bs_mask,
+            out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
+            out_offs = (
+                out_offs_m[:, None] * stride_x_fp4_m
+                + out_offs_n[None, :] * stride_x_fp4_n
             )
+
+            if EVEN_M_N:
+                tl.store(x_out_ptr + out_offs, out_tensor)
+            else:
+                out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
+                tl.store(x_out_ptr + out_offs, out_tensor, mask=out_mask)
+
+            bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+            if SHUFFLE:
+                bs_offs_0 = bs_offs_m[:, None] // 32
+                bs_offs_1 = bs_offs_m[:, None] % 32
+                bs_offs_2 = bs_offs_1 % 16
+                bs_offs_1 = bs_offs_1 // 16
+                bs_offs_3 = bs_offs_n[None, :] // 8
+                bs_offs_4 = bs_offs_n[None, :] % 8
+                bs_offs_5 = bs_offs_4 % 4
+                bs_offs_4 = bs_offs_4 // 4
+                bs_offs = (
+                    bs_offs_1
+                    + bs_offs_4 * 2
+                    + bs_offs_2 * 2 * 2
+                    + bs_offs_5 * 2 * 2 * 16
+                    + bs_offs_3 * 2 * 2 * 16 * 4
+                    + bs_offs_0 * 2 * 16 * scaleN
+                )
+                bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+                bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[
+                    None, :
+                ]
+                bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+            else:
+                bs_offs = (
+                    bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+                )
+                bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+            if EVEN_M_N:
+                tl.store(bs_ptr + bs_offs, bs_e8m0)
+            else:
+                tl.store(
+                    bs_ptr + bs_offs,
+                    bs_e8m0,
+                    mask=bs_mask,
+                )
+        else:
+            out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            out_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            out_offs = (
+                out_offs_m[:, None] * stride_x_fp4_m
+                + out_offs_n[None, :] * stride_x_fp4_n
+            )
+            x_out = x.to(x_out_ptr.dtype.element_ty)
+            if EVEN_M_N:
+                tl.store(x_out_ptr + out_offs, x_out)
+            else:
+                out_mask = (out_offs_m < M)[:, None] & (out_offs_n < N)[None, :]
+                tl.store(x_out_ptr + out_offs, x_out, mask=out_mask)
 
 
 @triton.heuristics(
@@ -199,7 +213,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 @triton.jit
 def _act_mul_and_dynamic_fp8_group_quant_kernel(
     x_ptr,
-    x_fp8_ptr,
+    x_out_ptr,
     x_bs_ptr,
     stride_x_m_in,
     stride_x_n_in,
@@ -215,6 +229,7 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
     EVEN_N: tl.constexpr,
+    DO_QUANT: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -245,31 +260,41 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
 
     x = _apply_activation_from_str(a, ACTIVATION) * b
 
-    x_fp8, x_bs = _fp8_quant_op(
-        x, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
-    )
-    x_fp8 = tl.ravel(x_fp8)
-    x_bs = tl.ravel(x_bs)
-
     out_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     out_offs = pid_m * stride_x_fp8_m + out_offs_n * stride_x_fp8_n
 
-    if EVEN_N:
-        tl.store(x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.dtype.element_ty))
-    else:
-        out_mask = out_offs_n < N
-        tl.store(
-            x_fp8_ptr + out_offs, x_fp8.to(x_fp8_ptr.dtype.element_ty), mask=out_mask
+    if DO_QUANT:
+        x_fp8, x_bs = _fp8_quant_op(
+            x, 1, BLOCK_SIZE_N, QUANT_BLOCK_SIZE, DTYPE_MAX, DTYPE_MIN
         )
+        x_fp8 = tl.ravel(x_fp8)
+        x_bs = tl.ravel(x_bs)
 
-    bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-    bs_offs = pid_m * stride_bs_m + bs_offs_n * stride_bs_n
-    if EVEN_N:
-        tl.store(x_bs_ptr + bs_offs, x_bs.to(x_bs_ptr.dtype.element_ty))
+        if EVEN_N:
+            tl.store(x_out_ptr + out_offs, x_fp8.to(x_out_ptr.dtype.element_ty))
+        else:
+            out_mask = out_offs_n < N
+            tl.store(
+                x_out_ptr + out_offs,
+                x_fp8.to(x_out_ptr.dtype.element_ty),
+                mask=out_mask,
+            )
+
+        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
+        bs_offs = pid_m * stride_bs_m + bs_offs_n * stride_bs_n
+        if EVEN_N:
+            tl.store(x_bs_ptr + bs_offs, x_bs.to(x_bs_ptr.dtype.element_ty))
+        else:
+            bs_mask = bs_offs_n < scaleN
+            tl.store(
+                x_bs_ptr + bs_offs,
+                x_bs.to(x_bs_ptr.dtype.element_ty),
+                mask=bs_mask,
+            )
     else:
-        bs_mask = bs_offs_n < scaleN
-        tl.store(
-            x_bs_ptr + bs_offs,
-            x_bs.to(x_bs_ptr.dtype.element_ty),
-            mask=bs_mask,
-        )
+        x_out = x.to(x_out_ptr.dtype.element_ty)
+        if EVEN_N:
+            tl.store(x_out_ptr + out_offs, x_out)
+        else:
+            out_mask = out_offs_n < N
+            tl.store(x_out_ptr + out_offs, x_out, mask=out_mask)
