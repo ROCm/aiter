@@ -400,7 +400,7 @@ def _moe_gemm_a4w4_gfx1250(
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
         BLOCKED_LAYOUT_W_SCALES: gl.constexpr = gl.BlockedLayout(
-            [1, 16], [1, 32], [NUM_WARPS, 1], [1, 0]
+            [1, 8], [1, 32], [1, NUM_WARPS], [1, 0]
         )
         offs_w_n_scale = pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, layout=gl.SliceLayout(1, BLOCKED_LAYOUT_W_SCALES))
         offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, layout=gl.SliceLayout(0, BLOCKED_LAYOUT_W_SCALES))
