@@ -50,6 +50,9 @@ from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_ma
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
 from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
 from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
+from op_tests.op_benchmarks.triton.bench_unified_attention import (
+    main as bench_unified_attention_main,
+)
 
 
 def disable_aiter_logs() -> None:
@@ -74,6 +77,7 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "rope": bench_rope_main,
     "mha": bench_mha_main,
     "mla": bench_mla_main,
+    "unified_attention": bench_unified_attention_main,
 }
 
 # Shape dicts from model_shapes.json (int, str values)
@@ -377,13 +381,17 @@ class MhaKernelHandler(KernelHandler):
         # bshd (batch-seq-head-dim) - fwd
         # thd (token-head-dim) - fwd_varlen with equal seq lens
         fn = "fwd_varlen" if self._mha_layout == "thd" else "fwd"
+        sliding_window_left = shape.get("sliding_window_left", -1)
+        sink = shape.get("sink", None)
         args = (
             f"-fn {fn} -causal true --dtype bf16 -b {self._batch_size} "
             f"-hq {shape['hq']} -hk {shape['hkv']} -sq {self._seq_len} -sk {self._seq_len} "
-            f"-d {shape['dqk']} -dv {shape['dv']} -metric {self._metric}"
+            f"-d {shape['dqk']} -dv {shape['dv']} --window-size-left {sliding_window_left} -metric {self._metric}"
         )
         if fn == "fwd_varlen":
             args += " -equal_seqlens"
+        if sink:
+            args += " -sink"
         return args
 
     def parse_stdout(self, stdout: str) -> float:
@@ -416,6 +424,8 @@ class MhaKernelHandler(KernelHandler):
             "dqk": shape["dqk"],
             "dv": shape["dv"],
             "mha_layout": self._mha_layout,
+            "sink": shape.get("sink", "false"),
+            "sliding_window": shape.get("sliding_window_left", None),
             self._metric: bench_result,
         }
 
@@ -465,6 +475,57 @@ class MlaKernelHandler(KernelHandler):
         }
 
 
+class UnifiedAttnKernelHandler(KernelHandler):
+    """Handler for unified attention benchmarks (bench_unified_attention.py)."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        result = []
+        for shape in shapes:
+            s = shape.copy()
+            self._shard_keys(s, ["hq", "hkv"])
+            result.append(s)
+        return result
+
+    def build_args(self) -> str:
+        shape = self._shape
+        block_size = int(shape.get("block_size", 0))
+        sliding_window = shape.get("sliding_window", None)
+        args = (
+            f"-b {self._batch_size} -hq {shape['hq']} -hk {shape['hkv']} "
+            f"-d {shape['dqk']} -dv {shape['dv']} -sq {self._seq_len} -sk {self._seq_len} "
+            f"-block_size {block_size} --metric {self._metric}"
+        )
+        if sliding_window is not None:
+            args += f" -sliding_window {sliding_window}"
+        return args
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line.split() for line in stdout.strip().splitlines() if line.strip()]
+        if len(lines) < 3:
+            raise ValueError(
+                f"Unexpected unified_attention bench output: expected at least 3 lines, got {len(lines)}"
+            )
+        data = lines[2]
+        if len(data) < 10:
+            raise ValueError(f"Unexpected unified_attention bench data line: {data!r}")
+        return float(data[9])
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": self._seq_len,
+            "hq": shape["hq"],
+            "hkv": shape["hkv"],
+            "dqk": shape["dqk"],
+            "dv": shape["dv"],
+            "sliding_window": shape.get("sliding_window", None),
+            self._metric: bench_result,
+        }
+
+
 _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: "moe" in k, MoeKernelHandler),
     (lambda k: "gemm" in k and "moe" not in k, GemmKernelHandler),
@@ -472,6 +533,7 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: k == "rope", RopeKernelHandler),
     (lambda k: k == "mha", MhaKernelHandler),
     (lambda k: k == "mla", MlaKernelHandler),
+    (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
 
 

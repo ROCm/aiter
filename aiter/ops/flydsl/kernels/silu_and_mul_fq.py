@@ -27,7 +27,7 @@ Each workgroup:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, vector, range_constexpr
+from flydsl.expr import arith, vector, range_constexpr, const_expr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -203,7 +203,7 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
 
                     vec_bf16_ty = T.vec(VEC, T.bf16)
                     vec_f32_ty = T.vec(VEC, f32)
-                    if vec_dw == 1:
+                    if const_expr(vec_dw == 1):
                         vec1_i32_ty = T.vec(1, i32)
                         gate_vec = vector.from_elements(vec1_i32_ty, [gate_raw])
                         up_vec = vector.from_elements(vec1_i32_ty, [up_raw])
@@ -267,12 +267,12 @@ def build_silu_and_mul_fq_module(inter_dim: int, topk: int):
                         )
 
                     _pack_bytes = VEC // 2
-                    if _pack_bytes == 1:
+                    if const_expr(_pack_bytes == 1):
                         store_val = arith.TruncIOp(T.i8, packed_i32)
                         buffer_ops.buffer_store(
                             store_val, out_rsrc, fp4_byte_off, offset_is_bytes=True
                         )
-                    elif _pack_bytes == 2:
+                    elif const_expr(_pack_bytes == 2):
                         store_val = arith.TruncIOp(T.i16, packed_i32)
                         buffer_ops.buffer_store(
                             store_val, out_rsrc, fp4_byte_off, offset_is_bytes=True
