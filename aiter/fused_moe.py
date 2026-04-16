@@ -187,7 +187,7 @@ def fused_moe_fake(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = 0,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
@@ -221,7 +221,7 @@ def fused_moe_(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = 0,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
@@ -909,6 +909,12 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if not is_shuffled and not run_1stage:
+            logger.warning(
+                f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
+                "Tuned kernels are optimized for preshuffled weights (preshuffle_on). "
+                "Running with preshuffle_off may produce incorrect results."
+            )
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(

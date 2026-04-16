@@ -22,7 +22,7 @@ struct MlaMetadataV12Traits
 };
 
 template <typename Traits>
-__launch_bounds__(ck_tile::get_warp_size(), 1) __global__
+__launch_bounds__(opus::get_warp_size(), 1) __global__
     void kn_get_mla_metadata_v1_2(MlaMetadataV1KernelParameter params)
 {
     using QoState = QoState<Traits>;
@@ -69,12 +69,12 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         }
     };
 
-    const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t lane_idx = opus::lane_id();
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
     int32_t sum_blocks = 0;
-    for(int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
+    for(int32_t bid = lane_idx; bid < num_batches; bid += opus::get_warp_size())
     {
         const int32_t bid_ori = Traits::kIsSparse ? (bid / ori_seqlen_qo / params.qk_batch_ratio)
                                                   : (bid / params.qk_batch_ratio);
@@ -101,7 +101,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     sum_blocks =
-        aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), ck_tile::get_warp_size()>(
+        aiter::warpReduce<aiter::AddFunctor, decltype(sum_blocks), opus::get_warp_size()>(
             sum_blocks);
 
     if(lane_idx == 0)
@@ -115,7 +115,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     // expected payload handled by each cu part.
-    const int32_t payload = ck_tile::integer_divide_ceil(sum_blocks, params.num_splits) +
+    const int32_t payload = integer_divide_ceil(sum_blocks, params.num_splits) +
                             params.fixed_over_head_num_blocks;
     const int32_t page_size   = params.page_size;
     int32_t curr_batch        = 0; // batch ID of the batch which is under review
@@ -144,7 +144,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
         {
             const int32_t num_qo_tiles = get_num_qo_tiles(curr_batch);
             const int32_t qo_tile_size =
-                ck_tile::integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
+                integer_divide_ceil(qo_state.get_seqlen(curr_batch), num_qo_tiles);
             const int32_t num_kv_blocks = integer_divide_ceil_power2(
                 curr_kv_seqlen, params.kv_granularity, params.kv_granularity_log2);
             const int32_t remain_kv_blocks = num_kv_blocks - curr_kv_block;
@@ -162,7 +162,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     work_info.batch_idx = curr_batch;
                     work_info.qo_start =
                         qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
-                    work_info.qo_end   = ck_tile::min(work_info.qo_start + qo_tile_size,
+                    work_info.qo_end   = opus::min(work_info.qo_start + qo_tile_size,
                                                     qo_state.get_end(curr_batch));
                     work_info.kv_start = curr_kv_begin + (curr_kv_block * params.kv_granularity);
                     if(page_size == 1)
@@ -178,15 +178,15 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                     1;
                             }
                         }
-                        batch_tail       = ck_tile::max(batch_tail, 0);
-                        work_info.kv_end = ck_tile::min(
+                        batch_tail       = opus::max(batch_tail, 0);
+                        work_info.kv_end = opus::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end - batch_tail);
                         if((curr_kv_end - work_info.kv_end < params.tail_done_threshold &&
                             curr_kv_end - work_info.kv_end > 0) ||
                            cur_tail_done)
                         {
-                            work_info.kv_end = ck_tile::min(curr_kv_end - batch_tail, curr_kv_end);
+                            work_info.kv_end = opus::min(curr_kv_end - batch_tail, curr_kv_end);
                         }
                         work_info.kv_offset = curr_kv_end - work_info.kv_end;
                         if(Traits::kIsSparse && params.qk_batch_ratio == 1)
@@ -197,7 +197,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                     }
                     else
                     {
-                        work_info.kv_end = ck_tile::min(
+                        work_info.kv_end = opus::min(
                             work_info.kv_start + (remain_kv_blocks * params.kv_granularity),
                             curr_kv_end);
                         work_info.kv_offset =
@@ -232,7 +232,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                 // record a work in work_info_set
                 if(curr_n_split_idx > 0)
                 {
-                    for(int32_t idx = lane_idx; idx < num_splits; idx += ck_tile::get_warp_size())
+                    for(int32_t idx = lane_idx; idx < num_splits; idx += opus::get_warp_size())
                     {
                         fill_work_info(idx);
                     }
@@ -308,7 +308,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         work_info.batch_idx = curr_batch;
                         work_info.qo_start =
                             qo_state.get_begin(curr_batch) + curr_qo_tile_idx * qo_tile_size;
-                        work_info.qo_end = ck_tile::min(work_info.qo_start + qo_tile_size,
+                        work_info.qo_end = opus::min(work_info.qo_start + qo_tile_size,
                                                         qo_state.get_end(curr_batch));
                         work_info.kv_start =
                             curr_kv_begin + (curr_kv_block * params.kv_granularity);
@@ -325,15 +325,15 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                                                  1;
                                 }
                             }
-                            batch_tail       = ck_tile::max(batch_tail, 0);
-                            work_info.kv_end = ck_tile::min(
+                            batch_tail       = opus::max(batch_tail, 0);
+                            work_info.kv_end = opus::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end - batch_tail);
                             if(curr_kv_end - work_info.kv_end < params.tail_done_threshold)
                             {
                                 cur_tail_done = true;
                                 work_info.kv_end =
-                                    ck_tile::min(curr_kv_end, curr_kv_end - batch_tail);
+                                    opus::min(curr_kv_end, curr_kv_end - batch_tail);
                             }
                             work_info.kv_offset = curr_kv_end - work_info.kv_end;
                             if(Traits::kIsSparse && params.qk_batch_ratio == 1)
@@ -345,7 +345,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
                         }
                         else
                         {
-                            work_info.kv_end = ck_tile::min(
+                            work_info.kv_end = opus::min(
                                 work_info.kv_start + (consuming_blks * params.kv_granularity),
                                 curr_kv_end);
                             work_info.kv_offset =
@@ -384,7 +384,7 @@ __launch_bounds__(ck_tile::get_warp_size(), 1) __global__
     }
 
     for(int32_t i = tot_qo_tiles + lane_idx; i < params.reduce_indptr_size;
-        i += ck_tile::get_warp_size())
+        i += opus::get_warp_size())
     {
         params.p_reduce_indptr[i] = last_reduce_indptr;
     }
@@ -404,7 +404,7 @@ void dispatch_mla_metadata_v1_2_device(const MlaMetadataV1KernelParameter& param
     const int32_t lds_bytes_per_batch =
         sizeof(int32_t) * (QoState<DummyTraits>::is_unique() ? 1 : 2);
     const int32_t max_qo_tiles =
-        kQoSplits ? (ck_tile::integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
+        kQoSplits ? (integer_divide_ceil(max_seqlen_qo, kPackedQoLenPerWg)) : 1;
     const int32_t max_lds_batch_size = lds_size / lds_bytes_per_batch;
 
     if(params.num_batches <= max_lds_batch_size)

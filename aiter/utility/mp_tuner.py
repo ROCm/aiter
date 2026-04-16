@@ -9,6 +9,14 @@ from aiter import dtypes
 from aiter import logger
 
 
+def _is_mapping_error(exc: BaseException) -> bool:
+    return isinstance(exc, KeyError)
+
+
+def _is_accelerator_error(exc: BaseException) -> bool:
+    return type(exc).__name__ == "AcceleratorError"
+
+
 def worker(
     gpu_id,
     info,
@@ -36,7 +44,7 @@ def worker(
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
 
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             print(f"run gpu func warning: info:{info}\t {e}", flush=True)
             us = -1  # not support or error
             max_err_ratio = 1.0
@@ -50,6 +58,8 @@ def worker(
         if us == 0:
             print(f"Warning: try run {max_retries} times, but still get 0!")
         torch.cuda.synchronize()
+        if us == -1 or res is None:
+            return info, us, round(max_err_ratio, 4)
         if ref is not None:
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
@@ -290,60 +300,34 @@ def mp_tuner(
     task_group = []
     # dispatch per shape to one pid
     if shape_grouped:
-        # Group tasks by info_keys (info[0])
         from collections import OrderedDict
 
         info_key_groups = OrderedDict()
-
         for task in tasks:
-            # Extract info_keys from task (task[0] is info, task[0][0] is info_keys)
             info_keys = task[0][0] if task and len(task) > 0 else None
-
             if info_keys not in info_key_groups:
                 info_key_groups[info_keys] = []
             info_key_groups[info_keys].append(task)
 
-        # Convert to list of groups
         task_group = list(info_key_groups.values())
         print(
             f"[Task Grouping] Grouped {len(tasks)} tasks into {len(task_group)} groups by info_keys"
         )
 
-        # Update in_datas to reflect the actual group sizes
-        # Each group gets one entry with (group_size, original_data)
-        new_in_datas = []
-        for group_idx, group in enumerate(task_group):
-            group_size = len(group)
-            # Use the first task's data configuration, or keep original if within bounds
-            if group_idx < len(in_datas):
-                original_data = (
-                    in_datas[group_idx][1] if len(in_datas[group_idx]) > 1 else None
-                )
-            else:
-                original_data = (
-                    in_datas[0][1] if in_datas and len(in_datas[0]) > 1 else None
-                )
-            new_in_datas.append((group_size, original_data))
-
-        in_datas = new_in_datas
-        print(
-            f"[in_datas] Updated to {len(in_datas)} entries with group sizes: {[size for size, _ in in_datas]}"
-        )
+        # in_datas already has one entry per shape from the tuner;
+        # just verify cardinality matches and use it directly.
+        assert len(task_group) == len(
+            in_datas
+        ), f"shape_grouped: group count ({len(task_group)}) != in_datas count ({len(in_datas)})"
+        ref_data_index = list(range(len(task_group)))
     else:
         task_group = tasks
+        import numpy as np
 
-    # to get index of input data for task_group
-    import numpy as np
-
-    ref_data_index = [i for i in range(len(in_datas))]
-    if not shape_grouped:
         cumulative = np.cumsum([size for size, _ in in_datas])
         ref_data_index = np.searchsorted(
             cumulative, np.arange(len(task_group)), side="right"
         )
-    else:
-        # For shape_grouped, each group directly maps to its in_data entry
-        ref_data_index = list(range(len(task_group)))
 
     print(f"Distributing {len(task_group)} task groups across {mp_num} GPUs")
 
@@ -410,7 +394,8 @@ def mp_tuner(
     while remaining_tasks:
         completed_this_round = []
         dummy_failed_tasks = []
-        timeout_count_this_round = 0  # Track timeouts in this round
+        consecutive_timeouts = 0
+        half_gpu = max(1, (mp_num + 1) // 2)
 
         for k, async_result in remaining_tasks:
             try:
@@ -430,6 +415,7 @@ def mp_tuner(
                 # Task completed successfully
                 result_dict[k] = task_result
                 completed_this_round.append((k, async_result))
+                consecutive_timeouts = 0
                 elapsed = time.time() - task_start_times[k]
                 if verbose:
                     print(
@@ -442,7 +428,7 @@ def mp_tuner(
                     elapsed = time.time() - task_start_times[k]
 
                     if elapsed > timeout:
-                        timeout_count_this_round += 1
+                        consecutive_timeouts += 1
 
                         error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
                         print(error_msg)
@@ -459,26 +445,26 @@ def mp_tuner(
                         # Trigger pool restart for timeout (similar to crash)
                         pool_restart_needed = True
 
-                        # If mp_num tasks timed out, all GPUs are likely stuck - restart immediately
-                        if timeout_count_this_round >= mp_num:
+                        # If half the GPUs worth of consecutive timeouts, pool is in bad shape
+                        if consecutive_timeouts >= half_gpu:
                             print(
-                                f"\n[!] {timeout_count_this_round} tasks timed out (all {mp_num} GPUs likely stuck)"
+                                f"\n[!] {consecutive_timeouts} consecutive tasks timed out (>= {half_gpu}/{mp_num} GPUs likely stuck)"
                             )
                             print("[!] Triggering immediate pool restart...\n")
                             break
+                    else:
+                        consecutive_timeouts = 0
 
             except Exception as e:
                 # Check if it's a process crash (segfault, memory fault, etc.)
                 error_type = type(e).__name__
-
-                # Special handling for KeyError (PID mapping issue)
-                is_mapping_error = error_type == "KeyError"
-
+                is_mapping_error = _is_mapping_error(e)
+                is_accelerator_error = _is_accelerator_error(e)
+                # not restart as this is not root use
                 if is_mapping_error:
-                    error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map (triggering pool restart): {error_type} - {e}"
+                    error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
-                    # pool_restart_needed = True
-                elif error_type == "AcceleratorError":
+                elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
                     # more tasks on the same bad GPU. Break immediately to trigger restart and
@@ -497,7 +483,6 @@ def mp_tuner(
                     break
                 else:
                     error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
-                    failed_tasks.append((k, "timeout"))
                     failed_tasks.append((k, "unknown error"))
 
                     # Always record a dummy result so reconstruction never sees an empty list
@@ -523,16 +508,18 @@ def mp_tuner(
         if pool_restart_needed and remaining_tasks:
             if verbose:
                 print(f"\n{'='*60}")
-                print("? Pool restart needed due to crash. Restarting pool...")
-                print(f"Remaining tasks: {len(remaining_tasks)}")
-                print(f"{'='*60}\n")
+                print(
+                    "? Pool restart needed due to crash. Restarting pool...", flush=True
+                )
+                print(f"Remaining tasks: {len(remaining_tasks)}", flush=True)
+                print(f"{'='*60}\n", flush=True)
 
             # Terminate old pool
             try:
                 pool.terminate()
                 pool.join()
             except Exception as e:
-                print(f"Warning: Error during pool termination: {e}")
+                print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
             pool = mp.Pool(processes=parallel_num)
 
@@ -554,7 +541,8 @@ def mp_tuner(
             # Reset pool restart flag
             pool_restart_needed = False
             print(
-                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n"
+                f"Pool restarted. Continuing with {len(remaining_tasks)} remaining tasks...\n",
+                flush=True,
             )
 
         # Small sleep to avoid busy waiting
