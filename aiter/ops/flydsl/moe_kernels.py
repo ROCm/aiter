@@ -552,6 +552,14 @@ def _get_compiled_silu_fq(inter_dim: int, topk: int):
     return build_silu_and_mul_fq_module(inter_dim, topk)
 
 
+@functools.cache
+def _get_compiled_swiglu(inter_dim: int):
+    """Compile and cache the fused swiglu_and_mul kernel (interleaved input)."""
+    from aiter.ops.flydsl.kernels.swiglu_and_mul import build_swiglu_and_mul_module
+
+    return build_swiglu_and_mul_module(inter_dim)
+
+
 # Public API
 
 
@@ -763,9 +771,22 @@ def flydsl_moe_stage1(
             ),
         )
     elif _is_splitk:
-        from aiter.ops.activation import silu_and_mul
+        if act == "swiglu":
+            _swiglu_fn = _get_compiled_swiglu(inter_dim)
+            num_rows = tmp_out.view(-1, inter_dim * 2).shape[0]
+            _run_compiled(
+                _swiglu_fn,
+                (
+                    tmp_out.view(-1, inter_dim * 2),
+                    out.view(-1, inter_dim),
+                    num_rows,
+                    torch.cuda.current_stream(),
+                ),
+            )
+        else:
+            from aiter.ops.activation import silu_and_mul
 
-        silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+            silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
 
     if fuse_fp4_quant:
         from aiter.utility.dtypes import fp8_e8m0

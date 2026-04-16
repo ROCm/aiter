@@ -1855,7 +1855,6 @@ def cktile_moe_stage1(
         else out
     )
 
-    # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
@@ -1877,10 +1876,55 @@ def cktile_moe_stage1(
     )
 
     if split_k > 1:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out)  # TODO: support fp32 splitk
+        is_interleaved = hasattr(torch, "float4_e2m1fn_x2") and w1.dtype == torch.float4_e2m1fn_x2
+        if is_interleaved:
+            inter_dim = out.shape[-1]
+            if activation == ActivationType.Swiglu:
+                from aiter.ops.flydsl.moe_kernels import _get_compiled_swiglu, _run_compiled
+                _swiglu_fn = _get_compiled_swiglu(inter_dim)
+                num_rows = tmp_out.view(-1, inter_dim * 2).shape[0]
+                _run_compiled(
+                    _swiglu_fn,
+                    (
+                        tmp_out.view(-1, inter_dim * 2),
+                        out.view(-1, inter_dim),
+                        num_rows,
+                        torch.cuda.current_stream(),
+                    ),
+                )
+            elif activation == ActivationType.Gelu:
+                NLane = 16
+                N0 = inter_dim // NLane
+                flat = tmp_out.view(-1, N0, 2, NLane)
+                gate = flat[:, :, 0, :].reshape(-1, inter_dim)
+                up = flat[:, :, 1, :].reshape(-1, inter_dim)
+                out.view(-1, inter_dim).copy_(torch.nn.functional.gelu(gate) * up)
+            else:
+                NLane = 16
+                N0 = inter_dim // NLane
+                flat = tmp_out.view(-1, N0, 2, NLane)
+                gate = flat[:, :, 0, :].reshape(-1, inter_dim)
+                up = flat[:, :, 1, :].reshape(-1, inter_dim)
+                out.view(-1, inter_dim).copy_(torch.nn.functional.silu(gate) * up)
         else:
-            aiter.gelu_and_mul(out, tmp_out)
+            if activation == ActivationType.Swiglu:
+                inter_dim = out.shape[-1]
+                from aiter.ops.flydsl.moe_kernels import _get_compiled_swiglu, _run_compiled
+                _swiglu_fn = _get_compiled_swiglu(inter_dim)
+                num_rows = tmp_out.view(-1, inter_dim * 2).shape[0]
+                _run_compiled(
+                    _swiglu_fn,
+                    (
+                        tmp_out.view(-1, inter_dim * 2),
+                        out.view(-1, inter_dim),
+                        num_rows,
+                        torch.cuda.current_stream(),
+                    ),
+                )
+            elif activation == ActivationType.Gelu:
+                aiter.gelu_and_mul(out, tmp_out)
+            else:
+                aiter.silu_and_mul(out, tmp_out)
     return out
 
 
