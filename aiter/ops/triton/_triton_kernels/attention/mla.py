@@ -561,7 +561,10 @@ def _mla_decode_fwd_kernel(
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        S_lora = tl.dot(Q_lora, KV_lora)
+        if SHUFFLED_KV_CACHE:
+            S_lora = tl.dot(Q_lora, KV_lora)
+        else:
+            S_lora = tl.dot(Q_lora, KV_lora.permute((1, 0)))
         S_rope = tl.dot(Q_rope, K_rope)
         S = qk_factor * (S_lora + S_rope)
 
@@ -592,7 +595,10 @@ def _mla_decode_fwd_kernel(
         M = m_j
 
         # acc : (BLOCK_M, KV_LORA_RANK)
-        acc += tl.dot(P.to(KV_lora.dtype), KV_lora.permute((1, 0)))
+        if SHUFFLED_KV_CACHE:
+            acc += tl.dot(P.to(KV_lora.dtype), KV_lora.permute((1, 0)))
+        else:
+            acc += tl.dot(P.to(KV_lora.dtype), KV_lora)
         seq_offset += TILE_SIZE
 
     if kv_scale_ptr is not None:
