@@ -270,8 +270,8 @@ jobs:
           SUMMARY_GPU_ARCHS: ${{ env.GPU_ARCHS }}
           SUMMARY_WHEEL_DIR: dist
         run: |
-          if [ -f scripts/generate_summary.py ]; then
-            python3 scripts/generate_summary.py build
+          if [ -f .github/scripts/generate_summary.py ]; then
+            python3 .github/scripts/generate_summary.py build
           else
             echo "## Build Summary - Python ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
             echo "- **Docker Image**: ${{ matrix.docker_image }}" >> $GITHUB_STEP_SUMMARY

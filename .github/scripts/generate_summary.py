@@ -2,8 +2,8 @@
 """Generate GitHub Actions job summaries for Aiter CI.
 
 Usage:
-    python3 scripts/generate_summary.py build
-    python3 scripts/generate_summary.py promote
+    python3 .github/scripts/generate_summary.py build
+    python3 .github/scripts/generate_summary.py promote
 
 Each mode reads its inputs from environment variables and appends
 Markdown to $GITHUB_STEP_SUMMARY.
