@@ -148,7 +148,9 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
             accumulator_fp8 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
             if ADD_BIAS_FP8:
                 if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
-                    bias_fp8_vals = tl.load(bias_fp8_ptr + offs_b_fp8_n).to(dtype=acc_dtype)
+                    bias_fp8_vals = tl.load(bias_fp8_ptr + offs_b_fp8_n).to(
+                        dtype=acc_dtype
+                    )
                     accumulator_fp8 += bias_fp8_vals[None, :]
 
             for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
@@ -214,7 +216,9 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
             accumulator_bf16 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
             if ADD_BIAS_BF16:
                 if NUM_KSPLIT == 1 or (SKIP_REDUCE and pid_k == 0):
-                    bias_bf16_vals = tl.load(bias_bf16_ptr + offs_b_bf16_n).to(dtype=acc_dtype)
+                    bias_bf16_vals = tl.load(bias_bf16_ptr + offs_b_bf16_n).to(
+                        dtype=acc_dtype
+                    )
                     accumulator_bf16 = accumulator_bf16 + bias_bf16_vals[None, :]
 
             for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
