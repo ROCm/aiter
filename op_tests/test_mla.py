@@ -8,7 +8,8 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes, get_gfx
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -494,12 +495,13 @@ def test_mla(
             seq_info,
             sm_scale,
             use_2d_view=use_2d_view,
+            min_kv_seq_len=ctx_lens,
         )
 
         err = checkAllclose(
             out_ref,
             out_gluon,
-            msg=f"mla_decode-absorb    [golden vs gluon_mfma]: {us_gluon_decode:>8.2f} us......",
+            msg=f"mla_decode-absorb    [golden vs gluon_mla]: {us_gluon_decode:>8.2f} us......",
         )
         return err, us_gluon_decode
 

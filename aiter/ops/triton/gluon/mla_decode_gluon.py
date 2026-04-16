@@ -18,6 +18,7 @@
 #     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
+import torch
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -101,8 +102,6 @@ def _mla_decode_gluon(
         shape=[64, 64]
     )
     dtype = Q_nope.type.element_ty
-    gl.static_assert(dtype == gl.bfloat16)
-    gl.static_assert(Q_pe.type.element_ty == dtype)
     buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
     buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
@@ -136,9 +135,6 @@ def _mla_decode_gluon(
         cga_layout=[],
         shape=[64, 64]
     )
-    gl.static_assert(Kv_c_cache.type.element_ty == dtype)
-    gl.static_assert(K_pe_cache.type.element_ty == dtype)
-
     linear_v: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (16, 0), (32, 0), (64, 0), (128, 0), (256, 0)),
         lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
@@ -463,6 +459,7 @@ def mla_decode_gluon(
     k_pe=None,
     kv_pe_offset=512,
     use_2d_view=True,
+    min_kv_seq_len=1,
 ):
     if k_pe is None:
         k_pe = kv_c
@@ -486,13 +483,13 @@ def mla_decode_gluon(
     assert (
         nhead % 64 == 0
     ), f"mla_decode_gluon requires nhead divisible by 64, got {nhead}"
-    if use_2d_view:
-        seq_len = seq_info.min().item()
-    else:
-        seq_len = (seq_info[1:] - seq_info[:-1]).min().item()
     assert (
-        seq_len > 192
-    ), f"mla_decode_gluon requires seq_len > 192, got min seq_len={seq_len}"
+        min_kv_seq_len > 192
+    ), f"mla_decode_gluon requires min_kv_seq_len > 192, got {min_kv_seq_len}"
+    assert q_nope.dtype == torch.bfloat16, f"q_nope must be bf16, got {q_nope.dtype}"
+    assert q_pe.dtype == torch.bfloat16, f"q_pe must be bf16, got {q_pe.dtype}"
+    assert kv_c.dtype == torch.bfloat16, f"kv_c must be bf16, got {kv_c.dtype}"
+    assert k_pe.dtype == torch.bfloat16, f"k_pe must be bf16, got {k_pe.dtype}"
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
