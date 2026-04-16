@@ -556,7 +556,7 @@ for (
                 inter_dim,
                 args.expert,
                 args.topk,
-                aiter.ActivationType.Swiglu,
+                aiter.ActivationType.Silu,
                 quant_type,
                 aq_dtype,
                 wq_dtype,
