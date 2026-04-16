@@ -653,7 +653,7 @@ def flydsl_moe_stage1(
     _need_quant = fuse_fp4_quant or _splitk_fq
     _need_sort = _need_quant and (fuse_sort_scale or _splitk_fq)
 
-    _sort_block_m = max(32, tile_m)
+    _sort_block_m = tile_m
     _all_blks = sorted_expert_ids.shape[0]
     _dense_blks = (
         min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
