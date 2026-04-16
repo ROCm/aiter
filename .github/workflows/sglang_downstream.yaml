@@ -48,19 +48,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
-            gpu_arch: gfx950
-            sglang_hostname: linux-mi35x-gpu-1
-          - runner: linux-aiter-mi355-1
-            label: MI355
-            gpu_arch: gfx950
-            sglang_hostname: linux-mi35x-gpu-1
+          - runner: aiter-1gpu-runner
+            label: MI325
 
     env:
       SGL_BRANCH: v0.5.10
-      GPU_ARCH: ${{ matrix.gpu_arch }}
-      SGLANG_CI_HOSTNAME_OVERRIDE: ${{ matrix.sglang_hostname }}
+      GPU_ARCH: gfx942
+      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi325-gpu-1
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -112,8 +106,8 @@ jobs:
           import urllib.request
 
           prefixes = [
-              "v0.5.10-rocm700-mi35x-",
-              "v0.5.10rc0-rocm700-mi35x-",
+              "v0.5.10-rocm700-mi30x-",
+              "v0.5.10rc0-rocm700-mi30x-",
           ]
           matches = {prefix: [] for prefix in prefixes}
           patterns = {
@@ -139,12 +133,12 @@ jobs:
                   break
 
           if not chosen_tag:
-              raise SystemExit("No public MI35X SGLang image found for v0.5.10.")
+              raise SystemExit("No public MI30X SGLang image found for v0.5.10.")
 
           image = f"rocm/sgl-dev:{chosen_tag}"
           print(f"Resolved SGLang base image: {image}")
           if chosen_tag.startswith("v0.5.10rc0-"):
-              print("Using v0.5.10rc0 image because no public v0.5.10 MI35X tag was found.")
+              print("Using v0.5.10rc0 image because no public v0.5.10 MI30X tag was found.")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               fh.write(f"SGL_IMAGE={image}\n")
