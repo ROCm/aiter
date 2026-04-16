@@ -834,21 +834,7 @@ def get_2stage_cfgs(
         )
         logger.info("\033[0m")
 
-    def use_cfg():
-        problem_type = (activation, dtype, q_dtype_a, q_dtype_w, q_type)
-        bypass_type = (
-            ActivationType.Silu,
-            dtypes.bf16,
-            dtypes.fp8,
-            dtypes.fp8,
-            QuantType.per_1x128,
-        )
-        if problem_type == bypass_type and (token * topk) <= 128:  # bypass tuned
-            aiter.logger.info("bypass tuned results for fp8 blockscale")
-            return False
-        return True
-
-    cfg = cfg_2stages.get(keys, None) if cfg_2stages and use_cfg() else None
+    cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -991,13 +977,6 @@ def get_2stage_cfgs(
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
-            )
-        elif activation == ActivationType.Swiglu and q_type == QuantType.per_1x32:
-            stage2_func = functools.partial(
-                cktile_moe_stage2,
-                n_pad_zeros=hidden_pad // 64 * 64,
-                k_pad_zeros=intermediate_pad // 128 * 128,
-                activation=activation,
             )
         else:
             stage2_func = functools.partial(
