@@ -41,7 +41,7 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    name: Sglang Integration Test (1 GPU, ${{ matrix.label }})
+    name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
     strategy:
