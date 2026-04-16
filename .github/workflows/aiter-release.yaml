@@ -47,9 +47,7 @@ on:
         type: choice
         options:
           - build-only-aiter
-          - aiter-k8s-build
-          - aiter-mi300-1gpu
-          - aiter-mi325-1gpu
+          - linux-aiter-mi35x-1
           - linux-aiter-mi355-1
           - aiter-1gpu-runner
       release_type:
