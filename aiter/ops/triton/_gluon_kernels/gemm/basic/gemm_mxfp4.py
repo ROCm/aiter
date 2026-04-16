@@ -241,14 +241,14 @@ def gemm_mxfp4_preshuffle_gfx1250(
                 smem_B.index(slot), pred=1)
         load_idx += 1
 
+    # --- 2. Pre-load tile 0 from LDS ---
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
     slot_c = compute_idx % NUM_BUFFERS
     cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(smem_A.index(slot_c), layout=dot_a_layout)
     cur_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
         depreshuffle_b_raw_to_kn(smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES),
         layout=dot_b_layout)
 
-    # --- 2. Pre-load tile 0 from LDS ---
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
     # --- 3. Main loop: WMMA(cur) → TDM(future) → wait → pre-load(next) ---
     main_iters: gl.constexpr = k_tiles - (NUM_BUFFERS - 1)
