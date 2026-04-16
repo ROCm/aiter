@@ -263,7 +263,7 @@ def fused_moe_(
         and a1_scale is not None
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = 512
+    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_BOUND", "512"))
     if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         q_dtype_a = dtypes.bf16
@@ -1029,13 +1029,14 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
+        _sk = max(ksplit, 1) if q_dtype_a in [dtypes.bf16, dtypes.fp16] else 1
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                split_k=max(ksplit, 1),
+                split_k=_sk,
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1044,7 +1045,7 @@ def get_2stage_cfgs(
                 activation=activation,
             ),
             get_block_m(),
-            ksplit,
+            ksplit if q_dtype_a in [dtypes.bf16, dtypes.fp16] else 0,
             False,
             True,
         )

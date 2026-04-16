@@ -70,7 +70,14 @@ def test_fmoe(
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-    score = torch.randn((token, E), dtype=dtype)
+    # force expert balanced
+    score = torch.zeros((token, E), dtype=dtype)
+    start_col = 0
+    end_col = topk
+    for token_id in range(token):
+        score[token_id, start_col:end_col] = 1.0
+        start_col = end_col % E
+        end_col = start_col + topk
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
