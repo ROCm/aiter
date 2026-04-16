@@ -213,9 +213,9 @@ def reduce_grouped(
 def moe_gemm_a16w4(
     x,
     w,
-    x_scales, #This argument is for API compatibility with lower-precision data types. For a16, this should be set to None
+    x_scales,  # This argument is for API compatibility with lower-precision data types. For a16, this should be set to None
     w_scales,
-    x_static_scale=None,#This argument is for API compatibility with lower-precision data types. For a16, this should be set to None
+    x_static_scale=None,  # This argument is for API compatibility with lower-precision data types. For a16, this should be set to None
     quant_static_scale=None,
     bias=None,
     routing_data: RoutingData | None = None,

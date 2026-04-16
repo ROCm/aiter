@@ -17,7 +17,7 @@ from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
-    downcast_to_static_fp8,
+    # downcast_to_static_fp8,
     downcast_to_mxfp,
     upcast_from_mxfp,
 )
@@ -181,7 +181,7 @@ class Case:
     ", ".join(f.name for f in fields(Case)),
     [
         tuple(getattr(case, f.name) for f in fields(Case))
-        for case in [            
+        for case in [
             Case(4, 4, 8, "bfloat16", 2, 1),
             Case(4, 4, 8, "bfloat16", 8, 2),
             Case(4, 4, 8, "bfloat16", 128, 4),
@@ -255,7 +255,7 @@ def test_op(
         weight_dtype_str = weight_dtype_str[2:]
 
     weight_dtype = dtype_str_to_torch(weight_dtype_str)
-    act_dtype = dtype_str_to_torch(act_dtype_str)
+    # act_dtype = dtype_str_to_torch(act_dtype_str)
     m, rdata, gindx, sindx = init_routing_data(
         m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
     )
@@ -283,7 +283,6 @@ def test_op(
     else:
         swizzle_mx_scale = None
 
-
     x_mx_scales_tri = None
     out_dtype = torch.bfloat16
     x_static_scale = None
@@ -293,7 +292,7 @@ def test_op(
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
-    
+
     quant_static_scale = None
     tri_y = moe_gemm_a16w4(
         x_tri,

@@ -274,7 +274,7 @@ def _moe_gemm_a16w4(
     tl.assume(grid_m >= 0)
     tl.assume(grid_n >= 0)
 
-    #is_x_microscaled: tl.constexpr = XMxScale is not None
+    # is_x_microscaled: tl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: tl.constexpr = 32
     w_type: tl.constexpr = W.dtype.element_ty
     tl.static_assert(w_type == tl.uint8, "mx_weight_ptr must be uint8 or fp8")
@@ -284,14 +284,14 @@ def _moe_gemm_a16w4(
     tl.static_assert(
         BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR"
     )
-    x_type: tl.constexpr = X.dtype.element_ty
-    '''
+    # x_type: tl.constexpr = X.dtype.element_ty
+    """
     if is_x_microscaled:
         tl.static_assert(x_type == tl.float8e4nv, "mx_act_ptr must be float8e4nv")
         tl.static_assert(
             XMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
         )
-    '''
+    """
     OUT_BLOCK_N: tl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
 
@@ -392,7 +392,7 @@ def _moe_gemm_a16w4(
         + offs_w_n.to(index_type)[None, :] * stride_w_n
     )
 
-    '''
+    """
     if is_x_microscaled:
         if GatherIndx is None:
             XMxScale += start_m * stride_x_mx_m
@@ -402,7 +402,7 @@ def _moe_gemm_a16w4(
             + offs_x_m.to(index_type)[:, None] * stride_x_mx_m
             + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
         )
-    '''
+    """
     num_k_iter = tl.cdiv(K, BLOCK_K * SPLIT_K)
     if not EVEN_K:
         num_k_iter -= 1
@@ -413,9 +413,9 @@ def _moe_gemm_a16w4(
         x = tl.load(XPtrs)
         w = tl.load(WPtrs, cache_modifier=W_CACHE_MODIFIER)
 
-        #if is_x_microscaled:
+        # if is_x_microscaled:
         #    x_scales = tl.load(XMxScalePtrs)
-        #else:
+        # else:
         #    x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
         x_scales: tl.constexpr = None
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
@@ -432,7 +432,7 @@ def _moe_gemm_a16w4(
         )
 
         WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
-        #if is_x_microscaled:
+        # if is_x_microscaled:
         #    XMxScalePtrs += (MX_SCALE_BLOCK_K * SPLIT_K) * stride_x_mx_k
 
         XPtrs += (BLOCK_K * SPLIT_K) * stride_x_k
@@ -443,7 +443,7 @@ def _moe_gemm_a16w4(
         mask_w_k = offs_w_k < (MASK_K_LIMIT // W_K_DIVISOR)
         if SWIZZLE_MX_SCALE is None:
             mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
-        #if is_x_microscaled:
+        # if is_x_microscaled:
         #    mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 
         x = tl.load(XPtrs, mask=mask_x_k[None, :], other=0.0)
@@ -451,9 +451,9 @@ def _moe_gemm_a16w4(
             WPtrs, mask=mask_w_k[:, None], other=0, cache_modifier=W_CACHE_MODIFIER
         )
 
-        #if is_x_microscaled:
+        # if is_x_microscaled:
         #   x_scales = tl.load(XMxScalePtrs, mask=mask_x_k_scale[None, :])
-        #else:
+        # else:
         #    x_scales = tl.full((BLOCK_M, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
         x_scales: tl.constexpr = None
         if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
