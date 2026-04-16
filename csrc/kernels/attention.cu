@@ -2462,7 +2462,7 @@ void paged_attention(
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(__hip_bfloat16, __hip_bfloat16,
                                     vllm::Fp8KVCacheDataType::kAuto);
     } else {
-      AITER_CHECK(false, "Unsupported data type");
+      AITER_CHECK(false, "Unsupported data type: ", AiterDtype_to_str(query.dtype()));
     }
   } else if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
     if (query.dtype() == AITER_DTYPE_fp16) {
@@ -2472,7 +2472,7 @@ void paged_attention(
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(__hip_bfloat16, uint8_t,
                                     vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else {
-      AITER_CHECK(false, "Unsupported data type");
+      AITER_CHECK(false, "Unsupported data type: ", AiterDtype_to_str(query.dtype()));
     }
   } else {
     AITER_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
