@@ -2317,10 +2317,6 @@ class FmoeTuner(TunerCommon):
             if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
-                ktm = kparams["tile_m"]
-                if ktm != blockM and not (ktm == 16 and blockM == 32 and token <= 16):
-                    continue
-
                 is_splitk = kparams.get("k_batch", 1) > 1
 
                 # (kernel_name, kparams, is_fp4, is_fp8)

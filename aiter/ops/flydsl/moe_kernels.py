@@ -76,7 +76,7 @@ def get_flydsl_stage1_kernels(
     xcd_swizzles = [0, 4]
 
     for tm in tile_ms:
-        if tm in [16, 32]:
+        if tm == 32:
             tile_ns = [32, 64, 128]
         else:
             tile_ns = [64, 128] if is_fp4_a else [128, 256]
