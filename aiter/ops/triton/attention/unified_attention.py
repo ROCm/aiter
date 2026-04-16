@@ -14,7 +14,7 @@ try:
     from aiter.ops.triton.gluon.unified_attention_3d import (
         _unified_attention_gluon_kernel_3d,
     )
-except: # noqa: E722
+except:  # noqa: E722
     _unified_attention_gluon_kernel_3d = None
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -101,6 +101,7 @@ def select_3d_config(
     q_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
     shuffled_kv_cache: bool = False,
+    NUM_BLOCKS_GATHER_PER_TILE: int = 1,
 ):
     reduce_num_warps = 2
     attn_warps = 2
@@ -175,6 +176,16 @@ def select_3d_config(
     elif q_dtype == e4m3_dtype and kv_cache_dtype == e4m3_dtype:
         TILE_SIZE = max(32, TILE_SIZE)
 
+    if NUM_BLOCKS_GATHER_PER_TILE > 1:
+        assert NUM_BLOCKS_GATHER_PER_TILE in [
+            4,
+            8,
+        ], "Only NUM_BLOCKS_GATHER_PER_TILE = 4 or 8 is supported"
+        attn_warps = 2
+        waves_per_eu = 1
+        num_segments = max(1, num_segments // NUM_BLOCKS_GATHER_PER_TILE)
+        TILE_SIZE = block_size * NUM_BLOCKS_GATHER_PER_TILE
+
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
@@ -247,7 +258,6 @@ def unified_attention(
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
     num_tokens, num_query_heads, head_size = q.shape
-    K_WIDTH = 0
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
@@ -255,6 +265,7 @@ def unified_attention(
     else:
         # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
         num_blocks, block_size, num_kv_heads, _ = k.shape
+        K_WIDTH = 16 if kv_cache_dtype == e4m3_dtype else 8
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
@@ -367,6 +378,7 @@ def unified_attention(
         )
 
     else:
+        NUM_BLOCKS_GATHER_PER_TILE = 1
         attn_config, reduce_config = select_3d_config(
             head_size,
             block_size,
@@ -376,6 +388,7 @@ def unified_attention(
             q_dtype,
             kv_cache_dtype,
             shuffled_kv_cache,
+            NUM_BLOCKS_GATHER_PER_TILE,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
@@ -462,7 +475,7 @@ def unified_attention(
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
                 K_WIDTH=K_WIDTH,
                 WARP_SIZE=WARP_SIZE,
-                NUM_BLOCKS_GATHER_PER_TILE=1,
+                NUM_BLOCKS_GATHER_PER_TILE=NUM_BLOCKS_GATHER_PER_TILE,
                 IS_Q_FP8=(q_dtype == e4m3_dtype),
                 IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
                 **attn_config,

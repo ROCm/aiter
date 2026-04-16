@@ -629,7 +629,7 @@ class AttentionProgram:
         )
 
         # Calculate tile range
-        num_tiles = (max_seq_prefix_len + cfg.BLOCK_SIZE - 1) // cfg.BLOCK_SIZE
+        num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = segm_idx * tiles_per_segment
         tile_end = min((segm_idx + 1) * tiles_per_segment, num_tiles)
         if cfg.SLIDING_WINDOW > 0:
@@ -756,13 +756,27 @@ class AttentionProgram:
 
     @gluon.jit
     def load_physical_block_idx_with_mod(
-        self, j, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
+        self, j, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
     ):
         if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
             # TDM load
             physical_block_idx = gl.load(
-                block_tables_ptr_shifted + j_hbm_start + (j % max_num_blocks_this_seg)
+                block_tables_ptr_shifted + j_hbm_start + (j % max_num_tiles_this_seg)
             )
+        else:
+            # TDM gather
+            offs_j = gl.arange(
+                0,
+                self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+                layout=self.cfg.GATHER_BLOCKED_LAYOUT,
+            )
+            physical_block_idx = gl.load(
+                block_tables_ptr_shifted
+                + j_hbm_start * self.cfg.NUM_BLOCKS_GATHER_PER_TILE
+                + (j * self.cfg.NUM_BLOCKS_GATHER_PER_TILE + offs_j)
+                % (max_num_tiles_this_seg * self.cfg.NUM_BLOCKS_GATHER_PER_TILE)
+            )
+
         return j + 1, physical_block_idx
 
     @gluon.jit
@@ -862,7 +876,7 @@ class AttentionProgram:
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.HEAD_SIZE // self.cfg.K_WIDTH,
-                    self.cfg.TILE_SIZE,
+                    self.cfg.BLOCK_SIZE,
                     self.cfg.K_WIDTH,
                 )
             )
@@ -902,7 +916,7 @@ class AttentionProgram:
             .reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                    self.cfg.TILE_SIZE // self.cfg.K_WIDTH,
+                    self.cfg.BLOCK_SIZE // self.cfg.K_WIDTH,
                     self.cfg.HEAD_SIZE,
                     self.cfg.K_WIDTH,
                 )
@@ -1586,7 +1600,7 @@ def _unified_attention_gluon_kernel_3d(
     )
 
     j_hbm_start: gl.int32 = pgm.tile_start
-    max_num_blocks_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
+    max_num_tiles_this_seg: gl.int32 = pgm.tile_end - pgm.tile_start
     j_hbm: gl.int32 = 0
     buffer_id: gl.int32 = 0
     need_addtional_mask: gl.constexpr = (
@@ -1602,7 +1616,7 @@ def _unified_attention_gluon_kernel_3d(
         j_hbm, block_tables_ptr_shifted, j_hbm_start
     )
     j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-        j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
+        j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
     )
     pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
     pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=buffer_id)
@@ -1612,7 +1626,7 @@ def _unified_attention_gluon_kernel_3d(
         # physical_block_idx = physical_block_idx + 1 # no-paging expt
         physical_block_idx = next_physical_block_idx
         j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
-            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_blocks_this_seg
+            j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
         )
         k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
         next_buffer_id = pgm.get_next_buffer_id(buffer_id)
