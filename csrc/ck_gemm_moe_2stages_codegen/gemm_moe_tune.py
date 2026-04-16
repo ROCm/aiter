@@ -2068,7 +2068,7 @@ class FmoeTuner(TunerCommon):
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 ktm = kparams["tile_m"]
-                if ktm != blockM and not (ktm == 16 and blockM == 32 and token <= 16):
+                if ktm != blockM:
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
@@ -2139,7 +2139,7 @@ class FmoeTuner(TunerCommon):
                 if blockM % s2_tile_m != 0:
                     continue
                 # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
-                if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                if s2_tile_m != blockM:
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
@@ -2224,7 +2224,7 @@ class FmoeTuner(TunerCommon):
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 ktm = kparams["tile_m"]
-                if ktm != blockM and not (ktm == 16 and blockM == 32 and token <= 16):
+                if ktm != blockM:
                     continue
                 # Validate split-k compatibility with model_dim
                 kb = kparams.get("k_batch", 1)
@@ -2291,9 +2291,11 @@ class FmoeTuner(TunerCommon):
 
             for kname, kparams in flydsl_s2_kernels.items():
                 s2_tile_m = kparams["tile_m"]
-                if blockM % s2_tile_m != 0:
+                if s2_tile_m != blockM:
                     continue
-                if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                if kparams.get("mode", "atomic") != "atomic":
+                    continue
+                if kparams.get("persist", None) is not None:
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
@@ -2563,7 +2565,7 @@ class FmoeTuner(TunerCommon):
     ):
         self._flydsl_fallbacks = []
         mp_num = args.mp
-        blockMs = [32, 64, 128]
+        blockMs = [16, 32, 64, 128]
         keys = self.keys
         tasks = []
         tasks_ck = []
@@ -2624,12 +2626,22 @@ class FmoeTuner(TunerCommon):
             print(
                 f"stage1 asm tasks is {len(tasks)}, tasks_ck is {len(tasks_ck)}, task_1stage is {len(task_1stage)}"
             )
-        in_data.append((len(tasks) + len(tasks_ck) + len(task_1stage), ()))
+        all_tasks = tasks + tasks_ck + task_1stage
+        # Record dispatched cases
+        dispatched = {}
+        for i, task in enumerate(all_tasks):
+            tag = task[0]  # (info, stage, kname, blockM)
+            dispatched[i] = tag
+            if args.verbose:
+                _, stage, kname, blockM = tag
+                print(f"  [dispatch] task {i}: {stage} {kname} blockM={blockM}")
+
+        in_data.append((len(all_tasks), ()))
         rets = []
-        if len(tasks) + len(tasks_ck) + len(task_1stage) > 0:
+        if len(all_tasks) > 0:
             ### shape_grouped should be False as multiple stages
             rets = mp_tuner(
-                tasks + tasks_ck + task_1stage,
+                all_tasks,
                 in_data,
                 mp_num,
                 True,
@@ -2637,6 +2649,24 @@ class FmoeTuner(TunerCommon):
                 timeout=args.timeout,
                 verbose=args.verbose,
             )
+
+        # Identify failed cases
+        if rets:
+            failed_cases = []
+            for i, ret in enumerate(rets):
+                info, us, err = ret
+                if us == float("inf") or us == -1:
+                    tag = dispatched.get(i, info)
+                    failed_cases.append((i, tag, us, err))
+            if failed_cases:
+                print(f"\n[tune] {len(failed_cases)} of {len(rets)} tasks failed:")
+                for i, tag, us, err in failed_cases:
+                    _, stage, kname, blockM = tag
+                    reason = "timeout/hang" if us == float("inf") else "crash/error"
+                    print(f"  task {i}: {stage} {kname} blockM={blockM} -> {reason}")
+            else:
+                print(f"\n[tune] all {len(rets)} tasks completed successfully")
+
         if not rets:
             print("no shape to tune or no solution found")
             return []
@@ -2742,7 +2772,7 @@ class FmoeTuner(TunerCommon):
                         act_type,
                         dtype,
                         q_dtype_a,
-                        q_dtype_w if q_dtype_w != torch.int4 else "torch.int4",
+                        q_dtype_w,
                         q_type,
                         use_g1u1,
                         doweight_stage1,
@@ -2874,7 +2904,7 @@ class FmoeTuner(TunerCommon):
                         act_type,
                         dtype,
                         q_dtype_a,
-                        q_dtype_w if q_dtype_w != torch.int4 else "torch.int4",
+                        q_dtype_w,
                         q_type,
                         use_g1u1,
                         doweight_stage1,

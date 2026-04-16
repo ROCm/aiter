@@ -193,7 +193,8 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [128]
-    modes = ["atomic", "reduce"]
+    # modes = ["atomic", "reduce"]
+    modes = ["atomic"]
 
     for tm in tile_ms:
         for tn in tile_ns:
