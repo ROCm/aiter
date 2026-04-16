@@ -5,12 +5,12 @@
 using namespace aiter;
 
 void rope_cached_2c_bwd_impl(
-    torch::Tensor&       input_grads_x, // [s, b, h, d]
-    torch::Tensor&       input_grads_y, // [s, b, h, d]
-    const torch::Tensor& output_grads_x,// [s, b, h, d]
-    const torch::Tensor& output_grads_y,// [s, b, h, d]
-    const torch::Tensor& cos,           // [s, 1, 1, d]
-    const torch::Tensor& sin,           // [s, 1, 1, d]
+    aiter_tensor_t&       input_grads_x, // [s, b, h, d]
+    aiter_tensor_t&       input_grads_y, // [s, b, h, d]
+    const aiter_tensor_t& output_grads_x,// [s, b, h, d]
+    const aiter_tensor_t& output_grads_y,// [s, b, h, d]
+    const aiter_tensor_t& cos,           // [s, 1, 1, d]
+    const aiter_tensor_t& sin,           // [s, 1, 1, d]
     const int32_t        rotate_style,
     const bool           reuse_freqs_front_part,
     const bool           nope_first)
@@ -38,24 +38,24 @@ void rope_cached_2c_bwd_impl(
     const int32_t stride_iy_h = input_grads_y.stride(2);
     const int32_t stride_iy_d = input_grads_y.stride(3);
 
-    TORCH_CHECK(stride_ix_d == 1 && stride_iy_d == 1 && stride_ox_d == 1 && stride_oy_d == 1,
+    AITER_CHECK(stride_ix_d == 1 && stride_iy_d == 1 && stride_ox_d == 1 && stride_oy_d == 1,
                 "rope_cached_2c_bwd_impl requires all stride_d to be 1");
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input_grads_x));
+    HipDeviceGuard device_guard(input_grads_x.device_id);
     DISPATCH_ROPE_TYPES_PARAMS(
-        output_grads_x.scalar_type(),
-        cos.scalar_type(),
+        output_grads_x.dtype(),
+        cos.dtype(),
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
         "dispatch_2c_sbhd_cached<OpCachedBwd, ...>",
         dispatch_2c_sbhd_cached<OpCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-            input_grads_x.data_ptr<scalar_t_0>(),
-            input_grads_y.data_ptr<scalar_t_0>(),
-            output_grads_x.data_ptr<scalar_t_0>(),
-            output_grads_y.data_ptr<scalar_t_0>(),
-            cos.data_ptr<scalar_t_1>(),
-            sin.data_ptr<scalar_t_1>(),
+            reinterpret_cast<scalar_t_0*>(input_grads_x.data_ptr()),
+            reinterpret_cast<scalar_t_0*>(input_grads_y.data_ptr()),
+            reinterpret_cast<scalar_t_0*>(output_grads_x.data_ptr()),
+            reinterpret_cast<scalar_t_0*>(output_grads_y.data_ptr()),
+            reinterpret_cast<scalar_t_1*>(cos.data_ptr()),
+            reinterpret_cast<scalar_t_1*>(sin.data_ptr()),
             size_s, size_b, size_h_x, size_h_y, size_d,
             size_f,
             stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
