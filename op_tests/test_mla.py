@@ -458,13 +458,15 @@ def test_mla(
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
+        4,
+        8,
         16,
         32,
         64,
         128,
     ]:
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [16, 128]:
+    elif kvtype == dtypes.fp8 and nhead in [4, 8, 16, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
@@ -573,10 +575,10 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2), (128, 4)],
+    choices=[(4, 1), (16, 1), (16, 2), (16, 4), (128, 1), (128, 2), (128, 4)],
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    default=[(4, 1), (16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
 )
