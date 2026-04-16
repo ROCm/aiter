@@ -317,7 +317,7 @@ def test_fmoe(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
 
-    return {"us": us2, "err": err}
+    return {"us": us2, "logits_diff": float(logits_diff)}
 
 
 l_quant = [
