@@ -288,6 +288,48 @@ class CudaCommunicator(DeviceCommunicatorBase):
         assert scale_out is not None
         return out, res_out, scale_out
 
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        group_size=128,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        total_bytes = input_.numel() * input_.element_size()
+        K = input_.shape[-1]
+        fused_ok = False
+        if (
+            K % group_size == 0
+            and K <= 16384
+            and total_bytes < 8 * 1024 * 8192
+            and self.world_size != 6
+            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
+        ):
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
+            try:
+                out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                    input_, res_inp_, weight_, eps, group_size, use_1stage
+                )
+                fused_ok = True
+            except Exception:
+                pass
+        if not fused_ok:
+            out_, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, prefill_support
+            )
+            hip_quant = get_hip_quant(QuantType.per_1x128)
+            out, scale_out = hip_quant(out_, quant_dtype=fp8)
+        assert out is not None
+        assert res_out is not None
+        assert scale_out is not None
+        return out, res_out, scale_out
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             dim += input_.dim()

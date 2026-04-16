@@ -730,6 +730,76 @@ class CustomAllreduce:
                 post_per_token_quant=True,
             )
 
+    def fused_ar_rms_per_group_quant(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        *,
+        w: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        registered: bool = False,
+        use_1stage: bool = False,
+    ):
+        res_out = torch.empty_like(inp)
+        K = inp.shape[-1]
+        num_groups = K // group_size
+        out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+        scale_out = torch.empty(
+            inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
+        )
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_allreduce_rmsnorm_quant_per_group(
+            self._ptr,
+            inp,
+            res_inp,
+            res_out,
+            out,
+            scale_out,
+            w,
+            eps,
+            group_size,
+            reg,
+            reg_bytes,
+            use_1stage,
+        )
+        return out, res_out, scale_out
+
+    def custom_fused_ar_rms_per_group_quant(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        use_1stage: bool = False,
+    ):
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_rms_per_group_quant(
+                    input, residual_inp, w=weight, eps=eps,
+                    group_size=group_size, registered=True,
+                    use_1stage=use_1stage,
+                )
+            else:
+                K = input.shape[-1]
+                num_groups = K // group_size
+                dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
+                dummy_scale = torch.zeros(
+                    input.shape[:-1] + (num_groups,),
+                    dtype=torch.float32, device=input.device,
+                )
+                return dummy_out, torch.zeros_like(input), dummy_scale
+        else:
+            return self.fused_ar_rms_per_group_quant(
+                input, residual_inp, w=weight, eps=eps,
+                group_size=group_size, registered=False,
+                use_1stage=use_1stage,
+            )
+
     def close(self):
         if not self.disabled and self._ptr:
             ops.dispose(self._ptr)

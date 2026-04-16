@@ -453,6 +453,21 @@ class GroupCoordinator:
             prefill_support=prefill_support,
         )
 
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
+            input_, residual_inp_, weight_, eps, group_size, prefill_support
+        )
+
     def _fused_allreduce_rmsnorm_out_place(
         self,
         input_: torch.Tensor,
