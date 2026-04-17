@@ -137,16 +137,17 @@ def test_fmoe_sqi8(
     else:
         smooth_info = "unused"
     ret = {
-        "num_tokens":num_tokens,
-        "model_dim":model_dim,
-        "inter_dim":inter_dim,
-        "num_experts":num_experts,
-        "topk":topk,
+        "num_tokens": num_tokens,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "num_experts": num_experts,
+        "topk": topk,
         "smooth": smooth_info,
         "diff": logits_diff1,
-        "time(us)":f"{dt:.0f}"
+        "time(us)": f"{dt:.0f}",
     }
     return ret
+
 
 if __name__ == "__main__":
     torch.set_default_device("cuda")
@@ -172,10 +173,11 @@ if __name__ == "__main__":
                     shared_smooth_up=shared_smooth_up,
                 )
                 summary.append(ret)
-    
+
     # show summary in table
     try:
         import pandas as pd
+
         print(pd.DataFrame(summary).to_markdown(index=False))
     except Exception:
         pass
