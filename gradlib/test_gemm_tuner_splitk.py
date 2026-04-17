@@ -99,7 +99,7 @@ def _install_stubs():
 _install_stubs()
 
 # Now import the module under test from the local gradlib tree
-sys.path.insert(0, str(Path(__file__).resolve().parent / "gradlib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gradlib.GemmTuner import Gemm  # noqa: E402
 
 
