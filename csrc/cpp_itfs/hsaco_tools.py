@@ -162,7 +162,7 @@ def get_kernel(kernel_path_prefix, constexpr_args: tuple = ()):
     ):
         fields = []
         for i, arg in enumerate(args):
-            if isinstance(arg, torch.Tensor):
+            if arg is None or isinstance(arg, torch.Tensor):
                 fields.append((f"arg_{i}", ctypes.c_void_p))
             elif isinstance(arg, int):
                 # ctypes.c_uint/ctypes.c_ulong

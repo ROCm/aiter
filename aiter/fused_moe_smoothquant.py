@@ -2,6 +2,7 @@ import torch
 
 from .fused_moe import moe_sorting
 
+import aiter
 from csrc.cpp_itfs.hsaco_tools import get_kernel
 from csrc.cpp_itfs.utils import AITER_CORE_DIR
 
@@ -18,7 +19,7 @@ def fused_moe_gelu_sqi8(
     topk_ids,  # [num_tokens, topk] torch.int32
     w1_scale,  # [expert, inter_dim, 1] torch.float32
     w2_scale,  # [expert, model_dim, 1] torch.float32
-    a1_smooth_scale,  # [expert, 1, model_dim] torch.float32
+    a1_smooth_scale,  # [expert/1, 1, model_dim] torch.float32
     a2_smooth_scale,  # [expert, 1, inter_dim] torch.float32):
 ):
     device = hidden_states.device
@@ -70,6 +71,16 @@ def fused_moe_gelu_sqi8(
         is_gemm1=True,
         topk_ids=None,
     ):
+        if smooth_scale is None:
+            pt_quant_func = aiter.get_hip_quant(aiter.QuantType.per_Token)
+            x_quant, x_quant_scale = pt_quant_func(
+                x,
+                scale=None,
+                quant_dtype=torch.int8,
+            )
+            x_quant_scale.is_sorted = False
+            return x_quant, x_quant_scale
+
         kwargs = {
             "BLOCK_SIZE_M": 256,
             "TOPK": topk,
@@ -79,29 +90,55 @@ def fused_moe_gelu_sqi8(
             "BLOCK_M2": 8,
             "QUANT1_K": model_dim,
             "QUANT2_K": model_dim,
+            "REDUCE_K": model_dim,
+            "BLOCK_QUANT": 256,
         }
         compile_time_args = tuple(kwargs.items())
         device = x.device
-        x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
-        x_quant_scale = torch.empty(
-            [sorted_ids.shape[0]], dtype=torch.float32, device=device
-        )
         if is_gemm1:
-            get_kernel(
-                f"{AITER_CORE_DIR}/hsa/gfx950/fmoe_smoothquant/quant-i8:quant1",
-                compile_time_args,
-            )(
-                [2 * div_up(M, kwargs["ROW_PER_BLOCK1"])],
-                [64],
-                x,
-                smooth_scale,
-                x_quant,
-                x_quant_scale,
-                topk_ids,
-                M,
-            )
-            x_quant_scale.is_sorted = False
+            if smooth_scale.shape[0] == 1:
+                x_quant = torch.empty((M, model_dim), dtype=torch.int8, device=device)
+                x_quant_scale = torch.empty([M, 1], dtype=torch.float32, device=device)
+                get_kernel(
+                    f"{AITER_CORE_DIR}/hsa/gfx950/fmoe_smoothquant/quant-i8:quant1_notopk",
+                    compile_time_args,
+                )(
+                    [M],
+                    [64],
+                    x,
+                    smooth_scale,
+                    x_quant,
+                    x_quant_scale,
+                    topk_ids,
+                    M,
+                )
+                x_quant_scale.is_sorted = False
+            else:
+                x_quant = torch.empty(
+                    (M, topk, model_dim), dtype=torch.int8, device=device
+                )
+                x_quant_scale = torch.empty(
+                    [M, topk, 1], dtype=torch.float32, device=device
+                )
+                get_kernel(
+                    f"{AITER_CORE_DIR}/hsa/gfx950/fmoe_smoothquant/quant-i8:quant1",
+                    compile_time_args,
+                )(
+                    [2 * div_up(M, kwargs["ROW_PER_BLOCK1"])],
+                    [64],
+                    x,
+                    smooth_scale,
+                    x_quant,
+                    x_quant_scale,
+                    topk_ids,
+                    M,
+                )
+                x_quant_scale.is_sorted = False
         else:
+            x_quant = torch.empty((M, topk, model_dim), dtype=torch.int8, device=device)
+            x_quant_scale = torch.empty(
+                [sorted_ids.shape[0]], dtype=torch.float32, device=device
+            )
             get_kernel(
                 f"{AITER_CORE_DIR}/hsa/gfx950/fmoe_smoothquant/quant-i8:quant2",
                 compile_time_args,
@@ -120,14 +157,21 @@ def fused_moe_gelu_sqi8(
                 num_valid_ids,
                 M,
             )
+            x_quant_scale.is_sorted = True
         return x_quant, x_quant_scale
 
     # quantize hidden_states in sorted_ids [tok_topk]
     # print(sorted_ids.dtype, sorted_ids.shape)
     def moe_gemm(output, input, pt_scale, weight, pc_scale, stage_index):
+        if input.ndim == 3:
+            num_tokens, _, dims = input.shape
+            is_in_3d = 1
+        else:
+            num_tokens, dims = input.shape
+            is_in_3d = 0
         AB_dtype = "s8"
-        is_input_over_4GB = input.numel() * input.element_size() > (1 << 32)
-        is_pt_scale_sorted = getattr(pt_scale, "is_sorted", True)
+        is_over_4GB = input.numel() * input.element_size() > (1 << 32)
+        is_pts_sorted = getattr(pt_scale, "is_sorted", False)
         wg_M, wg_N = 256, 256
         is_gate_up = stage_index == 1
         bpreshuffle = False
@@ -135,17 +179,16 @@ def fused_moe_gelu_sqi8(
         num_oc_blocks = output.shape[-1] // wg_N
         num_e_blocks = sorted_expert_ids.shape[0]
         kwargs = {
-            "is_input_over_4GB": is_input_over_4GB,
-            "is_pt_scale_sorted": is_pt_scale_sorted,
+            "is_in_3d": is_in_3d,
+            "is_over_4GB": is_over_4GB,
+            "is_pts_sorted": is_pts_sorted,
             "AB_dtype": AB_dtype,
             "wg_M": wg_M,
             "wg_N": wg_N,
-            "NUM_EXPERTS": E,
             "OC": output.shape[-1],
             "IC": input.shape[-1],
             "gate_up": is_gate_up,
             "bpreshuffle": bpreshuffle,
-            "TOPK": topk,
         }
         get_kernel(
             f"{AITER_CORE_DIR}/hsa/gfx950/fmoe_smoothquant/moe_gemm_8wave_gelu",
@@ -153,6 +196,7 @@ def fused_moe_gelu_sqi8(
         )(
             [num_oc_blocks * num_e_blocks],
             [8 * 64],
+            topk,
             sorted_ids,
             sorted_weights,
             sorted_expert_ids,
@@ -162,6 +206,7 @@ def fused_moe_gelu_sqi8(
             input,
             pt_scale,
             output,
+            None,
             num_tokens,
             num_oc_blocks * num_e_blocks,
         )

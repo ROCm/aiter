@@ -30,7 +30,15 @@ def smooth_quant_w(
     return quanted_weight, per_oc_scale  # [num_experts, OC, IC], [num_experts, OC, 1]
 
 
-def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
+def test_fmoe_sqi8(
+    num_tokens,
+    model_dim,
+    inter_dim,
+    num_experts,
+    topk,
+    use_smoothquant,
+    shared_smooth_up,
+):
     device = "cuda"
 
     if get_gfx() != "gfx950":
@@ -39,20 +47,30 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
 
     x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device) * 0.001
 
-    fc1_smooth_scale = 1.0 / torch.randint(
-        low=1,
-        high=5,
-        size=[num_experts, 1, model_dim],
-        dtype=torch.float32,
-        device=device,
-    )
-    fc2_smooth_scale = 1.0 / torch.randint(
-        low=1,
-        high=5,
-        size=[num_experts, 1, inter_dim],
-        dtype=torch.float32,
-        device=device,
-    )
+    if use_smoothquant:
+        # shared_smoothquant_up : share smooth scales between all experts
+        fc1_smooth_scale = 1.0 / torch.randint(
+            low=1,
+            high=5,
+            size=[1 if shared_smooth_up else num_experts, 1, model_dim],
+            dtype=torch.float32,
+            device=device,
+        )
+        fc2_smooth_scale = 1.0 / torch.randint(
+            low=1,
+            high=5,
+            size=[num_experts, 1, inter_dim],
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        # just to get correct references
+        fc1_smooth_scale = torch.ones(
+            [num_experts, 1, model_dim], dtype=torch.float32, device=device
+        )
+        fc2_smooth_scale = torch.ones(
+            [num_experts, 1, inter_dim], dtype=torch.float32, device=device
+        )
 
     w1_f32 = torch.randn(num_experts, inter_dim, model_dim, dtype=torch.float32) * 0.001
     w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32) * 0.001
@@ -85,8 +103,8 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
         x2,
         fc1_scale,
         fc2_scale,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
+        fc1_smooth_scale.expand(num_experts, -1, -1),
+        fc2_smooth_scale.expand(num_experts, -1, -1),
         activation=ActivationType.Gelu,
     )
 
@@ -99,8 +117,8 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
         x2,
         fc1_scale,
         fc2_scale,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
+        fc1_smooth_scale if use_smoothquant else None,
+        fc2_smooth_scale if use_smoothquant else None,
     )
 
     err0 = checkAllclose(ref0, ret, rtol=1e-3, atol=1e-3, msg="check with ref0")
@@ -109,11 +127,26 @@ def test_fmoe_sqi8(num_tokens, model_dim, inter_dim, num_experts, topk):
     logits_diff0 = calc_diff(ref0, ret)
     logits_diff1 = calc_diff(ref1, ret)
     print(
-        f"{num_tokens=} {model_dim=} {inter_dim=} {num_experts=} {topk=} {logits_diff0=:.6f}, {logits_diff1=:.6f}, {err0=:.6f}, {err1=:.6f}, {dt:.0f} us"
+        f"{num_tokens=} {model_dim=} {inter_dim=} {num_experts=} {topk=} {use_smoothquant=} {shared_smooth_up=} {logits_diff0=:.6f}, {logits_diff1=:.6f}, {err0=:.6f}, {err1=:.6f}, {dt:.0f} us"
     )
     assert logits_diff0 < 0.01
     assert logits_diff1 < 0.01
 
+    if use_smoothquant:
+        smooth_info = "shared-up" if shared_smooth_up else "per-expert"
+    else:
+        smooth_info = "unused"
+    ret = {
+        "num_tokens":num_tokens,
+        "model_dim":model_dim,
+        "inter_dim":inter_dim,
+        "num_experts":num_experts,
+        "topk":topk,
+        "smooth": smooth_info,
+        "diff": logits_diff1,
+        "time(us)":f"{dt:.0f}"
+    }
+    return ret
 
 if __name__ == "__main__":
     torch.set_default_device("cuda")
@@ -125,15 +158,24 @@ if __name__ == "__main__":
     # torch.cuda.set_device(0)
     torch.manual_seed(0)
 
-    test_fmoe_sqi8(
-        num_tokens=40960, model_dim=4096, inter_dim=1536, num_experts=400, topk=20
-    )
-    test_fmoe_sqi8(
-        num_tokens=40960, model_dim=4096, inter_dim=1536, num_experts=800, topk=25
-    )
-    test_fmoe_sqi8(
-        num_tokens=19147, model_dim=4096, inter_dim=1536, num_experts=400, topk=20
-    )
-    test_fmoe_sqi8(
-        num_tokens=20480, model_dim=4096, inter_dim=1536, num_experts=400, topk=20
-    )
+    summary = []
+    for num_experts, topk in [(800, 25), (400, 20)]:
+        for num_tokens in [40960, 20480, 19147]:
+            for use_smoothquant, shared_smooth_up in [(1, 0), (1, 1), (0, 0)]:
+                ret = test_fmoe_sqi8(
+                    num_tokens=num_tokens,
+                    model_dim=4096,
+                    inter_dim=1536,
+                    num_experts=num_experts,
+                    topk=topk,
+                    use_smoothquant=use_smoothquant,
+                    shared_smooth_up=shared_smooth_up,
+                )
+                summary.append(ret)
+    
+    # show summary in table
+    try:
+        import pandas as pd
+        print(pd.DataFrame(summary).to_markdown(index=False))
+    except Exception:
+        pass
