@@ -33,6 +33,15 @@ fi
 #   CLAUDE_PERMISSION_FLAGS — optional: space-separated CLI args; if set (even empty), replaces the default permission flags.
 #                     Default is `--dangerously-skip-permissions --allowedTools Read,Edit,Bash` as non-root; as root, Claude CLI
 #                     forbids dangerously-skip-permissions, so the script uses `--permission-mode acceptEdits --allowedTools Read,Edit,Bash`.
+#   KERNEL_FILE     — source file containing the kernels to optimise. Relative to REPO_ROOT, or absolute.
+#                     Substituted into {{KERNEL_FILE}} placeholders in prompt files.
+#                     Default: csrc/include/custom_all_reduce.cuh
+#   KERNELS_TO_OPTIMIZE — space- or comma-separated kernel function names to pass to Claude.
+#                     Substituted into {{KERNELS_TO_OPTIMIZE}} placeholders in prompt files.
+#                     Default: cross_device_reduce_1stage cross_device_reduce_2stage
+#   PROMPTS_FILTER  — space- or comma-separated list of prompt filenames (basename, with or without extension) to include
+#                     in the build phase. Only matching files from PROMPTS_DIR are run. If unset, all prompts are used
+#                     and a warning is printed. Example: PROMPTS_FILTER="step1_optimize_bandwidth,step2_tune_occupancy"
 #   TRIAL_MODE      — if 1, run only a single ISL/OSL pair (8192,1024) with 1 benchmark iteration per tag instead of
 #                     3 pairs × 4 runs. Use this for a quick sanity check that the server starts and produces results
 #                     before committing to a full benchmark run. Default: 0.
@@ -73,6 +82,16 @@ OUT_DIR=${OUT_DIR:-"$REPO_ROOT/kernel_optimization_results/$TIMESTAMP"}
 BASELINE_REF=${BASELINE_REF:-HEAD}
 CLEAN_OUTPUT_BEFORE_BUILD=${CLEAN_OUTPUT_BEFORE_BUILD:-0}
 TRIAL_MODE=${TRIAL_MODE:-0}  # if 1: single ISL/OSL pair (8192,1024) and 1 run per tag for a quick sanity check
+# PROMPTS_FILTER: space- or comma-separated list of prompt filenames (basename, with or without extension) to run.
+# Only prompts whose basename matches an entry are included. If unset, all prompts in PROMPTS_DIR are used (with a warning).
+# Example: PROMPTS_FILTER="step1_optimize_bandwidth step2_tune_occupancy"
+PROMPTS_FILTER=${PROMPTS_FILTER:-}
+# KERNEL_FILE: path to the source file containing the kernels to optimise.
+# Relative paths are resolved from REPO_ROOT; absolute paths are used as-is.
+KERNEL_FILE=${KERNEL_FILE:-csrc/include/custom_all_reduce.cuh}
+# KERNELS_TO_OPTIMIZE: space- or comma-separated list of kernel function names to pass to Claude.
+# These are substituted into {{KERNELS_TO_OPTIMIZE}} in prompt files.
+KERNELS_TO_OPTIMIZE=${KERNELS_TO_OPTIMIZE:-"cross_device_reduce_1stage cross_device_reduce_2stage"}
 
 MANIFEST="$OUT_DIR/kernel_opt_worktrees.manifest"
 REPO_PARENT=$(cd "$REPO_ROOT/.." && pwd)
@@ -112,6 +131,17 @@ Common environment variables:
   SKIP_CLAUDE     set to skip Claude CLI in build phase
   CLAUDE_MODEL    optional model passed to Claude CLI
   CLAUDE_BIN      Claude executable path (default: claude)
+  KERNEL_FILE     Source file with kernels to optimise (relative to repo root or absolute).
+                  Substituted into {{KERNEL_FILE}} in prompt files.
+                  Default: csrc/include/custom_all_reduce.cuh
+  KERNELS_TO_OPTIMIZE
+                  Space- or comma-separated kernel function names for Claude to target.
+                  Substituted into {{KERNELS_TO_OPTIMIZE}} in prompt files.
+                  Default: cross_device_reduce_1stage cross_device_reduce_2stage
+                  Example: KERNELS_TO_OPTIMIZE="my_kernel_a my_kernel_b"
+  PROMPTS_FILTER  Space- or comma-separated prompt filenames (basename, ±extension) to run.
+                  If unset, all prompts in PROMPTS_DIR are used (warning printed).
+                  Example: PROMPTS_FILTER="step1_bandwidth step2_occupancy"
   TRIAL_MODE      0 (default) or 1; skips to a single ISL/OSL pair (8192,1024) with 1 run per tag.
                   Use before a full run to confirm the server starts and results are produced.
   SERVER_READY_TIMEOUT_SEC
@@ -470,6 +500,26 @@ run_claude_prompt() {
   else
     prompt_text=$(cat "$prompt_file")
   fi
+  # Substitute {{KERNEL_FILE}} and {{KERNELS_TO_OPTIMIZE}} placeholders so prompt files
+  # remain kernel-agnostic; the actual targets are driven by env vars.
+  local kernel_file_abs
+  if [[ "${KERNEL_FILE:-}" == /* ]]; then
+    kernel_file_abs="$KERNEL_FILE"
+  else
+    kernel_file_abs="$REPO_ROOT/${KERNEL_FILE:-csrc/include/custom_all_reduce.cuh}"
+  fi
+  local kernels_formatted="" k
+  # Normalise commas to spaces so both "a,b" and "a b" work as separators.
+  for k in ${KERNELS_TO_OPTIMIZE//,/ }; do
+    [[ -z "$k" ]] && continue
+    kernels_formatted+=$'\n'"    ${k}"
+  done
+  if [[ -z "$kernels_formatted" ]]; then
+    kernels_formatted=$'\n'"    cross_device_reduce_1stage"$'\n'"    cross_device_reduce_2stage"
+  fi
+  prompt_text="${prompt_text//\{\{KERNEL_FILE\}\}/$kernel_file_abs}"
+  prompt_text="${prompt_text//\{\{KERNELS_TO_OPTIMIZE\}\}/$kernels_formatted}"
+
   local claude_bin=${CLAUDE_BIN:-claude}
   local model_flag=()
   if [[ -n "${CLAUDE_MODEL:-}" ]]; then
@@ -512,13 +562,58 @@ collect_prompts() {
     echo "ERROR: PROMPTS_DIR is not a directory: $PROMPTS_DIR" >&2
     exit 1
   fi
-  mapfile -t _prompts < <(
+
+  local -a all_prompts
+  mapfile -t all_prompts < <(
     find "$PROMPTS_DIR" -maxdepth 1 -type f \( -name '*.txt' -o -name '*.md' \) | LC_ALL=C sort
   )
-  if [[ ${#_prompts[@]} -eq 0 ]]; then
+  if [[ ${#all_prompts[@]} -eq 0 ]]; then
     echo "ERROR: No prompt files in $PROMPTS_DIR (*.txt or *.md)." >&2
     exit 1
   fi
+
+  if [[ -z "${PROMPTS_FILTER:-}" ]]; then
+    echo "WARN: PROMPTS_FILTER not set — running all ${#all_prompts[@]} prompt(s) in $PROMPTS_DIR." \
+         "Set PROMPTS_FILTER to a space/comma-separated list of filenames to restrict which prompts run." >&2
+    _prompts=("${all_prompts[@]}")
+    return
+  fi
+
+  # Normalise filter: replace commas with spaces, split into array.
+  local -a filter_names
+  IFS=' ,' read -r -a filter_names <<<"${PROMPTS_FILTER}"
+
+  _prompts=()
+  local f name base
+  for f in "${all_prompts[@]}"; do
+    base=$(basename "$f")
+    for name in "${filter_names[@]}"; do
+      # Match against full basename OR basename-without-extension.
+      if [[ "$base" == "$name" || "${base%.*}" == "$name" || "${base%.*}" == "${name%.*}" ]]; then
+        _prompts+=("$f")
+        break
+      fi
+    done
+  done
+
+  if [[ ${#_prompts[@]} -eq 0 ]]; then
+    echo "ERROR: PROMPTS_FILTER='${PROMPTS_FILTER}' matched no files in $PROMPTS_DIR." >&2
+    echo "       Available: $(IFS=', '; echo "${all_prompts[*]/#$PROMPTS_DIR\//}")" >&2
+    exit 1
+  fi
+
+  # Warn about any filter entries that matched nothing.
+  local matched name base f
+  for name in "${filter_names[@]}"; do
+    matched=0
+    for f in "${_prompts[@]}"; do
+      base=$(basename "$f")
+      [[ "$base" == "$name" || "${base%.*}" == "$name" || "${base%.*}" == "${name%.*}" ]] && matched=1 && break
+    done
+    if [[ "$matched" -eq 0 ]]; then
+      echo "WARN: PROMPTS_FILTER entry '${name}' matched no file in $PROMPTS_DIR — skipped." >&2
+    fi
+  done
 }
 
 slugify() {
