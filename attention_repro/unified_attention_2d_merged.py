@@ -1082,11 +1082,14 @@ class AttentionConfig:
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, self.K_WIDTH))
 
         # Blocked layouts for global-to-shared memory loads
-        HEAD_SIZE_DIV = HEAD_SIZE // 8
+        ELEMENT_SIZE = 8 if Q_FP8 else 16
+        MAX_LOAD = 128
+        SIZE_PER_THREAD = MAX_LOAD // ELEMENT_SIZE
+        HEAD_SIZE_DIV = HEAD_SIZE // SIZE_PER_THREAD
         self.blocked_q = gl.constexpr(
             gl.BlockedLayout(
-                size_per_thread=[1, 8],
-                threads_per_warp=[self.WARP_SIZE // 8, 8],
+                size_per_thread=[1, SIZE_PER_THREAD],
+                threads_per_warp=[self.WARP_SIZE // HEAD_SIZE_DIV, HEAD_SIZE_DIV],
                 warps_per_cta=[NUM_WARPS, 1],
                 order=[1, 0],
             )
@@ -1118,8 +1121,6 @@ class AttentionProgram:
     context_len_q_pos_qk: gl.tensor
     QK_scale: gl.tensor
     out_scale: gl.tensor
-    o_offs: gl.tensor
-    o_mask: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -1136,8 +1137,6 @@ class AttentionProgram:
         context_len_q_pos_qk,
         QK_scale,
         out_scale,
-        o_offs,
-        o_mask,
     ):
         self.cfg = cfg
         self.q = q
@@ -1151,8 +1150,6 @@ class AttentionProgram:
         self.context_len_q_pos_qk = context_len_q_pos_qk
         self.QK_scale = QK_scale
         self.out_scale = out_scale
-        self.o_offs = o_offs
-        self.o_mask = o_mask
 
     @gluon.jit
     def initialize(
@@ -1207,7 +1204,7 @@ class AttentionProgram:
 
             tile_start = 0
             tile_end = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
-            safe_tile_end = tile_end
+            safe_tile_end = tile_end - 1 # last tile is almost never safe
             query_pos_qk = gl.convert_layout(query_pos, gl.SliceLayout(1, cfg.qk_layout))[
                 :, None
             ]
@@ -1239,33 +1236,6 @@ class AttentionProgram:
         if v_descale_ptr is not None:
             out_scale = out_scale * gl.load(v_descale_ptr)
 
-        # Precompute output offsets and mask
-        offs_m_out = gl.arange(
-            0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout)
-        )
-        offs_d_out = gl.arange(
-            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout)
-        )
-
-        query_pos_out = (
-            q_block_local_idx * cfg.BLOCK_Q
-            + offs_m_out // cfg.NUM_QUERIES_PER_KV
-        )
-        query_offset_0_out = cur_batch_in_all_start_index + query_pos_out
-        query_offset_1_out = (
-            kv_head_idx * cfg.NUM_QUERIES_PER_KV
-            + offs_m_out % cfg.NUM_QUERIES_PER_KV
-        )
-
-        o_offs = (
-            query_offset_0_out[:, None] * output_stride_0
-            + query_offset_1_out[:, None] * output_stride_1
-            + offs_d_out[None, :]
-        )
-
-        query_mask_0_out = query_pos_out < cur_batch_query_len
-        query_mask_1_out = query_offset_1_out < cfg.NUM_QUERY_HEADS
-        o_mask = query_mask_0_out[:, None] & query_mask_1_out[:, None]
         return AttentionProgram(
             cfg,
             q,
@@ -1279,8 +1249,6 @@ class AttentionProgram:
             context_len_q_pos_qk,
             QK_scale,
             out_scale,
-            o_offs,
-            o_mask,
         )
 
     # ---- Core operations ----
@@ -1302,7 +1270,7 @@ class AttentionProgram:
         seq_offset = (
             j * self.cfg.TILE_SIZE
             + gl.arange(
-                0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, self.cfg.qk_layout)
+                0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, S.type.layout)
             )[None, :]
         )
 
@@ -1371,6 +1339,7 @@ class AttentionProgram:
                 [self.cfg.BLOCK_Q, STORE_COLS],
                 layout=o_smem_layout,
             )
+            c#asted_out = gl.where(o_mask, casted_out, 0.0)
             o_smem.reshape([self.cfg.BLOCK_M, self.cfg.HEAD_SIZE]).store(casted_out)
 
             o_base = (
@@ -1390,12 +1359,41 @@ class AttentionProgram:
                 o_smem,
             )
         else:
+
+            if USE_BLOCKED:
+                layout: gl.constexpr = self.cfg.blocked_q
+            else:
+                layout: gl.constexpr = self.cfg.pv_layout
+            offs_m_out = gl.arange(
+                0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, layout)
+            )
+            offs_d_out = gl.arange(
+                0, self.cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout)
+            )
+            query_pos_out = (
+                q_block_local_idx * self.cfg.BLOCK_Q
+                + offs_m_out // self.cfg.NUM_QUERIES_PER_KV
+            )
+            query_offset_0_out = cur_batch_in_all_start_index + query_pos_out
+            query_offset_1_out = (
+                kv_head_idx * self.cfg.NUM_QUERIES_PER_KV
+                + offs_m_out % self.cfg.NUM_QUERIES_PER_KV
+            )
+            o_offs = (
+                query_offset_0_out[:, None] * output_stride_0
+                + query_offset_1_out[:, None] * output_stride_1
+                + offs_d_out[None, :]
+            )
+            query_mask_0_out = query_pos_out < cur_batch_query_len
+            query_mask_1_out = query_offset_1_out < self.cfg.NUM_QUERY_HEADS
+            o_mask = query_mask_0_out[:, None] & query_mask_1_out[:, None]
+
             if USE_BLOCKED:
                 casted_out = gl.convert_layout(casted_out, self.cfg.blocked_q)
             if self.cfg.USE_STORE_BUFFER_OP:
-                gl.amd.cdna4.buffer_store(casted_out, self.output_ptr, offsets=self.o_offs, mask=self.o_mask)
+                gl.amd.cdna4.buffer_store(casted_out, self.output_ptr, offsets=o_offs, mask=o_mask)
             else:
-                gl.store(self.output_ptr + self.o_offs, casted_out, mask=self.o_mask)
+                gl.store(self.output_ptr + o_offs, casted_out, mask=o_mask)
 
     # ---- Subtile helpers (used by subtile_split_loop) ----
 
@@ -1557,17 +1555,19 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
 
     # LR_K_t0
     k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=0, target_dtype=q.dtype)
-
+    # K_t2 → buf 2%N, V_t1 → buf 1
+    kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=buf_2)
+    kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1)
     # QK_t0
     S = pgm.compute_qk(k)
-    S = pgm.apply_mask_qk(S, 0)
+    # TODO: this should be done only if kv len < tile size
+    if pgm.tile_start >= pgm.safe_tile_end:
+        S = pgm.apply_mask_qk(S, pgm.tile_start)
     # SM0_t0
     S = gl.convert_layout(S, pgm.cfg.pv_layout)
     p, alpha, M = pgm.softmax_part0(S, M)
 
-    # K_t2 → buf 2%N, V_t1 → buf 1
-    kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=buf_2)
-    kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1)
+
 
     # LR_K_t1
     k = kv_loader.load_k_from_shared(wait_count=3, buffer_id=1, target_dtype=q.dtype)
@@ -1577,20 +1577,21 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         t_1 = j + 1
         t_2 = j + 2
         t_3 = j + 3
-        
-        next4_physical_block_idx = kv_loader.load_block_ids(t_3 + 1)
-        gl.amd.gfx1250.tdm.async_wait(1)
+        gl.amd.gfx1250.tdm.async_wait(1) # merged
         if cfg.NUM_BUFFERS == 3:
             kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_0)
         else:
             kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_1)
-        
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
+   
+        next4_physical_block_idx = kv_loader.load_block_ids(t_3 + 1)
+
         # QK for tile (i+1)
         S = pgm.compute_qk(k)
-
         # SM1(prev) + LR_V(tile i) + GLDS_K(tile i+3)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+
+
         v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=True)
 
 
@@ -1600,6 +1601,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         # SM0 + LR_K(tile i+2) + GLDS_V(tile i+2)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
+        #gl.amd.gfx1250.tdm.async_wait(2)
         k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=True)
 
         next2_physical_block_idx = next3_physical_block_idx
@@ -1612,39 +1614,39 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
     # ---- Epilogue ----
     # After L loop iters: buf_0=L%N, buf_1=(L+1)%N, buf_2=(L+2)%N
     # Remaining tiles: L (V drain), L+1 (=tile_end-2), L+2 (=tile_end-1)
+    gl.amd.gfx1250.tdm.async_wait(1) # merged
+
     with gl.amd.warp_pipeline_stage("stage1"):
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         epilogue_t_2 = pgm.tile_end - 2
         epilogue_t_3 = pgm.tile_end - 1
         # SM1(prev) + LR_V(tile L) + PV(tile L)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype)
-        acc = pgm.compute_pv(p, v, acc)
-    with gl.amd.warp_pipeline_stage("stage2"):
-        # QK + SM0 for tile L+1, LR_K for tile L+2
         S = pgm.compute_qk(k)
-        S = pgm.apply_mask_qk(S, epilogue_t_2)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+        if epilogue_t_2 >= pgm.safe_tile_end:
+            S = pgm.apply_mask_qk(S, epilogue_t_2)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
+        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=True)
+        acc = pgm.compute_pv(p, v, acc)
+        # QK + SM0 for tile L+1, LR_K for tile L+2
         p, alpha, M = pgm.softmax_part0(S, M)
-        k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buf_2, target_dtype=q.dtype)
-
+        k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=True)
+    gl.amd.gfx1250.tdm.async_wait(0) # merged
     with gl.amd.warp_pipeline_stage("stage3"):
         # GLDS_V for tile L+2, QK+mask for tile L+2, LR_V for tile L+1
-        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
-        S = pgm.compute_qk(k)
-        S = pgm.apply_mask_qk(S, epilogue_t_3)
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-        v = kv_loader.load_v_from_shared(wait_count=1, buffer_id=buf_1, target_dtype=q.dtype)
-    with gl.amd.warp_pipeline_stage("stage4"):
-        # SM1 + PV for tile L+1, SM0 for tile L+2, LR_V for tile L+2
-        acc = pgm.compute_pv(p, v, acc)
-        S = gl.convert_layout(S, pgm.cfg.pv_layout)
-        p, alpha, M = pgm.softmax_part0(S, M)
-        v = kv_loader.load_v_from_shared(wait_count=0, buffer_id=buf_2, target_dtype=q.dtype)
+            S = pgm.compute_qk(k)
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+            S = pgm.apply_mask_qk(S, epilogue_t_3)
+            v = kv_loader.load_v_from_shared(wait_count=1, buffer_id=buf_1, target_dtype=q.dtype, skip_wait=True)
+            # SM1 + PV for tile L+1, SM0 for tile L+2, LR_V for tile L+2
+            acc = pgm.compute_pv(p, v, acc)
+            S = gl.convert_layout(S, pgm.cfg.pv_layout)
+            p, alpha, M = pgm.softmax_part0(S, M)
+            v = kv_loader.load_v_from_shared(wait_count=0, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=True)
 
-    with gl.amd.warp_pipeline_stage("stage5"):
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-        # PV for tile L+2
-        acc = pgm.compute_pv(p, v, acc)
+    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+    # PV for tile L+2
+    acc = pgm.compute_pv(p, v, acc)
 
     return M, L, acc
 
@@ -2152,6 +2154,7 @@ def kernel_unified_attention_2d(
         output_stride_0,
         output_stride_1,
         USE_TDM=False,
+        USE_BLOCKED=False,
     )
 
 
@@ -2258,7 +2261,8 @@ def unified_attention(
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = ARCH_NAME != "gfx1250" and kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
-
+    # USE_LOAD_BUFFER_OP = False
+    # USE_STORE_BUFFER_OP = False
     grid = (NUM_KV_HEADS, total_query_blocks)
     attn_kernel = kernel_unified_attention_2d[grid](
         query_ptr=q,
