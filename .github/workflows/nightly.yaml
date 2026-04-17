@@ -17,14 +17,23 @@ on:
         description: 'GPU architectures (default: gfx942;gfx950)'
         type: string
         required: false
+      skip_build:
+        description: 'Skip build + wheel tests (go straight to integration tests)'
+        type: boolean
+        default: false
       skip_tests:
-        description: 'Skip test job for faster iteration'
+        description: 'Skip wheel smoke tests'
         type: boolean
         default: false
       skip_promote:
-        description: 'Skip promote job (build + test only)'
+        description: 'Skip promote job'
         type: boolean
         default: false
+      wheel_url:
+        description: 'Pre-built wheel URL (used when skip_build=true)'
+        type: string
+        required: false
+        default: ''
       run_sglang:
         description: 'Run SGLang integration tests'
         type: boolean
@@ -38,9 +47,14 @@ on:
         type: boolean
         default: false
       sglang_job_filter:
-        description: 'SGLang scout filter (nightly-amd, pr-test-amd, etc.)'
-        type: string
-        required: false
+        description: 'SGLang scout filter'
+        type: choice
+        options:
+          - all
+          - nightly-amd
+          - nightly-amd-rocm720
+          - pr-test-amd
+          - pr-test-amd-rocm720
         default: 'all'
 
 concurrency:
@@ -50,6 +64,7 @@ concurrency:
 jobs:
   # ── Build ────────────────────────────────────────────────────────────
   build:
+    if: ${{ github.event.inputs.skip_build != 'true' }}
     uses: ./.github/workflows/aiter-release.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
@@ -68,7 +83,9 @@ jobs:
   # ── Wheel smoke tests ───────────────────────────────────────────────
   test:
     needs: build
-    if: ${{ !(github.event.inputs.skip_tests || false) }}
+    if: >-
+      github.event.inputs.skip_build != 'true' &&
+      github.event.inputs.skip_tests != 'true'
     uses: ./.github/workflows/test-whl.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
@@ -79,10 +96,11 @@ jobs:
 
   # ── Load model configs ──────────────────────────────────────────────
   load-configs:
-    needs: [build, test]
     if: >-
-      github.event.inputs.run_vllm == 'true' ||
-      github.event.inputs.run_atom == 'true'
+      always() && (
+        github.event.inputs.run_vllm == 'true' ||
+        github.event.inputs.run_atom == 'true'
+      )
     runs-on: ubuntu-latest
     outputs:
       vllm_matrix: ${{ steps.load.outputs.vllm_matrix }}
@@ -98,7 +116,6 @@ jobs:
   # ── SGLang Scout ────────────────────────────────────────────────────
   sglang:
     name: "SGLang Scout"
-    needs: [build, test]
     if: ${{ github.event.inputs.run_sglang == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -135,7 +152,8 @@ jobs:
             "${{ github.sha }}" \
             "${{ matrix.model }}" \
             "${{ matrix.tp }}" \
-            "${{ matrix.kv }}"
+            "${{ matrix.kv }}" \
+            "${{ github.event.inputs.wheel_url }}"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -168,7 +186,8 @@ jobs:
             "${{ github.sha }}" \
             "${{ matrix.model_path }}" \
             "${{ matrix.threshold }}" \
-            "${{ matrix.extra_args }}"
+            "${{ matrix.extra_args }}" \
+            "${{ github.event.inputs.wheel_url }}"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -182,9 +201,10 @@ jobs:
     if: >-
       always() &&
       github.repository_owner == 'ROCm' &&
-      !(github.event.inputs.skip_promote || false) &&
+      github.event.inputs.skip_promote != 'true' &&
+      github.event.inputs.skip_build != 'true' &&
       needs.build.result == 'success' &&
-      needs.test.result == 'success' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
       (needs.sglang.result == 'success' || needs.sglang.result == 'skipped') &&
       (needs.vllm.result == 'success' || needs.vllm.result == 'skipped') &&
       (needs.atom.result == 'success' || needs.atom.result == 'skipped')
