@@ -87,8 +87,8 @@ class AiterCommunicator:
             return False
         if not inp.is_contiguous():
             return False
-        if inp.shape[0] > self._MAX_NUM_TOKENS:
-            return False
+        # if inp.shape[0] > self._MAX_NUM_TOKENS:
+        #     return False
         buf_size = inp.numel() * inp.element_size()
         if buf_size * 2 > self._HEAP_SIZE:
             return False
