@@ -10,12 +10,14 @@ from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
 FLYDSL_VERSION = "flydsl==0.1.3.1"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
@@ -156,7 +158,7 @@ if not _is_metadata_only() and not IS_WINDOWS:
 
 
 def _load_modules_from_config():
-    cfg_path = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
+    cfg_path = OPT_COMPILER_CONFIG
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -178,6 +180,7 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
+            # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
             if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
@@ -314,6 +317,28 @@ if PREBUILD_KERNELS != 0:
 
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
+
+        # Retune GEMM shapes on the live GPU after the main build phase.
+        # Each requested module's tune script benchmarks all CSV shapes and
+        # writes results tagged with the live GPU's (gfx, cu_num) back to
+        # the source CSV, then rebuilds the inference .so.
+        if PRETUNE_MODULES:
+            # Import directly from the file to avoid triggering aiter/__init__.py,
+            # which would try to load module_aiter_core before it is registered.
+            sys.path.insert(0, os.path.join(this_dir, "aiter", "utility"))
+            from pretune import run_pretune_modules  # noqa: E402
+
+            cfg_path = OPT_COMPILER_CONFIG
+            with open(cfg_path, "r", encoding="utf-8") as _f:
+                _cfg = json.load(_f)
+            run_pretune_modules(
+                PRETUNE_MODULES,
+                _cfg,
+                core,
+                build_one_module,
+                csrc_dir=f"{this_dir}/csrc",
+                repo_dir=this_dir,
+            )
 
         # --- FlyDSL AOT pre-compilation ---
         try:

@@ -2,14 +2,23 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
-from dataclasses import dataclass
-import copy
 from pathlib import Path
 import pandas as pd
 import argparse
 import shutil
-import torch
-from gemm_a8w8_bpreshuffle_cktile_common import (
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+
+from gemm_a8w8_bpreshuffle_cktile_common import (  # noqa: E402
     kernelInstance,
     kernels_list,
     default_kernels_dict,
@@ -157,25 +166,14 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
+        write_lookup_header(
             os.path.join(self.working_path, "gemm_a8w8_bpreshuffle_cktile_lookup.h"),
-            "w",
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -229,41 +227,15 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
-    tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
-        tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[(tune_df["cu_num"] == cu_num)].reset_index()
-        tune_df = tune_df[tune_df["libtype"] == "cktile"].reset_index()
-        # NOTE: Matching by kernelName (not kernelId). The kernelId column in tuned
-        # CSVs is kept but it is NOT used for kernel selection anymore.
-        # This allows instance lists to be reordered or expanded (e.g. changing
-        # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
-        use_name = "kernelName" in tune_df.columns
-        if not use_name:
-            print(
-                "[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
-            )
-        for i in range(len(tune_df)):
-            M = tune_df.loc[i, "M"]
-            N = tune_df.loc[i, "N"]
-            K = tune_df.loc[i, "K"]
-            if use_name:
-                kname = str(tune_df.loc[i, "kernelName"])
-                if kname in kernels_by_name:
-                    tune_dict[(M, N, K)] = kernels_by_name[kname]
-                else:
-                    print(f"[Warning]: kernelName '{kname}' not found, skip it")
-            else:
-                kid = tune_df.loc[i, "kernelId"]
-                if kid < 0 or kid >= len(kernels_list):
-                    print(f"[Warning]: kernelId {kid} is out of range, skip it")
-                    continue
-                tune_dict[(M, N, K)] = kernels_list[kid]
-    return tune_dict
+        return build_tune_dict(
+            pd.read_csv(tune_dict_csv),
+            default_kernels_dict,
+            kernels_list,
+            libtype="cktile",
+            kernels_by_name=kernels_by_name,
+        )
+    return default_kernels_dict
 
 
 if __name__ == "__main__":

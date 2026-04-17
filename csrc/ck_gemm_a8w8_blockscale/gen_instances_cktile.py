@@ -2,13 +2,24 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
+import sys
 import shutil
 from pathlib import Path
 
 import pandas as pd
-import torch
 
-from gemm_a8w8_blockscale_cktile_instance import (
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
+
+from gemm_a8w8_blockscale_cktile_instance import (  # noqa: E402
     default_kernels_cktile_dict,
     TileKernelInstance,
     candidate_kernels_cktile_dict,
@@ -35,51 +46,15 @@ class gemm_a8w8_blockscale_codegen:
         """
         Get tune dict from csv file
         """
-
-        tune_dict = default_kernels_cktile_dict
-
         if os.path.exists(tune_dict_csv):
-            tune_df = pd.read_csv(tune_dict_csv)
-            if torch.cuda.is_available():
-                gpu = torch.cuda.current_device()
-                device_properties = torch.cuda.get_device_properties(gpu)
-                cu_num = device_properties.multi_processor_count
-                tune_df = tune_df[
-                    (tune_df["cu_num"] == cu_num) & (tune_df["libtype"] == "cktile")
-                ].reset_index()
-            # NOTE: Matching by kernelName (not kernelId). The kernelId column in tuned
-            # CSVs is kept but it is NOT used for kernel selection anymore.
-            # This allows instance lists to be reordered or expanded (e.g. changing
-            # BLOCK_PER_CU_MAX) without invalidating existing tuned CSVs.
-            use_name = "kernelName" in tune_df.columns
-            if not use_name:
-                print(
-                    "[Warning]: tuned CSV has no kernelName column, falling back to kernelId. "
-                    "Re-run tuner to generate a CSV with kernelName for robust matching."
-                )
-            for i in range(len(tune_df)):
-                M = int(tune_df.loc[i, "M"])
-                N = int(tune_df.loc[i, "N"])
-                K = int(tune_df.loc[i, "K"])
-
-                if use_name:
-                    kname = str(tune_df.loc[i, "kernelName"])
-                    if kname in candidate_kernels_by_name:
-                        tune_dict[(M, N, K)] = candidate_kernels_by_name[kname]
-                    else:
-                        print(
-                            f"Warning: kernelName '{kname}' not found for shape ({M}, {N}, {K})"
-                        )
-                else:
-                    kid = int(tune_df.loc[i, "kernelId"])
-                    if kid in candidate_kernels_cktile_dict:
-                        tune_dict[(M, N, K)] = candidate_kernels_cktile_dict[kid]
-                    else:
-                        print(
-                            f"Warning: kernelId {kid} not found for shape ({M}, {N}, {K})"
-                        )
-
-        return tune_dict
+            return build_tune_dict(
+                pd.read_csv(tune_dict_csv),
+                default_kernels_cktile_dict,
+                candidate_kernels_cktile_dict,
+                libtype="cktile",
+                kernels_by_name=candidate_kernels_by_name,
+            )
+        return default_kernels_cktile_dict
 
     def gen_cktile_instance(self, k: TileKernelInstance):
         """
@@ -189,24 +164,14 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"), "w"
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+        write_lookup_header(
+            os.path.join(self.working_path, "gemm_a8w8_blockscale_cktile_lookup.h"),
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         """
