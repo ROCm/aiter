@@ -240,7 +240,7 @@ def _gemm_a8w8_blockscale_kernel(
 
     # ----- Main Loop --------
 
-    for k in range(k_tiles_count - 1):
+    for k in range(k_tiles_count - (NUM_BUFFERS - 1)):
         # Loading a scale and curr A scale
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
@@ -325,7 +325,6 @@ def _gemm_a8w8_blockscale_kernel(
             )
         # wmma
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
-        num_computes += 1
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
         cur_a = next_a
         cur_b = next_b
@@ -364,7 +363,6 @@ def _gemm_a8w8_blockscale_kernel(
     # cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
-    num_computes += 1
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
     if NUM_BUFFERS > 2:
