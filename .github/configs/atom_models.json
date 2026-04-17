@@ -24,7 +24,7 @@
     "runner": "linux-aiter-mi35x-1"
   },
   {
-    "model_name": "gpt-oss-120b (2 GPUs)",
+    "model_name": "gpt-oss-120b-2gpu",
     "model_path": "openai/gpt-oss-120b",
     "extra_args": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3",
     "threshold": "0.38",
@@ -40,7 +40,7 @@
     "runner": "linux-aiter-mi35x-8"
   },
   {
-    "model_name": "DeepSeek-R1-0528-FP4 MTP",
+    "model_name": "DeepSeek-R1-0528-FP4-MTP",
     "model_path": "amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4",
     "extra_args": "--kv_cache_dtype fp8 -tp 4 --method mtp",
     "threshold": "0.93",
@@ -64,7 +64,7 @@
     "runner": "linux-aiter-mi35x-8"
   },
   {
-    "model_name": "DeepSeek-R1-0528 MTP",
+    "model_name": "DeepSeek-R1-0528-MTP",
     "model_path": "deepseek-ai/DeepSeek-R1-0528",
     "extra_args": "--kv_cache_dtype fp8 -tp 8 --method mtp",
     "threshold": "0.94",

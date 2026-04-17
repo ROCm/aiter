@@ -113,20 +113,24 @@ jobs:
           echo "vllm_matrix=$(cat .github/configs/vllm_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
           echo "atom_matrix=$(cat .github/configs/atom_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
 
-  # ── SGLang Scout ────────────────────────────────────────────────────
+  # ── SGLang Integration ───────────────────────────────────────────────
   sglang:
-    name: "SGLang Scout"
+    name: "SGLang Integration (1-GPU)"
     if: ${{ github.event.inputs.run_sglang == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: aiter-1gpu-runner
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: Run SGLang Scout
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run SGLang tests
+        timeout-minutes: 110
         env:
-          GH_TOKEN: ${{ secrets.SGLANG_PAT }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
         run: |
           bash .github/scripts/run_sglang.sh \
             "${{ github.sha }}" \
-            "${{ github.event.inputs.sglang_job_filter || 'all' }}"
+            "${{ github.event.inputs.wheel_url }}"
 
   # ── vLLM Benchmarks ────────────────────────────────────────────────
   vllm:
@@ -181,6 +185,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           ATOM_ENV_VARS: ${{ matrix.env_vars }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
           bash .github/scripts/run_atom.sh \
             "${{ github.sha }}" \
