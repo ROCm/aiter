@@ -357,9 +357,16 @@ def mla_decode_fwd(
             )
             or (
                 get_gfx() == "gfx950"
+                and (nhead * max_seqlen_q) % 128 == 0
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+            )
+            or (
+                get_gfx() == "gfx950"
                 and (nhead * max_seqlen_q) % 64 == 0
                 and q.dtype == dtypes.bf16
                 and kv_buffer.dtype == dtypes.bf16
+                and nhead <= 64
             )
         ):
             # Natively support cases

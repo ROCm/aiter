@@ -936,6 +936,13 @@ def get_mla_metadata_info_v1(
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     if (
         get_gfx() == "gfx950"
+        and (num_head_qo * effective_seqlen_qo) % 128 == 0
+        and kv_dtype == dtypes.bf16
+        and q_dtype == dtypes.bf16
+    ):
+        max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
+    elif (
+        get_gfx() == "gfx950"
         and (num_head_qo * effective_seqlen_qo) % 64 == 0
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
