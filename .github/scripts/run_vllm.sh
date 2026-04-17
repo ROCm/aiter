@@ -47,7 +47,7 @@ RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
 if [ -n "${AITER_INDEX_URL}" ]; then
-  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" \"${AITER_PKG}\"" >> /tmp/Dockerfile.vllm-nightly
+  echo "RUN ${AITER_INSTALL_CMD}" >> /tmp/Dockerfile.vllm-nightly
 else
   cat >> /tmp/Dockerfile.vllm-nightly <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /aiter && \

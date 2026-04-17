@@ -39,7 +39,7 @@ RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
 if [ -n "${AITER_INDEX_URL}" ]; then
-  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" \"${AITER_PKG}\"" >> /tmp/Dockerfile.vllm-test
+  echo "RUN ${AITER_INSTALL_CMD}" >> /tmp/Dockerfile.vllm-test
 else
   cat >> /tmp/Dockerfile.vllm-test <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /aiter && \
@@ -51,6 +51,8 @@ fi
 
 cat >> /tmp/Dockerfile.vllm-test <<'EOF'
 RUN echo "=== AITER version ===" && pip show amd-aiter || true
+# Clone vLLM repo for test files (not included in deployment image)
+RUN git clone --depth 1 https://github.com/vllm-project/vllm.git /app/vllm
 EOF
 
 docker build --network=host --no-cache \

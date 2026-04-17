@@ -116,7 +116,7 @@ bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
 if [ -n "${AITER_INDEX_URL}" ]; then
   docker exec ci_sglang bash -lc "
     pip uninstall -y amd-aiter aiter || true
-    pip install --extra-index-url '${AITER_INDEX_URL}' '${AITER_PKG}'
+    ${AITER_INSTALL_CMD}
     pip show amd-aiter
   "
 else
