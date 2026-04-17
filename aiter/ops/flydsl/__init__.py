@@ -27,7 +27,8 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
-    if installed_flydsl_version != _REQUIRED_FLYDSL_VERSION:
+    _base_version = installed_flydsl_version.split("+")[0]
+    if _base_version != _REQUIRED_FLYDSL_VERSION:
         raise ImportError(
             "Unsupported `flydsl` version: "
             f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
