@@ -33,19 +33,24 @@ fi
 #   CLAUDE_PERMISSION_FLAGS — optional: space-separated CLI args; if set (even empty), replaces the default permission flags.
 #                     Default is `--dangerously-skip-permissions --allowedTools Read,Edit,Bash` as non-root; as root, Claude CLI
 #                     forbids dangerously-skip-permissions, so the script uses `--permission-mode acceptEdits --allowedTools Read,Edit,Bash`.
+#   TRIAL_MODE      — if 1, run only a single ISL/OSL pair (8192,1024) with 1 benchmark iteration per tag instead of
+#                     3 pairs × 4 runs. Use this for a quick sanity check that the server starts and produces results
+#                     before committing to a full benchmark run. Default: 0.
 #   SERVER_READY_TIMEOUT_SEC — wait for OpenAI server log line (default: 300). If the message never appears, that benchmark tag is skipped as failed.
 #   SERVER_READY_LINE — substring to wait for in the *server-only* log (default: uvicorn). Do not set to text you also write into that log.
 #
-# Benchmarks: once per tag (baseline or each worktree), before the four benchmark_serving iterations, the script starts
-#   python3 -m atom.entrypoints.openai_server --model /shared_inference/models/gpt-oss-120b/ -tp 8 --kv_cache_dtype fp8 --host 0.0.0.0 --port 8000
-# in the background from that tag’s checkout directory (repo root for baseline, or the worktree path). It waits until the server log contains
-#   INFO:     Started server process
-# (timeout SERVER_READY_TIMEOUT_SEC), runs all four iterations, then stops the server before the next tag.
+# Benchmarks: once per tag (baseline or each worktree) the script starts the OpenAI server in the background, waits
+#   for SERVER_READY_LINE (timeout SERVER_READY_TIMEOUT_SEC), then runs benchmark_serving for each ISL/OSL pair.
+#   Full mode: 3 pairs (1024/1024, 1024/8192, 8192/1024) × 4 runs = 12 invocations per tag.
+#   Trial mode (TRIAL_MODE=1): 1 pair (8192/1024) × 1 run = 1 invocation per tag — useful for a quick sanity check.
+#   The server is stopped between tags so GPU VRAM is fully released before the next checkout is tested.
 #
 # JIT: after each `git worktree add`, `clean_jit <checkout>` removes that tree’s
 #   aiter/jit/<module>.so and aiter/jit/build/<module> so the .so is rebuilt when that worktree is used (not before benchmarks).
 #
 # Examples:
+#   Quick trial (sanity check, 1 size × 1 run):
+#     TRIAL_MODE=1 RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash run_server_test.sh
 #   Clean prior OUT_DIR + worktrees then build:
 #     CLEAN_OUTPUT_BEFORE_BUILD=1 OUT_DIR=./kernel_optimization_results/my_run RUN_PHASE=build_only OPTIMIZE_MODE=individual bash run_server_test.sh
 #   Build only (individual):   RUN_PHASE=build_only OPTIMIZE_MODE=individual bash run_server_test.sh
@@ -67,6 +72,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUT_DIR=${OUT_DIR:-"$REPO_ROOT/kernel_optimization_results/$TIMESTAMP"}
 BASELINE_REF=${BASELINE_REF:-HEAD}
 CLEAN_OUTPUT_BEFORE_BUILD=${CLEAN_OUTPUT_BEFORE_BUILD:-0}
+TRIAL_MODE=${TRIAL_MODE:-0}  # if 1: single ISL/OSL pair (8192,1024) and 1 run per tag for a quick sanity check
 
 MANIFEST="$OUT_DIR/kernel_opt_worktrees.manifest"
 REPO_PARENT=$(cd "$REPO_ROOT/.." && pwd)
@@ -106,6 +112,8 @@ Common environment variables:
   SKIP_CLAUDE     set to skip Claude CLI in build phase
   CLAUDE_MODEL    optional model passed to Claude CLI
   CLAUDE_BIN      Claude executable path (default: claude)
+  TRIAL_MODE      0 (default) or 1; skips to a single ISL/OSL pair (8192,1024) with 1 run per tag.
+                  Use before a full run to confirm the server starts and results are produced.
   SERVER_READY_TIMEOUT_SEC
                   server startup wait timeout in seconds (default: 300)
   SERVER_READY_LINE
@@ -118,6 +126,7 @@ Common environment variables:
 Examples:
   RUN_PHASE=build_only OPTIMIZE_MODE=individual bash $(basename "$0")
   RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash $(basename "$0")
+  TRIAL_MODE=1 RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash $(basename "$0")
 EOF
 }
 
@@ -319,6 +328,12 @@ run_benchmarks() {
   local log="$log_dir/benchmark_${tag}.log"
   local model="$SERVER_MODEL_PATH"
   local -a isl_osl_pairs=("1024,1024" "1024,8192" "8192,1024")
+  local bench_runs=4
+  if [[ "${TRIAL_MODE:-0}" == "1" ]]; then
+    isl_osl_pairs=("8192,1024")
+    bench_runs=1
+    echo "TRIAL_MODE=1: single ISL/OSL pair (8192,1024), 1 run" >>"$log"
+  fi
   local conc=8 port=$SERVER_PORT
   local server_log="$log_dir/openai_server_${tag}.log"
   local server_pid
@@ -345,7 +360,7 @@ run_benchmarks() {
     printf 'cd %q && PYTHONUNBUFFERED=1 python3 -m atom.entrypoints.openai_server \\\n' "$work_dir"
     printf '  --model %q -tp %s --kv_cache_dtype fp8 --host 0.0.0.0 --port %s\n' \
       "$SERVER_MODEL_PATH" "$SERVER_TP" "$SERVER_PORT"
-    echo "===== benchmark ${tag}: OpenAI server pid will be recorded below (shared across ${#isl_osl_pairs[@]} ISL/OSL pairs × 4 runs each) ====="
+    echo "===== benchmark ${tag}: OpenAI server pid will be recorded below (shared across ${#isl_osl_pairs[@]} ISL/OSL pairs × ${bench_runs} runs each) ====="
   } >>"$log"
 
   server_pid=$(start_openai_server_bg "$work_dir" "$server_log")
@@ -373,17 +388,17 @@ run_benchmarks() {
   fi
 
   {
-    echo "Server ready (${SERVER_READY_LINE}); running benchmark_serving ${#isl_osl_pairs[@]} ISL/OSL pairs × 4 runs each"
+    echo "Server ready (${SERVER_READY_LINE}); running benchmark_serving ${#isl_osl_pairs[@]} ISL/OSL pairs × ${bench_runs} runs each"
   } >>"$log"
 
   local bench_rc=0
   for pair in "${isl_osl_pairs[@]}"; do
     local isl=${pair%%,*}
     local osl=${pair##*,}
-    for i in $(seq 1 4); do
+    for i in $(seq 1 "$bench_runs"); do
       local result_fn="result_${tag}_isl${isl}_osl${osl}_conc${conc}_run${i}.json"
       {
-        echo "===== benchmark ${tag} isl=${isl} osl=${osl} run ${i}/4 ====="
+        echo "===== benchmark ${tag} isl=${isl} osl=${osl} run ${i}/${bench_runs} ====="
         echo "cwd: $work_dir"
         echo "test command line:"
         printf 'cd %q && \\\n' "$work_dir"
@@ -404,7 +419,7 @@ run_benchmarks() {
           "$work_dir" "$BENCH_SCRIPT" "http://localhost:$port" "$model" "$isl" "$osl" "$((conc * 4))" "$conc" "$log_dir" "$result_fn"
         echo "--- output ---"
       } >>"$log"
-      echo "Running isl=${isl} osl=${osl} run ${i}/4 ($tag) cwd=$work_dir → $log"
+      echo "Running isl=${isl} osl=${osl} run ${i}/${bench_runs} ($tag) cwd=$work_dir → $log"
       set +e
       (cd "$work_dir" && python "$BENCH_SCRIPT" \
         --backend=vllm --base-url="http://localhost:$port" --endpoint=/v1/completions \
@@ -448,7 +463,13 @@ run_claude_prompt() {
     return 0
   fi
   local prompt_text
-  prompt_text=$(cat "$prompt_file")
+  # Strip YAML frontmatter (--- ... ---) if present — it is harness metadata, not prompt content.
+  # Claude CLI's argument parser misreads '---' at the start of a -p value as an option name.
+  if IFS= read -r _first_line < "$prompt_file" && [[ "$_first_line" == "---" ]]; then
+    prompt_text=$(awk 'NR==1{next} /^---$/{if(!found){found=1;next}} found' "$prompt_file")
+  else
+    prompt_text=$(cat "$prompt_file")
+  fi
   local claude_bin=${CLAUDE_BIN:-claude}
   local model_flag=()
   if [[ -n "${CLAUDE_MODEL:-}" ]]; then
