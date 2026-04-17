@@ -870,6 +870,7 @@ class GemmTuner(GemmCommonTuner):
     def __init__(
         self,
         key=[
+            "gfx",
             "cu_num",
             "M",
             "N",
@@ -901,6 +902,7 @@ class GemmTuner(GemmCommonTuner):
 
         self.hipb_prefer_ratio = 0.995
         self.cu_num = self.get_cu_num()
+        self.gfx = self.get_gfx()
         self.gemmobj = None
         self.num_warmup = 10
 
@@ -987,7 +989,7 @@ class GemmTuner(GemmCommonTuner):
         info, time, err_ratio = results
         if time <= 0:
             return -1, -1
-        cu_num, m, n, k = info
+        gfx, cu_num, m, n, k = info
         flops = m * n * k * 2
         tflops = round(flops / (time * 1000000), 2)
 
@@ -1035,6 +1037,7 @@ class GemmTuner(GemmCommonTuner):
                             bpreshuffle=ds["bpreshuffle"],
                         )
             self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
+            self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             untunedf_cols = self.untunedf.columns
@@ -1066,7 +1069,8 @@ class GemmTuner(GemmCommonTuner):
         print(self.tunedf)
         if self.tunedf is None or (
             self.tunedf[
-                (self.tunedf["cu_num"] == self.cu_num)
+                (self.tunedf["gfx"] == self.gfx)
+                & (self.tunedf["cu_num"] == self.cu_num)
                 & (self.tunedf["M"] == m)
                 & (self.tunedf["N"] == n)
                 & (self.tunedf["K"] == k)
@@ -1077,6 +1081,7 @@ class GemmTuner(GemmCommonTuner):
             ].empty
         ):
             entry = {
+                "gfx": [self.gfx],
                 "cu_num": [self.cu_num],
                 "M": [m],
                 "N": [n],
@@ -1103,7 +1108,9 @@ class GemmTuner(GemmCommonTuner):
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
             outdtype = outdtype if outdtype is not None else indtype
-            self.set_run_iters((self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype))
+            self.set_run_iters(
+                (self.gfx, self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype)
+            )
 
             gemmobj = Gemm(
                 ds["M"],
@@ -1139,6 +1146,7 @@ class GemmTuner(GemmCommonTuner):
             splitK = info[2]
             kernelName = info[4]
             libtype = info[3]
+            res_one.append(get_gfx())
             res_one.append(get_cu_num())
             for ele in info[0]:
                 res_one.append(ele)
@@ -1151,7 +1159,7 @@ class GemmTuner(GemmCommonTuner):
             res_one.append(kernelName)
             res_one.append(err_ratio)
             ret = (
-                (self.cu_num, info[0][0], info[0][1], info[0][2]),
+                (self.gfx, self.cu_num, info[0][0], info[0][1], info[0][2]),
                 us,
                 err_ratio,
             )
@@ -1246,7 +1254,7 @@ class GemmTuner(GemmCommonTuner):
             resultsdf.to_csv(profile_file, index=False)
 
     def set_run_iters(self, input, inputdtype):
-        cu_num, m, n, k, *rest = input
+        gfx, cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
         # bpe = self.get_bpe(inputdtype)
         if flops < 128 * 5120 * 256 * 2:

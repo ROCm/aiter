@@ -92,7 +92,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
         info, time, err_ratio = results
         if time == -1:
             return -1, -1
-        cu_num, b, m, n, k = info[0]
+        gfx, cu_num, b, m, n, k = info[0]
         flops = m * n * k * 2 * b
         tflops = round(flops / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -121,6 +121,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
         shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
 
         task = []
         tasks_data = []
@@ -149,7 +150,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, B, M, N, K), kid, splitK, "")
+                    info = ((gfx, cu_num, B, M, N, K), kid, splitK, "")
                     task.append(
                         (
                             info,
@@ -195,6 +196,7 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
 
 if __name__ == "__main__":
     key = [
+        "gfx",
         "cu_num",
         "B",
         "M",

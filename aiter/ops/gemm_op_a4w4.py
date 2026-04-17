@@ -11,7 +11,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
@@ -33,16 +33,37 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 def get_GEMM_config(M: int, N: int, K: int):
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
     if not hasattr(get_GEMM_config, "gemm_dict"):
-        gemm_dict = pd.read_csv(tuned_file).drop_duplicates()
-        get_GEMM_config.gemm_dict = gemm_dict.set_index(
-            ["cu_num", "M", "N", "K"]
-        ).to_dict("index")
+        gemm_dict = pd.read_csv(
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
+        ).drop_duplicates()
+        # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
+        # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
+        if "gfx" in gemm_dict.columns:
+            get_GEMM_config.gemm_dict = gemm_dict.set_index(
+                ["gfx", "cu_num", "M", "N", "K"]
+            ).to_dict("index")
+            get_GEMM_config.has_gfx = True
+        else:
+            logger.warning(
+                f"{AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE} has no 'gfx' column — "
+                "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
+            )
+            get_GEMM_config.gemm_dict = gemm_dict.set_index(
+                ["cu_num", "M", "N", "K"]
+            ).to_dict("index")
+            get_GEMM_config.has_gfx = False
+    gfx = get_gfx()
     cu_num = get_cu_num()
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = get_GEMM_config.gemm_dict.get((cu_num, padded_M, N, K), None)
+        key = (
+            (gfx, cu_num, padded_M, N, K)
+            if get_GEMM_config.has_gfx
+            else (cu_num, padded_M, N, K)
+        )
+        config = get_GEMM_config.gemm_dict.get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
