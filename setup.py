@@ -19,8 +19,10 @@ PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
-    ENABLE_CK = False
-    PREBUILD_KERNELS = False
+    # On Windows, default to JIT-only (no prebuild during install) but do
+    # allow CK headers to be packaged so that runtime JIT compilation can
+    # use them. Both are still opt-out via env vars.
+    PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
 
 
 def getMaxJobs():
@@ -127,11 +129,11 @@ def _is_metadata_only():
 
 
 # Defer heavy imports until build time
-if not _is_metadata_only() and not IS_WINDOWS:
+if not _is_metadata_only():
     import json
     from concurrent.futures import ThreadPoolExecutor
 
-    sys.path.insert(0, f"{this_dir}/aiter/")
+    sys.path.insert(0, os.path.join(this_dir, "aiter"))
     from jit import core
     from jit.utils.cpp_extension import IS_HIP_EXTENSION
 
@@ -143,16 +145,39 @@ if not _is_metadata_only() and not IS_WINDOWS:
     else:
         IS_ROCM = False
 
-    if not IS_ROCM:
+    # On Windows, IS_HIP_EXTENSION may be False during pip install if hipconfig
+    # isn't on PATH yet — don't fail the install for that, JIT will use the
+    # bundled Windows ROCm at first runtime call.
+    if not IS_ROCM and not IS_WINDOWS:
         raise NotImplementedError("Only ROCM is supported")
 
-    ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
+    ck_dir = os.environ.get(
+        "CK_DIR", os.path.join(this_dir, "3rdparty", "composable_kernel")
+    )
     if ENABLE_CK:
-        assert os.path.exists(ck_dir), (
-            "CK is needed by aiter, please make sure clone by "
-            '"git clone --recursive https://github.com/ROCm/aiter.git" or '
-            '"git submodule sync ; git submodule update --init --recursive"'
-        )
+        ck_present = os.path.exists(ck_dir)
+        if not IS_WINDOWS:
+            assert ck_present, (
+                "CK is needed by aiter, please make sure clone by "
+                '"git clone --recursive https://github.com/ROCm/aiter.git" or '
+                '"git submodule sync ; git submodule update --init --recursive"'
+            )
+        elif not ck_present:
+            # On Windows we permit the CK submodule to be missing so `pip
+            # install .` can still succeed; JIT will fall back to the
+            # AITER_CK_FREE shims at runtime. Warn loudly so ENABLE_CK=1
+            # users notice they're getting a degraded build instead of
+            # silently shipping shim kernels.
+            import warnings
+
+            warnings.warn(
+                f"ENABLE_CK=1 but CK submodule not found at {ck_dir}. "
+                "JIT will fall back to AITER_CK_FREE shims at runtime. "
+                "To build with CK, run: "
+                '"git submodule sync ; git submodule update --init --recursive" '
+                "and reinstall. To silence this warning, set ENABLE_CK=0.",
+                stacklevel=2,
+            )
 
 
 def _load_modules_from_config():
@@ -413,6 +438,8 @@ setup_requires = [
     "ninja",
     "setuptools_scm",
 ]
+if not IS_WINDOWS:
+    setup_requires.append(FLYDSL_VERSION)
 if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
 
@@ -422,18 +449,17 @@ class ForcePlatlibDistribution(Distribution):
         return True
 
 
-if IS_WINDOWS:
-    install_requires = ["einops", "packaging", "psutil"]
-else:
-    install_requires = [
-        "pybind11>=3.0.1",
-        "ninja",
-        "pandas",
-        "einops",
-        "psutil",
-        "packaging",
-        FLYDSL_VERSION,
-    ]
+install_requires = [
+    "pybind11>=3.0.1",
+    "ninja",
+    "pandas",
+    "einops",
+    "psutil",
+    "packaging",
+]
+if not IS_WINDOWS:
+    # flydsl publishes Linux-only wheels.
+    install_requires.append(FLYDSL_VERSION)
 
 setup(
     name=PACKAGE_NAME,

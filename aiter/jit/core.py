@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -59,6 +60,13 @@ logger = logging.getLogger("aiter")
 
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Platform helpers — keep aiter importable / buildable on Windows.
+IS_WINDOWS = sys.platform == "win32"
+NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
+# Suffix for built JIT modules. Linux extensions ship as `.so`; on Windows
+# Python loads `.pyd` (which is just a renamed `.dll`).
+JIT_LIB_EXT = ".pyd" if IS_WINDOWS else ".so"
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
@@ -276,12 +284,13 @@ class AITER_CONFIG(object):
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
+        import tempfile
         from pathlib import Path
 
-        config_path = Path("/tmp/aiter_configs/")
+        config_path = Path(tempfile.gettempdir()) / "aiter_configs"
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
-        new_file_path = f"{config_path}/{merge_name}.csv"
+        new_file_path = str(config_path / f"{merge_name}.csv")
         lock_path = f"{new_file_path}.lock"
         tmp_file_path = f"{new_file_path}.tmp"
 
@@ -406,6 +415,21 @@ if multiprocessing.current_process().name == "MainProcess":
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
+
+    # On Windows, clang cannot resolve 'native' to a GPU arch at compile time
+    # because it queries the HIP runtime DLL which doesn't expose arch info
+    # the same way. Resolve it explicitly from torch device properties instead.
+    if sys.platform == "win32" and archs == ["native"]:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                gcn = torch.cuda.get_device_properties(0).gcnArchName
+                arch = gcn.split(":")[0]  # strip e.g. ':xnack-' suffix
+                if arch:
+                    archs = [arch]
+        except Exception:
+            pass  # leave as ['native'] and let the compiler error surface
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -436,17 +460,37 @@ def validate_and_update_archs():
 
 
 @functools.lru_cache()
+def _resolve_hipcc() -> str:
+    """Locate hipcc on both Linux and Windows (where it ships as .bat/.exe)."""
+    # Try the cross-platform resolver first.
+    try:
+        from jit.utils.cpp_extension import executable_path
+
+        return executable_path("hipcc")
+    except Exception:
+        pass
+    # Fallback: shutil.which, trying .bat/.exe on Windows.
+    import shutil
+
+    for name in ("hipcc", "hipcc.bat", "hipcc.exe") if IS_WINDOWS else ("hipcc",):
+        found = shutil.which(name)
+        if found:
+            return found
+    return "hipcc"  # let subprocess raise a clearer error
+
+
+@functools.lru_cache()
 def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
     cmd = (
-        ["hipcc"]
+        [_resolve_hipcc()]
         + flag_hip.split()
-        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+        + ["-x", "hip", "-E", "-P", NULL_DEVICE, "-o", NULL_DEVICE]
     )
     try:
         subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
@@ -461,13 +505,43 @@ def check_LLVM_MAIN_REVISION():
     #else
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
+    import tempfile
 
-    cmd = """echo "#include <tuple>
-__host__ __device__ void func(){std::tuple<int, int> t = std::tuple(1, 1);}" | hipcc -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
+    # Use a temp .cpp file instead of an `echo ... | hipcc -` shell pipe.
+    # The pipe pattern is unreliable on Windows cmd.exe (quoting/newlines
+    # behave differently) and was silently falling through to the fallback
+    # path there.
+    probe_src = (
+        "#include <tuple>\n"
+        "__host__ __device__ void func(){"
+        "std::tuple<int, int> t = std::tuple(1, 1);"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
     try:
-        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError:
+        subprocess.check_output(
+            [
+                _resolve_hipcc(),
+                "-x",
+                "hip",
+                "-P",
+                "-c",
+                "-Wno-unused-command-line-argument",
+                "-o",
+                NULL_DEVICE,
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return 554785
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
     return 554785 - 1
 
 
@@ -502,11 +576,11 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
         if hipify:
             if name.endswith(".cpp") or name.endswith(".cu"):
                 newName = name.replace(".cpp", ".cu")
-                ret.append(f"{dst}/{newName}")
-            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+                ret.append(os.path.join(dst, newName))
+            shutil.copy(os.path.join(src, name), os.path.join(dst, newName))
         else:
             if name.endswith(".cpp") or name.endswith(".cu"):
-                ret.append(f"{src}/{newName}")
+                ret.append(os.path.join(src, newName))
 
     ret = []
     for el in els:
@@ -515,11 +589,10 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
             continue
         if os.path.isdir(el):
             for entry in os.listdir(el):
-                if os.path.isdir(f"{el}/{entry}"):
+                child = os.path.join(el, entry)
+                if os.path.isdir(child):
                     if recursive:
-                        ret += rename_cpp_to_cu(
-                            [f"{el}/{entry}"], dst, hipify, recursive
-                        )
+                        ret += rename_cpp_to_cu([child], dst, hipify, recursive)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -529,7 +602,14 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
 
 @torch_compile_guard()
 def check_numa_custom_op() -> None:
-    numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
+    # /proc/sys/kernel/numa_balancing is Linux-only.
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        with open("/proc/sys/kernel/numa_balancing") as f:
+            numa_balance_set = f.read().strip()
+    except OSError:
+        return
     if numa_balance_set == "1":
         logger.warning(
             "WARNING: NUMA balancing is enabled, which may cause errors. "
@@ -694,11 +774,19 @@ def clone_3rdparty(third_party: str) -> None:
 
 
 def rm_module(md_name):
-    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+    path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Failed to remove {path}: {e}")
 
 
 def clear_build(md_name):
-    os.system(f"rm -rf {bd_dir}/{md_name}")
+    path = os.path.join(bd_dir, md_name)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def build_module(
@@ -719,7 +807,7 @@ def build_module(
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
-    target_name = f"{md_name}.so" if not is_standalone else md_name
+    target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -777,7 +865,9 @@ def build_module(
                 "-mllvm -amdgpu-function-calls=false",
             ]
         if hip_version > Version("6.2.41133"):
-            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+            # Skip this flag on Windows to avoid "Unknown command line argument" errors.
+            if not IS_WINDOWS:
+                flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
@@ -812,11 +902,70 @@ def build_module(
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
             if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob/"
+                blob_dir = os.path.join(op_dir, "blob")
                 os.makedirs(blob_dir, exist_ok=True)
+                rendered = blob_gen_cmd.format(blob_dir)
                 if AITER_LOG_MORE:
-                    logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
-                os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
+                    logger.info(f"exec_blob ---> {PY} {rendered}")
+                # Run via subprocess so it works on Windows cmd.exe (no shell
+                # quoting differences).
+                import shlex as _shlex
+
+                try:
+                    args = _shlex.split(rendered, posix=not IS_WINDOWS)
+                except ValueError:
+                    args = rendered.split()
+                rc = subprocess.call([PY] + args)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"blob generator failed (exit {rc}): {PY} {rendered}"
+                    )
+                # Optional post-generation pruning to dramatically cut JIT
+                # compile time. CK-tile generators emit hundreds of
+                # (dtype, quant, tile) specializations per module.
+                # Users can set AITER_BLOB_SKIP to a comma-separated list of
+                # substrings — any generated .cpp whose basename contains any
+                # of them is deleted before ninja sees it. AITER_BLOB_KEEP
+                # is the opposite (allow-list): keep only files whose
+                # basename contains at least one of the given substrings,
+                # plus any api/common-header .cpp that holds dispatch code.
+                skip_raw = os.environ.get("AITER_BLOB_SKIP", "").strip()
+                keep_raw = os.environ.get("AITER_BLOB_KEEP", "").strip()
+                if skip_raw or keep_raw:
+                    skip_tokens = [t for t in skip_raw.split(",") if t]
+                    keep_tokens = [t for t in keep_raw.split(",") if t]
+                    pruned = 0
+                    kept = 0
+                    for fname in os.listdir(blob_dir):
+                        if not fname.endswith(".cpp"):
+                            continue
+                        # Never prune API dispatch files. These are the
+                        # small glue files that map public entry points
+                        # onto the per-instance kernels.
+                        if "_api" in fname:
+                            kept += 1
+                            continue
+                        base = fname[:-4]
+                        if skip_tokens and any(t in base for t in skip_tokens):
+                            try:
+                                os.remove(os.path.join(blob_dir, fname))
+                                pruned += 1
+                                continue
+                            except OSError:
+                                pass
+                        if keep_tokens and not any(t in base for t in keep_tokens):
+                            try:
+                                os.remove(os.path.join(blob_dir, fname))
+                                pruned += 1
+                                continue
+                            except OSError:
+                                pass
+                        kept += 1
+                    if pruned:
+                        logger.info(
+                            f"[aiter] blob prune: kept {kept}, removed {pruned} "
+                            f"(skip={skip_tokens or '-'}, keep={keep_tokens or '-'})"
+                        )
                 sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
             return sources
 
@@ -875,6 +1024,55 @@ def build_module(
                     bd_include_dir,
                     hipify,
                 )
+
+        # Log the compile workload up-front.
+        _n_sources = len(set(sources))
+        logger.info(f"[aiter] [{md_name}] will compile {_n_sources} source files")
+
+        # Start a lightweight progress reporter in a background thread.
+        import threading as _threading
+
+        _progress_stop = _threading.Event()
+        _progress_interval = float(os.environ.get("AITER_PROGRESS_INTERVAL", "10"))
+
+        def _progress_watcher():
+            import time as _time
+
+            build_subdir = opbd_dir
+            started = _time.monotonic()
+            last_count = -1
+            last_emit = 0.0
+            while not _progress_stop.wait(_progress_interval):
+                try:
+                    entries = os.listdir(build_subdir)
+                except OSError:
+                    continue
+                obj_count = sum(
+                    1 for n in entries if n.endswith(".o") or n.endswith(".obj")
+                )
+                # Avoid re-printing identical lines; but at least every 60s
+                # emit a heartbeat.
+                now = _time.monotonic()
+                if obj_count == last_count and (now - last_emit) < 60:
+                    continue
+                elapsed = int(now - started)
+                pct = f" {100 * obj_count / _n_sources:5.1f}%" if _n_sources else ""
+                logger.info(
+                    f"[aiter] [{md_name}] building... "
+                    f"{obj_count}/{_n_sources}{pct}  elapsed {elapsed}s"
+                )
+                last_count = obj_count
+                last_emit = now
+
+        if _progress_interval > 0 and _n_sources > 8:
+            _progress_thread = _threading.Thread(
+                target=_progress_watcher,
+                name=f"aiter-progress-{md_name}",
+                daemon=True,
+            )
+            _progress_thread.start()
+        else:
+            _progress_thread = None
 
         try:
             _jit_compile(
@@ -1136,7 +1334,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
         if not os.path.exists(so_path):
             d_args = get_args_of_build(md_name)
             d_args["torch_exclude"] = True
