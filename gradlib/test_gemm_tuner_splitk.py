@@ -7,6 +7,8 @@ where gdx*gdy > 1024 must be filtered out to avoid out-of-bounds writes.
 import sys
 import types
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +99,7 @@ def _install_stubs():
 _install_stubs()
 
 # Now import the module under test from the local gradlib tree
-sys.path.insert(0, "gradlib")
+sys.path.insert(0, str(Path(__file__).resolve().parent / "gradlib"))
 from gradlib.GemmTuner import Gemm  # noqa: E402
 
 
