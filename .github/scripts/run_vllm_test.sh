@@ -18,6 +18,9 @@ AITER_SHA="${1:?Usage: run_vllm_test.sh <aiter_sha> <test_cmd> [aiter_index_url]
 TEST_CMD="${2:?test_cmd required}"
 AITER_INDEX_URL="${3:-}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/resolve_aiter_version.sh"
+
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
 SHORT_SHA="${AITER_SHA:0:7}"
 IMAGE_TAG="rocm/vllm-aiter-ci:test-${SHORT_SHA}"
@@ -36,7 +39,7 @@ RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
 if [ -n "${AITER_INDEX_URL}" ]; then
-  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" amd-aiter" >> /tmp/Dockerfile.vllm-test
+  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" \"${AITER_PKG}\"" >> /tmp/Dockerfile.vllm-test
 else
   cat >> /tmp/Dockerfile.vllm-test <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /aiter && \

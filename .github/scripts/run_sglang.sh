@@ -22,11 +22,8 @@ AITER_SHA="${1:?Usage: run_sglang.sh <aiter_sha> <test_cmd> [aiter_index_url]}"
 TEST_CMD="${2:?test_cmd required}"
 AITER_INDEX_URL="${3:-}"
 
-# Resolve package spec: "amd-aiter==X.Y.Z" if AITER_VERSION set, else "amd-aiter"
-AITER_PKG="amd-aiter"
-if [ -n "${AITER_VERSION:-}" ]; then
-  AITER_PKG="amd-aiter==${AITER_VERSION}"
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
 SGL_BRANCH="${SGL_BRANCH:-v0.5.10}"
 GPU_ARCH="${GPU_ARCH:-gfx942}"

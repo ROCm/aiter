@@ -26,6 +26,9 @@ THRESHOLD="${3:?threshold required}"
 EXTRA_ARGS="${4:-}"
 AITER_INDEX_URL="${5:-}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/resolve_aiter_version.sh"
+
 ATOM_BASE_IMAGE="${ATOM_BASE_IMAGE:-rocm/atom-dev:latest}"
 ATOM_BRANCH="${ATOM_BRANCH:-main}"
 ATOM_REPO="${ATOM_REPO:-ROCm/ATOM}"
@@ -54,7 +57,7 @@ RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
 if [ -n "${AITER_INDEX_URL}" ]; then
-  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" amd-aiter" >> "${ATOM_DIR}/Dockerfile.nightly"
+  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" \"${AITER_PKG}\"" >> "${ATOM_DIR}/Dockerfile.nightly"
 else
   cat >> "${ATOM_DIR}/Dockerfile.nightly" <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \

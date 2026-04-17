@@ -22,8 +22,8 @@ TP="${3:?tp required}"
 KV_CACHE_DTYPE="${4:-default}"
 AITER_INDEX_URL="${5:-}"
 
-AITER_PKG="amd-aiter"
-if [ -n "${AITER_VERSION:-}" ]; then AITER_PKG="amd-aiter==${AITER_VERSION}"; fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
 SHORT_SHA="${AITER_SHA:0:7}"
