@@ -144,7 +144,9 @@ def _extract_repro_and_reasons(lines):
 REPORT_DIR = "/tmp/tuning_test_reports"
 
 
-def _format_failures(name, error_shapes, mismatch_shapes, skip_count=0, output_lines=None):
+def _format_failures(
+    name, error_shapes, mismatch_shapes, skip_count=0, output_lines=None
+):
     """Write detailed report to file, return short summary for AssertionError."""
     os.makedirs(REPORT_DIR, exist_ok=True)
     report_file = os.path.join(REPORT_DIR, f"{name}_run_config_report.txt")
@@ -258,9 +260,13 @@ class TestRunConfig(unittest.TestCase):
         )
 
         lines = output.split("\n")
-        error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(lines)
+        error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(
+            lines
+        )
 
-        failures = _format_failures(name, error_shapes, mismatch_shapes, skip_count, lines)
+        failures = _format_failures(
+            name, error_shapes, mismatch_shapes, skip_count, lines
+        )
         self.assertEqual(
             len(failures),
             0,
@@ -348,14 +354,19 @@ class TestRunConfigCustom(unittest.TestCase):
         self.assertEqual(result.returncode, 0, f"{family} run_config failed")
 
         lines = output.split("\n")
-        error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(lines)
+        error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(
+            lines
+        )
 
-        failures = _format_failures(family, error_shapes, mismatch_shapes, skip_count, lines)
+        failures = _format_failures(
+            family, error_shapes, mismatch_shapes, skip_count, lines
+        )
         self.assertEqual(
-            len(failures), 0,
+            len(failures),
+            0,
             f"{family} run_config: {ok_count} OK, {skip_count} SKIP, "
             f"{len(error_shapes)} ERROR, {len(mismatch_shapes)} MISMATCH\n"
-            + "\n".join(failures)
+            + "\n".join(failures),
         )
 
 

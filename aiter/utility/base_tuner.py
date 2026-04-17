@@ -572,7 +572,7 @@ class TunerCommon:
         if status.startswith("error:"):
             return "ERROR", status[len("error:") :].strip()
         if status.startswith("mismatch"):
-            detail = status[len("mismatch"):].lstrip(":").strip()
+            detail = status[len("mismatch") :].lstrip(":").strip()
             return "MISMATCH", detail or "output mismatch vs reference"
         if not status:
             return "UNKNOWN", ""
@@ -642,9 +642,13 @@ class TunerCommon:
                     lines.append(f"reason: {status_detail}")
                 if status_summary in ("ERROR", "MISMATCH"):
                     if shapes_df is not None and idx < len(shapes_df):
-                        key_dict = {k: shapes_df.iloc[idx].get(k, "") for k in self.keys}
+                        key_dict = {
+                            k: shapes_df.iloc[idx].get(k, "") for k in self.keys
+                        }
                     elif self.untunedf is not None and idx < len(self.untunedf):
-                        key_dict = {k: self.untunedf.iloc[idx].get(k, "") for k in self.keys}
+                        key_dict = {
+                            k: self.untunedf.iloc[idx].get(k, "") for k in self.keys
+                        }
                     else:
                         key_dict = {}
                     if key_dict:
@@ -857,7 +861,9 @@ class TunerCommon:
 
         # Count actions
         update_count = len(comparison[comparison["update_reason"] == "threshold_met"])
-        no_baseline_count = len(comparison[comparison["update_reason"] == "no_baseline"])
+        no_baseline_count = len(
+            comparison[comparison["update_reason"] == "no_baseline"]
+        )
         skip_count = len(comparison[comparison["update_reason"] == "skip"])
         total = len(comparison)
 
@@ -881,9 +887,21 @@ class TunerCommon:
             for row in comparison.itertuples(index=False):
                 if row.update_reason == "skip":
                     continue
-                pre_str = f"{row.pre_us:.2f}" if pd.notna(row.pre_us) and row.pre_us > 0 else "N/A"
-                post_str = f"{row.post_us:.2f}" if pd.notna(row.post_us) and row.post_us > 0 else "N/A"
-                improve_str = f"{row.improvement_pct:.2f}%" if pd.notna(row.improvement_pct) else "N/A"
+                pre_str = (
+                    f"{row.pre_us:.2f}"
+                    if pd.notna(row.pre_us) and row.pre_us > 0
+                    else "N/A"
+                )
+                post_str = (
+                    f"{row.post_us:.2f}"
+                    if pd.notna(row.post_us) and row.post_us > 0
+                    else "N/A"
+                )
+                improve_str = (
+                    f"{row.improvement_pct:.2f}%"
+                    if pd.notna(row.improvement_pct)
+                    else "N/A"
+                )
                 action = "UPDATE" if row.update_reason == "threshold_met" else "NEW"
                 lines.append(
                     f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
@@ -899,14 +917,31 @@ class TunerCommon:
             for row in comparison.itertuples(index=False):
                 if row.update_reason != "skip":
                     continue
-                pre_str = f"{row.pre_us:.2f}" if pd.notna(row.pre_us) and row.pre_us > 0 else "N/A"
-                post_str = f"{row.post_us:.2f}" if pd.notna(row.post_us) and row.post_us > 0 else "N/A"
-                improve_str = f"{row.improvement_pct:.2f}%" if pd.notna(row.improvement_pct) else "N/A"
+                pre_str = (
+                    f"{row.pre_us:.2f}"
+                    if pd.notna(row.pre_us) and row.pre_us > 0
+                    else "N/A"
+                )
+                post_str = (
+                    f"{row.post_us:.2f}"
+                    if pd.notna(row.post_us) and row.post_us > 0
+                    else "N/A"
+                )
+                improve_str = (
+                    f"{row.improvement_pct:.2f}%"
+                    if pd.notna(row.improvement_pct)
+                    else "N/A"
+                )
                 pre_summary, _ = self._split_benchmark_status(row.pre_status)
-                post_summary, post_detail = self._split_benchmark_status(row.post_status)
+                post_summary, post_detail = self._split_benchmark_status(
+                    row.post_status
+                )
                 if post_summary in ("ERROR", "MISMATCH"):
                     reason = f"post-{post_summary.lower()}"
-                elif pd.notna(row.improvement_pct) and row.improvement_pct < threshold_percent:
+                elif (
+                    pd.notna(row.improvement_pct)
+                    and row.improvement_pct < threshold_percent
+                ):
                     reason = f"< {threshold_percent:.1f}% improve"
                 else:
                     reason = "no improvement"

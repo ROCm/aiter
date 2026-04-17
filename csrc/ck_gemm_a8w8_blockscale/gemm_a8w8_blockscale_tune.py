@@ -437,7 +437,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     )
                 ref = run_torch(x, weight, x_scale, w_scale)
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                status = "ok" if err_ratio <= args.errRatio else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
