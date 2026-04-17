@@ -10,9 +10,9 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale_gfx12,
 )
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
-)
+# from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+#     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+# )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
@@ -244,8 +244,8 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
 
     if impl == "gluon" and DEVICE_ARCH in ("gfx1250",):
         impl = gluon_gemm_a8w8_blockscale_gfx12
-    elif impl == "gluon" and DEVICE_ARCH in ("gfx950",):
-        impl = gluon_gemm_a8w8_blockscale
+    # elif impl == "gluon" and DEVICE_ARCH in ("gfx950",):
+    #     impl = gluon_gemm_a8w8_blockscale
     elif impl == "triton":
         impl = triton_gemm_a8w8_blockscale
     elif impl == "triton_shuffle":
