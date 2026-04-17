@@ -376,16 +376,28 @@ class TDMKVLoader:
             layout=kv_cfg.shared_v_layout,
         )
 
-        k_shared = gl.allocate_shared_memory(
-            key_cache_ptr.type.element_ty,
-            [2] + k_desc.block_shape,
-            layout=kv_cfg.shared_k_layout,
-        )
-        v_shared = gl.allocate_shared_memory(
-            value_cache_ptr.type.element_ty,
-            [2] + v_desc.block_shape,
-            layout=kv_cfg.shared_v_layout,
-        )
+        if cfg.SHUFFLED_KV_CACHE:
+            k_shared = gl.allocate_shared_memory(
+                key_cache_ptr.type.element_ty,
+                [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+                layout=kv_cfg.shared_k_layout,
+            )
+            v_shared = gl.allocate_shared_memory(
+                value_cache_ptr.type.element_ty,
+                [cfg.NUM_BUFFERS, 1, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+                layout=kv_cfg.shared_v_layout,
+            )
+        else:
+            k_shared = gl.allocate_shared_memory(
+                key_cache_ptr.type.element_ty,
+                [cfg.NUM_BUFFERS, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
+                layout=kv_cfg.shared_k_layout,
+            )
+            v_shared = gl.allocate_shared_memory(
+                value_cache_ptr.type.element_ty,
+                [cfg.NUM_BUFFERS, cfg.BLOCK_SIZE, cfg.HEAD_SIZE],
+                layout=kv_cfg.shared_v_layout,
+            )
 
         return TDMKVLoader(
             kv_cfg,
@@ -625,12 +637,12 @@ class TDMGatherKVLoader:
         kv_cfg = TDMGatherKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         k_shared = gl.allocate_shared_memory(
             key_cache_ptr.type.element_ty,
-            [2, cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+            [cfg.NUM_BUFFERS, cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
             layout=kv_cfg.shared_k_layout,
         )
         v_shared = gl.allocate_shared_memory(
             value_cache_ptr.type.element_ty,
-            [2, cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
+            [cfg.NUM_BUFFERS, cfg.NUM_KV_BLOCKS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE],
             layout=kv_cfg.shared_v_layout,
         )
 
@@ -1504,16 +1516,32 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 # ============================================================================
 
 @gluon.jit
-def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
+def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
+    # Buffer rotation: buf_0 = i%N, buf_1 = (i+1)%N, buf_2 = (i+2)%N
+    # Tile m uses buffer m%N for both K and V.
+    #
+    # Per-iteration mapping (iter i processes QK for tile i+1):
+    #   V read  (tile i)   → buf_0
+    #   K read  (tile i+2) → buf_2
+    #   K store (tile i+3) → (i+3)%N = buf_0 (N=3) or buf_1 (N=2)
+    #   V store (tile i+2) → buf_2
     physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
     next_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 1)
     next2_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 2)
     next3_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 3)
 
-    # Prologue: GLDS_K_t0(buf0), GLDS_K_t1(buf1), GLDS_V_t0(buf0)
-    kv_loader.load_k_to_shared(physical_block_idx, buffer_id=0)
-    kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1)
-    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=0)
+    buf_0: gl.int32 = 0
+    buf_1: gl.int32 = 1
+    if cfg.NUM_BUFFERS == 3:
+        buf_2: gl.int32 = 2
+    else:
+        buf_2: gl.int32 = 0  # (i+2)%2 = i%2 = buf_0
+
+    # ---- Prologue ----
+    # tile 0 → buf 0, tile 1 → buf 1, tile 2 → buf 2%N
+    kv_loader.load_k_to_shared(physical_block_idx, buffer_id=0)       # K_t0 → buf 0
+    kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1)  # K_t1 → buf 1
+    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=0)       # V_t0 → buf 0
 
     # LR_K_t0
     k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=0, target_dtype=q.dtype)
@@ -1525,78 +1553,83 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     S = gl.convert_layout(S, pgm.cfg.pv_layout)
     p, alpha, M = pgm.softmax_part0(S, M)
 
-    # GLDS_V_t1(buf1), GLDS_K_t2(buf0)
+    # K_t2 → buf 2%N, V_t1 → buf 1
+    kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=buf_2)
     kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1)
-    kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=0)
 
     # LR_K_t1
     k = kv_loader.load_k_from_shared(wait_count=3, buffer_id=1, target_dtype=q.dtype)
-    
-    iter_id = 0
+
+    # ---- Steady-state loop ----
     for j in range(pgm.tile_start, pgm.tile_end - 3):
         t_1 = j + 1
         t_2 = j + 2
         t_3 = j + 3
         next4_physical_block_idx = kv_loader.load_block_ids(t_3 + 1)
 
-        # QK for t_1
+        # QK for tile (i+1)
         S = pgm.compute_qk(k)
 
-        # SM1(prev) + LR_V + GLDS_K(t_3)
+        # SM1(prev) + LR_V(tile i) + GLDS_K(tile i+3)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=iter_id % 2, target_dtype=q.dtype)
-        kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=(iter_id + 1) % 2)
+        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype)
+        if cfg.NUM_BUFFERS == 3:
+            kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_0)
+        else:
+            kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_1)
 
         # PV
         acc = pgm.compute_pv(p, v, acc)
 
-        # SM0 + LR_K + GLDS_V(t_2)
+        # SM0 + LR_K(tile i+2) + GLDS_V(tile i+2)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
-        k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=iter_id % 2, target_dtype=q.dtype)
-        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=iter_id % 2)
+        k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=buf_2, target_dtype=q.dtype)
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
 
         next2_physical_block_idx = next3_physical_block_idx
         next3_physical_block_idx = next4_physical_block_idx
-        iter_id += 1
+        if cfg.NUM_BUFFERS == 3:
+            buf_0, buf_1, buf_2 = buf_1, buf_2, buf_0
+        else:
+            buf_0, buf_1, buf_2 = buf_1, buf_0, buf_1
+
+    # ---- Epilogue ----
+    # After L loop iters: buf_0=L%N, buf_1=(L+1)%N, buf_2=(L+2)%N
+    # Remaining tiles: L (V drain), L+1 (=tile_end-2), L+2 (=tile_end-1)
     with gl.amd.warp_pipeline_stage("stage1"):
-        # Epilogue
         epilogue_t_2 = pgm.tile_end - 2
         epilogue_t_3 = pgm.tile_end - 1
-        # SM1 + LR_V + PV (drain from last SM0)
+        # SM1(prev) + LR_V(tile L) + PV(tile L)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=iter_id % 2, target_dtype=q.dtype)
+        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype)
         acc = pgm.compute_pv(p, v, acc)
     with gl.amd.warp_pipeline_stage("stage2"):
-        # QK + SM0 for epilogue_t_2
+        # QK + SM0 for tile L+1, LR_K for tile L+2
         S = pgm.compute_qk(k)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
-        k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=iter_id % 2, target_dtype=q.dtype)
+        k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buf_2, target_dtype=q.dtype)
 
     with gl.amd.warp_pipeline_stage("stage3"):
-        # LR_K for epilogue_t_3 + GLDS_V for epilogue_t_3
-        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=iter_id % 2)
-
-        # QK for epilogue_t_3
+        # GLDS_V for tile L+2, QK+mask for tile L+2, LR_V for tile L+1
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         S = pgm.compute_qk(k)
         S = pgm.apply_mask_qk(S, epilogue_t_3)
-        v = kv_loader.load_v_from_shared(wait_count=1, buffer_id=(iter_id + 1) % 2, target_dtype=q.dtype)
+        v = kv_loader.load_v_from_shared(wait_count=1, buffer_id=buf_1, target_dtype=q.dtype)
 
     with gl.amd.warp_pipeline_stage("stage4"):
-        # SM1 + LR_V for epilogue_t_2
+        # SM1 + PV for tile L+1, SM0 for tile L+2, LR_V for tile L+2
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-
-        # PV for epilogue_t_2, SM0/SM1 for epilogue_t_3
         acc = pgm.compute_pv(p, v, acc)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
-        v = kv_loader.load_v_from_shared(wait_count=0, buffer_id=iter_id % 2, target_dtype=q.dtype)
+        v = kv_loader.load_v_from_shared(wait_count=0, buffer_id=buf_2, target_dtype=q.dtype)
 
     with gl.amd.warp_pipeline_stage("stage5"):
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
 
-        # PV for epilogue_t_3
+        # PV for tile L+2
         acc = pgm.compute_pv(p, v, acc)
 
     return M, L, acc
@@ -1614,8 +1647,9 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
 # ============================================================================
 
 @gluon.jit
-def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1, cfg):
+def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     """Subtile-pipelined loop: K split seq dim, V split head dim, multi-buffer."""
+    cfg: gl.constexpr = pgm.cfg
     QK_scale = pgm.QK_scale
 
     physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
@@ -1880,7 +1914,7 @@ def kernel_unified_attention_2d(
     FP8_MAX: gl.constexpr = float8_info.max,
     CAUSAL: gl.constexpr = True,
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
-    NUM_BUFFERS: gl.constexpr = 3,
+    NUM_BUFFERS: gl.constexpr = 2,
     # Loop variant selector:
     #   0 = double_buf (gather_shuffle style, safe/masked split)
     #   1 = new_order (4-deep pipeline)
@@ -2074,17 +2108,16 @@ def kernel_unified_attention_2d(
         M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc)
 
     elif LOOP_VARIANT == 1:
-        gl.static_assert(NUM_BUFFERS == 2, "For loop variant 1, NUM_BUFFERS should be 2")
-        # New-order 4-deep pipeline
+        gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 1, NUM_BUFFERS should be 2 or 3")
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
-        M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
+        M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg)
 
     elif LOOP_VARIANT == 2:
         gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 2, NUM_BUFFERS should be 2 or 3")
         # Subtile split multi-buffer pipeline
         acc0 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
         acc1 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
-        M, L, acc = attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1, cfg)
+        M, L, acc = attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1)
 
     # Normalize and store output
     l_recip = pgm.out_scale / L[:, None]
