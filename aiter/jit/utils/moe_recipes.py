@@ -143,6 +143,9 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
         mul_weight_stage = _get_mul_weight_stage(row)
         need_splitk = _should_include_splitk(row, quant_type)
 
+        if activation == "swiglu":
+            continue
+
         for preshuffle in _infer_preshuffle_modes(b_dtype, quant_type):
             for splitk in [False, True] if need_splitk else [False]:
                 key = (
