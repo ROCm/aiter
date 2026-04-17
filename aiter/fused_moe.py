@@ -816,6 +816,9 @@ def get_2stage_cfgs(
         doweight_stage1,
     )
 
+    silu_keys = None
+    if activation == ActivationType.Swiglu:
+        silu_keys = (*keys[:6], str(ActivationType.Silu), *keys[7:])
     def MainFunc():
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
@@ -838,6 +841,8 @@ def get_2stage_cfgs(
         logger.info("\033[0m")
 
     cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
+    if cfg is None and silu_keys is not None:
+        cfg = cfg_2stages.get(silu_keys, None) if cfg_2stages else None
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
         mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -845,12 +850,16 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None) if cfg_2stages else None
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
+        if cfg is None and silu_keys is not None:
+            cfg = cfg_2stages.get(silu_keys, None) if cfg_2stages else None
     if cfg is not None and not is_flydsl_available():
         kn1 = str(cfg.get("kernelName1", ""))
         kn2 = str(cfg.get("kernelName2", ""))
         if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
             fallback_cfgs = get_flydsl_fallback_cfgs(tune_file)
             fallback = fallback_cfgs.get(keys)
+            if fallback is None and silu_keys is not None:
+                fallback = fallback_cfgs.get(silu_keys)
             if fallback is not None:
                 cfg = fallback
                 logger.info(
