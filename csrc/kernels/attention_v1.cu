@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
 
 #include "attention_v1.h"
 #include "attention_common.cuh"
@@ -226,23 +226,23 @@ template <typename T,
           int PARTITION_SIZE_OLD,
           bool ALIBI_ENABLED,
           bool LOGITS_SOFT_CAP_ENABLED>
-void paged_attention_custom_launcher(torch::Tensor& out,
-                                     torch::Tensor& workspace_buffer,
-                                     torch::Tensor& query,
-                                     torch::Tensor& key_cache,
-                                     torch::Tensor& value_cache,
+void paged_attention_custom_launcher(const aiter_tensor_t& out,
+                                     const aiter_tensor_t& workspace_buffer,
+                                     const aiter_tensor_t& query,
+                                     const aiter_tensor_t& key_cache,
+                                     const aiter_tensor_t& value_cache,
                                      float scale,
-                                     torch::Tensor& block_tables,
-                                     const std::optional<torch::Tensor>& cu_query_lens,
-                                     torch::Tensor& context_lens,
+                                     const aiter_tensor_t& block_tables,
+                                     const aiter_tensor_t* cu_query_lens,
+                                     const aiter_tensor_t& context_lens,
                                      int max_num_blocks_per_seq,
                                      int max_num_partitions,
-                                     const std::optional<torch::Tensor>& alibi_slopes,
+                                     const aiter_tensor_t* alibi_slopes,
                                      const std::string& kv_cache_layout,
                                      float logits_soft_cap,
-                                     torch::Tensor& k_scale,
-                                     torch::Tensor& v_scale,
-                                     const std::optional<torch::Tensor>& fp8_out_scale)
+                                     const aiter_tensor_t& k_scale,
+                                     const aiter_tensor_t& v_scale,
+                                     const aiter_tensor_t* fp8_out_scale)
 {
     const int num_kv_heads = kv_cache_layout=="HND" ? key_cache.size(1) : key_cache.size(2);
     int num_seqs        = context_lens.size(0);
@@ -255,20 +255,20 @@ void paged_attention_custom_launcher(torch::Tensor& out,
 
     // NOTE: alibi_slopes is optional.
     const float* alibi_slopes_ptr =
-        alibi_slopes ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr()) : nullptr;
+        alibi_slopes ? reinterpret_cast<const float*>(alibi_slopes->data_ptr()) : nullptr;
 
     T* query_ptr               = reinterpret_cast<T*>(query.data_ptr());
     KVT* key_cache_ptr         = reinterpret_cast<KVT*>(key_cache.data_ptr());
     KVT* value_cache_ptr       = reinterpret_cast<KVT*>(value_cache.data_ptr());
-    int* context_lens_ptr      = context_lens.data_ptr<int>();
-    int* block_tables_ptr      = block_tables.data_ptr<int>();
-    int* cu_query_lens_ptr     = cu_query_lens ? cu_query_lens.value().data_ptr<int>() : nullptr;
+    int* context_lens_ptr      = reinterpret_cast<int*>(context_lens.data_ptr());
+    int* block_tables_ptr      = reinterpret_cast<int*>(block_tables.data_ptr());
+    int* cu_query_lens_ptr     = cu_query_lens ? reinterpret_cast<int*>(cu_query_lens->data_ptr()) : nullptr;
 
     const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
     const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
     // NOTE: fp8_out_scale is optional.
     const float* fp8_out_scale_ptr =
-        fp8_out_scale ? reinterpret_cast<const float*>(fp8_out_scale.value().data_ptr()) : nullptr;
+        fp8_out_scale ? reinterpret_cast<const float*>(fp8_out_scale->data_ptr()) : nullptr;
     OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
     
     const float logits_soft_cap_rcp = (LOGITS_SOFT_CAP_ENABLED ? 1.f / logits_soft_cap : 0.f);
@@ -291,8 +291,8 @@ void paged_attention_custom_launcher(torch::Tensor& out,
 
     dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
     dim3 block(NTHR);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(query.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     // mfma4 kernel is faster than mfma16 for gqa_ratio <= 4
     switch(gqa_ratio)
@@ -313,7 +313,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     case 14: LAUNCH_CUSTOM_ATTENTION_MFMA16(14); break;
     case 15: LAUNCH_CUSTOM_ATTENTION_MFMA16(15); break;
     case 16: LAUNCH_CUSTOM_ATTENTION_MFMA16(16); break;
-    default: TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio); break;
+    default: AITER_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio); break;
     }
 
     dim3 reduce_grid(num_heads, num_seqs);
@@ -331,7 +331,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     case 6: LAUNCH_CUSTOM_REDUCTION(6); break;
     case 7: LAUNCH_CUSTOM_REDUCTION(7); break;
     case 8: LAUNCH_CUSTOM_REDUCTION(8); break;
-    default: TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops); break;
+    default: AITER_CHECK(false, "Unsupported npar_loops: ", npar_loops); break;
     }
 }
 
@@ -378,7 +378,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     }                                                                                  \
     else                                                                               \
     {                                                                                  \
-        TORCH_CHECK(false, "logits_soft_cap must be non-negative");                    \
+        AITER_CHECK(false, "logits_soft_cap must be non-negative");                    \
     }
 
 
@@ -396,14 +396,14 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     switch(partition_size)                                                                         \
     {                                                                                              \
     case 256: CALL_CUSTOM_LAUNCHER_ALIBI(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 256); break; \
-    default: TORCH_CHECK(false, "Unsupported partition size: ", partition_size); break;            \
+    default: AITER_CHECK(false, "Unsupported partition size: ", partition_size); break;            \
     }
 
 #if defined(__HIPCC__) && defined(__gfx90a__)
 #define CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)       \
     if(fp8_out_scale)                                                         \
     {                                                                         \
-        TORCH_CHECK(false, "fp8 out scale unsupported for gfx90a");           \
+        AITER_CHECK(false, "fp8 out scale unsupported for gfx90a");           \
     }                                                                         \
     else                                                                      \
     {                                                                         \
@@ -426,7 +426,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     case 1: CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, 1, HEAD_SIZE); break;    \
     case 16: CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, 16, HEAD_SIZE); break;  \
     case 32: CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, 32, HEAD_SIZE); break;  \
-    default: TORCH_CHECK(false, "Unsupported block size: ", block_size); break; \
+    default: AITER_CHECK(false, "Unsupported block size: ", block_size); break; \
     }
 
 #define CALL_CUSTOM_LAUNCHER_BLK_HEAD(T, KVT, KV_DTYPE)                       \
@@ -434,30 +434,30 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     {                                                                         \
     case 64: CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 64); break;           \
     case 128: CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 128); break;         \
-    default: TORCH_CHECK(false, "Unsupported head size: ", head_size); break; \
+    default: AITER_CHECK(false, "Unsupported head size: ", head_size); break; \
     }
 
 
 void paged_attention_v1(
-    torch::Tensor& out, // [num_seqs, num_heads, head_size]
-    torch::Tensor& workspace_buffer,
-    torch::Tensor& query,       // [num_seqs, num_heads, head_size]
-    torch::Tensor& key_cache,   // [num_blocks, num_heads, block_size, head_size] or
-                                // [num_blocks, block_size, num_heads, head_size]
-    torch::Tensor& value_cache, // [num_blocks, num_heads, block_size, head_size] or
-                                // [num_blocks, block_size, num_heads, head_size]
+    const aiter_tensor_t& out, // [num_seqs, num_heads, head_size]
+    const aiter_tensor_t& workspace_buffer,
+    const aiter_tensor_t& query,       // [num_seqs, num_heads, head_size]
+    const aiter_tensor_t& key_cache,   // [num_blocks, num_heads, block_size, head_size] or
+                                       // [num_blocks, block_size, num_heads, head_size]
+    const aiter_tensor_t& value_cache, // [num_blocks, num_heads, block_size, head_size] or
+                                       // [num_blocks, block_size, num_heads, head_size]
     double scale,
-    torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
-    const std::optional<torch::Tensor>& cu_query_lens,  // [num_seqs+1]
-    torch::Tensor& context_lens,  // [num_seqs]
+    const aiter_tensor_t& block_tables,   // [num_seqs, max_num_blocks_per_seq]
+    const aiter_tensor_t* cu_query_lens,  // [num_seqs+1]
+    const aiter_tensor_t& context_lens,   // [num_seqs]
     int64_t max_context_len,
-    const std::optional<torch::Tensor>& alibi_slopes,
+    const aiter_tensor_t* alibi_slopes,
     const std::string& kv_cache_dtype,
     const std::string& kv_cache_layout,
     float logits_soft_cap,
-    torch::Tensor& k_scale,
-    torch::Tensor& v_scale,
-    const std::optional<torch::Tensor>& fp8_out_scale, int64_t partition_size)
+    const aiter_tensor_t& k_scale,
+    const aiter_tensor_t& v_scale,
+    const aiter_tensor_t* fp8_out_scale, int64_t partition_size)
 {
     const int64_t block_size = kv_cache_layout=="HND" ? key_cache.size(2) : key_cache.size(1);
     const int head_size = query.size(2);
@@ -467,39 +467,39 @@ void paged_attention_v1(
 
     if(kv_cache_dtype == "auto")
     {
-        if(query.dtype() == at::ScalarType::Half)
+        if(query.dtype() == AITER_DTYPE_fp16)
         {
             CALL_CUSTOM_LAUNCHER_BLK_HEAD(_Float16, _Float16, vllm::Fp8KVCacheDataType::kAuto);
         }
-        else if(query.dtype() == at::ScalarType::BFloat16)
+        else if(query.dtype() == AITER_DTYPE_bf16)
         {
             CALL_CUSTOM_LAUNCHER_BLK_HEAD(
                 __hip_bfloat16, __hip_bfloat16, vllm::Fp8KVCacheDataType::kAuto);
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+            AITER_CHECK(false, "Unsupported data type");
         }
     }
     else if(kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3")
     {
-        if(query.dtype() == at::ScalarType::Half)
+        if(query.dtype() == AITER_DTYPE_fp16)
         {
             CALL_CUSTOM_LAUNCHER_BLK_HEAD(_Float16, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
         }
-        else if(query.dtype() == at::ScalarType::BFloat16)
+        else if(query.dtype() == AITER_DTYPE_bf16)
         {
             CALL_CUSTOM_LAUNCHER_BLK_HEAD(
                 __hip_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
         }
         else
         {
-            TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+            AITER_CHECK(false, "Unsupported data type");
         }
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
+        AITER_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
     }
 }
 
