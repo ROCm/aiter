@@ -13,6 +13,9 @@
 # =============================================================================
 set -euo pipefail
 
+cleanup() { docker rmi "rocm/vllm-aiter-ci:nightly-${AITER_SHA:0:7}" 2>/dev/null || true; }
+trap cleanup EXIT
+
 AITER_SHA="${1:?Usage: run_vllm.sh <aiter_sha> <model> <tp> [kv_cache_dtype] [wheel_url]}"
 MODEL="${2:?model required}"
 TP="${3:?tp required}"
