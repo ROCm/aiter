@@ -7,7 +7,6 @@ where gdx*gdy > 1024 must be filtered out to avoid out-of-bounds writes.
 import sys
 import types
 import unittest
-from unittest.mock import patch
 
 
 # ---------------------------------------------------------------------------
