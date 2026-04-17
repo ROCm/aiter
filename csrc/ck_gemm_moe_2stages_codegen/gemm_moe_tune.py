@@ -1865,6 +1865,69 @@ class FmoeTuner(TunerCommon):
                     )
                 )
 
+        # xbf16: benchmark blockscaleBf16 kernels (bf16 input, kernel-internal quant)
+        if (
+            q_type == QuantType.per_1x128
+            and q_dtype_a == dtypes.fp8
+            and get_gfx() == "gfx950"
+        ):
+            xbf16_csv = kernels_list_csv_1stage.format(
+                quantDtype_1stage="blockscaleBf16",
+                extraInfo_1stage=extraInfo_1stage,
+            )
+            xbf16_kernels = self.get_kernels_dict(
+                xbf16_csv, key=["subGU_m", "subGU_n", "smf"]
+            )
+            for tile_m, tile_n, smf in xbf16_kernels.keys():
+                if inter_dim % tile_n != 0 or smf != 0:
+                    continue
+                for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
+                    task_1stage.append(
+                        (
+                            (info, "asm_1stage_xbf16", el, tile_m),
+                            FmoeTuner.generate_data_1stage,
+                            (
+                                token,
+                                model_dim,
+                                inter_dim,
+                                expert,
+                                topk,
+                                act_type,
+                                dtype,
+                                q_dtype_a,
+                                q_dtype_w,
+                                q_type,
+                                use_g1u1,
+                                tile_m,
+                            ),
+                            fmoe_func,
+                            (
+                                [0, 0, 2, 3, 4, 5, 6, 7, 18, 10, 11, 17],
+                                q_type,
+                                use_g1u1,
+                                act_type,
+                                el,
+                                topk,
+                                dtype,
+                            ),
+                            {},
+                            (
+                                FmoeTuner.torch_moe_blockscale
+                            ),
+                            (
+                                [1, 12, 13, 14, 15, 9, 10, 11],
+                                None,
+                                (128, 128),
+                                dtype,
+                            ),
+                            {},
+                            (None),
+                            0.01,
+                            1,
+                            True,
+                        )
+                    )
+
         return task_1stage
 
     def gen_2stages_asm1_task(self, key, blockMs):
@@ -2774,6 +2837,10 @@ class FmoeTuner(TunerCommon):
     def result_to_csv(self, results, file, concat=False):
         old_tunedf = self.get_tuned_gemm_list(file)
 
+        for col in self.columns:
+            if col not in old_tunedf.columns:
+                old_tunedf[col] = 0
+
         new_fallbacks = getattr(self, "_flydsl_fallbacks", [])
         new_fb_keys = set()
         if new_fallbacks:
@@ -2799,6 +2866,9 @@ class FmoeTuner(TunerCommon):
         resultdf = self.update_tunedf(old_tunedf, results)
         self.success = pd.concat([self.success, results], ignore_index=True)
         resultdf["run_1stage"] = resultdf["run_1stage"].astype(int)
+        if "xbf16" not in resultdf.columns:
+            resultdf["xbf16"] = 0
+        resultdf["xbf16"] = resultdf["xbf16"].fillna(0).astype(int)
         if results is not None:
             resultdf = resultdf.astype(str).drop_duplicates(
                 subset=self.keys,
@@ -2940,9 +3010,14 @@ class FmoeTuner(TunerCommon):
                 print(
                     "Error: please check errRatio, stage1 and stage2 should be valid together!"
                 )
-            asm_1stage_profileDF = profileDF[profileDF["stage"] == "asm_1stage"].drop(
-                columns=["stage"]
+            asm_1stage_mask = profileDF["stage"].isin(
+                ["asm_1stage", "asm_1stage_xbf16"]
             )
+            asm_1stage_profileDF = profileDF[asm_1stage_mask].copy()
+            asm_1stage_profileDF["xbf16"] = (
+                asm_1stage_profileDF["stage"] == "asm_1stage_xbf16"
+            ).astype(int)
+            asm_1stage_profileDF = asm_1stage_profileDF.drop(columns=["stage"])
             asm_1stage_profileDF = asm_1stage_profileDF.rename(
                 columns={
                     "kernelName": "kernelName1",
@@ -2985,6 +3060,7 @@ class FmoeTuner(TunerCommon):
                 how="inner",
             )
             profileDF["run_1stage"] = 0
+            profileDF["xbf16"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
             if len(profileDF) == 0:
                 print(
@@ -3015,6 +3091,7 @@ class FmoeTuner(TunerCommon):
                         None,
                         1,
                         self.INVALID_TIME,
+                        0,
                         0,
                         -1,
                         -1,
@@ -3104,6 +3181,26 @@ class FmoeTuner(TunerCommon):
                     )
                     profileDF.drop(columns=["us_quant_sort"], inplace=True)
 
+            has_xbf16 = "xbf16" in profileDF.columns and profileDF["xbf16"].any()
+            if q_type == QuantType.per_1x128 and has_xbf16:
+                from aiter.test_common import run_perftest
+                from aiter.ops.quant import per_group_quant_hip
+
+                dummy_act = torch.randn(token, model_dim, dtype=dtype, device="cuda")
+                _, us_quant = run_perftest(
+                    per_group_quant_hip,
+                    dummy_act,
+                    quant_dtype=dtypes.fp8,
+                    group_size=128,
+                    transpose_scale=True,
+                )
+                us_quant = round(us_quant, 4)
+                print(f"  per_1x128 quant benchmark: us={us_quant}")
+                non_xbf16 = profileDF.get("xbf16", 0) == 0
+                profileDF.loc[non_xbf16, "us1"] = (
+                    profileDF.loc[non_xbf16, "us1"] + us_quant
+                )
+
             profileDF["us"] = round(profileDF["us1"] + profileDF["us2"], 4)
             results = profileDF.apply(
                 lambda row: self.calculate(
@@ -3190,6 +3287,7 @@ class FmoeTuner(TunerCommon):
                         non_flydsl_df["us1"] + non_flydsl_df["us2"], 4
                     )
                     non_flydsl_df["run_1stage"] = 0
+                    non_flydsl_df["xbf16"] = 0
                     non_flydsl_df["tflops"] = 0
                     non_flydsl_df["bw"] = 0
                     fb = non_flydsl_df.loc[non_flydsl_df["us"].idxmin()].copy()
@@ -3269,6 +3367,7 @@ if __name__ == "__main__":
         "err2",
         "us",
         "run_1stage",
+        "xbf16",
         "tflops",
         "bw",
     ]
