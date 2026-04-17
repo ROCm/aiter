@@ -83,7 +83,7 @@ class AiterCommunicator:
 
         if os.environ.get("AITER_COMMS_PROBE_HEAP_ALLOC") == "1":
             try:
-                probe = self._shmem.empty((1,), dtype=torch.float16)
+                probe = self._shmem.empty((1, 8192), dtype=torch.float16)
                 logger.critical(
                     "[AiterCommunicator] probe heap alloc OK (refresh_peer_access triggered) data_ptr=%x",
                     probe.data_ptr(),
