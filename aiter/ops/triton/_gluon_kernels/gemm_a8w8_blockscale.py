@@ -286,12 +286,7 @@ def _gemm_a8w8_blockscale_kernel(
         cur_b = next_b
         num_computes += 1
 
-
-
-
-
-
-
+        # scales
         # Advance the ptrs to the next K block.
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
