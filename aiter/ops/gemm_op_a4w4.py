@@ -94,7 +94,7 @@ def gemm_a4w4_fake(
     return out
 
 
-@torch_compile_guard(gen_fake=gemm_a4w4_fake)
+@torch_compile_guard(mutates_args=[], gen_fake=gemm_a4w4_fake)
 def gemm_a4w4(
     A: Tensor,  # A:[M, K/2] f4x2
     B: Tensor,  # B:[N, K/2] f4x2
