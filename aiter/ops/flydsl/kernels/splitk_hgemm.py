@@ -112,6 +112,7 @@ def compile_hgemm_kernel(
     BLOCK_N_WARPS: int = 4,
     B_PRE_SHUFFLE: bool = False,
     B_TO_LDS: bool = False,
+    HAS_BIAS: bool = False,
 ):
     IS_SPLIT_K = SPLIT_K > 1
     BLOCK_K = TILE_K
@@ -187,6 +188,8 @@ def compile_hgemm_kernel(
         KERNEL_NAME += f"_SPK{SPLIT_K}"
     if B_TO_LDS:
         KERNEL_NAME += "_BS"
+    if HAS_BIAS:
+        KERNEL_NAME += "_BIAS"
 
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
@@ -217,6 +220,7 @@ def compile_hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        BIAS: fx.Tensor,
         m: fx.Int32,
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
@@ -230,6 +234,8 @@ def compile_hgemm_kernel(
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
+        if HAS_BIAS:
+            BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(
             base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,)
@@ -296,6 +302,11 @@ def compile_hgemm_kernel(
                     m_local_idx = global_tid // LDG_C_X_THREADS
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                     row_idx = m_offset + fx.Index(m_local_idx)
+                    init_vec = zero_vec
+                    if HAS_BIAS:
+                        init_vec = BIAS_.vec_load(
+                            (n_offset + n_local_idx,), LDG_VEC_SIZE
+                        )
                     cond_boundary = arith.cmpi(
                         arith.CmpIPredicate.ult, row_idx, fx.Index(m)
                     )
@@ -304,7 +315,7 @@ def compile_hgemm_kernel(
                     )
                     with ir.InsertionPoint(cond_boundary_if.then_block):
                         C_.vec_store(
-                            (row_idx, n_offset + n_local_idx), zero_vec, LDG_VEC_SIZE
+                            (row_idx, n_offset + n_local_idx), init_vec, LDG_VEC_SIZE
                         )
                         scf.YieldOp([])
                 scf.YieldOp([])
@@ -887,6 +898,11 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    if HAS_BIAS:
+                        bias_vec = BIAS_.vec_load(
+                            (n_offset + n_local_idx,), LDG_VEC_SIZE
+                        )
+                        vec = vec + bias_vec
                     C_.vec_store(
                         (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                     )
@@ -898,6 +914,7 @@ def compile_hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
+        BIAS: fx.Tensor,
         m: fx.Int32,
         COUNTER: fx.Tensor,
         signal_state: fx.Int32,
@@ -911,7 +928,7 @@ def compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, m, COUNTER, signal_state).launch(
+        hgemm_kernel(C, A, B, BIAS, m, COUNTER, signal_state).launch(
             grid=(bm, bn, SPLIT_K),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
