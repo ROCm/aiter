@@ -1,0 +1,58 @@
+[
+  {
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "model_name": "Mistral-7B",
+    "kv": "default",
+    "tp": 1,
+    "runner": "aiter-1gpu-runner",
+    "label": "MI325-1gpu"
+  },
+  {
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "model_name": "Mistral-7B",
+    "kv": "fp8",
+    "tp": 1,
+    "runner": "aiter-1gpu-runner",
+    "label": "MI325-1gpu"
+  },
+  {
+    "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "model_name": "Mixtral-8x7B",
+    "kv": "default",
+    "tp": 8,
+    "runner": "aiter-8gpu-runner",
+    "label": "MI325-8gpu"
+  },
+  {
+    "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "model_name": "Mixtral-8x7B",
+    "kv": "fp8",
+    "tp": 8,
+    "runner": "aiter-8gpu-runner",
+    "label": "MI325-8gpu"
+  },
+  {
+    "model": "deepseek-ai/DeepSeek-R1",
+    "model_name": "DeepSeek-R1",
+    "kv": "default",
+    "tp": 8,
+    "runner": "aiter-8gpu-runner",
+    "label": "MI325-8gpu"
+  },
+  {
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "model_name": "Mistral-7B",
+    "kv": "default",
+    "tp": 1,
+    "runner": "linux-aiter-mi35x-1",
+    "label": "MI35X-1gpu"
+  },
+  {
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "model_name": "Mistral-7B",
+    "kv": "fp8",
+    "tp": 1,
+    "runner": "linux-aiter-mi35x-1",
+    "label": "MI35X-1gpu"
+  }
+]
