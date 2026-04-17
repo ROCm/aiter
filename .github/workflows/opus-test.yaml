@@ -105,6 +105,7 @@ jobs:
           name: opus-test-log-${{ matrix.runner }}
           path: latest_test.log
           if-no-files-found: warn
+          retention-days: 7
 
       - name: Cleanup container
         if: always()

@@ -537,9 +537,9 @@ def test_mla(
         return err, us_asm_decode
 
     def test_sparse_mla_fp8():
-        if dtype != dtypes.fp8 and nhead == 128:
-            aiter.logger.info("don't support this case:\n")
-            return None, 1e12
+        # if dtype != dtypes.fp8 and nhead == 128:
+        #     aiter.logger.info("don't support this case:\n")
+        #     return None, 1e12
 
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
@@ -611,7 +611,7 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
-    if dtype == torch.bfloat16:
+    if dtype == torch.bfloat16 and kvtype == dtypes.bf16:
         err, us_asm_decode = test_sparse_mla_bf16()
     elif kvtype == dtypes.fp8:
         err, us_asm_decode = test_sparse_mla_fp8()
