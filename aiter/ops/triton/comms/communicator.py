@@ -83,19 +83,22 @@ class AiterCommunicator:
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self.disabled or self._shmem is None:
+            logger.critical("[AiterCommunicator] reject: disabled=%s shmem=%s", self.disabled, self._shmem is not None)
             return False
-        # Diagnostic gate: iris stays initialized but every call falls through.
-        # Used to isolate whether iris init itself slows surrounding NCCL ops.
         if os.environ.get("AITER_COMMS_FORCE_FALLBACK") == "1":
+            logger.critical("[AiterCommunicator] reject: AITER_COMMS_FORCE_FALLBACK=1")
             return False
         if inp.dtype not in self._SUPPORTED_DTYPES:
+            logger.critical("[AiterCommunicator] reject: dtype=%s", inp.dtype)
             return False
         if not inp.is_contiguous():
+            logger.critical("[AiterCommunicator] reject: noncontig shape=%s", tuple(inp.shape))
             return False
         # if inp.shape[0] > self._MAX_NUM_TOKENS:
         #     return False
         buf_size = inp.numel() * inp.element_size()
         if buf_size * 2 > self._HEAP_SIZE:
+            logger.critical("[AiterCommunicator] reject: oversize buf=%d heap=%d", buf_size, self._HEAP_SIZE)
             return False
         return True
 
@@ -117,18 +120,27 @@ class AiterCommunicator:
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         self._validate_input(inp)
+        try:
+            input_buf = self._get_buffers(inp.shape, inp.dtype)
+            input_buf.copy_(inp)
 
-        input_buf = self._get_buffers(inp.shape, inp.dtype)
-        input_buf.copy_(inp)
-
-        if self._workspace is None:
-            self._workspace = self._shmem.ccl.all_reduce_preamble(
-                input_buf,
-                input_buf,
+            if self._workspace is None:
+                self._workspace = self._shmem.ccl.all_reduce_preamble(
+                    input_buf,
+                    input_buf,
+                )
+            self._workspace = self._shmem.ccl.all_reduce(
+                input_buf, input_buf, workspace=self._workspace
             )
-        self._workspace = self._shmem.ccl.all_reduce(
-            input_buf, input_buf, workspace=self._workspace
-        )
 
-        inp.copy_(input_buf)
-        return inp
+            inp.copy_(input_buf)
+            return inp
+        except Exception as e:
+            logger.error(
+                "[AiterCommunicator] all_reduce raised shape=%s dtype=%s capturing=%s: %s",
+                tuple(inp.shape),
+                inp.dtype,
+                torch.cuda.is_current_stream_capturing(),
+                e,
+            )
+            raise
