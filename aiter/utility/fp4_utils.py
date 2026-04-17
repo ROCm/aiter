@@ -76,13 +76,11 @@ def e8m0_shuffle(scale):
         return scale
     assert scale.ndim == 2, "scale must be a 2D tensor"
     m, n = scale.shape
-    scale_padded = torch.empty(
-        (m + 255) // 256 * 256,
-        (n + 7) // 8 * 8,
-        dtype=scale.dtype,
-        device=scale.device,
+    sm = (m + 255) // 256 * 256
+    sn = (n + 7) // 8 * 8
+    scale_padded = torch.zeros(
+        sm, sn, dtype=scale.dtype, device=scale.device,
     )
-
     scale_padded[:m, :n] = scale
     scale = scale_padded
     sm, sn = scale.shape
