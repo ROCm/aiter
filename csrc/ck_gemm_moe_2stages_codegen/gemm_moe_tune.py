@@ -2983,6 +2983,7 @@ class FmoeTuner(TunerCommon):
             ## remove invalid candidate
             profileDF = profileDF[
                 (profileDF["us"] != float("-inf"))
+                & (profileDF["us"] != float("inf"))
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]

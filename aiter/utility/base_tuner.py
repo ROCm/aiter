@@ -376,7 +376,17 @@ class TunerCommon:
             return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
-        # print(df_updates)
+        # Widen integer columns to object so that float/string updates don't
+        # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
+        # cannot accept a float like 2.61).
+        import numpy as np
+        for col in df_old.columns:
+            if col in df_updates.columns and df_old[col].dtype != df_updates[col].dtype:
+                try:
+                    common = np.result_type(df_old[col].dtype, df_updates[col].dtype)
+                except TypeError:
+                    common = object
+                df_old[col] = df_old[col].astype(common)
         df_old["_tmp_key"] = df_old[key_columns].apply(tuple, axis=1)
         df_updates["_tmp_key"] = df_updates[key_columns].apply(tuple, axis=1)
         matched_keys = df_updates[df_updates["_tmp_key"].isin(df_old["_tmp_key"])][
