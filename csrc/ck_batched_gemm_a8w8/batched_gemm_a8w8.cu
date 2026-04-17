@@ -4,6 +4,7 @@
 #include "batched_gemm_a8w8_common.cuh"
 #include "batched_gemm_a8w8_manifest.h"
 #include "batched_gemm_a8w8_lookup.h"
+#include "gemm_dispatch_utils.h"
 #include <cmath>
 
 using BatchedRowwiseKernel = std::function<
@@ -12,25 +13,9 @@ using BatchedRowwiseKernel = std::function<
                   torch::Tensor &, std::optional<torch::Tensor>,
                   int)>;
 
-// Define a custom hash function for std::tuple<int, int, int, int>
-struct IntTupleHash
-{
-  size_t operator()(const std::tuple<int, int, int, int> &t) const
-  {
-    auto hash1 = std::hash<int>{}(std::get<0>(t));
-    auto hash2 = std::hash<int>{}(std::get<1>(t));
-    auto hash3 = std::hash<int>{}(std::get<2>(t));
-    auto hash4 = std::hash<int>{}(std::get<3>(t));
-    return hash1 ^ hash2 ^ hash3 ^ hash4;
-  }
-};
-
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
-using BatchedRowwiseKernelMap = std::unordered_map<
-    std::tuple<int, int, int, int>,
-    BatchedRowwiseKernel,
-    IntTupleHash>;
+using BatchedRowwiseKernelMap = BatchedGemmDispatchMap<BatchedRowwiseKernel>;
 
 template <typename DDataType, typename EDataType = DDataType>
 BatchedRowwiseKernel batched_rowwise_heuristic_dispatch(int B, int M, int N, int K)
@@ -113,9 +98,12 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
         static_assert(false, "batched_rowwise_dispatch used with unsupported dtype!");
     }
   }();
-  
-  // First check if this shape(M,N,K) is available in the direct lookup.
-  auto it = lookup.find({B, M, N, K});
+
+  const int cu_num         = get_device_cu_num();
+  const std::string& gfx   = get_device_gfx();
+
+  // First check if this shape(B,M,N,K) is available in the direct lookup.
+  auto it = lookup.find({gfx, cu_num, B, M, N, K});
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
   {
@@ -135,8 +123,8 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
   {
     padded_m = 20480;
   }
-  // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-  it = lookup.find({B, padded_m, N, K});
+  // Second check if this shape(B,padded_m,N,K) is available in the direct lookup.
+  it = lookup.find({gfx, cu_num, B, padded_m, N, K});
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
   {
