@@ -3,7 +3,7 @@
 # run_sglang.sh — Run a SGLang test on AITER runners
 #
 # Usage:
-#   run_sglang.sh <aiter_sha> <test_cmd> [wheel_url]
+#   run_sglang.sh <aiter_sha> <test_cmd> [aiter_index_url]
 #
 # Required env:
 #   HF_TOKEN — HuggingFace token
@@ -18,9 +18,9 @@ set -euo pipefail
 cleanup() { docker rm -f ci_sglang 2>/dev/null || true; }
 trap cleanup EXIT
 
-AITER_SHA="${1:?Usage: run_sglang.sh <aiter_sha> <test_cmd> [wheel_url]}"
+AITER_SHA="${1:?Usage: run_sglang.sh <aiter_sha> <test_cmd> [aiter_index_url]}"
 TEST_CMD="${2:?test_cmd required}"
-WHEEL_URL="${3:-}"
+AITER_INDEX_URL="${3:-}"
 
 SGL_BRANCH="${SGL_BRANCH:-v0.5.10}"
 GPU_ARCH="${GPU_ARCH:-gfx942}"
@@ -110,10 +110,10 @@ docker exec -u root ci_sglang bash -c "pip config set global.retries 10"
 bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
 
 # ── Install AITER under test ──
-if [ -n "${WHEEL_URL}" ]; then
+if [ -n "${AITER_INDEX_URL}" ]; then
   docker exec ci_sglang bash -lc "
     pip uninstall -y amd-aiter aiter || true
-    pip install --force-reinstall '${WHEEL_URL}'
+    pip install --extra-index-url '${AITER_INDEX_URL}' amd-aiter
     pip show amd-aiter
   "
 else

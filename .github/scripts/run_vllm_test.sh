@@ -3,7 +3,7 @@
 # run_vllm_test.sh — Run a vLLM pytest test inside Docker
 #
 # Usage:
-#   run_vllm_test.sh <aiter_sha> <test_cmd> [wheel_url]
+#   run_vllm_test.sh <aiter_sha> <test_cmd> [aiter_index_url]
 #
 # Required env:
 #   HF_TOKEN — HuggingFace token
@@ -14,9 +14,9 @@ CONTAINER_NAME="vllm_test_$$"
 cleanup() { docker stop "${CONTAINER_NAME}" 2>/dev/null || true; docker rm "${CONTAINER_NAME}" 2>/dev/null || true; }
 trap cleanup EXIT
 
-AITER_SHA="${1:?Usage: run_vllm_test.sh <aiter_sha> <test_cmd> [wheel_url]}"
+AITER_SHA="${1:?Usage: run_vllm_test.sh <aiter_sha> <test_cmd> [aiter_index_url]}"
 TEST_CMD="${2:?test_cmd required}"
-WHEEL_URL="${3:-}"
+AITER_INDEX_URL="${3:-}"
 
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
 SHORT_SHA="${AITER_SHA:0:7}"
@@ -35,8 +35,8 @@ RUN pip config set global.default-timeout 60 && pip config set global.retries 10
 RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
-if [ -n "${WHEEL_URL}" ]; then
-  echo "RUN pip install --force-reinstall \"${WHEEL_URL}\"" >> /tmp/Dockerfile.vllm-test
+if [ -n "${AITER_INDEX_URL}" ]; then
+  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" amd-aiter" >> /tmp/Dockerfile.vllm-test
 else
   cat >> /tmp/Dockerfile.vllm-test <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /aiter && \

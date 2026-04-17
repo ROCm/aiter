@@ -3,7 +3,7 @@
 # run_vllm.sh — Build vLLM+AITER image and run latency benchmark
 #
 # Usage:
-#   run_vllm.sh <aiter_sha> <model> <tp> [kv_cache_dtype] [wheel_url]
+#   run_vllm.sh <aiter_sha> <model> <tp> [kv_cache_dtype] [aiter_index_url]
 #
 # Required env:
 #   HF_TOKEN — HuggingFace token for model access
@@ -16,11 +16,11 @@ set -euo pipefail
 cleanup() { docker rmi "rocm/vllm-aiter-ci:nightly-${AITER_SHA:0:7}" 2>/dev/null || true; }
 trap cleanup EXIT
 
-AITER_SHA="${1:?Usage: run_vllm.sh <aiter_sha> <model> <tp> [kv_cache_dtype] [wheel_url]}"
+AITER_SHA="${1:?Usage: run_vllm.sh <aiter_sha> <model> <tp> [kv_cache_dtype] [aiter_index_url]}"
 MODEL="${2:?model required}"
 TP="${3:?tp required}"
 KV_CACHE_DTYPE="${4:-default}"
-WHEEL_URL="${5:-}"
+AITER_INDEX_URL="${5:-}"
 
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
 SHORT_SHA="${AITER_SHA:0:7}"
@@ -43,8 +43,8 @@ RUN pip config set global.default-timeout 60 && pip config set global.retries 10
 RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
-if [ -n "${WHEEL_URL}" ]; then
-  echo "RUN pip install --force-reinstall \"${WHEEL_URL}\"" >> /tmp/Dockerfile.vllm-nightly
+if [ -n "${AITER_INDEX_URL}" ]; then
+  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" amd-aiter" >> /tmp/Dockerfile.vllm-nightly
 else
   cat >> /tmp/Dockerfile.vllm-nightly <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /aiter && \

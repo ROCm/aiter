@@ -29,11 +29,11 @@ on:
         description: 'Skip promote job'
         type: boolean
         default: false
-      wheel_url:
-        description: 'Pre-built wheel URL (used when skip_build=true)'
+      aiter_index_url:
+        description: 'AITER pip index URL (installs latest wheel from index)'
         type: string
         required: false
-        default: ''
+        default: 'https://rocm.frameworks-devreleases.amd.com/whl-staging/gfx942-gfx950/'
       run_sglang:
         description: 'Run SGLang integration tests'
         type: boolean
@@ -141,7 +141,7 @@ jobs:
           bash .github/scripts/run_sglang.sh \
             "${{ github.sha }}" \
             "${{ matrix.test_cmd }}" \
-            "${{ github.event.inputs.wheel_url }}"
+            "${{ github.event.inputs.aiter_index_url }}"
 
   # ── vLLM Benchmarks ────────────────────────────────────────────────
   vllm:
@@ -168,7 +168,7 @@ jobs:
             "${{ matrix.model }}" \
             "${{ matrix.tp }}" \
             "${{ matrix.kv }}" \
-            "${{ github.event.inputs.wheel_url }}"
+            "${{ github.event.inputs.aiter_index_url }}"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -199,7 +199,7 @@ jobs:
           bash .github/scripts/run_vllm_test.sh \
             "${{ github.sha }}" \
             "${{ matrix.test_cmd }}" \
-            "${{ github.event.inputs.wheel_url }}"
+            "${{ github.event.inputs.aiter_index_url }}"
 
   # ── ATOM Accuracy ──────────────────────────────────────────────────
   atom:
@@ -228,7 +228,7 @@ jobs:
             "${{ matrix.model_path }}" \
             "${{ matrix.threshold }}" \
             "${{ matrix.extra_args }}" \
-            "${{ github.event.inputs.wheel_url }}"
+            "${{ github.event.inputs.aiter_index_url }}"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4

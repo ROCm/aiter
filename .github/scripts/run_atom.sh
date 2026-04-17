@@ -3,7 +3,7 @@
 # run_atom.sh — Run ATOM GSM8K accuracy test on AITER runners
 #
 # Usage:
-#   run_atom.sh <aiter_sha> <model_path> <threshold> [extra_args] [wheel_url]
+#   run_atom.sh <aiter_sha> <model_path> <threshold> [extra_args] [aiter_index_url]
 #
 # Required env:
 #   HF_TOKEN — HuggingFace token
@@ -20,11 +20,11 @@ CONTAINER_NAME="atom_nightly_$$"
 cleanup() { docker stop "${CONTAINER_NAME}" 2>/dev/null || true; docker rm "${CONTAINER_NAME}" 2>/dev/null || true; }
 trap cleanup EXIT
 
-AITER_SHA="${1:?Usage: run_atom.sh <aiter_sha> <model_path> <threshold> [extra_args] [wheel_url]}"
+AITER_SHA="${1:?Usage: run_atom.sh <aiter_sha> <model_path> <threshold> [extra_args] [aiter_index_url]}"
 MODEL_PATH="${2:?model_path required}"
 THRESHOLD="${3:?threshold required}"
 EXTRA_ARGS="${4:-}"
-WHEEL_URL="${5:-}"
+AITER_INDEX_URL="${5:-}"
 
 ATOM_BASE_IMAGE="${ATOM_BASE_IMAGE:-rocm/atom-dev:latest}"
 ATOM_BRANCH="${ATOM_BRANCH:-main}"
@@ -53,8 +53,8 @@ RUN pip uninstall -y amd-aiter || true
 RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
-if [ -n "${WHEEL_URL}" ]; then
-  echo "RUN pip install --force-reinstall \"${WHEEL_URL}\"" >> "${ATOM_DIR}/Dockerfile.nightly"
+if [ -n "${AITER_INDEX_URL}" ]; then
+  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" amd-aiter" >> "${ATOM_DIR}/Dockerfile.nightly"
 else
   cat >> "${ATOM_DIR}/Dockerfile.nightly" <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \
