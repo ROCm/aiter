@@ -116,6 +116,8 @@ def gemm_a8w8_blockscale(
         f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
     )
 
+    _LOGGER.warning("enters here")
+
     M, K = x.shape
     N, K = w.shape
 
@@ -160,6 +162,7 @@ def gemm_a8w8_blockscale(
     for i in range(int(math.log2(NUM_WARPS // 2))):
         warp_bases.append((1 << i, 0))
     warp_bases = tuple(warp_bases)
+    print("this is being called")
     _gemm_a8w8_blockscale_kernel[grid](
         x,
         w,

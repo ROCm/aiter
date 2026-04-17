@@ -240,13 +240,16 @@ def _gemm_a8w8_blockscale_kernel(
 
     #scales
     cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
+    cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
+
+    a_scale_ptr += stride_ascale_k
+    b_scale_ptr += stride_bscale_k
+
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
         cache=cache_modifier,
     )
-    # Loading b scale and curr b scale
-    cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
     b_scale = gl.amd.cdna4.buffer_load(
         ptr=b_scale_ptr,
         offsets=offs_b_scale,
@@ -287,35 +290,27 @@ def _gemm_a8w8_blockscale_kernel(
         num_computes += 1
 
         # scales
+ 
+
+        # Loading a scale and curr A scale
+        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
+        cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
+
         # Advance the ptrs to the next K block.
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
 
-        # Loading a scale and curr A scale
-        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
-        # Loading b scale and curr b scale
-        cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr,
             offsets=offs_b_scale,
             cache=cache_modifier,
         )
 
-        
-
-
-        # # WMMA 
-        # gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
-        # a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
-        # b = tdm_smem_b.index(num_computes % NUM_BUFFERS).load(layout=dot_b_layout)
-        # res = gl.amd.gfx1250.wmma(a, b, zeros)
-        # num_computes += 1
-        # acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
         # Store in WMMA slice order so next iteration's load aligns scale[i] with row/col i
         smem_scale_a.store(a_scale)
@@ -341,10 +336,6 @@ def _gemm_a8w8_blockscale_kernel(
         next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS), dot_b_layout
             )
-
-        # a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
-        # b = tdm_smem_b.index(num_computes % NUM_BUFFERS).load(layout=dot_b_layout)
-
         # wmma
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         num_computes += 1
@@ -354,6 +345,27 @@ def _gemm_a8w8_blockscale_kernel(
         cur_a = next_a
         cur_b = next_b
         num_computes += 1
+        # Advance the ptrs to the next K block.
+        a_scale_ptr += stride_ascale_k
+        b_scale_ptr += stride_bscale_k
+
+        a_scale = gl.amd.cdna4.buffer_load(
+            ptr=a_scale_ptr,
+            offsets=offs_a_scale,
+            cache=cache_modifier,
+        )
+        b_scale = gl.amd.cdna4.buffer_load(
+            ptr=b_scale_ptr,
+            offsets=offs_b_scale,
+            cache=cache_modifier,
+        )
+
+
+        # Store in WMMA slice order so next iteration's load aligns scale[i] with row/col i
+        smem_scale_a.store(a_scale)
+        smem_scale_b.store(b_scale) 
+    cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
+    cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     num_computes += 1
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
@@ -362,33 +374,13 @@ def _gemm_a8w8_blockscale_kernel(
         gl.amd.sched_barrier(0)
 
 
-    # Store -- storing should be via tdm
-
-    # c = acc.to(c_ptr.type.element_ty)
-
-    # # # Write back the block of the output matrix C with masks.
-    # offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
-    #     0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
-    # )
-    # offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
-    #     0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
-    # )
-    # c_offs = (
-    #     stride_cm * offs_cm[:, None]
-    #     + stride_cn * offs_cn[None, :]
-    # )
-    # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    # gl.amd.cdna4.buffer_store(
-    #     stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask
-    # )
-
+    # Store 
     tdm_shared_c: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
+        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
     tdm_smem_c = gl.allocate_shared_memory(
         c_ptr.type.element_ty,
-        shape=[BLOCK_M, BLOCK_N],
+        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=tdm_shared_c,
     )
     tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
@@ -400,10 +392,10 @@ def _gemm_a8w8_blockscale_kernel(
         base=c_ptr,
         shape=(M, N),
         strides=(stride_cm, stride_cn),
-        block_shape=(BLOCK_M, BLOCK_N),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         layout=tdm_shared_c,
     )
     gl.amd.gfx1250.tdm.async_store(
-        c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], tdm_smem_c
+        c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], tdm_smem_c
     )
     gl.amd.gfx1250.tdm.async_wait(0)
