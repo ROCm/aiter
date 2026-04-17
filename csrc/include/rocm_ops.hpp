@@ -1871,6 +1871,22 @@ namespace py = pybind11;
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
 
+#define CHUNK_GDR_FWD_H_PYBIND                                        \
+    m.def("chunk_gated_delta_rule_fwd_h_hip",                         \
+          &aiter::chunk_gated_delta_rule_fwd_h_hip,                   \
+          "HIP overlap_2 BV kernel for chunk_gated_delta_rule_fwd_h", \
+          py::arg("k"),                                               \
+          py::arg("w"),                                               \
+          py::arg("u"),                                               \
+          py::arg("g"),                                               \
+          py::arg("initial_state"),                                   \
+          py::arg("cu_seqlens"),                                      \
+          py::arg("chunk_offsets"),                                    \
+          py::arg("selected_bv"),                                     \
+          py::arg("has_initial_state"),                                \
+          py::arg("output_final_state"),                               \
+          py::arg("save_new_value"));
+
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \
           &aiter::fused_split_gdr_update,                             \

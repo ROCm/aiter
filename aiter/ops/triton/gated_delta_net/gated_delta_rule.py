@@ -348,6 +348,7 @@ def chunk_gated_delta_rule_opt(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    use_chunk_hip: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Optimized chunk-based gated delta rule operation using Triton (Forward only).
@@ -435,6 +436,7 @@ def chunk_gated_delta_rule_opt(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        use_chunk_hip=use_chunk_hip,
     )
     return o.to(q.dtype), final_state
 
