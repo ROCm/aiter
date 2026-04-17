@@ -133,7 +133,7 @@ void mla_decode_stage1_asm_fwd(
     int stride_Page    = KV->stride(0) * KV->element_size();
     uint32_t log2_page = (uint32_t)log2f(page_size);
 
-    KernelArgs args;
+    KernelArgs args = {};
     size_t arg_size  = sizeof(args);
     args.ptr_R       = splitData->data_ptr();
     args.ptr_LSE     = splitLse->data_ptr();
@@ -146,13 +146,20 @@ void mla_decode_stage1_asm_fwd(
     args.scalar      = softmax_scale;
     args.s_MQA       = gqa_ratio * max_seqlen_q;
     args.s_kv_split  = kv_split;
-    args.s_Q_Bs      = stride_Q;
+    args.s_Q_Bs      =  stride_Q;
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
-    args.out_16_nosplit = kv_split;
+    args.ptr_LSEP = nullptr;
+    if (lse != nullptr)
+    {
+        args.ptr_LSEP = lse->data_ptr();
+    }
 
     if (persistent)
     {
+        args.out_16_nosplit = kv_split;
+        args.ptr_RP = output->data_ptr();
+
         if (work_meta_data != nullptr)
         {
             args.ptr_STP = work_meta_data->data_ptr();
@@ -178,13 +185,9 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
+        args.out_16_nosplit = 0;
+        args.ptr_RP = nullptr;
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
-    }
-    args.ptr_RP = output->data_ptr(); //final output
-    args.ptr_LSEP = nullptr;
-    if (lse != nullptr)
-    {
-        args.ptr_LSEP = lse->data_ptr(); //final lse
     }
 
     // std::cout << "mla args" << std::endl;
@@ -260,12 +263,13 @@ void mla_decode_stage1_asm_fwd(
     int prefill = 0; // decode stage
     int causal = 0;
     int config_max_seqlen_q = max_seqlen_q;
+    int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
     
     if(gqa_ratio == 128){
         config_max_seqlen_q = 0;
         sub_Q = 128;
-        if (q_type == "bf16" && kv_type == "bf16"){
+        if (q_type == "bf16" && kv_type == "bf16" && arch_id == "gfx942"){
             ps = 0; // not use ps
         }
     }
@@ -325,7 +329,11 @@ void mla_decode_stage1_asm_fwd(
     } else if (gqa_ratio == 64){
         if (q_type == "bf16" && kv_type == "bf16"){
             if(!persistent){
-                config_max_seqlen_q = 0;
+                if(max_seqlen_q == 1){
+                    config_max_seqlen_q = 1;
+                } else {
+                    config_max_seqlen_q = 0;
+                }
                 sub_Q = 64;
             }
         } else if (q_type == "fp8" && kv_type == "fp8"){
@@ -338,9 +346,14 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio* max_seqlen_q % 128 == 0)){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = 32;
+        args.s_Q_Bs = gqa_ratio;
+    }
     int lse_flag = (lse != nullptr) ? 1 : 0;
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
-    
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag);
+
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
