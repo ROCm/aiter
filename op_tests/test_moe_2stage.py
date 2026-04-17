@@ -10,6 +10,7 @@ from aiter.int4_utils import *
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
+import os
 import pandas as pd
 import logging
 
@@ -31,6 +32,9 @@ from aiter.ops.shuffle import (
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
+AITER_MOE_EXPERT_BALANCE = (
+    os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
+)
 
 
 @benchmark()
@@ -49,7 +53,7 @@ def test_fmoe(
     doweight_stage1=False,
     hidden_pad=0,
     intermediate_pad=0,
-    preshuffle=False,
+    preshuffle=True,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -70,14 +74,17 @@ def test_fmoe(
         w2[:, :, -intermediate_pad:] = 0
         w2[:, -hidden_pad:, :] = 0
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
-    # force expert balanced
-    score = torch.zeros((token, E), dtype=dtype)
-    start_col = 0
-    end_col = topk
-    for token_id in range(token):
-        score[token_id, start_col:end_col] = 1.0
-        start_col = end_col % E
-        end_col = start_col + topk
+    if AITER_MOE_EXPERT_BALANCE:
+        score = torch.zeros((token, E), dtype=dtype)
+        start_col = 0
+        end_col = topk
+        for token_id in range(token):
+            score[token_id, start_col:end_col] = 1.0
+            start_col = end_col % E
+            end_col = start_col + topk
+    else:
+        score = torch.randn((token, E), dtype=dtype)
+
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
@@ -442,7 +449,7 @@ parser.add_argument(
     "--preshuffle",
     type=dtypes.str2bool,
     nargs="*",
-    default=[False, True],
+    default=[True],
     help="""Whether to use pre-shuffle weight mode. Default is [False, True].
     -p f    # False.
     -p t    # True.""",

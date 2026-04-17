@@ -1694,17 +1694,9 @@ __global__ void mxfp4_quant_moe_sort_kernel(
                 break;
             }
 
-            int64_t input_offset;
-            if (topk == 1)
-            {
-                input_offset = (int64_t)(token_idx) * input_stride;
-            }
-            else
-            {
-                input_offset = (int64_t)(token_idx * topk + topk_id) * input_stride;
-            }
+            int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
             auto buffer_input =
-                opus::make_gmem<DTYPE_I>(input + input_offset, cols * sizeof(DTYPE_I));
+                opus::make_gmem<DTYPE_I>(input + offset_base * input_stride, cols * sizeof(DTYPE_I));
             vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(
                 buffer_input, threadIdx.x * vec_size_i);
             vec_f vec_input_f;
@@ -1730,11 +1722,10 @@ __global__ void mxfp4_quant_moe_sort_kernel(
                 scale[addr]     = bs_e8m0;
             }
 
-            if(topk_id < topk)
+            if(topk_id < topk || topk == 1)
             {
-                int64_t out_offset = (int64_t)(token_idx * topk + topk_id) * cols;
                 scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(
-                    out, input_f_ptr, &row_scale, cols, out_offset);
+                    out, input_f_ptr, &row_scale, cols, offset_base * cols);
             }
         }
     }

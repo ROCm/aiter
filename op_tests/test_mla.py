@@ -56,10 +56,11 @@ def ref_masked_attention(
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
         attn_bias.to(query.dtype)
         attn_weights += attn_bias
+    lse = attn_weights.logsumexp(dim=-1)
     attn_weights = torch.softmax(attn_weights, dim=-1)
 
     out = torch.einsum("hqk,khd->qhd", attn_weights.float(), value.float())
-    return out.to(dtype)
+    return out.to(dtype), lse
 
 
 def torch_mha_extend(
@@ -82,7 +83,7 @@ def torch_mha_extend(
         q = qs[i]
         k = ks[i]
         v = vs[i]
-        o = ref_masked_attention(q, k, v, sm_scale, dtype)
+        o, _ = ref_masked_attention(q, k, v, sm_scale, dtype)
         os.append(o)
     o = torch.concat(os)
     return o
@@ -106,15 +107,18 @@ def torch_mla_extend(
     bs = qo_indptr.shape[0] - 1
 
     os = []
+    lses = []
     for i in range(bs):
         kvc = kvs[i]
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
+        o, lse = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
         os.append(o)
+        lses.append(lse)
     o = torch.concat(os)
-    return o
+    lse = torch.concat(lses, dim=1).transpose(0, 1)
+    return o, lse
 
 
 @benchmark()
@@ -132,6 +136,7 @@ def test_mla(
     varlen,
     decode_qlen,
     split_per_batch=None,
+    return_lse=False,
 ):
     ret = {}
 
@@ -236,7 +241,7 @@ def test_mla(
     def test_absorb_prefill():
         q = torch.randn((total_qo, nhead, qk_head_dim), dtype=torch.bfloat16)
 
-        out_ref = torch_mla_extend(
+        out_ref, _ = torch_mla_extend(
             q,
             kv_buffer,
             qo_indptr,
@@ -326,7 +331,7 @@ def test_mla(
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
     # troch implementation
-    out_ref = torch_mla_extend(
+    out_ref, lse_ref = torch_mla_extend(
         q,
         kv_buffer,
         qo_indptr,
@@ -390,19 +395,20 @@ def test_mla(
             nhead_kv,
             sm_scale,
             num_kv_splits=split_per_batch,
+            return_lse=return_lse,
         )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse,
-        #               msg=f'attn_lse    [golden vs aiter_asm]')
         err = checkAllclose(
             out_ref,
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
+        if return_lse and attn_lse is not None:
+            checkAllclose(
+                lse_ref,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
+            )
         return err, us_asm_decode
 
     def test_absorb_decode_fp8():
@@ -573,7 +579,7 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2), (128, 4)],
+    choices=[(16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2), (128, 4)],
     nargs="*",
     const=None,
     default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
@@ -594,6 +600,13 @@ parser.add_argument(
     action="store_true",
     help="""variable kv seqlens per batch. Default: False.
     --varlen # True""",
+)
+parser.add_argument(
+    "-lse",
+    "--return_lse",
+    action="store_true",
+    help="""return lse. Default: False.
+    --lse # True""",
 )
 
 
@@ -619,6 +632,7 @@ for nhead, decode_qlen in args.nhead:
                 varlen=args.varlen,
                 decode_qlen=decode_qlen,
                 split_per_batch=split_per_batch,
+                return_lse=args.return_lse,
             )
             df.append(ret)
     df = pd.DataFrame(df)
