@@ -81,6 +81,17 @@ class AiterCommunicator:
 
         self.disabled = False
 
+        if os.environ.get("AITER_COMMS_PROBE_HEAP_ALLOC") == "1":
+            try:
+                probe = self._shmem.empty((1,), dtype=torch.float16)
+                logger.critical(
+                    "[AiterCommunicator] probe heap alloc OK (refresh_peer_access triggered) data_ptr=%x",
+                    probe.data_ptr(),
+                )
+                del probe
+            except Exception as e:
+                logger.critical("[AiterCommunicator] probe heap alloc FAILED: %s", e)
+
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self.disabled or self._shmem is None:
             logger.critical("[AiterCommunicator] reject: disabled=%s shmem=%s", self.disabled, self._shmem is not None)
