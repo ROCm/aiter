@@ -53,6 +53,8 @@ class AiterCommunicator:
         self._input_buf = None
         self._buf_shape = None
         self._buf_dtype = None
+        self._realloc_count = 0
+        self._call_count = 0
 
         if not _rocm_arch_available():
             logger.debug("Allreduce only supported on ROCm MI300/MI350 series.")
@@ -129,7 +131,17 @@ class AiterCommunicator:
 
     def _get_buffers(self, shape, dtype):
         """Get or allocate symmetric heap buffers. Reuses if shape/dtype match."""
+        self._call_count += 1
         if self._buf_shape != shape or self._buf_dtype != dtype:
+            self._realloc_count += 1
+            logger.critical(
+                "[AiterCommunicator] _get_buffers REALLOC #%d (call #%d) old=%s new=%s dtype=%s",
+                self._realloc_count,
+                self._call_count,
+                self._buf_shape,
+                tuple(shape),
+                dtype,
+            )
             self._input_buf = self._shmem.empty(shape, dtype=dtype)
             self._buf_shape = shape
             self._buf_dtype = dtype
