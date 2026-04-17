@@ -817,7 +817,13 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                            has_lse,
                                            qscale_type,
                                            false);
-        TORCH_CHECK(t >= 0, "invalid argument for batch_prefill");
+        TORCH_CHECK(t >= 0,
+                    "invalid argument for batch_prefill: no matching kernel found. "
+                    "page_size=", args.page_block_size,
+                    ", num_pages=", args.num_total_pages,
+                    ", dtype=", dtype_str,
+                    ". If KV cache exceeds 4GB with page_size < 128, "
+                    "CDNA3+ GPU (MI300/MI350) is required.");
     }
     else
     {
