@@ -358,8 +358,8 @@ class RotaryEmbedding(nn.Module):
 
         self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
         self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
-        cos = self.cos_cache.squeeze(-2).squeeze(-2)
-        sin = self.sin_cache.squeeze(-2).squeeze(-2)
+        cos = self.cos_cache.view(self.cos_cache.shape[0], -1)
+        sin = self.sin_cache.view(self.sin_cache.shape[0], -1)
 
         rotate_style = 0 if self.is_neox_style else 1
 
