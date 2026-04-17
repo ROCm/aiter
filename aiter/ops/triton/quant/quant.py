@@ -3,14 +3,18 @@
 
 import triton
 import torch
+from typing import Optional
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
     _dynamic_mxfp4_quant_kernel,
     _mxfp4_quant_op,
+    _dynamic_nvfp4_quant_kernel,
+    _nvfp4_quant_op,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 __all__ = [
     "static_per_tensor_quant_fp8_i8",
@@ -18,6 +22,8 @@ __all__ = [
     "dynamic_per_token_quant_fp8_i8",
     "dynamic_mxfp4_quant",
     "_mxfp4_quant_op",
+    "dynamic_nvfp4_quant",
+    "_nvfp4_quant_op",
 ]
 
 
@@ -214,3 +220,85 @@ def dynamic_mxfp4_quant(
     )
 
     return (x_fp4, blockscale_e8m0)
+
+
+def dynamic_nvfp4_quant(
+    x: torch.Tensor,
+    global_scale: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a tensor to MX FP4 format.
+
+    Args:
+        x: The input tensor, typically fp16 or bf16.
+    Returns:
+        A tuple of (x_fp4, blockscale_e4m3).
+    """
+    _LOGGER.info(f"DYNAMIC_NVFP4_QUANT: x={tuple(x.shape)}")
+    # Assume x is 2D-Tensor for now
+    M, N = x.shape
+
+    assert (N // 2) % 2 == 0
+
+    # This is fixed by spec for MXFP4. Do not tune this.
+    NVFP4_QUANT_BLOCK_SIZE = 16
+    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    blockscale_e4m3 = torch.empty(
+        ((N + NVFP4_QUANT_BLOCK_SIZE - 1) // NVFP4_QUANT_BLOCK_SIZE, M),
+        dtype=e4m3_dtype,
+        device=x.device,
+    ).T
+
+    # for large N values
+    if M <= 32:
+        NUM_ITER = 1
+        BLOCK_SIZE_M = triton.next_power_of_2(M)
+        BLOCK_SIZE_N = 32
+        NUM_WARPS = 1
+        NUM_STAGES = 1
+    else:
+        NUM_ITER = 4
+        BLOCK_SIZE_M = 64
+        BLOCK_SIZE_N = 64
+        NUM_WARPS = 4
+        NUM_STAGES = 2
+
+        if N <= 16384:
+            BLOCK_SIZE_M = 32
+            BLOCK_SIZE_N = 128
+
+    # for small N values
+    if N <= 1024:
+        NUM_ITER = 1
+        NUM_STAGES = 1
+        NUM_WARPS = 4
+        BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
+        # BLOCK_SIZE_N needs to be multiple of 32
+        BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+        BLOCK_SIZE_M = min(8, triton.next_power_of_2(M))
+
+    grid = (
+        triton.cdiv(M, BLOCK_SIZE_M),
+        triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
+    )
+
+    _dynamic_nvfp4_quant_kernel[grid](
+        x,
+        x_fp4,
+        blockscale_e4m3,
+        *x.stride(),
+        *x_fp4.stride(),
+        *blockscale_e4m3.stride(),
+        M=M,
+        N=N,
+        NVFP4_QUANT_BLOCK_SIZE=NVFP4_QUANT_BLOCK_SIZE,
+        NUM_ITER=NUM_ITER,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        NUM_STAGES=NUM_STAGES,
+        num_warps=NUM_WARPS,
+        waves_per_eu=0,
+        num_stages=1,
+    )
+
+    return x_fp4, blockscale_e4m3

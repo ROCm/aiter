@@ -4,16 +4,28 @@
 import torch
 import pytest
 
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.ops.triton.quant.quant import (
+    dynamic_mxfp4_quant,
+)  # remove the last quant before merging
+from aiter.ops.triton.quant.quant import (
+    dynamic_nvfp4_quant,
+)  # remove the last quant before merging
 from aiter.utility.fp4_utils import (
     dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant,
 )
+from aiter.utility.fp4_utils import mxfp4_to_f32
+from aiter.ops.triton.utils.types import e4m3_dtype
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+DEVICE_ARCH = arch_info.get_arch()
 
 DEBUG_MODE = False
 
 
 def torch_dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor,
+    scaling_mode: str = "even",
+    is_nvfp4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format based of AMD Quark Spec.
@@ -31,7 +43,7 @@ def torch_dynamic_mxfp4_quant(
         A tuple of (x_fp4, blockscale_e8m0).
     """
     # Create padded x. Needed because mxfp4 works with block of 32 elements
-    MXFP4_QUANT_BLOCK_SIZE = 32
+    QUANT_BLOCK_SIZE = 16 if is_nvfp4 else 32
     EXP_BIAS_FP32 = 127
     EXP_BIAS_FP4 = 1
     EBITS_F32 = 8
@@ -43,11 +55,10 @@ def torch_dynamic_mxfp4_quant(
     sign_mask = 1 << (EBITS_FP4 + MBITS_FP4)
 
     x_shape = x.shape
-    if x.shape[-1] % MXFP4_QUANT_BLOCK_SIZE != 0:
+    if x.shape[-1] % QUANT_BLOCK_SIZE != 0:
         shape = list(x_shape)
         shape = shape[:-1] + [
-            ((shape[-1] - 1 + MXFP4_QUANT_BLOCK_SIZE) // MXFP4_QUANT_BLOCK_SIZE)
-            * MXFP4_QUANT_BLOCK_SIZE
+            ((shape[-1] - 1 + QUANT_BLOCK_SIZE) // QUANT_BLOCK_SIZE) * QUANT_BLOCK_SIZE
         ]
         shape = tuple(shape)
         x_padded = torch.zeros((shape), device=x.device, dtype=x.dtype)
@@ -57,22 +68,29 @@ def torch_dynamic_mxfp4_quant(
 
     # Calculate scale
     x_padded = x_padded.reshape(
-        -1, x_padded.shape[-1] // MXFP4_QUANT_BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE
+        -1, x_padded.shape[-1] // QUANT_BLOCK_SIZE, QUANT_BLOCK_SIZE
     ).to(torch.float32)
-    # print(f"x_padded.shape={x_padded.shape}")
     amax, _ = torch.max(torch.abs(x_padded), dim=-1)
-    amax = amax.view(torch.int32)
-    amax = (amax + 0x200000) & 0xFF800000
-    amax = amax.view(torch.float32)
-    scale_e8m0_unbiased = torch.log2(amax).floor() - 2
-    scale_e8m0_unbiased = torch.clamp(scale_e8m0_unbiased, min=-127, max=127)
-    quant_scale = torch.exp2(-scale_e8m0_unbiased)
+    if is_nvfp4:
+        scale_e4m3 = amax.to(torch.float32) / 6.0
 
-    # Compute quantized x
-    qx = x_padded * quant_scale.unsqueeze(-1)
+        # Compute quantized x
+        qx = x_padded * (1.0 / scale_e4m3).unsqueeze(-1)
 
-    # blockscale_e8m0
-    bs_e8m0 = scale_e8m0_unbiased.to(torch.uint8) + 127
+        block_scales = scale_e4m3.to(e4m3_dtype)
+    else:
+        amax = amax.view(torch.int32)
+        amax = (amax + 0x200000) & 0xFF800000
+        amax = amax.view(torch.float32)
+        scale_e8m0_unbiased = torch.log2(amax).floor() - 2
+        scale_e8m0_unbiased = torch.clamp(scale_e8m0_unbiased, min=-127, max=127)
+        quant_scale = torch.exp2(-scale_e8m0_unbiased)
+
+        # Compute quantized x
+        qx = x_padded * quant_scale.unsqueeze(-1)
+
+        # blockscale_e8m0
+        block_scales = scale_e8m0_unbiased.to(torch.uint8) + 127
 
     # Convert to mxfp4 format
     #
@@ -150,7 +168,7 @@ def torch_dynamic_mxfp4_quant(
     x_mxfp4 = torch.flatten(x_mxfp4, -2, -1)
 
     # Remove padded values
-    if x.shape[-1] % MXFP4_QUANT_BLOCK_SIZE != 0:
+    if x.shape[-1] % QUANT_BLOCK_SIZE != 0:
         x_mxfp4 = x_mxfp4[..., : x.shape[-1] // 2]
 
     # Reshape back to original
@@ -158,7 +176,38 @@ def torch_dynamic_mxfp4_quant(
     mxfp4_shape = tuple(mxfp4_shape[:-1] + [mxfp4_shape[-1] // 2])
     x_mxfp4 = x_mxfp4.reshape(mxfp4_shape)
 
-    return x_mxfp4, bs_e8m0
+    return x_mxfp4, block_scales
+
+
+def torch_dequant_nvfp4(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """
+    Tutorial-style dequant: unpack OCP e2m1 nibbles, decode with OCP rules, multiply by
+    per-block float8 scale broadcast (same construction as `random_nvfp4_tensor` reference).
+    """
+    NVFP4_QUANT_BLOCK_SIZE = 16
+    assert x.dtype == torch.uint8
+    assert scale.dtype == torch.float8_e4m3fn
+    assert (
+        scale.shape[-1] == x.shape[-1] * 2 // NVFP4_QUANT_BLOCK_SIZE
+    ), f"Expected scale last dim {x.shape[-1]*2 // NVFP4_QUANT_BLOCK_SIZE}, got {scale.shape[-1]}"
+    # high = (x >> 4) & 0xF
+    # low = x & 0xF
+    # raw = torch.stack((low, high), dim=-1).reshape(*p.shape[:-1], p.shape[-1] * 2)
+    # ref = _ocp_e2m1_to_f32(raw.to(torch.uint8))
+    # ref = mxfp4_to_f32(_pack_e2m1_along_dim(raw, dim=1))
+    ref = mxfp4_to_f32(x)
+    sc = (
+        scale.to(torch.float32)
+        .unsqueeze(-1)
+        .expand(*scale.shape, NVFP4_QUANT_BLOCK_SIZE)
+        .reshape(*scale.shape[:-1], x.shape[-1] * 2)
+    )
+    out = ref * sc
+    return out.contiguous().to(out_dtype)
 
 
 @pytest.mark.parametrize(
@@ -257,3 +306,32 @@ def test_fp4_utils_dynamic_mxfp4_quant(M: int, N: int, dtype):
         fp4_utils_scale.view(torch.uint8).cpu(), torch_scale.cpu()
     )
     torch.testing.assert_close(fp4_utils_out.view(torch.uint8).cpu(), torch_out.cpu())
+
+
+@pytest.mark.parametrize("M", [1, 4, 16, 32, 64, 128])
+@pytest.mark.parametrize("N", [16, 32, 64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_nvfp4_quant(
+    M: int,
+    N: int,
+    dtype: torch.dtype,
+):
+    torch.cuda.empty_cache()
+    if DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 quantization is only supported on GFX1250")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    x_og = torch.randn(M, N, device=device, dtype=dtype) / 20
+    x_q_triton, x_s_triton = dynamic_nvfp4_quant(x_og)
+    x_q_torch, x_s_torch = torch_dynamic_mxfp4_quant(x_og, is_nvfp4=True)
+
+    x_dq_triton = torch_dequant_nvfp4(x_q_triton, x_s_triton, out_dtype=dtype)
+    x_dq_torch = torch_dequant_nvfp4(x_q_torch, x_s_torch, out_dtype=dtype)
+
+    atol = None
+    rtol = None
+    if dtype == torch.bfloat16:
+        atol = 1.5e-2
+        rtol = 1.5e-2
+    torch.testing.assert_close(x_dq_triton, x_dq_torch, atol=atol, rtol=rtol)
