@@ -586,11 +586,16 @@ def test_chunk_opt(
     mask_p: float,
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
+    use_chunk_hip: bool = False,
 ):
     torch.manual_seed(42)
     if IS_INTEL_ALCHEMIST and D > 128:
         pytest.skip(
             reason="chunk_gated_delta_rule_opt is not supported on alchemist for D>128"
+        )
+    if use_chunk_hip and (D != 128 or dtype != torch.bfloat16):
+        pytest.skip(
+            reason="HIP overlap_2 kernel requires D=128 and bfloat16"
         )
 
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -623,6 +628,7 @@ def test_chunk_opt(
         initial_state=h0.clone(),
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_chunk_hip=use_chunk_hip,
     )
 
     ref, ref_ht = recurrent_gated_delta_rule_ref(
@@ -638,6 +644,55 @@ def test_chunk_opt(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    (
+        "B",
+        "T",
+        "H",
+        "D",
+        "scale",
+        "gate_logit_normalizer",
+        "mask_p",
+        "use_qk_l2norm_in_kernel",
+        "dtype",
+    ),
+    [
+        pytest.param(
+            *test,
+            id="hip-B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(
+                *test
+            ),
+        )
+        for test in [
+            (4, 1024, 4, 128, 0.1, 1, 0, False, torch.bfloat16),
+            (4, 1024, 4, 128, 0.1, 1, 0, True, torch.bfloat16),
+            (2, 1500, 4, 128, 0.1, 10, 0, False, torch.bfloat16),
+            (1, 63, 1, 128, 1, 1, 0, False, torch.bfloat16),
+            (2, 500, 3, 128, 1, 1, 0, False, torch.bfloat16),
+        ]
+    ],
+)
+def test_chunk_opt_hip(
+    B: int,
+    T: int,
+    H: int,
+    D: int,
+    scale: float,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    use_qk_l2norm_in_kernel: bool,
+    dtype: torch.dtype,
+):
+    test_chunk_opt(
+        B=B, T=T, H=H, D=D, scale=scale,
+        gate_logit_normalizer=gate_logit_normalizer,
+        mask_p=mask_p,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        dtype=dtype,
+        use_chunk_hip=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -666,10 +721,15 @@ def test_chunk_opt_varlen(
     mask_p: float,
     cu_seqlens: list[int],
     dtype: torch.dtype,
+    use_chunk_hip: bool = False,
 ):
     if IS_INTEL_ALCHEMIST and D > 128:
         pytest.skip(
             reason="chunk_gated_delta_rule_opt is not supported on alchemist for D>128"
+        )
+    if use_chunk_hip and (D != 128 or dtype != torch.bfloat16):
+        pytest.skip(
+            reason="HIP overlap_2 kernel requires D=128 and bfloat16"
         )
     torch.manual_seed(42)
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
@@ -698,6 +758,7 @@ def test_chunk_opt_varlen(
         initial_state=h0.clone(),
         output_final_state=True,
         cu_seqlens=cu_seqlens,
+        use_chunk_hip=use_chunk_hip,
     )
 
     ref = []
@@ -719,6 +780,35 @@ def test_chunk_opt_varlen(
 
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "dtype"),
+    [
+        pytest.param(*test, id="hip-H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
+        for test in [
+            (4, 128, 0, [0, 15], torch.bfloat16),
+            (4, 128, 0, [0, 256, 500, 1000], torch.bfloat16),
+            (4, 128, 0, [0, 15, 100, 300, 1200, 2000], torch.bfloat16),
+        ]
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_varlen_hip because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_opt_varlen_hip(
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
+):
+    test_chunk_opt_varlen(
+        H=H, D=D, mask_p=mask_p,
+        cu_seqlens=cu_seqlens, dtype=dtype,
+        use_chunk_hip=True,
+    )
 
 
 @pytest.mark.parametrize(
