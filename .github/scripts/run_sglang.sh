@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_sglang.sh — Run SGLang accuracy tests locally on AITER runners
+# run_sglang.sh — Run a SGLang test on AITER runners
 #
 # Usage:
-#   run_sglang.sh <aiter_sha> [wheel_url]
+#   run_sglang.sh <aiter_sha> <test_cmd> [wheel_url]
 #
 # Required env:
 #   HF_TOKEN — HuggingFace token
@@ -18,8 +18,9 @@ set -euo pipefail
 cleanup() { docker rm -f ci_sglang 2>/dev/null || true; }
 trap cleanup EXIT
 
-AITER_SHA="${1:?Usage: run_sglang.sh <aiter_sha> [wheel_url]}"
-WHEEL_URL="${2:-}"
+AITER_SHA="${1:?Usage: run_sglang.sh <aiter_sha> <test_cmd> [wheel_url]}"
+TEST_CMD="${2:?test_cmd required}"
+WHEEL_URL="${3:-}"
 
 SGL_BRANCH="${SGL_BRANCH:-v0.5.10}"
 GPU_ARCH="${GPU_ARCH:-gfx942}"
@@ -29,14 +30,12 @@ SGLANG_WORKSPACE="${RUNNER_TEMP:-/tmp}/sglang-downstream"
 echo "=== SGLang Integration Test ==="
 echo "AITER SHA:  ${AITER_SHA}"
 echo "SGL branch: ${SGL_BRANCH}"
-echo "GPU arch:   ${GPU_ARCH}"
+echo "Test cmd:   ${TEST_CMD}"
 echo ""
 
 # ── Clone SGLang ──
 rm -rf "${SGLANG_WORKSPACE}"
 git clone --depth 1 -b "${SGL_BRANCH}" https://github.com/sgl-project/sglang.git "${SGLANG_WORKSPACE}"
-test -d "${SGLANG_WORKSPACE}/sgl-kernel"
-test -d "${SGLANG_WORKSPACE}/python"
 
 # ── Patch SGLang CI scripts for aiter runners ──
 cd "${SGLANG_WORKSPACE}"
@@ -45,6 +44,9 @@ from pathlib import Path
 
 def replace_once(path_str, old, new):
     path = Path(path_str)
+    if not path.exists():
+        print(f"Warning: {path} not found, skipping patch")
+        return
     text = path.read_text()
     if old not in text:
         print(f"Warning: snippet not found in {path}: {old!r}")
@@ -130,24 +132,10 @@ else
   "
 fi
 
-# ── Run accuracy tests ──
+# ── Run test ──
 echo ""
-echo "=== Running SGLang accuracy tests ==="
-bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" \
-  python3 -c 'import os; print({k: os.environ.get(k) for k in ("GPU_ARCHS", "SGLANG_USE_AITER")})'
-
-bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
-  -e SGLANG_USE_AITER=0 python3 registered/eval/test_eval_accuracy_large.py
-
-bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
-  python3 registered/quant/test_eval_fp8_accuracy.py
-
-bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
-  python3 registered/models/test_qwen_models.py
+echo "=== Running: ${TEST_CMD} ==="
+bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" bash -c "${TEST_CMD}"
 
 echo ""
-echo "=== SGLang tests PASSED ==="
-
-# ── Cleanup ──
-docker rm -f ci_sglang || true
-rm -rf "${SGLANG_WORKSPACE}" || true
+echo "=== Test PASSED ==="

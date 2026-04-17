@@ -5,7 +5,8 @@
     "kv": "default",
     "tp": 1,
     "runner": "aiter-1gpu-runner",
-    "label": "MI325-1gpu"
+    "label": "MI325-1gpu",
+    "test_type": "bench-latency"
   },
   {
     "model": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -13,7 +14,8 @@
     "kv": "fp8",
     "tp": 1,
     "runner": "aiter-1gpu-runner",
-    "label": "MI325-1gpu"
+    "label": "MI325-1gpu",
+    "test_type": "bench-latency"
   },
   {
     "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -21,7 +23,8 @@
     "kv": "default",
     "tp": 8,
     "runner": "aiter-8gpu-runner",
-    "label": "MI325-8gpu"
+    "label": "MI325-8gpu",
+    "test_type": "bench-latency"
   },
   {
     "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -29,7 +32,8 @@
     "kv": "fp8",
     "tp": 8,
     "runner": "aiter-8gpu-runner",
-    "label": "MI325-8gpu"
+    "label": "MI325-8gpu",
+    "test_type": "bench-latency"
   },
   {
     "model": "deepseek-ai/DeepSeek-R1",
@@ -37,7 +41,8 @@
     "kv": "default",
     "tp": 8,
     "runner": "aiter-8gpu-runner",
-    "label": "MI325-8gpu"
+    "label": "MI325-8gpu",
+    "test_type": "bench-latency"
   },
   {
     "model": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -45,7 +50,8 @@
     "kv": "default",
     "tp": 1,
     "runner": "linux-aiter-mi35x-1",
-    "label": "MI35X-1gpu"
+    "label": "MI35X-1gpu",
+    "test_type": "bench-latency"
   },
   {
     "model": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -53,6 +59,7 @@
     "kv": "fp8",
     "tp": 1,
     "runner": "linux-aiter-mi35x-1",
-    "label": "MI35X-1gpu"
+    "label": "MI35X-1gpu",
+    "test_type": "bench-latency"
   }
 ]
