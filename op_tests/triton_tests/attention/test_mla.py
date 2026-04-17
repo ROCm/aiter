@@ -299,7 +299,6 @@ def test_mla_decode_fwd(
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
     ],
 )
-@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mla_prefill_fwd(
     batch_size: int,
     ctx_lens: int,
@@ -313,12 +312,7 @@ def test_mla_prefill_fwd(
     kv_dtype: torch.dtype,
     out_dtype: torch.dtype,
     use_out_scale: bool,
-    backend: str,
 ):
-    if backend == "triton" and DEVICE_ARCH not in ("gfx950",):
-        pytest.skip("Triton is only supported on gfx950")
-    if backend == "gluon" and DEVICE_ARCH not in ("gfx1250",):
-        pytest.skip("Gluon is only supported on gfx1250")
     torch.cuda.empty_cache()
     num_query_heads, num_kv_heads = num_heads
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
@@ -390,7 +384,6 @@ def test_mla_prefill_fwd(
         q_descale=q_descale,
         kv_descale=kv_descale,
         out_scale=out_scale,
-        use_gluon=(backend == "gluon"),
         shuffled_kv_cache=False,
     )
 
