@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from typing import Union
 
 import torch
@@ -82,6 +83,10 @@ class AiterCommunicator:
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self.disabled or self._shmem is None:
+            return False
+        # Diagnostic gate: iris stays initialized but every call falls through.
+        # Used to isolate whether iris init itself slows surrounding NCCL ops.
+        if os.environ.get("AITER_COMMS_FORCE_FALLBACK") == "1":
             return False
         if inp.dtype not in self._SUPPORTED_DTYPES:
             return False
