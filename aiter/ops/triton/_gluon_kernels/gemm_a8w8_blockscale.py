@@ -239,26 +239,28 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
     #scales
-    cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
-    cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
+    # cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
+    # cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
-    a_scale_ptr += stride_ascale_k
-    b_scale_ptr += stride_bscale_k
-
-    a_scale = gl.amd.cdna4.buffer_load(
-        ptr=a_scale_ptr,
-        offsets=offs_a_scale,
-        cache=cache_modifier,
-    )
-    b_scale = gl.amd.cdna4.buffer_load(
-        ptr=b_scale_ptr,
-        offsets=offs_b_scale,
-        cache=cache_modifier,
-    )
+    # a_scale = gl.amd.cdna4.buffer_load(
+    #     ptr=a_scale_ptr,
+    #     offsets=offs_a_scale,
+    #     cache=cache_modifier,
+    # )
+    # # Loading b scale and curr b scale
+    # b_scale = gl.amd.cdna4.buffer_load(
+    #     ptr=b_scale_ptr,
+    #     offsets=offs_b_scale,
+    #     cache=cache_modifier,
+    # )
 
     # ----- Main Loop --------
 
     for k in range(k_tiles_count - 1):
+        # Loading a scale and curr A scale
+        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
+        cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
+
 
         # wmma 
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
@@ -290,32 +292,31 @@ def _gemm_a8w8_blockscale_kernel(
         num_computes += 1
 
         # scales
- 
 
-        # Loading a scale and curr A scale
-        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
-        cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
-
+        
         # Advance the ptrs to the next K block.
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
-
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
+        # Loading b scale and curr b scale
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr,
             offsets=offs_b_scale,
             cache=cache_modifier,
         )
 
+        
+
 
         # Store in WMMA slice order so next iteration's load aligns scale[i] with row/col i
         smem_scale_a.store(a_scale)
         smem_scale_b.store(b_scale) 
 
+        
     # ======= Epilogue ========
 
     # load a from the last load
@@ -345,27 +346,28 @@ def _gemm_a8w8_blockscale_kernel(
         cur_a = next_a
         cur_b = next_b
         num_computes += 1
-        # Advance the ptrs to the next K block.
-        a_scale_ptr += stride_ascale_k
-        b_scale_ptr += stride_bscale_k
 
-        a_scale = gl.amd.cdna4.buffer_load(
-            ptr=a_scale_ptr,
-            offsets=offs_a_scale,
-            cache=cache_modifier,
-        )
-        b_scale = gl.amd.cdna4.buffer_load(
-            ptr=b_scale_ptr,
-            offsets=offs_b_scale,
-            cache=cache_modifier,
-        )
-
-
-        # Store in WMMA slice order so next iteration's load aligns scale[i] with row/col i
-        smem_scale_a.store(a_scale)
-        smem_scale_b.store(b_scale) 
+        
+    # final scale application
+    a_scale_ptr += stride_ascale_k
+    b_scale_ptr += stride_bscale_k
+    a_scale = gl.amd.cdna4.buffer_load(
+        ptr=a_scale_ptr,
+        offsets=offs_a_scale,
+        cache=cache_modifier,
+    )
+    # Loading b scale and curr b scale
+    b_scale = gl.amd.cdna4.buffer_load(
+        ptr=b_scale_ptr,
+        offsets=offs_b_scale,
+        cache=cache_modifier,
+    )
+    smem_scale_a.store(a_scale)
+    smem_scale_b.store(b_scale) 
+     # load a from the last load
     cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
     cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
+
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     num_computes += 1
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
