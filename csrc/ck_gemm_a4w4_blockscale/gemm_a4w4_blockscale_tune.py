@@ -182,7 +182,11 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 err_ratio = checkAllclose(
                     out[:M].to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
                 )
-                status = "ok" if err_ratio <= args.errRatio else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
