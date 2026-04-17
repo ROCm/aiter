@@ -118,6 +118,49 @@ def fused_moe(
     splitk=0,
     use_flydsl: bool = False,
 ):
+    # MOE_SHAPE_LOG hook v1: dump unique (tokens,K,inter,E,topk,quant,dtypes,...) to jsonl when env set
+    try:
+        _moe_shape_log_path = os.environ.get('MOE_SHAPE_LOG_PATH', '')
+        if _moe_shape_log_path:
+            import json as _json
+            if not hasattr(fused_moe, '_shape_cache'):
+                fused_moe._shape_cache = set()
+            _tok = int(hidden_states.shape[0])
+            _kd = int(hidden_states.shape[-1])
+            _e = int(w1.shape[0])
+            _nw1 = int(w1.shape[1])
+            _nw2 = int(w2.shape[1])
+            _inter = int(w2.shape[2])
+            _topk = int(topk_ids.shape[1])
+            _q = quant_type.value if hasattr(quant_type, 'value') else int(quant_type)
+            _act = activation.value if hasattr(activation, 'value') else int(activation)
+            _key = (_tok, _kd, _inter, _e, _topk, _q, _act,
+                    str(hidden_states.dtype), str(w1.dtype),
+                    str(w1_scale.dtype) if w1_scale is not None else 'none',
+                    str(a1_scale.dtype) if a1_scale is not None else 'none',
+                    bool(doweight_stage1), int(group_size))
+            if _key not in fused_moe._shape_cache:
+                fused_moe._shape_cache.add(_key)
+                _rec = {
+                    'tokens': _tok, 'K': _kd, 'inter': _inter,
+                    'E': _e, 'topk': _topk, 'quant_type': _q,
+                    'activation': _act,
+                    'a_dtype': str(hidden_states.dtype),
+                    'w_dtype': str(w1.dtype),
+                    'w_scale_dtype': str(w1_scale.dtype) if w1_scale is not None else None,
+                    'a_scale_dtype': str(a1_scale.dtype) if a1_scale is not None else None,
+                    'doweight_stage1': bool(doweight_stage1),
+                    'group_size': int(group_size),
+                    'N_w1': _nw1, 'N_w2': _nw2,
+                    'rank': int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', -1))),
+                }
+                try:
+                    with open(_moe_shape_log_path, 'a') as _f:
+                        _f.write(_json.dumps(_rec) + '\n')
+                except Exception:
+                    pass
+    except Exception:
+        pass
     # fast path for small batches
     if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
         ((quant_type == QuantType.No and w1.dtype == torch.bfloat16) or (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
@@ -691,7 +734,7 @@ def get_2stage_cfgs(
                 "use_g1u1",
                 "doweight_stage1",
             ]
-        ).to_dict("index")
+        ).pipe(lambda df: df[~df.index.duplicated(keep="first")]).to_dict("index")
         return cfg_2stages
 
     global cfg_2stages
@@ -1921,6 +1964,21 @@ def flydsl_moe_stage1(
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 64
     tile_k = 128 if _is_w_int4 else 256
+    # TILE_OVERRIDE v1 (stage1)
+    try:
+        _over_tn = os.environ.get('AITER_FLYDSL_STAGE1_TILE_N', '')
+        if _over_tn: tile_n = int(_over_tn)
+        _over_tk_env = os.environ.get('AITER_FLYDSL_STAGE1_TILE_K', '')
+        if _over_tk_env:
+            tile_k = int(_over_tk_env)
+        else:
+            # AUTO_TILE_K v1: decode (block_m<=16) -> tk=256, prefill -> tk=128
+            if _is_w_int4 and int(tile_m) <= 16:
+                tile_k = 256
+        _over_tm = os.environ.get('AITER_FLYDSL_STAGE1_TILE_M', '')
+        if _over_tm: tile_m = int(_over_tm)
+    except Exception:
+        pass
     # Decode/small-token fix (NO kernel changes):
     # FlyDSL stage1 kernel expects CK-style preshuffled W1 layout, but model weights are not
     # preshuffled. For small tokens, only a handful of experts are actually touched.
@@ -1983,6 +2041,15 @@ def flydsl_moe_stage1(
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
     blocks = int(sorted_eids.numel())
+    # GRID_TRIM v1: tighten launch grid.y to min(blocks, token_num*topk) to
+    # skip dispatching padding-only blocks. Safe for CUDA graphs (static bound).
+    try:
+        if os.environ.get('AITER_FLYDSL_MOE_GRID_TRIM', '1') in ('1','true','True','YES','yes'):
+            _upper = int(token_num) * int(topk)
+            if _upper > 0 and _upper < blocks:
+                blocks = _upper
+    except Exception:
+        pass
 
     # FlyDSL kernels expect `num_valid_ids[0]` == max valid sorted rows (padded length).
     # Some builds return a length-2 tensor; keep only the first element to avoid ambiguity.
@@ -2001,12 +2068,8 @@ def flydsl_moe_stage1(
     debug_flydsl = os.environ.get("AITER_FLYDSL_DEBUG", "0") == "1"
     if debug_flydsl:
         logger.info(
-            "[flydsl] stage1 inputs: tokens=%d topk=%d model_dim=%d inter_dim=%d block_m=%d",
-            token_num,
-            topk,
-            model_dim,
-            inter_dim,
-            tile_m,
+            "[flydsl] stage1 inputs: tokens=%d topk=%d model_dim=%d inter_dim=%d tile_m=%d tile_n=%d tile_k=%d",
+            token_num, topk, model_dim, inter_dim, tile_m, tile_n, tile_k,
         )
 
     x_q = hidden_states.contiguous().view(token_num, model_dim)
@@ -2081,6 +2144,9 @@ def flydsl_moe_stage1(
     else:
         _stage1_in_dtype = "fp8"
 
+    if debug_flydsl:
+        logger.info("[flydsl-dispatch] stage1 _stage1_in_dtype=%s, _is_w4a8_i8=%s, _is_w4a8_fp8=%s, _is_w4a16=%s, _is_bf16=%s",
+                    _stage1_in_dtype, _is_w4a8_i8, _is_w4a8_fp8, _is_w4a16, _is_bf16)
     key1 = (
         model_dim,
         inter_dim,
@@ -2446,10 +2512,29 @@ def flydsl_moe_stage2(
     tile_m = int(block_m) if block_m is not None else 64
     tile_n = 256
     tile_k = 64
+    # TILE_OVERRIDE v1 (stage2)
+    try:
+        _over_tn = os.environ.get('AITER_FLYDSL_STAGE2_TILE_N', '')
+        if _over_tn: tile_n = int(_over_tn)
+        _over_tk = os.environ.get('AITER_FLYDSL_STAGE2_TILE_K', '')
+        if _over_tk: tile_k = int(_over_tk)
+        _over_tm = os.environ.get('AITER_FLYDSL_STAGE2_TILE_M', '')
+        if _over_tm: tile_m = int(_over_tm)
+    except Exception:
+        pass
 
     sorted_ids = sorted_token_ids.contiguous()
     sorted_eids = sorted_expert_ids.contiguous()
     blocks = int(sorted_eids.numel())
+    # GRID_TRIM v1: tighten launch grid.y to min(blocks, token_num*topk) to
+    # skip dispatching padding-only blocks. Safe for CUDA graphs (static bound).
+    try:
+        if os.environ.get('AITER_FLYDSL_MOE_GRID_TRIM', '1') in ('1','true','True','YES','yes'):
+            _upper = int(token_num) * int(topk)
+            if _upper > 0 and _upper < blocks:
+                blocks = _upper
+    except Exception:
+        pass
 
     # FlyDSL kernels expect `num_valid_ids[0]` == max valid sorted rows (padded length).
     if num_valid_ids is not None and num_valid_ids.numel() > 1:
