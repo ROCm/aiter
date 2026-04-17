@@ -855,7 +855,9 @@ def compile_moe_gemm1(
                             mi_val = arith.index(mi * 16)
                             curr_row_a_lds = row_a_lds + mi_val
 
-                            if const_expr((a0_prefetch is not None) and (ku == 0) and (mi == 0)):
+                            if const_expr(
+                                (a0_prefetch is not None) and (ku == 0) and (mi == 0)
+                            ):
                                 a0, a1 = a0_prefetch
                             else:
                                 a0, a1 = lds_load_packs_k64(
@@ -2140,7 +2142,9 @@ def compile_moe_gemm2(
                             mi_val = arith.index(mi * 16)
                             curr_row_a_lds = row_a_lds + mi_val
 
-                            if const_expr((a0_prefetch is not None) and (ku == 0) and (mi == 0)):
+                            if const_expr(
+                                (a0_prefetch is not None) and (ku == 0) and (mi == 0)
+                            ):
                                 a0, a1 = a0_prefetch
                             else:
                                 a0, a1 = lds_load_packs_k64(

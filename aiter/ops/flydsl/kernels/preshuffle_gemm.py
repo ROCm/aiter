@@ -959,7 +959,9 @@ def compile_preshuffle_gemm_a8(
 
                         for mi in range_constexpr(m_repeat):
                             curr_row_a_lds = row_a_lds + (mi * 16)
-                            if const_expr((a0_prefetch is not None) and (ku0 == 0) and (mi == 0)):
+                            if const_expr(
+                                (a0_prefetch is not None) and (ku0 == 0) and (mi == 0)
+                            ):
                                 a0, a1 = a0_prefetch
                             else:
                                 a0, a1 = lds_load_packs_k64(
@@ -1019,7 +1021,9 @@ def compile_preshuffle_gemm_a8(
                 col_base = col_offset_base_bytes + ki64
                 for mi in range_constexpr(m_repeat):
                     curr_row_a_lds = row_a_lds + (mi * 16)
-                    if const_expr((a0_prefetch is not None) and (ku == 0) and (mi == 0)):
+                    if const_expr(
+                        (a0_prefetch is not None) and (ku == 0) and (mi == 0)
+                    ):
                         a0, a1 = a0_prefetch
                     else:
                         a0, a1 = lds_load_packs_k64(
@@ -1190,7 +1194,7 @@ def compile_preshuffle_gemm_a8(
                 mfma_total = (k_unroll * 2) * m_repeat * mfma_group
                 mfma_per_iter = 2 * mfma_group
                 sche_iters = 0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
-rocdl.sched_dsrd(2)
+                rocdl.sched_dsrd(2)
                 rocdl.sched_mfma(1)
                 if const_expr(tile_m == 16):
                     rocdl.sched_vmem(1)
@@ -1661,7 +1665,9 @@ rocdl.sched_dsrd(2)
             _wpe = int(waves_per_eu)
             if const_expr(_wpe >= 1):
                 for op in ctx.gpu_module_body.operations:
-                    if const_expr(hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"):
+                    if const_expr(
+                        hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
+                    ):
                         op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
                             T.i32, _wpe
                         )
