@@ -148,7 +148,7 @@ class AiterCommunicator:
                     input_buf,
                 )
             self._workspace = self._shmem.ccl.all_reduce(
-                input_buf, input_buf, workspace=self._workspace
+                input_buf, input_buf, workspace=self._workspace, async_op=True
             )
 
             inp.copy_(input_buf)
