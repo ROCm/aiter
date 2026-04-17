@@ -974,6 +974,7 @@ class AttentionConfig:
     K_WIDTH: gl.constexpr
     CAUSAL: gl.constexpr
     NUM_BUFFERS: gl.constexpr
+    LOOP_VARIANT: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -997,6 +998,7 @@ class AttentionConfig:
         KV_FP8,
         CAUSAL,
         NUM_BUFFERS,
+        LOOP_VARIANT,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -1024,6 +1026,7 @@ class AttentionConfig:
         self.K_WIDTH = gl.constexpr(8)
         self.CAUSAL = gl.constexpr(CAUSAL)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
+        self.LOOP_VARIANT = gl.constexpr(LOOP_VARIANT)
         # Operator layouts (gfx1250 WMMA)
         if ARCH_NAME == "gfx1250":
             assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
@@ -1212,6 +1215,15 @@ class AttentionProgram:
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
+
+        if cfg.LOOP_VARIANT == 1:
+            # TODO: we need to make sure masking last 2 is always enough
+            # This might be violated if BLOCK_M is too large compared to q_heads and tile_size
+            # like shortest and longest differ kv differ a lot
+            tile_end = gl.maximum(3, tile_end)
+        if cfg.LOOP_VARIANT == 2:
+            # TODO: This needs to be fixed, the we need to peel 1 iter and mask it to be safe
+            tile_end = gl.maximum(2, tile_end)
 
         QK_scale = cfg.RCP_LN2 * cfg.SOFTMAX_SCALE
 
@@ -1548,7 +1560,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
 
     # QK_t0
     S = pgm.compute_qk(k)
-
+    S = pgm.apply_mask_qk(S, 0)
     # SM0_t0
     S = gl.convert_layout(S, pgm.cfg.pv_layout)
     p, alpha, M = pgm.softmax_part0(S, M)
@@ -1565,18 +1577,22 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         t_1 = j + 1
         t_2 = j + 2
         t_3 = j + 3
+        
         next4_physical_block_idx = kv_loader.load_block_ids(t_3 + 1)
-
+        gl.amd.gfx1250.tdm.async_wait(1)
+        if cfg.NUM_BUFFERS == 3:
+            kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_0)
+        else:
+            kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_1)
+        
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         # QK for tile (i+1)
         S = pgm.compute_qk(k)
 
         # SM1(prev) + LR_V(tile i) + GLDS_K(tile i+3)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype)
-        if cfg.NUM_BUFFERS == 3:
-            kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_0)
-        else:
-            kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_1)
+        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=True)
+
 
         # PV
         acc = pgm.compute_pv(p, v, acc)
@@ -1584,8 +1600,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         # SM0 + LR_K(tile i+2) + GLDS_V(tile i+2)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
-        k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=buf_2, target_dtype=q.dtype)
-        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
+        k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=True)
 
         next2_physical_block_idx = next3_physical_block_idx
         next3_physical_block_idx = next4_physical_block_idx
@@ -1607,6 +1622,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
     with gl.amd.warp_pipeline_stage("stage2"):
         # QK + SM0 for tile L+1, LR_K for tile L+2
         S = pgm.compute_qk(k)
+        S = pgm.apply_mask_qk(S, epilogue_t_2)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
         k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buf_2, target_dtype=q.dtype)
@@ -1616,11 +1632,10 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         S = pgm.compute_qk(k)
         S = pgm.apply_mask_qk(S, epilogue_t_3)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
         v = kv_loader.load_v_from_shared(wait_count=1, buffer_id=buf_1, target_dtype=q.dtype)
-
     with gl.amd.warp_pipeline_stage("stage4"):
         # SM1 + PV for tile L+1, SM0 for tile L+2, LR_V for tile L+2
-        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
         acc = pgm.compute_pv(p, v, acc)
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
@@ -1628,7 +1643,6 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
 
     with gl.amd.warp_pipeline_stage("stage5"):
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-
         # PV for tile L+2
         acc = pgm.compute_pv(p, v, acc)
 
@@ -1670,12 +1684,14 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 
     # ---- pipeline prologue, iter -1 ----
     qk0 = pgm.compute_qk_subtile(k0)
+    qk0 = pgm.apply_mask_qk_subtile(qk0, 0, 0)
     k1 = kv_loader.load_k_from_shared(wait_count=2, target_dtype=q.dtype,
                                         buffer_id=0, sub_idx=1)
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=0, sub_idx=0)
     qk1 = pgm.compute_qk_subtile(k1)
-    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=0, sub_idx=1)
+    qk1 = pgm.apply_mask_qk_subtile(qk1, 0, 1)
 
+    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=0, sub_idx=1)
     qk = pgm.concat_subtile(qk0, qk1)
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
@@ -1948,6 +1964,7 @@ def kernel_unified_attention_2d(
         KV_FP8,
         CAUSAL,
         NUM_BUFFERS,
+        LOOP_VARIANT,
     )
 
     # Cast strides to int64 when not using buffer ops
@@ -2297,7 +2314,7 @@ def unified_attention(
 
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
-        print_irs_to_files(attn_kernel, f"unified_attention_2d_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}")
+        print_irs_to_files(attn_kernel, f"ds_w_rm_merged_wait_unified_attention_2d_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}")
     return attn_kernel
 
 
