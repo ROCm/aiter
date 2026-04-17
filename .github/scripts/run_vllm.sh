@@ -22,6 +22,9 @@ TP="${3:?tp required}"
 KV_CACHE_DTYPE="${4:-default}"
 AITER_INDEX_URL="${5:-}"
 
+AITER_PKG="amd-aiter"
+if [ -n "${AITER_VERSION:-}" ]; then AITER_PKG="amd-aiter==${AITER_VERSION}"; fi
+
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
 SHORT_SHA="${AITER_SHA:0:7}"
 IMAGE_TAG="rocm/vllm-aiter-ci:nightly-${SHORT_SHA}"
@@ -44,7 +47,7 @@ RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
 if [ -n "${AITER_INDEX_URL}" ]; then
-  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" amd-aiter" >> /tmp/Dockerfile.vllm-nightly
+  echo "RUN pip install --extra-index-url \"${AITER_INDEX_URL}\" \"${AITER_PKG}\"" >> /tmp/Dockerfile.vllm-nightly
 else
   cat >> /tmp/Dockerfile.vllm-nightly <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /aiter && \

@@ -22,6 +22,12 @@ AITER_SHA="${1:?Usage: run_sglang.sh <aiter_sha> <test_cmd> [aiter_index_url]}"
 TEST_CMD="${2:?test_cmd required}"
 AITER_INDEX_URL="${3:-}"
 
+# Resolve package spec: "amd-aiter==X.Y.Z" if AITER_VERSION set, else "amd-aiter"
+AITER_PKG="amd-aiter"
+if [ -n "${AITER_VERSION:-}" ]; then
+  AITER_PKG="amd-aiter==${AITER_VERSION}"
+fi
+
 SGL_BRANCH="${SGL_BRANCH:-v0.5.10}"
 GPU_ARCH="${GPU_ARCH:-gfx942}"
 SGLANG_CI_HOSTNAME="${SGLANG_CI_HOSTNAME:-linux-mi325-gpu-1}"
@@ -113,7 +119,7 @@ bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
 if [ -n "${AITER_INDEX_URL}" ]; then
   docker exec ci_sglang bash -lc "
     pip uninstall -y amd-aiter aiter || true
-    pip install --extra-index-url '${AITER_INDEX_URL}' amd-aiter
+    pip install --extra-index-url '${AITER_INDEX_URL}' '${AITER_PKG}'
     pip show amd-aiter
   "
 else

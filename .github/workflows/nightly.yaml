@@ -30,10 +30,15 @@ on:
         type: boolean
         default: false
       aiter_index_url:
-        description: 'AITER pip index URL (installs latest wheel from index)'
+        description: 'AITER pip index URL'
         type: string
         required: false
         default: 'https://rocm.frameworks-devreleases.amd.com/whl-staging/gfx942-gfx950/'
+      aiter_version:
+        description: 'AITER version to install (e.g. 0.1.12.post1+rocm7.2.1). Leave blank for latest.'
+        type: string
+        required: false
+        default: ''
       run_sglang:
         description: 'Run SGLang integration tests'
         type: boolean
@@ -137,6 +142,7 @@ jobs:
         timeout-minutes: ${{ matrix.timeout }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
         run: |
           bash .github/scripts/run_sglang.sh \
             "${{ github.sha }}" \
@@ -162,6 +168,7 @@ jobs:
         timeout-minutes: 45
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
         run: |
           bash .github/scripts/run_vllm.sh \
             "${{ github.sha }}" \
@@ -195,6 +202,7 @@ jobs:
         timeout-minutes: ${{ matrix.timeout }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
         run: |
           bash .github/scripts/run_vllm_test.sh \
             "${{ github.sha }}" \
@@ -220,6 +228,7 @@ jobs:
         timeout-minutes: 90
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
           ATOM_ENV_VARS: ${{ matrix.env_vars }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
