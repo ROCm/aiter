@@ -88,9 +88,14 @@ class AiterCommunicator:
                     "[AiterCommunicator] probe heap alloc OK (refresh_peer_access triggered) data_ptr=%x",
                     probe.data_ptr(),
                 )
-                del probe
+                workspace = self._shmem.ccl.all_reduce_preamble(probe, probe)
+                logger.critical(
+                    "[AiterCommunicator] probe preamble OK workspace=%s",
+                    type(workspace).__name__,
+                )
+                del probe, workspace
             except Exception as e:
-                logger.critical("[AiterCommunicator] probe heap alloc FAILED: %s", e)
+                logger.critical("[AiterCommunicator] probe FAILED: %s", e)
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self.disabled or self._shmem is None:
