@@ -60,11 +60,36 @@ SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 SPLIT_K_GLOBAL_SEMAPHORE_STATE: dict[SplitKStreamKey, int] = {}
 
+# Expand the original default HGEMM catalog with the extra cases that proved
+# useful during the wider one-off search, instead of maintaining separate
+# search-space modes.
+HGEMM_TILE_N_OPTIONS = (64, 128, 160, 192, 256)
+HGEMM_TILE_K_OPTIONS = (64, 96, 128, 160, 256)
+HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 80, 96, 112, 128, 160, 256)
+HGEMM_BASE_SPLIT_K_OPTIONS = (1, 2, 4, 8, 16)
+HGEMM_MAX_SPLIT_K = 32
+HGEMM_EXTRA_BLOCK_K_LOOPS_MIN = 2
+HGEMM_EXTRA_BLOCK_K_LOOPS_MAX = 8
 KERNEL_CONFIG_VARIANTS = (
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 2,
+        "b_to_lds": False,
+    },
     {
         "block_m_warps": 1,
         "block_n_warps": 4,
         "b_to_lds": False,
+    },
+    {
+        "block_m_warps": 2,
+        "block_n_warps": 2,
+        "b_to_lds": False,
+    },
+    {
+        "block_m_warps": 1,
+        "block_n_warps": 4,
+        "b_to_lds": True,
     },
     {
         "block_m_warps": 2,
@@ -186,6 +211,33 @@ def _to_kernel_dtype(dtype: torch.dtype) -> str:
 
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _hgemm_tile_m_options(m: Optional[int]) -> tuple[int, ...]:
+    if m is None:
+        return HGEMM_TILE_M_OPTIONS
+    max_tile_m = max(96, _align_up(max(1, m) * 2, 16))
+    return tuple(tile_m for tile_m in HGEMM_TILE_M_OPTIONS if tile_m <= max_tile_m)
+
+
+def _hgemm_split_k_options(k: Optional[int], tile_k: int) -> tuple[int, ...]:
+    if k is None:
+        return HGEMM_BASE_SPLIT_K_OPTIONS
+    options = set()
+    for split_k in range(1, HGEMM_MAX_SPLIT_K + 1):
+        if k % split_k != 0 or (k // split_k) % tile_k != 0:
+            continue
+        if split_k in HGEMM_BASE_SPLIT_K_OPTIONS:
+            options.add(split_k)
+            continue
+        block_k_loops = k // (split_k * tile_k)
+        if (
+            HGEMM_EXTRA_BLOCK_K_LOOPS_MIN
+            <= block_k_loops
+            <= HGEMM_EXTRA_BLOCK_K_LOOPS_MAX
+        ):
+            options.add(split_k)
+    return tuple(sorted(options))
 
 
 def _estimate_hgemm_lds_bytes(
@@ -514,53 +566,54 @@ def get_flydsl_splitk_hgemm_kernels(
         raise ValueError(
             "m, n, k must be provided together when requesting shape-aware kernels"
         )
-    tile_ns = [64, 128, 256]
-    tile_ks = [64, 128]
-    tile_ms = [16, 32, 48, 64, 96, 128]
-    split_ks = [1, 2, 4, 8, 16]
     b_preshuffles = [False, True]
-
-    for tile_m, tile_n, tile_k, split_k, b_preshuffle, variant in product(
+    tile_ms = _hgemm_tile_m_options(m)
+    for tile_m, tile_n, tile_k, b_preshuffle, variant in product(
         tile_ms,
-        tile_ns,
-        tile_ks,
-        split_ks,
+        HGEMM_TILE_N_OPTIONS,
+        HGEMM_TILE_K_OPTIONS,
         b_preshuffles,
         KERNEL_CONFIG_VARIANTS,
     ):
-        config = _normalize_registry_config(
-            dtype=dtype,
-            stage=FIXED_STAGE,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            split_k=split_k,
-            block_m_warps=variant["block_m_warps"],
-            block_n_warps=variant["block_n_warps"],
-            b_to_lds=variant["b_to_lds"],
-            b_preshuffle=b_preshuffle,
-        )
-        if config is None:
+        if n is not None and (n < tile_n or n % tile_n != 0):
             continue
-        config["dtype"] = dtype
-        config["out_dtype"] = out_dtype
-        config["target_gfx"] = get_gfx()
-        name = flydsl_kernel_name(
-            config["stage"],
-            dtype,
-            out_dtype,
-            config["tile_m"],
-            config["tile_n"],
-            config["tile_k"],
-            config["split_k"],
-            config["block_m_warps"],
-            config["block_n_warps"],
-            config["async_copy"],
-            config["b_to_lds"],
-            config["b_preshuffle"],
-            config["c_to_lds"],
-        )
-        kernels[name] = config
+        split_k_options = _hgemm_split_k_options(k, tile_k)
+        if not split_k_options:
+            continue
+        for split_k in split_k_options:
+            config = _normalize_registry_config(
+                dtype=dtype,
+                stage=FIXED_STAGE,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                split_k=split_k,
+                block_m_warps=variant["block_m_warps"],
+                block_n_warps=variant["block_n_warps"],
+                b_to_lds=variant["b_to_lds"],
+                b_preshuffle=b_preshuffle,
+            )
+            if config is None:
+                continue
+            config["dtype"] = dtype
+            config["out_dtype"] = out_dtype
+            config["target_gfx"] = get_gfx()
+            name = flydsl_kernel_name(
+                config["stage"],
+                dtype,
+                out_dtype,
+                config["tile_m"],
+                config["tile_n"],
+                config["tile_k"],
+                config["split_k"],
+                config["block_m_warps"],
+                config["block_n_warps"],
+                config["async_copy"],
+                config["b_to_lds"],
+                config["b_preshuffle"],
+                config["c_to_lds"],
+            )
+            kernels[name] = config
     if m is not None and n is not None and k is not None:
         for config in (
             iter_small_m_registry_configs(

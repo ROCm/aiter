@@ -38,8 +38,6 @@ schedule than the generic HGEMM kernel.
 from __future__ import annotations
 
 import functools
-import os
-from itertools import product
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -77,57 +75,34 @@ DTYPE_BYTES = 2
 LDG_VEC_SIZE = 8
 MAX_LDS_BYTES = 163840
 
-# Default to a compact search space so offline tuning remains tractable.
-# Set `AITER_FLYDSL_SMALL_M_SEARCH_SPACE=exhaustive` to recover the wider
-# catalog used for deeper one-off searches.
-SMALL_M_SEARCH_SPACE = (
-    os.getenv("AITER_FLYDSL_SMALL_M_SEARCH_SPACE", "compact").strip().lower()
+# Expand the original small-M catalog with the additional cases that proved
+# useful during the deeper exhaustive search, instead of maintaining separate
+# compact/exhaustive modes.
+SMALL_M_TILE_K_OPTIONS = (32, 64, 96, 128, 160, 192, 256)
+SMALL_M_MAX_SPLIT_K = 32
+SMALL_M_TILE_N_OPTIONS = (
+    32,
+    64,
+    96,
+    128,
+    160,
+    192,
+    224,
+    256,
+    384,
+    512,
+    768,
+    1024,
 )
-if SMALL_M_SEARCH_SPACE not in {"compact", "exhaustive"}:
-    raise ValueError(
-        "Unsupported AITER_FLYDSL_SMALL_M_SEARCH_SPACE="
-        f"{SMALL_M_SEARCH_SPACE!r}; expected 'compact' or 'exhaustive'"
-    )
-
-if SMALL_M_SEARCH_SPACE == "exhaustive":
-    SMALL_M_TILE_K_OPTIONS = [32, 64, 96, 128, 160, 192, 256]
-    SMALL_M_TILE_N_OPTIONS = [
-        32,
-        64,
-        96,
-        128,
-        160,
-        192,
-        224,
-        256,
-        384,
-        512,
-        768,
-        1024,
-    ]
-    SMALL_M_SPLIT_K_OPTIONS = [1, 2, 4, 8, 16, 32]
-    SMALL_M_NON_B_TO_LDS_WAVES_PER_EU_OPTIONS = [0, 2, 4]
-    SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS = [0, 2, 4]
-    SMALL_M_B_TO_LDS_UNROLL_OPTIONS = [0, 8, 16]
-    SMALL_M_N_TILE_REPEAT_OPTIONS = [1, 2, 4]
-    SMALL_M_PERSISTENT_N_TILE_OPTIONS = [2, 4, 8]
-    SMALL_M_BASE_BLOCK_N_WARPS = (1, 2, 3, 4)
-    SMALL_M_REPEAT_BLOCK_N_WARPS = (1, 2)
-    SMALL_M_B_TO_LDS_BLOCK_N_WARPS = (1, 2, 3, 4)
-    SMALL_M_PERSISTENT_BLOCK_N_WARPS = (2, 3, 4)
-else:
-    SMALL_M_TILE_K_OPTIONS = [64, 128, 256]
-    SMALL_M_TILE_N_OPTIONS = [64, 128, 192, 256, 512, 1024]
-    SMALL_M_SPLIT_K_OPTIONS = [1, 2, 4, 8, 16]
-    SMALL_M_NON_B_TO_LDS_WAVES_PER_EU_OPTIONS = [0]
-    SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS = [0, 2, 4]
-    SMALL_M_B_TO_LDS_UNROLL_OPTIONS = [8, 16]
-    SMALL_M_N_TILE_REPEAT_OPTIONS = [1, 2]
-    SMALL_M_PERSISTENT_N_TILE_OPTIONS = [2, 4]
-    SMALL_M_BASE_BLOCK_N_WARPS = (1, 2, 4)
-    SMALL_M_REPEAT_BLOCK_N_WARPS = (1, 2)
-    SMALL_M_B_TO_LDS_BLOCK_N_WARPS = (1, 2, 4)
-    SMALL_M_PERSISTENT_BLOCK_N_WARPS = (2, 4)
+SMALL_M_NON_B_TO_LDS_WAVES_PER_EU_OPTIONS = (0, 2, 4)
+SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS = (0, 2, 4)
+SMALL_M_B_TO_LDS_UNROLL_OPTIONS = (0, 8, 16)
+SMALL_M_N_TILE_REPEAT_OPTIONS = (1, 2, 4)
+SMALL_M_PERSISTENT_N_TILE_OPTIONS = (2, 4, 8)
+SMALL_M_BASE_BLOCK_N_WARPS = (1, 2, 3, 4)
+SMALL_M_REPEAT_BLOCK_N_WARPS = (1, 2)
+SMALL_M_B_TO_LDS_BLOCK_N_WARPS = (1, 2, 3, 4)
+SMALL_M_PERSISTENT_BLOCK_N_WARPS = (2, 3, 4)
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -136,6 +111,25 @@ def _ceil_div(x: int, y: int) -> int:
 
 def _align_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
+
+
+def _small_m_tile_k_options(k: int) -> tuple[int, ...]:
+    return tuple(
+        tile_k
+        for tile_k in SMALL_M_TILE_K_OPTIONS
+        if any(
+            k % split_k == 0 and (k // split_k) % tile_k == 0
+            for split_k in range(1, SMALL_M_MAX_SPLIT_K + 1)
+        )
+    )
+
+
+def _small_m_split_k_options(k: int, tile_k: int) -> tuple[int, ...]:
+    return tuple(
+        split_k
+        for split_k in range(1, SMALL_M_MAX_SPLIT_K + 1)
+        if k % split_k == 0 and (k // split_k) % tile_k == 0
+    )
 
 
 def small_m_kernel_name(
@@ -319,55 +313,56 @@ def iter_small_m_registry_configs(
         return
 
     seen_configs = set()
-    for tile_n, tile_k, split_k in product(
-        SMALL_M_TILE_N_OPTIONS,
-        SMALL_M_TILE_K_OPTIONS,
-        SMALL_M_SPLIT_K_OPTIONS,
-    ):
-        for variant in _small_m_registry_variants():
-            config = {
-                "kernel_family": "small_m",
-                "stage": STAGES,
-                "tile_m": TILE_M,
-                "tile_n": tile_n,
-                "tile_k": tile_k,
-                "split_k": split_k,
-                "block_m_warps": BLOCK_M_WARPS,
-                "block_n_warps": variant["block_n_warps"],
-                "n_tile_repeat": variant["n_tile_repeat"],
-                "persistent_n_tiles": variant["persistent_n_tiles"],
-                "waves_per_eu": variant["waves_per_eu"],
-                "b_to_lds_unroll": variant["b_to_lds_unroll"],
-                "async_copy": True,
-                "b_to_lds": variant["b_to_lds"],
-                "b_preshuffle": False,
-                "c_to_lds": False,
-                "dtype": dtype,
-                "out_dtype": out_dtype,
-                "target_gfx": get_gfx(),
-            }
-            try:
-                _validate_small_m_registry_config(
-                    m,
-                    n,
-                    k,
-                    tile_n=config["tile_n"],
-                    tile_k=config["tile_k"],
-                    split_k=config["split_k"],
-                    block_n_warps=config["block_n_warps"],
-                    n_tile_repeat=config["n_tile_repeat"],
-                    persistent_n_tiles=config["persistent_n_tiles"],
-                    waves_per_eu=config["waves_per_eu"],
-                    b_to_lds_unroll=config["b_to_lds_unroll"],
-                    b_to_lds=config["b_to_lds"],
-                )
-            except ValueError:
+    for tile_n in SMALL_M_TILE_N_OPTIONS:
+        for tile_k in _small_m_tile_k_options(k):
+            split_k_options = _small_m_split_k_options(k, tile_k)
+            if not split_k_options:
                 continue
-            config_key = tuple(sorted(config.items()))
-            if config_key in seen_configs:
-                continue
-            seen_configs.add(config_key)
-            yield config
+            for split_k in split_k_options:
+                for variant in _small_m_registry_variants():
+                    config = {
+                        "kernel_family": "small_m",
+                        "stage": STAGES,
+                        "tile_m": TILE_M,
+                        "tile_n": tile_n,
+                        "tile_k": tile_k,
+                        "split_k": split_k,
+                        "block_m_warps": BLOCK_M_WARPS,
+                        "block_n_warps": variant["block_n_warps"],
+                        "n_tile_repeat": variant["n_tile_repeat"],
+                        "persistent_n_tiles": variant["persistent_n_tiles"],
+                        "waves_per_eu": variant["waves_per_eu"],
+                        "b_to_lds_unroll": variant["b_to_lds_unroll"],
+                        "async_copy": True,
+                        "b_to_lds": variant["b_to_lds"],
+                        "b_preshuffle": False,
+                        "c_to_lds": False,
+                        "dtype": dtype,
+                        "out_dtype": out_dtype,
+                        "target_gfx": get_gfx(),
+                    }
+                    try:
+                        _validate_small_m_registry_config(
+                            m,
+                            n,
+                            k,
+                            tile_n=config["tile_n"],
+                            tile_k=config["tile_k"],
+                            split_k=config["split_k"],
+                            block_n_warps=config["block_n_warps"],
+                            n_tile_repeat=config["n_tile_repeat"],
+                            persistent_n_tiles=config["persistent_n_tiles"],
+                            waves_per_eu=config["waves_per_eu"],
+                            b_to_lds_unroll=config["b_to_lds_unroll"],
+                            b_to_lds=config["b_to_lds"],
+                        )
+                    except ValueError:
+                        continue
+                    config_key = tuple(sorted(config.items()))
+                    if config_key in seen_configs:
+                        continue
+                    seen_configs.add(config_key)
+                    yield config
 
 
 @functools.lru_cache(maxsize=512)
