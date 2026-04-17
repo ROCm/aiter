@@ -755,13 +755,19 @@ class AttentionProgram:
         return L, M, acc
 
     @gluon.jit
-    def load_physical_block_idx_with_mod(
+    def load_physical_block_idx_safe(
         self, j, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
     ):
         if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
-            # TDM load
+            # # TDM load
+            # physical_block_idx = gl.load(
+            #     block_tables_ptr_shifted + j_hbm_start + (j % max_num_tiles_this_seg)
+            # )
+            # TDM load <E2><80><94> use clamp instead of mask to avoid conditional branch
+            # that prevents latency hiding=
+            safe_j = gl.minimum(j, max_num_tiles_this_seg - 1)
             physical_block_idx = gl.load(
-                block_tables_ptr_shifted + j_hbm_start + (j % max_num_tiles_this_seg)
+                block_tables_ptr_shifted + j_hbm_start + safe_j
             )
         else:
             # TDM gather
@@ -1615,7 +1621,7 @@ def _unified_attention_gluon_kernel_3d(
     j_hbm, physical_block_idx = pgm.load_physical_block_idx(
         j_hbm, block_tables_ptr_shifted, j_hbm_start
     )
-    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+    j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
         j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
     )
     pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
@@ -1625,7 +1631,7 @@ def _unified_attention_gluon_kernel_3d(
     for j in range(pgm.tile_start, pgm.tile_end - 1):
         # physical_block_idx = physical_block_idx + 1 # no-paging expt
         physical_block_idx = next_physical_block_idx
-        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_with_mod(
+        j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(
             j_hbm, block_tables_ptr_shifted, j_hbm_start, max_num_tiles_this_seg
         )
         k = pgm.tdm_shared_load_k(wait_count=1, buffer_id=buffer_id)
