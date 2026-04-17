@@ -93,6 +93,8 @@ class AiterCommunicator:
                     "[AiterCommunicator] probe preamble OK workspace=%s",
                     type(workspace).__name__,
                 )
+                workspace = self._shmem.ccl.all_reduce(probe, probe, workspace=workspace)
+                logger.critical("[AiterCommunicator] probe all_reduce OK")
                 del probe, workspace
             except Exception as e:
                 logger.critical("[AiterCommunicator] probe FAILED: %s", e)
