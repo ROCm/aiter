@@ -13,7 +13,7 @@ import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
 
-_SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
+_SUFFIX_RE = re.compile(r"(?P<fp4>_fp4|_fq)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
 
 
 def flydsl_kernel_name(

@@ -955,7 +955,8 @@ def get_2stage_cfgs(
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
-        _s1_fq = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
+        _s1_suffix = kernelName1.split("_t")[-1] if is_flydsl1 else ""
+        _s1_fq = is_flydsl1 and ("_fp4" in _s1_suffix or "_fq" in _s1_suffix)
         if is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
