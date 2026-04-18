@@ -1527,7 +1527,7 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 
 @gluon.jit
 def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
-    MERGE_LOOP_TDM_WAITS: gl.constexpr = True
+    MERGE_LOOP_TDM_WAITS: gl.constexpr = (cfg.NUM_BUFFERS == 3)
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
     # Buffer rotation: buf_0 = i%N, buf_1 = (i+1)%N, buf_2 = (i+2)%N
     # Tile m uses buffer m%N for both K and V.
@@ -1564,7 +1564,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
 
     # QK_t0
     # TODO: this should be done only if kv len < tile size
-    if pgm.tile_start >= pgm.safe_tile_end:
+    if True or pgm.tile_start >= pgm.safe_tile_end:
         S = pgm.compute_qk(k)
         S = pgm.apply_mask_qk(S, pgm.tile_start)
     else:
@@ -1584,22 +1584,17 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         t_3 = j + 3
         if MERGE_LOOP_TDM_WAITS:
             gl.amd.gfx1250.tdm.async_wait(1) # merged
+
+        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
         kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_0 if cfg.NUM_BUFFERS == 3 else buf_1)
-        #if cfg.NUM_BUFFERS == 3 and MERGE_LOOP_TDM_WAITS:
-        #    kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
 
+        if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
+            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         next4_physical_block_idx = kv_loader.load_block_ids(t_3 + 1)
-
         # QK for tile (i+1)
         S = pgm.compute_qk(k)
         # SM1(prev) + LR_V(tile i) + GLDS_K(tile i+3)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-
-        v = kv_loader.load_v_from_shared(wait_count=3, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
-        #if cfg.NUM_BUFFERS == 2 or not MERGE_LOOP_TDM_WAITS:
-        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
-
-
         # PV
         acc = pgm.compute_pv(p, v, acc)
 
@@ -1607,8 +1602,9 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
         #gl.amd.gfx1250.tdm.async_wait(2)
-        k = kv_loader.load_k_from_shared(wait_count=3, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
-
+        k = kv_loader.load_k_from_shared(wait_count=3 if (MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3) else 2, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
+        if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2: 
+            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         next2_physical_block_idx = next3_physical_block_idx
         next3_physical_block_idx = next4_physical_block_idx
         if cfg.NUM_BUFFERS == 3:
@@ -1628,7 +1624,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         epilogue_t_2 = pgm.tile_end - 2
         epilogue_t_3 = pgm.tile_end - 1
         # SM1(prev) + LR_V(tile L) + PV(tile L)
-        if epilogue_t_2 >= pgm.safe_tile_end:
+        if True or epilogue_t_2 >= pgm.safe_tile_end:
             S = pgm.compute_qk(k)
             S = pgm.apply_mask_qk(S, epilogue_t_2)
         else:
