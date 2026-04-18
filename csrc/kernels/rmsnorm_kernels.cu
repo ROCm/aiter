@@ -14,18 +14,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-
-#include "dispatch_utils.h"
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
-
-using __nv_bfloat16 = __hip_bfloat16;
-using __nv_bfloat162 = __hip_bfloat162;
+#include <type_traits>
 
 namespace vllm
 {
@@ -35,42 +32,104 @@ namespace vllm
   {
     scalar_t x, y, z, w, u, v, s, t;
 
-    __device__ vec8_t() : x(0), y(0), z(0), w(0), u(0), v(0), s(0), t(0) {}
+    __device__ static inline float to_float(scalar_t value)
+    {
+      if constexpr (std::is_same_v<scalar_t, __half>)
+      {
+        return __half2float(value);
+      }
+      else if constexpr (std::is_same_v<scalar_t, hip_bfloat16>)
+      {
+        return static_cast<float>(value);
+      }
+      else
+      {
+        return static_cast<float>(value);
+      }
+    }
+
+    __device__ static inline scalar_t from_float(float value)
+    {
+      if constexpr (std::is_same_v<scalar_t, __half>)
+      {
+        return __float2half_rn(value);
+      }
+      else if constexpr (std::is_same_v<scalar_t, hip_bfloat16>)
+      {
+        return hip_bfloat16(value);
+      }
+      else
+      {
+        return static_cast<scalar_t>(value);
+      }
+    }
+
+    __device__ static inline scalar_t mul_elem(scalar_t lhs, scalar_t rhs)
+    {
+      return from_float(to_float(lhs) * to_float(rhs));
+    }
+
+    __device__ static inline scalar_t add_elem(scalar_t lhs, scalar_t rhs)
+    {
+      return from_float(to_float(lhs) + to_float(rhs));
+    }
+
+    __device__ vec8_t()
+        : x(from_float(0.0f)),
+          y(from_float(0.0f)),
+          z(from_float(0.0f)),
+          w(from_float(0.0f)),
+          u(from_float(0.0f)),
+          v(from_float(0.0f)),
+          s(from_float(0.0f)),
+          t(from_float(0.0f))
+    {
+    }
     __device__ vec8_t(scalar_t x, scalar_t y, scalar_t z, scalar_t w, scalar_t u,
                       scalar_t v, scalar_t s, scalar_t t)
         : x(x), y(y), z(z), w(w), u(u), v(v), s(s), t(t) {}
 
     __device__ vec8_t operator*(const vec8_t &other) const
     {
-      return vec8_t(x * other.x, y * other.y, z * other.z, w * other.w,
-                    u * other.u, v * other.v, s * other.s, t * other.t);
+      return vec8_t(mul_elem(x, other.x), mul_elem(y, other.y),
+                    mul_elem(z, other.z), mul_elem(w, other.w),
+                    mul_elem(u, other.u), mul_elem(v, other.v),
+                    mul_elem(s, other.s), mul_elem(t, other.t));
     }
 
     __device__ vec8_t operator*(const float &scale) const
     {
-      return vec8_t(x * scale, y * scale, z * scale, w * scale, u * scale,
-                    v * scale, s * scale, t * scale);
+      return vec8_t(from_float(to_float(x) * scale), from_float(to_float(y) * scale),
+                    from_float(to_float(z) * scale), from_float(to_float(w) * scale),
+                    from_float(to_float(u) * scale), from_float(to_float(v) * scale),
+                    from_float(to_float(s) * scale), from_float(to_float(t) * scale));
     }
 
     __device__ vec8_t operator+(const vec8_t &other) const
     {
-      return vec8_t(x + other.x, y + other.y, z + other.z, w + other.w,
-                    u + other.u, v + other.v, s + other.s, t + other.t);
+      return vec8_t(add_elem(x, other.x), add_elem(y, other.y),
+                    add_elem(z, other.z), add_elem(w, other.w),
+                    add_elem(u, other.u), add_elem(v, other.v),
+                    add_elem(s, other.s), add_elem(t, other.t));
     }
 
     __device__ void operator+=(const vec8_t &other)
     {
-      x += other.x;
-      y += other.y;
-      z += other.z;
-      w += other.w;
-      u += other.u;
-      v += other.v;
-      s += other.s;
-      t += other.t;
+      x = add_elem(x, other.x);
+      y = add_elem(y, other.y);
+      z = add_elem(z, other.z);
+      w = add_elem(w, other.w);
+      u = add_elem(u, other.u);
+      v = add_elem(v, other.v);
+      s = add_elem(s, other.s);
+      t = add_elem(t, other.t);
     }
 
-    __device__ scalar_t sum() const { return x + y + z + w + u + v + s + t; }
+    __device__ float sum() const
+    {
+      return to_float(x) + to_float(y) + to_float(z) + to_float(w) +
+             to_float(u) + to_float(v) + to_float(s) + to_float(t);
+    }
   };
 
   // TODO(woosuk): Further optimize this kernel.
@@ -83,7 +142,7 @@ namespace vllm
   {
     __shared__ float s_variance;
 
-    vec8_t<scalar_t> v8_variance = {0, 0, 0, 0, 0, 0, 0, 0};
+    vec8_t<scalar_t> v8_variance;
 
     vec8_t<scalar_t> *vectorized_out = reinterpret_cast<vec8_t<scalar_t> *>(out);
     vec8_t<scalar_t> const *vectorized_in =
@@ -171,7 +230,7 @@ namespace vllm
 #if defined(USE_ROCM) || (defined(CUDA_VERSION) && (CUDA_VERSION >= 12000))
   // CUDA < 12.0 runs into issues with packed type conversion
   template <>
-  struct _typeConvert<c10::Half>
+  struct _typeConvert<__half>
   {
     static constexpr bool exists = true;
     using hip_type = __half;
@@ -196,11 +255,11 @@ namespace vllm
   // CUDA_ARCH < 800 does not have BF16 support
   // TODO: Add in ROCm support once public headers handle bf16 maturely
   template <>
-  struct _typeConvert<c10::BFloat16>
+  struct _typeConvert<hip_bfloat16>
   {
     static constexpr bool exists = true;
-    using hip_type = __nv_bfloat16;
-    using packed_hip_type = __nv_bfloat162;
+    using hip_type = __hip_bfloat16;
+    using packed_hip_type = __hip_bfloat162;
 
     __device__ static inline float convert(hip_type x)
     {
@@ -554,9 +613,9 @@ namespace vllm
 
 } // namespace vllm
 
-void rms_norm(torch::Tensor &out,    // [..., hidden_size]
-              torch::Tensor &input,  // [..., hidden_size]
-              torch::Tensor &weight, // [hidden_size]
+void rms_norm(const aiter_tensor_t &out,    // [..., hidden_size]
+              const aiter_tensor_t &input,  // [..., hidden_size]
+              const aiter_tensor_t &weight, // [hidden_size]
               double epsilon)
 {
   int hidden_size = input.size(-1);
@@ -564,12 +623,12 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
 
   dim3 grid(num_tokens);
   dim3 block(std::min(hidden_size, 1024));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
-  VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "rms_norm_kernel", [&]
+  HipDeviceGuard device_guard(input.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
+  AITER_DISPATCH_FLOATING(input.dtype(), "rms_norm_kernel", [&]
                                { vllm::rms_norm_kernel<scalar_t><<<grid, block, 0, stream>>>(
-                                     out.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(),
-                                     weight.data_ptr<scalar_t>(), epsilon, num_tokens, hidden_size); });
+                                     reinterpret_cast<scalar_t*>(out.data_ptr()), reinterpret_cast<scalar_t*>(input.data_ptr()),
+                                     reinterpret_cast<scalar_t*>(weight.data_ptr()), epsilon, num_tokens, hidden_size); });
 }
 
 // void scaled_rms_norm(torch::Tensor& out,     // [..., hidden_size]
@@ -593,16 +652,16 @@ void rms_norm(torch::Tensor &out,    // [..., hidden_size]
 // }
 
 #define LAUNCH_FUSED_ADD_RMS_NORM(width)                                                                                             \
-  VLLM_DISPATCH_FLOATING_TYPES(                                                                                                      \
-      input.scalar_type(), "fused_add_rms_norm_kernel", [&] { vllm::fused_add_rms_norm_kernel<scalar_t, width>                       \
-                                                                  <<<grid, block, 0, stream>>>(input.data_ptr<scalar_t>(),           \
-                                                                                               residual.data_ptr<scalar_t>(),        \
-                                                                                               weight.data_ptr<scalar_t>(), epsilon, \
+  AITER_DISPATCH_FLOATING(                                                                                                           \
+      input.dtype(), "fused_add_rms_norm_kernel", [&] { vllm::fused_add_rms_norm_kernel<scalar_t, width>                            \
+                                                                  <<<grid, block, 0, stream>>>(reinterpret_cast<scalar_t*>(input.data_ptr()),           \
+                                                                                               reinterpret_cast<scalar_t*>(residual.data_ptr()),        \
+                                                                                               reinterpret_cast<scalar_t*>(weight.data_ptr()), epsilon, \
                                                                                                num_tokens, hidden_size); });
 
-void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
-                        torch::Tensor &residual, // [..., hidden_size]
-                        torch::Tensor &weight,   // [hidden_size]
+void fused_add_rms_norm(const aiter_tensor_t &input,    // [..., hidden_size]
+                        const aiter_tensor_t &residual, // [..., hidden_size]
+                        const aiter_tensor_t &weight,   // [hidden_size]
                         double epsilon)
 {
   int hidden_size = input.size(-1);
@@ -615,8 +674,8 @@ void fused_add_rms_norm(torch::Tensor &input,    // [..., hidden_size]
      hiding on global mem ops. */
   const int max_block_size = (num_tokens < 256) ? 1024 : 256;
   dim3 block(std::min(hidden_size, max_block_size));
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  HipDeviceGuard device_guard(input.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
   /*If the tensor types are FP16/BF16, try to use the optimized kernel
     with packed + vectorized ops.
     Max optimization is achieved with a width-8 vector of FP16/BF16s

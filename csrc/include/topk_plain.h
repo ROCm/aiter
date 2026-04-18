@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_enum.h"
-#include <torch/extension.h>
+#include "aiter_tensor.h"
 
-void topk_plain(torch::Tensor& values,
-                torch::Tensor& topk_ids,
-                torch::Tensor& topk_out,
+void topk_plain(const aiter_tensor_t& values,
+                const aiter_tensor_t& topk_ids,
+                const aiter_tensor_t& topk_out,
                 int topk,
                 bool largest = true,
-                torch::Tensor rowStarts = torch::Tensor(),
-                torch::Tensor rowEnds = torch::Tensor(),
+                const aiter_tensor_t* rowStarts = nullptr,
+                const aiter_tensor_t* rowEnds = nullptr,
                 int64_t stride0 = -1,
                 int64_t stride1 = 1);

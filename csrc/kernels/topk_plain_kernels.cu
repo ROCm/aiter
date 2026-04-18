@@ -31,15 +31,15 @@
 // See detailed examples and explanations inline with each strategy class.
 // ============================================================================
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
+#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 
 #include <hip/hip_runtime.h>
 #include <hipcub/hipcub.hpp>
 #include <hipcub/util_type.hpp>
 
-#include "dispatch_utils.h"
 #include "opus/opus.hpp"
 #include "py_itfs_common.h"
 #include "quick_all_reduce_base.h"
@@ -2495,13 +2495,14 @@ void topk_per_row_kernel_launcher(const float* in,
 
     int64_t workspace_size = invokeComputeTopkLastDimWorkspaceSize<float>(batch_size, stride0);
 
-    auto options            = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
-    torch::Tensor workspace = torch::empty({workspace_size}, options);
+    int current_device = 0;
+    HIP_CALL(hipGetDevice(&current_device));
+    auto workspace = AiterTensor::empty({workspace_size}, AITER_DTYPE_u8, current_device);
 
     if(out)
     {
         aiter::standalone_stable_radix_11bits<float, int, true, true>(
-            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            workspace.data_ptr(),
             buf_size,
             in,
             batch_size,
@@ -2517,7 +2518,7 @@ void topk_per_row_kernel_launcher(const float* in,
     else
     {
         aiter::standalone_stable_radix_11bits<float, int, false, true>(
-            static_cast<void*>(workspace.data_ptr<uint8_t>()),
+            workspace.data_ptr(),
             buf_size,
             in,
             batch_size,
@@ -2532,44 +2533,40 @@ void topk_per_row_kernel_launcher(const float* in,
     }
 }
 
-void topk_plain(torch::Tensor& values,   // [batch, len]
-                torch::Tensor& topk_ids, // [batch, k]
-                torch::Tensor& topk_out, // [batch, k]
+void topk_plain(const aiter_tensor_t& values,   // [batch, len]
+                const aiter_tensor_t& topk_ids, // [batch, k]
+                const aiter_tensor_t& topk_out, // [batch, k]
                 int topk,
                 bool largest,
-                torch::Tensor rowStarts,
-                torch::Tensor rowEnds,
+                const aiter_tensor_t* rowStarts,
+                const aiter_tensor_t* rowEnds,
                 int64_t stride0,
                 int64_t stride1)
 {
     const int32_t max_len = values.size(-1);
     const int32_t batch   = values.size(0);
 
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     // Check if we're using variable length mode
-    // Empty tensors have defined() = true but numel() = 0, so check both
     const bool use_variable_length =
-        rowStarts.defined() && rowEnds.defined() && rowStarts.numel() > 0 && rowEnds.numel() > 0;
+        rowStarts != nullptr && rowEnds != nullptr && rowStarts->numel() > 0 && rowEnds->numel() > 0;
 
     // Set default stride values if not specified
     if(stride0 < 0)
         stride0 = max_len;
 
     // Dispatch based on value tensor dtype
-    VLLM_DISPATCH_FLOATING_TYPES(values.scalar_type(), "topk_plain", [&] {
+    AITER_DISPATCH_FLOATING(values.dtype(), "topk_plain", [&] {
         using input_dtype = typename t2ck<scalar_t>::type;
         // Dispatch based on index tensor dtype
-        if(topk_ids.scalar_type() != torch::kInt32)
-        {
-            AT_ERROR("Unsupported index type for topk_ids");
-        }
+        AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32, "Unsupported index type for topk_ids");
 
         using IdxT = int32_t;
-        // Get raw pointers using the PyTorch scalar_t type, not input_dtype
-        const scalar_t* values_ptr = values.data_ptr<scalar_t>();
-        scalar_t* topk_out_ptr     = topk_out.data_ptr<scalar_t>();
-        IdxT* topk_ids_ptr         = topk_ids.data_ptr<IdxT>();
+        // Get raw pointers
+        const scalar_t* values_ptr = reinterpret_cast<const scalar_t*>(values.data_ptr());
+        scalar_t* topk_out_ptr     = reinterpret_cast<scalar_t*>(topk_out.data_ptr());
+        IdxT* topk_ids_ptr         = reinterpret_cast<IdxT*>(topk_ids.data_ptr());
 
         // Cast to input_dtype for the kernel
         const input_dtype* values_kernel_ptr = reinterpret_cast<const input_dtype*>(values_ptr);
@@ -2578,8 +2575,8 @@ void topk_plain(torch::Tensor& values,   // [batch, len]
         if(use_variable_length)
         {
             // Variable length mode: use rowStarts/rowEnds
-            const IdxT* rowStarts_ptr = rowStarts.data_ptr<IdxT>();
-            const IdxT* rowEnds_ptr   = rowEnds.data_ptr<IdxT>();
+            const IdxT* rowStarts_ptr = reinterpret_cast<const IdxT*>(rowStarts->data_ptr());
+            const IdxT* rowEnds_ptr   = reinterpret_cast<const IdxT*>(rowEnds->data_ptr());
 
             if(largest)
             {

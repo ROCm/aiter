@@ -9,7 +9,7 @@ from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_pre_gemm_sqrsum(
     out: Tensor,
     sqrsum: Tensor,
@@ -19,7 +19,7 @@ def mhc_pre_gemm_sqrsum(
 ) -> None: ...
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_pre_big_fuse(
     post_mix: Tensor,
     comb_mix: Tensor,
@@ -118,7 +118,7 @@ def mhc_pre(
     return post_mix, comb_mix, layer_input
 
 
-@compile_ops("module_mhc")
+@compile_ops("module_mhc", develop=True)
 def mhc_post(
     out: Tensor,
     x: Tensor,

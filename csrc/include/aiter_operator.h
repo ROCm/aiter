@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
+#include "aiter_tensor.h"
 
 torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other);
 torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other);
@@ -13,5 +14,5 @@ torch::Tensor aiter_mul_(torch::Tensor &input, torch::Tensor &other);
 torch::Tensor aiter_sub_(torch::Tensor &input, torch::Tensor &other);
 torch::Tensor aiter_div_(torch::Tensor &input, torch::Tensor &other);
 
-torch::Tensor aiter_sigmoid(torch::Tensor &input);
-torch::Tensor aiter_tanh(torch::Tensor &input);
+void aiter_sigmoid(const aiter_tensor_t& input, const aiter_tensor_t& output);
+void aiter_tanh(const aiter_tensor_t& input, const aiter_tensor_t& output);

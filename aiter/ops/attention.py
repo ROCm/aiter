@@ -81,7 +81,7 @@ def gen_pa_fwd_asm(
         return torch.empty_like(Q)
 
 
-@compile_ops("module_attention", gen_fake=gen_pa_fwd_native_fake)
+@compile_ops("module_attention", gen_fake=gen_pa_fwd_native_fake, develop=True)
 def pa_fwd_naive(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
@@ -652,7 +652,7 @@ direct_register_custom_op(
 MD_NAME = "module_mla_asm"
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
+@compile_ops(MD_NAME, ffi_type="ctypes", develop=True)
 def mla_decode_stage1_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -688,7 +688,7 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
+@compile_ops(MD_NAME, ffi_type="ctypes", develop=True)
 def mla_prefill_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -873,7 +873,7 @@ def get_ps_metadata_v1(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
+@compile_ops(MD_NAME, ffi_type="ctypes", develop=True)
 def mla_prefill_ps_asm_fwd(
     Q: torch.Tensor,
     K: torch.Tensor,

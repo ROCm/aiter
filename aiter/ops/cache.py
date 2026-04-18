@@ -9,17 +9,17 @@ from ..jit.core import compile_ops
 MD_NAME = "module_cache"
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def copy_blocks(
     key_caches: Tensor, value_caches: Tensor, block_mapping: Tensor
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -33,7 +33,7 @@ def reshape_and_cache(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_flash(
     key: Tensor,
     value: Tensor,
@@ -46,7 +46,7 @@ def reshape_and_cache_flash(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_with_pertoken_quant(
     key: Tensor,
     value: Tensor,
@@ -59,7 +59,7 @@ def reshape_and_cache_with_pertoken_quant(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_with_block_quant(
     key: Tensor,
     value: Tensor,
@@ -72,7 +72,7 @@ def reshape_and_cache_with_block_quant(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_with_block_quant_for_asm_pa(
     key: Tensor,  # [batch_size, seq_len, num_heads, head_size]
     value: Tensor,  # [batch_size, seq_len, num_heads, head_size]
@@ -86,7 +86,7 @@ def reshape_and_cache_with_block_quant_for_asm_pa(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def concat_and_cache_mla(
     kv_c: Tensor,
     k_pe: Tensor,
@@ -97,7 +97,7 @@ def concat_and_cache_mla(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def indexer_k_quant_and_cache(
     k: Tensor,
     kv_cache: Tensor,
@@ -107,7 +107,7 @@ def indexer_k_quant_and_cache(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def cp_gather_indexer_k_quant_cache(
     kv_cache: Tensor,
     dst_k: Tensor,
@@ -117,7 +117,7 @@ def cp_gather_indexer_k_quant_cache(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def fused_qk_rope_concat_and_cache_mla(
     q_nope: Tensor,
     q_pe: Tensor,  # [num_tokens, num_heads, pe_dim]

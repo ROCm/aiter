@@ -2,6 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -101,9 +102,12 @@ namespace py = pybind11;
     m.def("mul_", &aiter_mul_, "apply for mul_ with transpose and broadcast."); \
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
     m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
-#define AITER_UNARY_PYBIND                                  \
-    m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
-    m.def("tanh", &aiter_tanh, "apply for tanh.");
+#define AITER_UNARY_PYBIND                                            \
+    AITER_SET_STREAM_PYBIND                                           \
+    m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid.",            \
+          py::arg("input"), py::arg("output"));                       \
+    m.def("tanh", &aiter_tanh, "apply for tanh.",                     \
+          py::arg("input"), py::arg("output"));
 
 #define ATTENTION_ASM_PYBIND                        \
     m.def("pa_fwd_asm",                             \
@@ -167,9 +171,11 @@ namespace py = pybind11;
           py::arg("out_") = std::nullopt);
 
 #define ATTENTION_PYBIND                                          \
+    AITER_SET_STREAM_PYBIND                                       \
     m.def("paged_attention_rocm", &paged_attention);
 
 #define ATTENTION_RAGGED_PYBIND                                   \
+    AITER_SET_STREAM_PYBIND                                       \
     m.def("paged_attention_ragged",                               \
           &paged_attention_ragged,                                \
           "paged_attention_ragged(Tensor! out, Tensor exp_sums,"  \
@@ -184,6 +190,7 @@ namespace py = pybind11;
           "                float k_scale, float v_scale) -> ()");
 
 #define ATTENTION_V1_PYBIND                                       \
+    AITER_SET_STREAM_PYBIND                                       \
     m.def("paged_attention_v1",                                   \
           &paged_attention_v1,                                    \
           "paged_attention_v1(Tensor! out, Tensor exp_sums,"      \
@@ -243,6 +250,7 @@ namespace py = pybind11;
           py::arg("w_scale") = std::nullopt);
 
 #define CACHE_PYBIND                                                                \
+    AITER_SET_STREAM_PYBIND                                                         \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
           "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");      \
@@ -1113,6 +1121,7 @@ namespace py = pybind11;
           py::arg("gen")               = std::nullopt);
 
 #define MOE_OP_PYBIND                                                          \
+    AITER_SET_STREAM_PYBIND                                                    \
     m.def("topk_softmax",                                                      \
           &aiter::topk_softmax,                                                \
           py::arg("topk_weights"),                                             \
@@ -1164,6 +1173,7 @@ namespace py = pybind11;
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_TOPK_PYBIND             \
+    AITER_SET_STREAM_PYBIND         \
     m.def("topk_sigmoid",           \
           &aiter::topk_sigmoid,     \
           py::arg("topk_weights"),  \
@@ -1265,10 +1275,12 @@ namespace py = pybind11;
           py::arg("x_bias") = std::nullopt);
 
 #define POS_ENCODING_PYBIND                                               \
+    AITER_SET_STREAM_PYBIND                                               \
     m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding"); \
     m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
 
 #define QUANT_PYBIND                                                     \
+    AITER_SET_STREAM_PYBIND                                              \
     m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);   \
     m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant); \
     m.def("dynamic_per_token_scaled_quant",                              \
@@ -1348,12 +1360,14 @@ namespace py = pybind11;
           py::arg("num_rows"));
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
+    AITER_SET_STREAM_PYBIND                                                                \
     m.def("init_custom_qr",                                                                \
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
           py::arg("world_size"),                                                           \
           py::arg("qr_max_size") = std::nullopt);                                          \
     m.def("qr_destroy", &aiter::qr_destroy, "qr_destroy(int fa) -> ()", py::arg("fa"));    \
+    m.def("qr_handle_nbytes", &aiter::qr_handle_nbytes, "qr_handle_nbytes() -> int");      \
     m.def("qr_all_reduce",                                                                 \
           &aiter::qr_all_reduce,                                                           \
           "qr_all_reduce(int fa, Tensor inp, Tensor out,"                                  \
@@ -1363,15 +1377,22 @@ namespace py = pybind11;
           py::arg("out"),                                                                  \
           py::arg("quant_level"),                                                          \
           py::arg("cast_bf2half") = false);                                                \
-    m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
+    m.def("qr_get_handle",                                                                  \
+          &aiter::qr_get_handle,                                                            \
+          "qr_get_handle(int fa, int out_ptr, int out_nbytes) -> ()",                      \
+          py::arg("fa"),                                                                    \
+          py::arg("out_ptr"),                                                               \
+          py::arg("out_nbytes"));                                                           \
     m.def("qr_open_handles",                                                               \
           &aiter::qr_open_handles,                                                         \
-          "qr_open_handles(int fa, Tensor[] handles)",                                     \
+          "qr_open_handles(int fa, int[] handle_ptrs, int handle_nbytes)",                 \
           py::arg("fa"),                                                                   \
-          py::arg("handles"));                                                             \
+          py::arg("handle_ptrs"),                                                          \
+          py::arg("handle_nbytes"));                                                       \
     m.def("qr_max_size", &aiter::qr_max_size);
 
 #define RMSNORM_PYBIND                                                                             \
+    AITER_SET_STREAM_PYBIND                                                                        \
     m.def("rms_norm_cu",                                                                           \
           &rms_norm,                                                                               \
           "Apply Root Mean Square (RMS) Normalization to the input tensor.");                      \
@@ -1432,23 +1453,25 @@ namespace py = pybind11;
           py::arg("epsilon"),                                                                      \
           py::arg("use_model_sensitive_rmsnorm") = 0);
 
-#define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
-#define ROPE_2C_UNCACHED_FWD_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
-#define ROPE_1C_CACHED_FWD_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
-#define ROPE_2C_CACHED_FWD_PYBIND m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
-#define ROPE_1C_THD_FWD_PYBIND m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
-#define ROPE_1C_2D_FWD_PYBIND m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
+#define ROPE_1C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
+#define ROPE_2C_UNCACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);
+#define ROPE_1C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
+#define ROPE_2C_CACHED_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);
+#define ROPE_1C_THD_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
+#define ROPE_1C_2D_FWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
 
-#define ROPE_1C_UNCACHED_BWD_PYBIND m.def("rope_bwd_impl", &rope_bwd_impl);
-#define ROPE_2C_UNCACHED_BWD_PYBIND m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
-#define ROPE_1C_CACHED_BWD_PYBIND m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
-#define ROPE_2C_CACHED_BWD_PYBIND m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
-#define ROPE_1C_THD_BWD_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
-#define ROPE_1C_2D_BWD_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+#define ROPE_1C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_bwd_impl", &rope_bwd_impl);
+#define ROPE_2C_UNCACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);
+#define ROPE_1C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
+#define ROPE_2C_CACHED_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);
+#define ROPE_1C_THD_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
+#define ROPE_1C_2D_BWD_PYBIND AITER_SET_STREAM_PYBIND m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
 #define ROPE_1C_CACHED_POSITIONS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND                 \
     m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl)
 #define ROPE_2C_CACHED_POSITIONS_FWD_PYBIND    \
+    AITER_SET_STREAM_PYBIND                    \
     m.def("rope_cached_positions_2c_fwd_impl", \
           &rope_cached_positions_2c_fwd_impl,  \
           py::arg("output_x"),                 \
@@ -1462,11 +1485,14 @@ namespace py = pybind11;
           py::arg("reuse_freqs_front_part"),   \
           py::arg("nope_first"))
 #define ROPE_1C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND                         \
     m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl)
 #define ROPE_2C_CACHED_POSITIONS_OFFSETS_FWD_PYBIND \
+    AITER_SET_STREAM_PYBIND                         \
     m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl)
 
 #define FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND               \
+    AITER_SET_STREAM_PYBIND                                 \
     m.def("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle", \
           &fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,  \
           py::arg("qkv"),                                   \
@@ -1498,6 +1524,7 @@ namespace py = pybind11;
           py::arg("rotary_dim") = 0);
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
+    AITER_SET_STREAM_PYBIND                                     \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
           &aiter::fused_qk_norm_rope_cache_quant_shuffle);      \
     m.def("fused_qk_rmsnorm",                                   \
@@ -1638,16 +1665,17 @@ namespace py = pybind11;
     m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
 #define TOP_K_PER_ROW_PYBIND       \
+    AITER_SET_STREAM_PYBIND        \
     m.def("top_k_per_row_prefill", \
           &top_k_per_row_prefill,  \
           py::arg("logits"),       \
           py::arg("rowStarts"),    \
           py::arg("rowEnds"),      \
           py::arg("indices"),      \
-          py::arg("values"),       \
           py::arg("numRows"),      \
           py::arg("stride0"),      \
-          py::arg("stride1"));     \
+          py::arg("stride1"),      \
+          py::arg("values") = std::nullopt); \
     m.def("top_k_per_row_decode",  \
           &top_k_per_row_decode,   \
           py::arg("logits"),       \
@@ -1745,6 +1773,7 @@ namespace py = pybind11;
           py::arg("final_lse") = std::nullopt);
 
 #define TOPK_PLAIN_PYBIND                         \
+    AITER_SET_STREAM_PYBIND                       \
     m.def("topk_plain",                           \
           &topk_plain,                            \
           py::arg("values"),                      \
@@ -1752,12 +1781,13 @@ namespace py = pybind11;
           py::arg("topk_out"),                    \
           py::arg("topk"),                        \
           py::arg("largest")   = true,            \
-          py::arg("rowStarts") = torch::Tensor(), \
-          py::arg("rowEnds")   = torch::Tensor(), \
+          py::arg("rowStarts") = nullptr,         \
+          py::arg("rowEnds")   = nullptr,         \
           py::arg("stride0")   = -1,              \
           py::arg("stride1")   = 1);
 
 #define RMSNORM_QUANT_PYBIND                 \
+    AITER_SET_STREAM_PYBIND                  \
     m.def("add_rmsnorm_quant",               \
           &aiter::add_rmsnorm_quant,         \
           py::arg("out"),                    \
@@ -1807,6 +1837,7 @@ namespace py = pybind11;
           "Fused Gated RMSNorm + FP8 Group Quantization");
 
 #define MHC_PYBIND                              \
+    AITER_SET_STREAM_PYBIND                     \
     m.def("mhc_pre_gemm_sqrsum",                \
           &aiter::mhc_pre_gemm_sqrsum,          \
           "mhc_pre_gemm_sqrsum",                \
@@ -1840,6 +1871,7 @@ namespace py = pybind11;
           py::arg("post_layer_mix"),            \
           py::arg("comb_res_mix"));
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
+    AITER_SET_STREAM_PYBIND                                                    \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \
           "Causal 1D convolution update with state (for inference/decoding).", \
@@ -1849,11 +1881,12 @@ namespace py = pybind11;
           py::arg("bias"),                                                     \
           py::arg("out"),                                                      \
           py::arg("use_silu"),                                                 \
-          py::arg("cache_seqlens")      = torch::Tensor(),                     \
-          py::arg("conv_state_indices") = torch::Tensor(),                     \
+          py::arg("cache_seqlens")      = nullptr,                             \
+          py::arg("conv_state_indices") = nullptr,                             \
           py::arg("pad_slot_id")        = -1);
 
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
+    AITER_SET_STREAM_PYBIND                                           \
     m.def("fused_split_gdr_update",                                   \
           &aiter::fused_split_gdr_update,                             \
           "Fused split GDR decode update (HIP, ksplit4_db backend).", \
@@ -1869,11 +1902,11 @@ namespace py = pybind11;
           py::arg("num_heads_qk"),                                    \
           py::arg("num_heads_v"),                                     \
           py::arg("head_dim"),                                        \
+          py::arg("output"),                                          \
           py::arg("softplus_beta")           = 1.0f,                  \
           py::arg("softplus_threshold")      = 20.0f,                 \
           py::arg("scale")                   = -1.0f,                 \
-          py::arg("use_qk_l2norm_in_kernel") = true,                  \
-          py::arg("output")                  = c10::nullopt);
+          py::arg("use_qk_l2norm_in_kernel") = true);
 #define MLA_HK_PYBIND                   \
     m.def("hk_mla_decode_fwd",          \
           &hk_mla_decode_fwd,           \

@@ -1,24 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_dispatch.h"
 #include <algorithm>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <stdexcept>
-#include <torch/all.h>
-
-#define AT_DISPATCH_FP8_CASE(enum_type, ...) \
-    AT_PRIVATE_CASE_TYPE_USING_HINT(enum_type, fp8_t, __VA_ARGS__)
-
-#define AITER_DISPATCH_CASE_FP8_TYPES(...)                           \
-    AT_DISPATCH_FP8_CASE(at::ScalarType::Float8_e4m3fn, __VA_ARGS__) \
-    AT_DISPATCH_FP8_CASE(at::ScalarType::Float8_e4m3fnuz, __VA_ARGS__)
-
-#define AITER_DISPATCH_FP8_TYPES(TYPE, NAME, ...) \
-    AT_DISPATCH_SWITCH(TYPE, NAME, AITER_DISPATCH_CASE_FP8_TYPES(__VA_ARGS__))
 
 #if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx942__))
 #define __HIP__MI300_MI250__
@@ -48,12 +38,12 @@ struct scalar
 {
 };
 template <>
-struct scalar<c10::Half>
+struct scalar<__half>
 {
     using type = half;
 };
 template <>
-struct scalar<c10::BFloat16>
+struct scalar<hip_bfloat16>
 {
     using type = __hip_bfloat16;
 };
@@ -63,12 +53,12 @@ struct scalar2
 {
 };
 template <>
-struct scalar2<c10::Half>
+struct scalar2<__half>
 {
     using type = __half2;
 };
 template <>
-struct scalar2<c10::BFloat16>
+struct scalar2<hip_bfloat16>
 {
     using type = __hip_bfloat162;
 };
@@ -78,13 +68,13 @@ struct fmul2_out
 {
 };
 template <>
-struct fmul2_out<c10::Half>
+struct fmul2_out<__half>
 {
     // using type = __half2;
     using type = float2;
 };
 template <>
-struct fmul2_out<c10::BFloat16>
+struct fmul2_out<hip_bfloat16>
 {
     using type = float2;
     // using type = __hip_bfloat162;
@@ -385,7 +375,7 @@ void LLGemm1(void* in_a,
              const int K,
              hipStream_t stream,
              const int rows_per_block,
-             const c10::ScalarType scalar_type)
+             const AiterDtype scalar_type)
 {
     // NUM_TREADS need to be a multiple of WARP_SIZE, as we are using warp shuffle
     // operations.
@@ -396,7 +386,7 @@ void LLGemm1(void* in_a,
     int NUM_BLOCKS = M / rows_per_block;
 
     // call the kernel function...
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "LLGemm1", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(scalar_type, "LLGemm1", [&] {
         scalar_t* a_ptr = reinterpret_cast<scalar_t*>(in_a);
         scalar_t* b_ptr = reinterpret_cast<scalar_t*>(in_b);
         scalar_t* c_ptr = reinterpret_cast<scalar_t*>(out_c);
@@ -1697,10 +1687,10 @@ void wv_splitk_small_fp16_bf16(void* in_a,
                                const int N_in,
                                hipStream_t stream,
                                const int CuCount,
-                               const c10::ScalarType scalar_type)
+                               const AiterDtype scalar_type)
 {
     dim3 grid(CuCount);
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "wv_splitk_small_fp16_bf16", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(scalar_type, "wv_splitk_small_fp16_bf16", [&] {
         using fptype      = typename scalar<scalar_t>::type;
         fptype* af4       = reinterpret_cast<fptype*>(in_a);
         const fptype* bf4 = reinterpret_cast<const fptype*>(in_b);
@@ -1726,7 +1716,7 @@ void wvSplitK_(void* in_a,
                const int N_in,
                hipStream_t stream,
                const int CuCount,
-               const c10::ScalarType scalar_type)
+               const AiterDtype scalar_type)
 {
     dim3 grid(CuCount);
 
@@ -1753,7 +1743,7 @@ void wvSplitK_(void* in_a,
         }                                                                                  \
     }
 
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(scalar_type, "wvSplitK", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(scalar_type, "wvSplitK", [&] {
         using fptype      = typename scalar<scalar_t>::type;
         fptype* af4       = reinterpret_cast<fptype*>(in_a);
         const fptype* bf4 = reinterpret_cast<const fptype*>(in_b);
@@ -2220,8 +2210,8 @@ void wvSplitKQ_(void* in_a,
                 const int N_in,
                 hipStream_t stream,
                 const int CuCount,
-                const c10::ScalarType a_scalar_type,
-                const c10::ScalarType c_scalar_type)
+                const AiterDtype a_scalar_type,
+                const AiterDtype c_scalar_type)
 {
 #define WVSPLITKQ(_WvPrGrp, _YTILEs, _YTILEm, _YTILEb, _UNRLs, _UNRLm, _UNRLb, _N)                 \
     {                                                                                              \
@@ -2243,10 +2233,11 @@ void wvSplitKQ_(void* in_a,
     }
 
     dim3 grid(CuCount);
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(c_scalar_type, "wvSplitKQ", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_xxx(c_scalar_type, "wvSplitKQ", [&] {
         using fptype = typename scalar<scalar_t>::type;
         auto c_ptr   = reinterpret_cast<fptype*>(out_c);
-        AITER_DISPATCH_FP8_TYPES(a_scalar_type, "wvSplitKQ", [&] {
+        {
+            using fp8_t = uint8_t;
             auto a_ptr = reinterpret_cast<fp8_t*>(in_a);
             auto b_ptr = reinterpret_cast<fp8_t*>(in_b);
             switch(N_in)
@@ -2259,7 +2250,7 @@ void wvSplitKQ_(void* in_a,
                 throw std::runtime_error("Unsupported N value: " + std::to_string(M_in) + "," +
                                          std::to_string(K_in) + "," + std::to_string(N_in));
             }
-        });
+        }
     });
 }
 

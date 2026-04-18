@@ -15,14 +15,14 @@
  * limitations under the License.
  */
 
-#include <torch/all.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_bf16.h>
 #include "aiter_hip_common.h"
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
 #include "attention.h"
 
 #include <algorithm>
+#include <cfloat>
 #include "dtype_fp8.cuh"
 #include "quant_utils.cuh"
 
@@ -2201,13 +2201,13 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
 template <typename T, typename KVT, vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE, int HEAD_SIZE, typename OUTT, int PARTITION_SIZE_OLD>
 void paged_attention_custom_launcher(
-    torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
-    torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
-    torch::Tensor& value_cache, const int num_kv_heads, float scale,
-    torch::Tensor& block_tables, torch::Tensor& context_lens,
-    int max_context_len, const std::optional<torch::Tensor>& alibi_slopes,
+    const aiter_tensor_t& out, const aiter_tensor_t& exp_sums, const aiter_tensor_t& max_logits,
+    const aiter_tensor_t& tmp_out, const aiter_tensor_t& query, const aiter_tensor_t& key_cache,
+    const aiter_tensor_t& value_cache, const int num_kv_heads, float scale,
+    const aiter_tensor_t& block_tables, const aiter_tensor_t& context_lens,
+    int max_context_len, const aiter_tensor_t* alibi_slopes,
     float k_scale, float v_scale,
-    const std::optional<torch::Tensor>& fp8_out_scale) {
+    const aiter_tensor_t* fp8_out_scale) {
   int num_seqs = query.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -2219,7 +2219,7 @@ void paged_attention_custom_launcher(
   // NOTE: alibi_slopes is optional.
   const float* alibi_slopes_ptr =
       alibi_slopes
-          ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr())
+          ? reinterpret_cast<const float*>(alibi_slopes->data_ptr())
           : nullptr;
 
   float* exp_sums_ptr = reinterpret_cast<float*>(exp_sums.data_ptr());
@@ -2228,13 +2228,13 @@ void paged_attention_custom_launcher(
   T* query_ptr = reinterpret_cast<T*>(query.data_ptr());
   KVT* key_cache_ptr = reinterpret_cast<KVT*>(key_cache.data_ptr());
   KVT* value_cache_ptr = reinterpret_cast<KVT*>(value_cache.data_ptr());
-  int* block_tables_ptr = block_tables.data_ptr<int>();
-  int* context_lens_ptr = context_lens.data_ptr<int>();
+  int* block_tables_ptr = reinterpret_cast<int*>(block_tables.data_ptr());
+  int* context_lens_ptr = reinterpret_cast<int*>(context_lens.data_ptr());
 
   // NOTE: fp8_out_scale is optional.
   const float* fp8_out_scale_ptr =
       fp8_out_scale
-          ? reinterpret_cast<const float*>(fp8_out_scale.value().data_ptr())
+          ? reinterpret_cast<const float*>(fp8_out_scale->data_ptr())
           : nullptr;
   OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
 
@@ -2249,8 +2249,8 @@ void paged_attention_custom_launcher(
   constexpr int NTHR = 256; //PARTITION_SIZE;
   dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
   dim3 block(NTHR);
-  const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(query));
-  const hipStream_t stream = at::hip::getCurrentHIPStream();
+  HipDeviceGuard device_guard(query.device_id);
+  const hipStream_t stream = aiter::getCurrentHIPStream();
   switch (gqa_ratio) {
     case 1:
       //LAUNCH_CUSTOM_ATTENTION(1);
@@ -2317,7 +2317,7 @@ void paged_attention_custom_launcher(
       LAUNCH_CUSTOM_ATTENTION_MFMA16(16);
       break;
     default:
-      TORCH_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio);
+      AITER_CHECK(false, "Unsupported gqa ratio: ", gqa_ratio);
       break;
   }
 
@@ -2360,7 +2360,7 @@ void paged_attention_custom_launcher(
         LAUNCH_CUSTOM_REDUCTION(8);
         break;
       default:
-        TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);
+        AITER_CHECK(false, "Unsupported npar_loops: ", npar_loops);
         break;
     }
 #endif
@@ -2382,7 +2382,7 @@ void paged_attention_custom_launcher(
       CALL_CUSTOM_LAUNCHER(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, 256); \
       break;                                                                  \
     default:                                                                  \
-      TORCH_CHECK(false, "Unsupported partition size: ", partition_size);     \
+      AITER_CHECK(false, "Unsupported partition size: ", partition_size);     \
       break;                                                                  \
   }
 /*
@@ -2390,7 +2390,7 @@ void paged_attention_custom_launcher(
 #if defined(__HIPCC__) && defined(__gfx90a__)
   #define CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)   \
     if (fp8_out_scale) {                                                    \
-      TORCH_CHECK(false, "fp8 out scale unsupported for gfx90a");           \
+      AITER_CHECK(false, "fp8 out scale unsupported for gfx90a");           \
     } else {                                                                \
       CALL_CUSTOM_LAUNCHER_PSIZE(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T); \
     }
@@ -2413,7 +2413,7 @@ void paged_attention_custom_launcher(
       CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, 16, HEAD_SIZE);  \
       break;                                                      \
     default:                                                      \
-      TORCH_CHECK(false, "Unsupported block size: ", block_size); \
+      AITER_CHECK(false, "Unsupported block size: ", block_size); \
       break;                                                      \
   }
 /*
@@ -2427,7 +2427,7 @@ void paged_attention_custom_launcher(
       CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 128);          \
       break;                                                    \
     default:                                                    \
-      TORCH_CHECK(false, "Unsupported head size: ", head_size); \
+      AITER_CHECK(false, "Unsupported head size: ", head_size); \
       break;                                                    \
   }
 /*
@@ -2436,46 +2436,46 @@ void paged_attention_custom_launcher(
       break;                                                    \
 */
 void paged_attention(
-    torch::Tensor& out,         // [num_seqs, num_heads, head_size]
-    torch::Tensor& exp_sums,    // [num_seqs, num_heads, max_num_partitions]
-    torch::Tensor& max_logits,  // [num_seqs, num_heads, max_num_partitions]
-    torch::Tensor&
+    const aiter_tensor_t& out,         // [num_seqs, num_heads, head_size]
+    const aiter_tensor_t& exp_sums,    // [num_seqs, num_heads, max_num_partitions]
+    const aiter_tensor_t& max_logits,  // [num_seqs, num_heads, max_num_partitions]
+    const aiter_tensor_t&
         tmp_out,  // [num_seqs, num_heads, max_num_partitions, head_size]
-    torch::Tensor& query,  // [num_seqs, num_heads, head_size]
-    torch::Tensor&
+    const aiter_tensor_t& query,  // [num_seqs, num_heads, head_size]
+    const aiter_tensor_t&
         key_cache,  // [num_blocks, num_heads, head_size/x, block_size, x]
-    torch::Tensor&
+    const aiter_tensor_t&
         value_cache,  // [num_blocks, num_heads, head_size, block_size]
     int64_t num_kv_heads, double scale,
-    torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
-    torch::Tensor& context_lens,  // [num_seqs]
+    const aiter_tensor_t& block_tables,  // [num_seqs, max_num_blocks_per_seq]
+    const aiter_tensor_t& context_lens,  // [num_seqs]
     int64_t block_size, int64_t max_context_len,
-    const std::optional<torch::Tensor>& alibi_slopes,
+    const aiter_tensor_t* alibi_slopes,
     const std::string& kv_cache_dtype, double k_scale, double v_scale,
-    const std::optional<torch::Tensor>& fp8_out_scale, int64_t partition_size) {
+    const aiter_tensor_t* fp8_out_scale, int64_t partition_size) {
   const int head_size = query.size(2);
   if (kv_cache_dtype == "auto") {
-    if (query.dtype() == at::ScalarType::Half) {
+    if (query.dtype() == AITER_DTYPE_fp16) {
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(_Float16, _Float16,
                                     vllm::Fp8KVCacheDataType::kAuto);
-    } else if (query.dtype() == at::ScalarType::BFloat16) {
+    } else if (query.dtype() == AITER_DTYPE_bf16) {
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(__hip_bfloat16, __hip_bfloat16,
                                     vllm::Fp8KVCacheDataType::kAuto);
     } else {
-      TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+      AITER_CHECK(false, "Unsupported data type: ", AiterDtype_to_str(query.dtype()));
     }
   } else if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
-    if (query.dtype() == at::ScalarType::Half) {
+    if (query.dtype() == AITER_DTYPE_fp16) {
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(_Float16, uint8_t,
                                     vllm::Fp8KVCacheDataType::kFp8E4M3);
-    } else if (query.dtype() == at::ScalarType::BFloat16) {
+    } else if (query.dtype() == AITER_DTYPE_bf16) {
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(__hip_bfloat16, uint8_t,
                                     vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else {
-      TORCH_CHECK(false, "Unsupported data type: ", query.dtype());
+      AITER_CHECK(false, "Unsupported data type: ", AiterDtype_to_str(query.dtype()));
     }
   } else {
-    TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
+    AITER_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
   }
 }
 

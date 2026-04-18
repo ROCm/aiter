@@ -12,7 +12,7 @@ from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
-@compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
+@compile_ops("module_moe_asm", develop=True, fc_name="biased_grouped_topk")
 def biased_grouped_topk_hip(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -25,13 +25,13 @@ def biased_grouped_topk_hip(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", develop=True)
 def grouped_topk(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     num_expert_group: int,
-    topk_group: int,
+    topk_grp: int,
     need_renorm: bool,
     is_softmax: bool = True,
     routed_scaling_factor: float = 1.0,
@@ -58,7 +58,20 @@ def gen_moe_fused_gate_fake_tensor(
     return [output, indices]
 
 
-@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
+@compile_ops("module_moe_asm", develop=True, fc_name="moe_fused_gate")
+def _moe_fused_gate(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
+
+
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -69,7 +82,19 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]: ...
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _moe_fused_gate(
+        input,
+        bias,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        topk,
+        n_share_experts_fusion,
+        routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk(
@@ -197,7 +222,23 @@ def grouped_topk_torch(
     return topk_weights.to(dtypes.fp32), topk_ids.to(dtypes.i32)
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops(
+    "module_top_k_per_row",
+    develop=True,
+    fc_name="top_k_per_row_prefill",
+)
+def _top_k_per_row_prefill_kernel(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor,
+    rowEnds: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    values: Optional[torch.Tensor] = None,
+) -> None: ...
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -207,10 +248,20 @@ def top_k_per_row_prefill(
     numRows: int,
     stride0: int,
     stride1: int,
-) -> None: ...
+) -> None:
+    _top_k_per_row_prefill_kernel(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        numRows,
+        stride0,
+        stride1,
+        values,
+    )
 
 
-@compile_ops("module_top_k_per_row", ffi_type="ctypes")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes", develop=True)
 def top_k_per_row_prefill_fast(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -223,7 +274,7 @@ def top_k_per_row_prefill_fast(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row", develop=True)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -235,7 +286,7 @@ def top_k_per_row_decode(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row", ffi_type="ctypes")
+@compile_ops("module_top_k_per_row", ffi_type="ctypes", develop=True)
 def top_k_per_row_decode_fast(
     logits: torch.Tensor,
     next_n: int,

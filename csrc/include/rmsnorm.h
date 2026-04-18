@@ -15,13 +15,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "aiter_tensor.h"
 #include <torch/extension.h>
+#include <optional>
 
-void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double epsilon);
+void rms_norm(const aiter_tensor_t& out, const aiter_tensor_t& input, const aiter_tensor_t& weight, double epsilon);
 
-void fused_add_rms_norm(torch::Tensor& input,
-                        torch::Tensor& residual,
-                        torch::Tensor& weight,
+void fused_add_rms_norm(const aiter_tensor_t& input,
+                        const aiter_tensor_t& residual,
+                        const aiter_tensor_t& weight,
                         double epsilon);
 
 // ck
