@@ -1911,9 +1911,7 @@ class FmoeTuner(TunerCommon):
                                 dtype,
                             ),
                             {},
-                            (
-                                FmoeTuner.torch_moe_blockscale
-                            ),
+                            (FmoeTuner.torch_moe_blockscale),
                             (
                                 [1, 12, 13, 14, 15, 9, 10, 11],
                                 None,

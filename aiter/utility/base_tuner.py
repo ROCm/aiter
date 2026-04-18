@@ -380,6 +380,7 @@ class TunerCommon:
         # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
         # cannot accept a float like 2.61).
         import numpy as np
+
         for col in df_old.columns:
             if col in df_updates.columns and df_old[col].dtype != df_updates[col].dtype:
                 try:
