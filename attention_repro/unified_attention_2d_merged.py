@@ -1526,7 +1526,8 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 # ============================================================================
 
 @gluon.jit
-def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
+def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
+    cfg: gl.constexpr = pgm.cfg
     MERGE_LOOP_TDM_WAITS: gl.constexpr = (cfg.NUM_BUFFERS == 3)
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
     # Buffer rotation: buf_0 = i%N, buf_1 = (i+1)%N, buf_2 = (i+2)%N
@@ -1563,8 +1564,8 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
     kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1)
 
     # QK_t0
-    # TODO: this should be done only if kv len < tile size
-    if True or pgm.tile_start >= pgm.safe_tile_end:
+    # Assume non-causal will always have 1 unmasked valid tile
+    if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
         S = pgm.compute_qk(k)
         S = pgm.apply_mask_qk(S, pgm.tile_start)
     else:
@@ -1595,6 +1596,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         S = pgm.compute_qk(k)
         # SM1(prev) + LR_V(tile i) + GLDS_K(tile i+3)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+        k = kv_loader.load_k_from_shared(wait_count=3 if (MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3) else 2, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
         # PV
         acc = pgm.compute_pv(p, v, acc)
 
@@ -1602,7 +1604,6 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
         p, alpha, M = pgm.softmax_part0(S, M)
         #gl.amd.gfx1250.tdm.async_wait(2)
-        k = kv_loader.load_k_from_shared(wait_count=3 if (MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3) else 2, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
         if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2: 
             kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         next2_physical_block_idx = next3_physical_block_idx
@@ -1624,18 +1625,15 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg):
         epilogue_t_2 = pgm.tile_end - 2
         epilogue_t_3 = pgm.tile_end - 1
         # SM1(prev) + LR_V(tile L) + PV(tile L)
-        if True or epilogue_t_2 >= pgm.safe_tile_end:
-            S = pgm.compute_qk(k)
-            S = pgm.apply_mask_qk(S, epilogue_t_2)
-        else:
-            S = pgm.compute_qk(k)
+        S = pgm.compute_qk(k)
+        S = pgm.apply_mask_qk(S, epilogue_t_2)
         v = kv_loader.load_v_from_shared(wait_count=3 if cfg.NUM_BUFFERS == 3 else 2, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
-        if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
-            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
+
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
   
         S = gl.convert_layout(S, pgm.cfg.pv_layout)
-
+        if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
+            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
         k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
         acc = pgm.compute_pv(p, v, acc)
         # QK + SM0 for tile L+1, LR_K for tile L+2
@@ -2145,7 +2143,7 @@ def kernel_unified_attention_2d(
     elif LOOP_VARIANT == 1:
         gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 1, NUM_BUFFERS should be 2 or 3")
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
-        M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc, cfg)
+        M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
 
     elif LOOP_VARIANT == 2:
         gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 2, NUM_BUFFERS should be 2 or 3")
@@ -2334,7 +2332,7 @@ def unified_attention(
 
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
-        print_irs_to_files(attn_kernel, f"ds_w_rm_merged_wait_unified_attention_2d_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}")
+        print_irs_to_files(attn_kernel, f"unified_attention_2d_causal_{causal}_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}")
     return attn_kernel
 
 

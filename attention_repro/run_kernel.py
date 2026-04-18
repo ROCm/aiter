@@ -37,6 +37,7 @@ parser.add_argument('--block_m', type=int, default=128, help='')
 parser.add_argument('--remove_indirect_access', type=int, default=1, help='')
 parser.add_argument('--num_buffers', type=int, default=2, help='')
 parser.add_argument('--loop_variant', type=int, default=1, help='')
+parser.add_argument('--causal', type=int, default=1, help='')
 args = parser.parse_args()
 print(args)
 
@@ -44,7 +45,6 @@ args.window_size = 0
 args.num_kv_blocks = 1
 args.use_tdm = 1
 args.shuffled_kv_cache = 0
-args.causal=0
 
 block_size = args.block_size
 soft_cap = None
