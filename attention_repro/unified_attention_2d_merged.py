@@ -96,6 +96,7 @@ class AsyncKVLoader:
     key_cache_ptr: gl.tensor
     value_cache_ptr: gl.tensor
     block_tables_ptr_shifted: gl.tensor
+    block_table_stride: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_base_offset: gl.tensor
@@ -110,6 +111,7 @@ class AsyncKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         k_shared,
         v_shared,
         k_base_offset,
@@ -125,6 +127,7 @@ class AsyncKVLoader:
         self.k_base_offset = k_base_offset
         self.v_base_offset = v_base_offset
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.block_table_stride = block_table_stride
         self.stride_k_cache_0 = stride_k_cache_0
         self.stride_v_cache_0 = stride_v_cache_0
 
@@ -134,6 +137,7 @@ class AsyncKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         stride_k_cache_0,
@@ -188,6 +192,7 @@ class AsyncKVLoader:
             key_cache_ptr,
             value_cache_ptr,
             block_tables_ptr_shifted,
+            block_table_stride,
             k_shared,
             v_shared,
             k_base_offset,
@@ -308,6 +313,7 @@ class TDMKVLoaderConfig:
 class TDMKVLoader:
     kv_cfg: TDMKVLoaderConfig
     block_tables_ptr_shifted: gl.tensor
+    block_table_stride: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -322,6 +328,7 @@ class TDMKVLoader:
         self,
         kv_cfg,
         block_tables_ptr_shifted,
+        block_table_stride,
         k_shared,
         v_shared,
         k_desc,
@@ -337,6 +344,7 @@ class TDMKVLoader:
         self.k_desc = k_desc
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.block_table_stride = block_table_stride
         self.kv_head_idx = kv_head_idx
         self.stride_k_cache_2 = stride_k_cache_2
         self.stride_v_cache_2 = stride_v_cache_2
@@ -348,6 +356,7 @@ class TDMKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         stride_k_cache_0,
@@ -402,6 +411,7 @@ class TDMKVLoader:
         return TDMKVLoader(
             kv_cfg,
             block_tables_ptr_shifted,
+            block_table_stride,
             k_shared,
             v_shared,
             k_desc,
@@ -477,7 +487,9 @@ class TDMKVLoader:
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             return i
         else:
-            return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.num_blocks, other=0)
+            return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.block_table_stride, other=0)
+            #return gl.amd.cdna4.buffer_load(self.block_tables_ptr_shifted + i)
+
 
     @gluon.jit
     def lds_unshuffle_k(self, buffer_id):
@@ -582,6 +594,7 @@ class TDMGatherKVLoaderConfig:
 class TDMGatherKVLoader:
     kv_cfg: TDMGatherKVLoaderConfig
     block_tables_ptr_shifted: gl.tensor
+    block_table_stride: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -596,6 +609,7 @@ class TDMGatherKVLoader:
         self,
         kv_cfg,
         block_tables_ptr_shifted,
+        block_table_stride,
         k_shared,
         v_shared,
         k_desc,
@@ -611,6 +625,7 @@ class TDMGatherKVLoader:
         self.k_desc = k_desc
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.block_table_stride = block_table_stride
         self.kv_head_idx = kv_head_idx
         self.stride_k_cache_2 = stride_k_cache_2
         self.stride_v_cache_2 = stride_v_cache_2
@@ -622,6 +637,7 @@ class TDMGatherKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         stride_k_cache_0,
@@ -664,6 +680,7 @@ class TDMGatherKVLoader:
         return TDMGatherKVLoader(
             kv_cfg,
             block_tables_ptr_shifted,
+            block_table_stride,
             k_shared,
             v_shared,
             k_desc,
@@ -778,6 +795,7 @@ class TDMSubtileKVLoader:
     """
     kv_cfg: TDMSubtileKVLoaderConfig
     block_tables_ptr_shifted: gl.tensor
+    block_table_stride: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -792,6 +810,7 @@ class TDMSubtileKVLoader:
         self,
         kv_cfg,
         block_tables_ptr_shifted,
+        block_table_stride,
         k_shared,
         v_shared,
         k_desc,
@@ -807,6 +826,7 @@ class TDMSubtileKVLoader:
         self.k_desc = k_desc
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.block_table_stride = block_table_stride
         self.kv_head_idx = kv_head_idx
         self.stride_k_cache_2 = stride_k_cache_2
         self.stride_v_cache_2 = stride_v_cache_2
@@ -818,6 +838,7 @@ class TDMSubtileKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         stride_k_cache_0,
@@ -863,6 +884,7 @@ class TDMSubtileKVLoader:
         return TDMSubtileKVLoader(
             kv_cfg,
             block_tables_ptr_shifted,
+            block_table_stride,
             k_shared,
             v_shared,
             k_desc,
@@ -921,7 +943,7 @@ class TDMSubtileKVLoader:
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             return i
         else:
-            return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.num_blocks, other=0)
+            return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.block_table_stride, other=0)
 
 
 # ============================================================================
@@ -1296,9 +1318,45 @@ class AttentionProgram:
         return p, alpha, m_ij
 
     @gluon.jit
+    def softmax_part0_w_split(self, S, M):
+        m = reduce_max_prop_nan(S, -1)
+        m_ij = elementwise_max_prop_nan(M, m)
+        #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        m_ij_scaled = m_ij * self.QK_scale
+        q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
+        q_shifted = q_shifted.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 2, 2)
+        q_shift1, q_shift2 = gl.split(q_shifted)
+        q_shift1 = q_shift1.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 4, 2)
+        q_shift11, q_shift12 = gl.split(q_shift1)
+        q_shift2 = q_shift2.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 4, 2)
+        q_shift21, q_shift22 = gl.split(q_shift2)
+        q_shift1 = self.concat_subtile2(q_shift11, q_shift12)
+        p1 = gl.exp2(q_shift1)
+        p21 = gl.exp2(q_shift21)
+        #p22 = gl.exp2(q_shift22)
+        #p = self.combine_ps(p11, p12, p21, p22)
+        m_diff_scaled = M * self.QK_scale - m_ij_scaled
+        alpha = gl.exp2(m_diff_scaled)
+        return p1, p21, q_shift22, alpha, m_ij
+
+    @gluon.jit
+    def combine_ps(self, p1, p21, p22):
+        p2 = self.concat_subtile2(p21, p22)
+        p = self.concat_subtile2(p1, p2)
+        p = gl.convert_layout(p, self.cfg.pv_layout, assert_trivial=True)
+        return p  
+  
+    @gluon.jit
+    def concat_subtile2(self, x, y):
+        shape: gl.constexpr = [x.shape[0], x.shape[1] + y.shape[1]]
+        a = gl.join(x, y)
+        a = a.reshape(shape)
+        return a
+
+    @gluon.jit
     def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16):
-        l_ij = gl.sum(p, 1)
         acc = acc * alpha[:, None]
+        l_ij = gl.sum(p, 1)
         if target_dtype != gl.bfloat16:
             p = p.to(target_dtype)
         else:
@@ -1528,139 +1586,167 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 @gluon.jit
 def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     cfg: gl.constexpr = pgm.cfg
-    MERGE_LOOP_TDM_WAITS: gl.constexpr = (cfg.NUM_BUFFERS == 3)
+    # merging tdm wait for 2 buffer will restrict the flight times
+    MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
-    # Buffer rotation: buf_0 = i%N, buf_1 = (i+1)%N, buf_2 = (i+2)%N
-    # Tile m uses buffer m%N for both K and V.
+    SPLIT_SOFTMAX0: gl.constexpr = True 
+    SPLIT_SOFTMAX0_EPI: gl.constexpr = False
+    # Buffer rotation, tile m lives in slot m%N (same slot holds both K and V in disjoint regions).
+    # Three rolling slot indices, named by which tile they track at the current iteration i:
+    #   buf_tile_cur   = slot for tile i     ( i   %N)
+    #   buf_tile_next  = slot for tile i+1   ((i+1)%N)
+    #   buf_tile_next2 = slot for tile i+2   ((i+2)%N), aliases buf_tile_cur when N=2
     #
-    # Per-iteration mapping (iter i processes QK for tile i+1):
-    #   V read  (tile i)   → buf_0
-    #   K read  (tile i+2) → buf_2
-    #   K store (tile i+3) → (i+3)%N = buf_0 (N=3) or buf_1 (N=2)
-    #   V store (tile i+2) → buf_2
-    # If we use 3-buffers, we can dont have to insert ds_wait 0 with barriers as we dont have WAR race condition anymore
+    # Per-iteration roles (iter i processes QK for tile i+1):
+    #   V read  (tile i)    buf_tile_cur
+    #   K read  (tile i+2)  buf_tile_next2
+    #   V store (tile i+2)  buf_tile_next2        (K and V regions of the slot are disjoint)
+    #   K store (tile i+3)  buf_tile_cur   (N=3, since (i+3)%3 = i%3)
+    #                       buf_tile_next  (N=2, since (i+3)%2 = (i+1)%2)
+    # With 3 buffers buf_tile_next2 is a distinct slot, so we have no WAR
     physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
     next_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 1)
     next2_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 2)
     next3_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 3)
 
-    buf_0: gl.int32 = 0
-    buf_1: gl.int32 = 1
+    buf_tile_cur:  gl.int32 = 0
+    buf_tile_next: gl.int32 = 1
     if cfg.NUM_BUFFERS == 3:
-        buf_2: gl.int32 = 2
+        buf_tile_next2: gl.int32 = 2
     else:
-        buf_2: gl.int32 = 0  # (i+2)%2 = i%2 = buf_0
+        buf_tile_next2: gl.int32 = 0  # aliases buf_tile_cur: (i+2)%2 = i%2
 
     # ---- Prologue ----
-    # tile 0 → buf 0, tile 1 → buf 1, tile 2 → buf 2%N
-    kv_loader.load_k_to_shared(physical_block_idx, buffer_id=0)       # K_t0 → buf 0
-    kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1)  # K_t1 → buf 1
-    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=0)       # V_t0 → buf 0
+    # tile 0 - buf_tile_cur, tile 1 - buf_tile_next, tile 2 - buf_tile_next2
+    kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buf_tile_cur)   # K_t0
+    kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=buf_tile_next)  # K_t1
+    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buf_tile_cur)   # V_t0
 
     # LR_K_t0
-    k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=0, target_dtype=q.dtype)
-    # K_t2 → buf 2%N, V_t1 → buf 1
-    kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=buf_2)
-    kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1)
+    k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=buf_tile_cur, target_dtype=q.dtype)
+    # K_t2 - buf_tile_next2, V_t1 - buf_tile_next
+    kv_loader.load_k_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+    kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=buf_tile_next)
 
     # QK_t0
+    S = pgm.compute_qk(k)    
     # Assume non-causal will always have 1 unmasked valid tile
-    if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
-        S = pgm.compute_qk(k)
+    if cfg.CAUSAL:
         S = pgm.apply_mask_qk(S, pgm.tile_start)
-    else:
-        S = pgm.compute_qk(k)    
     # LR_K_t1
     # SM0_t0
-    k = kv_loader.load_k_from_shared(wait_count=3, buffer_id=1, target_dtype=q.dtype)
+    k = kv_loader.load_k_from_shared(wait_count=3, buffer_id=buf_tile_next, target_dtype=q.dtype)
 
-    S = gl.convert_layout(S, pgm.cfg.pv_layout)
-    p, alpha, M = pgm.softmax_part0(S, M)
-    
-
+    S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+    if SPLIT_SOFTMAX0:
+        p1, p21, q_shift22, alpha, M = pgm.softmax_part0_w_split(S, M)
+    else:
+        p, alpha, M = pgm.softmax_part0(S, M)
     # ---- Steady-state loop ----
     for j in range(pgm.tile_start, pgm.tile_end - 3):
         t_1 = j + 1
         t_2 = j + 2
         t_3 = j + 3
+        next4_physical_block_idx = kv_loader.load_block_ids(t_3 + 1)
         if MERGE_LOOP_TDM_WAITS:
             gl.amd.gfx1250.tdm.async_wait(1) # merged
-
-        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
-        kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_0 if cfg.NUM_BUFFERS == 3 else buf_1)
-
-        if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
-            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
-        next4_physical_block_idx = kv_loader.load_block_ids(t_3 + 1)
         # QK for tile (i+1)
         S = pgm.compute_qk(k)
         # SM1(prev) + LR_V(tile i) + GLDS_K(tile i+3)
+        if SPLIT_SOFTMAX0:
+            p22 = gl.exp2(q_shift22)
+            p = pgm.combine_ps(p1, p21, p22)
+        v = kv_loader.load_v_from_shared(wait_count=2, buffer_id=buf_tile_cur, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
+        # NOTE:
+        # If we are using 2 buffers:
+        # when we dont have s_wait_dscnt 0 with barriers:
+        # this can only be issued after qk is done, that makes sure all ds_reads are completed
+        # then we need a barrier to ensure all waves are done reading k from the buffer
+        # However, if we are using 3 buffers, we dont need extra barrier or s_wait_dscnt 0
+        kv_loader.load_k_to_shared(next3_physical_block_idx, buffer_id=buf_tile_cur if cfg.NUM_BUFFERS == 3 else buf_tile_next)
+        # we can try to issue this earlier
+        if MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3:
+            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-        k = kv_loader.load_k_from_shared(wait_count=3 if (MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3) else 2, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
+        k_wait: gl.constexpr = 3 if (MERGE_LOOP_TDM_WAITS and cfg.NUM_BUFFERS == 3) else 2
+        k = kv_loader.load_k_from_shared(wait_count=k_wait, buffer_id=buf_tile_next2, target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS)
         # PV
         acc = pgm.compute_pv(p, v, acc)
 
         # SM0 + LR_K(tile i+2) + GLDS_V(tile i+2)
-        S = gl.convert_layout(S, pgm.cfg.pv_layout)
-        p, alpha, M = pgm.softmax_part0(S, M)
-        #gl.amd.gfx1250.tdm.async_wait(2)
-        if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2: 
-            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+        if SPLIT_SOFTMAX0:
+            p1, p21, q_shift22, alpha, M = pgm.softmax_part0_w_split(S, M)
+        else:
+            p, alpha, M = pgm.softmax_part0(S, M)
+        # same situation as K, but for V. Using 3 buffers relaxes where this can go
+        if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
+            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
         next2_physical_block_idx = next3_physical_block_idx
         next3_physical_block_idx = next4_physical_block_idx
+        # Advance all three slot indices by +1 mod N. Aliasing is preserved:
+        #   N=3: buf_tile_cur stays aliased with buf_k_store (both = new i%3)
+        #   N=2: buf_tile_next2 stays aliased with buf_tile_cur (both = new i%2)
         if cfg.NUM_BUFFERS == 3:
-            buf_0, buf_1, buf_2 = buf_1, buf_2, buf_0
+            buf_tile_cur, buf_tile_next, buf_tile_next2 = buf_tile_next, buf_tile_next2, buf_tile_cur
         else:
-            buf_0, buf_1, buf_2 = buf_1, buf_0, buf_1
+            buf_tile_cur, buf_tile_next, buf_tile_next2 = buf_tile_next, buf_tile_cur, buf_tile_next
 
     # ---- Epilogue ----
-    # After L loop iters: buf_0=L%N, buf_1=(L+1)%N, buf_2=(L+2)%N
+    # At entry (iter index L = tile_end - 3):
     # Remaining tiles: L (V drain), L+1 (=tile_end-2), L+2 (=tile_end-1)
+    
     if MERGE_EPI_TDM_WAITS:
         gl.amd.gfx1250.tdm.async_wait(1) # merged
-
+    epilogue_t_2 = pgm.tile_end - 2
+    epilogue_t_3 = pgm.tile_end - 1
+    # try to issue earlier
+    if MERGE_EPI_TDM_WAITS and cfg.NUM_BUFFERS == 3:
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+    ######################################
     with gl.amd.warp_pipeline_stage("stage1"):
-        if cfg.NUM_BUFFERS == 3:
-            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
-        epilogue_t_2 = pgm.tile_end - 2
-        epilogue_t_3 = pgm.tile_end - 1
         # SM1(prev) + LR_V(tile L) + PV(tile L)
+        if SPLIT_SOFTMAX0:
+            p22 = gl.exp2(q_shift22)
+            p = pgm.combine_ps(p1, p21, p22)
         S = pgm.compute_qk(k)
-        S = pgm.apply_mask_qk(S, epilogue_t_2)
-        v = kv_loader.load_v_from_shared(wait_count=3 if cfg.NUM_BUFFERS == 3 else 2, buffer_id=buf_0, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
-
+        if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+            S = pgm.apply_mask_qk(S, epilogue_t_2)
+        v_wait: gl.constexpr = 3 if (MERGE_EPI_TDM_WAITS and cfg.NUM_BUFFERS == 3) else 2
+        v = kv_loader.load_v_from_shared(wait_count=v_wait, buffer_id=buf_tile_cur, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-  
-        S = gl.convert_layout(S, pgm.cfg.pv_layout)
+        # if not issued earlier, isue here
         if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
-            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_2)
-        k = kv_loader.load_k_from_shared(wait_count=1, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
+            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+        # we have 2 v in the queue
+        k = kv_loader.load_k_from_shared(wait_count=2, buffer_id=buf_tile_next2, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
         acc = pgm.compute_pv(p, v, acc)
-        # QK + SM0 for tile L+1, LR_K for tile L+2
-        p, alpha, M = pgm.softmax_part0(S, M)
-
-
-    #with gl.amd.warp_pipeline_stage("stage3"):
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+        if SPLIT_SOFTMAX0_EPI:
+            p1, p21, q_shift22, alpha, M = pgm.softmax_part0_w_split(S, M)
+        else:
+            p, alpha, M = pgm.softmax_part0(S, M)
+    ######################################
+    #with gl.amd.warp_pipeline_stage("stage2"):
     if MERGE_EPI_TDM_WAITS:
         gl.amd.gfx1250.tdm.async_wait(0) # merged
-    # GLDS_V for tile L+2, QK+mask for tile L+2, LR_V for tile L+1
-    v = kv_loader.load_v_from_shared(wait_count=1, buffer_id=buf_1, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
-
+    v = kv_loader.load_v_from_shared(wait_count=1, buffer_id=buf_tile_next, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
+    # Last tile can be partial
     S = pgm.compute_qk(k)
     S = pgm.apply_mask_qk(S, epilogue_t_3)
-
+    if SPLIT_SOFTMAX0_EPI:
+        p22 = gl.exp2(q_shift22)
+        p = pgm.combine_ps(p1, p21, p22)
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
-    v_last = kv_loader.load_v_from_shared(wait_count=0, buffer_id=buf_2, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
-
-    # SM1 + PV for tile L+1, SM0 for tile L+2, LR_V for tile L+2
     acc = pgm.compute_pv(p, v, acc)
+    v = kv_loader.load_v_from_shared(wait_count=0, buffer_id=buf_tile_next2, target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS)
 
-    S = gl.convert_layout(S, pgm.cfg.pv_layout)
+    S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
     p, alpha, M = pgm.softmax_part0(S, M)
-
+    ######################################
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
     # PV for tile L+2
-    acc = pgm.compute_pv(p, v_last, acc)
+    acc = pgm.compute_pv(p, v, acc)
 
     return M, L, acc
 
@@ -2094,6 +2180,7 @@ def kernel_unified_attention_2d(
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         stride_k_cache_0,

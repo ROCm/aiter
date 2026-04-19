@@ -411,7 +411,7 @@ def test_gluon_unified_attn_2d_noncausal(
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
     # NOTE: for now, skip paged access
-    remove_indirect_access=True
+    remove_indirect_access=False
 
     (
         query,

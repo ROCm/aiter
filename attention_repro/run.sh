@@ -1,6 +1,6 @@
 
-seq_q_l=512
-seq_kv_l=512
+seq_q_l=256
+seq_kv_l=256
 num_heads_q=8
 num_heads_k=1
 bs=1
@@ -13,12 +13,13 @@ block_m=128
 remove_indirect_access=1
 num_buffers=3
 loop_variant=1
-causal=0
+causal=1
 export PRINT_IRS=1
 rm -r ~/.triton/cache/
 # maxnum: v_max_num_f32_e32
 # maximum: v_maximum -> nan propagating, hence no self max
-export LLIR_REMOVE_DS_WAIT_0="loop"
+# remove s_wait_dscnt 0s from the loop, inserted with barrier for tdm asyn wait
+export LLIR_REMOVE_DS_WAIT_0="loop" 
 # # # # # # If no TDM load wait around
 # export LLIR_REMOVE_BARRIER=1
 source $TRITON_GFX1250_MODEL_PATH/ffmlite_env.sh
