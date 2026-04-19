@@ -1711,10 +1711,8 @@ def reference_attention_kv_blockscale(
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
-# scatter_pages=True: adjacent logical tokens map to physically distant pages.
-# Currently expected to FAIL because V loads use SRD rebase with int32 voffset, which
-# overflows when the within-tile page spread exceeds 2GB. K loads work (flat 64-bit).
-# Will pass once V also uses flat addressing or 64-bit offset support.
+# scatter_pages=True: adjacent logical tokens map to physically distant pages,
+# stress-testing the paged KV cache addressing when pages span large physical distances.
 @pytest.mark.parametrize("scatter_pages", [False, True])
 @pytest.mark.parametrize("kv_layout", ["linear", "vectorized"])
 def test_batch_prefill_large_kvcache(
