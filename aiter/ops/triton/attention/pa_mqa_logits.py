@@ -152,6 +152,10 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         "HiddenDim": hidden_dim,
         "SplitKV": 5,
     }
+    # Adjust ChunkQ down to the largest power-of-2 divisor of heads.
+    # Needed when heads-per-GPU < ChunkQ (e.g. TP>=8 for 128-head models).
+    while config["ChunkQ"] > 1 and heads % config["ChunkQ"] != 0:
+        config["ChunkQ"] //= 2
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * config["SplitKV"]),)
@@ -204,7 +208,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         f"got q hidden_dim={hidden_dim} and packed KV dim={packed_dim}."
     )
 
-    TileQCount = batch_size * next_n * (heads // ChunkQ)
+    TileQCount = max(1, batch_size * next_n * (heads // ChunkQ))
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
     packed_kv_cache = kv_cache_fp8.view(num_blocks, -1)
@@ -221,6 +225,10 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         "HiddenDim": hidden_dim,
         "SplitKV": SplitKV,
     }
+    # Adjust ChunkQ down to the largest power-of-2 divisor of heads.
+    # Needed when heads-per-GPU < ChunkQ (e.g. TP>=8 for 128-head models).
+    while config["ChunkQ"] > 1 and heads % config["ChunkQ"] != 0:
+        config["ChunkQ"] //= 2
     assert heads % config["ChunkQ"] == 0
 
     grid = (batch_size * next_n * (heads // config["ChunkQ"] * SplitKV),)
