@@ -10,6 +10,52 @@ from ..utility import dtypes
 
 
 @compile_ops(
+    "module_fused_qk_rmsnorm_group_quant", fc_name="fused_qk_rmsnorm_bf16"
+)
+def _fused_qk_rmsnorm_bf16_kernel(
+    q_out: Tensor,
+    k_out: Tensor,
+    q: Tensor,
+    q_weight: Tensor,
+    q_epsilon: float,
+    k: Tensor,
+    k_weight: Tensor,
+    k_epsilon: float,
+) -> None: ...
+
+
+def fused_qk_rmsnorm_bf16(
+    q: Tensor,
+    q_weight: Tensor,
+    q_epsilon: float,
+    k: Tensor,
+    k_weight: Tensor,
+    k_epsilon: float,
+) -> tuple[Tensor, Tensor]:
+    """Fused RMSNorm for Q and K latent projections in DeepSeek MLA.
+
+    Replaces two sequential add_rmsnorm_quant_kernel launches with a single
+    fused launch using blockIdx.y to process Q and K in parallel (small T)
+    or in the same block sequentially (large T).
+
+    Args:
+        q:         [T, q_lora_rank] BF16/FP16 — Q latent after lora projection
+        q_weight:  [q_lora_rank]    BF16/FP16 — q_a_layernorm weight
+        q_epsilon: RMSNorm epsilon for Q
+        k:         [T, kv_lora_rank] BF16/FP16 — KV latent (k_nope slice)
+        k_weight:  [kv_lora_rank]    BF16/FP16 — kv_a_layernorm weight
+        k_epsilon: RMSNorm epsilon for K
+
+    Returns:
+        (q_out, k_out): normalized tensors, same shape and dtype as inputs
+    """
+    q_out = q.new_empty(q.shape)
+    k_out = k.new_empty(k.shape)
+    _fused_qk_rmsnorm_bf16_kernel(q_out, k_out, q, q_weight, q_epsilon, k, k_weight, k_epsilon)
+    return q_out, k_out
+
+
+@compile_ops(
     "module_fused_qk_rmsnorm_group_quant", fc_name="fused_qk_rmsnorm_group_quant"
 )
 def _fused_qk_rmsnorm_group_quant_kernel(

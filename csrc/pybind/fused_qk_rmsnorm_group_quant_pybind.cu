@@ -6,6 +6,16 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    m.def("fused_qk_rmsnorm_bf16",
+          &aiter::fused_qk_rmsnorm_bf16,
+          py::arg("q_out"),
+          py::arg("k_out"),
+          py::arg("q"),
+          py::arg("q_weight"),
+          py::arg("q_epsilon"),
+          py::arg("k"),
+          py::arg("k_weight"),
+          py::arg("k_epsilon"));
     m.def("fused_qk_rmsnorm_group_quant",
           &aiter::fused_qk_rmsnorm_group_quant,
           py::arg("q_out_quantized"),

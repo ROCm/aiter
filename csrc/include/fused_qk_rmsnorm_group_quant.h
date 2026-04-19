@@ -8,6 +8,15 @@
 
 namespace aiter {
 
+void fused_qk_rmsnorm_bf16(torch::Tensor& q_out,
+                           torch::Tensor& k_out,
+                           torch::Tensor& q,
+                           torch::Tensor& q_weight,
+                           double q_epsilon,
+                           torch::Tensor& k,
+                           torch::Tensor& k_weight,
+                           double k_epsilon);
+
 void fused_qk_rmsnorm_group_quant(torch::Tensor& q_out_quantized,
                                   torch::Tensor& q_out_scale,
                                   torch::Tensor& q,
