@@ -122,8 +122,9 @@ def compile_mixed_moe_gemm1(
       act(X @ W.T) -> [tokens*topk, inter_dim]
 
     Direct store (no atomic). When k_batch>1 (split-K), each CTA computes
-    a K-slice and atomically adds gate/up partials. Split-K is currently
-    supported only for g1u1.
+    a K-slice and atomically accumulates partials:
+      - g1u1: gate/up partials (2*inter_dim channels)
+      - g1u0: proj partials (inter_dim channels)
     Note: persist_m=1 (no persistence) is optimal for stage1 because K=model_dim
     is large, so each CTA is already compute-heavy. persist_m>1 serializes M blocks
     that the GPU can process in parallel.
@@ -208,8 +209,6 @@ def compile_mixed_moe_gemm1(
     _is_splitk = k_batch > 1
     if gate_only and not _is_splitk:
         raise ValueError("gate_only requires k_batch > 1 (split-K)")
-    if (not _use_g1u1) and _is_splitk:
-        raise ValueError("g1u0 stage1 does not support k_batch > 1 (split-K)")
     if _is_splitk:
         _k_per_batch = model_dim // k_batch
         assert (
@@ -270,7 +269,7 @@ def compile_mixed_moe_gemm1(
     _go_tag = "_go" if gate_only else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v33_g1u0_splitk"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -1878,7 +1877,9 @@ def compile_mixed_moe_gemm1(
                 # ---- Epilogue: CShuffle + direct store (accumulate=False) ----
                 # G1U1 output: out[(t*topk+s) * inter_dim + col] = act(gate) * up
                 # G1U0 output: out[(t*topk+s) * inter_dim + col] = act(proj)
-                # For split-K: skip activation, output gate/up separately with atomic add.
+                # For split-K:
+                # - g1u1: skip activation, output gate/up partials with atomic add.
+                # - g1u0: skip activation, output proj partials with atomic add.
                 tw_pf = None
                 if epilogue_pf is not None:
                     _, tw_pf, _ = epilogue_pf
@@ -1940,8 +1941,9 @@ def compile_mixed_moe_gemm1(
                             v1 = vector.from_elements(vec1_out, [v_out])
                             vector.store(v1, lds_out, [lds_idx], alignment=2)
 
+                _splitk_out_cols = inter_dim * (2 if _use_g1u1 else 1)
                 _out_row_stride = (
-                    inter_dim * 2 * out_elem_bytes
+                    _splitk_out_cols * out_elem_bytes
                     if _is_splitk
                     else (inter_dim // 2 if _need_quant else inter_dim * out_elem_bytes)
                 )
@@ -2021,7 +2023,9 @@ def compile_mixed_moe_gemm1(
                 if _need_sort:
                     _n32_sort = _sorted_scale_cols_i32 * _c32_i32
 
-                # Mutable slot for split-K N-offset (gate=0, up=inter_dim)
+                # Mutable slot for split-K N-offset:
+                # - g1u1: gate pass uses 0, up pass uses inter_dim
+                # - g1u0: always 0 (single pass)
                 _sk_n_offset = [0]
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
@@ -2233,35 +2237,35 @@ def compile_mixed_moe_gemm1(
                     )
 
                     gpu.barrier()
-
-                    # Pass 2: up
-                    acc = acc_up
-                    _sk_n_offset[0] = inter_dim
-                    c_shuffle_epilog(
-                        arith=arith,
-                        vector=vector,
-                        gpu=gpu,
-                        scf=scf,
-                        range_constexpr=range_constexpr,
-                        tile_m=tile_m,
-                        tile_n=tile_n,
-                        e_vec=_eff_e_vec,
-                        cshuffle_nlane=_cshuffle_nlane_sk,
-                        block_size=total_threads,
-                        m_repeat=m_repeat,
-                        num_acc_n=num_acc_n,
-                        tx=tx,
-                        lane_div_16=lane_div_16,
-                        lane_mod_16=lane_mod_16,
-                        bx_m=bx_m,
-                        by_n=by_n,
-                        n_tile_base=n_tile_base,
-                        lds_out=lds_out,
-                        frag_elem_type=_frag_elem,
-                        write_row_to_lds=write_row_to_lds,
-                        precompute_row=precompute_row,
-                        store_pair=store_pair,
-                    )
+                    if _use_g1u1:
+                        # Pass 2: up
+                        acc = acc_up
+                        _sk_n_offset[0] = inter_dim
+                        c_shuffle_epilog(
+                            arith=arith,
+                            vector=vector,
+                            gpu=gpu,
+                            scf=scf,
+                            range_constexpr=range_constexpr,
+                            tile_m=tile_m,
+                            tile_n=tile_n,
+                            e_vec=_eff_e_vec,
+                            cshuffle_nlane=_cshuffle_nlane_sk,
+                            block_size=total_threads,
+                            m_repeat=m_repeat,
+                            num_acc_n=num_acc_n,
+                            tx=tx,
+                            lane_div_16=lane_div_16,
+                            lane_mod_16=lane_mod_16,
+                            bx_m=bx_m,
+                            by_n=by_n,
+                            n_tile_base=n_tile_base,
+                            lds_out=lds_out,
+                            frag_elem_type=_frag_elem,
+                            write_row_to_lds=write_row_to_lds,
+                            precompute_row=precompute_row,
+                            store_pair=store_pair,
+                        )
                 else:
                     c_shuffle_epilog(
                         arith=arith,

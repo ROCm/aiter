@@ -2012,7 +2012,7 @@ class FmoeTuner(TunerCommon):
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         flydsl_s1_kernels = get_flydsl_stage1_kernels(
-            a_dtype_str, b_dtype_str, out_dtype_str
+            a_dtype_str, b_dtype_str, out_dtype_str, model_dim=model_dim
         )
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_str, b_dtype_str, out_dtype_str
@@ -2025,8 +2025,7 @@ class FmoeTuner(TunerCommon):
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
-                if is_splitk and not use_g1u1 and b_dtype_str == "fp4":
-                    continue
+
                 if kparams.get("gate_only", False) and not use_g1u1 and b_dtype_str == "fp4":
                     continue
 

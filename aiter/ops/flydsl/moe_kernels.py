@@ -60,7 +60,7 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
 
 
 def get_flydsl_stage1_kernels(
-    a_dtype: str, b_dtype: str, out_dtype: str
+    a_dtype: str, b_dtype: str, out_dtype: str, model_dim: Optional[int] = None
 ) -> Dict[str, Dict]:
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
@@ -90,6 +90,16 @@ def get_flydsl_stage1_kernels(
                                 if tk == 512 and kb == 16:
                                     continue
                                 if tn // 32 * 64 > 256:
+                                    continue
+                            # Split-K stage1 requires:
+                            #   model_dim % k_batch == 0 and
+                            #   (model_dim // k_batch) % tile_k == 0
+                            # When model_dim is provided by the tuner, skip
+                            # kernels that can never compile for that shape.
+                            if model_dim is not None and kb > 1:
+                                if model_dim % kb != 0:
+                                    continue
+                                if (model_dim // kb) % tk != 0:
                                     continue
                             gate_onlys = [False, True] if kb > 1 and is_fp4 else [False]
                             for bnt in b_nts:
@@ -552,9 +562,10 @@ def flydsl_moe_stage1(
     When fuse_sort_scale=True, the kernel writes e8m0 scales in sorted tiled
     layout directly, avoiding a separate moe_mxfp4_sort call.
 
-    When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
-    add into a zeroed buffer, then an activation+mul helper fuses reduction.
-    Split-K is currently supported only for g1u1.
+    When k_batch>1 (split-K), the kernel writes partial sums via atomics into
+    a zeroed buffer, then runs post-activation:
+      - g1u1: reduce gate/up partials with activation+mul
+      - g1u0: reduce proj partials then apply unary activation
 
     When gate_only=True (requires use_g1u1 and k_batch>1), each workgroup computes only
     one B-tile stream (no gate/up interleaving).  The grid X doubles so
@@ -621,8 +632,9 @@ def flydsl_moe_stage1(
     dev = a.device
     _splitk_fq = _is_splitk and fuse_fp4_quant
 
-    if _is_splitk and not use_g1u1:
-        raise ValueError("g1u0 stage1 does not support k_batch > 1")
+    _splitk_out_cols = inter_dim * (2 if use_g1u1 else 1)
+    if _splitk_fq and not use_g1u1:
+        raise ValueError("split-K fused fp4 quant currently requires use_g1u1=True")
     if _splitk_fq and act not in ("silu", "swiglu"):
         raise ValueError("split-K fused fp4 quant only supports silu/swiglu stage1")
 
@@ -639,7 +651,7 @@ def flydsl_moe_stage1(
     if _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
-            (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
+            (token_num, topk, _splitk_out_cols), dtype=torch_tmp_out_dtype, device=dev
         )
     else:
         tmp_out = None
@@ -777,14 +789,27 @@ def flydsl_moe_stage1(
             ),
         )
     elif _is_splitk:
-        if act == "gelu":
-            from aiter.ops.activation import gelu_and_mul
+        if use_g1u1:
+            if act == "gelu":
+                from aiter.ops.activation import gelu_and_mul
 
-            gelu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+                gelu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+            else:
+                from aiter.ops.activation import silu_and_mul
+
+                silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
         else:
-            from aiter.ops.activation import silu_and_mul
-
-            silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
+            tmp_view = tmp_out.view(-1, inter_dim).to(torch.float32)
+            if act == "gelu":
+                out.copy_(
+                    torch.nn.functional.gelu(tmp_view, approximate="tanh")
+                    .to(out.dtype)
+                    .view_as(out)
+                )
+            else:
+                out.copy_(
+                    torch.nn.functional.silu(tmp_view).to(out.dtype).view_as(out)
+                )
 
     if fuse_fp4_quant:
         from aiter.utility.dtypes import fp8_e8m0
