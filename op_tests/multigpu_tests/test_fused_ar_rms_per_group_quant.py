@@ -14,7 +14,6 @@ Usage:
 
 import os
 from typing import Optional
-import aiter
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -28,15 +27,10 @@ from aiter.dist.parallel_state import (
     init_distributed_environment,
     set_custom_all_reduce,
     get_tp_group,
-    graph_capture,
     destroy_model_parallel,
     destroy_distributed_environment,
 )
 from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_allreduce_rmsnorm,
-)
 from aiter.test_common import (
     checkAllclose,
     perftest,
@@ -133,9 +127,7 @@ def fused_ar_rmsnorm_per_group_quant(
     # post-quant rounding.
     bf16_vs_fp8_diff = None
     if bf16_out is not None:
-        bf16_vs_fp8_diff = (
-            (bf16_out.float() - dequant).abs().max().item()
-        )
+        bf16_vs_fp8_diff = (bf16_out.float() - dequant).abs().max().item()
 
     if dist.is_initialized():
         destroy_model_parallel()
@@ -205,9 +197,9 @@ def test_fused_ar_rmsnorm_per_group_quant(
     M, K = shape
     expected_scale_shape = (M, K // group_size)
     for ss in scale_shapes:
-        assert ss == expected_scale_shape, (
-            f"Scale shape mismatch: got {ss}, expected {expected_scale_shape}"
-        )
+        assert (
+            ss == expected_scale_shape
+        ), f"Scale shape mismatch: got {ss}, expected {expected_scale_shape}"
 
     atol = 5e-2
     rtol = 5e-2
@@ -294,24 +286,52 @@ parser = argparse.ArgumentParser(
     description="Test fused AR+RMSNorm+per-group FP8 quant"
 )
 parser.add_argument(
-    "-d", "--dtype", type=str, choices=["fp16", "bf16"],
-    nargs="?", const=None, default=None,
+    "-d",
+    "--dtype",
+    type=str,
+    choices=["fp16", "bf16"],
+    nargs="?",
+    const=None,
+    default=None,
 )
 parser.add_argument(
-    "-s", "--shape", type=dtypes.str2tuple, nargs="*", default=None,
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=None,
     help="shape(s). e.g. -s 128,4096 64,4096",
 )
 parser.add_argument(
-    "-t", "--tp", type=int, nargs="?", const=None, default=None,
+    "-t",
+    "--tp",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
 )
 parser.add_argument(
-    "-p", "--pp", type=int, nargs="?", const=None, default=None,
+    "-p",
+    "--pp",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
 )
 parser.add_argument(
-    "-g", "--graphon", type=int, nargs="?", const=None, default=None,
+    "-g",
+    "--graphon",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
 )
 parser.add_argument(
-    "--group-size", type=int, nargs="?", const=None, default=None,
+    "--group-size",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
 )
 
 if __name__ == "__main__":
@@ -352,9 +372,15 @@ if __name__ == "__main__":
 
     df = pd.DataFrame(df)
     show_cols = [
-        "tp_size", "shape", "dtype", "withGraph", "emit_bf16",
-        "per_group_min_us", "per_group_max_us",
-        "per_group_err", "bf16_vs_fp8",
+        "tp_size",
+        "shape",
+        "dtype",
+        "withGraph",
+        "emit_bf16",
+        "per_group_min_us",
+        "per_group_max_us",
+        "per_group_err",
+        "bf16_vs_fp8",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
     logger.info(
