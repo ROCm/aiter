@@ -2481,18 +2481,31 @@ def run_batch_prefill_sink(
     q = build_q_tensor(total_q, num_qo_heads, head_dim, dtype, -5, 5)
 
     kv_cache = build_paged_kv_cache(
-        batch_size, kv_len, page_size, num_kv_heads, head_dim,
-        kv_lens, -5, 5, dtype, contiguous_kv=True,
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        -5,
+        5,
+        dtype,
+        contiguous_kv=True,
     )
-    kv_data_fp32        = kv_cache["kv_data_fp32"]
-    kv_indices_cpu      = kv_cache["kv_indices_cpu"]
+    kv_data_fp32 = kv_cache["kv_data_fp32"]
+    kv_indices_cpu = kv_cache["kv_indices_cpu"]
     kv_indptr_cpu_cache = kv_cache["kv_indptr_cpu"]
     kv_last_page_len_cpu = kv_cache["kv_last_page_len_cpu"]
 
     k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, contiguous_kv=True)
     k_cache, v_cache = apply_kv_layout(
-        k_cache_ref, v_cache_ref, num_kv_heads, head_dim, page_size,
-        k_vector_size, "vectorized",
+        k_cache_ref,
+        v_cache_ref,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        k_vector_size,
+        "vectorized",
     )
 
     # Build sink_ptr tensor
@@ -2512,14 +2525,24 @@ def run_batch_prefill_sink(
 
         # Full pages: [num_full_pages, page_size, num_kv_heads, head_dim]
         # Last page: [:last_len, num_kv_heads, head_dim]
-        ki = torch.cat([
-            kv_data_fp32[used_idx[:-1], 0].reshape(-1, num_kv_heads, head_dim),
-            kv_data_fp32[used_idx[-1],  0, :last_len].reshape(-1, num_kv_heads, head_dim),
-        ], dim=0).to(dtype)
-        vi = torch.cat([
-            kv_data_fp32[used_idx[:-1], 1].reshape(-1, num_kv_heads, head_dim),
-            kv_data_fp32[used_idx[-1],  1, :last_len].reshape(-1, num_kv_heads, head_dim),
-        ], dim=0).to(dtype)
+        ki = torch.cat(
+            [
+                kv_data_fp32[used_idx[:-1], 0].reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_idx[-1], 0, :last_len].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
+        vi = torch.cat(
+            [
+                kv_data_fp32[used_idx[:-1], 1].reshape(-1, num_kv_heads, head_dim),
+                kv_data_fp32[used_idx[-1], 1, :last_len].reshape(
+                    -1, num_kv_heads, head_dim
+                ),
+            ],
+            dim=0,
+        ).to(dtype)
 
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
 
@@ -2534,10 +2557,10 @@ def run_batch_prefill_sink(
     o_ref = torch.cat(o_ref_list, dim=0)
 
     # ── CK kernel ─────────────────────────────────────────────────────────────
-    kv_indptr_gpu      = kv_indptr_cpu_cache.to(0)
-    kv_indices_gpu     = kv_indices_cpu.to(0)
-    kv_last_page_lens  = kv_last_page_len_cpu.to(0)
-    cu_seqlens_q       = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_indptr_cpu_cache.to(0)
+    kv_indices_gpu = kv_indices_cpu.to(0)
+    kv_last_page_lens = kv_last_page_len_cpu.to(0)
+    cu_seqlens_q = q_indptr_cpu.to(0)
 
     out = aiter.mha_batch_prefill_func(
         q,
