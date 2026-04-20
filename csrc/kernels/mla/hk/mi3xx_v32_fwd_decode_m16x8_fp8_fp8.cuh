@@ -323,15 +323,32 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 params.p_kv_indices, kv_ld_row_base_idx, kv_start + T::kBlockN, kv_end);
         }
 
+        // kSkipCompute: this warp has no real compute on this tile; it only
+        // participates in barriers and the cooperative V-transpose so active
+        // warps' PV GEMM can complete. row_max/row_sum/oaccu freeze.
+        // Invariant (enforced by dispatcher): kSkipCompute=true implies this is
+        // the warp's epilogue iter AND the global last iter (no next tile),
+        // because per-warp causal_offset < kBlockN can defer at most one tile.
+        // kIsGlobalLast is no longer a separate param: it is exactly equivalent
+        // to (kEpilogueType != None) since epilogue now fires only on the
+        // global last tile (synchronized across warps so writes overlap).
         auto mla_main = [&]<bool kIsFirstIter,
+                            bool kSkipCompute,
                             PvGemmEpilogueType kEpilogueType,
                             bool kCheckBoundary,
-                            bool kCheckBoundaryNext,
-                            bool kIsGlobalLast>(const int32_t kv_tile_start,
-                                                const int32_t kv_tile_end) {
+                            bool kCheckBoundaryNext>(const int32_t kv_tile_start,
+                                                    const int32_t kv_tile_end) {
             constexpr bool kDoEpilogue = (kEpilogueType != PvGemmEpilogueType::None);
+            // A warp only stops loading K / swapping LDS pong on the global last
+            // tile. In the new design, "global last" coincides with either the
+            // epilogue iter (active or skip-with-epilogue) or the idle warp's
+            // single skip iter (no epilogue).
+            constexpr bool kIsGlobalLast = kSkipCompute || kDoEpilogue;
 
-            static_assert((kCheckBoundary == false) || (kDoEpilogue == true));
+            static_assert((kSkipCompute == false) || (kIsFirstIter == false),
+                          "A skipped iter cannot be the warp's first compute iter.");
+            static_assert((kSkipCompute == false) || (kCheckBoundary == false),
+                          "Skipped iters do not call softmax_scale_p so kCheckBoundary is moot.");
             static_assert((kIsGlobalLast == false) || (kCheckBoundaryNext == false));
 
             __builtin_amdgcn_s_waitcnt(0);
@@ -351,77 +368,86 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             // GEMM on NoPE
             constexpr uint32_t num_nope_iter = (k_q_nope_end + 1 - k_q_nope_begin) / 4;
-            opus::static_for<num_nope_iter>([&](auto idx) {
-                constexpr uint32_t reg_start = idx.value * 4 + k_q_nope_begin;
-                using q_range_0 =
-                    hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
-                                         2>;
-                using q_range_1 = hkdart::
-                    split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
-                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+            if constexpr(kSkipCompute == false)
+            {
+                opus::static_for<num_nope_iter>([&](auto idx) {
+                    constexpr uint32_t reg_start = idx.value * 4 + k_q_nope_begin;
+                    using q_range_0 =
+                        hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
+                                            2>;
+                    using q_range_1 = hkdart::
+                        split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
+                    hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+                    hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
-                // Load K from LDS to GPR
-                constexpr int32_t tile_idx = (reg_start - k_q_nope_begin) / 2;
-                kv_manager.template load_k_to_gpr<0, (tile_idx + 0) * T::kBlockK>(kv_0,
-                                                                                  p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<16, (tile_idx + 0) * T::kBlockK>(kv_0,
-                                                                                   p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<0, (tile_idx + 1) * T::kBlockK>(kv_1,
-                                                                                  p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(kv_1,
-                                                                                   p_lds_kv_curr);
+                    // Load K from LDS to GPR
+                    constexpr int32_t tile_idx = (reg_start - k_q_nope_begin) / 2;
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 0) * T::kBlockK>(kv_0,
+                                                                                    p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 0) * T::kBlockK>(kv_0,
+                                                                                    p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 1) * T::kBlockK>(kv_1,
+                                                                                    p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(kv_1,
+                                                                                    p_lds_kv_curr);
 
-                kv_manager.template async_load_k_tile<(idx.value + 1) * 64,
-                                                      kIsGlobalLast,
-                                                      kCheckBoundaryNext>(
-                    p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
+                    kv_manager.template async_load_k_tile<(idx.value + 1) * 64,
+                                                        kIsGlobalLast,
+                                                        kCheckBoundaryNext>(
+                        p_lds_kv_next_warp, warp_idx, params.kv_buffer, row_kv_ld_next, kv_ld_col_base);
 
-                asm volatile("s_waitcnt lgkmcnt(2)");
-                if constexpr(idx.value == 0)
-                {
-                    hk::mma_ABt(p_comp, kv_0, q_0);
-                    __builtin_amdgcn_s_setprio(15);
-                }
-                else
-                {
-                    hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
-                }
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
-            });
+                    asm volatile("s_waitcnt lgkmcnt(2)");
+                    if constexpr(idx.value == 0)
+                    {
+                        hk::mma_ABt(p_comp, kv_0, q_0);
+                        __builtin_amdgcn_s_setprio(15);
+                    }
+                    else
+                    {
+                        hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
+                    }
+                    asm volatile("s_waitcnt lgkmcnt(0)");
+                    hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
+                });
+            }
 
             // GEMM on RoPE
             constexpr uint32_t num_rope_iter = (k_q_rope_end + 1 - k_q_rope_begin) / 4;
-            opus::static_for<num_rope_iter>([&](auto idx) {
-                constexpr uint32_t reg_start = idx.value * 4 + k_q_rope_begin;
-                using q_range_0 =
-                    hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
-                                         2>;
-                using q_range_1 = hkdart::
-                    split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
-                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+            if constexpr(kSkipCompute == false)
+            {
+                opus::static_for<num_rope_iter>([&](auto idx) {
+                    constexpr uint32_t reg_start = idx.value * 4 + k_q_rope_begin;
+                    using q_range_0 =
+                        hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
+                                            2>;
+                    using q_range_1 = hkdart::
+                        split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
+                    hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+                    hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
-                // Load K from LDS to GPR
-                constexpr int32_t tile_idx = (reg_start - k_q_rope_begin) / 2;
-                kv_manager.template load_k_to_gpr<0, (tile_idx + 0 + 16) * T::kBlockK>(
-                    kv_0, p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<16, (tile_idx + 0 + 16) * T::kBlockK>(
-                    kv_0, p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<0, (tile_idx + 1 + 16) * T::kBlockK>(
-                    kv_1, p_lds_kv_curr);
-                kv_manager.template load_k_to_gpr<16, (tile_idx + 1 + 16) * T::kBlockK>(
-                    kv_1, p_lds_kv_curr);
+                    // Load K from LDS to GPR
+                    constexpr int32_t tile_idx = (reg_start - k_q_rope_begin) / 2;
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 0 + 16) * T::kBlockK>(
+                        kv_0, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 0 + 16) * T::kBlockK>(
+                        kv_0, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 1 + 16) * T::kBlockK>(
+                        kv_1, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 1 + 16) * T::kBlockK>(
+                        kv_1, p_lds_kv_curr);
 
-                asm volatile("s_waitcnt lgkmcnt(2)");
-                hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
-            });
-            __builtin_amdgcn_s_setprio(14);
+                    asm volatile("s_waitcnt lgkmcnt(2)");
+                    hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
+                    asm volatile("s_waitcnt lgkmcnt(0)");
+                    hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
+                });
+            }
+            if constexpr(kSkipCompute == false)
+            {
+                __builtin_amdgcn_s_setprio(14);
+            }
 
-            // Transpose V
+            // Transpose V (cooperative -- runs even when this warp skips compute)
             v8ui v;
             kv_manager.load_v_to_gpr(&v, warp_idx, p_lds_kv_curr);
 
@@ -448,29 +474,44 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             // Element-wise scale. Boundary problem is handled here as well.
             const uint32_t col_0_idx = lane_idx >> 4;
-            softmax_scale_p<kCheckBoundary, k_p_comp_begin>(
-                col_0_idx * 4 + kv_tile_start, kv_end_eff, params.softmax_scale);
+            if constexpr(kSkipCompute == false)
+            {
+                softmax_scale_p<kCheckBoundary, k_p_comp_begin>(
+                    col_0_idx * 4 + kv_tile_start, kv_end_eff, params.softmax_scale);
+            }
 
             // Get max of row interleaveing with transposing V
-            comp_t local_max = max_8<k_p_comp_begin, comp_t>();
+            comp_t local_max{};
+            if constexpr(kSkipCompute == false)
+            {
+                local_max = max_8<k_p_comp_begin, comp_t>();
+            }
 
             asm volatile("s_waitcnt lgkmcnt(0)"); // Wait for un-transposed V to be loaded
             __builtin_amdgcn_sched_barrier(
                 0); // For avoiding conflict between ds_bpermute and ds_read.
 
-            constexpr int32_t reduce_range = opus::get_warp_size();
-            constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
-            local_max                      = aiter::
-                warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
-                    local_max);
-            vt_manager.transpose_v(&v);
+            comp_t rescale = 1.0f;
+            if constexpr(kSkipCompute == false)
+            {
+                constexpr int32_t reduce_range = opus::get_warp_size();
+                constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
+                local_max                      = aiter::
+                    warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
+                        local_max);
+            }
+            vt_manager.transpose_v(&v); // cooperative -- always runs
 
-            const comp_t new_row_max = kIsFirstIter ? local_max : opus::max(local_max, row_max);
-            const comp_t rescale =
-                kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
-            row_max = new_row_max;
+            if constexpr(kSkipCompute == false)
+            {
+                const comp_t new_row_max =
+                    kIsFirstIter ? local_max : opus::max(local_max, row_max);
+                rescale =
+                    kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
+                row_max = new_row_max;
 
-            softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
+                softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
+            }
 
             // Prepare for output
             const uintptr_t p_lds_o    = kDoEpilogue ? p_lds_kv_curr : 0;
@@ -478,7 +519,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             vt_manager.store_transposed_v_to_lds(p_lds_vt, warp_idx, v);
 
-            if constexpr(kIsFirstIter == false)
+            if constexpr((kSkipCompute == false) && (kIsFirstIter == false))
             {
                 __builtin_amdgcn_s_setprio(8);
                 hk::mul_vgpr<0, 0>(oaccu, oaccu, rescale);
@@ -528,10 +569,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_sched_barrier(0);
 
-            pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin, true>();
-            pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin + 2, false>();
-            pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 4, true>();
-            pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 6, false>();
+            if constexpr(kSkipCompute == false)
+            {
+                pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin, true>();
+                pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin + 2, false>();
+                pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 4, true>();
+                pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 6, false>();
+            }
 
             // GEMM on PV
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
@@ -548,37 +592,42 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_range_1>
                     oaccu_1;
 
-                constexpr uint32_t kColOffsetDelta = T::kBlockK / 2;
-                constexpr uint32_t kColOffset0     = idx.value * T::kBlockK * 2;
-                constexpr uint32_t kColOffset1     = kColOffset0 + kColOffsetDelta * 1;
-                constexpr uint32_t kColOffset2     = kColOffset0 + kColOffsetDelta * 2;
-                constexpr uint32_t kColOffset3     = kColOffset0 + kColOffsetDelta * 3;
+                if constexpr(kSkipCompute == false)
+                {
+                    constexpr uint32_t kColOffsetDelta = T::kBlockK / 2;
+                    constexpr uint32_t kColOffset0     = idx.value * T::kBlockK * 2;
+                    constexpr uint32_t kColOffset1     = kColOffset0 + kColOffsetDelta * 1;
+                    constexpr uint32_t kColOffset2     = kColOffset0 + kColOffsetDelta * 2;
+                    constexpr uint32_t kColOffset3     = kColOffset0 + kColOffsetDelta * 3;
 
-                vt_manager.template load_transposed_v_to_gpr<kColOffset0, k_kv_0_begin>(p_lds_vt);
-                vt_manager.template load_transposed_v_to_gpr<kColOffset1, k_kv_0_begin + 2>(
-                    p_lds_vt);
-                vt_manager.template load_transposed_v_to_gpr<kColOffset2, k_kv_1_begin>(p_lds_vt);
-                vt_manager.template load_transposed_v_to_gpr<kColOffset3, k_kv_1_begin + 2>(
-                    p_lds_vt);
+                    vt_manager.template load_transposed_v_to_gpr<kColOffset0, k_kv_0_begin>(
+                        p_lds_vt);
+                    vt_manager.template load_transposed_v_to_gpr<kColOffset1, k_kv_0_begin + 2>(
+                        p_lds_vt);
+                    vt_manager.template load_transposed_v_to_gpr<kColOffset2, k_kv_1_begin>(
+                        p_lds_vt);
+                    vt_manager.template load_transposed_v_to_gpr<kColOffset3, k_kv_1_begin + 2>(
+                        p_lds_vt);
 
-                asm volatile("s_waitcnt lgkmcnt(4)");
-                if constexpr(kIsFirstIter)
-                {
-                    hk::mma_ABt(oaccu_0, kv_0, p_mfma);
-                }
-                else
-                {
-                    hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
-                }
+                    asm volatile("s_waitcnt lgkmcnt(4)");
+                    if constexpr(kIsFirstIter)
+                    {
+                        hk::mma_ABt(oaccu_0, kv_0, p_mfma);
+                    }
+                    else
+                    {
+                        hk::mma_ABt(oaccu_0, kv_0, p_mfma, oaccu_0);
+                    }
 
-                asm volatile("s_waitcnt lgkmcnt(0)");
-                if constexpr(kIsFirstIter)
-                {
-                    hk::mma_ABt(oaccu_1, kv_1, p_mfma);
-                }
-                else
-                {
-                    hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
+                    asm volatile("s_waitcnt lgkmcnt(0)");
+                    if constexpr(kIsFirstIter)
+                    {
+                        hk::mma_ABt(oaccu_1, kv_1, p_mfma);
+                    }
+                    else
+                    {
+                        hk::mma_ABt(oaccu_1, kv_1, p_mfma, oaccu_1);
+                    }
                 }
 
                 if constexpr(kDoEpilogue)
@@ -625,190 +674,177 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             }
         };
 
-        // Cooperative-only path for warps that have already finished compute but
-        // must keep participating in barriers and V transpose so active warps can
-        // complete their PV GEMM. Only valid on the global last tile (kIsGlobalLast
-        // is implicit). No K load and no LDS pingpong swap.
-        auto mla_dummy = [&]() {
-            __builtin_amdgcn_s_waitcnt(0);
-            __builtin_amdgcn_s_barrier();
-            __builtin_amdgcn_sched_barrier(0);
-
-            v8ui v;
-            kv_manager.load_v_to_gpr(&v, warp_idx, p_lds_kv_curr);
-
-            asm volatile("s_waitcnt lgkmcnt(0)");
-            vt_manager.transpose_v(&v);
-            vt_manager.store_transposed_v_to_lds(p_lds_vt, warp_idx, v);
-
-            asm volatile("s_waitcnt lgkmcnt(0)");
-            __builtin_amdgcn_s_barrier();
-            __builtin_amdgcn_sched_barrier(0);
-        };
-
         // Per-warp dispatch.
-        // Cooperative-uniform template params (same across warps): kIsFirstIter,
-        // kCheckBoundaryNext, kIsGlobalLast.
-        // Per-warp template params: kEpilogueType, kCheckBoundary.
-        // Since causal_offset in [0, qseqlen-1] with qseqlen <= kBlockM/kTileM = 8
-        // and kBlockN = 32, num_tiles_global - num_tiles_eff is 0 or 1.
+        // All warps execute the same number of global tiles (= num_iters). On
+        // tiles past this warp's effective end (kv_end_eff), the warp dispatches
+        // mla_main with kSkipCompute=true: it still participates in barriers and
+        // the cooperative V transpose but skips QK/softmax/PV. The epilogue
+        // (output_to_vram + LSE) fires ONLY on the global last tile and is
+        // synchronized across all working warps so the output writes overlap.
+        //
+        // Per-warp causal_offset < kBlockN (qseqlen <= 8, kBlockN = 32) means
+        // num_iters_eff in {0, num_iters - 1, num_iters}: at most 1 trailing
+        // skip iter.
+        //
+        // Per-warp template params: kEpilogueType, kCheckBoundary, kSkipCompute.
+        // Cooperative-uniform: kIsFirstIter, kCheckBoundaryNext.
         if(kv_len_eff <= 0)
         {
-            // Warp fully idle. kv_len <= causal_offset < kBlockN, so global has 1 tile.
-            mla_dummy();
+            // Warp fully idle. kv_len <= causal_offset < kBlockN, so num_iters == 1.
+            // One skip iter on the global last tile, no epilogue (no oaccu state).
+            mla_main.template
+            operator()<false, true, PvGemmEpilogueType::None, false, false>(
+                kv_start, kv_end);
         }
         else if(kv_len_eff < T::kBlockN)
         {
+            // Warp has exactly 1 partial real tile.
             if(kv_len < T::kBlockN)
             {
-                // Global has 1 tile, warp's last == global last (partial).
+                // num_iters == 1: single real iter, also the epilogue iter.
                 if(partial_qo_loc < 0)
                 {
                     mla_main.template
-                    operator()<true, PvGemmEpilogueType::OutputFinal, true, false, true>(
+                    operator()<true, false, PvGemmEpilogueType::OutputFinal, true, false>(
                         kv_start, kv_end);
                 }
                 else
                 {
                     mla_main.template
-                    operator()<true, PvGemmEpilogueType::OutputSplit, true, false, true>(
+                    operator()<true, false, PvGemmEpilogueType::OutputSplit, true, false>(
                         kv_start, kv_end);
                 }
             }
             else
             {
-                // Global has 2 tiles (kv_len in [kBlockN, kBlockN + qseqlen - 1]).
-                // Warp finishes (with epilogue) on tile 0, then mla_dummy on tile 1.
-                // Tile 1 is global last and partial -> kCheckBoundaryNext = true.
+                // num_iters == 2: real (partial) iter on tile 0, then skip+epilogue
+                // on tile 1. Tile 1 is global last and partial since
+                // kv_len in [kBlockN, kBlockN + qseqlen - 1].
+                mla_main.template
+                operator()<true, false, PvGemmEpilogueType::None, true, true>(
+                    kv_start, kv_start + T::kBlockN);
                 if(partial_qo_loc < 0)
                 {
                     mla_main.template
-                    operator()<true, PvGemmEpilogueType::OutputFinal, true, true, false>(
-                        kv_start, kv_start + T::kBlockN);
+                    operator()<false, true, PvGemmEpilogueType::OutputFinal, false, false>(
+                        kv_start + T::kBlockN, kv_end);
                 }
                 else
                 {
                     mla_main.template
-                    operator()<true, PvGemmEpilogueType::OutputSplit, true, true, false>(
-                        kv_start, kv_start + T::kBlockN);
+                    operator()<false, true, PvGemmEpilogueType::OutputSplit, false, false>(
+                        kv_start + T::kBlockN, kv_end);
                 }
-                mla_dummy();
             }
         }
         else if(kv_len_eff == T::kBlockN)
         {
+            // Warp has exactly 1 exact (full) real tile.
             if(kv_len == T::kBlockN)
             {
-                // Global has 1 tile, exact fit.
+                // num_iters == 1: single real iter, also the epilogue iter.
                 if(partial_qo_loc < 0)
                 {
                     mla_main.template
-                    operator()<true, PvGemmEpilogueType::OutputFinal, false, false, true>(
+                    operator()<true, false, PvGemmEpilogueType::OutputFinal, false, false>(
                         kv_start, kv_end);
                 }
                 else
                 {
                     mla_main.template
-                    operator()<true, PvGemmEpilogueType::OutputSplit, false, false, true>(
+                    operator()<true, false, PvGemmEpilogueType::OutputSplit, false, false>(
                         kv_start, kv_end);
                 }
             }
             else
             {
-                // Global has 2 tiles, warp does tile 0 exactly, then mla_dummy on tile 1.
-                // Tile 1 is global last; partial iff kv_len % kBlockN != 0.
+                // num_iters == 2: exact real iter on tile 0, then skip+epilogue
+                // on tile 1. kCheckBoundaryNext iff global last tile is partial.
                 const bool boundary_next = (kv_len % T::kBlockN) != 0;
                 if(boundary_next)
                 {
-                    if(partial_qo_loc < 0)
-                    {
-                        mla_main.template
-                        operator()<true, PvGemmEpilogueType::OutputFinal, false, true, false>(
-                            kv_start, kv_start + T::kBlockN);
-                    }
-                    else
-                    {
-                        mla_main.template
-                        operator()<true, PvGemmEpilogueType::OutputSplit, false, true, false>(
-                            kv_start, kv_start + T::kBlockN);
-                    }
+                    mla_main.template
+                    operator()<true, false, PvGemmEpilogueType::None, false, true>(
+                        kv_start, kv_start + T::kBlockN);
                 }
                 else
                 {
-                    if(partial_qo_loc < 0)
-                    {
-                        mla_main.template
-                        operator()<true, PvGemmEpilogueType::OutputFinal, false, false, false>(
-                            kv_start, kv_start + T::kBlockN);
-                    }
-                    else
-                    {
-                        mla_main.template
-                        operator()<true, PvGemmEpilogueType::OutputSplit, false, false, false>(
-                            kv_start, kv_start + T::kBlockN);
-                    }
+                    mla_main.template
+                    operator()<true, false, PvGemmEpilogueType::None, false, false>(
+                        kv_start, kv_start + T::kBlockN);
                 }
-                mla_dummy();
+                if(partial_qo_loc < 0)
+                {
+                    mla_main.template
+                    operator()<false, true, PvGemmEpilogueType::OutputFinal, false, false>(
+                        kv_start + T::kBlockN, kv_end);
+                }
+                else
+                {
+                    mla_main.template
+                    operator()<false, true, PvGemmEpilogueType::OutputSplit, false, false>(
+                        kv_start + T::kBlockN, kv_end);
+                }
             }
         }
-        else // kv_len_eff > kBlockN: warp processes >= 2 tiles
+        else // kv_len_eff > kBlockN: warp has >= 2 real tiles
         {
             const int32_t kv_1st_end = kv_start + T::kBlockN;
 
-            // First tile (warp not yet on last). kCheckBoundaryNext = true iff
-            // tile 1 is global last AND partial (i.e., kv_end is within tile 1).
+            // First real tile (kIsFirstIter=true). Next-tile boundary check iff
+            // the tile being prefetched (tile 1) is the global last AND partial.
             if((kv_1st_end + T::kBlockN - 1) < kv_end)
             {
                 mla_main.template
-                operator()<true, PvGemmEpilogueType::None, false, false, false>(
+                operator()<true, false, PvGemmEpilogueType::None, false, false>(
                     kv_start, kv_1st_end);
             }
             else
             {
                 mla_main.template
-                operator()<true, PvGemmEpilogueType::None, false, true, false>(
+                operator()<true, false, PvGemmEpilogueType::None, false, true>(
                     kv_start, kv_1st_end);
             }
 
             int32_t kv_idx = kv_1st_end;
-            // Middle tiles: while next tile is not warp's last active.
+            // Middle real tiles: while next tile is not warp's last real.
             while((kv_idx + T::kBlockN) < kv_end_eff)
             {
                 if((kv_idx + 2 * T::kBlockN - 1) < kv_end)
                 {
                     mla_main.template
-                    operator()<false, PvGemmEpilogueType::None, false, false, false>(
+                    operator()<false, false, PvGemmEpilogueType::None, false, false>(
                         kv_idx, kv_idx + T::kBlockN);
                 }
                 else
                 {
                     mla_main.template
-                    operator()<false, PvGemmEpilogueType::None, false, true, false>(
+                    operator()<false, false, PvGemmEpilogueType::None, false, true>(
                         kv_idx, kv_idx + T::kBlockN);
                 }
                 kv_idx += T::kBlockN;
             }
 
-            // Warp's last active tile starts at kv_idx, ends at kv_end_eff (or
-            // kv_idx+kBlockN if exact). It may or may not be the global last tile.
-            const bool warp_tile_exact = ((kv_idx + T::kBlockN) == kv_end_eff);
+            // Warp's last real tile starts at kv_idx, ends at min(kv_idx+kBlockN, kv_end_eff).
+            // It may or may not coincide with the global last tile.
+            const bool warp_tile_exact     = ((kv_idx + T::kBlockN) == kv_end_eff);
             const bool tile_is_global_last = ((kv_idx + T::kBlockN) >= kv_end);
 
             if(tile_is_global_last)
             {
-                // kIsGlobalLast = true, kCheckBoundaryNext forced false.
+                // Warp's last real == global last -> real iter with epilogue.
                 if(warp_tile_exact)
                 {
                     if(partial_qo_loc < 0)
                     {
                         mla_main.template
-                        operator()<false, PvGemmEpilogueType::OutputFinal, false, false, true>(
+                        operator()<false, false, PvGemmEpilogueType::OutputFinal, false, false>(
                             kv_idx, kv_end);
                     }
                     else
                     {
                         mla_main.template
-                        operator()<false, PvGemmEpilogueType::OutputSplit, false, false, true>(
+                        operator()<false, false, PvGemmEpilogueType::OutputSplit, false, false>(
                             kv_idx, kv_end);
                     }
                 }
@@ -817,90 +853,66 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     if(partial_qo_loc < 0)
                     {
                         mla_main.template
-                        operator()<false, PvGemmEpilogueType::OutputFinal, true, false, true>(
+                        operator()<false, false, PvGemmEpilogueType::OutputFinal, true, false>(
                             kv_idx, kv_end);
                     }
                     else
                     {
                         mla_main.template
-                        operator()<false, PvGemmEpilogueType::OutputSplit, true, false, true>(
+                        operator()<false, false, PvGemmEpilogueType::OutputSplit, true, false>(
                             kv_idx, kv_end);
                     }
                 }
             }
             else
             {
-                // Warp's last active tile is NOT global last. delta == 1.
-                // Need to load K for next (global last) tile; kCheckBoundaryNext
-                // = global_last_partial.
+                // Warp's last real is NOT the global last; one trailing skip iter
+                // does the epilogue. Real iter prefetches K for the global last
+                // tile (kCheckBoundaryNext = global_last_partial).
                 const bool boundary_next = (kv_len % T::kBlockN) != 0;
                 if(warp_tile_exact)
                 {
                     if(boundary_next)
                     {
-                        if(partial_qo_loc < 0)
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputFinal, false, true, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
-                        else
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputSplit, false, true, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
+                        mla_main.template
+                        operator()<false, false, PvGemmEpilogueType::None, false, true>(
+                            kv_idx, kv_idx + T::kBlockN);
                     }
                     else
                     {
-                        if(partial_qo_loc < 0)
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputFinal, false, false, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
-                        else
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputSplit, false, false, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
+                        mla_main.template
+                        operator()<false, false, PvGemmEpilogueType::None, false, false>(
+                            kv_idx, kv_idx + T::kBlockN);
                     }
                 }
                 else
                 {
                     if(boundary_next)
                     {
-                        if(partial_qo_loc < 0)
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputFinal, true, true, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
-                        else
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputSplit, true, true, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
+                        mla_main.template
+                        operator()<false, false, PvGemmEpilogueType::None, true, true>(
+                            kv_idx, kv_idx + T::kBlockN);
                     }
                     else
                     {
-                        if(partial_qo_loc < 0)
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputFinal, true, false, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
-                        else
-                        {
-                            mla_main.template
-                            operator()<false, PvGemmEpilogueType::OutputSplit, true, false, false>(
-                                kv_idx, kv_idx + T::kBlockN);
-                        }
+                        mla_main.template
+                        operator()<false, false, PvGemmEpilogueType::None, true, false>(
+                            kv_idx, kv_idx + T::kBlockN);
                     }
                 }
-                mla_dummy();
+                // Skip + epilogue on the global last tile.
+                if(partial_qo_loc < 0)
+                {
+                    mla_main.template
+                    operator()<false, true, PvGemmEpilogueType::OutputFinal, false, false>(
+                        kv_idx + T::kBlockN, kv_end);
+                }
+                else
+                {
+                    mla_main.template
+                    operator()<false, true, PvGemmEpilogueType::OutputSplit, false, false>(
+                        kv_idx + T::kBlockN, kv_end);
+                }
             }
         }
     }
