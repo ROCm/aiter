@@ -113,10 +113,12 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         auto_shuffle_b=False,
         c_to_lds=config["c_to_lds"],
     )
-    if bias is not None:
-        out = out + bias
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
+    if bias is not None:
+        if bias.dtype != out.dtype:
+            bias = bias.to(out.dtype)
+        out = out + bias
     return out
 
 
@@ -814,6 +816,7 @@ class GemmTuner(GemmCommonTuner):
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
         "batch": 1,
+        "config_env_name": "AITER_CONFIG_GEMM_BF16",
     }
 
     def _setup_specific_arguments(self):
@@ -867,6 +870,7 @@ class GemmTuner(GemmCommonTuner):
     def __init__(
         self,
         key=[
+            "gfx",
             "cu_num",
             "M",
             "N",
@@ -898,8 +902,81 @@ class GemmTuner(GemmCommonTuner):
 
         self.hipb_prefer_ratio = 0.995
         self.cu_num = self.get_cu_num()
+        self.gfx = self.get_gfx()
         self.gemmobj = None
         self.num_warmup = 10
+
+    def _clear_op_caches(self):
+        from aiter.tuned_gemm import get_GEMM_A16W16_config_, get_GEMM_A16W16_config
+
+        get_GEMM_A16W16_config_.cache_clear()
+        get_GEMM_A16W16_config.cache_clear()
+
+    def run_config(self, args):
+        from aiter.tuned_gemm import gemm_a16w16
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            bias = untunedf.loc[i, "bias"]
+            indtype = str(untunedf.loc[i, "dtype"])
+            outdtype = str(untunedf.loc[i, "outdtype"])
+            scaleAB = untunedf.loc[i, "scaleAB"]
+            bpreshuffle = untunedf.loc[i, "bpreshuffle"]
+            shape_str = f"({M}, {N}, {K}, {indtype}, bias={bias})"
+            try:
+                inp, weights, _, bias_tensor, x_scale, _, shuffleweights, w_scale = (
+                    generate_data(
+                        M,
+                        N,
+                        K,
+                        eval(indtype),
+                        eval(outdtype),
+                        scaleAB,
+                        bpreshuffle,
+                        0,
+                        bias,
+                    )
+                )
+                w = shuffleweights if bpreshuffle else weights
+                scale_a = x_scale if scaleAB else None
+                scale_b = w_scale if scaleAB else None
+                out, us = run_perftest(
+                    gemm_a16w16,
+                    inp,
+                    w,
+                    bias=bias_tensor,
+                    otype=eval(outdtype),
+                    scale_a=scale_a,
+                    scale_b=scale_b,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = get_gemm_ref(
+                    inp,
+                    weights,
+                    bias_tensor,
+                    x_scale,
+                    w_scale,
+                    eval(indtype),
+                    eval(outdtype),
+                )
+                _atol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                _rtol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                err_ratio = checkAllclose(
+                    out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
+                )
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+        return results
 
     def calculate_perf(
         self,
@@ -912,7 +989,7 @@ class GemmTuner(GemmCommonTuner):
         info, time, err_ratio = results
         if time <= 0:
             return -1, -1
-        cu_num, m, n, k = info
+        gfx, cu_num, m, n, k = info
         flops = m * n * k * 2
         tflops = round(flops / (time * 1000000), 2)
 
@@ -960,6 +1037,7 @@ class GemmTuner(GemmCommonTuner):
                             bpreshuffle=ds["bpreshuffle"],
                         )
             self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
+            self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             untunedf_cols = self.untunedf.columns
@@ -991,7 +1069,8 @@ class GemmTuner(GemmCommonTuner):
         print(self.tunedf)
         if self.tunedf is None or (
             self.tunedf[
-                (self.tunedf["cu_num"] == self.cu_num)
+                (self.tunedf["gfx"] == self.gfx)
+                & (self.tunedf["cu_num"] == self.cu_num)
                 & (self.tunedf["M"] == m)
                 & (self.tunedf["N"] == n)
                 & (self.tunedf["K"] == k)
@@ -1002,6 +1081,7 @@ class GemmTuner(GemmCommonTuner):
             ].empty
         ):
             entry = {
+                "gfx": [self.gfx],
                 "cu_num": [self.cu_num],
                 "M": [m],
                 "N": [n],
@@ -1028,7 +1108,9 @@ class GemmTuner(GemmCommonTuner):
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
             outdtype = outdtype if outdtype is not None else indtype
-            self.set_run_iters((self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype))
+            self.set_run_iters(
+                (self.gfx, self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype)
+            )
 
             gemmobj = Gemm(
                 ds["M"],
@@ -1064,6 +1146,7 @@ class GemmTuner(GemmCommonTuner):
             splitK = info[2]
             kernelName = info[4]
             libtype = info[3]
+            res_one.append(get_gfx())
             res_one.append(get_cu_num())
             for ele in info[0]:
                 res_one.append(ele)
@@ -1076,7 +1159,7 @@ class GemmTuner(GemmCommonTuner):
             res_one.append(kernelName)
             res_one.append(err_ratio)
             ret = (
-                (self.cu_num, info[0][0], info[0][1], info[0][2]),
+                (self.gfx, self.cu_num, info[0][0], info[0][1], info[0][2]),
                 us,
                 err_ratio,
             )
@@ -1171,7 +1254,7 @@ class GemmTuner(GemmCommonTuner):
             resultsdf.to_csv(profile_file, index=False)
 
     def set_run_iters(self, input, inputdtype):
-        cu_num, m, n, k, *rest = input
+        gfx, cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
         # bpe = self.get_bpe(inputdtype)
         if flops < 128 * 5120 * 256 * 2:
