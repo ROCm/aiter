@@ -10,7 +10,7 @@ import torch
 
 
 from .kernels.gdr_decode import create_shuffle_gdr_decode_kernel
-from .kernels.tensor_shim import get_dtype_str
+from .kernels.tensor_shim import get_dtype_str, _run_compiled
 
 __all__ = [
     "flydsl_gdr_decode",
@@ -72,21 +72,8 @@ def flydsl_gdr_decode(
         use_qk_l2norm,
         **kwargs,
     )
-    exe_compiled = exe.compile(
-        query,
-        key,
-        value,
-        a,
-        b,
-        dt_bias,
-        A_log,
-        indices,
-        state_,
-        out,
-        batch_size,
-        stream,
-    )
-    exe_compiled(
+    _run_compiled(
+        exe,
         query,
         key,
         value,
