@@ -13,11 +13,11 @@
 Run the following cmd to start tuning, please wait a few minutes as it will build batched_gemm_a8w8_tune via jit:
 `python3 csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py -i aiter/configs/a8w8_untuned_batched_gemm.csv -o aiter/configs/a8w8_tuned_batched_gemm.csv`
 You can find the results of the tuning in `aiter/configs/a8w8_tuned_batched_gemm.csv`, like this:
-    |**cu_num**|**B**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
-    |----------|-----|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
-    |80        |16   |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
+    |**gfx**  |**cu_num**|**B**|**M**|**N**|**K**|**kernelId**|**splitK**|**us**|**kernelName**|**tflops**|**bw**|**errRatio**|
+    |---------|----------|-----|-----|-----|-----|------------|----------|------|--------------|----------|------|------------|
+    |gfx942   |80        |16   |128  |1536 |7168 |23          |0         |32.99 |xxxxxxxx      |125.4     |89.5  |0.01        |
 
-    `cu_num` means the number of compute units, and it is used to distinguish between graphics.
+    `gfx` identifies the GPU architecture (e.g. `gfx942`, `gfx950`). `cu_num` is the number of compute units and distinguishes partitioned or binned variants of the same architecture (e.g. MI308X vs MI300X both use `gfx942`).
 
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_batched_gemm_a8w8.py` and run it, please wait a few minutes as it will build batched_gemm_a8w8 tuned kernels in `aiter/configs/a8w8_tuned_batched_gemm.csv` via jit:

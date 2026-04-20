@@ -6,7 +6,9 @@
 """AOT pre-compilation for MoE / Mixed-MoE FlyDSL kernels from aiter CSV configs.
 
 Reads tuned CSV config files (e.g. dsv3_fp4_tuned_fmoe.csv), extracts all
-unique FlyDSL kernel names, and pre-compiles them into the cache.
+unique FlyDSL kernel names, and pre-compiles them into the cache. The default
+CSV set is resolved through ``AITER_CONFIGS`` so model-specific tuned CSVs can
+be merged the same way as runtime JIT config lookup.
 
 Usage:
     # Compile all unique FlyDSL kernels from default CSVs
@@ -27,6 +29,7 @@ import sys
 import time
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
@@ -38,13 +41,9 @@ from aiter.ops.flydsl.moe_kernels import (
     _s2_args_std,
 )
 
-_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "../../configs/model_configs"
-)
-
+# Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
-    os.path.join(_CONFIGS_DIR, "dsv3_fp4_tuned_fmoe.csv"),
-    os.path.join(_CONFIGS_DIR, "kimik2_fp4_tuned_fmoe.csv"),
+    AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
 ]
 
 
@@ -341,7 +340,7 @@ def main():
         type=str,
         nargs="+",
         default=DEFAULT_CSVS,
-        help="Path(s) to tuned CSV config file(s)",
+        help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
     )
     args = parser.parse_args()
 

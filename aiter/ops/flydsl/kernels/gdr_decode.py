@@ -420,37 +420,4 @@ def create_shuffle_gdr_decode_kernel(
             batch_size,
         ).launch(grid=(gx, 1, 1), block=(BLOCK_THREADS, 1, 1), stream=stream)
 
-    _compile_hints = {}
-
-    def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_compile_hints):
-            return launch_gdr_decode_kernel(*args, **kwargs)
-
-    _compile_cache = {}
-
-    def _compile(
-        query, key, value, a, b, dt_bias, A_log, indices, state, out, batch_size, stream
-    ):
-        with CompilationContext.compile_hints(_compile_hints):
-            lookup_key = (query.dtype, batch_size)
-            if _compile_cache.get(lookup_key, None) is None:
-                _compile_cache[lookup_key] = flyc.compile(
-                    launch_gdr_decode_kernel,
-                    query,
-                    key,
-                    value,
-                    a,
-                    b,
-                    dt_bias,
-                    A_log,
-                    indices,
-                    state.clone(),
-                    out,
-                    batch_size,
-                    stream,
-                )
-            return _compile_cache[lookup_key]
-
-    _launch.compile = _compile
-
-    return _launch
+    return launch_gdr_decode_kernel
