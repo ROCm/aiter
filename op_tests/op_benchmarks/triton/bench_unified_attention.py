@@ -1,7 +1,6 @@
 from sys import exit
 
 import itertools
-import sys
 import argparse
 import torch
 import triton
