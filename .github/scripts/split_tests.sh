@@ -125,12 +125,10 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_fused_qk_rmsnorm_group_quant.py]=5
     FILE_TIMES[op_tests/test_aiter_sigmoid.py]=4
     FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=4
+    FILE_TIMES[op_tests/test_mha_varlen_fp8.py]=4
+    FILE_TIMES[op_tests/test_mla_prefill_ps.py]=4
     FILE_TIMES[op_tests/test_moe_topk_sigmoid.py]=4
-    FILE_TIMES[op_tests/test_moeTopkSoftmax.py]=3
-    FILE_TIMES[op_tests/test_layernorm2dFusedAddQuant.py]=3
-    FILE_TIMES[op_tests/test_rmsnorm2d.py]=3
-    FILE_TIMES[op_tests/test_rmsnorm2dFusedAddQuant.py]=3
-    FILE_TIMES[op_tests/test_aiter_sigmoid.py]=3
+    FILE_TIMES[op_tests/test_topk_row_prefill.py]=4
     FILE_TIMES[op_tests/test_layernorm2d.py]=3
     FILE_TIMES[op_tests/test_pretune.py]=1
 elif [[ "$TEST_TYPE" == "triton" ]]; then
@@ -210,6 +208,10 @@ fi
 
 get_time() {
     local abs="$1"
+    if [[ "$TEST_TYPE" == "aiter" ]] && [[ "${AITER_SKIP_PERF:-0}" == "1" ]] && [[ -n "${FAST_FILE_TIMES[$abs]+x}" ]]; then
+        echo "${FAST_FILE_TIMES[$abs]}"
+        return
+    fi
     # FILE_TIMES keys use full path (e.g. op_tests/test_mla.py), so look up with abs
     if [[ -n "${FILE_TIMES[$abs]+x}" ]]; then
         echo "${FILE_TIMES[$abs]}"
@@ -217,6 +219,73 @@ get_time() {
         echo 15
     fi
 }
+
+if [[ "$TEST_TYPE" == "aiter" ]]; then
+    # PR fast-path timings with AITER_SKIP_PERF=1.
+    declare -A FAST_FILE_TIMES
+    FAST_FILE_TIMES[op_tests/test_mla_persistent.py]=635
+    FAST_FILE_TIMES[op_tests/test_batch_prefill.py]=600
+    FAST_FILE_TIMES[op_tests/test_mha.py]=550
+    FAST_FILE_TIMES[op_tests/test_gemm_a8w8_blockscale.py]=465
+    FAST_FILE_TIMES[op_tests/test_mha_varlen.py]=417
+    FAST_FILE_TIMES[op_tests/test_mla.py]=195
+    FAST_FILE_TIMES[op_tests/test_topk_per_row.py]=106
+    FAST_FILE_TIMES[op_tests/test_topk_plain.py]=86
+    FAST_FILE_TIMES[op_tests/test_jit_dir_with_enum.py]=78
+    FAST_FILE_TIMES[op_tests/test_pa_mtp.py]=73
+    FAST_FILE_TIMES[op_tests/test_pa.py]=59
+    FAST_FILE_TIMES[op_tests/test_mla_sparse.py]=45
+    FAST_FILE_TIMES[op_tests/test_groupnorm.py]=37
+    FAST_FILE_TIMES[op_tests/test_causal_conv1d.py]=33
+    FAST_FILE_TIMES[op_tests/test_mhc.py]=33
+    FAST_FILE_TIMES[op_tests/test_mha_varlen_fp8.py]=30
+    FAST_FILE_TIMES[op_tests/test_mha_fp8.py]=30
+    FAST_FILE_TIMES[op_tests/test_split_gdr_update.py]=27
+    FAST_FILE_TIMES[op_tests/test_batched_gemm_bf16.py]=24
+    FAST_FILE_TIMES[op_tests/test_pa_ps.py]=23
+    FAST_FILE_TIMES[op_tests/test_sampling.py]=22
+    FAST_FILE_TIMES[op_tests/test_pa_ragged.py]=22
+    FAST_FILE_TIMES[op_tests/test_gemm_a4w4.py]=20
+    FAST_FILE_TIMES[op_tests/test_pa_ragged_experimental.py]=19
+    FAST_FILE_TIMES[op_tests/test_batched_gemm_a8w8.py]=18
+    FAST_FILE_TIMES[op_tests/test_gated_rmsnorm_fp8_group_quant.py]=16
+    FAST_FILE_TIMES[op_tests/test_pa_v1.py]=16
+    FAST_FILE_TIMES[op_tests/test_fused_qk_norm.py]=15
+    FAST_FILE_TIMES[op_tests/test_rope.py]=13
+    FAST_FILE_TIMES[op_tests/test_fused_qk_norm_rope_cache_quant.py]=10
+    FAST_FILE_TIMES[op_tests/test_gemm_a16w16.py]=10
+    FAST_FILE_TIMES[op_tests/test_mla_prefill_ps.py]=10
+    FAST_FILE_TIMES[op_tests/test_concat_cache_mla.py]=9
+    FAST_FILE_TIMES[op_tests/test_moe_2stage.py]=9
+    FAST_FILE_TIMES[op_tests/test_gemm_a8w8.py]=8
+    FAST_FILE_TIMES[op_tests/test_kvcache.py]=8
+    FAST_FILE_TIMES[op_tests/test_fused_qk_norm_mrope_cache_quant.py]=8
+    FAST_FILE_TIMES[op_tests/test_deepgemm.py]=8
+    FAST_FILE_TIMES[op_tests/test_quant.py]=7
+    FAST_FILE_TIMES[op_tests/test_moe_dp_share_expert.py]=7
+    FAST_FILE_TIMES[op_tests/test_moe_sorting_mxfp4.py]=6
+    FAST_FILE_TIMES[op_tests/test_moe_sorting.py]=6
+    FAST_FILE_TIMES[op_tests/test_moe_blockscale.py]=6
+    FAST_FILE_TIMES[op_tests/test_moe_tkw1.py]=6
+    FAST_FILE_TIMES[op_tests/test_moe.py]=6
+    FAST_FILE_TIMES[op_tests/test_fused_qk_rmsnorm_group_quant.py]=6
+    FAST_FILE_TIMES[op_tests/test_moe_ep.py]=5
+    FAST_FILE_TIMES[op_tests/test_aiter_addInp.py]=5
+    FAST_FILE_TIMES[op_tests/test_sample.py]=5
+    FAST_FILE_TIMES[op_tests/test_activation.py]=5
+    FAST_FILE_TIMES[op_tests/test_kvcache_blockscale.py]=5
+    FAST_FILE_TIMES[op_tests/test_aiter_add.py]=5
+    FAST_FILE_TIMES[op_tests/test_smoothquant.py]=4
+    FAST_FILE_TIMES[op_tests/test_topk_row_prefill.py]=4
+    FAST_FILE_TIMES[op_tests/test_indexer_k_quant_and_cache.py]=4
+    FAST_FILE_TIMES[op_tests/test_moe_topk_sigmoid.py]=4
+    FAST_FILE_TIMES[op_tests/test_moeTopkSoftmax.py]=3
+    FAST_FILE_TIMES[op_tests/test_layernorm2dFusedAddQuant.py]=3
+    FAST_FILE_TIMES[op_tests/test_rmsnorm2d.py]=3
+    FAST_FILE_TIMES[op_tests/test_rmsnorm2dFusedAddQuant.py]=3
+    FAST_FILE_TIMES[op_tests/test_aiter_sigmoid.py]=3
+    FAST_FILE_TIMES[op_tests/test_layernorm2d.py]=3
+fi
 
 # ------------------------------
 # LPT greedy allocation: sort first then distribute
