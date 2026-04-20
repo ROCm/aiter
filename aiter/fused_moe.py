@@ -604,9 +604,10 @@ def nextPow2(n):
 
 
 def get_padded_M(M):
-    if M == 20480:
-        return 20480
     padded_m = M
+    # Keep compatibility with historical tuning keys for this shape.
+    if padded_m == 20480:
+        return 20480
     if M < 32768:
         padded_m = nextPow2(padded_m)
     else:
@@ -726,6 +727,9 @@ def _flydsl_stage2_wrapper(
         sort_block_m=parsed.get("sort_block_m", 0),
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
+        # Keep stage2 persist behavior aligned with kernel naming.
+        # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
+        persist=parsed.get("persist", False),
     )
 
 

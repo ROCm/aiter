@@ -356,7 +356,7 @@ class FmoeTuner(TunerCommon):
             moe_buf.zero_()
 
         sort_block_m = kparams.get("sort_block_m", 0)
-        persist = kparams.get("persist", None)
+        persist = kparams.get("persist", False)
         return flydsl_moe_stage2(
             inter_states=a2_qt,
             w2=w2_shuffled_flydsl,

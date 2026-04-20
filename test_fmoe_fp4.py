@@ -57,7 +57,7 @@ out, us_aiter = run_perftest(
     None,
     0,
     num_iters=100,
-    num_warmup=2,
+    num_warmup=10,
     testGraph=False,
     num_rotate_args=0,
     needTrace=False,

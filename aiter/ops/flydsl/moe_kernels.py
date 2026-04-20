@@ -486,6 +486,12 @@ def _run_compiled(exe, args):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
     """
+    # flydsl>=0.1.2 exposes flydsl.compiler.compile; older versions (e.g.
+    # 0.1.1.dev409) only provide jit wrappers and execute via exe(*args).
+    if not hasattr(flyc, "compile"):
+        exe(*args)
+        return
+
     cf = getattr(exe, "_aiter_cf", None)
     if cf is None:
         cf = flyc.compile(exe, *args)
@@ -866,7 +872,8 @@ def flydsl_moe_stage2(
     if persist is True:
         _persist_m = -1
     elif persist is False:
-        _persist_m = 4 if m_blocks > 256 else 1
+        # _persist_m = 4 if m_blocks > 256 else 1
+        _persist_m = 1  # _persist_m = 1 is better for g1u0
     else:
         _persist_m = -1 if m_blocks > 256 else 1
 
