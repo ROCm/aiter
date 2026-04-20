@@ -175,6 +175,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "$OUT_DIR/baseline" "$OUT_DIR/optimized/accumulative" "$OUT_DIR/optimized/individual"
+# Normalise OUT_DIR to an absolute path. Without this, a relative OUT_DIR (e.g. ./results/...)
+# breaks when benchmark subshells do `cd <worktree>` — the relative path then resolves inside
+# the worktree instead of the original directory. Also strips any trailing slash.
+OUT_DIR=$(cd "$OUT_DIR" && pwd)
+MANIFEST="$OUT_DIR/kernel_opt_worktrees.manifest"
 
 module_under_test="module_custom_all_reduce"
 
@@ -504,9 +509,11 @@ run_claude_prompt() {
   # remain kernel-agnostic; the actual targets are driven by env vars.
   local kernel_file_abs
   if [[ "${KERNEL_FILE:-}" == /* ]]; then
-    kernel_file_abs="$KERNEL_FILE"
+    # Absolute path: re-anchor to the worktree by replacing the repo root prefix.
+    # e.g. /aiter-test/csrc/... → <worktree>/csrc/...
+    kernel_file_abs="${KERNEL_FILE/#$REPO_ROOT/$workspace}"
   else
-    kernel_file_abs="$REPO_ROOT/${KERNEL_FILE:-csrc/include/custom_all_reduce.cuh}"
+    kernel_file_abs="$workspace/${KERNEL_FILE:-csrc/include/custom_all_reduce.cuh}"
   fi
   local kernels_formatted="" k
   # Normalise commas to spaces so both "a,b" and "a b" work as separators.
@@ -517,6 +524,7 @@ run_claude_prompt() {
   if [[ -z "$kernels_formatted" ]]; then
     kernels_formatted=$'\n'"    cross_device_reduce_1stage"$'\n'"    cross_device_reduce_2stage"
   fi
+  prompt_text="${prompt_text//\{\{REPO_ROOT\}\}/$workspace}"
   prompt_text="${prompt_text//\{\{KERNEL_FILE\}\}/$kernel_file_abs}"
   prompt_text="${prompt_text//\{\{KERNELS_TO_OPTIMIZE\}\}/$kernels_formatted}"
 
