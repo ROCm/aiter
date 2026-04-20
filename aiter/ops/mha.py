@@ -2751,6 +2751,7 @@ def mha_batch_prefill_fake_tensors(
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
+    sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[torch.Tensor] = None,

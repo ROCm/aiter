@@ -2414,16 +2414,21 @@ def ref_masked_attention_with_sink(
     # [num_heads, seqlen_q, seqlen_k]
     attn = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
 
-    # Build mask: True = should be masked (set to -inf)
-    for i_q in range(seqlen_q):
-        abs_q = seqlen_k - seqlen_q + i_q  # bottom-right causal absolute position
-        k_end = abs_q
-        k_start_window = 0 if window_left < 0 else max(sink_size, abs_q - window_left)
-        for i_k in range(seqlen_k):
-            is_sink = i_k < sink_size
-            is_window = k_start_window <= i_k <= k_end
-            if not (is_sink or is_window):
-                attn[:, i_q, i_k] = float("-inf")
+    # Build mask vectorized to avoid per-element GPU synchronization
+    # i_q: [seqlen_q, 1], i_k: [1, seqlen_k]
+    i_q = torch.arange(seqlen_q, device=query.device).unsqueeze(1)  # [sq, 1]
+    i_k = torch.arange(seqlen_k, device=query.device).unsqueeze(0)  # [1, sk]
+    abs_q = seqlen_k - seqlen_q + i_q  # [sq, 1]
+    k_end = abs_q  # causal boundary
+    if window_left < 0:
+        k_start_window = torch.zeros_like(abs_q)
+    else:
+        k_start_window = torch.clamp(abs_q - window_left, min=sink_size)
+    is_sink = i_k < sink_size  # [1, sk]
+    is_window = (i_k >= k_start_window) & (i_k <= k_end)  # [sq, sk]
+    valid = is_sink | is_window  # [sq, sk]
+    # attn: [H, sq, sk] — broadcast mask over heads
+    attn.masked_fill_(~valid.unsqueeze(0), float("-inf"))
 
     if sink_ptr_value is not None:
         # Append virtual sink token column: logit = sink_ptr_value[h] (scaled space)
