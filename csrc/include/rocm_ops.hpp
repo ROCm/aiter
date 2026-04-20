@@ -451,7 +451,8 @@ namespace py = pybind11;
           py::arg("group_size"),                                                                \
           py::arg("reg_ptr"),                                                                   \
           py::arg("reg_bytes"),                                                                 \
-          py::arg("use_1stage"));                                                               \
+          py::arg("use_1stage"),                                                                \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \

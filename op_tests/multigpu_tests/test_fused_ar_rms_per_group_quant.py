@@ -80,8 +80,14 @@ def fused_ar_rmsnorm_per_group_quant(
     group_size=128,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
+    emit_bf16: bool = False,
 ):
-    """Run fused AR+RMSNorm+per-group-quant on a single rank."""
+    """Run fused AR+RMSNorm+per-group-quant on a single rank.
+
+    When ``emit_bf16=True`` the kernel ALSO writes the pre-quantization
+    bf16/fp16 normed output; we cross-check that bf16 output against the
+    fp8+scale dequant to verify the two outputs agree to FP8 precision.
+    """
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     set_custom_all_reduce(True)
@@ -104,23 +110,39 @@ def fused_ar_rmsnorm_per_group_quant(
 
     @perftest()
     def run_fused(x):
-        out, res_out, scale_out = (
-            tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-                x, x, weight, eps, group_size=group_size
-            )
+        res = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+            x, x, weight, eps, group_size=group_size, emit_bf16=emit_bf16
         )
+        if emit_bf16:
+            out, res_out, scale_out, bf16_out = res
+            return out, scale_out, res_out, bf16_out
+        out, res_out, scale_out = res
         return out, scale_out, res_out
 
     result, us = run_fused(x)
-    out_fp8, scale_out, res_out = result
+    if emit_bf16:
+        out_fp8, scale_out, res_out, bf16_out = result
+    else:
+        out_fp8, scale_out, res_out = result
+        bf16_out = None
     dequant = out_fp8.float() * scale_out.repeat_interleave(group_size, dim=-1)
+
+    # When requesting bf16 output, verify it matches the fp8+scale dequant
+    # at FP8 precision: both are produced by the same fused kernel from the
+    # same internal fp32 normed value, so they should differ only by the
+    # post-quant rounding.
+    bf16_vs_fp8_diff = None
+    if bf16_out is not None:
+        bf16_vs_fp8_diff = (
+            (bf16_out.float() - dequant).abs().max().item()
+        )
 
     if dist.is_initialized():
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
 
-    return dequant.to(x.dtype), us, scale_out.shape
+    return dequant.to(x.dtype), us, scale_out.shape, bf16_vs_fp8_diff
 
 
 @benchmark()
@@ -132,6 +154,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
     group_size=128,
     withGraph=False,
     distributed_init_method: Optional[str] = None,
+    emit_bf16: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -158,6 +181,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
                     group_size,
                     withGraph,
                     distributed_init_method,
+                    emit_bf16,
                 ),
             )
         )
@@ -174,8 +198,9 @@ def test_fused_ar_rmsnorm_per_group_quant(
         cpu_rslt.append(host_normed)
 
     rets = [el.get() for el in rets]
-    all_us = [us for _, us, _ in rets]
-    scale_shapes = [ss for _, _, ss in rets]
+    all_us = [us for _, us, _, _ in rets]
+    scale_shapes = [ss for _, _, ss, _ in rets]
+    bf16_diffs = [bd for _, _, _, bd in rets if bd is not None]
 
     M, K = shape
     expected_scale_shape = (M, K // group_size)
@@ -187,10 +212,11 @@ def test_fused_ar_rmsnorm_per_group_quant(
     atol = 5e-2
     rtol = 5e-2
     max_err = 0.0
-    for dequant_out, us, _ in rets:
+    for dequant_out, us, _, _ in rets:
         msg = (
             f"test_fused_ar_rmsnorm_per_group_quant: "
-            f"{shape=} {dtype=} {group_size=} {withGraph=} {us:>8.2f}"
+            f"{shape=} {dtype=} {group_size=} {withGraph=} "
+            f"{emit_bf16=} {us:>8.2f}"
         )
         err = checkAllclose(
             cpu_rslt[dequant_out.device.index],
@@ -201,24 +227,68 @@ def test_fused_ar_rmsnorm_per_group_quant(
         )
         max_err = max(max_err, err)
 
+    # bf16 side-output correctness: should agree with fp8+scale dequant to
+    # within at most one FP8 quantization step (~3% relative).
+    max_bf16_vs_fp8 = max(bf16_diffs) if bf16_diffs else 0.0
+    if emit_bf16:
+        assert max_bf16_vs_fp8 < 1.0, (
+            f"bf16 side-output disagrees with fp8 dequant by "
+            f"{max_bf16_vs_fp8}, expected <1.0"
+        )
+
     return {
+        "emit_bf16": emit_bf16,
         "per_group_min_us": min(all_us),
         "per_group_max_us": max(all_us),
         "per_group_err": max_err,
+        "bf16_vs_fp8": max_bf16_vs_fp8,
     }
 
 
 l_dtype = ["bf16"]
+# Default matrix covers:
+#   * Unaligned token counts (13, 17) that exercise the thread-padding path.
+#   * Decode-scale batches (1, 32, 128, 512).
+#   * Prefill-scale batches (1024, 2048) that straddle the 1-stage (<=128KB),
+#     2-stage (<=512KB), and split (>512KB) kernel dispatch boundaries.
+#   * Hidden sizes covering the common FP8/MoE model families:
+#       4096   Qwen3.5-FP8, Qwen3-MoE, Mixtral 8x7B, Llama 3 8B
+#       6144   Mixtral 8x22B, some hybrid configs
+#       7168   DeepSeek-V2/V3
+#       8192   Llama 3/3.1 70B, GLM-4
 l_shape = [
+    # hidden = 4096 (Qwen3.5-FP8 / Qwen3-MoE / Mixtral 8x7B / Llama 3 8B)
     (13, 4096),
     (17, 4096),
-    (64, 4096),
+    (1, 4096),
+    (32, 4096),
     (128, 4096),
+    (512, 4096),
+    (1024, 4096),
+    (2048, 4096),
+    # hidden = 6144 (Mixtral 8x22B)
+    (1, 6144),
+    (32, 6144),
+    (128, 6144),
+    (512, 6144),
+    # hidden = 7168 (DeepSeek-V2/V3)
+    (1, 7168),
+    (32, 7168),
+    (128, 7168),
+    (512, 7168),
+    # hidden = 8192 (Llama 3/3.1 70B / GLM-4)
+    (1, 8192),
+    (32, 8192),
+    (128, 8192),
+    (512, 8192),
 ]
 l_tp = [8]
 l_pp = [1]
 l_graph = [False]
 l_group_size = [128]
+# Cover both the fp8-only output (keep_bf16=False, std-attention layers)
+# and the fp8+bf16 dual-output (keep_bf16=True, GDN-style layers).
+l_emit_bf16 = [False, True]
 
 parser = argparse.ArgumentParser(
     description="Test fused AR+RMSNorm+per-group FP8 quant"
@@ -263,8 +333,8 @@ if __name__ == "__main__":
         l_group_size = [args.group_size]
 
     df = []
-    for dtype, shape, tp, pp, graph_on, gs in itertools.product(
-        l_dtype, l_shape, l_tp, l_pp, l_graph, l_group_size
+    for dtype, shape, tp, pp, graph_on, gs, emit_bf16 in itertools.product(
+        l_dtype, l_shape, l_tp, l_pp, l_graph, l_group_size, l_emit_bf16
     ):
         ret = test_fused_ar_rmsnorm_per_group_quant(
             tp,
@@ -276,13 +346,15 @@ if __name__ == "__main__":
             distributed_init_method=get_distributed_init_method(
                 get_ip(), get_open_port()
             ),
+            emit_bf16=emit_bf16,
         )
         df.append(ret)
 
     df = pd.DataFrame(df)
     show_cols = [
-        "tp_size", "shape", "dtype", "withGraph",
-        "per_group_min_us", "per_group_max_us", "per_group_err",
+        "tp_size", "shape", "dtype", "withGraph", "emit_bf16",
+        "per_group_min_us", "per_group_max_us",
+        "per_group_err", "bf16_vs_fp8",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
     logger.info(

@@ -461,11 +461,13 @@ class GroupCoordinator:
         eps: float,
         group_size: int = 128,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        emit_bf16: bool = False,
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
-            input_, residual_inp_, weight_, eps, group_size, prefill_support
+            input_, residual_inp_, weight_, eps, group_size, prefill_support,
+            emit_bf16=emit_bf16,
         )
 
     def _fused_allreduce_rmsnorm_out_place(

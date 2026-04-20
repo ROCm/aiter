@@ -85,7 +85,8 @@ void fused_allreduce_rmsnorm_quant_per_group(fptr_t _fa,
                                              int64_t group_size,
                                              int64_t reg_ptr,
                                              int64_t reg_bytes,
-                                             bool use_1stage);
+                                             bool use_1stage,
+                                             int64_t bf16_out_ptr = 0);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_input_buffer(fptr_t _fa,

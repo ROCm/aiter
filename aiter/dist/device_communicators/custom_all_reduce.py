@@ -740,6 +740,7 @@ class CustomAllreduce:
         group_size: int = 128,
         registered: bool = False,
         use_1stage: bool = False,
+        emit_bf16: bool = False,
     ):
         res_out = torch.empty_like(inp)
         K = inp.shape[-1]
@@ -748,6 +749,15 @@ class CustomAllreduce:
         scale_out = torch.empty(
             inp.shape[:-1] + (num_groups,), dtype=torch.float32, device=inp.device
         )
+        # Optional bf16/fp16 mirror of the pre-quantization normed output.
+        # Requested by GDN-style layers that also need an unquantized view
+        # (e.g. Qwen3.5 in_proj_ba). Zero-overhead when not requested
+        # because the kernel branches on the pointer being non-null.
+        bf16_out = None
+        bf16_ptr = 0
+        if emit_bf16:
+            bf16_out = torch.empty_like(inp)
+            bf16_ptr = int(bf16_out.data_ptr())
         reg = 0 if registered else self._pool["input"].data_ptr
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.fused_allreduce_rmsnorm_quant_per_group(
@@ -763,7 +773,10 @@ class CustomAllreduce:
             reg,
             reg_bytes,
             use_1stage,
+            bf16_ptr,
         )
+        if emit_bf16:
+            return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
 
     def custom_fused_ar_rms_per_group_quant(
@@ -774,6 +787,7 @@ class CustomAllreduce:
         eps: float,
         group_size: int = 128,
         use_1stage: bool = False,
+        emit_bf16: bool = False,
     ):
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -783,6 +797,7 @@ class CustomAllreduce:
                     input, residual_inp, w=weight, eps=eps,
                     group_size=group_size, registered=True,
                     use_1stage=use_1stage,
+                    emit_bf16=emit_bf16,
                 )
             else:
                 K = input.shape[-1]
@@ -792,12 +807,20 @@ class CustomAllreduce:
                     input.shape[:-1] + (num_groups,),
                     dtype=torch.float32, device=input.device,
                 )
+                if emit_bf16:
+                    return (
+                        dummy_out,
+                        torch.zeros_like(input),
+                        dummy_scale,
+                        torch.zeros_like(input),
+                    )
                 return dummy_out, torch.zeros_like(input), dummy_scale
         else:
             return self.fused_ar_rms_per_group_quant(
                 input, residual_inp, w=weight, eps=eps,
                 group_size=group_size, registered=False,
                 use_1stage=use_1stage,
+                emit_bf16=emit_bf16,
             )
 
     def close(self):

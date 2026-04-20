@@ -296,10 +296,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
         eps,
         group_size=128,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        emit_bf16: bool = False,
+    ):
+        """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
+        pre-quantization bf16/fp16 normed output.
+
+        When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
+        used by GDN-style layers that have both an FP8 projection and a bf16
+        gating projection consuming the same normed activation, so they can
+        skip the separate per-group quant kernel entirely (see Qwen3.5).
+        """
         total_bytes = input_.numel() * input_.element_size()
         K = input_.shape[-1]
         fused_ok = False
+        out = res_out = scale_out = bf16_out = None
         if (
             K % group_size == 0
             and K <= 16384
@@ -313,9 +324,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 else (total_bytes <= 128 * 1024)
             )
             try:
-                out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_per_group_quant(
-                    input_, res_inp_, weight_, eps, group_size, use_1stage
+                result = self.ca_comm.custom_fused_ar_rms_per_group_quant(
+                    input_, res_inp_, weight_, eps, group_size, use_1stage,
+                    emit_bf16=emit_bf16,
                 )
+                if emit_bf16:
+                    out, res_out, scale_out, bf16_out = result
+                else:
+                    out, res_out, scale_out = result
                 fused_ok = True
             except Exception:
                 pass
@@ -325,9 +341,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
+            if emit_bf16:
+                bf16_out = out_
         assert out is not None
         assert res_out is not None
         assert scale_out is not None
+        if emit_bf16:
+            assert bf16_out is not None
+            return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:

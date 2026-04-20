@@ -72,7 +72,8 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
     eps: float,
     group_size: int = 128,
     prefill_support: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    emit_bf16: bool = False,
+):
     return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
         input_,
         residual_inp_,
@@ -80,6 +81,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
         eps,
         group_size,
         prefill_support,
+        emit_bf16=emit_bf16,
     )
 
 
