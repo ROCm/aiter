@@ -9,10 +9,11 @@ whether the optional dependency exists before relying on FlyDSL kernels.
 """
 
 from importlib.metadata import PackageNotFoundError, version
+from packaging.version import Version
 
 from .utils import is_flydsl_available
 
-_MIN_FLYDSL_VERSION = "0.1.3"
+_MIN_FLYDSL_VERSION = Version("0.1.3")
 
 __all__ = [
     "is_flydsl_available",
@@ -27,7 +28,7 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
-    _base_version = installed_flydsl_version.split("+")[0]
+    _base_version = Version(installed_flydsl_version.split("+")[0])
     if _base_version < _MIN_FLYDSL_VERSION:
         raise ImportError(
             "Unsupported `flydsl` version: "
