@@ -1281,19 +1281,23 @@ def _flash_attn_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
-        ret = ret and (hdim_q == 128)
+        gfx = get_gfx()
+        if gfx not in ("gfx942", "gfx950"):
+            return False
+        ret = (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
         )
-        # support per tensor and per head quant scale
-        ret = ret and (
-            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
-        )
-        ret = ret and (
-            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
-        )
+        if gfx == "gfx942":
+            # gfx942: per tensor and per head quant scale
+            ret = ret and (
+                q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+            )
+            ret = ret and (
+                q_descale.shape == k_descale.shape
+                and q_descale.shape == v_descale.shape
+            )
         return ret
 
     def can_impl_fmha_v3_fwd():
@@ -1307,6 +1311,10 @@ def _flash_attn_forward(
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        if ret and get_gfx() == "gfx950" and q.dtype == dtypes.fp8:
+            ret = ret and (not causal)
+            ret = ret and (nhead_q == nhead_k)
+            ret = ret and (seqlen_q == seqlen_k)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2062,19 +2070,22 @@ def _flash_attn_varlen_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
-        ret = ret and (hdim_q == 128)
+        gfx = get_gfx()
+        if gfx not in ("gfx942", "gfx950"):
+            return False
+        ret = (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
         )
-        # support per tensor and per head quant scale
-        ret = ret and (
-            q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
-        )
-        ret = ret and (
-            q_descale.shape == k_descale.shape and q_descale.shape == v_descale.shape
-        )
+        if gfx == "gfx942":
+            ret = ret and (
+                q_descale.shape == (1,) or q_descale.shape == (batch_size, nhead_k)
+            )
+            ret = ret and (
+                q_descale.shape == k_descale.shape
+                and q_descale.shape == v_descale.shape
+            )
         return ret
 
     def can_impl_fmha_v3_fwd():
@@ -3044,6 +3055,13 @@ def flash_attn_fp8_pertensor_func(
         )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+
+    _is_gfx950_fp8 = get_gfx() == "gfx950" and q.dtype == dtypes.fp8
+    if _is_gfx950_fp8:
+        # gfx950 FP8 kernel folds q/k descales into softmax_scale and
+        # applies v_descale in-kernel (output is BF16 directly).
+        softmax_scale = softmax_scale * q_descale.item() * k_descale.item()
+
     head_size_q_og = q.size(3)
     head_size_v_og = v.size(3)
     if head_size_q_og % 8 != 0:

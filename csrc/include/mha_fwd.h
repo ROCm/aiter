@@ -356,6 +356,39 @@ struct __attribute__((packed)) fmha_fwd_v3_args
     p3 _p40;
 };
 
+// Simplified args struct for gfx950 FP8 FMHA kernel (f8_mha_hd128.sp3).
+// This kernel uses a flat BHSD layout with unified Q/K/V strides.
+// Limitations: no causal mask, no GQA, no variable seqlen, no descaling, no LSE.
+struct __attribute__((packed)) fmha_fwd_v3_fp8_950_args
+{
+    void* ptr_o;
+    p2 _p0;
+    const void* ptr_q;
+    p2 _p1;
+    const void* ptr_k;
+    p2 _p2;
+    const void* ptr_v;
+    p2 _p3;
+    float scalar;
+    p3 _p4;
+    float log2e;
+    p3 _p5;
+    unsigned int seq_len;
+    p3 _p6;
+    unsigned int s_Ts;
+    p3 _p7;
+    unsigned int s_Hs;
+    p3 _p8;
+    unsigned int s_Bs;
+    p3 _p9;
+    unsigned int inst_addr_lo;
+    p3 _p10;
+    unsigned int inst_addr_hi;
+    p3 _p11;
+    float v_descale;
+    p3 _p12;
+};
+
 __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      const ck_tile::stream_config& s);
 

@@ -251,12 +251,46 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     impl_ptr =
         &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name.c_str()); });
 
+    int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
+    auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
+
+    // gfx950 FP8 kernel has a simpler arg layout (no LSE, no GQA, no descaling)
+    if(arch_id == "gfx950" && a.data_type == "fp8bf16")
+    {
+        fmha_fwd_v3_fp8_950_args fp8_args{};
+        size_t arg_size      = sizeof(fp8_args);
+        fp8_args.ptr_o       = a.o_ptr;
+        fp8_args.ptr_q       = a.q_ptr;
+        fp8_args.ptr_k       = a.k_ptr;
+        fp8_args.ptr_v       = a.v_ptr;
+        fp8_args.scalar      = a.scale_s;
+        fp8_args.log2e       = a.scale_s * 1.4426950408889634f;
+        fp8_args.seq_len     = a.seqlen_q;
+        fp8_args.s_Ts        = cfg.ts_qo * a.stride_q; // bpe=1 for fp8
+        fp8_args.s_Hs        = a.nhead_stride_q;        // bpe=1 for fp8
+        fp8_args.s_Bs        = a.batch_stride_q;         // bpe=1 for fp8
+        // KERNEL_PREFETCH=1 needs a valid GPU address for instruction prefetch.
+        // Any valid device pointer works; Q is convenient and always valid.
+        auto q_addr = reinterpret_cast<uintptr_t>(a.q_ptr);
+        fp8_args.inst_addr_lo = static_cast<uint32_t>(q_addr & 0xFFFFFFFF);
+        fp8_args.inst_addr_hi = static_cast<uint32_t>((q_addr >> 32) & 0xFFFFFFFF);
+
+        fp8_args.v_descale = 1.0f;
+        if (a.v_descale_ptr) {
+            hipMemcpy(&fp8_args.v_descale, a.v_descale_ptr, sizeof(float), hipMemcpyDeviceToHost);
+        }
+
+        return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+            void* args_ptr       = &fp8_args;
+            size_t* arg_size_ptr = &arg_size;
+            impl_ptr->launch_kernel(
+                {args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
+        });
+    }
+
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);
     init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
-
-    int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
-    auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
         // Explicit assignment forces evaluation order and prevents compiler from

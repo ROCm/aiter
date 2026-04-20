@@ -6,6 +6,7 @@ import aiter
 from aiter import dtypes
 from aiter.test_common import run_perftest
 from aiter import per_tensor_quant
+from aiter.jit.utils.chip_info import get_gfx
 import pytest
 import pandas as pd
 import argparse
@@ -57,7 +58,9 @@ def run_ck(
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 8])
-@pytest.mark.parametrize("nheads, nheads_k", [(8, 1), (40, 8), (32, 8), (5, 1)])
+@pytest.mark.parametrize(
+    "nheads, nheads_k", [(8, 1), (40, 8), (32, 8), (5, 1), (5, 5), (8, 8), (32, 32)]
+)
 @pytest.mark.parametrize(
     "d,d_v",
     [
@@ -78,6 +81,7 @@ def run_ck(
         (1024, 1023),
         (2048, 2048),
         (4096, 4096),
+        (75520, 75520),
     ],
 )
 def test_flash_attn_output(
@@ -91,6 +95,17 @@ def test_flash_attn_output(
     causal,
     local,
 ):
+    gfx = get_gfx()
+    is_gfx950 = gfx == "gfx950"
+
+    if is_gfx950:
+        if causal:
+            pytest.skip("gfx950 FP8 kernel does not support causal masking")
+        if nheads != nheads_k:
+            pytest.skip("gfx950 FP8 kernel does not support GQA (nheads must equal nheads_k)")
+        if seqlen_q != seqlen_k:
+            pytest.skip("gfx950 FP8 kernel requires seqlen_q == seqlen_k")
+
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
@@ -119,6 +134,12 @@ def test_flash_attn_output(
     k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
     v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
+    if is_gfx950:
+        # gfx950 FP8 kernel expects BHSD-contiguous data presented as BSHD view
+        q_quant = q_quant.transpose(1, 2).contiguous().transpose(1, 2)
+        k_quant = k_quant.transpose(1, 2).contiguous().transpose(1, 2)
+        v_quant = v_quant.transpose(1, 2).contiguous().transpose(1, 2)
+
     out, us_quant_fwd = run_ck(
         q_quant,
         k_quant,
@@ -129,7 +150,12 @@ def test_flash_attn_output(
         k_descale,
         v_descale,
     )
-    out_ref, us_fwd = run_ck(q, k, v, causal, window_size)
+    if is_gfx950:
+        # gfx950 FP8: kernel output is fully dequantized (descales folded in Python),
+        # so reference uses the original BF16 data
+        out_ref, us_fwd = run_ck(q, k, v, causal, window_size)
+    else:
+        out_ref, us_fwd = run_ck(q, k, v, causal, window_size)
 
     abs_diff = (out - out_ref).abs()
     max_diff = abs_diff.max().item()

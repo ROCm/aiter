@@ -241,10 +241,11 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     } else if (q_dtype == torch::kBFloat16) {
         dtype_str = "bf16";
     } else if (is_qkv_fp8) {
-        if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
-            dtype_str = "fp8bf16"; // only support bf16 out for fp8
+        if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16
+            || out_.value().dtype() == q_dtype)  // gfx950: FP8 output allowed
+            dtype_str = "fp8bf16";
         else
-            TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
+            TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 or same FP8 type");
     }
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
@@ -325,11 +326,14 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
-    auto out_type = dtype_str == "fp8bf16" ? torch::kBFloat16 : q.scalar_type();
+    bool is_gfx950_fp8 = (dtype_str == "fp8bf16") && (get_gpu_arch() == "gfx950");
+    // gfx950 FP8 kernel now outputs BF16 directly (with in-kernel v_descale + conversion).
+    auto out_type = (dtype_str == "fp8bf16") ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
+        TORCH_CHECK(out.dtype() == out_type,
+            "For FP8 input, output must have dtype BF16. For FP16/BF16 input, output must match input dtype");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size_v);
@@ -338,7 +342,14 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
         }
     }
     else {
-        out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type));
+        if (is_gfx950_fp8) {
+            // Kernel uses shared strides for Q/K/V (FP8) and derives output strides as 2×.
+            // Output is BF16 in BHSD physical layout, presented as BSHD view.
+            out = torch::empty({batch_size, num_heads, seqlen_q, head_size_v},
+                               opts.dtype(out_type)).transpose(1, 2);
+        } else {
+            out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type));
+        }
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
