@@ -158,7 +158,7 @@ def run_ck(
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no", "bias", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
@@ -210,14 +210,14 @@ def test_flash_attn_output(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     return_lse = True
@@ -372,6 +372,7 @@ def test_flash_attn_output(
         * nheads
         * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     )
+    fwd_flop = fwd_flop / 2 if causal else fwd_flop
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
         batch_size
@@ -379,15 +380,19 @@ def test_flash_attn_output(
         * dtype_bytes
         * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
     )
+    fwd_num_bytes = fwd_num_bytes / 2 if causal else fwd_num_bytes
     bwd_flop = (
         batch_size
         * nheads
         * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
     )
+    bwd_flop = bwd_flop / 2 if causal else bwd_flop
     bwd_num_bytes = (
         2 * fwd_num_bytes
         + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
+    bwd_num_bytes = bwd_num_bytes / 2 if causal else bwd_num_bytes
+
     ret = {}
     ret["fwd_us"] = us_fwd
     ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
@@ -411,7 +416,7 @@ def flash_attn_output_benchmark(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
@@ -427,7 +432,7 @@ def flash_attn_output_benchmark(
         local,
         bias_type,
         deterministic,
-        mha_type,
+        gqa_ratio,
         dtype,
         input_layout,
     )
@@ -438,7 +443,7 @@ def flash_attn_output_benchmark(
     ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
 )
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no"])
 @pytest.mark.parametrize("local", [False, True])
@@ -491,14 +496,14 @@ def test_flash_attn_seq_padding(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
 ):
 
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     if bias_type == "bias":
@@ -694,7 +699,7 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=6,
+    default=16,
     help="""Number of heads. Default is 6.
     e.g.: -n 8""",
 )
@@ -777,14 +782,14 @@ parser.add_argument(
          -det false # disable deterministic attention""",
 )
 parser.add_argument(
-    "-m",
-    "--mha_type",
-    type=str,
+    "-gr",
+    "--gqa_ratio",
+    type=int,
     nargs="+",
-    choices=["mha", "mqa", "gqa"],
-    default=["mha", "mqa", "gqa"],
-    help="""Type of multi-head attention.
-    e.g.: -m mha""",
+    choices=[1, 8],
+    default=[1, 8],
+    help="""gqa ratio.
+    e.g.: -gr 8""",
 )
 parser.add_argument(
     "-d",
@@ -812,14 +817,14 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         causal,
         local,
         deterministic,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.causal,
         args.local,
         args.deterministic,
@@ -836,7 +841,7 @@ if __name__ == "__main__":
             local,
             args.bias_type,
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
             args.input_layout,
         )
@@ -854,7 +859,7 @@ if __name__ == "__main__":
             local,
             args.bias_type if args.bias_type != "bias" else "no",
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
         )
 
