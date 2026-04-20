@@ -15,7 +15,6 @@ PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.NONE)
 
-
 @gluon.jit
 def elementwise_max_prop_nan(a, b):
     return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
@@ -1400,7 +1399,6 @@ class AttentionProgram:
                 [self.cfg.BLOCK_Q, STORE_COLS],
                 layout=o_smem_layout,
             )
-            c#asted_out = gl.where(o_mask, casted_out, 0.0)
             o_smem.reshape([self.cfg.BLOCK_M, self.cfg.HEAD_SIZE]).store(casted_out)
 
             o_base = (
@@ -2091,17 +2089,21 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     k0_s, k1_s = pgm.split_subtile(k)
     qk0 = pgm.compute_qk_subtile(k0_s)
     # Assume non-causal will always have 1 unmasked valid tile
-    if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
+    #if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
+    if cfg.CAUSAL:
         qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
     qk1 = pgm.compute_qk_subtile(k1_s)
-    if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
+    #if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
+    if cfg.CAUSAL:
         qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
 
     # Inline softmax init for tile 0 (mirrors subtile_split's prologue):
     # produce m_ij/alpha/M and seed the loop's carry state (p0, qk1_shifted).
-    qk = pgm.concat_subtile(qk0, qk1)
-    qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
-    m = reduce_max_prop_nan(qk, -1)
+    #qk = pgm.concat_subtile(qk0, qk1)
+    #qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
+    m0 = reduce_max_prop_nan(qk0, -1)
+    m1 = reduce_max_prop_nan(qk1, -1)
+    m = elementwise_max_prop_nan(m0, m1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
     m_diff_scaled = M * QK_scale - m_ij_scaled
@@ -2134,6 +2136,7 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     #   S4: PV subtile 1   + SM0-B (qk0_shifted/qk1_shifted from qk0/qk1, p0 = exp2(qk0_shifted))
     # Merged wait: single async_wait(1) at stage 1 drains V_j and K_{j+2};
     # V_{j+1} stays pending into next iter. Non-merged: async_wait(2) per stage.
+    
     for j in range(pgm.tile_start, pgm.tile_end - 3):
         next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
 
@@ -2165,9 +2168,9 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 
         # SM1-A: finalize the deferred half of last tile's softmax, and fold
         # alpha into the accumulators.
-        p1 = gl.exp2(qk1_shifted)
+        qk1_shifted0, qk1_shifted1 = pgm.split_subtile(qk1_shifted)
+        p10 = gl.exp2(qk1_shifted0)
         acc0 = acc0 * alpha[:, None]
-        acc1 = acc1 * alpha[:, None]
 
         # Split v (full V of tile j) into two subtile halves in-register.
         v0_s, v1_s = pgm.split_subtile(v)
@@ -2183,6 +2186,9 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 
         # WMMA: QK subtile 1 for tile j+1
         qk1 = pgm.compute_qk_subtile(k1_s)
+        p11 = gl.exp2(qk1_shifted0)
+        acc1 = acc1 * alpha[:, None]
+        p1 = pgm.concat_subtile(p10, p11)
 
         # SM1-B: assemble full p for PV, update L, cast p to storage dtype.
         p = pgm.concat_subtile(p0, p1)
@@ -2202,11 +2208,11 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 
         # WMMA: PV subtile 0 for tile j
         acc0 = pgm.compute_pv(p, v0_s, acc0)
-
         # SM0-A: reduce_max over full qk for tile j+1, update M and alpha.
         qk = pgm.concat_subtile(qk0, qk1)
         qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
         m = reduce_max_prop_nan(qk, -1)
+
         m_ij = elementwise_max_prop_nan(M, m)
         m_ij_scaled = m_ij * QK_scale
         m_diff_scaled = M * QK_scale - m_ij_scaled
@@ -2253,14 +2259,15 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     with gl.amd.warp_pipeline_stage("stage1"):
         # Early V store for tile L+2 (MERGE + N=3 path).
 
-
         # QK subtiles for tile L+1 (k register = K_{L+1}).
         k0_s, k1_s = pgm.split_subtile(k)
         qk0 = pgm.compute_qk_subtile(k0_s) 
-        if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        #if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        if cfg.CAUSAL:
             qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)     
         qk1 = pgm.compute_qk_subtile(k1_s)
-        if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        #if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        if cfg.CAUSAL:
             qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
 
         # ds_load V of tile L
@@ -2269,7 +2276,7 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
             wait_count=v_wait, buffer_id=buf_tile_cur,
             target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
         )
-
+    
         # SM1 for tile L (same shape as steady-state stages 1+2 SM1).
         p1 = gl.exp2(qk1_shifted)
         acc0 = acc0 * alpha[:, None]
@@ -2282,7 +2289,6 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
             p = p.to(q.dtype)
         else:
             p = p.to(q.dtype, fp_downcast_rounding="rtz")
-
         # Late V store for tile L+2 (non-MERGE or N=2 path).
         if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
             kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
@@ -2301,6 +2307,9 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
         qk = pgm.concat_subtile(qk0, qk1)
         qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
         m = reduce_max_prop_nan(qk, -1)
+        # m0 = reduce_max_prop_nan(qk0, -1)
+        # m1 = reduce_max_prop_nan(qk1, -1)
+        # m = elementwise_max_prop_nan(m0, m1)
         m_ij = elementwise_max_prop_nan(M, m)
         m_ij_scaled = m_ij * QK_scale
         m_diff_scaled = M * QK_scale - m_ij_scaled
