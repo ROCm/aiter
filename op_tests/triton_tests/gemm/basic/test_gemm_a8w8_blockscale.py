@@ -3,6 +3,7 @@
 
 import torch
 import pytest
+import importlib.util
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
@@ -18,6 +19,30 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
+
+
+def get_gpu_arch():
+    """Get the GPU architecture name (e.g., 'gfx1250', 'gfx942')."""
+    if not torch.cuda.is_available():
+        return None
+    props = torch.cuda.get_device_properties(0)
+    return getattr(props, "gcnArchName", None)
+
+
+def is_flydsl_supported():
+    """Check if flydsl kernels are supported on the current GPU."""
+    if importlib.util.find_spec("flydsl") is None:
+        return False
+    arch = get_gpu_arch()
+    return arch is not None and arch.startswith("gfx1250")
+
+
+def _flydsl_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, y):
+    """Lazy import and call the flydsl gemm_a8w8_blockscale kernel."""
+    from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_gfx1250 import (
+        gemm_a8w8_blockscale as flydsl_gemm,
+    )
+    return flydsl_gemm(x, weight, x_scale, w_scale, y=y, dtype=dtype)
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -45,12 +70,40 @@ e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_x_vals():
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    # GPT-OSS-120B attention projections
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
-    x_vals += [(v, 9216, 7168) for v in (128, 192, 4096, 8000)]
-    x_vals += [(v, 7168, 4608) for v in (128, 192, 4096, 8000)]
-    x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
+    # K must be a multiple of 128 (kernel constraint); M and N are free.
+    x_vals = [
+        # Aligned baselines
+        (128, 128, 128),
+        (256, 256, 256),
+        (512, 512, 512),
+        (128, 256, 512),
+        (256, 512, 256),
+        # Tiny M / N (masking at tile edges)
+        (1, 1, 128),
+        (1, 16, 128),
+        (16, 1, 128),
+        (1, 3, 128),
+        # Unaligned M and N, aligned K
+        (3, 5, 128),
+        (7, 9, 128),
+        (17, 33, 128),
+        (63, 127, 128),
+        (65, 129, 128),
+        # Unaligned M/N with multi-tile K
+        (17, 33, 512),
+        (63, 127, 256),
+        (129, 31, 512),
+        # Asymmetric rectangular
+        (32, 256, 128),
+        (256, 32, 128),
+        (128, 128, 1024),
+        (1024, 128, 128),
+        (1535, 512, 768),
+        (1536, 511, 768),
+        # User-requested shapes
+        (32, 5120, 2944),
+        (2048, 5120, 2944),
+    ]
     return x_vals
 
 
@@ -131,6 +184,7 @@ def generate_gemm_a8w8_blockscale_inputs(
         # "gluon",
         "triton",
         "triton_shuffle",
+        "flydsl",
     ],
 )
 def test_gemm(dtype, M, N, K, layout, output, impl: str):
@@ -143,6 +197,9 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         pytest.skip(
             "Gluon implementation is not supported on this device (requires CDNA4/gfx950)."
         )
+
+    if impl == "flydsl" and not is_flydsl_supported():
+        pytest.skip("FlyDSL not supported (requires gfx1250 and flydsl package)")
 
     if impl == "triton_shuffle":
         if N % 16 > 0 or K % 32 > 0:
@@ -186,6 +243,8 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         impl = triton_gemm_a8w8_blockscale
     elif impl == "triton_shuffle":
         impl = triton_gemm_a8w8_blockscale_preshuffle
+    elif impl == "flydsl":
+        impl = _flydsl_gemm_a8w8_blockscale
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
