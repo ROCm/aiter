@@ -2644,3 +2644,32 @@ def test_batch_prefill_sink(
         dtype=dtype,
         seed=seed,
     )
+
+
+# CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
+# above only executes the non-sink scenarios. Add a small representative sweep
+# of the StreamLLM sink scenarios here so they actually exercise in CI.
+if __name__ == "__main__":
+    sink_cases = list(
+        itertools.product(
+            [(128, 512), (1024, 2048)],  # (window_left, kv_len)
+            [4],  # sink_size
+            [None, 2.0],  # sink_ptr_value
+            [torch.bfloat16],  # dtype
+        )
+    )
+    for (window_left, kv_len), sink_size, sink_ptr_value, dtype in sink_cases:
+        run_batch_prefill_sink(
+            batch_size=1,
+            qo_len=128,
+            kv_len=kv_len,
+            page_size=16,
+            num_qo_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            window_left=window_left,
+            sink_size=sink_size,
+            sink_ptr_value=sink_ptr_value,
+            dtype=dtype,
+            seed=42,
+        )
