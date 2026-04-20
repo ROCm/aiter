@@ -6,7 +6,10 @@ import itertools
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.int4_utils import *
+from aiter.int4_utils import (
+    convert_int8_to_uint32_int4,
+    rearrange_4bit_elements,
+)
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
@@ -326,7 +329,7 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
-    err = checkAllclose(
+    checkAllclose(
         out2_ref,
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
