@@ -1824,7 +1824,7 @@ def test_batch_prefill_large_kvcache(
 
     if scatter_pages:
         # Interleave: [0, N-1, 1, N-2, 2, N-3, ...] so adjacent logical tokens
-        # map to physically distant pages (low <-> high, spanning >4GB gap).
+        # map to physically distant pages (low <-> high, spanning >2GB gap).
         lo = torch.arange(0, num_blocks, 2, dtype=torch.int32)
         hi = torch.arange(num_blocks - 1, -1, -2, dtype=torch.int32)
         page_indices = torch.zeros(num_blocks, dtype=torch.int32)
