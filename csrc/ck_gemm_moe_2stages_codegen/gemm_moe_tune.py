@@ -2025,9 +2025,7 @@ class FmoeTuner(TunerCommon):
         ck_stage1_splitk_kernels = {}
         splitk_list = []
         enable_stage1_splitk = (
-            use_splitk
-            and is_fp8_blockscale
-            and (token * topk <= expert)
+            use_splitk and is_fp8_blockscale and (token * topk <= expert)
         )
         if enable_stage1_splitk:
             tilek = 128
