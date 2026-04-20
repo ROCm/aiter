@@ -46,7 +46,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.compiler.protocol import fly_values
-from flydsl.expr import arith, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -478,10 +478,12 @@ def compile_small_m_hgemm_kernel(
     )
     WAVES_PER_EU = (
         int(WAVES_PER_EU_HINT)
-        if WAVES_PER_EU_HINT > 0
-        else (2 if WIDE_N_B_TO_LDS else 0)
+        if const_expr(WAVES_PER_EU_HINT > 0)
+        else (2 if const_expr(WIDE_N_B_TO_LDS) else 0)
     )
-    EFFECTIVE_B_TO_LDS_UNROLL = int(B_TO_LDS_UNROLL) if B_TO_LDS_UNROLL > 0 else 8
+    EFFECTIVE_B_TO_LDS_UNROLL = (
+        int(B_TO_LDS_UNROLL) if const_expr(B_TO_LDS_UNROLL > 0) else 8
+    )
 
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
@@ -532,7 +534,7 @@ def compile_small_m_hgemm_kernel(
         n_tile_repeat=N_TILE_REPEAT,
         persistent_n_tiles=PERSISTENT_N_TILES,
         waves_per_eu=WAVES_PER_EU,
-        b_to_lds_unroll=EFFECTIVE_B_TO_LDS_UNROLL if B_TO_LDS else 0,
+        b_to_lds_unroll=EFFECTIVE_B_TO_LDS_UNROLL if const_expr(B_TO_LDS) else 0,
         b_to_lds=B_TO_LDS,
         has_bias=HAS_BIAS,
     )
@@ -568,7 +570,7 @@ def compile_small_m_hgemm_kernel(
             shape=(STAGES * BLOCK_M * BLOCK_K,),
         )
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        if B_TO_LDS:
+        if const_expr(B_TO_LDS):
             smem_b_ptr = SmemPtr(
                 base_ptr,
                 smem_b_offset,
@@ -590,7 +592,7 @@ def compile_small_m_hgemm_kernel(
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
         block_n_tiles = n // BLOCK_N
-        tile_group = PERSISTENT_N_TILES if PERSISTENT_N else N_TILE_REPEAT
+        tile_group = PERSISTENT_N_TILES if const_expr(PERSISTENT_N) else N_TILE_REPEAT
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         tile_block_n_indices = [
@@ -639,7 +641,7 @@ def compile_small_m_hgemm_kernel(
                 n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                 row_idx = m_offset + fx.Index(m_local_idx)
                 init_vec = zero_vec
-                if HAS_BIAS:
+                if const_expr(HAS_BIAS):
                     init_vec = bias_g.vec_load(
                         (tile_n_offset + n_local_idx,), LDG_VEC_SIZE
                     )
@@ -888,7 +890,7 @@ def compile_small_m_hgemm_kernel(
             return vecs
 
         def maybe_ldg_matrix_b(k_offset, tile_n_offset, tile_active):
-            if N_TILE_REPEAT == 1:
+            if const_expr(N_TILE_REPEAT == 1):
                 return ldg_matrix_b(k_offset, tile_n_offset)
             load_if = scf.IfOp(
                 tile_active,
@@ -982,7 +984,7 @@ def compile_small_m_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    if HAS_BIAS:
+                    if const_expr(HAS_BIAS):
                         bias_vec = bias_g.vec_load(
                             (tile_n_offset + n_local_idx,), LDG_VEC_SIZE
                         )
@@ -1012,9 +1014,9 @@ def compile_small_m_hgemm_kernel(
                         )
                         cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
 
-        if IS_SPLIT_K:
+        if const_expr(IS_SPLIT_K):
             cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
-            if not B_TO_LDS:
+            if const_expr(not B_TO_LDS):
                 cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_ks0_if.then_block):
                     for tile_i in range_constexpr(N_TILE_REPEAT):
@@ -1048,7 +1050,7 @@ def compile_small_m_hgemm_kernel(
             rocdl.sched_barrier(0)
             gpu.barrier()
 
-        if B_TO_LDS:
+        if const_expr(B_TO_LDS):
 
             def ldg_sts_b_async(k_offset, lds_stage, tile_n_offset):
                 for i in range_constexpr(LDG_REG_B_COUNT_AS):
@@ -1118,7 +1120,7 @@ def compile_small_m_hgemm_kernel(
 
             def run_b_to_lds_tile(tile_n_offset, tile_counter_idx):
                 c_frags_local = [acc_init] * C_FRAGS_LEN
-                if IS_SPLIT_K:
+                if const_expr(IS_SPLIT_K):
                     cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
                     with ir.InsertionPoint(cond_ks0_if.then_block):
                         zero_c_tile(BIAS_, tile_n_offset)
@@ -1142,7 +1144,7 @@ def compile_small_m_hgemm_kernel(
                         WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
                     )
                     LDG_TOTAL = LDG_REG_A_COUNT_AS + LDG_REG_B_COUNT_AS
-                    if WIDE_N_B_TO_LDS:
+                    if const_expr(WIDE_N_B_TO_LDS):
                         for _ in range_constexpr(WARP_K_STEPS * WARP_M_STEPS):
                             rocdl.sched_dsrd(1)
                         for _ in range_constexpr(WARP_K_STEPS * WARP_N_STEPS):
@@ -1222,7 +1224,7 @@ def compile_small_m_hgemm_kernel(
 
                 write_c_frags_to_lds(c_frags_local)
                 gpu.barrier()
-                if IS_SPLIT_K:
+                if const_expr(IS_SPLIT_K):
                     split_k_barrier(COUNTER, tile_counter_idx)
                     store_split_k_tile(tile_n_offset)
                 else:
@@ -1359,7 +1361,7 @@ def compile_small_m_hgemm_kernel(
                 with ir.InsertionPoint(tile_store_if.then_block):
                     write_c_frags_to_lds(tile_c_frags[tile_i])
                     gpu.barrier()
-                    if IS_SPLIT_K:
+                    if const_expr(IS_SPLIT_K):
                         split_k_barrier(COUNTER, tile_counter_indices[tile_i])
                         store_split_k_tile(tile_n_offsets[tile_i])
                     else:
@@ -1382,7 +1384,7 @@ def compile_small_m_hgemm_kernel(
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             allocator.finalize()
-        if WAVES_PER_EU > 0:
+        if const_expr(WAVES_PER_EU > 0):
             for op in ctx.gpu_module_body.operations:
                 if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
                     op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
@@ -1390,7 +1392,7 @@ def compile_small_m_hgemm_kernel(
                     )
 
         bm = (m + BLOCK_M - 1) // BLOCK_M
-        tile_group = PERSISTENT_N_TILES if PERSISTENT_N else N_TILE_REPEAT
+        tile_group = PERSISTENT_N_TILES if const_expr(PERSISTENT_N) else N_TILE_REPEAT
         bn = (n // BLOCK_N + tile_group - 1) // tile_group
         small_m_hgemm_kernel._func.__name__ = KERNEL_NAME
         small_m_hgemm_kernel(C, A, B, BIAS, m, COUNTER, signal_state).launch(

@@ -303,7 +303,7 @@ def compile_hgemm_kernel(
                     n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
                     row_idx = m_offset + fx.Index(m_local_idx)
                     init_vec = zero_vec
-                    if HAS_BIAS:
+                    if const_expr(HAS_BIAS):
                         init_vec = bias_g.vec_load(
                             (n_offset + n_local_idx,), LDG_VEC_SIZE
                         )
@@ -686,11 +686,11 @@ def compile_hgemm_kernel(
                 for _ in range_constexpr(WARP_K_STEPS * WARP_N_STEPS):
                     rocdl.sched_dsrd(1)
                 for _ in range_constexpr(
-                    LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
+                    LDG_REG_A_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_A_COUNT
                 ):
                     rocdl.sched_vmem(1)
                 for _ in range_constexpr(
-                    LDG_REG_B_COUNT_AS if ASYNC_COPY else LDG_REG_B_COUNT
+                    LDG_REG_B_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_B_COUNT
                 ):
                     rocdl.sched_vmem(1)
                 for _ in range_constexpr(
@@ -753,7 +753,9 @@ def compile_hgemm_kernel(
                 mfma_total = (
                     WARP_K_STEPS * WARP_M_STEPS * WARP_N_STEPS * MFMA_PER_WARP_K
                 )
-                ldg_reg_a_count_ = LDG_REG_A_COUNT_AS if ASYNC_COPY else LDG_REG_A_COUNT
+                ldg_reg_a_count_ = (
+                    LDG_REG_A_COUNT_AS if const_expr(ASYNC_COPY) else LDG_REG_A_COUNT
+                )
                 ldg_total = ldg_reg_a_count_ + WARP_K_STEPS * WARP_N_STEPS
                 mfma_ = OnlineScheduler(mfma_total, mfma_total)
                 ldg_ = OnlineScheduler(ldg_total, ldg_total)
@@ -889,7 +891,7 @@ def compile_hgemm_kernel(
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                    if HAS_BIAS:
+                    if const_expr(HAS_BIAS):
                         bias_vec = BIAS_.vec_load(
                             (n_offset + n_local_idx,), LDG_VEC_SIZE
                         )
