@@ -234,13 +234,14 @@ class AiterAsmKernel: private AiterAsmKernelFast
     private:
     std::unique_ptr<char[]> hsaco_data;
 
-    const void* load_hsaco_file(const char* hsaco_path)
+    const void* load_hsaco_file(const char* kernel_name, const char* hsaco_path)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         std::string arch_name     = get_gpu_arch();
         if(AITER_ASM_DIR != nullptr)
         {
             std::string full_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco_path;
+            AITER_LOG_INFO("RegisterKernel: " << kernel_name << " hsaco: " << full_path);
 
             std::ifstream file(full_path, std::ios::binary | std::ios::ate);
 
@@ -257,10 +258,11 @@ class AiterAsmKernel: private AiterAsmKernelFast
         else
         {
 #if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
-            std::string fname = "hsa/" + arch_name + "/" + hsaco;
+            std::string fname = "hsa/" + arch_name + "/" + hsaco_path;
             auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
             AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
             AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
+            AITER_LOG_INFO("RegisterKernel: " << kernel_name << " hsaco: [embedded] " << fname);
             return hasco_obj->second.data();
 #else
             AITER_CHECK(AITER_ASM_DIR != nullptr, "AITER_ASM_DIR not set");
@@ -272,8 +274,7 @@ class AiterAsmKernel: private AiterAsmKernelFast
     public:
     AiterAsmKernel(const char* kernel_name, const char* hsaco_path)
     {
-        AITER_LOG_INFO("hipModuleLoad: " << hsaco_path << " GetFunction: " << kernel_name);
-        init(kernel_name, load_hsaco_file(hsaco_path));
+        init(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
     };
 
     using AiterAsmKernelFast::launch_kernel;
