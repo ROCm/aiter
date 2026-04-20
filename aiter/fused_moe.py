@@ -604,6 +604,8 @@ def nextPow2(n):
 
 
 def get_padded_M(M):
+    if M == 20480:
+        return 20480
     padded_m = M
     if M < 32768:
         padded_m = nextPow2(padded_m)

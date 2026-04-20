@@ -2097,13 +2097,17 @@ class FmoeTuner(TunerCommon):
                     s2_kname = kname
                 else:
                     s2_tile_m = kparams["tile_m"]
-                    if blockM % s2_tile_m != 0:
+                    if s2_tile_m != blockM:
                         continue
-                    # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
-                    if s2_tile_m != blockM and s2_tile_m != blockM // 2:
-                        continue
-                    s2_kparams = {**kparams, "sort_block_m": blockM}
-                    s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
+                    # if blockM % s2_tile_m != 0:
+                    #     continue
+                    # # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
+                    # if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                    #     continue
+                    s2_kparams = kparams
+                    s2_kname = kname
+                    # s2_kparams = {**kparams, "sort_block_m": blockM}
+                    # s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
                 tasks_flydsl.append(
                     (
                         (info, "stage2", s2_kname, blockM),
