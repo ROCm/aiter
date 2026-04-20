@@ -87,7 +87,7 @@ def run_gemm_asm(
 
 @benchmark()
 def test_gemm(dtype, M, N, K):
-    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
     if get_gfx() not in ["gfx950"]:
         return

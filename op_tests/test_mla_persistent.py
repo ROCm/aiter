@@ -11,9 +11,70 @@ import itertools
 import argparse
 import pandas as pd
 import math
+import os
+from pathlib import Path
+from typing import Union
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
+
+
+def dump_mla_metadata_v1_txt(
+    filepath: Union[str, Path],
+    *,
+    batch: int,
+    q_seq_len: int,
+    max_num_blocks: int,
+    work_q: int,
+    work_kv: int,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    col_width: int = 5,
+) -> None:
+    """
+    Dump MLA v1 persistent metadata to a text file.
+
+    Per-TG columns use the first work item in that TG (work_indptr[tg]).
+    work_info_set columns: batch_idx, partial_index, q_start, q_end, kv_start, kv_end, ...
+    """
+    path = Path(filepath)
+    wi = work_indptr.detach().cpu().to(torch.int64).tolist()
+    wis = work_info_set.detach().cpu().to(torch.int32)
+    total_tgs = len(wi) - 1
+    w = col_width
+
+    def tg_first_work_row(tg: int):
+        if tg < 0 or tg >= total_tgs:
+            return None
+        w0 = int(wi[tg])
+        w1 = int(wi[tg + 1])
+        if w0 >= w1 or w0 >= wis.shape[0]:
+            return None
+        return wis[w0]
+
+    def line_for(name: str, pick) -> str:
+        parts = []
+        for tg in range(total_tgs):
+            row = tg_first_work_row(tg)
+            parts.append(pick(row) if row is not None else 0)
+        nums = " ".join(f"{v:>{w}}" for v in parts)
+        return f"{name}:\n    {nums}\n"
+
+    work_ind_line = " ".join(f"{int(v):>{w}}" for v in wi)
+
+    lines = [
+        f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
+        f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n",
+        line_for("bs_indptr", lambda r: int(r[0].item())),
+        line_for("partial_indptr", lambda r: int(r[1].item())),
+        line_for("w_q_start", lambda r: int(r[2].item())),
+        line_for("w_q_end", lambda r: int(r[3].item())),
+        line_for("w_kv_start", lambda r: int(r[4].item())),
+        line_for("w_kv_end", lambda r: int(r[5].item())),
+        f"work_indptr:\n    {work_ind_line}\n",
+    ]
+    path.write_text("".join(lines), encoding="utf-8")
+
 
 # current supported case in ps decode MLA: mtp == 0, 1, 2, 3 (decode_qlen = 1, 2, 3, 4)
 # qdtype bf16, kdtype bf16: nhead16
@@ -25,7 +86,7 @@ torch.set_printoptions(sci_mode=False)
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.bf16 and nhead == 32:
+    if dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942":
         return False
     return True
 
@@ -341,7 +402,8 @@ def torch_mla_extend(
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
-    lse = torch.concat(lses).transpose(0, 1)
+    # Each lse is (nheads, seq_q_i); concatenate query positions along dim=1, then (total_q, nheads).
+    lse = torch.concat(lses, dim=1).transpose(0, 1)
     return o, lse
 
 
@@ -386,6 +448,7 @@ def torch_mla_extend_split_kv(
     final_lse = torch.empty(total_q, nheads, dtype=torch.float32, device=dev)
 
     io_transformed = False
+    use_qseqlen_fold = False
     q_ratio = 1
     if (
         nheads == 16
@@ -397,22 +460,58 @@ def torch_mla_extend_split_kv(
             and is_fp8_kvc
             and max_seqlen_q == 4
         )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 32
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 2
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 8
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 4
+        )
+        or (
+            get_gfx() == "gfx950"
+            and nheads == 64
+            and is_fp8_q
+            and is_fp8_kvc
+            and max_seqlen_q == 1
+        )
+        or (
+            get_gfx() == "gfx950"
+            and (nheads * max_seqlen_q) % 128 == 0
+            and not is_fp8_q
+            and not is_fp8_kvc
+        )
     ):
         # Natively support cases
         pass
     elif nheads in range(32, 128 + 1, 16):
         # we use nhead=16 to simulate such cases by customized metadata
         # metadata also views qo's tensor as shape (total_s * (nhead // 16), 16, ...)
-        fold_factor = nheads // 16
+        ori_nheads = nheads
         use_qseqlen_fold = (
             get_gfx() == "gfx950"
             and is_fp8_q
             and is_fp8_kvc
-            and max_seqlen_q * fold_factor == 4
+            and (
+                (max_seqlen_q * (nheads // 16)) == 4
+                or (nheads == 64 and max_seqlen_q == 2)
+            )
         )
+
+        if use_qseqlen_fold and nheads == 64 and max_seqlen_q == 2:
+            fold_factor = nheads // 32
+            nheads = 32
+        else:
+            fold_factor = nheads // 16
+            nheads = 16
+
         total_s = total_q * fold_factor
-        ori_nheads = nheads
-        nheads = 16
         if use_qseqlen_fold:
             max_seqlen_q = max_seqlen_q * fold_factor
             q_ratio = 1
@@ -519,7 +618,14 @@ def torch_mla_extend_split_kv(
         partial_lse,
     )
 
-    return partial_o, partial_lse, final_out, final_lse, io_transformed
+    return (
+        partial_o,
+        partial_lse,
+        final_out,
+        final_lse,
+        io_transformed,
+        use_qseqlen_fold,
+    )
 
 
 def torch_mla_reduce_v1(
@@ -693,7 +799,7 @@ def torch_mla_split_kv_and_reduce(
     kv_scale=None,
 ):
     total_q, nhead, _ = q.shape
-    partial_out, partial_lse, split_out, split_lse, io_transformed = (
+    partial_out, partial_lse, split_out, split_lse, io_transformed, use_qseqlen_fold = (
         torch_mla_extend_split_kv(
             q,
             kv_cache,
@@ -727,7 +833,7 @@ def torch_mla_split_kv_and_reduce(
     )
 
     if io_transformed:
-        if max_seqlen_q == 1:
+        if max_seqlen_q == 1 or use_qseqlen_fold:
             split_out = split_out.reshape(total_q, nhead, kv_lora_rank)
             split_lse = split_lse.reshape(total_q, nhead)
         else:
@@ -846,6 +952,7 @@ def test_mla(
     non_persistent_mode,
     paged_layout,
     scale_dim,
+    return_lse,
 ):
     ret = {}
 
@@ -1019,11 +1126,34 @@ def test_mla(
         dtype_kv=kvtype,
     )
 
+    if os.environ.get("DUMP_MLA_METADATA", ""):
+        kv_gran = max(page_size, 16)
+        max_num_blocks = max(
+            (int(seq_lens_kv[i].item()) + kv_gran - 1) // kv_gran
+            for i in range(batch_size)
+        )
+        num_works = int(work_indptr[-1].item())
+        if num_works > 0:
+            r0 = work_info_set[0, :6].detach().cpu()
+            hdr_work_q = int(r0[3].item() - r0[2].item())
+        else:
+            hdr_work_q = int(max_seqlen_qo)
+        dump_mla_metadata_v1_txt(
+            os.environ.get("MLA_METADATA_DUMP_PATH", "mla_metadata_dump.txt"),
+            batch=batch_size,
+            q_seq_len=int(max_seqlen_qo),
+            max_num_blocks=max_num_blocks,
+            work_q=hdr_work_q,
+            work_kv=kv_gran,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+        )
+
     # """ test code for decode_update_mla_metadata_v1 """
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
     # print(f"{work_indptr=}")
-    # print(f"{work_info_set[:32]=}")
+    # print(f"{work_info_set[:work_indptr[-1].item()]=}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
@@ -1190,17 +1320,11 @@ def test_mla(
             intra_batch_mode=non_persistent_mode,
         )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         err = checkAllclose(
             out_ref,
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-
         if not non_persistent_mode:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
@@ -1287,33 +1411,26 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
             intra_batch_mode=non_persistent_mode,
-            return_lse=False,
+            return_lse=return_lse,
         )
 
-        # print(f"{out_ref.view(total_q, -1)=}")
-        # print(f"{out_asm.view(total_q, -1)=}")
-        # checkAllclose(logits_ref, attn_logits,
-        #               msg=f'attn_logits [golden vs aiter_asm]')
-        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         err = checkAllclose(
             out_ref,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
 
+        if not non_persistent_mode and return_lse:
+            err = checkAllclose(
+                lse_ref,
+                attn_lse.reshape(total_q, nhead),
+                msg=f"mla_decode-absorb_fp8    [lse_ref vs attn_lse]: {us_asm_decode:>8.2f} us......",
+            )
         err = checkAllclose(
             out_ref_fp8,
             out_asm,
             msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-
-        # # Turn on this if kernel has lse output
-        # lse_ref_reshaped = lse_ref_fp8.reshape(decode_qlen, batch_size, nhead).permute(1, 0, 2).reshape(total_q, nhead)
-        # checkAllclose(
-        #     lse_ref_reshaped,
-        #     attn_lse,
-        #     msg=f"mla_decode-absorb_fp8 lse    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-        # )
 
         if not non_persistent_mode:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
@@ -1635,6 +1752,13 @@ parser.add_argument(
     help="""scale dim.
     e.g.: -sd 4""",
 )
+parser.add_argument(
+    "-lse",
+    "--return_lse",
+    action="store_true",
+    help="""return lse. Default: False.
+    --lse # True""",
+)
 
 args = parser.parse_args()
 for nhead, decode_qlen in args.nhead:
@@ -1660,6 +1784,7 @@ for nhead, decode_qlen in args.nhead:
                 non_persistent_mode=args.non_persistent_mode,
                 paged_layout=args.paged_layout,
                 scale_dim=args.scale_dim,
+                return_lse=args.return_lse,
             )
             df.append(ret)
     df = pd.DataFrame(df)

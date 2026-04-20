@@ -2,12 +2,15 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import lru_cache
+
 import torch
-import aiter
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 import triton
 import triton.language as tl
+
+import aiter
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+import aiter.ops.triton.gluon.triton_version as tv
 
 GLUON_JIT_KERNEL_ENABLED = True
 try:
@@ -46,24 +49,8 @@ def get_recommended_splits(num_sequences, num_kv_heads):
     return max_context_partition_num
 
 
-def parse_triton_version(version_str):
-    """Parse version string into comparable tuple format, handling possible development version suffixes"""
-    # Remove potential suffixes like .dev, +git etc.
-    version_str = version_str.split("+")[0].split("-")[0]
-
-    # Split version number and convert to integers
-    parts = []
-    for part in version_str.split("."):
-        try:
-            parts.append(int(part))
-        except ValueError:
-            break
-    return tuple(parts)
-
-
-TRITON_VERSION = parse_triton_version(triton.__version__)
 # Pre-compute version check as constexpr for use in JIT kernels
-TRITON_VERSION_GE_3_6_0 = tl.constexpr(TRITON_VERSION >= (3, 6, 0))
+TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 
 @gluon.jit

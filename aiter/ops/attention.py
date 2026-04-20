@@ -916,7 +916,7 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 16 == 0
+    assert num_head_qo % 8 == 0
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
@@ -926,11 +926,17 @@ def get_mla_metadata_info_v1(
         and q_dtype == dtypes.fp8
         and kv_dtype == dtypes.fp8
         and num_head_qo > 16
-        and max_seqlen_qo * (num_head_qo // 16) == 4
+        and not (num_head_qo == 32 and max_seqlen_qo == 2)
+        and (
+            (max_seqlen_qo * (num_head_qo // 16) == 4)
+            or (num_head_qo == 64 and max_seqlen_qo == 2)
+        )
     )
 
+    # In sparse mode, each expanded batch has 1 Q token
+    effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     max_qo_tiles_per_batch = (
-        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
+        int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16
         or (
             get_gfx() == "gfx942"
@@ -938,8 +944,21 @@ def get_mla_metadata_info_v1(
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
         )
+        or (
+            get_gfx() == "gfx950"
+            and (num_head_qo * effective_seqlen_qo) % 128 == 0
+            and kv_dtype == dtypes.bf16
+            and q_dtype == dtypes.bf16
+        )
+        or (
+            get_gfx() == "gfx950"
+            and num_head_qo == 64
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and effective_seqlen_qo == 1
+        )
         or use_qseqlen_fold
-        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
+        else int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
