@@ -344,8 +344,6 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
     else {
         if (is_gfx950_fp8) {
-            // Kernel uses shared strides for Q/K/V (FP8) and derives output strides as 2×.
-            // Output is BF16 in BHSD physical layout, presented as BSHD view.
             out = torch::empty({batch_size, num_heads, seqlen_q, head_size_v},
                                opts.dtype(out_type)).transpose(1, 2);
         } else {

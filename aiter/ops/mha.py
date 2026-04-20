@@ -3058,9 +3058,10 @@ def flash_attn_fp8_pertensor_func(
 
     _is_gfx950_fp8 = get_gfx() == "gfx950" and q.dtype == dtypes.fp8
     if _is_gfx950_fp8:
-        # gfx950 FP8 kernel folds q/k descales into softmax_scale and
-        # applies v_descale in-kernel (output is BF16 directly).
         softmax_scale = softmax_scale * q_descale.item() * k_descale.item()
+        output_bytes = q.size(0) * q.size(2) * q.size(1) * q.size(3) * 2
+        assert output_bytes < 4 * 1024**3, \
+            f"gfx950 FP8 kernel: output size ({output_bytes / 1024**3:.1f} GB) exceeds 4 GB soffset limit. Reduce batch size."
 
     head_size_q_og = q.size(3)
     head_size_v_og = v.size(3)

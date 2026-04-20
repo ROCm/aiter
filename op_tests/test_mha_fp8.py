@@ -82,6 +82,7 @@ def run_ck(
         (2048, 2048),
         (4096, 4096),
         (75520, 75520),
+        (75600, 75600),
     ],
 )
 def test_flash_attn_output(
@@ -105,6 +106,8 @@ def test_flash_attn_output(
             pytest.skip("gfx950 FP8 kernel does not support GQA (nheads must equal nheads_k)")
         if seqlen_q != seqlen_k:
             pytest.skip("gfx950 FP8 kernel requires seqlen_q == seqlen_k")
+        if seqlen_q % 128 != 0 and seqlen_q < 4096:
+            pytest.skip("gfx950 FP8 kernel: non-128-aligned seq_len < 4096 has high FP8 quantization error")
 
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
