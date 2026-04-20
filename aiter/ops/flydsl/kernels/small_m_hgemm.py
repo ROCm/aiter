@@ -365,7 +365,7 @@ def iter_small_m_registry_configs(
                     yield config
 
 
-@functools.lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=1024)
 def compile_small_m_hgemm_kernel(
     dtype: str,
     n: int,
