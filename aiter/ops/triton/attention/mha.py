@@ -81,6 +81,10 @@ def _flash_attn_forward(
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
     sliding_window = window_size_left if window_size_left >= 0 else 0
 
+    # Triton cannot specialize on numpy scalar types; ensure native Python int
+    max_seqlen_q = int(max_seqlen_q)
+    max_seqlen_k = int(max_seqlen_k)
+
     # FP8
     IS_FP8 = types._is_fp8(q)
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
@@ -110,7 +114,7 @@ def _flash_attn_forward(
         # Layout is bshd.
         # q and k are [batch, seq_len, num_head, head_dim_qk].
         # v is [batch, seq_len, num_head, head_dim_v].
-        batch, seqlen_q, num_q_heads = q.shape[:-1]
+        batch, seqlen_q, num_q_heads = (int(x) for x in q.shape[:-1])
         num_k_heads = k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
