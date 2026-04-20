@@ -12,7 +12,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .utils import is_flydsl_available
 
-_REQUIRED_FLYDSL_VERSION = "0.1.3.1"
+_MIN_FLYDSL_VERSION = "0.1.3"
 
 __all__ = [
     "is_flydsl_available",
@@ -28,10 +28,10 @@ if is_flydsl_available():
         ) from exc
 
     _base_version = installed_flydsl_version.split("+")[0]
-    if _base_version != _REQUIRED_FLYDSL_VERSION:
+    if _base_version < _MIN_FLYDSL_VERSION:
         raise ImportError(
             "Unsupported `flydsl` version: "
-            f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
+            f"expected >=`{_MIN_FLYDSL_VERSION}`, "
             f"got `{installed_flydsl_version}`."
         )
 
