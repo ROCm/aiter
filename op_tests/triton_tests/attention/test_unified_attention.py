@@ -186,13 +186,30 @@ def make_unified_attn_inputs(
 
 
 def ref_attn(
-    query, key_cache, value_cache, query_lens, kv_lens, block_tables, scale,
-    sliding_window=None, soft_cap=None, sinks=None, causal=True,
+    query,
+    key_cache,
+    value_cache,
+    query_lens,
+    kv_lens,
+    block_tables,
+    scale,
+    sliding_window=None,
+    soft_cap=None,
+    sinks=None,
+    causal=True,
 ):
     return ref_paged_attn(
-        query, key_cache, value_cache, query_lens, kv_lens, block_tables,
-        scale, out_dtype=query.dtype, sliding_window=sliding_window,
-        soft_cap=soft_cap, sinks=sinks,
+        query,
+        key_cache,
+        value_cache,
+        query_lens,
+        kv_lens,
+        block_tables,
+        scale,
+        out_dtype=query.dtype,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        sinks=sinks,
     )
 
 
@@ -246,7 +263,11 @@ def test_triton_unified_attn(
     scale = head_size_qk**-0.5
 
     query = torch.randn(
-        sum(query_lens), num_query_heads, head_size_qk, dtype=torch.float32, device="cuda"
+        sum(query_lens),
+        num_query_heads,
+        head_size_qk,
+        dtype=torch.float32,
+        device="cuda",
     )
     key_cache = torch.randn(
         num_blocks,
@@ -282,8 +303,11 @@ def test_triton_unified_attn(
     )
     sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
     output = torch.empty(
-        sum(query_lens), num_query_heads, head_size_v,
-        dtype=out_dtype, device="cuda",
+        sum(query_lens),
+        num_query_heads,
+        head_size_v,
+        dtype=out_dtype,
+        device="cuda",
     )
 
     maybe_quantized_query = query
