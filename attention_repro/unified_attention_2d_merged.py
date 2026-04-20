@@ -2045,7 +2045,7 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     """
     cfg: gl.constexpr = pgm.cfg
     MERGE_LOOP_TDM_WAITS: gl.constexpr = True
-    MERGE_EPI_TDM_WAITS: gl.constexpr = True
+    MERGE_EPI_TDM_WAITS: gl.constexpr = False
     QK_scale = pgm.QK_scale
 
     # Buffer rotation — tile m lives in slot m%N (K and V share the slot in
