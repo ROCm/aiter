@@ -8,4 +8,6 @@
 
 #include "pipeline/opus_gemm_traits_a8w8_scale.cuh"
 #include "pipeline/opus_gemm_traits_a8w8_noscale.cuh"
+// Both opus_gemm_a16w16_traits (split-barrier) and
+// opus_gemm_a16w16_flatmm_traits (warp-spec) live in this one header.
 #include "pipeline/opus_gemm_traits_a16w16.cuh"

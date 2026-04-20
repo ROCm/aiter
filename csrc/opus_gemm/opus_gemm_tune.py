@@ -6,10 +6,14 @@ from aiter.jit.core import AITER_CONFIG_OPUS_GEMM_A16W16
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.deepgemm import opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune
-from opus_gemm_common import a16w16_kernels_list
+from opus_gemm_common import a16w16_kernels_list, a16w16_flatmm_kernels_list
 
 
-a16w16_kernel_ids = sorted(a16w16_kernels_list.keys())
+# Merge split-barrier a16w16 (kids 4..9) with flatmm kids (100..115) so the
+# tuner searches both pipelines in one pass. Both use the same 3-tensor
+# launcher signature and the same GENERATE_A16W16_TUNE_LOOKUP map.
+a16w16_all_kernels = {**a16w16_kernels_list, **a16w16_flatmm_kernels_list}
+a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
 
 
 def generate_data(batch, m, n, k, seed, device="cuda"):
@@ -52,7 +56,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
     }
 
     def getKernelName(self, kernelId):
-        k = a16w16_kernels_list.get(kernelId)
+        k = a16w16_all_kernels.get(kernelId)
         return k.name if k else None
 
     def _setup_specific_arguments(self):
