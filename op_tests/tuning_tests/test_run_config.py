@@ -182,7 +182,7 @@ def _parse_all_benchmark_results(lines):
         reason = ""
         for j in range(i + 1, min(i + 4, len(lines))):
             if lines[j].strip().startswith("reason:"):
-                reason = lines[j].strip()[len("reason:"):].strip()
+                reason = lines[j].strip()[len("reason:") :].strip()
                 break
         result = {"shape": shape, "e2e_us": e2e_us, "status": status}
         if reason:
@@ -329,9 +329,7 @@ class TestRunConfig(unittest.TestCase):
             excludes = cfg.get("exclude_patterns", [])
             csvs = _find_tuned_csvs(pattern)
             csvs = [
-                c
-                for c in csvs
-                if not any(ex in os.path.basename(c) for ex in excludes)
+                c for c in csvs if not any(ex in os.path.basename(c) for ex in excludes)
             ]
             if not csvs:
                 self.skipTest(f"No tuned CSVs found for {name} (pattern={pattern})")
@@ -464,10 +462,10 @@ class TestRunConfigCustom(unittest.TestCase):
             )
             csv_names = [f"{config_prop} -> {merged}"]
 
-        print(
-            f"\nRunning {family} --run_config with: {csv_names}"
+        print(f"\nRunning {family} --run_config with: {csv_names}")
+        result = _run_config(
+            cfg["script"], merged, timeout=timeout, extra_args=extra_args
         )
-        result = _run_config(cfg["script"], merged, timeout=timeout, extra_args=extra_args)
 
         output = result.stdout + result.stderr
         if result.returncode != 0:
