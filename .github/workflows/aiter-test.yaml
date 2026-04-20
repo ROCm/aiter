@@ -93,6 +93,11 @@ jobs:
                 echo "Pinned CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"; \
               fi \
            && pip install -r requirements.txt \
+           && echo "=== FlyDSL commit verification ===" \
+           && pip show flydsl \
+           && python -c "import importlib.metadata, json, pathlib; dist = importlib.metadata.distribution('flydsl'); du = pathlib.Path(dist._path) / 'direct_url.json'; print(json.dumps(json.loads(du.read_text()), indent=2)) if du.exists() else print('No direct_url.json found')" \
+           && python -c "import flydsl; print('flydsl location:', flydsl.__file__)" \
+           && echo "=== FlyDSL commit verification done ===" \
            && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: 128" \
            && PREBUILD_KERNELS=1 MAX_JOBS=128 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
            && pip install dist/*.whl \
@@ -372,6 +377,35 @@ jobs:
           -w /workspace \
           aiter_test \
           bash -c "pip show amd-aiter || true"
+
+      - name: Verify FlyDSL commit
+        run: |
+          set -ex
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c '
+            echo "=== FlyDSL commit verification ==="
+            pip show flydsl
+            python -c "
+import importlib.metadata, json, pathlib
+dist = importlib.metadata.distribution(\"flydsl\")
+du = pathlib.Path(dist._path) / \"direct_url.json\"
+if du.exists():
+    info = json.loads(du.read_text())
+    print(json.dumps(info, indent=2))
+    commit = info.get(\"vcs_info\", {}).get(\"commit_id\", \"UNKNOWN\")
+    expected = \"656347f287611b1acecf49e852ca0b850cc3f1b9\"
+    print(f\"Installed commit: {commit}\")
+    print(f\"Expected commit:  {expected}\")
+    assert commit == expected, f\"MISMATCH: {commit} != {expected}\"
+    print(\"VERIFIED: FlyDSL commit matches.\")
+else:
+    print(\"WARNING: No direct_url.json - flydsl may not be installed from git\")
+    exit(1)
+"
+            echo "=== FlyDSL commit verification done ==="
+          '
 
       - name: Tests
         timeout-minutes: 90
