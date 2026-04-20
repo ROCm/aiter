@@ -939,7 +939,7 @@ def get_mla_metadata_info_v1(
         and (num_head_qo * effective_seqlen_qo) % 128 == 0
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
-        and (num_head_qo & (num_head_qo - 1) == 0)
+        and ((num_head_qo & (num_head_qo - 1)) == 0)
     ):
         max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
     elif (
@@ -947,7 +947,7 @@ def get_mla_metadata_info_v1(
         and (num_head_qo * effective_seqlen_qo) % 64 == 0
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
-        and (num_head_qo & (num_head_qo - 1) == 0)
+        and ((num_head_qo & (num_head_qo - 1)) == 0)
     ):
         max_qo_tiles_per_batch = int(math.ceil(effective_seqlen_qo * num_head_qo / 64))
     elif (
