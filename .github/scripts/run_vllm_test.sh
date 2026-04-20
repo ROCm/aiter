@@ -38,29 +38,21 @@ RUN pip config set global.default-timeout 60 && pip config set global.retries 10
 RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
-if [ -n "${AITER_INDEX_URL}" ]; then
-  # Try wheel install; fall back to source if wheel is incompatible with this Python version
-  cat >> /tmp/Dockerfile.vllm-test <<EOF
-RUN ${AITER_INSTALL_CMD} || \
-    (echo "WARNING: Wheel install failed, building aiter from source" && \
-     rm -rf /aiter && git clone https://github.com/ROCm/aiter.git /aiter && \
-     cd /aiter && git checkout ${AITER_SHA} && \
-     git submodule sync && git submodule update --init --recursive && \
-     pip install -e .)
-EOF
-else
-  cat >> /tmp/Dockerfile.vllm-test <<EOF
+# Always install aiter from source at the tested SHA.
+# Released wheels may be missing exports (e.g. rms_norm) that newer vLLM expects.
+cat >> /tmp/Dockerfile.vllm-test <<EOF
 RUN rm -rf /aiter && git clone https://github.com/ROCm/aiter.git /aiter && \
     cd /aiter && git checkout ${AITER_SHA} && \
     git submodule sync && git submodule update --init --recursive && \
     pip install -e .
 EOF
-fi
 
 cat >> /tmp/Dockerfile.vllm-test <<'EOF'
 RUN echo "=== AITER version ===" && pip show amd-aiter || true
 # Clone vLLM repo for test files (remove existing dir from base image if present)
 RUN rm -rf /app/vllm && git clone --depth 1 https://github.com/vllm-project/vllm.git /app/vllm
+# Install vLLM test dependencies
+RUN pip install tblib || true
 EOF
 
 docker build --network=host --no-cache \
