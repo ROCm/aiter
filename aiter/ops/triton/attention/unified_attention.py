@@ -295,6 +295,7 @@ def unified_attention(
     else:
         total_num_q_blocks = num_tokens // BLOCK_Q + num_seqs
     num_2d_prgms = total_num_q_blocks * num_kv_heads
+    ALL_DECODE = int(max_seqlen_q) == 1
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,

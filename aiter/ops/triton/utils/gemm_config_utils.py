@@ -216,6 +216,16 @@ def compute_splitk_params(config: dict, K: int) -> dict:
     config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
     if "BLOCK_SIZE_K" in config:
+        # If NUM_KSPLIT makes K too small, then BLOCK_K will decrease to be smaller than
+        # GROUP_K.
+        while (
+            config["NUM_KSPLIT"] > 1
+            and config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]
+        ):
+            config["NUM_KSPLIT"] = max(config["NUM_KSPLIT"] // 2, 1)
+            config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+
+        # If BLOCK_SIZE_K is still too large with NUM_KSPLIT=1, fix it to equal K dim.
         if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
             config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
 

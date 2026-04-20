@@ -177,15 +177,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_ar(input_, prefill_support)
         ):
-            inp_size = input_.numel() * input_.element_size()
-            if not prefill_support and inp_size > 64 * 1024 * 1024:
-                pass  # fall through to rccl for large prefill tensors
-            else:
-                out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
-                assert out is not None
-                return out
+            out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
+            assert out is not None
+            return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
@@ -221,23 +217,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_ar(input_, prefill_support)
             and can_use_fuse_ar_rms
         ):
-            if not prefill_support and total_bytes > 64 * 1024 * 1024:
-                pass  # fall through to rccl for large prefill tensors
-            else:
-                use_1stage = (
-                    self._ar_1stage_override
-                    if self._ar_1stage_override is not None
-                    else (total_bytes <= 128 * 1024)
-                )
-                out, res_out = ca_comm.custom_fused_ar_rms(
-                    input_, res_inp_, weight_, eps, use_1stage
-                )
-                assert out is not None
-                assert res_out is not None
-                return out, res_out
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
+            out, res_out = ca_comm.custom_fused_ar_rms(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
+            assert out is not None
+            assert res_out is not None
+            return out, res_out
         # call split kernel
         ar_out = self.all_reduce(input_, prefill_support=prefill_support)
         out = torch.empty_like(ar_out)
