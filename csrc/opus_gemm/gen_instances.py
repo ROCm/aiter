@@ -13,43 +13,55 @@ from opus_gemm_common import (
     a8w8_scale_kernels_list,
     a8w8_kernels_list,
     a16w16_kernels_list,
+    a16w16_flatmm_kernels_list,
 )
 
 
 PIPELINE_HEADER_MAP = {
-    "a8w8_scale": "pipeline/opus_gemm_pipeline_a8w8_scale.cuh",
-    "a8w8":       "pipeline/opus_gemm_pipeline_a8w8_noscale.cuh",
-    "a16w16":     "pipeline/opus_gemm_pipeline_a16w16.cuh",
+    "a8w8_scale":    "pipeline/opus_gemm_pipeline_a8w8_scale.cuh",
+    "a8w8":          "pipeline/opus_gemm_pipeline_a8w8_noscale.cuh",
+    "a16w16":        "pipeline/opus_gemm_pipeline_a16w16.cuh",
+    "a16w16_flatmm": "pipeline/opus_gemm_pipeline_a16w16_flatmm.cuh",
 }
 
 KERNEL_FUNC_MAP = {
-    "a8w8_scale": "gemm_a8w8_scale_kernel",
-    "a8w8":       "gemm_a8w8_noscale_kernel",
-    "a16w16":     "gemm_a16w16_kernel",
+    "a8w8_scale":    "gemm_a8w8_scale_kernel",
+    "a8w8":          "gemm_a8w8_noscale_kernel",
+    "a16w16":        "gemm_a16w16_kernel",
+    "a16w16_flatmm": "gemm_a16w16_flatmm_kernel",
 }
 
 INPUT_DTYPE_MAP = {
-    "a8w8_scale": ("fp8_t", "fp8_t"),
-    "a8w8":       ("fp8_t", "fp8_t"),
-    "a16w16":     ("bf16_t", "bf16_t"),
+    "a8w8_scale":    ("fp8_t", "fp8_t"),
+    "a8w8":          ("fp8_t", "fp8_t"),
+    "a16w16":        ("bf16_t", "bf16_t"),
+    "a16w16_flatmm": ("bf16_t", "bf16_t"),
 }
 
-NOSCALE_TAGS = {"a8w8", "a16w16"}
+# Tags whose launchers take 3 torch tensors (XQ, WQ, Y). a16w16_flatmm also
+# routes through this path but generates a distinct launcher (different Traits
+# template, different kargs struct, different K-check).
+NOSCALE_TAGS = {"a8w8", "a16w16", "a16w16_flatmm"}
 
 TRAITS_NAME_MAP = {
-    "a8w8_scale": "opus_gemm_a8w8_scale_traits",
-    "a8w8":       "opus_gemm_a8w8_noscale_traits",
-    "a16w16":     "opus_gemm_a16w16_traits",
+    "a8w8_scale":    "opus_gemm_a8w8_scale_traits",
+    "a8w8":          "opus_gemm_a8w8_noscale_traits",
+    "a16w16":        "opus_gemm_a16w16_traits",
+    "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits",
 }
 
 KARGS_NAME_MAP = {
-    "a8w8_scale": "opus_gemm_scale_kargs",
-    "a8w8":       "opus_gemm_noscale_kargs",
-    "a16w16":     "opus_gemm_noscale_kargs",
+    "a8w8_scale":    "opus_gemm_scale_kargs",
+    "a8w8":          "opus_gemm_noscale_kargs",
+    "a16w16":        "opus_gemm_noscale_kargs",
+    "a16w16_flatmm": "opus_gemm_flatmm_kargs",
 }
 
 WARP_SIZE = 64
 VALID_BF16_MFMA = {(16, 16, 32), (32, 32, 16)}
+# Flatmm pipeline currently only supports W_M < 32 (ra layout relies on
+# LOAD_GROUP_M_LANE == 1). W_M == 32 (LGML == 4) path not rewritten.
+VALID_FLATMM_MFMA = {(16, 16, 32)}
 
 
 class opus_gemm_codegen:
@@ -219,6 +231,98 @@ class opus_gemm_codegen:
             "min_k": 2 * k.B_K,
         }
 
+    # ── a16w16_flatmm validator ──
+
+    @staticmethod
+    def _validate_a16w16_flatmm(k: OpusGemmInstance):
+        """Validate an a16w16_flatmm instance at codegen time.
+
+        Mirrors the static_asserts in opus_gemm_a16w16_flatmm_traits: derives
+        pfk from LDS budget / WG_PER_CU and requires pfk >= 3 (depth-1 pipeline
+        entry point). Raises ValueError if invalid.
+        """
+        errors = []
+        sizeof_da = 2  # bf16 locked
+
+        # ── Locked config (traits enforces these via templates) ──
+        if k.BLOCK_SIZE != 256:
+            errors.append(f"BLOCK_SIZE={k.BLOCK_SIZE} must be 256 (4-wave warp-spec)")
+        if k.T_M != 2:
+            errors.append(f"T_M={k.T_M} must be 2")
+        if k.T_N != 1:
+            errors.append(f"T_N={k.T_N} must be 1")
+
+        # ── MFMA: only W_M<32 path supported (LOAD_GROUP_M_LANE=1) ──
+        if (k.W_M, k.W_N, k.W_K) not in VALID_FLATMM_MFMA:
+            errors.append(
+                f"WAVE=({k.W_M},{k.W_N},{k.W_K}) not in {VALID_FLATMM_MFMA} "
+                f"(flatmm ra layout requires W_M<32)"
+            )
+        if k.W_M >= 32:
+            errors.append(f"W_M={k.W_M}: flatmm LGML=4 path not implemented")
+
+        # ── VEC ──
+        expected_vec = 16 // sizeof_da
+        if k.VEC_A != expected_vec or k.VEC_B != expected_vec:
+            errors.append(f"VEC_A={k.VEC_A}, VEC_B={k.VEC_B} must be {expected_vec}")
+        if k.VEC_C != 4:
+            errors.append(f"VEC_C={k.VEC_C} must be 4")
+
+        # ── Tile geometry (LOAD_GROUP_K = W_K * 2 = 64 for W_K=32) ──
+        LOAD_GROUP_M = 64 if k.W_M >= 32 else 32
+        LOAD_GROUP_N = 64 if k.W_N >= 32 else 32
+        LOAD_GROUP_K = k.W_K * 2
+        if k.B_M % LOAD_GROUP_M != 0:
+            errors.append(f"B_M={k.B_M} not div by LOAD_GROUP_M={LOAD_GROUP_M}")
+        if k.B_N % LOAD_GROUP_N != 0:
+            errors.append(f"B_N={k.B_N} not div by LOAD_GROUP_N={LOAD_GROUP_N}")
+        if k.B_K % LOAD_GROUP_K != 0:
+            errors.append(f"B_K={k.B_K} not div by LOAD_GROUP_K={LOAD_GROUP_K}")
+
+        num_load_groups_per_bm = k.B_M // LOAD_GROUP_M
+        num_load_groups_per_bn = k.B_N // LOAD_GROUP_N
+        num_load_groups_per_bk = k.B_K // LOAD_GROUP_K
+
+        # ── LDS per-group-load size ──
+        smem_linear_wave = WARP_SIZE * 16 // sizeof_da  # 512 for bf16
+        smem_sub = smem_linear_wave // LOAD_GROUP_K
+        slots = LOAD_GROUP_M // smem_sub
+        smem_padding = 16 // sizeof_da if k.W_M >= 32 else 2 * 16 // sizeof_da
+        smem_per_group_load_size = slots * (smem_linear_wave + smem_padding) * sizeof_da
+
+        # ── WG_PER_CU ──
+        if k.WG_PER_CU not in (1, 2):
+            errors.append(f"WG_PER_CU={k.WG_PER_CU} must be 1 or 2")
+
+        # ── pfk derivation (match traits formula) ──
+        lds_total = 163840  # gfx950 budget; host-side constant for validation only
+        max_lds_per_wg = lds_total // max(k.WG_PER_CU, 1)
+        per_block_iter = (num_load_groups_per_bm + num_load_groups_per_bn) * \
+                          num_load_groups_per_bk * smem_per_group_load_size
+        pfk = max_lds_per_wg // per_block_iter if per_block_iter > 0 else 0
+        if pfk < 3:
+            errors.append(
+                f"prefetch_k_iter={pfk} < 3 "
+                f"(LDS budget {max_lds_per_wg} / per-iter {per_block_iter})"
+            )
+
+        min_k = pfk * k.B_K
+        lds_footprint = pfk * per_block_iter
+
+        if errors:
+            msg = f"Invalid a16w16_flatmm instance '{k.name}':\n" + "\n".join(f"  - {e}" for e in errors)
+            raise ValueError(msg)
+
+        return {
+            "pfk": pfk,
+            "min_k": min_k,
+            "lds_bytes": lds_footprint,
+            "slots": slots,
+            "groups_bm": num_load_groups_per_bm,
+            "groups_bn": num_load_groups_per_bn,
+            "groups_bk": num_load_groups_per_bk,
+        }
+
     # ── Instance generation ──
 
     def gen_instance(self, k: OpusGemmInstance):
@@ -230,6 +334,14 @@ class opus_gemm_codegen:
                 f"  LDS={info['lds_bytes'] // 1024}KiB"
                 f"  K>={info['min_k']}"
             )
+        elif k.kernel_tag == "a16w16_flatmm":
+            info = self._validate_a16w16_flatmm(k)
+            print(
+                f"  {k.name}: pfk={info['pfk']} "
+                f"slots={info['slots']} "
+                f"groups=({info['groups_bm']},{info['groups_bn']},{info['groups_bk']}) "
+                f"LDS={info['lds_bytes'] // 1024}KiB K>={info['min_k']}"
+            )
 
         pipeline_header = PIPELINE_HEADER_MAP[k.kernel_tag]
         kernel_func = KERNEL_FUNC_MAP[k.kernel_tag]
@@ -237,7 +349,9 @@ class opus_gemm_codegen:
         traits_name = TRAITS_NAME_MAP[k.kernel_tag]
         kargs_name = KARGS_NAME_MAP[k.kernel_tag]
 
-        if k.kernel_tag in NOSCALE_TAGS:
+        if k.kernel_tag == "a16w16_flatmm":
+            self._gen_flatmm_instance(k, pipeline_header, kernel_func, da, db, traits_name, kargs_name)
+        elif k.kernel_tag in NOSCALE_TAGS:
             self._gen_noscale_instance(k, pipeline_header, kernel_func, da, db, traits_name, kargs_name)
         else:
             self._gen_scale_instance(k, pipeline_header, kernel_func, da, db, traits_name, kargs_name)
@@ -337,6 +451,8 @@ template torch::Tensor
                            f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>")
 
         min_k = 2 * k.B_K
+        # Kid-specific K-bound checks. Split-barrier pipeline requires
+        # K >= 2 * B_K and the loop count to be even.
         k_check = f"""
     int loops_ = (K + {k.B_K} - 1) / {k.B_K};
     TORCH_CHECK(loops_ >= 2,
@@ -414,6 +530,105 @@ template torch::Tensor
                 os.path.join(self.instances_path, f"{k.name}_C{CDtype}.cpp")
             ).write_text(instance)
 
+    def _gen_flatmm_instance(self, k, pipeline_header, kernel_func, da, db, traits_name, kargs_name):
+        """Generate a flatmm launcher (a16w16_flatmm).
+
+        Flatmm traits template signature has 7 parameters:
+          <BLOCK_SIZE, BLOCK, DTYPE (5-tuple incl. D_BIAS), VEC, MFMA, WG_PER_CU, HAS_BIAS>.
+
+        The Python-visible launcher keeps the 3-tensor signature (XQ, WQ, Y)
+        so the launcher type matches the a16w16 split-barrier one and both can
+        populate the same std::function in GENERATE_A16W16_TUNE_LOOKUP.
+
+        Runtime check uses Traits::prefetch_k_iter (compile-time member) to
+        report min_k accurately per-instance.
+        """
+        has_bias_str = "true" if False else "false"  # HAS_BIAS hardcoded false
+
+        # Kid-specific runtime K-bound check per INTEGRATION.md "Runtime
+        # 前置约束" item 1: K >= Traits::prefetch_k_iter * Traits::B_K.
+        # pfk is a compile-time member so the effective bound is inlined.
+        k_check = f"""
+    int loops_ = (K + {k.B_K} - 1) / {k.B_K};
+    TORCH_CHECK(loops_ >= Traits::prefetch_k_iter,
+        "K=", K, " too small for flatmm B_K={k.B_K}, need K >= pfk*B_K = ",
+        Traits::prefetch_k_iter * {k.B_K}, " (pfk=", Traits::prefetch_k_iter, ")");
+    TORCH_CHECK(M >= 1 && N >= 1 && K >= 1, "M, N, K must be >= 1");
+    TORCH_CHECK(batch >= 1, "batch must be >= 1");
+"""
+
+        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include <torch/all.h>
+#include <torch/extension.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include "{pipeline_header}"
+
+template <typename D_C>
+torch::Tensor
+{k.name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &Y)
+{{{{
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    using Traits = {traits_name}<{k.BLOCK_SIZE},
+        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+        opus::tuple<{da}, {db}, D_C, fp32_t, D_C>,
+        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
+        {k.WG_PER_CU},
+        {has_bias_str}>;
+{k_check}
+    {kargs_name} kargs{{{{}}}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.ptr_bias = nullptr;  // HAS_BIAS=false; field reserved for future.
+    kargs.m = M;
+    kargs.n = N;
+    kargs.k = K;
+    kargs.batch = batch;
+    kargs.stride_a = K;
+    kargs.stride_b = K;
+    kargs.stride_c = N;
+    kargs.stride_a_batch = M * K;
+    kargs.stride_b_batch = N * K;
+    kargs.stride_c_batch = M * N;
+
+    int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
+    int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
+    dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
+    dim3 block({k.BLOCK_SIZE});
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    {kernel_func}<Traits><<<grid, block, 0, stream>>>(kargs);
+
+    return Y;
+}}}}
+"""
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+
+        INSTANCE_TEMPLATE = """// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "impl/{name}.cuh"
+template torch::Tensor
+{name}<{dtype}>(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &Y);
+"""
+        for CDtype in k.output_dtypes:
+            instance = INSTANCE_TEMPLATE.format(name=k.name, dtype=CDtype)
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_C{CDtype}.cpp")
+            ).write_text(instance)
+
     # ── Lookup / manifest generation ──
 
     def gen_lookup_dict(self, kernels_dict):
@@ -447,7 +662,13 @@ template torch::Tensor
             f.write(LOOKUP_END)
 
     def gen_a16w16_tune_lookup(self, kernels_dict):
-        """Emit opus_gemm_a16w16_tune_lookup.h with int-ID-to-kernel map for tuning."""
+        """Emit opus_gemm_a16w16_tune_lookup.h with int-ID-to-kernel map for tuning.
+
+        Includes both "a16w16" (split-barrier) and "a16w16_flatmm" (4-wave
+        warp-specialized) kernels so a single tuner run can search across both
+        pipelines. Both generate launchers with the same 3-tensor signature
+        (XQ, WQ, Y) so they share the GENERATE_A16W16_TUNE_LOOKUP lookup map.
+        """
         HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -459,10 +680,11 @@ template torch::Tensor
         FOOTER = """
    }
 """
+        a16w16_tune_tags = ("a16w16", "a16w16_flatmm")
         with open(os.path.join(self.working_path, "opus_gemm_a16w16_tune_lookup.h"), "w") as f:
             f.write(HEADER)
             for kid, k in kernels_dict.items():
-                if isinstance(kid, int) and k.kernel_tag == "a16w16":
+                if isinstance(kid, int) and k.kernel_tag in a16w16_tune_tags:
                     f.write(ENTRY.format(kid=kid, kernel_name=k.name))
             f.write(FOOTER)
 
@@ -558,14 +780,15 @@ if __name__ == "__main__":
         "--kernel_tag",
         default=None,
         required=False,
-        help="filter kernels by tag (e.g. a16w16, a8w8, a8w8_scale)",
+        help="filter kernels by tag (e.g. a16w16, a16w16_flatmm, a8w8, a8w8_scale)",
     )
 
     args = parser.parse_args()
     TAG_TO_LIST = {
-        "a8w8_scale": a8w8_scale_kernels_list,
-        "a8w8": a8w8_kernels_list,
-        "a16w16": a16w16_kernels_list,
+        "a8w8_scale":    a8w8_scale_kernels_list,
+        "a8w8":          a8w8_kernels_list,
+        "a16w16":        a16w16_kernels_list,
+        "a16w16_flatmm": a16w16_flatmm_kernels_list,
     }
     kdict = TAG_TO_LIST.get(args.kernel_tag, kernels_list) if args.kernel_tag else kernels_list
     codegen = opus_gemm_codegen(args.working_path, args.tune)
