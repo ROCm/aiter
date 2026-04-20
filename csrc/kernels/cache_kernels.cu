@@ -408,10 +408,11 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     }();
     float v_max = wave_reduce(v_local_max, f_max_f32);
 
-    float k_token_scale          = k_max / dtypeMax;
-    float v_token_scale          = v_max / dtypeMax;
-    float k_token_scale_inverted = 1.0 / k_token_scale;
-    float v_token_scale_inverted = 1.0 / v_token_scale;
+    constexpr float k_pertoken_quant_scale_eps = 1e-12f;
+    float k_token_scale = k_max / dtypeMax;
+    float v_token_scale = v_max / dtypeMax;
+    float k_token_scale_inverted = 1.0f / fmaxf(k_token_scale, k_pertoken_quant_scale_eps);
+    float v_token_scale_inverted = 1.0f / fmaxf(v_token_scale, k_pertoken_quant_scale_eps);
 
 #pragma unroll
     for(int i_d = 0; i_d < local_dim_elems; i_d++)

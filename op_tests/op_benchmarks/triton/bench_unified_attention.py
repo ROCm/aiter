@@ -1,7 +1,8 @@
 from sys import exit
 
 import itertools
-
+import sys
+import argparse
 import torch
 import triton
 
@@ -348,8 +349,8 @@ def run_benchmark(custom, args):
     bench_mha.run(None, print_data=True)
 
 
-def parse_args():
-    parser = get_parser(kernel_name="UnifiedAttention")
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
+    parser = get_parser(kernel_name="Unified Attention")
 
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
@@ -462,7 +463,7 @@ def parse_args():
         help="Metrics for the kernel benchmark.",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
 arg_to_torch_dtype = {
@@ -472,8 +473,8 @@ arg_to_torch_dtype = {
 }
 
 
-def main():
-    args = parse_args()
+def main(args: list[str] | None = None) -> None:
+    args = parse_args(args=args)
     if args.model:
         if args.causal is None:
             args.causal = True
