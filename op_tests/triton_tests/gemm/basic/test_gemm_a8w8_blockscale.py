@@ -42,6 +42,7 @@ def _flydsl_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, y):
     from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_gfx1250 import (
         gemm_a8w8_blockscale as flydsl_gemm,
     )
+
     return flydsl_gemm(x, weight, x_scale, w_scale, y=y, dtype=dtype)
 
 
