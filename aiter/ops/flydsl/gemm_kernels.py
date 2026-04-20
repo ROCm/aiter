@@ -24,6 +24,8 @@ from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
     "flydsl_hgemm",
+    "get_flydsl_a16w16_gfx1250_kernels",
+    "get_flydsl_a16w16_gfx1250_kernel_params",
 ]
 
 SPLIT_K_COUNTER_MAX_LEN = 128
@@ -459,6 +461,120 @@ def _register_all_configs():
 
 
 _register_all_configs()
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL A16W16 GEMM for gfx1250 (RDNA4)
+# ---------------------------------------------------------------------------
+
+_A16W16_GFX1250_KERNELS: Dict[str, Dict] = {}
+
+
+def _a16w16_kernel_name(
+    in_dtype: str,
+    out_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+    waves_per_eu: Optional[int],
+    l2_prefetch_distance: int,
+) -> str:
+    wpe = waves_per_eu if waves_per_eu is not None else 0
+    return (
+        f"flydsl_a16w16_gfx1250_{in_dtype}_{out_dtype}"
+        f"_tm{tile_m}_tn{tile_n}_tk{tile_k}"
+        f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}"
+        f"_wpe{wpe}_l2p{l2_prefetch_distance}"
+    )
+
+
+def _validate_a16w16_config(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+) -> bool:
+    # WMMA 16×16×32, wave_size=32 — tile must be divisible by warp tile
+    if tile_m % (m_warp * 16) != 0:
+        return False
+    if tile_n % (n_warp * 16) != 0:
+        return False
+    # tile_k must be multiple of WMMA_K=32
+    if tile_k % 32 != 0:
+        return False
+    if num_buffers < 2:
+        return False
+    return True
+
+
+def get_flydsl_a16w16_gfx1250_kernels(
+    in_dtype: str = "bf16", out_dtype: str = "bf16"
+) -> Dict[str, Dict]:
+    """Return the catalog of valid a16w16 configs for gfx1250.
+
+    Only call this when running on gfx1250; the kernel is RDNA4-specific.
+    """
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128, 256]
+    tile_ks = [32, 64]
+    m_warps = [1, 2, 4]
+    n_warps = [2, 4]
+    num_buffers_opts = [2, 3, 4]
+    waves_per_eu_opts: list[Optional[int]] = [None, 2, 4]
+    l2_prefetch_distances = [1, 2]
+
+    kernels: Dict[str, Dict] = {}
+    for tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, wpe, l2p in product(
+        tile_ms,
+        tile_ns,
+        tile_ks,
+        m_warps,
+        n_warps,
+        num_buffers_opts,
+        waves_per_eu_opts,
+        l2_prefetch_distances,
+    ):
+        if not _validate_a16w16_config(tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers):
+            continue
+        name = _a16w16_kernel_name(
+            in_dtype, out_dtype, tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers, wpe, l2p
+        )
+        kernels[name] = {
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "tile_k": tile_k,
+            "m_warp": m_warp,
+            "n_warp": n_warp,
+            "num_buffers": num_buffers,
+            "waves_per_eu": wpe,
+            "l2_prefetch_distance": l2p,
+            "in_dtype": in_dtype,
+            "out_dtype": out_dtype,
+        }
+    return kernels
+
+
+def get_flydsl_a16w16_gfx1250_kernel_params(name: str) -> Optional[Dict]:
+    config = _A16W16_GFX1250_KERNELS.get(name)
+    if config is not None:
+        return dict(config)
+    return None
+
+
+def _register_a16w16_configs():
+    for in_dtype in ("bf16", "f16"):
+        for out_dtype in ("bf16", "f16"):
+            _A16W16_GFX1250_KERNELS.update(
+                get_flydsl_a16w16_gfx1250_kernels(in_dtype, out_dtype)
+            )
+
+
+_register_a16w16_configs()
 
 
 def _get_split_k_global_semaphore(stream: torch.cuda.Stream) -> torch.Tensor:

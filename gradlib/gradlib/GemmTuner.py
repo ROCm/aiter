@@ -40,13 +40,27 @@ try:
         from aiter.ops.flydsl.gemm_kernels import (
             flydsl_hgemm,
             get_flydsl_splitk_hgemm_kernels,
+            get_flydsl_a16w16_gfx1250_kernels,
         )
     else:
         raise ImportError("flydsl package is not installed")
 except ImportError as exc:
     flydsl_hgemm = None
     get_flydsl_splitk_hgemm_kernels = None
+    get_flydsl_a16w16_gfx1250_kernels = None
     FLYDSL_TUNE_ERROR = str(exc)
+
+FLYDSL_A16W16_TUNE_ERROR = None
+try:
+    if is_flydsl_available():
+        from aiter.ops.flydsl.kernels.gemm_a16w16_gfx1250 import (
+            gemm_a16w16 as flydsl_gemm_a16w16_kernel,
+        )
+    else:
+        raise ImportError("flydsl package is not installed")
+except ImportError as exc:
+    flydsl_gemm_a16w16_kernel = None
+    FLYDSL_A16W16_TUNE_ERROR = str(exc)
 
 
 @lru_cache(maxsize=1)
@@ -122,6 +136,30 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
     return out
 
 
+def run_flydsl_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16, config=None):
+    if flydsl_gemm_a16w16_kernel is None:
+        raise RuntimeError(
+            f"flydsl a16w16 kernel is not available for tuning: {FLYDSL_A16W16_TUNE_ERROR}"
+        )
+    if config is None:
+        raise ValueError("flydsl a16w16 tuning requires a kernel config")
+    out_dtype = torch.bfloat16 if otype == dtypes.bf16 else torch.float16
+    return flydsl_gemm_a16w16_kernel(
+        input,
+        weight,
+        bias=bias,
+        dtype=out_dtype,
+        tile_m=config["tile_m"],
+        tile_n=config["tile_n"],
+        tile_k=config["tile_k"],
+        m_warp=config["m_warp"],
+        n_warp=config["n_warp"],
+        num_buffers=config["num_buffers"],
+        waves_per_eu=config["waves_per_eu"],
+        l2_prefetch_distance=config["l2_prefetch_distance"],
+    )
+
+
 @lru_cache(maxsize=1)
 def get_flydsl_bf16_catalog():
     if get_flydsl_splitk_hgemm_kernels is None:
@@ -131,6 +169,18 @@ def get_flydsl_bf16_catalog():
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
     logger.info(f"FlyDSL bf16 catalog size: {len(catalog)} kernels")
+    return catalog
+
+
+@lru_cache(maxsize=1)
+def get_flydsl_a16w16_gfx1250_catalog():
+    if get_flydsl_a16w16_gfx1250_kernels is None:
+        return []
+    kernels = get_flydsl_a16w16_gfx1250_kernels("bf16", "bf16")
+    catalog = [
+        (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
+    ]
+    logger.info(f"FlyDSL a16w16 gfx1250 catalog size: {len(catalog)} kernels")
     return catalog
 
 
@@ -435,6 +485,11 @@ class Gemm:
             solidx = solidx + 1
             self.asm_map[solidx] = kernelName
             for splitK in range(start, maxSplitK + 1):
+                if splitK > 1:
+                    gdx = (self.n + tile_n - 1) // tile_n
+                    gdy = (self.m + tile_m - 1) // tile_m
+                    if gdx * gdy > 1024:
+                        continue
                 info = (
                     (
                         self.m,
@@ -490,7 +545,10 @@ class Gemm:
     def run_asm_triton_sols(self):
         tasks = []
         if "all" in self.libtype or "flydsl" in self.libtype:
-            tasks.extend(self.flydsl_gemm_all_sols())
+            if get_gfx() == "gfx1250":
+                tasks.extend(self.flydsl_a16w16_gemm_all_sols())
+            else:
+                tasks.extend(self.flydsl_gemm_all_sols())
         if "all" in self.libtype or "triton" in self.libtype:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
@@ -588,6 +646,74 @@ class Gemm:
             "FlyDSL candidate count for "
             f"M={self.m}, N={self.n}, K={self.k}, outdtype={self.outdtype}, "
             f"bpreshuffle={self.is_shuffle}: {len(task)}/{len(flydsl_catalog)}"
+        )
+        return task
+
+    def flydsl_a16w16_gemm_all_sols(self):
+        if flydsl_gemm_a16w16_kernel is None or get_flydsl_a16w16_gfx1250_kernels is None:
+            logger.warning(
+                f"FlyDSL a16w16 kernel is not available for tuning: {FLYDSL_A16W16_TUNE_ERROR}"
+            )
+            return []
+        if self.scaleAB or self.indtype != dtypes.bf16:
+            logger.warning(
+                "FlyDSL a16w16 only supports indtype=bf16 and no scaleAB, "
+                f"but actual indtype is {self.indtype}, scaleAB is {self.scaleAB}"
+            )
+            return []
+
+        task = []
+        catalog = get_flydsl_a16w16_gfx1250_catalog()
+        for solidx, kernel_name, config in catalog:
+            info = (
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    self.has_bias,
+                    str(self.indtype),
+                    str(self.outdtype),
+                    self.scaleAB,
+                    self.is_shuffle,
+                ),
+                solidx,
+                1,  # no split-K in a16w16; kernel handles it via num_buffers pipelining
+                "flydsl",
+                kernel_name,
+            )
+            task.append(
+                (
+                    info,
+                    generate_data,
+                    (
+                        self.m,
+                        self.n,
+                        self.k,
+                        self.indtype,
+                        self.outdtype,
+                        self.scaleAB,
+                        self.is_shuffle,
+                        0,
+                        self.has_bias,
+                    ),
+                    run_flydsl_gemm_a16w16,
+                    ([0, 1, 3], self.outdtype, config),
+                    {
+                        "num_warmup": self.num_warmup,
+                        "num_iters": 101,
+                    },
+                    get_gemm_ref,
+                    ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                    {},
+                    None,
+                    self.rtol,
+                    self.atol,
+                )
+            )
+        logger.info(
+            "FlyDSL a16w16 gfx1250 candidate count for "
+            f"M={self.m}, N={self.n}, K={self.k}, outdtype={self.outdtype}: "
+            f"{len(task)}/{len(catalog)}"
         )
         return task
 

@@ -108,8 +108,14 @@ def get_GEMM_A16W16_config(
         if config is not None:
             if config["libtype"] == "flydsl":
                 if is_flydsl_available():
-                    flydsl_config = aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-                        config["kernelName"]
+                    kernel_name = config["kernelName"]
+                    flydsl_config = (
+                        aiter.ops.flydsl.gemm_kernels.get_flydsl_a16w16_gfx1250_kernel_params(
+                            kernel_name
+                        )
+                        or aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                            kernel_name
+                        )
                     )
                     if flydsl_config is None:
                         config = None
@@ -262,11 +268,17 @@ def gemm_a16w16(
         bpreshuffle=bpreshuffle,
     )
     if config is not None and config["libtype"] == "flydsl":
+        kernel_name = config["kernelName"]
         flydsl_config = (
-            aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
-                config["kernelName"]
+            aiter.ops.flydsl.gemm_kernels.get_flydsl_a16w16_gfx1250_kernel_params(
+                kernel_name
+            )
+            or aiter.ops.flydsl.gemm_kernels.get_flydsl_splitk_hgemm_kernel_params(
+                kernel_name
             )
         )
+        if flydsl_config is not None and "tile_k" in flydsl_config and "m_warp" in flydsl_config:
+            return flydsl_a16w16_gemm(inp_view, B, bias, otype, config=flydsl_config)
         return flydsl_gemm(
             inp_view,
             B,
@@ -426,6 +438,31 @@ def asm_gemm(
         inp.shape[0], weights.shape[0], dtype=otype, device=inp.device
     )
     return gemm_a16w16_asm(inp, weights, out_asm, bias, splitK, KernelName, bpreshuffle)
+
+
+def flydsl_a16w16_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    bias: Optional[Tensor] = None,
+    otype: Optional[torch.dtype] = None,
+    config: dict = None,
+):
+    from aiter.ops.flydsl.kernels.gemm_a16w16_gfx1250 import gemm_a16w16 as _gemm_a16w16
+    out_dtype = otype if otype is not None else inp.dtype
+    return _gemm_a16w16(
+        inp,
+        weights,
+        bias=bias,
+        dtype=out_dtype,
+        tile_m=config["tile_m"],
+        tile_n=config["tile_n"],
+        tile_k=config["tile_k"],
+        m_warp=config["m_warp"],
+        n_warp=config["n_warp"],
+        num_buffers=config["num_buffers"],
+        waves_per_eu=config["waves_per_eu"],
+        l2_prefetch_distance=config["l2_prefetch_distance"],
+    )
 
 
 def flydsl_gemm(
