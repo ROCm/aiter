@@ -122,7 +122,6 @@ def _mla_prefill_fwd_kernel(
 
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    # tl.device_print("cur_batch_query_len", cur_batch_query_len)
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
 
@@ -313,7 +312,11 @@ _mla_decode_fwd_kernel_repr = make_kernel_repr(
         "BLOCK_M",
         "NUM_SEGMENTS_PER_SEQ",
         "num_warps",
+        "waves_per_eu",
         "num_stages",
+        "SHUFFLED_KV_CACHE",
+        "IS_Q_FP8",
+        "IS_KV_FP8",
     ],
 )
 
@@ -348,8 +351,12 @@ def _mla_decode_fwd_kernel(
     BLOCK_M: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     num_warps: tl.constexpr,  # int
+    waves_per_eu: tl.constexpr,  # int
     num_stages: tl.constexpr,  # int
     ALL_DECODE: tl.constexpr = False,  # bool
+    SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
+    IS_Q_FP8: tl.constexpr = False,  # bool
+    IS_KV_FP8: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -395,6 +402,19 @@ def _mla_decode_fwd_kernel(
     offs_lora_rank = tl.arange(0, KV_LORA_RANK)
     offs_rope_head_dim = tl.arange(0, QK_ROPE_HEAD_DIM)
     offs_t = tl.arange(0, TILE_SIZE)
+
+    offs_lora_rank_shfl = None
+    offs_rope_head_dim_shfl = None
+    offs_t_shfl = None
+    if SHUFFLED_KV_CACHE:
+        offs_lora_rank_shfl = tl.arange(0, KV_LORA_RANK * 16)
+        offs_rope_head_dim_shfl = tl.arange(0, QK_ROPE_HEAD_DIM * 16)
+        offs_t_shfl = tl.arange(0, TILE_SIZE // 16)
+
+    if IS_KV_FP8:
+        K_WIDTH: tl.constexpr = 16
+    else:
+        K_WIDTH: tl.constexpr = 8
 
     num_queries_per_kv: tl.constexpr = num_query_heads // num_kv_heads
     query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
@@ -459,41 +479,96 @@ def _mla_decode_fwd_kernel(
     ):
         physical_block_idx = tl.load(block_tables_ptr_shifted + j).to(tl.int64)
 
-        kv_offset = (
-            physical_block_idx * stride_kv_buffer_0 + kv_head_idx * stride_kv_buffer_2
-        )
+        if SHUFFLED_KV_CACHE:
+            kv_offset = (
+                physical_block_idx * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_1
+            )
+            kv_lora_offset = (
+                kv_offset
+                + offs_t_shfl[:, None] * stride_kv_buffer_2
+                + offs_lora_rank_shfl[None, :] * stride_kv_buffer_3
+            )
 
-        kv_lora_offset = (
-            kv_offset
-            + offs_t[:, None] * stride_kv_buffer_1
-            + offs_lora_rank[None, :] * stride_kv_buffer_3
-        )
+            k_rope_offset = (
+                kv_offset
+                + offs_t_shfl[:, None] * stride_kv_buffer_2
+                + (KV_LORA_RANK * 16 + offs_rope_head_dim_shfl)[None, :]
+                * stride_kv_buffer_3
+            )
+        else:
+            kv_offset = (
+                physical_block_idx * stride_kv_buffer_0
+                + kv_head_idx * stride_kv_buffer_2
+            )
+            kv_lora_offset = (
+                kv_offset
+                + offs_t[:, None] * stride_kv_buffer_1
+                + offs_lora_rank[None, :] * stride_kv_buffer_3
+            )
+
+            k_rope_offset = (
+                kv_offset
+                + offs_t[None, :] * stride_kv_buffer_1
+                + (KV_LORA_RANK + offs_rope_head_dim)[:, None] * stride_kv_buffer_3
+            )
+
         # KV_lora : (BLOCK_M, KV_LORA_RANK)
         KV_lora = tl.load(
             kv_buffer_ptr + kv_lora_offset,
             cache_modifier=KV_cache_modifier,
         )
+        KV_lora = KV_lora.to(Q_lora.dtype)
 
-        k_rope_offset = (
-            kv_offset
-            + offs_t[None, :] * stride_kv_buffer_1
-            + (KV_LORA_RANK + offs_rope_head_dim)[:, None] * stride_kv_buffer_3
-        )
         # K_rope : (BLOCK_M, QK_ROPE_HEAD_DIM)
         K_rope = tl.load(
             kv_buffer_ptr + k_rope_offset,
             cache_modifier=KV_cache_modifier,
         )
+        K_rope = K_rope.to(Q_rope.dtype)
+
+        if SHUFFLED_KV_CACHE:
+            KV_lora = (
+                KV_lora.reshape(
+                    (
+                        1,
+                        TILE_SIZE // 16,
+                        KV_LORA_RANK // (2 * K_WIDTH),
+                        2,
+                        16,
+                        K_WIDTH,
+                    )
+                )
+                .permute((0, 1, 4, 2, 3, 5))
+                .reshape((TILE_SIZE, KV_LORA_RANK))
+                .permute((1, 0))
+            )
+            K_rope = (
+                K_rope.reshape(
+                    (
+                        1,
+                        TILE_SIZE // 16,
+                        QK_ROPE_HEAD_DIM // (2 * K_WIDTH),
+                        2,
+                        16,
+                        K_WIDTH,
+                    )
+                )
+                .permute((0, 1, 4, 2, 3, 5))
+                .reshape((TILE_SIZE, QK_ROPE_HEAD_DIM))
+                .permute((1, 0))
+            )
 
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
-        S_lora = tl.dot(Q_lora, KV_lora.trans(1, 0).to(Q_lora.dtype))
-        S_rope = tl.dot(Q_rope, K_rope.to(Q_lora.dtype))
+        if SHUFFLED_KV_CACHE:
+            S_lora = tl.dot(Q_lora, KV_lora)
+        else:
+            S_lora = tl.dot(Q_lora, KV_lora.permute((1, 0)))
+        S_rope = tl.dot(Q_rope, K_rope)
         S = qk_factor * (S_lora + S_rope)
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
+        S = tl.where(seq_mask, S, float("-inf"))
 
         # compute running maximum
         # m_j : (BLOCK_M,)
@@ -520,7 +595,10 @@ def _mla_decode_fwd_kernel(
         M = m_j
 
         # acc : (BLOCK_M, KV_LORA_RANK)
-        acc += tl.dot(P.to(KV_lora.dtype), KV_lora)
+        if SHUFFLED_KV_CACHE:
+            acc += tl.dot(P.to(KV_lora.dtype), KV_lora.permute((1, 0)))
+        else:
+            acc += tl.dot(P.to(KV_lora.dtype), KV_lora)
         seq_offset += TILE_SIZE
 
     if kv_scale_ptr is not None:

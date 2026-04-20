@@ -12,20 +12,30 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 )
 from aiter.ops.triton._triton_kernels.attention.mla import _mla_decode_fwd_reduce_kernel
 
-from aiter.ops.triton.gluon.mla import (
-    _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
-)
-from aiter.ops.triton.gluon.mla import (
-    _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
-)
-from aiter.ops.triton.gluon.mla import (
-    _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
-)
+try:
+    from aiter.ops.triton.gluon.mla import (
+        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
+    )
+    from aiter.ops.triton.gluon.mla import (
+        _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
+    )
+    from aiter.ops.triton.gluon.mla import (
+        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
+    )
+except:  # noqa: E722
+    gluon_mla_prefill_fwd_kernel_non_pipelined = None
+    gluon_mla_decode_fwd_kernel_non_pipelined = None
+    gluon_mla_decode_fwd_kernel = None
+
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+if IS_DEVICE_ARCH_GFX12:
+    assert gluon_mla_prefill_fwd_kernel_non_pipelined is not None
+    assert gluon_mla_decode_fwd_kernel_non_pipelined is not None
+    assert gluon_mla_decode_fwd_kernel is not None
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 
@@ -49,29 +59,54 @@ def select_2d_config(
 
 
 def select_3d_config(
-    block_size, max_seqlen_k, target_num_prgms, num_2d_prgms, q_dtype, kv_dtype
+    block_size,
+    max_seqlen_k,
+    target_num_prgms,
+    num_2d_prgms,
+    q_dtype,
+    kv_dtype,
+    shuffled_kv_cache,
 ):
     reduce_num_warps = 2
-    attn_warps = 8
-    if kv_dtype == torch.bfloat16:
-        attn_warps = 2
+    attn_warps = 2
+    waves_per_eu = 1
+    num_segments = 0
+    if shuffled_kv_cache:
+        if IS_DEVICE_ARCH_GFX12:
+            if kv_dtype == torch.bfloat16:
+                if num_2d_prgms >= 64:
+                    num_segments = 1
+                else:
+                    num_segments = 2
+            else:
+                if num_2d_prgms >= 64:
+                    num_segments = 1
+                else:
+                    num_segments = 2
+        else:
+            attn_warps = 2
+            waves_per_eu = 1
 
     TILE_SIZE = block_size
+
     MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
-    num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
-    num_segments = min(num_segments, MAX_SEGMENTS)
-    num_segments = triton.next_power_of_2(num_segments)
-    num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = max(8, num_segments)
-    num_segments = max(num_segments, MIN_SEGMENTS)
-    if num_segments == MIN_SEGMENTS:
-        reduce_num_warps = 1
+    if num_segments == 0:
+        num_segments = math.ceil(target_num_prgms / num_2d_prgms) * 2
+        num_segments = min(num_segments, MAX_SEGMENTS)
+        num_segments = triton.next_power_of_2(num_segments)
+        num_segments = min(num_segments, 128)
+        MIN_SEGMENTS = max(8, num_segments)
+        num_segments = max(num_segments, MIN_SEGMENTS)
+
+        if num_segments == MIN_SEGMENTS:
+            reduce_num_warps = 1
+
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "waves_per_eu": 1,
-        "num_stages": 2,
+        "waves_per_eu": waves_per_eu,
+        "num_stages": 2 if DEVICE_ARCH in ("gfx1250", "gfx950") else 1,
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -98,15 +133,12 @@ def mla_prefill_fwd(
     q_descale,
     kv_descale,
     out_scale,
-    use_gluon: bool,
     shuffled_kv_cache: bool,
 ):
     assert causal, "Only causal attention is supported"
     assert (
         not shuffled_kv_cache
     ), "Shuffled kv cache is not supported in mla_prefill_fwd"
-    if use_gluon:
-        assert IS_DEVICE_ARCH_GFX12, "Gluon is only supported on gfx12"
 
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
     num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
@@ -144,7 +176,7 @@ def mla_prefill_fwd(
         num_2d_prgms,
     )
 
-    if use_gluon:
+    if IS_DEVICE_ARCH_GFX12:
         gluon_mla_prefill_fwd_kernel_non_pipelined[(num_kv_heads, total_num_q_blocks)](
             output_ptr=out,
             query_ptr=q,
@@ -225,23 +257,13 @@ def mla_decode_fwd(
     q_descale,
     kv_descale,
     out_scale,
-    use_gluon: bool,
     shuffled_kv_cache: bool,
-    num_warps: int = None,
-    waves_per_eu: int = None,
-    num_stages: int = None,
-    num_segments: int = None,
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
-    if shuffled_kv_cache:
-        assert IS_DEVICE_ARCH_GFX12, "Shuffled kv cache is only supported on gfx12"
-        assert use_gluon, "Shuffled kv cache is only supported with gluon"
-
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
     if shuffled_kv_cache:
         num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
-        # block_size = block_size * 16
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
     num_seqs = len(seqused_k)
@@ -288,7 +310,9 @@ def mla_decode_fwd(
         num_2d_prgms,
         q_dtype,
         kv_buffer_dtype,
+        shuffled_kv_cache,
     )
+
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
     segm_output = torch.empty(
         total_num_tokens,
@@ -313,17 +337,7 @@ def mla_decode_fwd(
         device=q.device,
     )
 
-    if num_warps is not None:
-        attn_config["num_warps"] = num_warps
-    if waves_per_eu is not None:
-        attn_config["waves_per_eu"] = waves_per_eu
-    if num_stages is not None:
-        attn_config["num_stages"] = num_stages
-    if num_segments is not None:
-        attn_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
-        reduce_config["NUM_SEGMENTS_PER_SEQ"] = num_segments
-
-    if use_gluon:
+    if IS_DEVICE_ARCH_GFX12:
         if shuffled_kv_cache:
             impl = gluon_mla_decode_fwd_kernel
         else:
@@ -349,7 +363,9 @@ def mla_decode_fwd(
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2) * (16 if shuffled_kv_cache else 1),
+            stride_kv_buffer_2=kv_buffer.stride(
+                2
+            ),  # * (16 if shuffled_kv_cache else 1),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,
@@ -383,13 +399,16 @@ def mla_decode_fwd(
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2),
+            stride_kv_buffer_2=kv_buffer.stride(2) * (16 if shuffled_kv_cache else 1),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            IS_Q_FP8=(q_dtype == e4m3_dtype),
+            IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
             **attn_config,
         )
     if skip_reduce:
