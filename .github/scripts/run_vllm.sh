@@ -47,10 +47,18 @@ RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
 if [ -n "${AITER_INDEX_URL}" ]; then
-  echo "RUN ${AITER_INSTALL_CMD}" >> /tmp/Dockerfile.vllm-nightly
+  # Try wheel install; fall back to source if wheel is incompatible with this Python version
+  cat >> /tmp/Dockerfile.vllm-nightly <<EOF
+RUN ${AITER_INSTALL_CMD} || \
+    (echo "WARNING: Wheel install failed, building aiter from source" && \
+     rm -rf /aiter && git clone https://github.com/ROCm/aiter.git /aiter && \
+     cd /aiter && git checkout ${AITER_SHA} && \
+     git submodule sync && git submodule update --init --recursive && \
+     pip install -e .)
+EOF
 else
   cat >> /tmp/Dockerfile.vllm-nightly <<EOF
-RUN git clone https://github.com/ROCm/aiter.git /aiter && \
+RUN rm -rf /aiter && git clone https://github.com/ROCm/aiter.git /aiter && \
     cd /aiter && git checkout ${AITER_SHA} && \
     git submodule sync && git submodule update --init --recursive && \
     pip install -e .

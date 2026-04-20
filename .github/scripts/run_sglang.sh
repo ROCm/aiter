@@ -23,6 +23,8 @@ TEST_CMD="${2:?test_cmd required}"
 AITER_INDEX_URL="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SGLang Docker images use Python 3.10
+export AITER_PYTHON_TAG=cp310
 source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
 SGL_BRANCH="${SGL_BRANCH:-v0.5.10}"
@@ -71,30 +73,41 @@ replace_once(
 )
 PY
 
-# ── Resolve SGLang base image ──
+# ── Resolve SGLang base image (with retry) ──
 SGL_IMAGE=$(python3 - <<'PY'
-import json, re, urllib.request
+import json, re, time, urllib.request, urllib.error
 
 prefixes = ["v0.5.10-rocm700-mi30x-", "v0.5.10rc0-rocm700-mi30x-"]
-matches = {p: [] for p in prefixes}
 patterns = {p: re.compile(rf"^{re.escape(p)}\d{{8}}(?:-preview)?$") for p in prefixes}
-next_url = "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100"
 
-while next_url:
-    with urllib.request.urlopen(next_url, timeout=30) as resp:
-        data = json.load(resp)
-    for item in data.get("results", []):
-        name = item["name"]
+max_retries = 3
+for attempt in range(1, max_retries + 1):
+    matches = {p: [] for p in prefixes}
+    try:
+        next_url = "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100"
+        while next_url:
+            with urllib.request.urlopen(next_url, timeout=60) as resp:
+                data = json.load(resp)
+            for item in data.get("results", []):
+                name = item["name"]
+                for p in prefixes:
+                    if patterns[p].match(name):
+                        matches[p].append(name)
+            next_url = data.get("next")
+
         for p in prefixes:
-            if patterns[p].match(name):
-                matches[p].append(name)
-    next_url = data.get("next")
-
-for p in prefixes:
-    if matches[p]:
-        print(f"rocm/sgl-dev:{sorted(matches[p], reverse=True)[0]}")
-        exit(0)
-raise SystemExit("No public MI30X SGLang image found")
+            if matches[p]:
+                print(f"rocm/sgl-dev:{sorted(matches[p], reverse=True)[0]}")
+                exit(0)
+        raise SystemExit("No public MI30X SGLang image found")
+    except (urllib.error.URLError, OSError) as e:
+        if attempt < max_retries:
+            wait = 15 * attempt
+            print(f"Docker Hub request failed (attempt {attempt}/{max_retries}): {e}", flush=True)
+            print(f"Retrying in {wait}s...", flush=True)
+            time.sleep(wait)
+        else:
+            raise SystemExit(f"Docker Hub unreachable after {max_retries} attempts: {e}")
 PY
 )
 echo "SGLang image: ${SGL_IMAGE}"
@@ -113,13 +126,7 @@ docker exec -u root ci_sglang bash -c "pip config set global.retries 10"
 bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
 
 # ── Install AITER under test ──
-if [ -n "${AITER_INDEX_URL}" ]; then
-  docker exec ci_sglang bash -lc "
-    pip uninstall -y amd-aiter aiter || true
-    ${AITER_INSTALL_CMD}
-    pip show amd-aiter
-  "
-else
+install_aiter_from_source() {
   docker exec ci_sglang bash -lc "
     set -ex
     pip uninstall -y amd-aiter aiter || true
@@ -133,6 +140,21 @@ else
     pip install -e .
     pip show amd-aiter || pip show aiter
   "
+}
+
+if [ -n "${AITER_INDEX_URL}" ]; then
+  # Try wheel install first; fall back to source if wheel is incompatible
+  # (e.g. no wheel for this Python version)
+  if ! docker exec ci_sglang bash -lc "
+    pip uninstall -y amd-aiter aiter || true
+    ${AITER_INSTALL_CMD}
+    pip show amd-aiter
+  "; then
+    echo "WARNING: Wheel install failed, falling back to source install from SHA ${AITER_SHA}"
+    install_aiter_from_source
+  fi
+else
+  install_aiter_from_source
 fi
 
 # ── Run test ──

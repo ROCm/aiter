@@ -56,16 +56,15 @@ RUN pip uninstall -y amd-aiter || true
 RUN pip install --upgrade "pybind11>=3.0.1"
 EOF
 
-if [ -n "${AITER_INDEX_URL}" ]; then
-  echo "RUN ${AITER_INSTALL_CMD}" >> "${ATOM_DIR}/Dockerfile.nightly"
-else
-  cat >> "${ATOM_DIR}/Dockerfile.nightly" <<EOF
+# Always install aiter from source at the tested SHA.
+# ATOM depends on bleeding-edge aiter APIs (e.g. destroy_dist_env, init_dist_env)
+# that may not be available in released wheels.
+cat >> "${ATOM_DIR}/Dockerfile.nightly" <<EOF
 RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \
     cd /app/aiter-test && git checkout ${AITER_SHA} && \
     git submodule sync && git submodule update --init --recursive && \
     MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
 EOF
-fi
 
 echo 'RUN echo "=== AITER version ===" && pip show amd-aiter || true' >> "${ATOM_DIR}/Dockerfile.nightly"
 
