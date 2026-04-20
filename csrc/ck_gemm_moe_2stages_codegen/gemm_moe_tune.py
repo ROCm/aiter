@@ -377,6 +377,8 @@ class FmoeTuner(TunerCommon):
             sorted_weights=sorted_weights,
             sort_block_m=sort_block_m,
             persist=persist,
+            waves_per_eu=kparams.get("waves_per_eu", 3),
+            b_nt=kparams.get("b_nt", 2),
         )
 
     @staticmethod
@@ -1990,17 +1992,23 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
-            return tasks_flydsl
+        #if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
+        #    return tasks_flydsl
 
         _a_dtype_map = {
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
             dtypes.bf16: "fp16",
+            dtypes.i8: "int8",
+        }
+        _b_dtype_map = {
+            dtypes.i8: "int8",
+            dtypes.fp8: "fp8",
+            dtypes.fp4x2: "fp4",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
-        b_dtype_str = "fp4"
+        b_dtype_str = _b_dtype_map.get(q_dtype_w, "fp4")
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         flydsl_s1_kernels = get_flydsl_stage1_kernels(
@@ -2017,13 +2025,13 @@ class FmoeTuner(TunerCommon):
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
-                if is_splitk and not use_g1u1:
+                if is_splitk and not use_g1u1 and b_dtype_str == "fp4":
                     continue
-                if kparams.get("gate_only", False) and not use_g1u1:
+                if kparams.get("gate_only", False) and not use_g1u1 and b_dtype_str == "fp4":
                     continue
 
                 s1_variants = [(kname, kparams, False)]
-                if (not is_splitk) or (act_type != ActivationType.Gelu):
+                if b_dtype_str == "fp4" and ((not is_splitk) or (act_type != ActivationType.Gelu)):
                     fq_params = {**kparams, "fuse_fp4_quant": True}
                     s1_variants.append((kname + "_fq", fq_params, True))
 
@@ -2082,14 +2090,20 @@ class FmoeTuner(TunerCommon):
                     )
 
             for kname, kparams in flydsl_s2_kernels.items():
-                s2_tile_m = kparams["tile_m"]
-                if blockM % s2_tile_m != 0:
-                    continue
-                # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
-                if s2_tile_m != blockM and s2_tile_m != blockM // 2:
-                    continue
-                s2_kparams = {**kparams, "sort_block_m": blockM}
-                s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
+                if b_dtype_str != "fp4":
+                    if kparams["tile_m"] != blockM:
+                        continue
+                    s2_kparams = kparams
+                    s2_kname = kname
+                else:
+                    s2_tile_m = kparams["tile_m"]
+                    if blockM % s2_tile_m != 0:
+                        continue
+                    # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
+                    if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                        continue
+                    s2_kparams = {**kparams, "sort_block_m": blockM}
+                    s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
                 tasks_flydsl.append(
                     (
                         (info, "stage2", s2_kname, blockM),
@@ -2395,10 +2409,10 @@ class FmoeTuner(TunerCommon):
                 if q_type == QuantType.per_1x32
                 else blockMs
             )
-            tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
+            #tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
+            #tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, shape_blockMs))
-            task_1stage.extend(self.gen_1stage_asm_task(info))
+            #task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue

@@ -275,6 +275,7 @@ def load_b_raw_w4a16(
     lane_div_16: ir.Value,
     elem_type: ir.Type,
     kpack_bytes: int = 8,
+    cache_modifier: int = 0,
 ):
     """Phase 1 of W4A16 B load: issue buffer_load_dword, return raw packed i32.
 
@@ -311,6 +312,7 @@ def load_b_raw_w4a16(
         vec_elems=4,
         elem_bytes=1,
         offset_in_bytes=True,
+        cache_modifier=cache_modifier,
     )
     packed32 = vector.extract(
         vector.bitcast(T.vec(1, T.i32), b4),
@@ -360,6 +362,7 @@ def load_b_pack_k32(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     unpack_int4: bool = False,
+    cache_modifier: int = 0,
 ) -> ir.Value:
     """Load one B pack for one MFMA(x32) micro-step.
 
@@ -394,6 +397,7 @@ def load_b_pack_k32(
             vec_elems=4,
             elem_bytes=1,
             offset_in_bytes=True,
+            cache_modifier=cache_modifier,
         )
         packed32 = vector.extract(
             vector.bitcast(T.vec(1, T.i32), b4),
@@ -427,6 +431,7 @@ def load_b_pack_k32(
         vec_elems=vec_elems,
         elem_bytes=elem_bytes,
         offset_in_bytes=(elem_bytes == 1),
+        cache_modifier=cache_modifier,
     )
 
     b_i32x4 = vector.bitcast(T.i32x4, b16)

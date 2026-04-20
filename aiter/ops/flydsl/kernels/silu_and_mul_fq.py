@@ -36,7 +36,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
 
-BLOCK_THREADS = 256
+BLOCK_THREADS = 192
 WARP_SIZE = 64
 
 

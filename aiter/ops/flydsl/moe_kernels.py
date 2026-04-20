@@ -66,25 +66,32 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
 
-    tile_ns = [32, 64, 128, 256] if is_fp4 else [128]
-    tile_ks = [256]
-    tile_ms = [16, 32, 64, 128]
-    waves_per_eus = [1, 2, 3, 4]
-    k_batches = [1, 2, 4, 7, 14]
-    b_nts = [0, 2]
+    tile_ns = [32, 64, 128, 256] if is_fp4 else [128, 256]
+    tile_ks = [256] if is_fp4 else [128, 256]
+    tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
+    waves_per_eus = [1, 2, 3, 4] if is_fp4 else [0, 1, 2, 3, 4]
+    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1]
+    b_nts = [0, 2] if is_fp4 else [0, 2]
+    # Stage1: fp4 (mixed) and non-fp4 (moe_gemm_2stage) both honor ``use_async_copy``.
     async_copies = [False, True]
 
     for tm in tile_ms:
-        if tm in [16, 32]:
-            tile_ns = [32, 64, 128]
-        else:
-            tile_ns = [64, 128, 256]
+        if is_fp4:
+            if tm in [16, 32]:
+                tile_ns = [32, 64, 128]
+            else:
+                tile_ns = [64, 128, 256]
         for tn in tile_ns:
             for tk in tile_ks:
                 for async_copy in async_copies:
                     for wpe in waves_per_eus:
                         for kb in k_batches if wpe == 3 else [1]:
-                            gate_onlys = [False, True] if kb > 1 else [False]
+                            if is_fp4:
+                                if tk == 512 and kb == 16:
+                                    continue
+                                if tn // 32 * 64 > 256:
+                                    continue
+                            gate_onlys = [False, True] if kb > 1 and is_fp4 else [False]
                             for bnt in b_nts:
                                 for go in gate_onlys:
                                     name = flydsl_kernel_name(
@@ -92,7 +99,9 @@ def get_flydsl_stage1_kernels(
                                     )
                                     if async_copy:
                                         name += "_async"
-                                    if wpe != 1:
+                                    if is_fp4 and wpe != 1:
+                                        name += f"_w{wpe}"
+                                    elif not is_fp4 and wpe > 0:
                                         name += f"_w{wpe}"
                                     if kb != 1:
                                         name += f"_kb{kb}"
@@ -124,35 +133,48 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [256] if is_fp4 else [128]
+    tile_ns = [128, 256] if is_fp4 else [128, 256]
+    tile_ks = [256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
+    waves_per_eus = [0] if is_fp4 else [0, 1, 2, 3, 4]
+    b_nts = [0] if is_fp4 else [0, 2]
 
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
-                    base_name = flydsl_kernel_name(
-                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
-                    )
-                    base_params = {
-                        "stage": 2,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "mode": mode,
-                        "MPerBlock": tm,
-                    }
-                    kernels[base_name] = base_params
-                    # Persistent variant: round-robin over M tiles, grid_y=cu_num.
-                    kernels[base_name + "_persist"] = {
-                        **base_params,
-                        "persist": True,
-                    }
+                    for wpe in waves_per_eus:
+                        for bnt in b_nts:
+                            base_name = flydsl_kernel_name(
+                                2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                            )
+                            if is_fp4 and wpe != 1:
+                                base_name += f"_w{wpe}"
+                            elif not is_fp4 and wpe > 0:
+                                base_name += f"_w{wpe}"
+                            if bnt != 2:
+                                base_name += f"_bnt{bnt}"
+                            base_params = {
+                                "stage": 2,
+                                "a_dtype": a_dtype,
+                                "b_dtype": b_dtype,
+                                "out_dtype": out_dtype,
+                                "tile_m": tm,
+                                "tile_n": tn,
+                                "tile_k": tk,
+                                "mode": mode,
+                                "MPerBlock": tm,
+                                "waves_per_eu": wpe,
+                                "b_nt": bnt,
+                            }
+                            kernels[base_name] = base_params
+                            # Persistent variant: round-robin over M tiles, grid_y=cu_num.
+                            if is_fp4:
+                                kernels[base_name + "_persist"] = {
+                                    **base_params,
+                                    "persist": True,
+                                }
     return kernels
 
 
@@ -160,6 +182,11 @@ def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
         for b in ("fp4",):
+            for out in ("bf16", "f16"):
+                _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
+                _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
+    for a in ("fp8", "int8"):
+        for b in (a,):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
                 _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
@@ -232,6 +259,11 @@ def compile_flydsl_moe_stage1(
             doweight_stage1=doweight_stage1,
             in_dtype=a_dtype,
             out_dtype=out_dtype,
+            act=act,
+            use_g1u1=use_g1u1,
+            use_async_copy=use_async_copy,
+            waves_per_eu=waves_per_eu,
+            b_nt=b_nt,
         )
 
 
@@ -250,6 +282,9 @@ def compile_flydsl_moe_stage2(
     accumulate: bool = True,
     persist_m: int = 1,
     sort_block_m: int = 0,
+    use_async_copy: bool = False,
+    waves_per_eu: int = 3,
+    b_nt: int = 2,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -286,6 +321,9 @@ def compile_flydsl_moe_stage2(
             in_dtype=a_dtype,
             out_dtype=out_dtype,
             accumulate=accumulate,
+            use_async_copy=use_async_copy,
+            waves_per_eu=waves_per_eu,
+            b_nt=b_nt,
         )
 
 
@@ -774,6 +812,8 @@ def flydsl_moe_stage2(
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
+    waves_per_eu: int = 3,
+    b_nt: int = 2,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -891,6 +931,8 @@ def flydsl_moe_stage2(
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
     )
     _run_compiled(exe, args)
 
