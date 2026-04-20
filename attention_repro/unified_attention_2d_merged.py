@@ -486,8 +486,8 @@ class TDMKVLoader:
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             return i
         else:
-            return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.block_table_stride, other=0)
-            #return gl.amd.cdna4.buffer_load(self.block_tables_ptr_shifted + i)
+            #return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.block_table_stride, other=0)
+            return gl.load(self.block_tables_ptr_shifted + i)
 
 
     @gluon.jit
@@ -1234,18 +1234,6 @@ class AttentionProgram:
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
 
-        if cfg.LOOP_VARIANT == 1:
-            # TODO: we need to make sure masking last 2 is always enough
-            # This might be violated if BLOCK_M is too large compared to q_heads and tile_size
-            # like shortest and longest differ kv differ a lot
-            tile_end = gl.maximum(3, tile_end)
-        if cfg.LOOP_VARIANT == 2:
-            # TODO: This needs to be fixed, the we need to peel 1 iter and mask it to be safe
-            tile_end = gl.maximum(2, tile_end)
-        if cfg.LOOP_VARIANT == 3:
-            # Same prologue/epilogue depth as variant 1 (3-tile prologue + 3-tile epilogue).
-            tile_end = gl.maximum(3, tile_end)
-
         QK_scale = cfg.RCP_LN2 * cfg.SOFTMAX_SCALE
 
         if q_descale_ptr is not None:
@@ -1385,7 +1373,6 @@ class AttentionProgram:
         output_stride_0,
         output_stride_1,
         USE_TDM: gl.constexpr = False,
-        USE_BLOCKED: gl.constexpr = False,
     ):
         casted_out = out.to(self.output_ptr.dtype.element_ty)
 
@@ -1419,10 +1406,8 @@ class AttentionProgram:
             )
         else:
 
-            if USE_BLOCKED:
-                layout: gl.constexpr = self.cfg.blocked_q
-            else:
-                layout: gl.constexpr = self.cfg.pv_layout
+
+            layout: gl.constexpr = self.cfg.pv_layout
             offs_m_out = gl.arange(
                 0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, layout)
             )
@@ -1446,13 +1431,62 @@ class AttentionProgram:
             query_mask_0_out = query_pos_out < cur_batch_query_len
             query_mask_1_out = query_offset_1_out < self.cfg.NUM_QUERY_HEADS
             o_mask = query_mask_0_out[:, None] & query_mask_1_out[:, None]
-
-            if USE_BLOCKED:
-                casted_out = gl.convert_layout(casted_out, self.cfg.blocked_q)
             if self.cfg.USE_STORE_BUFFER_OP:
                 gl.amd.cdna4.buffer_store(casted_out, self.output_ptr, offsets=o_offs, mask=o_mask)
             else:
                 gl.store(self.output_ptr + o_offs, casted_out, mask=o_mask)
+
+    @gluon.jit
+    def store_output_split(
+        self,
+        out,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+        output_stride_0,
+        output_stride_1,
+        split_idx: gl.constexpr,
+    ):
+        """Store one HEAD_SIZE // 2 half of the output.
+
+        `out` is [BLOCK_M, HEAD_SIZE // 2]. `split_idx` ∈ {0, 1} selects which
+        half of the head dim this call writes. No TDM path: the two halves are
+        interleaved per query head in global memory (stride HEAD_SIZE between
+        q_in_kv rows), so a 2D TDM descriptor with contiguous inner would
+        stomp on the other split.
+        """
+        HALF: gl.constexpr = self.cfg.HEAD_SIZE // 2
+        casted_out = out.to(self.output_ptr.dtype.element_ty)
+
+        layout: gl.constexpr = self.cfg.pv_layout
+        offs_m_out = gl.arange(
+            0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, layout)
+        )
+        offs_d_out = gl.arange(
+            0, HALF, layout=gl.SliceLayout(0, layout)
+        ) + split_idx * HALF
+        query_pos_out = (
+            q_block_local_idx * self.cfg.BLOCK_Q
+            + offs_m_out // self.cfg.NUM_QUERIES_PER_KV
+        )
+        query_offset_0_out = cur_batch_in_all_start_index + query_pos_out
+        query_offset_1_out = (
+            kv_head_idx * self.cfg.NUM_QUERIES_PER_KV
+            + offs_m_out % self.cfg.NUM_QUERIES_PER_KV
+        )
+        o_offs = (
+            query_offset_0_out[:, None] * output_stride_0
+            + query_offset_1_out[:, None] * output_stride_1
+            + offs_d_out[None, :]
+        )
+        query_mask_0_out = query_pos_out < cur_batch_query_len
+        query_mask_1_out = query_offset_1_out < self.cfg.NUM_QUERY_HEADS
+        o_mask = query_mask_0_out[:, None] & query_mask_1_out[:, None]
+        if self.cfg.USE_STORE_BUFFER_OP:
+            gl.amd.cdna4.buffer_store(casted_out, self.output_ptr, offsets=o_offs, mask=o_mask)
+        else:
+            gl.store(self.output_ptr + o_offs, casted_out, mask=o_mask)
 
     # ---- Subtile helpers (used by subtile_split_loop) ----
 
@@ -1605,7 +1639,7 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     # merging tdm wait for 2 buffer will restrict the flight times
     MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
-    SPLIT_SOFTMAX0: gl.constexpr = True 
+    SPLIT_SOFTMAX0: gl.constexpr = True
     SPLIT_SOFTMAX0_EPI: gl.constexpr = False
     # Buffer rotation, tile m lives in slot m%N (same slot holds both K and V in disjoint regions).
     # Three rolling slot indices, named by which tile they track at the current iteration i:
@@ -1658,8 +1692,12 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
         p1, p21, q_shift22, alpha, M = pgm.softmax_part0_w_split(S, M)
     else:
         p, alpha, M = pgm.softmax_part0(S, M)
+    # TODO: we need to make sure masking last 2 is always enough
+    # This might be violated if BLOCK_M is too large compared to q_heads and tile_size
+    # like shortest and longest differ kv differ a lot
+    tile_end = gl.maximum(3, pgm.tile_end)
     # ---- Steady-state loop ----
-    for j in range(pgm.tile_start, pgm.tile_end - 3):
+    for j in range(pgm.tile_start, tile_end - 3):
         t_1 = j + 1
         t_2 = j + 2
         t_3 = j + 3
@@ -1714,8 +1752,8 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     
     if MERGE_EPI_TDM_WAITS:
         gl.amd.gfx1250.tdm.async_wait(1) # merged
-    epilogue_t_2 = pgm.tile_end - 2
-    epilogue_t_3 = pgm.tile_end - 1
+    epilogue_t_2 = tile_end - 2
+    epilogue_t_3 = tile_end - 1
     # try to issue earlier
     if MERGE_EPI_TDM_WAITS and cfg.NUM_BUFFERS == 3:
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
@@ -1820,8 +1858,8 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buf_tile_cur, sub_idx=1)
 
     # ---- pipeline prologue, iter -2 ----
-    pred = 1 - pgm.tile_end
-    pred = (pred >> 31) & 1
+    # pred = 1 - pgm.tile_end
+    # pred = (pred >> 31) & 1
     pred = 1
     kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=buf_tile_next, sub_idx=0, pred=pred)
     gl.amd.gfx1250.tdm.async_wait(1)
@@ -1833,12 +1871,11 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 
     # ---- pipeline prologue, iter -1 ----
     qk0 = pgm.compute_qk_subtile(k0)
-    if cfg.CAUSAL:
-        qk0 = pgm.apply_mask_qk_subtile(qk0, 0, 0)
-    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buf_tile_cur, sub_idx=0)
     qk1 = pgm.compute_qk_subtile(k1)
-    if cfg.CAUSAL:
-        qk1 = pgm.apply_mask_qk_subtile(qk1, 0, 1)
+    if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
+        qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
+        qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
+    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buf_tile_cur, sub_idx=0)
 
     kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buf_tile_cur, sub_idx=1)
     qk = pgm.concat_subtile(qk0, qk1)
@@ -1866,8 +1903,10 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     # The first 4 are needed by this iter's ds_loads; K1_{j+2} stays pending for iter j+1.
     # Merged wait: async_wait(1) drains the oldest 4 in one shot (relies on TDM FIFO).
     next3_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 3)
-    for j in range(pgm.tile_start, pgm.tile_end - 2):
-        # pred = j + 3 - pgm.tile_end
+    # TODO: This needs to be fixed, the we need to peel 1 iter and mask it to be safe
+    tile_end = gl.maximum(2, pgm.tile_end)
+    for j in range(pgm.tile_start, tile_end - 2):
+        # pred = j + 3 - tile_end
         # pred = (pred >> 31) & 1
         pred = 1
         next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
@@ -1897,7 +1936,8 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
         if q.dtype != gl.bfloat16:
             p = p.to(q.dtype)
         else:
-            p = p.to(q.dtype, fp_downcast_rounding="rtz")
+            #p = p.to(q.dtype, fp_downcast_rounding="rtz")
+            p = p.to(q.dtype)
         kv_loader.load_v_to_shared(v_blk, buffer_id=buf_tile_next, sub_idx=1)
 
         acc0 = pgm.compute_pv(p, v0, acc0)
@@ -1940,7 +1980,7 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     # After last rotation in the loop body:
     #   buf_tile_cur  = (tile_end-2)%N  (holds V of tile_end-2)
     #   buf_tile_next = (tile_end-1)%N  (holds K of tile_end-1, receives V of tile_end-1)
-    epi_v_blk = kv_loader.load_block_ids(pgm.tile_end - 1)
+    epi_v_blk = kv_loader.load_block_ids(tile_end - 1)
     kv_loader.load_v_to_shared(epi_v_blk, buffer_id=buf_tile_next, sub_idx=0)
     kv_loader.load_v_to_shared(epi_v_blk, buffer_id=buf_tile_next, sub_idx=1)
 
@@ -1968,9 +2008,9 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
                                         buffer_id=buf_tile_next, sub_idx=1, skip_wait=True)
 
     qk0 = pgm.compute_qk_subtile(k0)
-    qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_end - 1, 0)
+    qk0 = pgm.apply_mask_qk_subtile(qk0, tile_end - 1, 0)
     qk1 = pgm.compute_qk_subtile(k1)
-    qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_end - 1, 1)
+    qk1 = pgm.apply_mask_qk_subtile(qk1, tile_end - 1, 1)
     acc1 = pgm.compute_pv(p, v1, acc1)
 
     qk = pgm.concat_subtile(qk0, qk1)
@@ -2027,7 +2067,19 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 # ============================================================================
 
 @gluon.jit
-def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
+def attention_loop_reg_subtile_split(
+    pgm, kv_loader, q, M, L, acc0, acc1,
+    # The following are only used when INTERNAL_STORE is True; pass dummies otherwise.
+    q_block_local_idx,
+    cur_batch_in_all_start_index,
+    kv_head_idx,
+    cur_batch_query_len,
+    output_stride_0,
+    output_stride_1,
+    FP8_MIN: gl.constexpr,
+    FP8_MAX: gl.constexpr,
+    INTERNAL_STORE: gl.constexpr = False,
+):
     """Reordered-style pipeline with register-side K/V subtile splitting.
 
     TDM/ds_load pattern: same as attention_loop_reordered (one K and one V TDM
@@ -2044,9 +2096,10 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     no extra LDS traffic or layout conversion is needed.
     """
     cfg: gl.constexpr = pgm.cfg
-    MERGE_LOOP_TDM_WAITS: gl.constexpr = True
-    MERGE_EPI_TDM_WAITS: gl.constexpr = False
-    QK_scale = pgm.QK_scale
+    MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
+    MERGE_EPI_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
+
+    QK_scale: gl.constexpr = pgm.QK_scale
 
     # Buffer rotation — tile m lives in slot m%N (K and V share the slot in
     # disjoint LDS regions, same as attention_loop_reordered).
@@ -2087,20 +2140,21 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 
     # QK_t0 — split K in registers and run two subtile WMMAs.
     k0_s, k1_s = pgm.split_subtile(k)
-    qk0 = pgm.compute_qk_subtile(k0_s)
     # Assume non-causal will always have 1 unmasked valid tile
     #if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
-    if cfg.CAUSAL:
+    #if cfg.CAUSAL:
+    qk0 = pgm.compute_qk_subtile(k0_s)
+    qk1 = pgm.compute_qk_subtile(k1_s)  
+    if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
         qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
-    qk1 = pgm.compute_qk_subtile(k1_s)
-    #if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
-    if cfg.CAUSAL:
         qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
+     
 
     # Inline softmax init for tile 0 (mirrors subtile_split's prologue):
     # produce m_ij/alpha/M and seed the loop's carry state (p0, qk1_shifted).
-    #qk = pgm.concat_subtile(qk0, qk1)
-    #qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
+    # qk = pgm.concat_subtile(qk0, qk1)
+    # qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
+    # m = reduce_max_prop_nan(qk, -1)
     m0 = reduce_max_prop_nan(qk0, -1)
     m1 = reduce_max_prop_nan(qk1, -1)
     m = elementwise_max_prop_nan(m0, m1)
@@ -2136,9 +2190,13 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     #   S4: PV subtile 1   + SM0-B (qk0_shifted/qk1_shifted from qk0/qk1, p0 = exp2(qk0_shifted))
     # Merged wait: single async_wait(1) at stage 1 drains V_j and K_{j+2};
     # V_{j+1} stays pending into next iter. Non-merged: async_wait(2) per stage.
-    
-    for j in range(pgm.tile_start, pgm.tile_end - 3):
-        next4_physical_block_idx = kv_loader.load_block_ids(j + 4)
+    # Same prologue/epilogue depth as variant 1 (3-tile prologue + 3-tile epilogue).
+    last_block_ind = kv_loader.block_table_stride - 1
+    tile_end = gl.maximum(3, pgm.tile_end)
+    for j in range(pgm.tile_start, tile_end - 3):
+        next_4 = j + 4
+        next_4 = gl.minimum(next_4, last_block_ind)
+        next4_physical_block_idx = kv_loader.load_block_ids(next_4)
 
         # ============ Stage 1 ============
         if MERGE_LOOP_TDM_WAITS:
@@ -2198,7 +2256,9 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
         if q.dtype != gl.bfloat16:
             p = p.to(q.dtype)
         else:
-            p = p.to(q.dtype, fp_downcast_rounding="rtz")
+            # works better
+            #p = p.to(q.dtype, fp_downcast_rounding="rtz")
+            p = p.to(q.dtype)
 
         # ds_load full K of tile j+2 into register (for iter j+1 stage 1 QK).
         k = kv_loader.load_k_from_shared(
@@ -2233,8 +2293,7 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
         qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
         p0 = gl.exp2(qk0_shifted)
 
-        next2_physical_block_idx = next3_physical_block_idx
-        next3_physical_block_idx = next4_physical_block_idx
+        next2_physical_block_idx, next3_physical_block_idx = next3_physical_block_idx, next4_physical_block_idx
         # Advance all three slot indices by +1 mod N. Aliasing is preserved:
         #   N=3: buf_tile_cur stays aliased with buf_k_store (both = new j%3)
         #   N=2: buf_tile_next2 stays aliased with buf_tile_cur (both = new j%2)
@@ -2252,96 +2311,57 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     # alpha, M (exactly as at a steady-state iter entry).
     if MERGE_EPI_TDM_WAITS:
         gl.amd.gfx1250.tdm.async_wait(1)  # merged
-    epilogue_t_2 = pgm.tile_end - 2
-    epilogue_t_3 = pgm.tile_end - 1
-    if cfg.NUM_BUFFERS == 3:
+    epilogue_t_2 = tile_end - 2
+    epilogue_t_3 = tile_end - 1
+    # Early V_{L+2} TDM store (MERGE + N=3 only — without MERGE the late
+    # path inside the stage1 block issues it instead; without this gating
+    # the N=3 non-MERGE case would double-issue V_{L+2}).
+    if cfg.NUM_BUFFERS == 3 and MERGE_EPI_TDM_WAITS:
         kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
-    with gl.amd.warp_pipeline_stage("stage1"):
-        # Early V store for tile L+2 (MERGE + N=3 path).
-
-        # QK subtiles for tile L+1 (k register = K_{L+1}).
-        k0_s, k1_s = pgm.split_subtile(k)
-        qk0 = pgm.compute_qk_subtile(k0_s) 
-        #if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
-        if cfg.CAUSAL:
-            qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)     
-        qk1 = pgm.compute_qk_subtile(k1_s)
-        #if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
-        if cfg.CAUSAL:
-            qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
-
-        # ds_load V of tile L
-        v_wait: gl.constexpr = 3 if cfg.NUM_BUFFERS == 3 else 2
-        v = kv_loader.load_v_from_shared(
-            wait_count=v_wait, buffer_id=buf_tile_cur,
-            target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
-        )
     
-        # SM1 for tile L (same shape as steady-state stages 1+2 SM1).
-        p1 = gl.exp2(qk1_shifted)
-        acc0 = acc0 * alpha[:, None]
-        acc1 = acc1 * alpha[:, None]
-        p = pgm.concat_subtile(p0, p1)
-        p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
-        l_ij = gl.sum(p, 1)
-        L = L * alpha + l_ij
-        if q.dtype != gl.bfloat16:
-            p = p.to(q.dtype)
-        else:
-            p = p.to(q.dtype, fp_downcast_rounding="rtz")
-        # Late V store for tile L+2 (non-MERGE or N=2 path).
-        if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
-            kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+    # 4-stage body for 1st sub-epilogue, mirroring the steady-state loop:
+    #   S1: QK sub 0 for L+1 + SM1-A for L (exp2 qk1_shifted + acc0 *= alpha)
+    #       + ds_load V_L
+    #   S2: QK sub 1 for L+1 + SM1-B for L (acc1 *= alpha + concat p +
+    #       convert/sum/L/cast) + late V_{L+2} TDM + ds_load K_{L+2}
+    #   S3: PV sub 0 for L + SM0 for L+1
+    #   S4: PV sub 1 for L + SM0-B for L+1
+    # Each WMMA is followed by independent VALU; dependent consumers
+    # (mask, concat_qk) are issued afterwards.
 
-        # ds_load K of tile L+2 into register for the post-stage1 QK.
-        k = kv_loader.load_k_from_shared(
-            wait_count=2, buffer_id=buf_tile_next2,
-            target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
-        )
+    # Split k (K_{L+1}) in-register.
+    k0_s, k1_s = pgm.split_subtile(k)
 
-        # PV subtiles for tile L.
-        v0_s, v1_s = pgm.split_subtile(v)
-        acc0 = pgm.compute_pv(p, v0_s, acc0)
-        # SM0 for tile L+1: reduce_max over concat qk, then compute shifted
-        # halves directly from qk0/qk1 and combine.
-        qk = pgm.concat_subtile(qk0, qk1)
-        qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
-        m = reduce_max_prop_nan(qk, -1)
-        # m0 = reduce_max_prop_nan(qk0, -1)
-        # m1 = reduce_max_prop_nan(qk1, -1)
-        # m = elementwise_max_prop_nan(m0, m1)
-        m_ij = elementwise_max_prop_nan(M, m)
-        m_ij_scaled = m_ij * QK_scale
-        m_diff_scaled = M * QK_scale - m_ij_scaled
-        M = m_ij
-        alpha = gl.exp2(m_diff_scaled)
-        acc1 = pgm.compute_pv(p, v1_s, acc1)
-
-        qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
-        qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
-        p0_next = gl.exp2(qk0_shifted)
-        p1_next = gl.exp2(qk1_shifted)
-        p = pgm.concat_subtile(p0_next, p1_next)
-
-    if MERGE_EPI_TDM_WAITS:
-        gl.amd.gfx1250.tdm.async_wait(0)  # merged
-
-    # ds_load V of tile L+1.
+    # --- S1 ---
+    # WMMA: QK sub 0 for tile L+1.
+    qk0 = pgm.compute_qk_subtile(k0_s)
+    # Mask depends on qk0 (post-WMMA VALU).
+    #if cfg.CAUSAL:
+    #if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+    #    qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
+    # SM1-A for tile L — indep of WMMA1 (exp2 of deferred half + acc0 fold).
+    p1 = gl.exp2(qk1_shifted)
+    acc0 = acc0 * alpha[:, None]
+    # ds_load V of tile L. With MERGE the outer async_wait(1) has already
+    # drained V_L; without MERGE we have 3 TDMs outstanding (V_L,
+    # K_{L+2}, V_{L+1}) and wait_count=2 drains the oldest (V_L).
+    v_wait: gl.constexpr = 2
     v = kv_loader.load_v_from_shared(
-        wait_count=1, buffer_id=buf_tile_next,
+        wait_count=v_wait, buffer_id=buf_tile_cur,
         target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
     )
-
-    # QK subtiles for tile L+2 (last tile is always masked).
-    k0_s, k1_s = pgm.split_subtile(k)
-    qk0 = pgm.compute_qk_subtile(k0_s)
-    acc0 = acc0 * alpha[:, None]
-
-    qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
+    # --- S2 ---
+    # WMMA: QK sub 1 for tile L+1.
     qk1 = pgm.compute_qk_subtile(k1_s)
-    qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
+    # Mask depends on qk1.
+    #if cfg.CAUSAL:
+    if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
+        qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
+    # SM1-B for tile L — indep of WMMA2 (operates on p0, p1, L, alpha;
+    # none depend on qk1).
     acc1 = acc1 * alpha[:, None]
-
+    p = pgm.concat_subtile(p0, p1)
     p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
@@ -2350,18 +2370,21 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     else:
         p = p.to(q.dtype, fp_downcast_rounding="rtz")
 
-    # PV subtiles for tile L+1.
+    # Late V_{L+2} TDM store (non-MERGE or N=2 path).
+    if cfg.NUM_BUFFERS == 2 or not MERGE_EPI_TDM_WAITS:
+        kv_loader.load_v_to_shared(next2_physical_block_idx, buffer_id=buf_tile_next2)
+    # Split V_L in-register for PV WMMAs.
     v0_s, v1_s = pgm.split_subtile(v)
-    acc0 = pgm.compute_pv(p, v0_s, acc0)
-    acc1 = pgm.compute_pv(p, v1_s, acc1)
-
-    # ds_load V of tile L+2.
-    v = kv_loader.load_v_from_shared(
-        wait_count=0, buffer_id=buf_tile_next2,
+    # ds_load K of tile L+2 for 2nd sub-epi's QK (matches loop's S2/S3 ds_load k).
+    k = kv_loader.load_k_from_shared(
+        wait_count=2, buffer_id=buf_tile_next2,
         target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
     )
 
-    # SM0 for tile L+2: reduce_max over concat qk, shifted from qk0/qk1 directly.
+    # --- S3 ---
+    # WMMA: PV sub 0 for tile L.
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    # SM0 for tile L+1 — reduce over concat qk, update M/alpha (indep of WMMA3).
     qk = pgm.concat_subtile(qk0, qk1)
     qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
     m = reduce_max_prop_nan(qk, -1)
@@ -2370,14 +2393,51 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
+
+    # --- S4 ---
+    # WMMA: PV sub 1 for tile L.
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    # SM0-B for tile L+1 — prep qk-shifted halves for next sub-epi (indep of WMMA4).
     qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
     qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
     p0_next = gl.exp2(qk0_shifted)
     p1_next = gl.exp2(qk1_shifted)
     p = pgm.concat_subtile(p0_next, p1_next)
 
-    # SM1 for tile L+2.
+    if MERGE_EPI_TDM_WAITS:
+        gl.amd.gfx1250.tdm.async_wait(0)  # merged
+
+    # ds_load V of tile L+1 (drains one TDM; V_{L+2} stays in flight into S3).
+    v = kv_loader.load_v_from_shared(
+        wait_count=1, buffer_id=buf_tile_next,
+        target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
+    )
+
+    # 4-stage body for 2nd sub-epilogue, mirroring the steady-state loop:
+    #   S1: QK sub 0 for L+2 + SM1-A for L+1 (acc0 alpha fold)
+    #   S2: QK sub 1 for L+2 + SM1-B for L+1 (convert/sum/L/cast)
+    #   S3: PV sub 0 for L+1 + ds_load V_{L+2} + SM0 for L+2
+    #   S4: PV sub 1 for L+1 + SM0-B for L+2
+    # Each WMMA is followed by independent VALU that hides its latency; the
+    # dependent consumer (mask / SM0 reduce) is issued afterwards.
+
+    # Split k (full K_{L+2}) into subtile halves in-register.
+    k0_s, k1_s = pgm.split_subtile(k)
+
+    # --- S1 ---
+    # WMMA: QK sub 0 for L+2 (last tile is masked).
+    qk0 = pgm.compute_qk_subtile(k0_s)
+    # VALU indep of WMMA1 — fold alpha into acc0.
     acc0 = acc0 * alpha[:, None]
+    # Mask depends on qk0.
+    qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
+
+    # --- S2 ---
+    # WMMA: QK sub 1 for L+2.
+    qk1 = pgm.compute_qk_subtile(k1_s)
+    # SM1-B for L+1: all independent of WMMA2 (operates on p from prior
+    # stage1, which is in qk-subtile composite layout). acc1 *= alpha, then
+    # convert p → pv_layout, sum for L update, cast p to q.dtype.
     acc1 = acc1 * alpha[:, None]
     p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
     l_ij = gl.sum(p, 1)
@@ -2385,17 +2445,115 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     if q.dtype != gl.bfloat16:
         p = p.to(q.dtype)
     else:
-        p = p.to(q.dtype, fp_downcast_rounding="rtz")
+        # works better
+        #p = p.to(q.dtype, fp_downcast_rounding="rtz")
+        p = p.to(q.dtype)
+    # Mask depends on qk1.
+    qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_3, 1)
 
-    # PV subtiles for tile L+2.
+    # Split V_{L+1} before reassigning v (ds_load below overwrites v but
+    # v0_s/v1_s keep the old register tile alive for the PV WMMAs below).
     v0_s, v1_s = pgm.split_subtile(v)
-    acc0 = pgm.compute_pv(p, v0_s, acc0)
-    acc1 = pgm.compute_pv(p, v1_s, acc1)
 
-    # Concatenate split accumulators -> full [BLOCK_M, HEAD_SIZE]. Splits are
-    # contiguous (inverse of concat_subtile), so concat_subtile is the inverse.
-    acc = pgm.concat_subtile(acc0, acc1)
-    acc = gl.convert_layout(acc, pgm.cfg.pv_layout, assert_trivial=True)
+    # --- S3 ---
+    # WMMA: PV sub 0 for L+1.
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    # ds_load V of tile L+2 (drains the last TDM). The TDM wait + LDS→reg
+    # transfer latency overlaps WMMA3's compute and the SM0 VALU below —
+    # same placement idea as the loop's ds_load k at the S2/S3 boundary.
+    v = kv_loader.load_v_from_shared(
+        wait_count=0, buffer_id=buf_tile_next2,
+        target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
+    )
+    # SM0 for L+2 — reduce over concat qk, update M/alpha (indep of WMMA3).
+    qk = pgm.concat_subtile(qk0, qk1)
+    qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
+    m = reduce_max_prop_nan(qk, -1)
+    m_ij = elementwise_max_prop_nan(M, m)
+    m_ij_scaled = m_ij * QK_scale
+    m_diff_scaled = M * QK_scale - m_ij_scaled
+    M = m_ij
+    alpha = gl.exp2(m_diff_scaled)
+
+    # --- S4 ---
+    # WMMA: PV sub 1 for L+1.
+    acc1 = pgm.compute_pv(p, v1_s, acc1)
+    # SM0-B for L+2 — prepare p for tile L+2 SM1 (indep of WMMA4).
+    qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
+    qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
+    p0_next = gl.exp2(qk0_shifted)
+    p1_next = gl.exp2(qk1_shifted)
+    p = pgm.concat_subtile(p0_next, p1_next)
+
+    # ============ 3rd sub-epilogue: SM1 for L+2 + PV sub 0 for L+2 ============
+    # Only 2 WMMAs remain (PV sub 0 and sub 1 for L+2). SM1 prep feeds WMMA5's
+    # p input so it must go before it. acc1 *= alpha is deferred past WMMA5
+    # to overlap VALU with the WMMA latency (acc1 is still scaled before the
+    # final PV WMMA that runs after this section).
+    acc0 = acc0 * alpha[:, None]
+    p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
+    l_ij = gl.sum(p, 1)
+    L = L * alpha + l_ij
+    if q.dtype != gl.bfloat16:
+        p = p.to(q.dtype)
+    else:
+        # works better
+        #p = p.to(q.dtype, fp_downcast_rounding="rtz")
+        p = p.to(q.dtype)
+
+    # Split V_{L+2} in-register.
+    v0_s, v1_s = pgm.split_subtile(v)
+    # WMMA: PV sub 0 for L+2.
+    acc0 = pgm.compute_pv(p, v0_s, acc0)
+    # Fold alpha into acc1 during WMMA5 latency.
+    acc1 = acc1 * alpha[:, None]
+
+    if INTERNAL_STORE:
+        # Interleave the store of acc0 (first half) with the remaining
+        # compute_pv for acc1 (second half). acc1 is touched for its final
+        # WMMA *after* acc0's store has been issued, so the global store of
+        # half-0 overlaps the compute of half-1.
+        l_recip = pgm.out_scale / L[:, None]
+        o0 = acc0 * l_recip
+        if pgm.output_ptr.dtype.is_fp8():
+            o0 = gl.minimum(o0, FP8_MAX)
+            o0 = gl.maximum(o0, FP8_MIN)
+        pgm.store_output_split(
+            o0,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            output_stride_0,
+            output_stride_1,
+            split_idx=0,
+        )
+        acc1 = pgm.compute_pv(p, v1_s, acc1)
+        o1 = acc1 * l_recip
+        if pgm.output_ptr.dtype.is_fp8():
+            o1 = gl.minimum(o1, FP8_MAX)
+            o1 = gl.maximum(o1, FP8_MIN)
+        pgm.store_output_split(
+            o1,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            output_stride_0,
+            output_stride_1,
+            split_idx=1,
+        )
+
+        # The caller is expected to skip the outer normalize+store when
+        # INTERNAL_STORE is True; returning a zero acc of the expected shape
+        # keeps the return tuple shape stable.
+        acc = gl.zeros([cfg.BLOCK_M, cfg.HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
+    else:
+        acc1 = pgm.compute_pv(p, v1_s, acc1)
+        # Concatenate split accumulators -> full [BLOCK_M, HEAD_SIZE]. Splits are
+        # contiguous (inverse of concat_subtile), so concat_subtile is the inverse.
+        acc = pgm.concat_subtile(acc0, acc1)
+        acc = gl.convert_layout(acc, pgm.cfg.pv_layout, assert_trivial=True)
 
     return M, L, acc
 
@@ -2458,7 +2616,7 @@ def kernel_unified_attention_2d(
     stride_v_cache_1: gl.int32,
     stride_v_cache_2: gl.int32,
     stride_v_cache_3: gl.constexpr,
-    block_table_stride,
+    block_table_stride: gl.int32,
     num_seqs: gl.constexpr,
     SCALE: gl.constexpr,
     NUM_QUERY_HEADS: gl.constexpr,
@@ -2485,6 +2643,10 @@ def kernel_unified_attention_2d(
     #   2 = subtile_split (subtile multi-buffer pipeline)
     LOOP_VARIANT: gl.constexpr = 0,
 ):
+    # When True (variant 3 only), the store of acc0/acc1 is interleaved with
+    # the final PV compute inside the loop function instead of happening once
+    # after the loop returns.
+    INTERNAL_STORE_SPLIT: gl.constexpr = True
     NUM_WARPS: gl.constexpr = gl.num_warps()
     # Workgroup offsets
     kv_head_idx = gl.program_id(0)
@@ -2690,26 +2852,38 @@ def kernel_unified_attention_2d(
         # Reordered TDM pipeline with register-side K/V subtile splitting.
         acc0 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
         acc1 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
-        M, L, acc = attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1)
+        M, L, acc = attention_loop_reg_subtile_split(
+            pgm, kv_loader, q, M, L, acc0, acc1,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            output_stride_0,
+            output_stride_1,
+            FP8_MIN,
+            FP8_MAX,
+            INTERNAL_STORE=INTERNAL_STORE_SPLIT,
+        )
 
-    # Normalize and store output
-    l_recip = pgm.out_scale / L[:, None]
-    acc = acc * l_recip
-    if output_ptr.dtype.is_fp8():
-        acc = gl.minimum(acc, FP8_MAX)
-        acc = gl.maximum(acc, FP8_MIN)
+    # Normalize and store output (skipped when variant 3 stored the two halves
+    # internally — acc is a dummy in that case).
+    if not (LOOP_VARIANT == 3 and INTERNAL_STORE_SPLIT):
+        l_recip = pgm.out_scale / L[:, None]
+        acc = acc * l_recip
+        if output_ptr.dtype.is_fp8():
+            acc = gl.minimum(acc, FP8_MAX)
+            acc = gl.maximum(acc, FP8_MIN)
 
-    pgm.store_output(
-        acc,
-        q_block_local_idx,
-        cur_batch_in_all_start_index,
-        kv_head_idx,
-        cur_batch_query_len,
-        output_stride_0,
-        output_stride_1,
-        USE_TDM=False,
-        USE_BLOCKED=False,
-    )
+        pgm.store_output(
+            acc,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            output_stride_0,
+            output_stride_1,
+            USE_TDM=False,
+        )
 
 
 # ============================================================================
