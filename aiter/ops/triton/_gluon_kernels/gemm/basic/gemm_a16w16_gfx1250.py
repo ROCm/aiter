@@ -1252,8 +1252,90 @@ def _gemm_a16w16_lds_pipeline_kernel(
             OPERAND_LAYOUT_B,
         )
 
-    # Main pipeline loop
-    for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
+    # Main pipeline loop — first iteration peeled out below, then loop runs
+    # for (num_k_tiles - (NUM_BUFFERS - 1) - 1) remaining iterations.
+
+    # ---- Peeled first iteration ----
+    # WMMA for the current tile — uses operands pre-loaded in the
+    # *previous* iteration so no ds_read stall before the matrix op.
+    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+    # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
+    gl.amd.gfx1250.tdm.async_load(
+        a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+    )
+    gl.amd.gfx1250.tdm.async_load(
+        b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+    )
+
+    # Walk the descriptors forward one K tile.
+    if PHYSICAL_MK:
+        a_desc = gl.amd.gfx1250.tdm.advance(
+            a_desc, [0, BLOCK_K], update_bounds=False
+        )
+    else:
+        a_desc = gl.amd.gfx1250.tdm.advance(
+            a_desc, [BLOCK_K, 0], update_bounds=False
+        )
+
+    if PHYSICAL_KN:
+        b_desc = gl.amd.gfx1250.tdm.advance(
+            b_desc, [BLOCK_K, 0], update_bounds=False
+        )
+    else:
+        b_desc = gl.amd.gfx1250.tdm.advance(
+            b_desc, [0, BLOCK_K], update_bounds=False
+        )
+
+    # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
+    # ops in-flight.  Waiting for (NUM_BUFFERS-2)*2 guarantees that tile
+    # compute_idx+1 has landed in LDS.
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+
+    load_idx += 1
+
+    if USE_L2_PREFETCH:
+        gemm_l2_prefetch(
+            L2_PREFETCH_DISTANCE - 1,
+            0,
+            a_desc,
+            b_desc,
+            0,
+            0,
+            BLOCK_K,
+            not PHYSICAL_MK,
+            not PHYSICAL_KN,
+        )
+
+    # Pre-load the NEXT tile's operands into registers *before* the WMMA
+    # below.  The hardware can run LDS reads and the matrix unit in
+    # parallel, hiding the ds_read latency inside the WMMA execution.
+    if PHYSICAL_MK:
+        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
+        )
+    else:
+        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_A,
+        )
+
+    if PHYSICAL_KN:
+        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
+        )
+    else:
+        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_B,
+        )
+
+    cur_a = next_a
+    cur_b = next_b
+    compute_idx += 1
+
+    # ---- Remaining main-loop iterations ----
+    for _ in range(num_k_tiles - (NUM_BUFFERS - 1) - 1):
 
         # WMMA for the current tile — uses operands pre-loaded in the
         # *previous* iteration so no ds_read stall before the matrix op.
