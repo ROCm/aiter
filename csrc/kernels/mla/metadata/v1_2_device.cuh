@@ -476,10 +476,10 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
          (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 64 == 0) && !q_is_fp8 &&
          !kv_is_fp8) &&
-            (num_heads & (num_heads - 1) == 0) ||
+            ((num_heads & (num_heads - 1)) == 0) ||
         ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 128 == 0) && !q_is_fp8 &&
          !kv_is_fp8) &&
-            (num_heads & (num_heads - 1) == 0) ||
+            ((num_heads & (num_heads - 1)) == 0) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
 
     const bool use_qseqlen_fold =
@@ -547,9 +547,9 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     params.tail_done_threshold          = max_seqlen_qo;
 
     const int32_t kPackedQoLenPerWg =
-        ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 64 == 0) && (num_heads <= 64) &&
-         ((num_heads * max_seqlen_qo) % 128 != 0) && !q_is_fp8 && !kv_is_fp8 &&
-         (num_heads & (num_heads - 1) == 0))
+        (natively_supported && (arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 64 == 0) &&
+         (num_heads <= 64) && ((num_heads * max_seqlen_qo) % 128 != 0) && !q_is_fp8 && !kv_is_fp8 &&
+         ((num_heads & (num_heads - 1)) == 0) && (qk_batch_ratio == 1))
             ? 64
             : 128;
 
