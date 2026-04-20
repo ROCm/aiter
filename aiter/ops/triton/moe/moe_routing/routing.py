@@ -256,7 +256,7 @@ def routing(logits, n_expts_act, sm_first=False):
     num_tokens, n_expts_tot = logits.shape
     m = num_tokens * n_expts_act
     tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 256))
     if num_tokens <= 16:
         HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
         (

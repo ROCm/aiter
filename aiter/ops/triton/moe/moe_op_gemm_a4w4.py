@@ -89,9 +89,9 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
 
     split_k = 1
     if use_gluon:
-        # TODO: need to tune
-        block_n = 128
-        block_k = 512
+        # Match MXFP4 preshuffle config
+        block_n = 256
+        block_k = 256
         num_warps = 4
     else:
         if block_m == 16:
@@ -123,7 +123,7 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
         "xcd_swizzle": xcd_swizzle,
         "w_cache_modifier": w_cache_modifier,
         "split_k": split_k,
-        "waves_per_eu": 0,
+        "waves_per_eu": 1 if use_gluon else 0,
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
@@ -354,6 +354,10 @@ def moe_gemm_a4w4(
             config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE"
         )
         assert config["split_k"] == 1, "split_k is not currently supported for gfx1250"
+        print(f"[moe_gemm_a4w4] x.shape={tuple(x.shape)} x.stride={tuple(x.stride())}")
+        print(f"[moe_gemm_a4w4] w.shape={tuple(w.shape)} w.stride={tuple(w.stride())}")
+        print(f"[moe_gemm_a4w4] M={M} N={N} K={K}")
+        print(f"[moe_gemm_a4w4] BLOCK_M={config['block_m']} BLOCK_N={config['block_n']} BLOCK_K={config['block_k']}")
         _moe_gemm_a4w4_gfx1250[(grid,)](
             y,
             y.stride(0),
