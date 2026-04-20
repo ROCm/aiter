@@ -476,10 +476,16 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
          (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 64 == 0) && !q_is_fp8 &&
          !kv_is_fp8) &&
-            (num_heads <= 64) ||
+            (num_heads & (num_heads - 1) == 0) ||
         ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 128 == 0) && !q_is_fp8 &&
+<<<<<<< HEAD
          !kv_is_fp8) ||
         ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
+=======
+         !kv_is_fp8) &&
+            (num_heads & (num_heads - 1) == 0) ||
+        ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8);
+>>>>>>> d7970245f (fix the native supported conditions)
 
     const bool use_qseqlen_fold =
         !natively_supported && (arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 && (num_heads > 16) &&
@@ -507,14 +513,9 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
     TORCH_CHECK(
         (num_heads == 16) || (num_heads == 128) || ((num_heads == 32) && q_is_fp8 && kv_is_fp8) ||
             ((num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
-<<<<<<< HEAD
             ((arch_id == "gfx950") && (num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8) ||
             ((arch_id == "gfx942") && (num_heads == 8) && (max_seqlen_qo == 2) && !q_is_fp8 && !kv_is_fp8) ||
             ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 128 == 0) && !q_is_fp8 &&
-=======
-            ((num_heads == 8) && (max_seqlen_qo == 4) && q_is_fp8 && kv_is_fp8) ||
-            ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 64 == 0) && !q_is_fp8 &&
->>>>>>> 5c57ae576 (mla ps mode support nhead*qseqlen = n*64 through mla_a16w16_qh64_qseqlen1_gqaratio64_v3_ps)
              !kv_is_fp8),
         __func__,
         ": only supports #heads in [16, 64, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
@@ -553,7 +554,8 @@ void get_mla_metadata_v1_2_device(const torch::Tensor& seqlens_qo_indptr, // [ba
 
     const int32_t kPackedQoLenPerWg =
         ((arch_id == "gfx950") && ((num_heads * max_seqlen_qo) % 64 == 0) && (num_heads <= 64) &&
-         ((num_heads * max_seqlen_qo) % 128 != 0) && !q_is_fp8 && !kv_is_fp8)
+         ((num_heads * max_seqlen_qo) % 128 != 0) && !q_is_fp8 && !kv_is_fp8 &&
+         (num_heads & (num_heads - 1) == 0))
             ? 64
             : 128;
 
