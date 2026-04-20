@@ -15,6 +15,7 @@ namespace aiter {
  *    - Variance computed over full hidden_size
  *    - Gemma-style weight: (1 + weight) instead of weight
  * 3. FP8 group quantization with group_size=128
+ * 4. Optional: also write unquantized normed output
  *
  * Constraints:
  * - hidden_size must be a multiple of 128
@@ -30,6 +31,8 @@ namespace aiter {
  *   transpose_scale: If true, store scales in [num_groups, num_tokens] layout
  *   residual: Optional residual tensor [num_tokens, hidden_size] (bf16/fp16)
  *             If provided, computes x = x + residual and writes back inplace
+ *   out_normed: Optional tensor [num_tokens, hidden_size] (bf16/fp16)
+ *               If provided, also writes the unquantized normed output
  */
 void gemma_rmsnorm_fp8_group_quant(
     torch::Tensor& out,
@@ -39,6 +42,7 @@ void gemma_rmsnorm_fp8_group_quant(
     double epsilon,
     int group_size,
     bool transpose_scale = false,
-    c10::optional<torch::Tensor> residual = c10::nullopt);
+    c10::optional<torch::Tensor> residual = c10::nullopt,
+    c10::optional<torch::Tensor> out_normed = c10::nullopt);
 
 } // namespace aiter

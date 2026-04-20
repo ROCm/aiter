@@ -31,9 +31,13 @@ def gemma_rmsnorm_fp8_group_quant(
     group_size: int,
     transpose_scale: bool = False,
     residual: Optional[Tensor] = None,
+    out_normed: Optional[Tensor] = None,
 ) -> None:
     """
     HIP kernel for fused Gemma RMSNorm + FP8 group quantization.
+
+    Always produces FP8 quantized output (out + scale).
+    Optionally also writes unquantized normed output to out_normed.
 
     This is a JIT-compiled binding that will be replaced with the actual kernel.
     """

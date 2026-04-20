@@ -18,6 +18,7 @@ namespace aiter {
  *    - Variance computed over full hidden_size
  *    - Gemma-style: (1 + weight) instead of weight
  * 3. FP8 group quantization with group_size=128
+ * 4. Optional: also write unquantized normed output (HAS_OUT_NORMED)
  *
  * Constraints:
  * - hidden_size must be a multiple of GROUP_SIZE (128)
@@ -37,13 +38,15 @@ namespace aiter {
 template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128,
           int THREAD_DATA_SIZE = 16, int BLOCK_SIZE = 256,
           int MAX_GROUPS_PER_THREAD = 3,
-          bool TRANSPOSE_SCALE = false, bool HAS_RESIDUAL = false>
+          bool TRANSPOSE_SCALE = false, bool HAS_RESIDUAL = false,
+          bool HAS_OUT_NORMED = false>
 __global__ void gemma_rmsnorm_fp8_group_quant_kernel(
     DTYPE_O* __restrict__ out,           // [num_tokens, hidden_size]
     float* __restrict__ scale,           // [num_tokens, num_groups] or transposed
     DTYPE_I const* __restrict__ x,       // [num_tokens, hidden_size]
     DTYPE_I* __restrict__ residual,      // [num_tokens, hidden_size] (inplace if HAS_RESIDUAL)
     DTYPE_I const* __restrict__ weight,  // [hidden_size]
+    DTYPE_I* __restrict__ out_normed,    // [num_tokens, hidden_size] (if HAS_OUT_NORMED)
     double epsilon,
     int num_tokens,
     int hidden_size)
@@ -122,7 +125,7 @@ __global__ void gemma_rmsnorm_fp8_group_quant_kernel(
 
     const float inv_std = s_inv_std;
 
-    // ---- Phase 2: Apply Gemma RMSNorm + FP8 group quantize from cached data ----
+    // ---- Phase 2: Apply Gemma RMSNorm + quantize, optionally write normed ----
     constexpr float FP8_MAX = static_cast<float>(opus::finfo<DTYPE_O>::max());
 
     #pragma unroll
@@ -140,7 +143,18 @@ __global__ void gemma_rmsnorm_fp8_group_quant_kernel(
                 normed_vals[i] = x_cache[iter][i] * inv_std * (1.0f + w);
             }
 
-            // Group-local max for quantization
+            const int elem_base = token_base + g * GROUP_SIZE
+                                  + thread_in_group * THREAD_DATA_SIZE;
+
+            // Optionally write unquantized normed output
+            if constexpr (HAS_OUT_NORMED) {
+                #pragma unroll
+                for (int i = 0; i < THREAD_DATA_SIZE; i++) {
+                    out_normed[elem_base + i] = opus::cast<DTYPE_I>(normed_vals[i]);
+                }
+            }
+
+            // FP8 group quantization
             float local_max = -INFINITY;
             #pragma unroll
             for (int i = 0; i < THREAD_DATA_SIZE; i++) {
@@ -155,8 +169,6 @@ __global__ void gemma_rmsnorm_fp8_group_quant_kernel(
             float quant_scale = (local_max > 1e-10f) ? (local_max / FP8_MAX) : 1e-10f;
             float quant_scale_inv = 1.0f / quant_scale;
 
-            const int elem_base = token_base + g * GROUP_SIZE
-                                  + thread_in_group * THREAD_DATA_SIZE;
             using DTYPE_O_STORE = typename opus::vector_traits<DTYPE_O>::dtype;
             DTYPE_O_STORE* out_ptr = reinterpret_cast<DTYPE_O_STORE*>(out + elem_base);
 
@@ -186,13 +198,14 @@ __global__ void gemma_rmsnorm_fp8_group_quant_kernel(
  */
 template <typename DTYPE_I, typename DTYPE_O,
           int THREAD_DATA_SIZE, int BLOCK_SIZE, int MAX_GROUPS_PER_THREAD,
-          bool TRANSPOSE_SCALE, bool HAS_RESIDUAL>
+          bool TRANSPOSE_SCALE, bool HAS_RESIDUAL, bool HAS_OUT_NORMED>
 void gemma_rmsnorm_fp8_group_quant_launcher_impl(
     torch::Tensor& out,
     torch::Tensor& scale,
     torch::Tensor const& x,
     torch::Tensor& residual,
     torch::Tensor const& weight,
+    torch::Tensor& out_normed,
     double epsilon,
     int num_tokens,
     int hidden_size)
@@ -206,15 +219,21 @@ void gemma_rmsnorm_fp8_group_quant_launcher_impl(
         ? reinterpret_cast<DTYPE_I*>(residual.data_ptr())
         : nullptr;
 
+    DTYPE_I* out_normed_ptr = HAS_OUT_NORMED
+        ? reinterpret_cast<DTYPE_I*>(out_normed.data_ptr())
+        : nullptr;
+
     gemma_rmsnorm_fp8_group_quant_kernel<
         DTYPE_I, DTYPE_O, 128, THREAD_DATA_SIZE,
-        BLOCK_SIZE, MAX_GROUPS_PER_THREAD, TRANSPOSE_SCALE, HAS_RESIDUAL>
+        BLOCK_SIZE, MAX_GROUPS_PER_THREAD, TRANSPOSE_SCALE, HAS_RESIDUAL,
+        HAS_OUT_NORMED>
         <<<grid, block, 0, stream>>>(
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),
             reinterpret_cast<float*>(scale.data_ptr()),
             reinterpret_cast<DTYPE_I const*>(x.data_ptr()),
             residual_ptr,
             reinterpret_cast<DTYPE_I const*>(weight.data_ptr()),
+            out_normed_ptr,
             epsilon,
             num_tokens,
             hidden_size
@@ -233,10 +252,12 @@ void gemma_rmsnorm_fp8_group_quant_launcher(
     torch::Tensor const& x,
     torch::Tensor& residual,
     torch::Tensor const& weight,
+    torch::Tensor& out_normed,
     double epsilon,
     int group_size,
     bool transpose_scale,
-    bool has_residual)
+    bool has_residual,
+    bool has_out_normed)
 {
     TORCH_CHECK(x.dim() == 2, "Input x must be 2D: [num_tokens, hidden_size]");
     const int num_tokens = x.size(0);
@@ -256,6 +277,13 @@ void gemma_rmsnorm_fp8_group_quant_launcher(
                     "Residual must have same shape as x");
     }
 
+    if (has_out_normed) {
+        TORCH_CHECK(out_normed.dim() == 2 &&
+                    out_normed.size(0) == num_tokens &&
+                    out_normed.size(1) == hidden_size,
+                    "out_normed must have same shape as x");
+    }
+
     constexpr int THREAD_DATA_SIZE = 16;
     constexpr int threads_per_group = 128 / THREAD_DATA_SIZE;  // 8
     constexpr int BLOCK_SIZE = 256;
@@ -268,47 +296,58 @@ void gemma_rmsnorm_fp8_group_quant_launcher(
                 " requires max_groups_per_thread=", max_groups_per_thread,
                 " (max 3, i.e., hidden_size <= ", 3 * groups_per_block * 128, ")");
 
-    // Dispatch on max_groups_per_thread, transpose_scale, and has_residual
-    #define DISPATCH_INNER(MGT)                                                  \
+    // Dispatch on max_groups_per_thread, transpose_scale, has_residual, has_out_normed
+    #define DISPATCH_INNER(MGT, OUT_NORMED)                                      \
         if (transpose_scale && has_residual) {                                   \
             gemma_rmsnorm_fp8_group_quant_launcher_impl<                         \
                 DTYPE_I, DTYPE_O, THREAD_DATA_SIZE, BLOCK_SIZE,                  \
-                MGT, true, true>(                                                \
-                out, scale, x, residual, weight, epsilon, num_tokens,            \
-                hidden_size);                                                    \
+                MGT, true, true, OUT_NORMED>(                                    \
+                out, scale, x, residual, weight, out_normed, epsilon,            \
+                num_tokens, hidden_size);                                        \
         } else if (transpose_scale) {                                            \
             gemma_rmsnorm_fp8_group_quant_launcher_impl<                         \
                 DTYPE_I, DTYPE_O, THREAD_DATA_SIZE, BLOCK_SIZE,                  \
-                MGT, true, false>(                                               \
-                out, scale, x, residual, weight, epsilon, num_tokens,            \
-                hidden_size);                                                    \
+                MGT, true, false, OUT_NORMED>(                                   \
+                out, scale, x, residual, weight, out_normed, epsilon,            \
+                num_tokens, hidden_size);                                        \
         } else if (has_residual) {                                               \
             gemma_rmsnorm_fp8_group_quant_launcher_impl<                         \
                 DTYPE_I, DTYPE_O, THREAD_DATA_SIZE, BLOCK_SIZE,                  \
-                MGT, false, true>(                                               \
-                out, scale, x, residual, weight, epsilon, num_tokens,            \
-                hidden_size);                                                    \
+                MGT, false, true, OUT_NORMED>(                                   \
+                out, scale, x, residual, weight, out_normed, epsilon,            \
+                num_tokens, hidden_size);                                        \
         } else {                                                                 \
             gemma_rmsnorm_fp8_group_quant_launcher_impl<                         \
                 DTYPE_I, DTYPE_O, THREAD_DATA_SIZE, BLOCK_SIZE,                  \
-                MGT, false, false>(                                              \
-                out, scale, x, residual, weight, epsilon, num_tokens,            \
-                hidden_size);                                                    \
+                MGT, false, false, OUT_NORMED>(                                  \
+                out, scale, x, residual, weight, out_normed, epsilon,            \
+                num_tokens, hidden_size);                                        \
         }
 
-    if (max_groups_per_thread <= 1) {
-        DISPATCH_INNER(1)
-    } else if (max_groups_per_thread <= 2) {
-        DISPATCH_INNER(2)
+    #define DISPATCH_MGT(OUT_NORMED)                                             \
+        if (max_groups_per_thread <= 1) {                                        \
+            DISPATCH_INNER(1, OUT_NORMED)                                        \
+        } else if (max_groups_per_thread <= 2) {                                 \
+            DISPATCH_INNER(2, OUT_NORMED)                                        \
+        } else {                                                                 \
+            DISPATCH_INNER(3, OUT_NORMED)                                        \
+        }
+
+    if (has_out_normed) {
+        DISPATCH_MGT(true)
     } else {
-        DISPATCH_INNER(3)
+        DISPATCH_MGT(false)
     }
 
+    #undef DISPATCH_MGT
     #undef DISPATCH_INNER
 }
 
 /**
  * Python-facing interface
+ *
+ * Always produces FP8 quantized output (out + scale).
+ * Optionally also writes unquantized normed output to out_normed.
  */
 void gemma_rmsnorm_fp8_group_quant(
     torch::Tensor& out,
@@ -318,7 +357,8 @@ void gemma_rmsnorm_fp8_group_quant(
     double epsilon,
     int group_size,
     bool transpose_scale,
-    c10::optional<torch::Tensor> residual)
+    c10::optional<torch::Tensor> residual,
+    c10::optional<torch::Tensor> out_normed)
 {
     TORCH_CHECK(x.is_cuda(), "Input x must be on CUDA device");
     TORCH_CHECK(weight.is_cuda(), "Weight must be on CUDA device");
@@ -330,27 +370,40 @@ void gemma_rmsnorm_fp8_group_quant(
         ? residual.value()
         : torch::empty({0}, x.options());
 
+    bool has_out_normed = out_normed.has_value();
+    torch::Tensor out_normed_tensor = has_out_normed
+        ? out_normed.value()
+        : torch::empty({0}, x.options());
+
     if (has_residual) {
         TORCH_CHECK(residual_tensor.is_cuda(),
                     "Residual must be on CUDA device");
     }
 
-    if (x.scalar_type() == at::ScalarType::BFloat16 &&
-        (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz ||
-         out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+    if (has_out_normed) {
+        TORCH_CHECK(out_normed_tensor.is_cuda(),
+                    "out_normed must be on CUDA device");
+        TORCH_CHECK(out_normed_tensor.scalar_type() == x.scalar_type(),
+                    "out_normed dtype must match input dtype. "
+                    "Input: ", x.scalar_type(),
+                    ", out_normed: ", out_normed_tensor.scalar_type());
+    }
+
+    TORCH_CHECK(out.scalar_type() == at::ScalarType::Float8_e4m3fnuz ||
+                out.scalar_type() == at::ScalarType::Float8_e4m3fn,
+                "Output must be FP8 dtype, got ", out.scalar_type());
+
+    if (x.scalar_type() == at::ScalarType::BFloat16) {
         gemma_rmsnorm_fp8_group_quant_launcher<opus::bf16_t, opus::fp8_t>(
-            out, scale, x, residual_tensor, weight, epsilon,
-            group_size, transpose_scale, has_residual);
-    } else if (x.scalar_type() == at::ScalarType::Half &&
-               (out.scalar_type() == at::ScalarType::Float8_e4m3fnuz ||
-                out.scalar_type() == at::ScalarType::Float8_e4m3fn)) {
+            out, scale, x, residual_tensor, weight, out_normed_tensor,
+            epsilon, group_size, transpose_scale, has_residual, has_out_normed);
+    } else if (x.scalar_type() == at::ScalarType::Half) {
         gemma_rmsnorm_fp8_group_quant_launcher<opus::fp16_t, opus::fp8_t>(
-            out, scale, x, residual_tensor, weight, epsilon,
-            group_size, transpose_scale, has_residual);
+            out, scale, x, residual_tensor, weight, out_normed_tensor,
+            epsilon, group_size, transpose_scale, has_residual, has_out_normed);
     } else {
         TORCH_CHECK(false,
-                    "Unsupported dtype combination. Input: ", x.scalar_type(),
-                    ", Output: ", out.scalar_type());
+                    "Unsupported input dtype: ", x.scalar_type());
     }
 }
 

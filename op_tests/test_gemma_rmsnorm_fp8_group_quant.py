@@ -7,6 +7,7 @@ Tests the fused HIP kernel that performs:
 2. Gemma RMSNorm: out = x * rsqrt(mean(x^2) + eps) * (1 + weight)
    - Variance over full hidden_size, Gemma-style (1+weight)
 3. FP8 group quantization with group_size=128
+4. Optional: also write unquantized normed output (out_normed)
 
 Constraint: hidden_size must be a multiple of 128
 """
@@ -29,9 +30,10 @@ def gemma_rmsnorm_fp8_group_quant_reference_impl(
     Reference implementation matching the fused HIP kernel.
 
     Returns:
-        (out_quant, scales, residual_out)
+        (out_quant, scales, normed, residual_out)
         - out_quant: [num_tokens, hidden_size] in quant_dtype
         - scales: [num_tokens, num_groups] in float32
+        - normed: [num_tokens, hidden_size] in input dtype (unquantized)
         - residual_out: [num_tokens, hidden_size] or None
     """
     if quant_dtype == torch.float8_e4m3fnuz:
@@ -57,6 +59,9 @@ def gemma_rmsnorm_fp8_group_quant_reference_impl(
     inv_std = torch.rsqrt(variance + eps)
     normed = x_f * inv_std * (1.0 + weight.float().unsqueeze(0))
 
+    # Unquantized normed output in input dtype
+    normed_out = normed.to(x.dtype)
+
     # Step 3: Per-group FP8 quantization
     normed_grouped = normed.view(num_tokens, num_groups, group_size)
     scales = normed_grouped.abs().amax(dim=-1) / fp8_max
@@ -66,7 +71,7 @@ def gemma_rmsnorm_fp8_group_quant_reference_impl(
         normed_grouped / scales.unsqueeze(-1), -fp8_max, fp8_max
     ).to(quant_dtype)
 
-    return out_quant.reshape(num_tokens, hidden_size), scales, residual_out
+    return out_quant.reshape(num_tokens, hidden_size), scales, normed_out, residual_out
 
 
 @perftest()
@@ -77,15 +82,22 @@ def test_gemma_rmsnorm_fp8_group_quant_reference(
     del group_size, transpose_scale
     # Clone residual since reference modifies it inplace across warmup iterations
     res = residual.clone() if residual is not None else None
-    out_q, scales, res_out = gemma_rmsnorm_fp8_group_quant_reference_impl(
+    out_q, scales, normed, res_out = gemma_rmsnorm_fp8_group_quant_reference_impl(
         x, weight, eps, quant_dtype, res
     )
-    return out_q, scales, res_out
+    return out_q, scales, normed, res_out
 
 
 @perftest()
 def test_gemma_rmsnorm_fp8_group_quant_hip(
-    x, weight, eps, group_size, quant_dtype, transpose_scale=False, residual=None
+    x,
+    weight,
+    eps,
+    group_size,
+    quant_dtype,
+    transpose_scale=False,
+    residual=None,
+    with_out_normed=False,
 ):
     """HIP kernel implementation wrapped for perf timing."""
     from aiter.ops.gemma_rmsnorm_fp8_group_quant import gemma_rmsnorm_fp8_group_quant
@@ -99,8 +111,14 @@ def test_gemma_rmsnorm_fp8_group_quant_hip(
     # Clone residual since kernel modifies it inplace across warmup iterations
     res = residual.clone() if residual is not None else None
 
+    out_normed = None
+    if with_out_normed:
+        out_normed = torch.empty(
+            num_tokens, hidden_size, dtype=x.dtype, device=x.device
+        )
+
     gemma_rmsnorm_fp8_group_quant(
-        out_quant, scales, x, weight, eps, group_size, transpose_scale, res
+        out_quant, scales, x, weight, eps, group_size, transpose_scale, res, out_normed
     )
 
     # Normalize scale layout for comparison
@@ -109,14 +127,16 @@ def test_gemma_rmsnorm_fp8_group_quant_hip(
             scales.reshape(-1).view(num_groups, num_tokens).transpose(0, 1).contiguous()
         )
 
-    return out_quant, scales, res
+    return out_quant, scales, out_normed, res
 
 
-def calculate_bandwidth(num_tokens, hidden_size, time_us, has_residual=False):
+def calculate_bandwidth(
+    num_tokens, hidden_size, time_us, has_residual=False, has_out_normed=False
+):
     """
     Calculate memory bandwidth in GB/s.
 
-    Without residual:
+    Base:
     - Read x: num_tokens * hidden_size * 2 bytes (bf16)
     - Read weight: hidden_size * 2 bytes (bf16, broadcast)
     - Write out: num_tokens * hidden_size * 1 byte (fp8)
@@ -125,6 +145,9 @@ def calculate_bandwidth(num_tokens, hidden_size, time_us, has_residual=False):
     With residual (additional):
     - Read residual: num_tokens * hidden_size * 2 bytes (bf16)
     - Write residual: num_tokens * hidden_size * 2 bytes (bf16)
+
+    With out_normed (additional):
+    - Write out_normed: num_tokens * hidden_size * 2 bytes (bf16)
     """
     read_x = num_tokens * hidden_size * 2
     read_weight = hidden_size * 2
@@ -135,9 +158,11 @@ def calculate_bandwidth(num_tokens, hidden_size, time_us, has_residual=False):
     total_bytes = read_x + read_weight + write_out + write_scales
 
     if has_residual:
-        read_residual = num_tokens * hidden_size * 2
-        write_residual = num_tokens * hidden_size * 2
-        total_bytes += read_residual + write_residual
+        total_bytes += num_tokens * hidden_size * 2  # read residual
+        total_bytes += num_tokens * hidden_size * 2  # write residual
+
+    if has_out_normed:
+        total_bytes += num_tokens * hidden_size * 2  # write out_normed
 
     time_s = time_us * 1e-6
     bandwidth_gbs = (total_bytes / time_s) / 1e9
@@ -154,8 +179,9 @@ def test_gemma_rmsnorm_fp8_group_quant(
     quant_dtype=torch.float8_e4m3fnuz,
     transpose_scale: bool = False,
     has_residual: bool = False,
+    with_out_normed: bool = False,
 ):
-    """Test Gemma RMSNorm + FP8 group quantization."""
+    """Test Gemma RMSNorm + FP8 group quantization, optionally with out_normed."""
     torch.manual_seed(42)
     device = "cuda"
 
@@ -176,7 +202,8 @@ def test_gemma_rmsnorm_fp8_group_quant(
     print(f"  Shape: [{num_tokens}, {hidden_size}]")
     print(f"  dtype: {dtype}, quant_dtype: {quant_dtype}")
     print(f"  group_size: {group_size}, transpose_scale: {transpose_scale}")
-    print(f"  has_residual: {has_residual}, eps: {eps}")
+    print(f"  has_residual: {has_residual}, with_out_normed: {with_out_normed}")
+    print(f"  eps: {eps}")
     print(f"{'='*80}")
 
     # Clone inputs for reference (residual is modified inplace)
@@ -184,7 +211,7 @@ def test_gemma_rmsnorm_fp8_group_quant(
     hip_residual = residual.clone() if residual is not None else None
 
     # Run reference
-    (ref_quant, ref_scales, ref_res_out), ref_time = (
+    (ref_quant, ref_scales, ref_normed, ref_res_out), ref_time = (
         test_gemma_rmsnorm_fp8_group_quant_reference(
             x.clone(),
             weight,
@@ -197,7 +224,7 @@ def test_gemma_rmsnorm_fp8_group_quant(
     )
 
     # Run HIP kernel
-    (hip_quant, hip_scales, hip_res_out), hip_time = (
+    (hip_quant, hip_scales, hip_normed, hip_res_out), hip_time = (
         test_gemma_rmsnorm_fp8_group_quant_hip(
             x.clone(),
             weight,
@@ -206,12 +233,17 @@ def test_gemma_rmsnorm_fp8_group_quant(
             quant_dtype,
             transpose_scale,
             hip_residual,
+            with_out_normed,
         )
     )
 
     # Calculate bandwidth
-    ref_bw = calculate_bandwidth(num_tokens, hidden_size, ref_time, has_residual)
-    hip_bw = calculate_bandwidth(num_tokens, hidden_size, hip_time, has_residual)
+    ref_bw = calculate_bandwidth(
+        num_tokens, hidden_size, ref_time, has_residual, with_out_normed
+    )
+    hip_bw = calculate_bandwidth(
+        num_tokens, hidden_size, hip_time, has_residual, with_out_normed
+    )
 
     print("\nPerformance:")
     print(f"  Reference time: {ref_time:.2f} us  ({ref_bw:.2f} GB/s)")
@@ -249,9 +281,19 @@ def test_gemma_rmsnorm_fp8_group_quant(
         ref_scales.float(), hip_scales.float(), rtol=1e-3, atol=1e-3, msg="Scales"
     )
 
+    # Check out_normed if requested
+    if with_out_normed:
+        assert hip_normed is not None, "out_normed should not be None"
+        print("\nout_normed comparison:")
+        checkAllclose(
+            ref_normed.float(),
+            hip_normed.float(),
+            rtol=1e-2,
+            atol=0.05,
+            msg="Unquantized normed output",
+        )
+
     # Check residual if applicable
-    # Residual tolerance is higher because ref does float add then bf16 cast,
-    # while kernel does the same but rounding may differ slightly.
     if has_residual:
         print("\nResidual comparison:")
         checkAllclose(
@@ -271,6 +313,7 @@ def test_gemma_rmsnorm_fp8_group_quant(
         "hidden_size": hidden_size,
         "has_residual": has_residual,
         "transpose_scale": transpose_scale,
+        "with_out_normed": with_out_normed,
         "ref_time_us": ref_time,
         "hip_time_us": hip_time,
         "ref_bw_gbs": ref_bw,
@@ -287,6 +330,11 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["fp16", "bf16"])
     parser.add_argument("--residual", action="store_true", help="Test with residual")
+    parser.add_argument(
+        "--out-normed",
+        action="store_true",
+        help="Also output unquantized normed values",
+    )
 
     args = parser.parse_args()
     dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16}
@@ -301,6 +349,7 @@ if __name__ == "__main__":
                     dtype=dtype,
                     transpose_scale=transpose,
                     has_residual=has_res,
+                    with_out_normed=args.out_normed,
                 )
     else:
         # Comprehensive benchmark: Gemma model hidden sizes
@@ -340,14 +389,16 @@ if __name__ == "__main__":
         for num_tokens, hidden_size in test_configs:
             for transpose in [False, True]:
                 for has_res in [False, True]:
-                    result = test_gemma_rmsnorm_fp8_group_quant(
-                        num_tokens=num_tokens,
-                        hidden_size=hidden_size,
-                        dtype=dtype,
-                        transpose_scale=transpose,
-                        has_residual=has_res,
-                    )
-                    results.append(result)
+                    for out_normed in [False, True]:
+                        result = test_gemma_rmsnorm_fp8_group_quant(
+                            num_tokens=num_tokens,
+                            hidden_size=hidden_size,
+                            dtype=dtype,
+                            transpose_scale=transpose,
+                            has_residual=has_res,
+                            with_out_normed=out_normed,
+                        )
+                        results.append(result)
 
         df = pd.DataFrame(results)
         df_md = df.to_markdown(index=False)
