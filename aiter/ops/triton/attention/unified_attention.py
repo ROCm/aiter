@@ -19,34 +19,12 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
-last_dispatch_info = {}
-
 # Cached tuned configs: populated on the first autotuned call, then used
 # directly with the raw @triton.jit kernels (zero decorator overhead).
 _2d_tune_cfg = None
 _3d_tune_cfg = None
 _reduce_tune_cfg = None
 
-
-def predict_kernel_path(
-    num_seqs, num_q_heads, num_kv_heads, max_seqlen_q, max_seqlen_k,
-    total_q_tokens, sliding_window=None, force_kernel=None,
-):
-    """Predict the 2D/3D dispatch without running the kernel."""
-    if force_kernel is not None:
-        return force_kernel.upper()
-    num_queries_per_kv = num_q_heads // num_kv_heads
-    BLOCK_M = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-    total_q_blocks = total_q_tokens // BLOCK_Q + num_seqs
-    num_2d_prgms = total_q_blocks * num_kv_heads
-    SLIDING_WINDOW = 1 + (sliding_window - 1 if sliding_window else -1)
-    target = get_num_sms() * 4
-    is_2d = use_2d_kernel(
-        0, SLIDING_WINDOW, max_seqlen_q == 1,
-        max_seqlen_q, max_seqlen_k, target, num_2d_prgms,
-    )
-    return "2D" if is_2d else "3D"
 
 
 def select_2d_config(
@@ -121,16 +99,30 @@ def select_2d_config(
 
 
 def select_3d_config(
-    head_size, block_size, element_size, max_seqlen_k, target_num_prgms, num_2d_prgms
+    head_size, block_size, element_size, max_seqlen_k,
+    target_num_prgms, num_2d_prgms, all_decode=False,
 ):
-    reduce_num_warps = 4
-    attn_warps = 2
+    arch = get_arch()
+
     TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
-    # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+
+    if arch.is_rdna:
+        attn_warps = 2
+        attn_stages = 1
+        waves_per_eu = 2
+    elif all_decode:
+        attn_warps = 8
+        attn_stages = 2
+        waves_per_eu = 2
+    else:
+        attn_warps = 2
+        attn_stages = 1
+        waves_per_eu = 2
+
+    reduce_num_warps = 4
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
-    # MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
     MIN_SEGMENTS = 8
     num_segments = max(num_segments, MIN_SEGMENTS)
     if num_segments == MIN_SEGMENTS:
@@ -139,15 +131,15 @@ def select_3d_config(
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": attn_warps,
-        "num_stages": 1,
-        "waves_per_eu": 2,
+        "num_stages": attn_stages,
+        "waves_per_eu": waves_per_eu,
     }
     reduce_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
         "num_warps": reduce_num_warps,
         "num_stages": 1,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves_per_eu,
     }
     return attn_config, reduce_config
 
@@ -465,12 +457,6 @@ def unified_attention(
     else:
         _dispatch_2d = _auto_2d
 
-    last_dispatch_info["kernel"] = "2D" if _dispatch_2d else "3D"
-    last_dispatch_info["auto"] = "2D" if _auto_2d else "3D"
-    last_dispatch_info["num_2d_prgms"] = num_2d_prgms
-    last_dispatch_info["target_prgms"] = target_num_prgms
-    last_dispatch_info["forced"] = force_kernel is not None
-
     if _dispatch_2d:
         config = select_2d_config(
             block_size,
@@ -616,6 +602,7 @@ def unified_attention(
             max_seqlen_k,
             target_num_prgms,
             num_2d_prgms,
+            all_decode=ALL_DECODE,
         )
         HEAD_SIZE_V_PADDED = triton.next_power_of_2(head_size_v)
         reduce_grid = (q.shape[0], num_query_heads)
@@ -830,3 +817,5 @@ def unified_attention(
                 SAGE_MXFP4=sage_mxfp4,
                 **eff_reduce,
             )
+
+    return "2D" if _dispatch_2d else "3D"

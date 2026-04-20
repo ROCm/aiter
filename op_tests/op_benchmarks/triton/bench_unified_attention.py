@@ -6,7 +6,7 @@ import itertools
 import torch
 import triton
 
-from aiter.ops.triton.attention.unified_attention import unified_attention, predict_kernel_path
+from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton._triton_kernels.attention.unified_attention import UNIFIED_ATTN_AUTOTUNE
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_v2
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
@@ -159,25 +159,8 @@ def create_benchmark_configs(custom, args):
     for i in range(len(x_vals_list)):
         x_vals_list[i] = (*x_vals_list[i], decode_p)
 
-    sliding_window_val = args.sliding_window if hasattr(args, 'sliding_window') else None
     for i in range(len(x_vals_list)):
-        vals = x_vals_list[i]
-        has_model = "model" in x_names
-        batch = vals[1] if has_model else vals[0]
-        hq = vals[2] if has_model else vals[1]
-        hk_v = vals[3] if has_model else vals[2]
-        sq = vals[4] if has_model else vals[3]
-        sk_v = vals[5] if has_model else vals[4]
-        dp = vals[-1]
-        eff_sq = 1 if dp >= 1.0 else sq
-        total_q = int(batch * eff_sq)
-        kpath = predict_kernel_path(
-            int(batch), int(hq), int(hk_v), int(eff_sq), int(sk_v),
-            total_q, sliding_window=sliding_window_val,
-            force_kernel=args.force_kernel,
-        )
-        x_vals_list[i] = (*vals, kpath)
-
+        x_vals_list[i] = list(x_vals_list[i]) + [""]
     x_names.append("KERNEL")
 
     all_metrics = {
@@ -231,8 +214,10 @@ def create_benchmark_configs(custom, args):
 
 def run_benchmark(custom, args):
     torch.manual_seed(20)
+    configs = create_benchmark_configs(custom, args)
+    x_vals_ref = configs[0].x_vals
 
-    @triton.testing.perf_report(create_benchmark_configs(custom, args))
+    @triton.testing.perf_report(configs)
     def bench_mha(
         BATCH,
         HQ,
@@ -434,11 +419,20 @@ def run_benchmark(custom, args):
             force_kernel=args.force_kernel,
         )
 
+        actual_kernel = fn()
+
         if UNIFIED_ATTN_AUTOTUNE:
-            fn()
             torch.cuda.synchronize()
 
         ms = triton.testing.do_bench(fn)
+
+        shape_key = ((model,) if model is not None else ()) + (
+            BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, DECODE_P,
+        )
+        for vals in x_vals_ref:
+            if tuple(vals[:-1]) == shape_key:
+                vals[-1] = actual_kernel
+                break
 
         run_correctness = args.test
         if run_correctness:
