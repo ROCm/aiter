@@ -215,8 +215,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              transpose_c,
                                              1,
                                              false,
-                                             1,
-                                             GemmConfig::TiledMMAPermuteN_v>>;
+                                             1>>;
 
         using Kernel =
             ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
