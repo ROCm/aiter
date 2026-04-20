@@ -81,18 +81,19 @@ def _cat_and_cache_mla_kernel(
                 kv_cache_ptr
                 + pid_t_slot * kv_cache_stride_b
                 + pid_hk * kv_cache_stride_h
-                + (pid_blk // 16) * (BLOCK_D_nope + BLOCK_D_pe) * 16
             )
             kv_cache_nope_offs = (
-                (pid_blk % 16) * K_WIDTH
+                (pid_blk // 16) * BLOCK_D_nope * 16
+                + (pid_blk % 16) * K_WIDTH
                 + dk_nope_offs_shfl[:, None] * K_WIDTH * 16
                 + k_width_shfl[None, :]
             ) * kv_cache_stride_d
             kv_cache_pe_offs = (
-                BLOCK_D_nope * 16
+                (pid_blk // 16) * BLOCK_D_pe * 16
                 + (pid_blk % 16) * K_WIDTH
                 + d_pe_offs_shfl[:, None] * K_WIDTH * 16
                 + k_width_shfl[None, :]
+                + BLOCK_SIZE * BLOCK_D_nope
             ) * kv_cache_stride_d
 
             tl.store(kv_cache_ptrs + kv_cache_nope_offs, k_nope)
