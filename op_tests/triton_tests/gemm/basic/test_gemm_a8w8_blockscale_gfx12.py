@@ -212,6 +212,7 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         )
     )
 
+    # uncomment for testing matrix storing
     # x_scale.fill_(1.0)
     # x_scale_shuffled.fill_(1.0)
     # w_scale.fill_(1.0)
@@ -226,5 +227,5 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     b = run_triton(x, weight_triton, x_scale, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
-test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")
-test_gemm("bf16", 2048, 5120, 2880, "TN", True, "gluon")
+# test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")
+# test_gemm("bf16", 2048, 5120, 2880, "TN", True, "gluon")

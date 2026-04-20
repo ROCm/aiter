@@ -3,6 +3,7 @@
 
 import torch
 import pytest
+import argparse
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
@@ -195,7 +196,7 @@ def generate_gemm_a8w8_blockscale_inputs(
         "triton_shuffle",
     ],
 )
-def test_gemm(dtype, M, N, K, layout, output, impl: str):
+def test_gemm(dtype, M, N, K, layout, output, impl="gluon"):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
@@ -226,19 +227,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
             shuffle=("_shuffle" in impl),
         )
     )
-    x, weight, weight_triton, x_scale, x_scale_shuffled, w_scale, y = (
-        generate_gemm_a8w8_blockscale_inputs(
-            M,
-            N,
-            K,
-            block_shape_n,
-            block_shape_k,
-            dtype=dtype,
-            layout=layout,
-            output=output,
-            shuffle=("_shuffle" in impl),
-        )
-    )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
@@ -256,3 +244,20 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+
+parser = argparse.ArgumentParser(prog='test_gemm_a8w8_blockscale.py')
+parser.add_argument('--gluon')
+parser.add_argument('--triton')
+gluon_check = parser.parse_args(['--gluon', 'gluon'])
+triton_check = parser.parse_args(['--triton', 'triton'])
+if (gluon_check):
+    test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")
+    test_gemm("bf16", 2048, 5120, 2880, "TN", True, "gluon")
+if (triton_check):
+    test_gemm("bf16", 32, 5120, 2880, "TN", True, "triton")
+    test_gemm("bf16", 2048, 5120, 2880, "TN", True, "triton")
+if (!gluon_check && !triton_check): # neither
+    test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")
+    test_gemm("bf16", 2048, 5120, 2880, "TN", True, "gluon")
+    test_gemm("bf16", 32, 5120, 2880, "TN", True, "triton")
+    test_gemm("bf16", 2048, 5120, 2880, "TN", True, "triton")
