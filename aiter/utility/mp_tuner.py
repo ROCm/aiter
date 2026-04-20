@@ -278,7 +278,13 @@ def _task_desc(task_group, k):
         if isinstance(task, list):
             task = task[0]
         info, stage, kname, blockM = task[0]
-        token, model_dim, inter_dim, expert, topk = info[1], info[2], info[3], info[4], info[5]
+        token, model_dim, inter_dim, expert, topk = (
+            info[1],
+            info[2],
+            info[3],
+            info[4],
+            info[5],
+        )
         return f"[{stage} {kname} blockM={blockM} token={token} M={model_dim} N={inter_dim} E={expert} topk={topk}]"
     except Exception:
         return ""

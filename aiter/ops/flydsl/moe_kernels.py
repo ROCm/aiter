@@ -593,7 +593,7 @@ def _run_compiled(exe, args):
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext → gpu_module_body error).
+        # (self.func(*args) without CompilationContext -> gpu_module_body error).
         # Clean up leaked contexts to isolate failures.
         try:
             from flydsl._mlir import ir

@@ -193,7 +193,12 @@ class FmoeTuner(TunerCommon):
             w_groups = weight.view(E, dim1, dim2 // group_size, group_size)
             w_group_max = w_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
             w_scale_raw = (w_group_max / 7.0).squeeze(-1)  # [E, dim1, G]
-            weight_qt = (w_groups / w_scale_raw.unsqueeze(-1)).round().clamp(-7, 7).to(dtypes.i8)
+            weight_qt = (
+                (w_groups / w_scale_raw.unsqueeze(-1))
+                .round()
+                .clamp(-7, 7)
+                .to(dtypes.i8)
+            )
             weight_qt = weight_qt.view(E, dim1, dim2)
             # Scale: [E, K//32, N] = permuted from [E, N, G]
             weight_scale = w_scale_raw.permute(0, 2, 1).to(dtypes.bf16)  # [E, G, N]
@@ -1002,12 +1007,12 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_flydsl = pack_int8_to_packed_int4(
                 shuffle_weight(w2_qt, (16, 16))
             ).view(E2, N2, K2 // 2)
-            w1_scale_flydsl = shuffle_scale_for_int4(
-                w1_scale, group_size=32
-            ).view(-1).contiguous()
-            w2_scale_flydsl = shuffle_scale_for_int4(
-                w2_scale, group_size=32
-            ).view(-1).contiguous()
+            w1_scale_flydsl = (
+                shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
+            )
+            w2_scale_flydsl = (
+                shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
+            )
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
             w1_scale_aiter = w1_scale
@@ -1025,7 +1030,11 @@ class FmoeTuner(TunerCommon):
         if stage == 1:
             if not doweight_stage1:
                 sorted_weights = None
-            if q_type == QuantType.per_1x32 and q_dtype_w != dtypes.i4x2 and q_dtype_a == dtypes.fp4x2:
+            if (
+                q_type == QuantType.per_1x32
+                and q_dtype_w != dtypes.i4x2
+                and q_dtype_a == dtypes.fp4x2
+            ):
                 a1_scale_fp4_sort = moe_mxfp4_sort(
                     a1_scale,  # a1_scale[: token * topk, :].view(token, topk, -1),
                     sorted_ids=sorted_ids,
@@ -1060,8 +1069,8 @@ class FmoeTuner(TunerCommon):
                 w2_qt_shffle_flydsl,  # 17
                 w1_scale_flydsl,  # 18
                 w2_scale_flydsl,  # 19
-                a1_qt_fp8_cast,  # 20 — fp8-cast input for _fp8 FlyDSL variant
-                None,  # 21 — None placeholder (a1_scale=None for a8w4 torch ref)
+                a1_qt_fp8_cast,  # 20 -- fp8-cast input for _fp8 FlyDSL variant
+                None,  # 21 -- None placeholder (a1_scale=None for a8w4 torch ref)
                 (
                     torch.clamp(
                         torch.randn(
@@ -1077,10 +1086,10 @@ class FmoeTuner(TunerCommon):
                         and dtype in [dtypes.bf16, dtypes.fp16]
                     )
                     else None
-                ),  # 22 — bias for stage1 (a8w4 only)
+                ),  # 22 -- bias for stage1 (a8w4 only)
             )
         elif stage == 2:
-            # a8w4: a1_scale is dummy non-None → torch_moe_stage1's per_1x32
+            # a8w4: a1_scale is dummy non-None -> torch_moe_stage1's per_1x32
             # branch would call mxfp4_to_f32(bf16), pass None to take a16w4 path.
             ref_a1_scale = (
                 None
@@ -1148,7 +1157,7 @@ class FmoeTuner(TunerCommon):
                 sorted_weights = None
 
             return (
-                a2_qt,  # 0  — fp8 for FlyDSL (a8w4), fp4x2 for a4w4
+                a2_qt,  # 0  -- fp8 for FlyDSL (a8w4), fp4x2 for a4w4
                 w1_qt_shffle_ck,  # 1
                 w2_qt_shffle_ck,  # 2
                 a2_scale,  # 3
@@ -1168,8 +1177,8 @@ class FmoeTuner(TunerCommon):
                 w2_qt_shffle_flydsl,  # 17
                 w1_scale_flydsl,  # 18
                 w2_scale_flydsl,  # 19
-                ref1_bf16,  # 20 — bf16 stage1 output for torch ref (a8w4)
-                None,  # 21 — None placeholder (a2_scale=None for a8w4 torch ref)
+                ref1_bf16,  # 20 -- bf16 stage1 output for torch ref (a8w4)
+                None,  # 21 -- None placeholder (a2_scale=None for a8w4 torch ref)
                 (
                     torch.clamp(
                         torch.randn((expert, model_dim), dtype=dtype, device=device),
@@ -1183,7 +1192,7 @@ class FmoeTuner(TunerCommon):
                         and dtype in [dtypes.bf16, dtypes.fp16]
                     )
                     else None
-                ),  # 22 — bias for stage2 (a8w4 only)
+                ),  # 22 -- bias for stage2 (a8w4 only)
             )
 
     @staticmethod
@@ -1302,7 +1311,12 @@ class FmoeTuner(TunerCommon):
         fuse_fp8=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
-        if quant_type == QuantType.per_1x32 and w1_qt.dtype == dtypes.i8 and w1_scale is not None and w1_scale.dtype == dtypes.bf16:
+        if (
+            quant_type == QuantType.per_1x32
+            and w1_qt.dtype == dtypes.i8
+            and w1_scale is not None
+            and w1_scale.dtype == dtypes.bf16
+        ):
             w1_qt = w1_qt.view(dtypes.i4x2)
             w2_qt = w2_qt.view(dtypes.i4x2)
         ref1 = torch_moe_stage1(
@@ -1355,7 +1369,12 @@ class FmoeTuner(TunerCommon):
         doweight_stage1=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
-        if quant_type == QuantType.per_1x32 and w2_qt.dtype == dtypes.i8 and w2_scale is not None and w2_scale.dtype == dtypes.bf16:
+        if (
+            quant_type == QuantType.per_1x32
+            and w2_qt.dtype == dtypes.i8
+            and w2_scale is not None
+            and w2_scale.dtype == dtypes.bf16
+        ):
             w1_qt = w1_qt.view(dtypes.i4x2)
             w2_qt = w2_qt.view(dtypes.i4x2)
         return torch_moe_stage2(
@@ -1956,7 +1975,7 @@ class FmoeTuner(TunerCommon):
         )
         for blockM in blockMs:
             # per_1x32 + fp4x2 is a8w4 (MX-FP8 act + MX-FP4 weight); no ASM kernel exists
-            # for this combo — the pertokenFp8 CSV only covers per_Token quant.
+            # for this combo -- the pertokenFp8 CSV only covers per_Token quant.
             if (
                 use_g1u1
                 and q_dtype_w != torch.int4
@@ -2378,13 +2397,12 @@ class FmoeTuner(TunerCommon):
                 if ktm != blockM:
                     continue
 
-
                 is_splitk = kparams.get("k_batch", 1) > 1
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
-                #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations → out_dtype="fp8"
-                #   a4w4 (a_dtype_str="fp4"): stage2 expects fp4 activations → out_dtype="fp4"
+                #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations -> out_dtype="fp8"
+                #   a4w4 (a_dtype_str="fp4"): stage2 expects fp4 activations -> out_dtype="fp4"
                 if a_dtype_str == "fp8":
                     fp8_params = {
                         **kparams,
@@ -2782,18 +2800,26 @@ class FmoeTuner(TunerCommon):
                 w1_scale_fmoe = w1_scale
                 w2_scale_fmoe = w2_scale
                 if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-                    w1_qt_fmoe = pack_int8_to_packed_int4(
-                        shuffle_weight(w1_qt_fmoe, (16, 16))
-                    ).view(w1.shape[0], w1.shape[1], w1.shape[2] // 2).view(dtypes.i4x2)
-                    w2_qt_fmoe = pack_int8_to_packed_int4(
-                        shuffle_weight(w2_qt_fmoe, (16, 16))
-                    ).view(w2.shape[0], w2.shape[1], w2.shape[2] // 2).view(dtypes.i4x2)
-                    w1_scale_fmoe = shuffle_scale_for_int4(
-                        w1_scale, group_size=32
-                    ).view(-1).contiguous()
-                    w2_scale_fmoe = shuffle_scale_for_int4(
-                        w2_scale, group_size=32
-                    ).view(-1).contiguous()
+                    w1_qt_fmoe = (
+                        pack_int8_to_packed_int4(shuffle_weight(w1_qt_fmoe, (16, 16)))
+                        .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+                        .view(dtypes.i4x2)
+                    )
+                    w2_qt_fmoe = (
+                        pack_int8_to_packed_int4(shuffle_weight(w2_qt_fmoe, (16, 16)))
+                        .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+                        .view(dtypes.i4x2)
+                    )
+                    w1_scale_fmoe = (
+                        shuffle_scale_for_int4(w1_scale, group_size=32)
+                        .view(-1)
+                        .contiguous()
+                    )
+                    w2_scale_fmoe = (
+                        shuffle_scale_for_int4(w2_scale, group_size=32)
+                        .view(-1)
+                        .contiguous()
+                    )
                 elif q_dtype_w == torch.int4:
                     w1_qt_fmoe = rearrange_4bit_elements(
                         convert_int8_to_uint32_int4(

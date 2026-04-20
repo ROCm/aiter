@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 
@@ -132,9 +132,7 @@ def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:
     return out.view(-1).to(torch.int8)
 
 
-def shuffle_scale_for_int4(
-    scale: torch.Tensor, group_size: int = 32
-) -> torch.Tensor:
+def shuffle_scale_for_int4(scale: torch.Tensor, group_size: int = 32) -> torch.Tensor:
     """Prepare groupwise scale tensor for W4A16 int4 kernel.
 
     Input: scale tensor of shape ``[E, num_groups, N]``.

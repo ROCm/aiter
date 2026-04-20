@@ -819,6 +819,7 @@ def get_2stage_cfgs(
     silu_keys = None
     if activation == ActivationType.Swiglu:
         silu_keys = (*keys[:6], str(ActivationType.Silu), *keys[7:])
+
     def MainFunc():
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
@@ -1015,7 +1016,11 @@ def get_2stage_cfgs(
             has_bias=_has_bias,
             fuse_quant=_fuse_quant,
         )
-    if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2 and is_flydsl_available():
+    if (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.i4x2
+        and is_flydsl_available()
+    ):
         # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
         # with groupwise scale). Tile sizes and k-split are chosen based on problem
         # dimensions to balance occupancy and memory bandwidth:
@@ -1032,7 +1037,9 @@ def get_2stage_cfgs(
         kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
         if _ksplit > 1:
             kn1 += f"_kb{_ksplit}"
-        kn2 = flydsl_kernel_name(2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic")
+        kn2 = flydsl_kernel_name(
+            2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
         return MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,
@@ -1619,7 +1626,11 @@ def torch_moe_stage1(
         hidden_states = hidden_states * a1_scale
     elif quant_type == QuantType.No:
         pass
-    elif quant_type == QuantType.per_1x32 and w1_scale is not None and w1_scale.dtype == dtypes.bf16:
+    elif (
+        quant_type == QuantType.per_1x32
+        and w1_scale is not None
+        and w1_scale.dtype == dtypes.bf16
+    ):
         # a16wi4: groupwise dequant int4 weights with scale [E, K//32, N]
         group_size = 32
         num_groups = model_dim // group_size
@@ -1671,7 +1682,11 @@ def torch_moe_stage1(
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
         if use_swiglu:
-            if quant_type == QuantType.per_1x32 and w1_scale is not None and w1_scale.dtype == dtypes.bf16:
+            if (
+                quant_type == QuantType.per_1x32
+                and w1_scale is not None
+                and w1_scale.dtype == dtypes.bf16
+            ):
                 # a16wi4: FlyDSL int4_bf16 kernel uses standard silu(gate)*up
                 out = torch.nn.functional.silu(gate) * up
             else:
@@ -1734,7 +1749,11 @@ def torch_moe_stage2(
             w2_scale.shape[0], w2.shape[1] // 128, 1, w2.shape[2] // 128, 1
         )
         w2 = w2.view(w2_shape)
-    elif quant_type == QuantType.per_1x32 and w2_scale is not None and w2_scale.dtype == dtypes.bf16:
+    elif (
+        quant_type == QuantType.per_1x32
+        and w2_scale is not None
+        and w2_scale.dtype == dtypes.bf16
+    ):
         # a16wi4: groupwise dequant int4 weights with scale
         # w2: [E, model_dim, inter_dim], w2_scale is [E, inter_dim//32, model_dim]
         group_size = 32
@@ -1905,11 +1924,17 @@ def cktile_moe_stage1(
     )
 
     if split_k > 1:
-        is_interleaved = hasattr(torch, "float4_e2m1fn_x2") and w1.dtype == torch.float4_e2m1fn_x2
+        is_interleaved = (
+            hasattr(torch, "float4_e2m1fn_x2") and w1.dtype == torch.float4_e2m1fn_x2
+        )
         if is_interleaved:
             inter_dim = out.shape[-1]
             if activation == ActivationType.Swiglu:
-                from aiter.ops.flydsl.moe_kernels import _get_compiled_swiglu, _run_compiled
+                from aiter.ops.flydsl.moe_kernels import (
+                    _get_compiled_swiglu,
+                    _run_compiled,
+                )
+
                 _swiglu_fn = _get_compiled_swiglu(inter_dim)
                 num_rows = tmp_out.view(-1, inter_dim * 2).shape[0]
                 _run_compiled(
@@ -1938,7 +1963,11 @@ def cktile_moe_stage1(
         else:
             if activation == ActivationType.Swiglu:
                 inter_dim = out.shape[-1]
-                from aiter.ops.flydsl.moe_kernels import _get_compiled_swiglu, _run_compiled
+                from aiter.ops.flydsl.moe_kernels import (
+                    _get_compiled_swiglu,
+                    _run_compiled,
+                )
+
                 _swiglu_fn = _get_compiled_swiglu(inter_dim)
                 num_rows = tmp_out.view(-1, inter_dim * 2).shape[0]
                 _run_compiled(
