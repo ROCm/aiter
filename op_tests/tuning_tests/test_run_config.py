@@ -12,7 +12,9 @@ Run:
     python3 -m unittest op_tests.tuning_tests.test_run_config -v
 """
 
+import csv
 import os
+import re
 import sys
 import subprocess
 import unittest
@@ -57,6 +59,20 @@ def _find_tuned_csvs(pattern):
             ):
                 found.append(os.path.join(d, f))
     return found
+
+
+def _resolve_config_via_aiter(config_property):
+    """Resolve config file through AITER_CONFIGS (same path as production).
+    Returns the resolved file path, or None if unavailable."""
+    try:
+        from aiter.jit.core import AITER_CONFIGS
+
+        config_file = getattr(AITER_CONFIGS, config_property, None)
+        if config_file and os.path.exists(config_file):
+            return config_file
+    except Exception:
+        pass
+    return None
 
 
 def _merge_config_paths(csv_list):
@@ -141,6 +157,64 @@ def _extract_repro_and_reasons(lines):
     return "\n".join(parts)
 
 
+def _parse_all_benchmark_results(lines):
+    """Parse all benchmark result lines, returning a list of dicts with timing data.
+    Each dict: {shape, e2e_us, status, reason}."""
+    all_results = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if "| " not in stripped:
+            continue
+        if stripped.startswith("Shape") or stripped.startswith("-"):
+            continue
+        parts = [p.strip() for p in stripped.split("|")]
+        if len(parts) < 3:
+            continue
+        status = parts[-1]
+        if status not in ("OK", "ERROR", "MISMATCH", "SKIP"):
+            continue
+        shape = parts[0]
+        e2e_us_str = parts[-2]
+        try:
+            e2e_us = float(e2e_us_str)
+        except ValueError:
+            e2e_us = None
+        reason = ""
+        for j in range(i + 1, min(i + 4, len(lines))):
+            if lines[j].strip().startswith("reason:"):
+                reason = lines[j].strip()[len("reason:"):].strip()
+                break
+        result = {"shape": shape, "e2e_us": e2e_us, "status": status}
+        if reason:
+            result["reason"] = reason
+        # Parse shape tuple into individual columns (M, N, K, ...)
+        m = re.match(r"\((.+)\)", shape)
+        if m:
+            vals = [v.strip() for v in m.group(1).split(",")]
+            for idx, col in enumerate(["M", "N", "K"]):
+                if idx < len(vals):
+                    try:
+                        result[col] = int(vals[idx])
+                    except ValueError:
+                        result[col] = vals[idx]
+        all_results.append(result)
+    return all_results
+
+
+def _save_results_csv(name, all_results):
+    """Save all benchmark results to CSV for later comparison."""
+    if not all_results:
+        return None
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    csv_file = os.path.join(REPORT_DIR, f"{name}_run_config_results.csv")
+    fieldnames = ["M", "N", "K", "e2e_us", "status", "reason"]
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(all_results)
+    return csv_file
+
+
 REPORT_DIR = "/tmp/tuning_test_reports"
 
 
@@ -181,43 +255,57 @@ TUNER_FAMILIES = {
         "script": "csrc/ck_gemm_a8w8/gemm_a8w8_tune.py",
         "csv_pattern": "a8w8_tuned_gemm",
         "exclude_patterns": ["bpreshuffle", "blockscale", "batched"],
+        "config_property": "AITER_CONFIG_GEMM_A8W8_FILE",
     },
     "a8w8_bpreshuffle": {
         "script": "csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py",
         "csv_pattern": "a8w8_bpreshuffle_tuned_gemm",
         "exclude_patterns": ["blockscale"],
+        "config_property": "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE",
     },
     "a8w8_blockscale": {
         "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
         "csv_pattern": "a8w8_blockscale_tuned_gemm",
         "exclude_patterns": ["bpreshuffle", "fmoe"],
+        "config_property": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE",
     },
     "a8w8_blockscale_bpreshuffle": {
         "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
         "csv_pattern": "a8w8_blockscale_bpreshuffle_tuned_gemm",
         "exclude_patterns": ["fmoe"],
         "extra_args": ["--preshuffle"],
+        "config_property": "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE",
     },
     "a4w4_blockscale": {
         "script": "csrc/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale_tune.py",
         "csv_pattern": "a4w4_blockscale_tuned_gemm",
         "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A4W4_FILE",
     },
     "batched_a8w8": {
         "script": "csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py",
         "csv_pattern": "a8w8_tuned_batched_gemm",
         "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_A8W8_BATCHED_GEMM_FILE",
     },
     "batched_bf16": {
         "script": "csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py",
         "csv_pattern": "bf16_tuned_batched_gemm",
         "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_BF16_BATCHED_GEMM_FILE",
     },
     "fmoe": {
         "script": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
         "csv_pattern": "tuned_fmoe",
         "exclude_patterns": ["untuned", "profile"],
         "timeout": 1200,
+        "config_property": "AITER_CONFIG_FMOE_FILE",
+    },
+    "gradlib_bf16": {
+        "script": "gradlib/gradlib/gemm_tuner.py",
+        "csv_pattern": "bf16_tuned_gemm",
+        "exclude_patterns": ["batched"],
+        "config_property": "AITER_CONFIG_GEMM_BF16_FILE",
     },
 }
 
@@ -228,21 +316,27 @@ class TestRunConfig(unittest.TestCase):
 
     def _test_family(self, name):
         cfg = TUNER_FAMILIES[name]
-        pattern = cfg["csv_pattern"]
-        excludes = cfg.get("exclude_patterns", [])
         timeout = cfg.get("timeout", 600)
-
-        csvs = _find_tuned_csvs(pattern)
-        csvs = [
-            c for c in csvs if not any(ex in os.path.basename(c) for ex in excludes)
-        ]
-
-        if not csvs:
-            self.skipTest(f"No tuned CSVs found for {name} (pattern={pattern})")
-
-        merged = _merge_config_paths(csvs)
-        csv_names = [os.path.basename(c) for c in csvs]
         extra_args = cfg.get("extra_args", None)
+
+        config_prop = cfg.get("config_property")
+        merged = _resolve_config_via_aiter(config_prop) if config_prop else None
+
+        if merged:
+            csv_names = [f"{config_prop} -> {merged}"]
+        else:
+            pattern = cfg["csv_pattern"]
+            excludes = cfg.get("exclude_patterns", [])
+            csvs = _find_tuned_csvs(pattern)
+            csvs = [
+                c
+                for c in csvs
+                if not any(ex in os.path.basename(c) for ex in excludes)
+            ]
+            if not csvs:
+                self.skipTest(f"No tuned CSVs found for {name} (pattern={pattern})")
+            merged = _merge_config_paths(csvs)
+            csv_names = [os.path.basename(c) for c in csvs]
 
         result = _run_config(
             cfg["script"], merged, timeout=timeout, extra_args=extra_args
@@ -263,6 +357,11 @@ class TestRunConfig(unittest.TestCase):
         error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(
             lines
         )
+
+        all_results = _parse_all_benchmark_results(lines)
+        csv_file = _save_results_csv(name, all_results)
+        if csv_file:
+            print(f"\n  Results CSV: {csv_file} ({len(all_results)} shapes)")
 
         failures = _format_failures(
             name, error_shapes, mismatch_shapes, skip_count, lines
@@ -299,16 +398,24 @@ class TestRunConfig(unittest.TestCase):
     def test_fmoe(self):
         self._test_family("fmoe")
 
+    def test_gradlib_bf16(self):
+        self._test_family("gradlib_bf16")
+
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
 @unittest.skipUnless(
-    TUNE_TEST_FAMILY and TUNE_TEST_CONFIG,
-    "Set TUNE_TEST_FAMILY and TUNE_TEST_CONFIG to run",
+    TUNE_TEST_FAMILY,
+    "Set TUNE_TEST_FAMILY (and optionally TUNE_TEST_CONFIG) to run",
 )
 class TestRunConfigCustom(unittest.TestCase):
     """Run --run_config with user-specified family and config CSV.
 
     Usage:
+        # Use AITER_CONFIGS resolution (same as production):
+        TUNE_TEST_FAMILY=a8w8_blockscale \
+        python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
+
+        # Explicit config CSV:
         TUNE_TEST_FAMILY=a8w8_blockscale \
         TUNE_TEST_CONFIG="aiter/configs/a8w8_blockscale_tuned_gemm.csv" \
         python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
@@ -329,23 +436,38 @@ class TestRunConfigCustom(unittest.TestCase):
         )
         cfg = TUNER_FAMILIES[family]
         timeout = cfg.get("timeout", 600)
+        extra_args = cfg.get("extra_args", None)
 
-        # Resolve relative paths against AITER_ROOT
-        resolved = []
-        for p in config.split(os.pathsep):
-            p = p.strip()
-            if not p:
-                continue
-            if not os.path.isabs(p):
-                p = os.path.join(AITER_ROOT, p)
-            self.assertTrue(os.path.exists(p), f"Config not found: {p}")
-            resolved.append(p)
-        merged = os.pathsep.join(resolved)
+        if config:
+            # Explicit config: resolve relative paths against AITER_ROOT
+            resolved = []
+            for p in config.split(os.pathsep):
+                p = p.strip()
+                if not p:
+                    continue
+                if not os.path.isabs(p):
+                    p = os.path.join(AITER_ROOT, p)
+                self.assertTrue(os.path.exists(p), f"Config not found: {p}")
+                resolved.append(p)
+            merged = os.pathsep.join(resolved)
+            csv_names = [os.path.basename(p) for p in resolved]
+        else:
+            # No config specified: resolve via AITER_CONFIGS (production path)
+            config_prop = cfg.get("config_property")
+            self.assertIsNotNone(
+                config_prop, f"No config_property defined for family '{family}'"
+            )
+            merged = _resolve_config_via_aiter(config_prop)
+            self.assertIsNotNone(
+                merged,
+                f"Could not resolve config for {family} via AITER_CONFIGS.{config_prop}",
+            )
+            csv_names = [f"{config_prop} -> {merged}"]
 
         print(
-            f"\nRunning {family} --run_config with: {[os.path.basename(p) for p in resolved]}"
+            f"\nRunning {family} --run_config with: {csv_names}"
         )
-        result = _run_config(cfg["script"], merged, timeout=timeout)
+        result = _run_config(cfg["script"], merged, timeout=timeout, extra_args=extra_args)
 
         output = result.stdout + result.stderr
         if result.returncode != 0:
@@ -357,6 +479,11 @@ class TestRunConfigCustom(unittest.TestCase):
         error_shapes, mismatch_shapes, ok_count, skip_count = _parse_benchmark_results(
             lines
         )
+
+        all_results = _parse_all_benchmark_results(lines)
+        csv_file = _save_results_csv(family, all_results)
+        if csv_file:
+            print(f"\n  Results CSV: {csv_file} ({len(all_results)} shapes)")
 
         failures = _format_failures(
             family, error_shapes, mismatch_shapes, skip_count, lines

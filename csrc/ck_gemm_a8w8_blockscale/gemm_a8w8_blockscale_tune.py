@@ -11,7 +11,11 @@ from einops import rearrange
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, get_asm_dir
+from aiter.jit.core import (
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    get_asm_dir,
+)
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
@@ -181,6 +185,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         """
 
         super().__init__(name, keys, resultList, description)
+
+    def run(self, args, fast_mode=False):
+        if getattr(args, "preshuffle", False):
+            self.ARG_DEFAULTS["config_env_name"] = (
+                "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
+            )
+            self.ARG_DEFAULTS["tune_file"] = (
+                f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}"
+            )
+        return super().run(args, fast_mode)
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op

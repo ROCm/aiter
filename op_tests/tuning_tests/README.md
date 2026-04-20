@@ -24,9 +24,17 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `batched_a8w8` | `csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py` | `a8w8_tuned_batched_gemm.csv` | ✓ | ✓ |
 | `batched_bf16` | `csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py` | `bf16_tuned_batched_gemm.csv` | ✓ | ✓ + shape_grouped |
 | `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
-| `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | — | ✓ (hipBLASLt/ASM/FlyDSL) |
+| `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 
-`test_run_config` auto-discovers tuned CSVs from both `aiter/configs/` and `aiter/configs/model_configs/`, merges them per family.
+## Config resolution
+
+`test_run_config` resolves tuned config files through `AITER_CONFIGS` in `aiter/jit/core.py` — the same path used by production operators at runtime. This validates that:
+
+1. The `AITER_CONFIG_*` env var names and default file paths in `core.py` are correct
+2. Model-specific configs under `aiter/configs/model_configs/` are properly discovered and merged
+3. The merged config works with every tuned shape
+
+If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls back to filesystem scanning of `aiter/configs/` and `aiter/configs/model_configs/`.
 
 ## Running
 
@@ -48,7 +56,19 @@ python3 -m unittest discover -s op_tests/tuning_tests -v
 
 ## Reproducing with custom config
 
-Use `TUNE_TEST_FAMILY` and `TUNE_TEST_CONFIG` to run `--run_config` on a specific tuned CSV:
+Use `TUNE_TEST_FAMILY` to run `--run_config` for a specific family. Config is resolved via `AITER_CONFIGS` automatically:
+
+```bash
+# Use production config resolution (recommended)
+TUNE_TEST_FAMILY=a8w8_blockscale \
+python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
+
+# blockscale with preshuffle (--preshuffle is auto-applied)
+TUNE_TEST_FAMILY=a8w8_blockscale_bpreshuffle \
+python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
+```
+
+Optionally set `TUNE_TEST_CONFIG` to override with explicit CSV paths:
 
 ```bash
 # Single config (relative path from aiter root)
@@ -60,18 +80,8 @@ python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
 TUNE_TEST_FAMILY=a8w8_blockscale \
 TUNE_TEST_CONFIG="aiter/configs/a8w8_blockscale_tuned_gemm.csv:aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_ds_v3.csv" \
 python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
-
-# Reproduce fmoe issues
-TUNE_TEST_FAMILY=fmoe \
-TUNE_TEST_CONFIG="aiter/configs/tuned_fmoe.csv" \
-python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
-
-# blockscale with preshuffle
-TUNE_TEST_FAMILY=a8w8_blockscale_bpreshuffle \
-TUNE_TEST_CONFIG="aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv" \
-python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
 ```
 
-Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`
+Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`, `gradlib_bf16`
 
 The test checks both **exit code** and **per-shape status** — shapes with `ERROR` (kernel crash) or `MISMATCH` (accuracy exceeded errRatio) will fail the test.
