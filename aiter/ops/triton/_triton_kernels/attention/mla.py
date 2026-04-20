@@ -403,13 +403,11 @@ def _mla_decode_fwd_kernel(
     offs_rope_head_dim = tl.arange(0, QK_ROPE_HEAD_DIM)
     offs_t = tl.arange(0, TILE_SIZE)
 
-    offs_lora_rank_shfl = None
-    offs_rope_head_dim_shfl = None
-    offs_t_shfl = None
+    offs_kv_lora_shfl = None
+    offs_kv_rope_shfl = None
     if SHUFFLED_KV_CACHE:
-        offs_lora_rank_shfl = tl.arange(0, KV_LORA_RANK * 16)
-        offs_rope_head_dim_shfl = tl.arange(0, QK_ROPE_HEAD_DIM * 16)
-        offs_t_shfl = tl.arange(0, TILE_SIZE // 16)
+        offs_kv_lora_shfl = tl.arange(0, TILE_SIZE * KV_LORA_RANK)
+        offs_kv_rope_shfl = tl.arange(0, TILE_SIZE * QK_ROPE_HEAD_DIM)
 
     if IS_KV_FP8:
         K_WIDTH: tl.constexpr = 16
@@ -484,16 +482,11 @@ def _mla_decode_fwd_kernel(
                 physical_block_idx * stride_kv_buffer_0
                 + kv_head_idx * stride_kv_buffer_1
             )
-            kv_lora_offset = (
-                kv_offset
-                + offs_t_shfl[:, None] * stride_kv_buffer_2
-                + offs_lora_rank_shfl[None, :] * stride_kv_buffer_3
-            )
+            kv_lora_offset = kv_offset + offs_kv_lora_shfl[None, :] * stride_kv_buffer_3
 
             k_rope_offset = (
                 kv_offset
-                + offs_t_shfl[:, None] * stride_kv_buffer_2
-                + (KV_LORA_RANK * 16 + offs_rope_head_dim_shfl)[None, :]
+                + (TILE_SIZE * KV_LORA_RANK + offs_kv_rope_shfl)[None, :]
                 * stride_kv_buffer_3
             )
         else:
