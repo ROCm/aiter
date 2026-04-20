@@ -62,7 +62,7 @@ template <typename... Args>
         }                                                              \
     } while(0)
 
-// Fatal on any HIP error — use for init/teardown/resource management where
+// Fatal on any HIP error -- use for init/teardown/resource management where
 // failure means unrecoverable state.
 #define HIP_CALL(call)                                                            \
     do                                                                            \
@@ -272,6 +272,7 @@ class AiterAsmKernel: private AiterAsmKernelFast
     public:
     AiterAsmKernel(const char* kernel_name, const char* hsaco_path)
     {
+        AITER_LOG_INFO("hipModuleLoad: " << hsaco_path << " GetFunction: " << kernel_name);
         init(kernel_name, load_hsaco_file(hsaco_path));
     };
 
