@@ -406,21 +406,21 @@ class MLAProgram:
         kv_lora_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=kv_buffer_ptr,
             shape=(
-                num_blocks * cfg.NUM_KV_HEADS * (cfg.BLOCK_SIZE // 16),
-                cfg.KV_LORA_RANK * 16,
+                num_blocks * cfg.NUM_KV_HEADS,
+                cfg.BLOCK_SIZE * cfg.KV_LORA_RANK,
             ),
-            strides=(stride_kv_buffer_2, 1),
-            block_shape=(cfg.BLOCK_SIZE // 16, cfg.KV_LORA_RANK * 16),
+            strides=(stride_kv_buffer_1, 1),
+            block_shape=(gl.constexpr(1), cfg.BLOCK_SIZE * cfg.KV_LORA_RANK),
             layout=cfg.KV_LORA_SHARED_LAYOUT,
         )
         k_rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=kv_buffer_ptr + (cfg.KV_LORA_RANK * 16),
+            base=kv_buffer_ptr + (cfg.BLOCK_SIZE * cfg.KV_LORA_RANK),
             shape=(
-                num_blocks * cfg.NUM_KV_HEADS * (cfg.BLOCK_SIZE // 16),
-                cfg.QK_ROPE_HEAD_DIM * 16,
+                num_blocks * cfg.NUM_KV_HEADS,
+                cfg.BLOCK_SIZE * cfg.QK_ROPE_HEAD_DIM,
             ),
-            strides=(stride_kv_buffer_2, 1),
-            block_shape=(cfg.BLOCK_SIZE // 16, cfg.QK_ROPE_HEAD_DIM * 16),
+            strides=(stride_kv_buffer_1, 1),
+            block_shape=(gl.constexpr(1), cfg.BLOCK_SIZE * cfg.QK_ROPE_HEAD_DIM),
             layout=cfg.K_ROPE_SHARED_LAYOUT,
         )
 
@@ -609,10 +609,7 @@ class MLAProgram:
 
     @gluon.jit
     def get_kv_buffer_row_offsets(self, block_idx):
-        return (
-            (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx)
-            * (self.cfg.BLOCK_SIZE // 16)
-        ).to(gl.int32)
+        return ((block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx)).to(gl.int32)
 
     @gluon.jit
     def tdm_load_global_to_shared_kv_lora(self, row_offsets, buffer_id):
@@ -1500,7 +1497,13 @@ def _mla_prefill_fwd_kernel_non_pipelined(
 
         # acc : (BLOCK_M, KV_LORA_RANK)
         KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
-        P = P.to(KV_lora_trans.dtype)
+        if IS_Q_FP8 and IS_KV_FP8:
+            P = P.to(KV_lora_trans.dtype)
+        elif IS_KV_FP8:
+            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
+            KV_lora_trans = KV_lora_trans.to(gl.bfloat16)
+        else:
+            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
         P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
         acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
@@ -1882,7 +1885,13 @@ def _mla_decode_fwd_kernel_non_pipelined(
 
         # acc : (BLOCK_M, KV_LORA_RANK)
         KV_lora_trans = kv_lora_shared.load(layout=cfg.V_DOT_LAYOUT)
-        P = P.to(KV_lora_trans.dtype)
+        if IS_Q_FP8 and IS_KV_FP8:
+            P = P.to(KV_lora_trans.dtype)
+        elif IS_KV_FP8:
+            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
+            KV_lora_trans = KV_lora_trans.to(gl.bfloat16)
+        else:
+            P = P.to(gl.bfloat16, fp_downcast_rounding="rtz")
         P = gl.convert_layout(P, layout=cfg.P_DOT_LAYOUT)
         acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE

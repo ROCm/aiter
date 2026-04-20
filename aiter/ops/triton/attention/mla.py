@@ -363,7 +363,9 @@ def mla_decode_fwd(
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(2) * (16 if shuffled_kv_cache else 1),
+            stride_kv_buffer_2=kv_buffer.stride(
+                2
+            ),  # * (16 if shuffled_kv_cache else 1),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,
