@@ -27,6 +27,7 @@ env:
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
   AITER_PREBUILD_MAX_JOBS: "96"
+  AITER_SKIP_PERF: ${{ github.event_name == 'pull_request' && '1' || '0' }}
 
 jobs:
   check-signal:
@@ -477,10 +478,19 @@ jobs:
         timeout-minutes: 90
         run: |
           set -ex
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
+          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
+            docker exec \
+            -e AITER_SKIP_PERF=${{ env.AITER_SKIP_PERF }} \
+            -w /workspace \
+            aiter_test \
+            bash -c "MAX_JOBS=64 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
+          else
+            docker exec \
+            -e AITER_SKIP_PERF=${{ env.AITER_SKIP_PERF }} \
+            -w /workspace \
+            aiter_test \
+            bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
+          fi
 
       - name: Collect test logs
         if: always()
@@ -708,6 +718,7 @@ jobs:
         run: |
           set -ex
           docker exec \
+          -e AITER_SKIP_PERF=${{ env.AITER_SKIP_PERF }} \
           -e MULTIGPU=TRUE \
           -w /workspace \
           aiter_test \
