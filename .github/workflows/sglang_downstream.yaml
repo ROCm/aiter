@@ -49,7 +49,7 @@ jobs:
       matrix:
         include:
           - runner: linux-aiter-mi35x-1
-            label: MI355
+            label: MI35X
 
     env:
       SGL_BRANCH: v0.5.10
