@@ -207,9 +207,12 @@ std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const s
 
 float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 {
+    if(!a.use_asm_v3)
+        return -1;
+
     std::string arch_id = get_gpu_arch();
 
-    if((!a.use_asm_v3) || (a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
+    if((a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
        (a.data_type != "bf16" && a.data_type != "fp8bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
        ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
@@ -239,19 +242,14 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     };
 
     AiterAsmKernel* impl_ptr = nullptr;
-    static thread_local std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>>
-        impl_ptr_map;
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
 
     const auto& cfg     = it->second;
     const char* name    = cfg.knl_name.c_str();
     std::string co_name = get_kernel_co_name(cfg.co_name, arch_id);
 
-    auto result = impl_ptr_map.emplace(name, nullptr);
-    if(result.second)
-    {
-        result.first->second = std::make_unique<AiterAsmKernel>(name, co_name.c_str());
-    }
-    impl_ptr = result.first->second.get();
+    impl_ptr =
+        &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name.c_str()); });
 
     fmha_fwd_v3_args args;
     size_t arg_size = sizeof(args);

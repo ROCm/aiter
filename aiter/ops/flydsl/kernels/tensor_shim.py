@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import torch
 import numpy as np
+import flydsl.compiler as flyc
 from itertools import product
 from abc import ABC, abstractmethod
 
@@ -9,6 +11,18 @@ from flydsl._mlir import ir
 from flydsl.expr.typing import T
 
 from flydsl.expr import buffer_ops, range_constexpr, vector
+
+
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        cf = flyc.compile(exe, *args)
+        exe._cf = cf
+    else:
+        cf(*args)
 
 
 def _to_raw(v):
@@ -20,6 +34,15 @@ def _to_raw(v):
     return ir.Value._CAPICreate(v._CAPIPtr)
 
 
+def get_dtype_str(dtype):
+    if dtype == torch.float:
+        return "f32"
+    elif dtype == torch.half:
+        return "f16"
+    elif dtype == torch.bfloat16:
+        return "bf16"
+
+
 def get_dtype_in_kernel(dtype: str):
     if dtype == "f32":
         return T.f32
@@ -27,6 +50,15 @@ def get_dtype_in_kernel(dtype: str):
         return T.f16
     elif dtype == "bf16":
         return T.bf16
+
+
+def get_dtype_vec_size(dtype: str):
+    if dtype == "f32":
+        return 4
+    elif dtype == "f16":
+        return 8
+    elif dtype == "bf16":
+        return 8
 
 
 class TensorView:

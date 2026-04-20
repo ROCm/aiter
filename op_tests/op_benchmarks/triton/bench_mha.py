@@ -598,7 +598,9 @@ def run_benchmark(run: BenchRun):
             requires_grad=requires_grad,
         )
         sink = (
-            torch.randn((HQ,), device=device, dtype=dtype, requires_grad=requires_grad)
+            torch.randn(
+                (HQ,), device=device, dtype=torch_dtype, requires_grad=requires_grad
+            )
             if run.sink
             else None
         )

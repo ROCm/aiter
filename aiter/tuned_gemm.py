@@ -126,9 +126,14 @@ def get_GEMM_A16W16_config(
 
     if config is None:
         default_config = {}
-        if bpreshuffle:
+        gfx = get_gfx()
+        # gfx12: no ASM/skinny/hipblaslt kernels, use torch
+        if gfx.startswith("gfx12"):
+            default_config["libtype"] = "torch"
+            default_config["solidx"] = 0
+        elif bpreshuffle:
             default_config["bpreshuffle"] = True
-            if get_gfx() == "gfx942":
+            if gfx == "gfx942":
                 default_config["libtype"] = "hipblaslt"
                 default_config["solidx"] = -1
                 default_config["kernelName"] = ""
@@ -273,13 +278,18 @@ def gemm_a16w16(
             config=flydsl_config,
         )
 
-    if config is not None and config["libtype"] == "asm":
+    gfx = get_gfx()
+    _no_asm = gfx.startswith("gfx12")
+    if config is not None and config["libtype"] == "asm" and not _no_asm:
         kernelName = config["kernelName"]
         splitK = config["splitK"]
         out = asm_gemm(inp_view, B, bias, otype, splitK, kernelName, bpreshuffle)
     else:
-        solution_idx = config["solidx"]
-        solfunc = solMap[config["libtype"]]
+        libtype = config["libtype"]
+        if _no_asm and libtype in ("asm", "skinny", "hipblaslt"):
+            libtype = "torch"
+        solution_idx = config["solidx"] if libtype == config.get("libtype") else 0
+        solfunc = solMap[libtype]
         out = solfunc(
             inp_view,
             B,
