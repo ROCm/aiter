@@ -1,13 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""FlyDSL-only unit test for gemm_a16w16 on gfx1250.
-
-Intentionally isolated from the triton test harness: does NOT import
-`aiter.ops.flydsl` or `aiter.ops.triton` at top level, because those
-trigger a build of `module_aiter_core` (via `aiter.ops.enum`) which is
-orthogonal to the flydsl kernel under test. The kernel file is loaded
-directly by file path.
-"""
 
 import importlib.util
 import os
