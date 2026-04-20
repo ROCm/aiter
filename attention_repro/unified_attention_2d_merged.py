@@ -2186,7 +2186,7 @@ def attention_loop_reg_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 
         # WMMA: QK subtile 1 for tile j+1
         qk1 = pgm.compute_qk_subtile(k1_s)
-        p11 = gl.exp2(qk1_shifted0)
+        p11 = gl.exp2(qk1_shifted1)
         acc1 = acc1 * alpha[:, None]
         p1 = pgm.concat_subtile(p10, p11)
 
