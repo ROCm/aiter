@@ -60,7 +60,7 @@ EOF
 # ATOM depends on bleeding-edge aiter APIs (e.g. destroy_dist_env, init_dist_env)
 # that may not be available in released wheels.
 cat >> "${ATOM_DIR}/Dockerfile.nightly" <<EOF
-RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \
+RUN rm -rf /app/aiter-test && git clone https://github.com/ROCm/aiter.git /app/aiter-test && \
     cd /app/aiter-test && git checkout ${AITER_SHA} && \
     git submodule sync && git submodule update --init --recursive && \
     MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
