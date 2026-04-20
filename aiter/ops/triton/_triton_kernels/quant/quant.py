@@ -93,6 +93,7 @@ def _mxfp4_quant_op(
     Converts given x (in fp32) to mxfp4 format.
     x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
 
+    Uses integer bit operations instead of tl.log2/tl.exp2 for scale computation.
     """
     EXP_BIAS_FP32: tl.constexpr = 127
     EXP_BIAS_FP4: tl.constexpr = 1
@@ -109,30 +110,29 @@ def _mxfp4_quant_op(
     # Calculate scale
     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
     amax = amax.to(tl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(tl.float32, bitcast=True)
-    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
-    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+    amax_rounded = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+
+    # Extract exponent directly from IEEE 754 representation (replaces tl.log2().floor())
+    # amax_rounded has mantissa=0, so it's exactly 2^(exp_biased - 127)
+    # log2(amax_rounded) = exp_biased - 127
+    # scale_e8m0_unbiased = log2(amax_rounded) - 2 = exp_biased - 127 - 2
+    exp_biased = (amax_rounded >> 23).to(tl.int32)
+    scale_e8m0_unbiased = exp_biased - 129  # 127 + 2 = 129
+    scale_e8m0_unbiased = tl.maximum(tl.minimum(scale_e8m0_unbiased, 127), -127)
 
     # blockscale_e8m0
-    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
+    bs_e8m0 = (scale_e8m0_unbiased + 127).to(tl.uint8)
 
-    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+    # Construct quant_scale = 2^(-scale_e8m0_unbiased) using IEEE 754 bit construction
+    # (replaces tl.exp2)
+    # 2^(-scale_e8m0_unbiased) has biased exponent = 127 - scale_e8m0_unbiased
+    quant_exp = (127 - scale_e8m0_unbiased)
+    quant_scale = (quant_exp << 23).to(tl.float32, bitcast=True)
 
     # Compute quantized x
     qx = x * quant_scale
 
     # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
-    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
-    #   Zeros: S000 -> +/-0
-    #   Denormal Numbers: S001 -> +/- 0.5
-    #   Normal Numbers:
-    #           S010 -> +/- 1.0
-    #           S011 -> +/- 1.5
-    #           S100 -> +/- 2.0
-    #           S101 -> +/- 3.0
-    #           S110 -> +/- 4.0
-    #           S111 -> +/- 6.0
     qx = qx.to(tl.uint32, bitcast=True)
 
     # Extract sign
