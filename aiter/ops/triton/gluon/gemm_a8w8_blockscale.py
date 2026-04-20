@@ -182,6 +182,8 @@ def gemm_a8w8_blockscale(
         w_scale.stride(1),
         NUM_WARPS=config["num_warps"],
         warp_bases=warp_bases,
+        NUM_BUFFERS=3,
+        L2_PREFETCH_DISTANCE=1,
         **config,
     )
 

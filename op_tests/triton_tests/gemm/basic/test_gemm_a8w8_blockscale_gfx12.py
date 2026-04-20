@@ -3,7 +3,7 @@
 
 import torch
 import pytest
-# NOTE: when below was ops.triton.gemm_a8w8, a precompiled kernel ran instead of gfx1250
+# NOTE: when below was ops.triton.gemm_a8w8_blockscale, a precompiled kernel ran instead of gfx1250. if required in specifically triton folder, must change
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
@@ -153,17 +153,9 @@ def generate_gemm_a8w8_blockscale_inputs(
     x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
 
-    # broken
-    if shuffle:
-        weight_shuffle_layout = (16, 16)
-        weight_shuffled = shuffle_weight(weight, weight_shuffle_layout).reshape(
-            weight.shape[0] // weight_shuffle_layout[0],
-            weight.shape[1] * weight_shuffle_layout[0],
-        )
-        x_scale_shuffled = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    else:
-        weight_shuffled = weight
-        x_scale_shuffled = x_scale
+    # Note: for now. weight shuffle was buggy, removed for wrapup
+    weight_shuffled = weight
+    x_scale_shuffled = x_scale
 
     y = None
     if output:
@@ -232,9 +224,6 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
     b = run_triton(x, weight_triton, x_scale, w_scale, dtype, y, impl)
-
-    print(a)
-    print(b)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
 test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")

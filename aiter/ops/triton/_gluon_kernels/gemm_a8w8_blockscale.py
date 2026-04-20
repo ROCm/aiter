@@ -67,6 +67,8 @@ def _gemm_a8w8_blockscale_kernel(
     NUM_WARPS: gl.constexpr,
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    L2_PREFETCH_DISTANCE: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -87,29 +89,14 @@ def _gemm_a8w8_blockscale_kernel(
     **scale_n = (N + GROUP_N - 1) // GROUP_N
     """
 
-    # TODO: make parameters
-    NUM_BUFFERS: gl.constexpr = 3
-    L2_PREFETCH_DISTANCE: gl.constexpr = 1
-
-    # Setup
+    # program setup
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     
-    blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 16],
-        threads_per_warp=[4, 8], # 32
-        warps_per_cta=[NUM_WARPS, 1],
-        order=[1, 0],
-    )
-    blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1],
-        threads_per_warp=[8, 4], # 32
-        warps_per_cta=[1, NUM_WARPS],
-        order=[0, 1],
-    )
 
+    # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 128])
 
 
@@ -133,12 +120,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
 
 
-    k_tiles_count = gl.cdiv(K, BLOCK_SIZE_K)
-
-    # Create pointers for first block of A and B input matrices
-    offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
-    offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
-
+    # scales shared mem and offsets -- offsets in wmma layout to match tdm
     smem_scale_a = gl.allocate_shared_memory(
         gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
     )
@@ -148,16 +130,21 @@ def _gemm_a8w8_blockscale_kernel(
     )
 
     offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
     )
     offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
     )
 
-    offs_a = offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
-
-    # Create pointers for the scales
     offs_a_scale = offs_am * stride_ascale_m
+
+    offs_b_scale_n = offs_bn // GROUP_N
+    offs_b_scale = offs_b_scale_n * stride_bscale_n
+
+
+    # tdm offsets
+    off_am_tdm = pid_m * BLOCK_SIZE_M
+    off_bm_tdm = pid_n * BLOCK_SIZE_N
     
     
     # TDM tensor descriptors and shared mem
@@ -168,16 +155,17 @@ def _gemm_a8w8_blockscale_kernel(
                                                         layout=tdm_shared_a)
     b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(base=b_ptr,
                                                         shape=(K, N),
-                                                            strides=(stride_bk, stride_bn),
-                                                            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N), 
-                                                            layout=tdm_shared_b)
-    tdm_smem_a = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
-    tdm_smem_b = gl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
+                                                        strides=(stride_bk, stride_bn),
+                                                        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N), 
+                                                        layout=tdm_shared_b)
+    tdm_smem_a = gl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=tdm_shared_a)
+    tdm_smem_b = gl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=tdm_shared_b)
 
-    # edit these if you need
+    # loads/computes indexes/counters
     num_loads = 0 
     num_computes = 0 
 
+    # acc setup
     acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
     acc = gl.zeros(
         (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=wmma_layout
@@ -189,17 +177,12 @@ def _gemm_a8w8_blockscale_kernel(
 
     # ------------ Prologue ---------------
 
-    # Load A scale from global
+    # load scales
     a_scale = gl.amd.cdna4.buffer_load(
         ptr=a_scale_ptr,
         offsets=offs_a_scale,
         cache=cache_modifier,
     )
-
-    offs_b = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    offs_b_scale_n = offs_bn // GROUP_N
-    offs_b_scale = offs_b_scale_n * stride_bscale_n
-    # Load b scale from global
     b_scale = gl.amd.cdna4.buffer_load(
         ptr=b_scale_ptr,
         offsets=offs_b_scale,
@@ -211,12 +194,6 @@ def _gemm_a8w8_blockscale_kernel(
             prefetch_iteration = num_loads + L2_PREFETCH_DISTANCE + NUM_BUFFERS + i
             gl.amd.gfx1250.tdm.prefetch(a_desc, [0, prefetch_iteration * BLOCK_SIZE_K], pred=True)
             gl.amd.gfx1250.tdm.prefetch(b_desc, [prefetch_iteration * BLOCK_SIZE_K, 0], pred=True)
-            
-
-    off_am_tdm: gl.int32 = pid_m * BLOCK_SIZE_M
-    off_bm_tdm: gl.int32 = pid_n * BLOCK_SIZE_N
-    # Loading initial batch of a and b to be in the queue. now 2 things in queue (with num buffers 2)
-
 
     # TDM prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
@@ -224,19 +201,22 @@ def _gemm_a8w8_blockscale_kernel(
         gl.amd.gfx1250.tdm.async_load(b_desc, [num_loads * BLOCK_SIZE_K, off_bm_tdm], tdm_smem_b.index(num_loads % NUM_BUFFERS))
         num_loads += 1
     
-    # Store scales in WMMA slice order so load(SliceLayout(1/0, wmma_layout)) aligns scale[i] with row/col i
-    smem_scale_a.store(a_scale)
-    smem_scale_b.store(b_scale) 
-
     # wait for the buffers to finish
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
-    # load shared relaxed for a and b -- edit these
+    # load shared relaxed for a and b
     cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
             tdm_smem_a.index(num_computes % NUM_BUFFERS), dot_a_layout
         )
     cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
             tdm_smem_b.index(num_computes % NUM_BUFFERS), dot_b_layout
         )
+    
+    # store scales
+    smem_scale_a.store(a_scale)
+    smem_scale_b.store(b_scale) 
+
+    # setup for loop
+    k_tiles_count = gl.cdiv(K, BLOCK_SIZE_K)
 
     # ----- Main Loop --------
 
@@ -245,17 +225,16 @@ def _gemm_a8w8_blockscale_kernel(
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
-
         # wmma 
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
-        # async loads
+        # load into tdm
         gl.amd.gfx1250.tdm.async_load(a_desc, [off_am_tdm, num_loads * BLOCK_SIZE_K], tdm_smem_a.index(num_loads % NUM_BUFFERS),
                                 pred=1)
         gl.amd.gfx1250.tdm.async_load(b_desc, [num_loads * BLOCK_SIZE_K, off_bm_tdm], tdm_smem_b.index(num_loads % NUM_BUFFERS),
                                     pred=1)
         
-        # async wait and load index increase
+        # wait for loads before proceeding
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
         # prefetches
@@ -263,19 +242,15 @@ def _gemm_a8w8_blockscale_kernel(
             prefetch_iteration = num_loads + L2_PREFETCH_DISTANCE - 1
             gl.amd.gfx1250.tdm.prefetch(a_desc, [0, prefetch_iteration * BLOCK_SIZE_K], pred=True)
             gl.amd.gfx1250.tdm.prefetch(b_desc, [prefetch_iteration * BLOCK_SIZE_K, 0], pred=True)
-        # load shared relaxed for next a and b
+        # begin loading in advance
         next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS), dot_a_layout
             )
         next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS), dot_b_layout
             )
-        cur_a = next_a
-        cur_b = next_b
-        num_computes += 1
 
-        # scales
-        # Advance the ptrs to the next K block.
+        # scales -- ptrs, load from global
         a_scale_ptr += stride_ascale_k
         b_scale_ptr += stride_bscale_k
         a_scale = gl.amd.cdna4.buffer_load(
@@ -283,20 +258,22 @@ def _gemm_a8w8_blockscale_kernel(
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
-        # Loading b scale and curr b scale
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr,
             offsets=offs_b_scale,
             cache=cache_modifier,
         )
-        # Store in WMMA slice order so next iteration's load aligns scale[i] with row/col i
         smem_scale_a.store(a_scale)
         smem_scale_b.store(b_scale) 
+
+        cur_a = next_a
+        cur_b = next_b
+        num_computes += 1
 
         
     # ======= Epilogue ========
 
-    # load a from the last load
+    # scale from last store
     cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
     cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
@@ -310,7 +287,6 @@ def _gemm_a8w8_blockscale_kernel(
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
-        # Loading b scale and curr b scale
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr,
             offsets=offs_b_scale,
@@ -329,39 +305,15 @@ def _gemm_a8w8_blockscale_kernel(
         cur_a = next_a
         cur_b = next_b
         num_computes += 1
-        # scales
-        # Advance the ptrs to the next K block.
         
-        # Store in WMMA slice order so next iteration's load aligns scale[i] with row/col i
+        # scale store in smem and load for next iteration
         smem_scale_a.store(a_scale)
         smem_scale_b.store(b_scale) 
 
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
 
-
-        
-        
-    # final scale application
-    # a_scale_ptr += stride_ascale_k
-    # b_scale_ptr += stride_bscale_k
-    # a_scale = gl.amd.cdna4.buffer_load(
-    #     ptr=a_scale_ptr,
-    #     offsets=offs_a_scale,
-    #     cache=cache_modifier,
-    # )
-    # # Loading b scale and curr b scale
-    # b_scale = gl.amd.cdna4.buffer_load(
-    #     ptr=b_scale_ptr,
-    #     offsets=offs_b_scale,
-    #     cache=cache_modifier,
-    # )
-    # smem_scale_a.store(a_scale)
-    # smem_scale_b.store(b_scale) 
-     # load a from the last load
-    # cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, wmma_layout))
-    # cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, wmma_layout))
-
+    # wmma remaining tile
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
@@ -380,7 +332,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
     tdm_smem_c.store(acc.to(c_ptr.type.element_ty))
 
-    # Ensure all wavefronts have finished writing to LDS before TDM reads it.
+    # wait for all wavefronts before write
     gl.barrier()
 
     c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
