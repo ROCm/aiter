@@ -28,13 +28,24 @@ import os
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    AotJob,
+    CompileBundle,
+    collect_aot_jobs,
+    compile_bundle_to_cache,
+    execute_bundle,
+    job_identity,
+    make_compile_one_config,
+    make_aot_job,
+    print_summary,
+    resolve_csv_paths,
+    run_job_sections,
+)
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
-    _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
     _s2_args_fp4,
@@ -47,57 +58,73 @@ DEFAULT_CSVS = [
 ]
 
 
-def parse_csv(csv_path: str):
-    """Parse the CSV and return a list of unique compile jobs.
+def _row_int(row: dict[str, str], *keys: str) -> int:
+    for key in keys:
+        value = row.get(key, "").strip()
+        if value:
+            return int(value)
+    raise KeyError(f"Missing integer field in CSV row; tried {keys!r}")
 
-    Each job is a dict with keys:
-        kernel_name, stage, model_dim, inter_dim, experts, topk,
-        doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
 
-    Deduplicates by
-    (kernel_name, model_dim, inter_dim, experts, topk, doweight_stage1).
-    """
-    jobs = []
+def _iter_moe_kernel_names(row: dict[str, str]) -> list[str]:
+    kernel_name = row.get("kernel_name", "").strip()
+    if kernel_name:
+        return [kernel_name]
+    return [
+        name
+        for name in (
+            row.get("kernelName1", "").strip(),
+            row.get("kernelName2", "").strip(),
+        )
+        if name
+    ]
+
+
+def _normalize_moe_row(row: dict[str, str]) -> list[AotJob]:
+    op_family = row.get("op_family", "").strip()
+    if op_family and op_family != "moe":
+        return []
+
+    problem = {
+        "model_dim": _row_int(row, "model_dim"),
+        "inter_dim": _row_int(row, "inter_dim"),
+        "experts": _row_int(row, "experts", "expert"),
+        "topk": _row_int(row, "topk"),
+        "doweight_stage1": bool(int(row.get("doweight_stage1", "0"))),
+    }
+    jobs: list[AotJob] = []
+    for kernel_name in _iter_moe_kernel_names(row):
+        if not kernel_name.startswith("flydsl_"):
+            continue
+
+        spec = get_flydsl_kernel_params(kernel_name)
+        if spec is None:
+            print(f"  [WARN] Unknown kernel name: {kernel_name}, skipping")
+            continue
+
+        jobs.append(make_aot_job(kernel_name=kernel_name, problem=problem, spec=spec))
+    return jobs
+
+
+def parse_csv(csv_path: str) -> list[AotJob]:
+    """Parse the CSV and return unique normalized MoE compile jobs."""
+    jobs: list[AotJob] = []
     seen = set()
 
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            model_dim = int(row["model_dim"])
-            inter_dim = int(row["inter_dim"])
-            experts = int(row["expert"])
-            topk = int(row["topk"])
-            doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
-
-            for col in ("kernelName1", "kernelName2"):
-                name = row.get(col, "").strip()
-                if not name or not name.startswith("flydsl_"):
-                    continue
-
-                job = {
-                    "kernel_name": name,
-                    "model_dim": model_dim,
-                    "inter_dim": inter_dim,
-                    "experts": experts,
-                    "topk": topk,
-                    "doweight_stage1": doweight_stage1,
-                }
+            for job in _normalize_moe_row(row):
                 key = job_identity(job)
                 if key in seen:
                     continue
                 seen.add(key)
-
-                params = get_flydsl_kernel_params(name)
-                if params is None:
-                    print(f"  [WARN] Unknown kernel name: {name}, skipping")
-                    continue
-
-                jobs.append({**job, **params})
+                jobs.append(job)
 
     return jobs
 
 
-def _precompile_to_cache(
+def _build_stage1_bundle(
     stage: int,
     model_dim: int,
     inter_dim: int,
@@ -119,14 +146,14 @@ def _precompile_to_cache(
     persist: bool = False,
     sort_block_m: int = 0,
     **kwargs,
-):
-    """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
+) -> CompileBundle:
+    """Build the stage1 executable and dummy args bundle for AOT compilation.
 
     Constructs minimal zero-filled tensors matching the kernel's expected
-    signature, then calls the JitFunction.  With COMPILE_ONLY=1 the compiled
-    artifact is saved to the pkl cache without executing on GPU.
-    No dependency on HIP ops (moe_sorting, shuffle_weight, etc.).
+    signature.
     """
+    del stage, mode, persist, sort_block_m, kwargs
+
     import torch
 
     dev = torch.device("cuda")
@@ -134,6 +161,9 @@ def _precompile_to_cache(
     tokens = tile_m
     E = experts
     _grid_y = 1
+    _is_splitk = k_batch > 1
+    n_in = inter_dim * 2 if is_fp4 else inter_dim
+    k_in = model_dim
 
     # Dummy routing tensors (shape matters, data doesn't)
     sorted_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
@@ -141,193 +171,215 @@ def _precompile_to_cache(
     num_valid_ids = torch.zeros(1, device=dev, dtype=torch.int32)
     sw = torch.zeros(tokens * topk, device=dev, dtype=torch.float32)
 
-    with compile_only_env():
-        if stage == 1:
-            _is_splitk = k_batch > 1
-            n_in = inter_dim * 2 if is_fp4 else inter_dim
-            k_in = model_dim
-
-            if is_fp4:
-                out = torch.zeros(
-                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
-                )
-                a = torch.zeros(tokens * model_dim // 2, device=dev, dtype=torch.uint8)
-                w = torch.zeros(
-                    E * 2 * inter_dim * model_dim // 2, device=dev, dtype=torch.uint8
-                )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                out_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                args = _s1_args_fp4(
-                    out,
-                    a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
-                    sorted_expert_ids,
-                    sw,
-                    num_valid_ids,
-                    out_scale,
-                    tokens,
-                    n_in,
-                    k_in,
-                    _grid_y,
-                    dev,
-                )
-            else:
-                out = torch.zeros(
-                    tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16
-                )
-                a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.int8)
-                w = torch.zeros(
-                    E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8
-                )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                args = _s1_args_std(
-                    out,
-                    a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
-                    sorted_expert_ids,
-                    sw,
-                    num_valid_ids,
-                    tokens,
-                    n_in,
-                    k_in,
-                    _grid_y,
-                )
-
-            exe = compile_flydsl_moe_stage1(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage1=doweight_stage1,
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=out_dtype,
-                waves_per_eu=waves_per_eu,
-                k_batch=k_batch,
-                b_nt=b_nt,
-                gate_only=gate_only,
-                fuse_fp4_quant=fuse_fp4_quant and not _is_splitk,
-                fuse_sort_scale=fuse_fp4_quant and not _is_splitk,
-            )
-            _run_compiled(exe, args)
-
-        elif stage == 2:
-            accumulate = mode != "reduce"
-            _persist_m = -1 if persist else 4
-            n_in = model_dim
-            k_in = inter_dim
-
-            if is_fp4:
-                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(
-                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
-                )
-                w = torch.zeros(
-                    E * model_dim * inter_dim // 2, device=dev, dtype=torch.uint8
-                )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
-                args = _s2_args_fp4(
-                    out,
-                    a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
-                    sorted_expert_ids,
-                    sw,
-                    num_valid_ids,
-                    tokens,
-                    n_in,
-                    k_in,
-                    _grid_y,
-                    dev,
-                )
-            else:
-                out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
-                a = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.int8)
-                w = torch.zeros(E * model_dim * inter_dim, device=dev, dtype=torch.int8)
-                a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
-                args = _s2_args_std(
-                    out,
-                    a,
-                    w,
-                    a_scale,
-                    w_scale,
-                    sorted_ids,
-                    sorted_expert_ids,
-                    sw,
-                    num_valid_ids,
-                    tokens,
-                    n_in,
-                    k_in,
-                    _grid_y,
-                )
-
-            exe = compile_flydsl_moe_stage2(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage2=False,
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=out_dtype,
-                accumulate=accumulate,
-                persist_m=_persist_m,
-                sort_block_m=sort_block_m,
-            )
-            _run_compiled(exe, args)
-
-
-def compile_one_config(
-    kernel_name: str, model_dim: int, inter_dim: int, experts: int, topk: int, **kwargs
-) -> dict:
-    """Compile one MoE kernel configuration and save to cache.
-
-    Uses COMPILE_ONLY=1 with dummy tensors to trigger MLIR compilation and
-    pkl cache write without depending on HIP ops or executing on GPU.
-
-    Returns a dict with timing info.
-    """
-    shape_str = (
-        f"{kernel_name}  "
-        f"model_dim={model_dim} inter_dim={inter_dim} "
-        f"E={experts} topk={topk}"
-    )
-    result = {"kernel_name": kernel_name, "shape": shape_str, "compile_time": None}
-
-    t0 = time.time()
-    try:
-        _precompile_to_cache(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            **kwargs,
+    if is_fp4:
+        out = torch.zeros(
+            tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
         )
-        elapsed = time.time() - t0
-        result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}")
-    except Exception as e:
-        print(f"  [FAIL] compile  {shape_str}: {e}")
+        a = torch.zeros(tokens * model_dim // 2, device=dev, dtype=torch.uint8)
+        w = torch.zeros(
+            E * 2 * inter_dim * model_dim // 2, device=dev, dtype=torch.uint8
+        )
+        a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+        w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+        out_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+        args = _s1_args_fp4(
+            out,
+            a,
+            w,
+            a_scale,
+            w_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            out_scale,
+            tokens,
+            n_in,
+            k_in,
+            _grid_y,
+            dev,
+        )
+    else:
+        out = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.bfloat16)
+        a = torch.zeros(tokens * model_dim, device=dev, dtype=torch.int8)
+        w = torch.zeros(E * 2 * inter_dim * model_dim, device=dev, dtype=torch.int8)
+        a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+        w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+        args = _s1_args_std(
+            out,
+            a,
+            w,
+            a_scale,
+            w_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            tokens,
+            n_in,
+            k_in,
+            _grid_y,
+        )
 
-    return result
+    exe = compile_flydsl_moe_stage1(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage1=doweight_stage1,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        waves_per_eu=waves_per_eu,
+        k_batch=k_batch,
+        b_nt=b_nt,
+        gate_only=gate_only,
+        fuse_fp4_quant=fuse_fp4_quant and not _is_splitk,
+        fuse_sort_scale=fuse_fp4_quant and not _is_splitk,
+    )
+    return exe, args
+
+
+def _build_stage2_bundle(
+    stage: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str = "fp4",
+    b_dtype: str = "fp4",
+    out_dtype: str = "bf16",
+    mode: str = "atomic",
+    persist: bool = False,
+    sort_block_m: int = 0,
+    **kwargs,
+) -> CompileBundle:
+    """Build the stage2 executable and dummy args bundle for AOT compilation."""
+    del stage, kwargs
+
+    import torch
+
+    dev = torch.device("cuda")
+    is_fp4 = b_dtype == "fp4"
+    tokens = tile_m
+    E = experts
+    _grid_y = 1
+    accumulate = mode != "reduce"
+    _persist_m = -1 if persist else 4
+    n_in = model_dim
+    k_in = inter_dim
+
+    # Dummy routing tensors (shape matters, data doesn't)
+    sorted_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
+    sorted_expert_ids = torch.zeros(_grid_y, device=dev, dtype=torch.int32)
+    num_valid_ids = torch.zeros(1, device=dev, dtype=torch.int32)
+    sw = torch.zeros(tokens * topk, device=dev, dtype=torch.float32)
+
+    if is_fp4:
+        out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
+        a = torch.zeros(tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8)
+        w = torch.zeros(E * model_dim * inter_dim // 2, device=dev, dtype=torch.uint8)
+        a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+        w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+        args = _s2_args_fp4(
+            out,
+            a,
+            w,
+            a_scale,
+            w_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            tokens,
+            n_in,
+            k_in,
+            _grid_y,
+            dev,
+        )
+    else:
+        out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
+        a = torch.zeros(tokens * topk * inter_dim, device=dev, dtype=torch.int8)
+        w = torch.zeros(E * model_dim * inter_dim, device=dev, dtype=torch.int8)
+        a_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+        w_scale = torch.zeros(1, device=dev, dtype=torch.float32)
+        args = _s2_args_std(
+            out,
+            a,
+            w,
+            a_scale,
+            w_scale,
+            sorted_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            tokens,
+            n_in,
+            k_in,
+            _grid_y,
+        )
+
+    exe = compile_flydsl_moe_stage2(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        doweight_stage2=False,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        accumulate=accumulate,
+        persist_m=_persist_m,
+        sort_block_m=sort_block_m,
+    )
+    return exe, args
+
+
+_BUNDLE_BUILDERS = {
+    1: _build_stage1_bundle,
+    2: _build_stage2_bundle,
+}
+
+
+def build_moe_bundle(problem: dict[str, object], spec: dict[str, object]) -> CompileBundle:
+    stage = spec.get("stage")
+    bundle_builder = _BUNDLE_BUILDERS.get(stage)
+    if bundle_builder is None:
+        raise ValueError(f"Unsupported MoE AOT stage: {stage}")
+    return bundle_builder(**problem, **spec)
+
+
+def _compile_one_moe_job(job: AotJob) -> None:
+    compile_bundle_to_cache(build_moe_bundle(job["problem"], job["spec"]), runner=execute_bundle)
+
+
+def _moe_shape_str(job: AotJob) -> str:
+    problem = job["problem"]
+    return (
+        f'{job["kernel_name"]}  '
+        f'model_dim={problem["model_dim"]} inter_dim={problem["inter_dim"]} '
+        f'E={problem["experts"]} topk={problem["topk"]}'
+    )
+
+
+def _moe_result_fields(job: AotJob) -> dict:
+    return {"kernel_name": job["kernel_name"]}
+
+
+compile_one_config = make_compile_one_config(
+    shape_builder=_moe_shape_str,
+    compile_action=_compile_one_moe_job,
+    result_builder=_moe_result_fields,
+)
 
 
 def main():
@@ -344,11 +396,7 @@ def main():
     )
     args = parser.parse_args()
 
-    csv_paths = [os.path.abspath(p) for p in args.csv]
-    for csv_path in csv_paths:
-        if not os.path.isfile(csv_path):
-            print(f"Error: CSV file not found: {csv_path}")
-            sys.exit(1)
+    csv_paths = resolve_csv_paths(args.csv)
 
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
@@ -357,8 +405,8 @@ def main():
 
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
-    stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
-    stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
+    stage1_jobs = [j for j in all_jobs if j["spec"]["stage"] == 1]
+    stage2_jobs = [j for j in all_jobs if j["spec"]["stage"] == 2]
 
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
@@ -373,44 +421,16 @@ def main():
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
-
-    if stage1_jobs:
-        print(f"\n--- Stage 1 ({len(stage1_jobs)} kernels) ---")
-        for i, job in enumerate(stage1_jobs, 1):
-            print(f"\n[{i}/{len(stage1_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
-
-    if stage2_jobs:
-        print(f"\n--- Stage 2 ({len(stage2_jobs)} kernels) ---")
-        for i, job in enumerate(stage2_jobs, 1):
-            print(f"\n[{i}/{len(stage2_jobs)}] ", end="")
-            r = compile_one_config(**job)
-            results.append(r)
+    results = run_job_sections(
+        [
+            ("Stage 1", stage1_jobs),
+            ("Stage 2", stage2_jobs),
+        ],
+        compile_one_config,
+    )
 
     total_elapsed = time.time() - total_t0
-
-    ok = sum(1 for r in results if r["compile_time"] is not None)
-    fail = sum(1 for r in results if r["compile_time"] is None)
-
-    print("\n" + "=" * 72)
-    print("Summary")
-    print("=" * 72)
-    print(f"  Total time:   {total_elapsed:.1f}s")
-    print(f"  Compiled:     {ok} ok, {fail} failed")
-    print(f"  Cache dir:    {cache_dir}")
-
-    print()
-
-    exit_code = 0
-    if fail > 0:
-        print("Some compilations failed. Check output above for details.")
-        exit_code = 1
-    else:
-        print("All compilations succeeded. Cache is ready.")
-
-    sys.exit(exit_code)
+    sys.exit(print_summary(total_elapsed=total_elapsed, results=results, cache_dir=cache_dir))
 
 
 if __name__ == "__main__":

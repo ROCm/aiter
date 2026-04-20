@@ -372,7 +372,7 @@ if PREBUILD_KERNELS != 0:
                     )
                     results = []
                     for job in jobs:
-                        results.append(compile_one_config(**job))
+                        results.append(compile_one_config(job))
                     ok = sum(
                         1 for result in results if result["compile_time"] is not None
                     )

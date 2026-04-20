@@ -36,7 +36,19 @@ import sys
 import time
 from typing import Dict, Optional
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    AotJob,
+    CompileBundle,
+    collect_aot_jobs,
+    compile_bundle_to_cache,
+    job_identity,
+    make_compile_one_config,
+    make_aot_job,
+    print_summary,
+    resolve_csv_paths,
+    run_job_sections,
+    torch_dtype_for_kernel,
+)
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
@@ -151,78 +163,63 @@ def _parse_hgemm_kernel_name(name: str) -> Optional[Dict]:
     }
 
 
-def parse_csv(csv_path: str):
-    """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
-    jobs = []
+def _row_int(row: dict[str, str], *keys: str) -> int:
+    for key in keys:
+        value = row.get(key, "").strip()
+        if value:
+            return int(value)
+    raise KeyError(f"Missing integer field in CSV row; tried {keys!r}")
+
+
+def _normalize_gemm_row(row: dict[str, str]) -> list[AotJob]:
+    kernel_name = row.get("kernel_name", row.get("kernelName", "")).strip()
+    libtype = row.get("libtype", "").strip()
+    op_family = row.get("op_family", "").strip()
+    if op_family and op_family != "gemm":
+        return []
+    if libtype and libtype != "flydsl":
+        return []
+    if not kernel_name.startswith("flydsl_"):
+        return []
+
+    if kernel_name.startswith("flydsl_bpreshuflle_"):
+        spec = _parse_preshuffle_kernel_name(kernel_name)
+    elif kernel_name.startswith("flydsl_gemm"):
+        spec = _parse_hgemm_kernel_name(kernel_name)
+    else:
+        spec = None
+
+    if spec is None:
+        print(f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping")
+        return []
+
+    problem = {
+        "m": _row_int(row, "m", "M"),
+        "n": _row_int(row, "n", "N"),
+        "k": _row_int(row, "k", "K"),
+    }
+    return [make_aot_job(kernel_name=kernel_name, problem=problem, spec=spec)]
+
+
+def parse_csv(csv_path: str) -> list[AotJob]:
+    """Parse a GEMM tuned CSV and return unique normalized FlyDSL compile jobs."""
+    jobs: list[AotJob] = []
     seen = set()
 
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            kernel_name = row.get("kernelName", "").strip()
-            libtype = row.get("libtype", "").strip()
-            if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
-                continue
-
-            m = int(row["M"])
-            n = int(row["N"])
-            k = int(row["K"])
-
-            if kernel_name.startswith("flydsl_bpreshuflle_"):
-                params = _parse_preshuffle_kernel_name(kernel_name)
-            elif kernel_name.startswith("flydsl_gemm"):
-                params = _parse_hgemm_kernel_name(kernel_name)
-            else:
-                params = None
-
-            if params is None:
-                print(
-                    f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
-                )
-                continue
-
-            job = {
-                "kernel_name": kernel_name,
-                "m": m,
-                "n": n,
-                "k": k,
-                **params,
-            }
-            key = job_identity(job)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            jobs.append(job)
+            for job in _normalize_gemm_row(row):
+                key = job_identity(job)
+                if key in seen:
+                    continue
+                seen.add(key)
+                jobs.append(job)
 
     return jobs
 
 
-def _torch_dtype_for_kernel(dtype_name: str):
-    import torch
-
-    mapping = {
-        "bf16": torch.bfloat16,
-        "f16": torch.float16,
-        "fp16": torch.float16,
-    }
-    if dtype_name not in mapping:
-        raise ValueError(f"Unsupported torch dtype name for GEMM AOT: {dtype_name!r}")
-    return mapping[dtype_name]
-
-
-def _compile_executable_to_cache(exe, *args) -> None:
-    compile_fn = getattr(exe, "compile", None)
-    if compile_fn is None:
-        import flydsl.compiler as flyc
-
-        compile_fn = flyc.compile
-        args = (exe, *args)
-    with compile_only_env():
-        compile_fn(*args)
-
-
-def _compile_hgemm_to_cache(
+def _build_hgemm_bundle(
     *,
     m: int,
     n: int,
@@ -241,13 +238,13 @@ def _compile_hgemm_to_cache(
     c_to_lds: bool,
     target_gfx: str,
     **kwargs,
-):
+) -> CompileBundle:
     del kwargs, out_dtype
 
     import torch
 
     dev = torch.device("cuda")
-    torch_dtype = _torch_dtype_for_kernel(dtype)
+    torch_dtype = torch_dtype_for_kernel(dtype)
 
     current_gfx = get_gfx()
     if target_gfx != current_gfx:
@@ -279,10 +276,10 @@ def _compile_hgemm_to_cache(
         B_PRE_SHUFFLE=b_preshuffle,
         B_TO_LDS=b_to_lds,
     )
-    _compile_executable_to_cache(exe, out, a, b, m, counter, 0, stream)
+    return exe, (out, a, b, m, counter, 0, stream)
 
 
-def _compile_preshuffle_to_cache(
+def _build_preshuffle_bundle(
     *,
     m: int,
     n: int,
@@ -297,13 +294,13 @@ def _compile_preshuffle_to_cache(
     use_async_copy: int,
     waves_per_eu: int,
     **kwargs,
-):
+) -> CompileBundle:
     del kwargs
 
     import torch
 
     dev = torch.device("cuda")
-    out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
+    out_torch_dtype = torch_dtype_for_kernel(out_dtype)
 
     # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
     a = torch.empty((m * k,), device=dev, dtype=torch.int8)
@@ -326,37 +323,44 @@ def _compile_preshuffle_to_cache(
         use_async_copy=bool(use_async_copy),
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
     )
-    _compile_executable_to_cache(exe, out, a, b, scale_a, scale_b, m, n, stream)
+    return exe, (out, a, b, scale_a, scale_b, m, n, stream)
 
 
-def compile_one_config(
-    kernel_name: str, kind: str, m: int, n: int, k: int, **kwargs
-) -> dict:
-    """Compile one GEMM kernel configuration and save it to cache."""
-    shape_str = f"{kernel_name}  M={m} N={n} K={k}"
-    result = {
-        "kernel_name": kernel_name,
-        "kind": kind,
-        "shape": shape_str,
-        "compile_time": None,
-    }
+_BUNDLE_BUILDERS = {
+    "hgemm": _build_hgemm_bundle,
+    "preshuffle": _build_preshuffle_bundle,
+}
 
-    t0 = time.time()
-    try:
-        if kind == "hgemm":
-            _compile_hgemm_to_cache(m=m, n=n, k=k, **kwargs)
-        elif kind == "preshuffle":
-            _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
-        else:
-            raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
-        elapsed = time.time() - t0
-        result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}")
-    except Exception as e:
-        print(f"  [FAIL] compile  {shape_str}: {e}")
+def build_gemm_bundle(problem: dict[str, object], spec: dict[str, object]) -> CompileBundle:
+    kind = spec.get("kind")
+    bundle_builder = _BUNDLE_BUILDERS.get(kind)
+    if bundle_builder is None:
+        raise ValueError(f"Unknown GEMM AOT kind: {kind}")
+    return bundle_builder(**problem, **spec)
 
-    return result
+
+def _compile_one_gemm_job(job: AotJob) -> None:
+    compile_bundle_to_cache(build_gemm_bundle(job["problem"], job["spec"]))
+
+
+def _gemm_shape_str(job: AotJob) -> str:
+    problem = job["problem"]
+    return (
+        f'{job["kernel_name"]}  '
+        f'M={problem["m"]} N={problem["n"]} K={problem["k"]}'
+    )
+
+
+def _gemm_result_fields(job: AotJob) -> dict:
+    return {"kernel_name": job["kernel_name"], "kind": job["spec"]["kind"]}
+
+
+compile_one_config = make_compile_one_config(
+    shape_builder=_gemm_shape_str,
+    compile_action=_compile_one_gemm_job,
+    result_builder=_gemm_result_fields,
+)
 
 
 def main():
@@ -373,11 +377,7 @@ def main():
     )
     args = parser.parse_args()
 
-    csv_paths = [os.path.abspath(p) for p in args.csv]
-    for csv_path in csv_paths:
-        if not os.path.isfile(csv_path):
-            print(f"Error: CSV file not found: {csv_path}")
-            sys.exit(1)
+    csv_paths = resolve_csv_paths(args.csv)
 
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
@@ -386,8 +386,8 @@ def main():
 
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
-    hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
-    preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
+    hgemm_jobs = [j for j in all_jobs if j["spec"]["kind"] == "hgemm"]
+    preshuffle_jobs = [j for j in all_jobs if j["spec"]["kind"] == "preshuffle"]
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
@@ -402,41 +402,16 @@ def main():
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
-
-    if hgemm_jobs:
-        print(f"\n--- HGEMM ({len(hgemm_jobs)} kernels) ---")
-        for i, job in enumerate(hgemm_jobs, 1):
-            print(f"\n[{i}/{len(hgemm_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
-
-    if preshuffle_jobs:
-        print(f"\n--- Preshuffle GEMM ({len(preshuffle_jobs)} kernels) ---")
-        for i, job in enumerate(preshuffle_jobs, 1):
-            print(f"\n[{i}/{len(preshuffle_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
+    results = run_job_sections(
+        [
+            ("HGEMM", hgemm_jobs),
+            ("Preshuffle GEMM", preshuffle_jobs),
+        ],
+        compile_one_config,
+    )
 
     total_elapsed = time.time() - total_t0
-
-    ok = sum(1 for r in results if r["compile_time"] is not None)
-    fail = sum(1 for r in results if r["compile_time"] is None)
-
-    print("\n" + "=" * 72)
-    print("Summary")
-    print("=" * 72)
-    print(f"  Total time:   {total_elapsed:.1f}s")
-    print(f"  Compiled:     {ok} ok, {fail} failed")
-    print(f"  Cache dir:    {cache_dir}")
-    print()
-
-    exit_code = 0
-    if fail > 0:
-        print("Some compilations failed. Check output above for details.")
-        exit_code = 1
-    else:
-        print("All compilations succeeded. Cache is ready.")
-
-    sys.exit(exit_code)
+    sys.exit(print_summary(total_elapsed=total_elapsed, results=results, cache_dir=cache_dir))
 
 
 if __name__ == "__main__":
