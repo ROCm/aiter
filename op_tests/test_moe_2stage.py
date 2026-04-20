@@ -6,10 +6,14 @@ import itertools
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.int4_utils import *
+from aiter.int4_utils import (
+    rearrange_4bit_elements,
+    convert_int8_to_uint32_int4,
+)
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
+import glob
 import os
 import pandas as pd
 import logging
@@ -297,6 +301,41 @@ l_quant = [
 ]
 
 
+_MODEL_CSV_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "aiter",
+    "configs",
+    "model_configs",
+)
+_MODEL_CSV_TOKEN = "_tuned_fmoe"
+
+
+def _discover_model_csvs():
+    """Return {model_name: csv_path} for every *tuned_fmoe*.csv (excluding untuned).
+
+    blockscale csvs are filtered out: their q_type=per_1x128 is not handled by
+    test_fmoe's quant prep code (only per_Tensor / per_Token / per_1x32 /
+    per_128x128 / No are supported).
+    """
+    found = {}
+    for path in sorted(
+        glob.glob(os.path.join(_MODEL_CSV_DIR, f"*{_MODEL_CSV_TOKEN}*.csv"))
+    ):
+        name = os.path.basename(path)
+        if "untuned" in name or "blockscale" in name:
+            continue
+        stem = name[: -len(".csv")]
+        head, _, tail = stem.partition(_MODEL_CSV_TOKEN)
+        model = "_".join(p for p in (head.strip("_"), tail.strip("_")) if p)
+        if not model:
+            continue
+        found[model] = path
+    return found
+
+
+_AVAILABLE_MODELS = sorted(_discover_model_csvs())
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -419,111 +458,251 @@ parser.add_argument(
     help="""Hidden intermediate pad.
     e.g.: -hip 0,0""",
 )
+parser.add_argument(
+    "-m",
+    "--model",
+    type=str,
+    nargs="*",
+    default=None,
+    help="""Run csv-driven test cases sourced from
+    aiter/configs/model_configs/*tuned_fmoe*.csv (untuned files excluded).
+    Pass one or more model short-names, or "all" to scan every fmoe csv.
+    Every row in the selected csv(s) is exercised.
+    When set, the original itertools sweep is skipped.
+    Available models ({n}):
+      {models}
+    e.g.: -m {first}
+          -m all""".format(
+        n=len(_AVAILABLE_MODELS),
+        models="\n      ".join(_AVAILABLE_MODELS) or "(none discovered)",
+        first=_AVAILABLE_MODELS[0] if _AVAILABLE_MODELS else "<model>",
+    ),
+)
 
 args = parser.parse_args()
+
 
 l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
 
 
-df = []
-for (
-    dtype,
-    (quant_type, aq_dtype, wq_dtype),
-    (model_dim, inter_dim),
-    doweight_stage1,
-) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
-    if (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.bf16,
-        dtypes.fp4x2,
-    ):
-        for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-            for m in args.tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
+# ---------------------------------------------------------------------------
+# Both modes (CLI sweep / model-csv) reduce to the same shape:
+#   yield (test_fmoe_kwargs, extras_for_df)
+# A single runner consumes the stream.
+# ---------------------------------------------------------------------------
+# Only kept for dtypes that may not exist as torch attributes in older builds;
+# anything else falls through to getattr(torch, attr).
+_DTYPE_STR_FALLBACK = {
+    "torch.float4_e2m1fn_x2": dtypes.fp4x2,
+    "torch.float8_e8m0fnu": dtypes.fp8_e8m0,
+}
+
+
+def _str2dtype(s):
+    s = s.strip()
+    if s in ("None", "none", ""):
+        return None
+    if s.startswith("torch."):
+        attr = s.split(".", 1)[1]
+        if hasattr(torch, attr):
+            return getattr(torch, attr)
+    if s in _DTYPE_STR_FALLBACK:
+        return _DTYPE_STR_FALLBACK[s]
+    raise ValueError(f"unsupported dtype string: {s!r}")
+
+
+def _str2enum(s, enum_cls):
+    return getattr(enum_cls, s.strip().split(".")[-1])
+
+
+def _resolve_model_filter(requested):
+    available = _discover_model_csvs()
+    if not available:
+        raise RuntimeError(
+            f"no *{_MODEL_CSV_TOKEN}*.csv discovered under {_MODEL_CSV_DIR}"
+        )
+    if any(m.lower() == "all" for m in requested):
+        return available
+    selected = {}
+    for m in requested:
+        if m not in available:
+            raise ValueError(
+                f"unknown model {m!r}; available: {sorted(available)} (or 'all')"
+            )
+        selected[m] = available[m]
+    return selected
+
+
+def _row_to_kwargs(row):
+    # csv rows store already-effective dims, so pad defaults to 0.
+    return dict(
+        dtype=_str2dtype(row["dtype"]),
+        token=int(row["token"]),
+        model_dim=int(row["model_dim"]),
+        inter_dim=int(row["inter_dim"]),
+        E=int(row["expert"]),
+        topk=int(row["topk"]),
+        actType=_str2enum(row["act_type"], aiter.ActivationType),
+        qType=_str2enum(row["q_type"], aiter.QuantType),
+        AQDType=_str2dtype(row["q_dtype_a"]),
+        WQDType=_str2dtype(row["q_dtype_w"]),
+        use_g1u1=dtypes.str2bool(str(row["use_g1u1"])),
+        doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
+        hidden_pad=0,
+        intermediate_pad=0,
+        preshuffle=True,
+    )
+
+
+def _iter_csv_cases(model_to_path):
+    """Yield (kwargs, extras) for every row of every selected model csv."""
+    for model, path in model_to_path.items():
+        df_csv = pd.read_csv(path)
+        for _, row in df_csv.iterrows():
+            try:
+                kwargs = _row_to_kwargs(row)
+            except Exception as e:
+                aiter.logger.warning(
+                    "[%s] skip row token=%s dim=(%s,%s): parse error %s",
+                    model,
+                    row.get("token"),
+                    row.get("model_dim"),
+                    row.get("inter_dim"),
+                    e,
                 )
-                df.append(ret)
-    elif (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.fp8,
-        dtypes.fp4x2,
+                continue
+            yield kwargs, {
+                "model": model,
+                "kernelName1": str(row.get("kernelName1", "") or ""),
+                "kernelName2": str(row.get("kernelName2", "") or ""),
+            }
+
+
+_PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
+_PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
+_PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
+
+
+def _iter_legacy_cases():
+    """Yield (kwargs, extras) for the original CLI-driven sweep."""
+    extras = {"model": "legacy"}
+
+    def _kw(
+        dtype,
+        m,
+        model_dim,
+        inter_dim,
+        quant_type,
+        aq_dtype,
+        wq_dtype,
+        doweight_stage1,
+        act_type,
+        **over,
     ):
-        for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
-            for m in args.tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    aiter.ActivationType.Swiglu,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
-                )
-                df.append(ret)
-    elif (quant_type, aq_dtype, wq_dtype) == (
-        aiter.QuantType.per_1x32,
-        dtypes.fp4x2,
-        dtypes.fp4x2,
-    ):
-        for preshuffle in args.preshuffle:
-            for act_type in args.act:
+        return dict(
+            dtype=dtype,
+            token=m,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            E=args.expert,
+            topk=args.topk,
+            actType=act_type,
+            qType=quant_type,
+            AQDType=aq_dtype,
+            WQDType=wq_dtype,
+            use_g1u1=True,
+            doweight_stage1=doweight_stage1,
+            **over,
+        )
+
+    for (
+        dtype,
+        (quant_type, aq_dtype, wq_dtype),
+        (model_dim, inter_dim),
+        doweight_stage1,
+    ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
+        triple = (quant_type, aq_dtype, wq_dtype)
+
+        if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+            for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for m in args.tokenNum:
-                    ret = test_fmoe(
+                    yield _kw(
                         dtype,
                         m,
                         model_dim,
                         inter_dim,
-                        args.expert,
-                        args.topk,
-                        act_type,
                         quant_type,
                         aq_dtype,
                         wq_dtype,
-                        use_g1u1=True,
-                        doweight_stage1=doweight_stage1,
-                        preshuffle=preshuffle,
-                        hidden_pad=0,
-                        intermediate_pad=0,
-                    )
-                    df.append(ret)
-    else:
-        for act_type in args.act:
-            for m in args.tokenNum:
-                ret = test_fmoe(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    args.expert,
-                    args.topk,
-                    act_type,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    use_g1u1=True,
-                    doweight_stage1=doweight_stage1,
-                )
-                df.append(ret)
+                        doweight_stage1,
+                        aiter.ActivationType.Swiglu,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                    ), extras
+        elif triple == _PER1X32_FP4_FP4:
+            for preshuffle in args.preshuffle:
+                for act_type in args.act:
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            preshuffle=preshuffle,
+                            hidden_pad=0,
+                            intermediate_pad=0,
+                        ), extras
+        else:
+            for act_type in args.act:
+                for m in args.tokenNum:
+                    yield _kw(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        doweight_stage1,
+                        act_type,
+                    ), extras
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+if args.model:
+    model_to_path = _resolve_model_filter(args.model)
+    aiter.logger.info(
+        "moe_2stage csv-driven mode: %d model csv(s): %s",
+        len(model_to_path),
+        ", ".join(sorted(model_to_path)),
+    )
+    case_iter = _iter_csv_cases(model_to_path)
+else:
+    case_iter = _iter_legacy_cases()
+
+df = []
+seen = 0
+for kwargs, extras in case_iter:
+    seen += 1
+    ret = test_fmoe(**kwargs)
+    if ret is None:
+        continue
+    ret.update(extras)
+    df.append(ret)
+
+aiter.logger.info(
+    "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",
+    seen,
+    len(df),
+    seen - len(df),
+)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
