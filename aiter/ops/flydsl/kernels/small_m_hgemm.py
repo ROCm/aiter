@@ -95,9 +95,9 @@ SMALL_M_TILE_N_OPTIONS = (
     1024,
 )
 SMALL_M_NON_B_TO_LDS_WAVES_PER_EU_OPTIONS = (0, 2, 4)
-# Avoid catalog entries that normalize to the same kernel (hint 0 becomes 2 / 8
-# for wide-N B_TO_LDS in compile_small_m_hgemm_kernel).
-SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS = (2, 4)
+# Keep 0 for narrow B_TO_LDS shapes where it remains a real candidate, and
+# canonicalize only the wide-N B_TO_LDS duplicates at registry emission time.
+SMALL_M_B_TO_LDS_WAVES_PER_EU_OPTIONS = (0, 2, 4)
 SMALL_M_B_TO_LDS_UNROLL_OPTIONS = (8, 16)
 SMALL_M_N_TILE_REPEAT_OPTIONS = (1, 2, 4)
 SMALL_M_PERSISTENT_N_TILE_OPTIONS = (2, 4, 8)
@@ -299,6 +299,23 @@ def _small_m_registry_variants():
     return tuple(variants)
 
 
+def _canonicalize_small_m_registry_config(config: dict) -> dict:
+    """Match registry metadata to the effective compile-time kernel settings."""
+    canonical = dict(config)
+    wide_n_b_to_lds = (
+        canonical["b_to_lds"]
+        and canonical["n_tile_repeat"] == 1
+        and canonical["tile_n"] >= 128
+        and canonical["block_n_warps"] >= 2
+    )
+    if canonical["b_to_lds"]:
+        if canonical["b_to_lds_unroll"] <= 0:
+            canonical["b_to_lds_unroll"] = 8
+        if canonical["waves_per_eu"] <= 0 and wide_n_b_to_lds:
+            canonical["waves_per_eu"] = 2
+    return canonical
+
+
 def iter_small_m_registry_configs(
     dtype: str,
     out_dtype: str,
@@ -360,6 +377,7 @@ def iter_small_m_registry_configs(
                         )
                     except ValueError:
                         continue
+                    config = _canonicalize_small_m_registry_config(config)
                     config_key = tuple(sorted(config.items()))
                     if config_key in seen_configs:
                         continue
