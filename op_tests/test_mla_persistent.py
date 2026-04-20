@@ -480,12 +480,14 @@ def torch_mla_extend_split_kv(
             and (nheads * max_seqlen_q) % 64 == 0
             and not is_fp8_q
             and not is_fp8_kvc
+            and (nheads & (nheads - 1) == 0)
         )
         or (
             get_gfx() == "gfx950"
             and (nheads * max_seqlen_q) % 128 == 0
             and not is_fp8_q
             and not is_fp8_kvc
+            and (nheads & (nheads - 1) == 0)
         )
     ):
         # Natively support cases
