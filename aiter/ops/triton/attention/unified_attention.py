@@ -173,14 +173,22 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     assert BLOCK_Q >= 1
-
+    # Ideally we would launch with kernel with:
+    # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
+    # However, it is slow to realize the query_lens on cpu.
+    # Instead we use upper-bound:
+    # \sum_i[ceil(query_len[i] / BLOCK_Q)]
+    #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
+    #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
+    #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
+    #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
     cu_count = get_num_sms()
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
     is_quantized = q_descale is not None
-
+    # if batch contains a prefill
     if use_2d_kernel(
         head_size_qk,
         SLIDING_WINDOW,

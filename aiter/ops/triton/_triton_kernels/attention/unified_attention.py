@@ -198,9 +198,13 @@ def kernel_unified_attention_2d(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
 
+    # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
 
+    # alibi slope for this head
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
             alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
@@ -327,6 +331,7 @@ def kernel_unified_attention_2d(
             ).to(Q.dtype)
             S += qk_scale * tl.dot(Q_rope, K_rope)
 
+        # S : (BLOCK_M, TILE_SIZE)
         S += qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
@@ -380,13 +385,18 @@ def kernel_unified_attention_2d(
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
 
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc = acc * alpha[:, None]
 
+        # update constants
         L = L * alpha + l_j
         M = m_j
 
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
+    # epilogue
+    # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     if v_descale is not None:
         one_over_L = v_descale / L[:, None]
     else:
@@ -566,6 +576,7 @@ def kernel_unified_attention_3d(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_V_PADDED], dtype=tl.float32)
 
+    # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
 
     # alibi slope for this head
@@ -679,6 +690,7 @@ def kernel_unified_attention_3d(
             ).to(Q.dtype)
             S += qk_scale * tl.dot(Q_rope, K_rope)
 
+        # S : (BLOCK_M, TILE_SIZE)
         S += qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
@@ -731,11 +743,14 @@ def kernel_unified_attention_3d(
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
 
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc = acc * alpha[:, None]
 
+        # update constants
         L = L * alpha + l_j
         M = m_j
 
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc += tl.dot(P.to(V.dtype), V)
 
     if v_descale is not None:
