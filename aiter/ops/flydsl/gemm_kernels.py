@@ -19,6 +19,7 @@ from aiter.jit.utils.chip_info import get_gfx
 
 from ..shuffle import shuffle_weight
 from .kernels.splitk_hgemm import compile_hgemm_kernel
+from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
 
 __all__ = [
@@ -571,10 +572,8 @@ def _compile_flydsl_hgemm(
         _check_split_k_counter_capacity(runtime_m, n, tile_m, tile_n, split_k)
         launch_stream = _normalize_launch_stream(a.device, stream)
         semaphore = _get_split_k_global_semaphore(launch_stream)
-        exe_compiled = kernel.compile(
-            out, a, b, runtime_m, semaphore, signal_state, stream
-        )
-        return exe_compiled(
+        return _run_compiled(
+            kernel,
             out,
             a,
             b,
