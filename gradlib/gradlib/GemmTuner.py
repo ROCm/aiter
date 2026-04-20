@@ -583,6 +583,8 @@ class Gemm:
         for solidx, kernel_name, config in flydsl_catalog:
             if config["b_preshuffle"] != self.is_shuffle:
                 continue
+            if config["tile_m"] > max(self.m, 16):
+                continue
             if self.n < config["tile_n"] or self.n % config["tile_n"] != 0:
                 continue
             if self.k % config["split_k"] != 0:

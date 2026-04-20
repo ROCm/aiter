@@ -118,6 +118,10 @@ def get_GEMM_A16W16_config(
                         )
                     )
                     if flydsl_config is None:
+                        logger.warning(
+                            f"FlyDSL kernel '{kernel_name}' from tuned config is not "
+                            "recognised by the current catalog; falling back to next candidate."
+                        )
                         config = None
                 else:
                     config = None
@@ -487,8 +491,11 @@ def flydsl_gemm(
         split_k=config["split_k"],
         block_m_warps=config["block_m_warps"],
         block_n_warps=config["block_n_warps"],
+        stages=config["stage"],
+        async_copy=config["async_copy"],
         b_to_lds=config["b_to_lds"],
         b_preshuffle=config["b_preshuffle"],
+        c_to_lds=config["c_to_lds"],
     )
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
