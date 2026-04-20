@@ -443,7 +443,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         info_keys,
         seed,
     ):
-        cu_num, M, N, K, q_dtype_w = info_keys
+        gfx, cu_num, M, N, K, q_dtype_w = info_keys
         q_dtype_eval = eval(q_dtype_w)
         if q_dtype_eval == dtypes.fp8:
             pass

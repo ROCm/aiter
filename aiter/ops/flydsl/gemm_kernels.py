@@ -755,7 +755,8 @@ def flydsl_preshuffle_gemm_a8(
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     out_contig = Out.contiguous()
-    exe(
+    _run_compiled(
+        exe,
         out_contig.view(-1),
         _as_i8(XQ.contiguous()).view(-1),
         _as_i8(WQ.contiguous()).view(-1),
