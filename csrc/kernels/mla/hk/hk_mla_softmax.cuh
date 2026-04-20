@@ -173,7 +173,7 @@ __device__ __forceinline__ void softmax_p0(comp_t* p_row_max,
 {
     constexpr comp_t log2e = 1.4426950408889634;
 
-    const uint32_t lane_idx = ckt::get_lane_id();
+    const uint32_t lane_idx = opus::lane_id();
 
     // Element-wise scale. Boundary problem is handled here as well.
     const uint32_t col_0_idx = lane_idx >> 4;
@@ -196,13 +196,13 @@ __device__ __forceinline__ void softmax_p0(comp_t* p_row_max,
                    "n"(k_p_comp_begin + 6),
                    "n"(k_p_comp_begin + 7));
 
-    constexpr int32_t reduce_range = ckt::get_warp_size();
-    constexpr int32_t stop_stride  = ckt::get_warp_size() / 4 - 1;
+    constexpr int32_t reduce_range = opus::get_warp_size();
+    constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
     local_max =
         aiter::warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
             local_max);
 
-    const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, *p_row_max);
+    const comp_t new_row_max = kIsFirstIter ? local_max : opus::max(local_max, *p_row_max);
     *p_rescale = kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f(((*p_row_max) - new_row_max) * log2e);
     *p_row_max = new_row_max;
 }
@@ -262,8 +262,8 @@ softmax_p1(comp_t* p_row_sum_e, const comp_t new_row_max, const comp_t rescale)
 
     float local_sum_e = tmp0[0] + tmp0[1];
 
-    constexpr int32_t reduce_range = ckt::get_warp_size();
-    constexpr int32_t stop_stride  = ckt::get_warp_size() / 4 - 1;
+    constexpr int32_t reduce_range = opus::get_warp_size();
+    constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
     local_sum_e =
         aiter::warpReduce<aiter::AddFunctor, decltype(local_sum_e), reduce_range, stop_stride>(
             local_sum_e);

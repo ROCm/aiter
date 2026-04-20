@@ -21,7 +21,7 @@ struct HkMlaDecodeFwdTraits
     static constexpr int32_t kVoHeadDim     = kKvLoraRank;
     static constexpr int32_t kPageSize      = 1;
     static constexpr int32_t kNumWarps      = 8;
-    static constexpr int32_t kNumThreads    = kNumWarps * ckt::get_warp_size();
+    static constexpr int32_t kNumThreads    = kNumWarps * opus::get_warp_size();
     static constexpr int32_t kOccupancy     = 1;
     static constexpr int32_t kBlockM        = 128; // Block=ThreadBlock
     static constexpr int32_t kBlockN        = 32;
@@ -212,8 +212,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
 
     // Runtime constants
-    const uint32_t warp_idx           = ckt::get_warp_id();
-    const uint32_t lane_idx           = ckt::get_lane_id();
+    const uint32_t warp_idx           = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
+    const uint32_t lane_idx           = opus::lane_id();
     const uint32_t kv_ld_row_base_idx = kv_manager.get_kv_ld_row_base_idx(warp_idx);
     const uint32_t kv_ld_col_base     = kv_manager.get_kv_ld_col_base(warp_idx);
 
@@ -242,7 +242,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     constexpr uint32_t kSzLdsKv = kv_manager.get_lds_size_in_byte();
     constexpr uint32_t kSzLdsTv = vt_manager.get_lds_size_in_byte();
     constexpr uint32_t kSzLdsO =
-        ckt::max(o_manager.get_lds_size_in_byte(), split_o_manager.get_lds_size_in_byte());
+        (o_manager.get_lds_size_in_byte() > split_o_manager.get_lds_size_in_byte())
+            ? o_manager.get_lds_size_in_byte()
+            : split_o_manager.get_lds_size_in_byte();
 
     static_assert(kSzLdsO <= kSzLdsKv,
                   "kSzLdsO must be less than or equal to kSzLdsKv because we want to reuse p_lds_o "
@@ -271,7 +273,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         // visible range. With kv_offset KV positions remaining after this
         // chunk, qpos i sees up to (kv_end + kv_offset - (Q - 1 - i)) =
         // kv_end - max(0, qpos_off_from_last - kv_offset).
-        const int32_t causal_offset = ckt::max(qpos_off_from_last - kv_offset, 0);
+        const int32_t causal_offset = opus::max(qpos_off_from_last - kv_offset, 0);
         const int32_t kv_end_eff = kv_end - causal_offset;
         const int32_t kv_len = kv_end - kv_start;
         const int32_t kv_len_eff = kv_end_eff - kv_start;
@@ -349,7 +351,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             // GEMM on NoPE
             constexpr uint32_t num_nope_iter = (k_q_nope_end + 1 - k_q_nope_begin) / 4;
-            ckt::static_for<0, num_nope_iter, 1>{}([&](auto idx) {
+            opus::static_for<num_nope_iter>([&](auto idx) {
                 constexpr uint32_t reg_start = idx.value * 4 + k_q_nope_begin;
                 using q_range_0 =
                     hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
@@ -391,7 +393,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             // GEMM on RoPE
             constexpr uint32_t num_rope_iter = (k_q_rope_end + 1 - k_q_rope_begin) / 4;
-            ckt::static_for<0, num_rope_iter, 1>{}([&](auto idx) {
+            opus::static_for<num_rope_iter>([&](auto idx) {
                 constexpr uint32_t reg_start = idx.value * 4 + k_q_rope_begin;
                 using q_range_0 =
                     hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
@@ -456,14 +458,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             __builtin_amdgcn_sched_barrier(
                 0); // For avoiding conflict between ds_bpermute and ds_read.
 
-            constexpr int32_t reduce_range = ckt::get_warp_size();
-            constexpr int32_t stop_stride  = ckt::get_warp_size() / 4 - 1;
+            constexpr int32_t reduce_range = opus::get_warp_size();
+            constexpr int32_t stop_stride  = opus::get_warp_size() / 4 - 1;
             local_max                      = aiter::
                 warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
                     local_max);
             vt_manager.transpose_v(&v);
 
-            const comp_t new_row_max = kIsFirstIter ? local_max : ckt::max(local_max, row_max);
+            const comp_t new_row_max = kIsFirstIter ? local_max : opus::max(local_max, row_max);
             const comp_t rescale =
                 kIsFirstIter ? 1.0f : __builtin_amdgcn_exp2f((row_max - new_row_max) * log2e);
             row_max = new_row_max;
@@ -533,7 +535,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             // GEMM on PV
             constexpr uint32_t num_pv_iter = T::kVoHeadDim / (T::kBlockK * 2); // 512/(32*2)=8
-            ckt::static_for<0, num_pv_iter, 1>{}([&](auto idx) {
+            opus::static_for<num_pv_iter>([&](auto idx) {
                 constexpr uint32_t oaccu_base = k_o_begin + idx.value * 8 * 2;
                 using oaccu_range_0           = hkdart::split_many_t<
                     hkdart::type_list<hkdart::range<oaccu_base + 0, oaccu_base + 8 - 1>>,
