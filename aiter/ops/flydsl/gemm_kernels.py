@@ -20,7 +20,7 @@ from aiter.jit.utils.chip_info import get_gfx
 
 from ..shuffle import shuffle_weight
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
-from .kernels.small_m_hgemm import SMALL_M_KERNEL_MAX, iter_small_m_registry_configs
+from .kernels.small_m_hgemm import iter_small_m_registry_configs
 from .kernels.tensor_shim import _run_compiled
 from .utils import get_shared_memory_per_block, is_flydsl_available
 

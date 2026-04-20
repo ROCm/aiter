@@ -467,7 +467,6 @@ def compile_small_m_hgemm_kernel(
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
     LDG_A_X_THREADS = BLOCK_K // LDG_VEC_SIZE
-    LDG_B_X_THREADS = BLOCK_K // LDG_VEC_SIZE
     LDG_C_X_THREADS = BLOCK_N // LDG_VEC_SIZE
     assert BLOCK_MK_SIZE % LDG_VEC_SIZE == 0
     assert BLOCK_NK_SIZE % LDG_VEC_SIZE == 0

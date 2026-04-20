@@ -38,7 +38,7 @@ except ImportError:
 
 
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf, memref
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr.typing import T
 
 
@@ -219,14 +219,9 @@ def compile_moe_gemm1(
             "stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')"
         )
 
-    epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
-    # IMPORTANT: module name participates in FlyDSL's compile cache key.
-    # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
-    module_name = (
-        f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
-    ).replace("-", "_")
+    # IMPORTANT: FlyDSL compile cache keys should include an explicit ABI tag so
+    # signature changes cannot reuse an old binary. Intended tag pattern:
+    # mfma_moe1_{in_dtype}_{out_dtype}_{cshuffle|direct}_t{tile_m}x{tile_n}x{tile_k}_abi3
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
     # Reuse the same LDS bytes for both:
@@ -1076,7 +1071,7 @@ def compile_moe_gemm1(
                 # Epilogue hoists to keep IR + Python build time small:
                 col_i32_list = []
                 for ni in range_constexpr(num_acc_n):
-                    col_i32_list.append(arith.index_cast(i32, col_g_list[ni]))
+                    col_i32_list.append(arith.index_cast(T.i32, col_g_list[ni]))
 
                 inter_i32_local = inter_i32_v
 
@@ -1525,18 +1520,9 @@ def compile_moe_gemm2(
         ty = T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
         return ty() if callable(ty) else ty
 
-    epilog_tag = "cshuffle"
-    # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
-    # binary for a different (tile_m, tile_n, tile_k) configuration.
-    # See stage1 note: include ABI tag to prevent binary reuse across signature changes.
-    # IMPORTANT: module name participates in FlyDSL's compile cache key.
-    # Dynamic-shape variant: safe to reuse across (tokens/sorted_size/size_expert_ids) at runtime.
-    # Keep a distinct ABI tag so the compile cache never mixes with historical signatures.
-    module_name = (
-        f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
-    ).replace("-", "_")
+    # IMPORTANT: include tiling in any future module/cache tag to avoid reusing a compiled
+    # binary for a different (tile_m, tile_n, tile_k). Stage2 dynamic-shape tag pattern:
+    # mfma_moe2_{in_dtype}_{out_s}_cshuffle_t{tile_m}x{tile_n}x{tile_k}_abi2
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
     # because the AST rewriter intercepts `if` statements inside kernel bodies and
