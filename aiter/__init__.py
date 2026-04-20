@@ -58,6 +58,10 @@ def getLogger():
 
 logger = getLogger()
 
+# Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
+_flydsl_cache = os.path.join(os.path.dirname(__file__), "jit", "flydsl_cache")
+if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ:
+    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = _flydsl_cache
 
 if sys.platform == "win32":
     logger.info("Windows: CK and HIP ops are not available. Triton ops only.")
@@ -102,7 +106,7 @@ else:
         from .ops.causal_conv1d import *  # noqa: F403,E402
         from .ops.fused_split_gdr_update import *  # noqa: F403,E402
         from . import mla  # noqa: F403,F401,E402
-    except (ImportError, RuntimeError, OSError) as e:
+    except (ImportError, RuntimeError, OSError, KeyError) as e:
         logger.warning(
             "ROCm/HIP JIT runtime not available: %s. "
             "CK and HIP ops are disabled. Triton ops remain available.",

@@ -28,7 +28,7 @@ from torch.distributed import ProcessGroup
 import aiter as ops
 from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
-from aiter.utility.dtypes import fp8, _torch_to_aiter_dtype, torch_to_aiter_pybind
+from aiter.utility.dtypes import fp8
 
 try:
     ops.meta_size()
@@ -44,9 +44,6 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
-
-
-_torch_to_aiter = torch_to_aiter_pybind
 
 
 class IPCBuffer:
@@ -423,7 +420,7 @@ class CustomAllreduce:
         """Batch-register graph-captured buffer addresses."""
         self._pool.flush_graph_buffers(self._ptr)
 
-    def should_custom_ar(self, inp: torch.Tensor):
+    def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -436,7 +433,12 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / 2)
+            # decode
+            if not prefill_support:
+                return inp_size <= 8192 * 8192
+            # prefill
+            else:
+                return inp_size <= (self.max_size / 2)
         return False
 
     def should_custom_ag(self, inp: torch.Tensor):
@@ -475,8 +477,8 @@ class CustomAllreduce:
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
         ops.all_reduce(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             use_new,
             open_fp8_quant,
             reg_inp,
@@ -526,8 +528,8 @@ class CustomAllreduce:
         reg_bytes = 0 if registered else self._pool["input"].max_size
         ops.reduce_scatter(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             reg,
             reg_bytes,
         )
@@ -565,8 +567,8 @@ class CustomAllreduce:
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         ops.all_gather_reg(
             self._ptr,
-            _torch_to_aiter(inp),
-            _torch_to_aiter(out),
+            inp,
+            out,
             dim,
         )
         return out
@@ -583,9 +585,9 @@ class CustomAllreduce:
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
         ops.all_gather_unreg(
             self._ptr,
-            _torch_to_aiter(inp),
+            inp,
             self._pool["input"].data_ptr,
-            _torch_to_aiter(out),
+            out,
             self._pool["input"].max_size,
             dim,
         )
@@ -627,11 +629,11 @@ class CustomAllreduce:
             assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
             ops.fused_allreduce_rmsnorm(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
@@ -648,12 +650,12 @@ class CustomAllreduce:
                 )
             ops.fused_allreduce_rmsnorm_quant(
                 self._ptr,
-                _torch_to_aiter(inp),
-                _torch_to_aiter(res_inp),
-                _torch_to_aiter(res_out),
-                _torch_to_aiter(out),
-                _torch_to_aiter(scale_out),
-                _torch_to_aiter(w),
+                inp,
+                res_inp,
+                res_out,
+                out,
+                scale_out,
+                w,
                 eps,
                 reg,
                 reg_bytes,
