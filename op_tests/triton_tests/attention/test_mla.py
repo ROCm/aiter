@@ -171,13 +171,12 @@ def torch_mla_extend(
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, use_out_scale",
     [
-        # (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
     ],
 )
-# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
-@pytest.mark.parametrize("shuffled_kv_cache", [False])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
 @torch.inference_mode()
 def test_mla_decode_fwd(
     batch_size: int,
