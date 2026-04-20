@@ -917,35 +917,4 @@ def compile_hgemm_kernel(
             stream=stream,
         )
 
-    _compile_hints = {
-        "llvm_options": {
-            "enable-post-misched": False,
-            "lsr-drop-solution": True,
-        },
-    }
-
-    def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_compile_hints):
-            return launch_hgemm_kernel(*args, **kwargs)
-
-    _compile_cache = {}
-
-    def _compile(C, A, B, m, COUNTER, signal_state, stream):
-        with CompilationContext.compile_hints(_compile_hints):
-            if _compile_cache.get(m, None) is None:
-                try:
-                    _compile_cache[m] = flyc.compile(
-                        launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream
-                    )
-                except Exception as e:
-                    raise RuntimeError(
-                        f"{KERNEL_NAME} failed "
-                        f"(arch={GPU_ARCH}, n={n}, k={k}, TILE_M={TILE_M}, TILE_N={TILE_N}, "
-                        f"TILE_K={TILE_K}, SPLIT_K={SPLIT_K}, B_TO_LDS={B_TO_LDS}, "
-                        f"SMEM_USE={SMEM_USE}, SMEM_LIMIT={smem_limit}): {e}",
-                    ) from e
-            return _compile_cache[m]
-
-    _launch.compile = _compile
-
-    return _launch
+    return launch_hgemm_kernel
