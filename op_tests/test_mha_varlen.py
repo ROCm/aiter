@@ -223,6 +223,8 @@ def run_ck(
             * 2
             + nhead * lse_dtype_bytes * real_seqlen_q
         )
+    fwd_flop = fwd_flop / 2 if causal else fwd_flop
+    bwd_flop = bwd_flop / 2 if causal else bwd_flop
     if dout is None or not return_lse:
         return out, dropout_mask, None, None, None, (us_fwd, fwd_flop, fwd_num_bytes)
     else:
@@ -375,7 +377,7 @@ def run_ck_seq_padding(
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
@@ -429,14 +431,14 @@ def test_flash_attn_varlen_func(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
     return_lse = True
     torch.random.manual_seed(0)
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     q = torch.randn(
@@ -622,7 +624,7 @@ def flash_attn_varlen_func_benchmark(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
@@ -639,14 +641,14 @@ def flash_attn_varlen_func_benchmark(
         local=local,
         bias_type=bias_type,
         deterministic=deterministic,
-        mha_type=mha_type,
+        gqa_ratio=gqa_ratio,
         dtype=dtype,
         input_layout=input_layout,
     )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize(
     "padding_scenario",
@@ -687,7 +689,7 @@ def flash_attn_varlen_func_benchmark(
 @pytest.mark.parametrize("local", [False, True])
 def test_varlen_flash_attn_seq_padding(
     batch_size,
-    mha_type,
+    gqa_ratio,
     deterministic,
     padding_scenario,
     dtype,
@@ -703,9 +705,8 @@ def test_varlen_flash_attn_seq_padding(
     nheads = 9
     device = "cuda"
 
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    if nheads % nheads_k != 0:
-        pytest.skip("nheads must be divisible by nheads_k")
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
 
     # Dynamically generate padding configurations
     q_padded_lens = torch.randint(seqlen_q // 2, seqlen_q + 1, (batch_size,)).tolist()
@@ -821,7 +822,7 @@ def test_varlen_flash_attn_seq_padding(
     out_tol = max(4 * ref_diff, 0.01)
 
     print(
-        f"\nGroup Mode Test (bs={batch_size}, {mha_type}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
+        f"\nGroup Mode Test (bs={batch_size}, {gqa_ratio}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
     )
     assert out_diff <= out_tol
 
@@ -870,7 +871,7 @@ def test_varlen_flash_attn_seq_padding(
 @benchmark()
 def varlen_flash_attn_seq_padding_benchmark(
     batch_size,
-    mha_type,
+    gqa_ratio,
     deterministic,
     padding_scenario,
     dtype,
@@ -882,7 +883,7 @@ def varlen_flash_attn_seq_padding_benchmark(
 ):
     return test_varlen_flash_attn_seq_padding(
         batch_size=batch_size,
-        mha_type=mha_type,
+        gqa_ratio=gqa_ratio,
         deterministic=deterministic,
         padding_scenario=padding_scenario,
         dtype=dtype,
@@ -913,7 +914,7 @@ if __name__ == "__main__":
         "--nheads",
         type=int,
         nargs="?",
-        default=9,
+        default=16,
         help="""Number of attention heads.
     e.g. -nh 4""",
     )
@@ -998,14 +999,14 @@ if __name__ == "__main__":
          -det false # disable deterministic attention""",
     )
     parser.add_argument(
-        "-mha",
-        "--mha_type",
-        type=str,
+        "-gr",
+        "--gqa_ratio",
+        type=int,
         nargs="+",
-        choices=["mha", "mqa", "gqa"],
-        default=["mha", "mqa", "gqa"],
-        help="""Type of multi-head attention.
-    e.g. -mha mha/mqa/gqa""",
+        choices=[1, 8],
+        default=[1, 8],
+        help="""gqa ratio.
+    e.g. -gr 1""",
     )
     parser.add_argument(
         "-dt",
@@ -1034,14 +1035,14 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         causal,
         local,
         deterministic,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.causal,
         args.local,
         args.deterministic,
@@ -1059,7 +1060,7 @@ if __name__ == "__main__":
             local,
             args.bias_type,
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
             args.input_layout,
         )
@@ -1070,21 +1071,21 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         deterministic,
         padding_scenario,
         local,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.deterministic,
         ["mixed", "q_only", "k_only", "no_padding"],
         args.local,
     ):
         ret = varlen_flash_attn_seq_padding_benchmark(
             args.batch_size,
-            mha_type,
+            gqa_ratio,
             deterministic,
             padding_scenario,
             dtypes.d_dtypes[dtype],

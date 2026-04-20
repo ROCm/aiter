@@ -380,7 +380,6 @@ def test_flash_attn_output(
         * dtype_bytes
         * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
     )
-    fwd_num_bytes = fwd_num_bytes / 2 if causal else fwd_num_bytes
     bwd_flop = (
         batch_size
         * nheads
@@ -391,7 +390,6 @@ def test_flash_attn_output(
         2 * fwd_num_bytes
         + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
-    bwd_num_bytes = bwd_num_bytes / 2 if causal else bwd_num_bytes
 
     ret = {}
     ret["fwd_us"] = us_fwd
