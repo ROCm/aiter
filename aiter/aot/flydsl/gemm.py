@@ -123,7 +123,7 @@ def parse_csv(csv_path: str):
         for row in reader:
             kernel_name = row.get("kernelName", "").strip()
             libtype = row.get("libtype", "").strip()
-            if libtype != "flydsl" or not kernel_name.startswith("flydsl_")
+            if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
                 continue
 
             m = int(row["M"])
