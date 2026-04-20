@@ -116,10 +116,10 @@ def use_2d_kernel(
 
 
 def unified_attention(
-    q,  # [num_tokens, num_query_heads, head_size_qk]
-    k,  # [num_blks, blk_size, num_kv_heads, head_size_qk]
-    v,  # [num_blks, blk_size, num_kv_heads, head_size_v]
-    out,  # [num_tokens, num_query_heads, head_size_v]
+    q,
+    k,
+    v,
+    out,
     cu_seqlens_q,
     max_seqlen_q,
     seqused_k,
@@ -127,47 +127,18 @@ def unified_attention(
     softmax_scale,
     causal,
     window_size,
+    block_table,
     softcap,
-    q_descale,  # None (no quantization) or float32 scalar (fp8 per tensor)
-    k_descale,  # None (no quantization) or float32 scalar (fp8 per tensor)
-    v_descale,  # None (no quantization) or float32 scalar (fp8 per tensor)
-    block_table,  # [num_seqs, cdiv(max_seqlen_k, block_size)]
+    q_descale,
+    k_descale,
+    v_descale,
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
     sinks=None,
     rope_size=None,
 ):
-    """
-    Compute unified multi-head attention with Triton kernels, supporting paged KV-cache,
-    optional FP8 quantization, ALiBi, sliding-window attention, softcap, sinks, and split RoPE heads.
-
-    Args:
-        q: Query tensor of shape (Tq, Hq, Dqk_total) where Dqk_total = d + r.
-        k: Key cache tensor of shape (num_blks, blk_size, Hkv, Dqk_total).
-        v: Value cache tensor of shape (num_blks, blk_size, Hkv, Dv).
-        out: Output tensor of shape (Tq, Hq, Dv). Filled in-place.
-        cu_seqlens_q: Cumulative query sequence lengths, shape (num_seqs + 1,).
-        max_seqlen_q: Maximum query sequence length in the batch.
-        seqused_k: Per-sequence effective key lengths, shape (num_seqs,).
-        max_seqlen_k: Maximum key sequence length in the batch.
-        softmax_scale: Scale factor applied to attention logits.
-        causal: Whether to apply causal masking.
-        window_size: Sliding-window configuration. Effective left window uses 1 + window_size[0].
-        softcap: Optional logit soft-capping value; disabled when <= 0.
-        q_descale: Query dequant scale (None or scalar float32 for FP8).
-        k_descale: Key dequant scale (None or scalar float32 for FP8).
-        v_descale: Value dequant scale (None or scalar float32 for FP8).
-        block_table: Block mapping table of shape (num_seqs, ceil(max_seqlen_k / block_size)).
-        alibi_slopes: ALiBi slopes tensor. Enables ALiBi bias when provided.
-        output_scale: If provided, output is scaled by 1 / output_scale (FP8 output).
-        qq_bias: Optional per-query bias tensor.
-        sinks: Optional sink scores tensor. Shape[0] must equal num_query_heads.
-        rope_size: Size of RoPE portion within Q/K head dimension.
-            None: inferred split if head size is not power-of-two.
-            0: disable inferred split.
-            r > 0: separate RoPE handling of size r within Dqk_total = d + r.
-    """
+    assert causal, "Only causal attention is supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -191,10 +162,7 @@ def unified_attention(
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
 
-    assert block_table is not None, "block_table is required"
     block_size = v.shape[1]
-    block_table_stride_0 = block_table.stride(0)
-
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
     num_kv_heads = k.shape[-2]
@@ -210,7 +178,7 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = max_seqlen_q == 1
+    ALL_DECODE = int(max_seqlen_q) == 1
     is_quantized = q_descale is not None
 
     if use_2d_kernel(
@@ -233,8 +201,6 @@ def unified_attention(
             num_2d_prgms,
             is_quantized=is_quantized,
         )
-
-        BLOCK_M = config["BLOCK_M"]
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
 
@@ -253,15 +219,15 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
-            scale=softmax_scale if softmax_scale is not None else 1.0,
-            q_scale=q_descale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            out_scale=1 / output_scale if output_scale is not None else 1.0,
+            scale=softmax_scale,
+            q_descale_ptr=q_descale,
+            k_descale_ptr=k_descale,
+            v_descale_ptr=v_descale,
+            out_scale_ptr=output_scale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table_stride_0,
+            block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             output_stride_0=out.stride(0),
@@ -289,10 +255,8 @@ def unified_attention(
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
-            OUTPUT_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
             HAS_ROPE=HAS_ROPE,
-            IS_CAUSAL=causal,
             **config,
         )
 
@@ -342,12 +306,13 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
-            q_scale=q_descale,
-            k_scale=k_descale,
+            q_descale_ptr=q_descale,
+            k_descale_ptr=k_descale,
+            v_descale_ptr=v_descale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table_stride_0,
+            block_table_stride=block_table.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
@@ -356,6 +321,8 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
             HEAD_SIZE_V=head_size_v,
             HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
+            ROPE_SIZE=rope_size,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -375,28 +342,23 @@ def unified_attention(
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
             HAS_ROPE=HAS_ROPE,
-            ROPE_SIZE=rope_size,
-            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
-            IS_CAUSAL=causal,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
-            v_scale=v_descale,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
-            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+            out_scale_ptr=output_scale,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
-            block_table_stride=block_table_stride_0,
+            block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size_v,
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_v),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            OUTPUT_FP8=output_scale is not None,
             **reduce_config,
         )

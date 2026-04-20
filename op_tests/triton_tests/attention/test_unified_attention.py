@@ -183,7 +183,6 @@ def make_unified_attn_inputs(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("quant_scheme", [None, "fp8"])
 @torch.inference_mode()
 def test_triton_unified_attn(
@@ -195,7 +194,6 @@ def test_triton_unified_attn(
     block_size,
     soft_cap,
     num_blocks,
-    causal,
     quant_scheme,
 ):
     head_size_qk = head_sizes[0]
@@ -258,7 +256,7 @@ def test_triton_unified_attn(
         max_seqlen_q=max_query_len,
         max_seqlen_k=max_kv_len,
         softmax_scale=scale,
-        causal=causal,
+        causal=True,
         window_size=window_size,
         block_table=block_tables,
         softcap=soft_cap if soft_cap is not None else 0,
@@ -279,7 +277,6 @@ def test_triton_unified_attn(
         sliding_window,
         soft_cap,
         sinks,
-        causal=causal,
     )
 
     if quant_scheme == "fp8":
