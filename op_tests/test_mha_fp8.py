@@ -112,33 +112,28 @@ def test_flash_attn_output(
     dtype = torch.bfloat16
     quant_dtype = dtypes.fp8
 
-    q = torch.rand(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
-    k = torch.rand(
-        batch_size,
-        seqlen_k,
-        nheads_k,
-        d,
-        device="cuda",
-        dtype=dtype,
-    )
-    v = torch.rand(
-        batch_size,
-        seqlen_k,
-        nheads_k,
-        d_v,
-        device="cuda",
-        dtype=dtype,
-    )
-
-    q_quant, q_descale = per_tensor_quant(q, quant_dtype=quant_dtype)
-    k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
-    v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
-
     if is_gfx950:
-        # gfx950 FP8 kernel expects BHSD-contiguous data presented as BSHD view
-        q_quant = q_quant.transpose(1, 2).contiguous().transpose(1, 2)
-        k_quant = k_quant.transpose(1, 2).contiguous().transpose(1, 2)
-        v_quant = v_quant.transpose(1, 2).contiguous().transpose(1, 2)
+        # Allocate directly in BHSD-physical layout (no DtoD memcpy needed)
+        q = torch.rand(batch_size, nheads, seqlen_q, d, device="cuda", dtype=dtype)
+        k = torch.rand(batch_size, nheads_k, seqlen_k, d, device="cuda", dtype=dtype)
+        v = torch.rand(batch_size, nheads_k, seqlen_k, d_v, device="cuda", dtype=dtype)
+        q_quant, q_descale = per_tensor_quant(q, quant_dtype=quant_dtype)
+        k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
+        v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
+        # Present as BSHD view for aiter API
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        q_quant = q_quant.transpose(1, 2)
+        k_quant = k_quant.transpose(1, 2)
+        v_quant = v_quant.transpose(1, 2)
+    else:
+        q = torch.rand(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
+        k = torch.rand(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype)
+        v = torch.rand(batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype)
+        q_quant, q_descale = per_tensor_quant(q, quant_dtype=quant_dtype)
+        k_quant, k_descale = per_tensor_quant(k, quant_dtype=quant_dtype)
+        v_quant, v_descale = per_tensor_quant(v, quant_dtype=quant_dtype)
 
     out, us_quant_fwd = run_ck(
         q_quant,

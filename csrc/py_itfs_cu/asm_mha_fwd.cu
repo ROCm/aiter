@@ -327,7 +327,8 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
 
     auto opts = q.options();
     bool is_gfx950_fp8 = (dtype_str == "fp8bf16") && (get_gpu_arch() == "gfx950");
-    // gfx950 FP8 kernel now outputs BF16 directly (with in-kernel v_descale + conversion).
+    TORCH_CHECK(!is_gfx950_fp8 || !is_causal,
+        "gfx950 FP8 kernel does not support causal masking");
     auto out_type = (dtype_str == "fp8bf16") ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
