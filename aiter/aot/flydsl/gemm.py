@@ -260,9 +260,9 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
-    _compile_executable_to_cache(
-        exe, out, a, b, bias if has_bias else None, m, counter, 0, stream
-    )
+    # FlyDSL JIT does not accept None for tensor slots; pass a real buffer when
+    # bias fusion is disabled (matches runtime launcher dummy tensor behavior).
+    _compile_executable_to_cache(exe, out, a, b, bias, m, counter, 0, stream)
 
 
 def _compile_preshuffle_to_cache(
