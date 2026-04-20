@@ -200,6 +200,7 @@ class Case:
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(4096, 3072, 3072, 128, 4),
             Case(8192, 7168, 4096, 256, 8),
+            Case(2048, 8192, 4096, 8, 2, hbm_swizzling=True),
         ]
     ],
 )
