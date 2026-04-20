@@ -138,7 +138,7 @@ def get_GEMM_A16W16_config(
                     if flydsl_config is None:
                         logger.warning(
                             f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                            "recognised by the current catalog; falling back to next candidate."
+                            "recognized by the current catalog; falling back to next candidate."
                         )
                         config = None
                 else:
