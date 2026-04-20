@@ -247,7 +247,7 @@ def test_fmoe(
         w2_bias=exp_bias2,
         doweight=not doweight_stage1,
     )
-
+    
     # ######################## stage 2 end ###########
     out2_ck, us2 = run_perftest(
         fused_moe,
@@ -265,6 +265,7 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
+        aq_dtype = AQDType,
         num_iters=5,
         num_warmup=2,
     )
@@ -626,19 +627,20 @@ def _iter_legacy_cases():
         if triple in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
                 for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
+                    for act_type in args.act:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
                 for act_type in args.act:

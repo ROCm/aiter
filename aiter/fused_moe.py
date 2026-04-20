@@ -115,6 +115,22 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _normalize_lookup_dtype(dtype_override):
+    if dtype_override is None:
+        return None
+    if dtype_override in [dtypes.fp8, getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e4m3fnuz", None)]:
+        return dtypes.fp8
+    if dtype_override in [dtypes.fp16, torch.float16]:
+        return dtypes.fp16
+    if dtype_override in [dtypes.bf16, torch.bfloat16]:
+        return dtypes.bf16
+    if dtype_override in [dtypes.fp4x2, getattr(torch, "float4_e2m1fn_x2", None)]:
+        return dtypes.fp4x2
+    if dtype_override in [dtypes.i4x2, getattr(torch, "int4", None)]:
+        return dtypes.i4x2
+    return dtype_override
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -141,6 +157,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    aq_dtype=None,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -166,6 +183,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        aq_dtype=aq_dtype,
     )
 
 
@@ -193,6 +211,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    aq_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -227,6 +246,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    aq_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -272,6 +292,9 @@ def fused_moe_(
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
+    lookup_q_dtype_a = _normalize_lookup_dtype(aq_dtype) or q_dtype_a
+    if aq_dtype is not None:
+        q_dtype_a = lookup_q_dtype_a
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -280,7 +303,7 @@ def fused_moe_(
         E,
         topk,
         dtype,
-        q_dtype_a,
+        lookup_q_dtype_a,
         q_dtype_w,
         quant_type,
         isG1U1,
@@ -351,6 +374,7 @@ def fused_moe_(
             doweight_stage1=doweight_stage1,
             q_dtype_a=q_dtype_a,
             q_dtype_w=q_dtype_w,
+            lookup_q_dtype_a=lookup_q_dtype_a,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
@@ -1139,6 +1163,7 @@ def fused_moe_2stages(
     # following for quant
     q_dtype_a=None,
     q_dtype_w=None,
+    lookup_q_dtype_a=None,
     w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
@@ -1163,7 +1188,7 @@ def fused_moe_2stages(
         E,
         topk,
         dtype,
-        q_dtype_a,
+        lookup_q_dtype_a if lookup_q_dtype_a is not None else q_dtype_a,
         q_dtype_w,
         quant_type,
         isG1U1,
@@ -1190,7 +1215,6 @@ def fused_moe_2stages(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
-        and activation == aiter.ActivationType.Swiglu
     ):
         a1 = hidden_states.to(dtypes.fp8)
         M = sorted_ids.shape[0]
