@@ -2559,6 +2559,13 @@ class FmoeTuner(TunerCommon):
             return tasks_flydsl
 
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        _a_dtype_map = {
+            dtypes.fp8: "fp8",
+            dtypes.fp4x2: "fp4",
+            dtypes.fp16: "fp16",
+            dtypes.bf16: "fp16",
+        }
+        a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
 
         flydsl_s1_kernels = get_flydsl_stage1_kernels_int4_bf16(out_dtype_str)
         flydsl_s2_kernels = get_flydsl_stage2_kernels_int4_bf16(out_dtype_str)
@@ -2581,10 +2588,9 @@ class FmoeTuner(TunerCommon):
                     k_tiles = k_per_batch // kparams["tile_k"]
                     if k_tiles < 4 or k_tiles % 2 != 0:
                         continue
-
                 # Int4 kernels: no fuse_fp4_quant
                 ref_args_extra = (
-                    [0, 10, 11, 12, 13, 3, 4, 5, 8],
+                    [0, 10, 11, 12, 13, 3, 4, 5, 8, 22],
                     dtype,
                     act_type,
                     q_type,
@@ -2614,11 +2620,12 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage1_out,
                         (
-                            [0, 16, 5, 6, 7, 8, 18, 14],
+                            [0, 16, 5, 6, 7, 8, 18, 14, 22],
                             dtype,
                             topk,
                             kparams,
                             blockM,
+                            q_dtype_a,
                             q_type,
                             act_type,
                         ),
