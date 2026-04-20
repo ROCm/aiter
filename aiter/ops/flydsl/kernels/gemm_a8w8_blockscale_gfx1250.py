@@ -173,7 +173,7 @@ def compile_gemm_a8w8_blockscale(
 
     scale_k = K // scale_block_k
 
-    gpu_arch = str(get_hip_arch(timeout_s=300))
+    gpu_arch = str(get_hip_arch())
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
     elem_bytes_d = 2 if out_dtype in ("bf16", "fp16") else 4
@@ -285,13 +285,11 @@ def compile_gemm_a8w8_blockscale(
         stages_a_mem = [stages_a[i].get() for i in range(num_buffers)]
         stages_b_mem = [stages_b[i].get() for i in range(num_buffers)]
 
-        # Build descriptor once per buffer at k_base=0; advance per iter.
-        _k_zero = arith.index(0)
-        a_desc_bases = [
-            tdm_ops.make_tensor_descriptor_2d(
+        def copy_a_to_lds(k_base, buffer_idx):
+            desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_x,
-                lds_memref=stages_a_mem[i],
-                global_offset=(blk_m, _k_zero),
+                lds_memref=stages_a_mem[buffer_idx],
+                global_offset=(blk_m, k_base),
                 tensor_shape=(tile_m, tile_k),
                 strides=(K, 1),
                 tile_shape=(tile_m, tile_k),
@@ -300,13 +298,13 @@ def compile_gemm_a8w8_blockscale(
                 pad_amount=LDS_PAD_A_BYTES,
                 num_warps=num_warps,
             )
-            for i in range(num_buffers)
-        ]
-        b_desc_bases = [
-            tdm_ops.make_tensor_descriptor_2d(
+            tdm_ops.tensor_load_2d(desc)
+
+        def copy_b_to_lds(k_base, buffer_idx):
+            desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_w,
-                lds_memref=stages_b_mem[i],
-                global_offset=(blk_n, _k_zero),
+                lds_memref=stages_b_mem[buffer_idx],
+                global_offset=(blk_n, k_base),
                 tensor_shape=(tile_n, tile_k),
                 strides=(K, 1),
                 tile_shape=(tile_n, tile_k),
@@ -315,15 +313,6 @@ def compile_gemm_a8w8_blockscale(
                 pad_amount=LDS_PAD_B_BYTES,
                 num_warps=num_warps,
             )
-            for i in range(num_buffers)
-        ]
-
-        def copy_a_to_lds(k_base, buffer_idx):
-            desc = tdm_ops.advance_tdm_descriptor(a_desc_bases[buffer_idx], k_base)
-            tdm_ops.tensor_load_2d(desc)
-
-        def copy_b_to_lds(k_base, buffer_idx):
-            desc = tdm_ops.advance_tdm_descriptor(b_desc_bases[buffer_idx], k_base)
             tdm_ops.tensor_load_2d(desc)
 
         def issue_all_tdm_loads(k_base, buffer_idx):
@@ -647,11 +636,24 @@ def gemm_a8w8_blockscale(
     assert dtype in torch_to_str, f"Unsupported output dtype {dtype}"
     out_dtype_str = torch_to_str[dtype]
 
-    if y is None:
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-    else:
+    # Pad N up to tile_n so the kernel's WMMAs and stores land inside
+    # the allocated output — identical trick to gemm_a16w16. Matches
+    # the kernel's expectation that N % tile_n == 0 for warp tiling.
+    # The kernel still reads garbage from W for cols >= N (no TDM OOB
+    # clip), but those writes land in y_buf[:, N:N_stride] which we
+    # slice off before returning.
+    N_stride = ((N + tile_n - 1) // tile_n) * tile_n
+
+    if y is not None:
         assert y.shape == (M, N), f"y shape {y.shape} != ({M}, {N})"
         assert y.dtype == dtype, f"y dtype {y.dtype} != {dtype}"
+
+    if N_stride != N:
+        y_buf = torch.empty((M, N_stride), dtype=dtype, device=x.device)
+    elif y is not None:
+        y_buf = y
+    else:
+        y_buf = torch.empty((M, N), dtype=dtype, device=x.device)
 
     launcher = compile_gemm_a8w8_blockscale(
         K=K,
@@ -669,8 +671,15 @@ def gemm_a8w8_blockscale(
     )
 
     stream = torch.cuda.current_stream(device=x.device).cuda_stream
-    launcher(y, x, w, x_scale, w_scale, M, N, stream=stream)
-    return y
+    launcher(y_buf, x, w, x_scale, w_scale, M, N_stride, stream=stream)
+
+    if N_stride != N:
+        result = y_buf[:, :N]
+        if y is not None:
+            y.copy_(result)
+            return y
+        return result
+    return y_buf
 
 
 __all__ = [
