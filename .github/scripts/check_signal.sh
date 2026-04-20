@@ -91,7 +91,8 @@ find_checks_run_id() {
     gh_args+=(--branch "${target_branch}")
   fi
 
-  if [ -n "${GITHUB_EVENT_NAME:-}" ]; then
+  # Nightly workflows reuse the Checks result from the push run on the same SHA.
+  if [ -n "${GITHUB_EVENT_NAME:-}" ] && [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
     gh_args+=(--event "${GITHUB_EVENT_NAME}")
   fi
 
