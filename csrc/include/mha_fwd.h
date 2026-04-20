@@ -65,8 +65,7 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bool skip_min_seqlen_q,
                              ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
                              ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
-                             int page_size,
-                             bool use_64bit_load = false)
+                             int page_size)
         : fmha_batch_prefill_traits{head_size_q,
                                     head_size_v,
                                     dtype,
@@ -84,7 +83,6 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                                     kv_lookup_table,
                                     page_size}
     {
-        this->use_64bit_load = use_64bit_load;
     }
 };
 
