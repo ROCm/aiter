@@ -969,11 +969,14 @@ class TunerCommon:
         compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
         os.makedirs(compare_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(output_file))[0]
-        pid = os.getpid()
-        compare_report_file = os.path.join(
-            compare_dir, f"{base_name}.{pid}.compare.txt"
+        fd, compare_report_file = tempfile.mkstemp(
+            prefix=f"{base_name}.",
+            suffix=".compare.txt",
+            dir=compare_dir,
+            text=True,
         )
-        with open(compare_report_file, "w") as f:
+        os.chmod(compare_report_file, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(
                 f"Compare report for {self.name}\n"
                 f"Shapes: {len(self.untunedf)}\n"
