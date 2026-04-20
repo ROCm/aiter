@@ -61,7 +61,9 @@ if not IS_WINDOWS and is_develop_mode():
 
         _installed = pkg_version("flydsl")
         _expected = FLYDSL_VERSION.split("==")[1]
-        if _installed != _expected and not _installed.startswith(_expected.split("+")[0]):
+        if _installed != _expected and not _installed.startswith(
+            _expected.split("+")[0]
+        ):
             raise ImportError("version mismatch")
     except Exception:
         subprocess.check_call(
