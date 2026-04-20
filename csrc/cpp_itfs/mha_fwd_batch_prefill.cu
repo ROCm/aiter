@@ -55,21 +55,27 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     if(q_dtype_str == "fp8" || q_dtype_str == "fp8bf16")
         element_size = 1;
 
-    // Check if KV cache exceeds 4GB (INT32_MAX byte offset).
+    // Check if KV cache exceeds 2GB (INT32_MAX byte offset for SRD voffset).
     // Only relevant when page_block_size < kN0 (tile N dimension), because:
     //   - page_size >= kN0: SRD is rebased per-page using 64-bit pointer arithmetic,
     //     so within-page offsets are always small. No overflow possible.
     //   - page_size < kN0: full offsets (page * stride + within_page) are used as
     //     32-bit buffer_load voffset, which overflows at >2GB.
+    // The 2GB bound matches CK's existing TwoGB convention (transform_conv_fwd_to_gemm.hpp).
     // kN0 = 128 across all batch prefill tile configurations (bn0 in codegen).
+    //
+    // Threshold = total KV cache footprint in bytes (not just page-base offset),
+    // so we cover within-page offset and avoid an off-by-one at exactly INT32_MAX.
+    // batch_stride_k is per-page element stride (page_size * nhead_k * head_dim),
+    // so num_total_pages * batch_stride_k * element_size = full buffer size in bytes.
     constexpr int kN0_min = 128;
     bool use_64bit_load   = false;
-    if(args.page_block_size < kN0_min && args.num_total_pages > 1)
+    if(args.page_block_size < kN0_min)
     {
-        int64_t max_page_byte_offset = static_cast<int64_t>(args.num_total_pages - 1) *
-                                       static_cast<int64_t>(args.batch_stride_k) *
-                                       element_size;
-        use_64bit_load = (max_page_byte_offset > INT32_MAX);
+        int64_t total_kv_bytes = static_cast<int64_t>(args.num_total_pages) *
+                                 static_cast<int64_t>(args.batch_stride_k) *
+                                 element_size;
+        use_64bit_load = (total_kv_bytes > INT32_MAX);
     }
 
     auto traits = get_mha_batch_prefill_traits(head_size_q,
