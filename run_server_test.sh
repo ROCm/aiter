@@ -4,7 +4,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exec /usr/bin/env bash "$0" "$@"
 fi
 
-# Kernel optimisation harness (git worktrees + per-checkout JIT clean for module_custom_all_reduce):
+# Kernel optimisation harness (git worktrees):
 #
 #   individual    — one worktree per prompt, each branched from BASELINE_REF; Claude CLI runs in that tree only.
 #   accumulative  — one combined worktree; prompts run in order on the same tree (combined optimisations).
@@ -35,7 +35,6 @@ fi
 #                     forbids dangerously-skip-permissions, so the script uses `--permission-mode acceptEdits --allowedTools Read,Edit,Bash`.
 #   KERNEL_FILE     — source file containing the kernels to optimise. Relative to REPO_ROOT, or absolute.
 #                     Substituted into {{KERNEL_FILE}} placeholders in prompt files.
-#                     Default: csrc/include/custom_all_reduce.cuh
 #   KERNELS_TO_OPTIMIZE — space- or comma-separated kernel function names to pass to Claude.
 #                     Substituted into {{KERNELS_TO_OPTIMIZE}} placeholders in prompt files.
 #                     Default: cross_device_reduce_1stage cross_device_reduce_2stage
@@ -90,10 +89,10 @@ TRIAL_MODE=${TRIAL_MODE:-0}  # if 1: single ISL/OSL pair (8192,1024) and 1 run p
 PROMPTS_FILTER=${PROMPTS_FILTER:-}
 # KERNEL_FILE: path to the source file containing the kernels to optimise.
 # Relative paths are resolved from REPO_ROOT; absolute paths are used as-is.
-KERNEL_FILE=${KERNEL_FILE:-csrc/include/custom_all_reduce.cuh}
+KERNEL_FILE=${KERNEL_FILE:-}
 # KERNELS_TO_OPTIMIZE: space- or comma-separated list of kernel function names to pass to Claude.
 # These are substituted into {{KERNELS_TO_OPTIMIZE}} in prompt files.
-KERNELS_TO_OPTIMIZE=${KERNELS_TO_OPTIMIZE:-"cross_device_reduce_1stage cross_device_reduce_2stage"}
+KERNELS_TO_OPTIMIZE=${KERNELS_TO_OPTIMIZE:-}
 
 MANIFEST="$OUT_DIR/kernel_opt_worktrees.manifest"
 REPO_PARENT=$(cd "$REPO_ROOT/.." && pwd)
@@ -135,11 +134,9 @@ Common environment variables:
   CLAUDE_BIN      Claude executable path (default: claude)
   KERNEL_FILE     Source file with kernels to optimise (relative to repo root or absolute).
                   Substituted into {{KERNEL_FILE}} in prompt files.
-                  Default: csrc/include/custom_all_reduce.cuh
   KERNELS_TO_OPTIMIZE
                   Space- or comma-separated kernel function names for Claude to target.
                   Substituted into {{KERNELS_TO_OPTIMIZE}} in prompt files.
-                  Default: cross_device_reduce_1stage cross_device_reduce_2stage
                   Example: KERNELS_TO_OPTIMIZE="my_kernel_a my_kernel_b"
   PROMPTS_FILTER  Space- or comma-separated prompt filenames (basename, ±extension) to run.
                   If unset, all prompts in PROMPTS_DIR are used (warning printed).
@@ -182,8 +179,6 @@ mkdir -p "$OUT_DIR/baseline" "$OUT_DIR/optimized/accumulative" "$OUT_DIR/optimiz
 # the worktree instead of the original directory. Also strips any trailing slash.
 OUT_DIR=$(cd "$OUT_DIR" && pwd)
 MANIFEST="$OUT_DIR/kernel_opt_worktrees.manifest"
-
-module_under_test="module_custom_all_reduce"
 
 # Set up an isolated JIT cache for a worktree and export AITER_JIT_DIR pointing to it.
 #
@@ -396,10 +391,8 @@ stop_openai_server() {
     done
   done
 
-  # SIGTERM the server's process group and every collected descendant.
-  # This allows Python/C++ destructors to run, which is required for HIP IPC
-  # shared memory (used by custom all-reduce) to be properly released by the KFD.
-  # SIGKILL bypasses destructors and leaves IPC mappings alive in the KFD,
+  # SIGTERM first so Python/C++ destructors run and GPU resources are released cleanly.
+  # SIGKILL bypasses destructors and leaves mappings alive in the KFD,
   # permanently holding VRAM until the driver session is reset.
   local pgid
   pgid=$(ps -o pgid= -p "$server_pid" 2>/dev/null | tr -d ' ') || true
@@ -465,7 +458,7 @@ run_benchmarks() {
   local log="$log_dir/benchmark_${tag}.log"
   # Use a per-worktree JIT cache so each checkout compiles its own modules.
   # Always derive from work_dir so successive benchmark tags each get the right dir
-  # (build_phase exports AITER_JIT_DIR per worktree via clean_jit, but benchmark_phase
+  # (build_phase exports AITER_JIT_DIR per worktree via ninja_jit_setup, but benchmark_phase
   # may run standalone or iterate over multiple worktrees in a loop).
   export AITER_JIT_DIR="$work_dir/.jit_cache"
   mkdir -p "$AITER_JIT_DIR"
@@ -621,7 +614,7 @@ run_claude_prompt() {
     # e.g. /aiter-test/csrc/... → <worktree>/csrc/...
     kernel_file_abs="${KERNEL_FILE/#$REPO_ROOT/$workspace}"
   else
-    kernel_file_abs="$workspace/${KERNEL_FILE:-csrc/include/custom_all_reduce.cuh}"
+    kernel_file_abs=""
   fi
   local kernels_formatted="" k
   # Normalise commas to spaces so both "a,b" and "a b" work as separators.
@@ -629,9 +622,7 @@ run_claude_prompt() {
     [[ -z "$k" ]] && continue
     kernels_formatted+=$'\n'"    ${k}"
   done
-  if [[ -z "$kernels_formatted" ]]; then
-    kernels_formatted=$'\n'"    cross_device_reduce_1stage"$'\n'"    cross_device_reduce_2stage"
-  fi
+  # (no fallback — if KERNELS_TO_OPTIMIZE is unset, {{KERNELS_TO_OPTIMIZE}} substitutes to empty)
   prompt_text="${prompt_text//\{\{REPO_ROOT\}\}/$workspace}"
   prompt_text="${prompt_text//\{\{KERNEL_FILE\}\}/$kernel_file_abs}"
   prompt_text="${prompt_text//\{\{KERNELS_TO_OPTIMIZE\}\}/$kernels_formatted}"
