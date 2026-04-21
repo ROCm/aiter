@@ -966,9 +966,17 @@ class TunerCommon:
         if not args.compare or (total_batches <= 1 and len(self.untunedf) <= 30):
             return None
 
-        report_root, _ = os.path.splitext(output_file)
-        compare_report_file = f"{report_root}.compare.txt"
-        with open(compare_report_file, "w") as f:
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(output_file))[0]
+        fd, compare_report_file = tempfile.mkstemp(
+            prefix=f"{base_name}.",
+            suffix=".compare.txt",
+            dir=compare_dir,
+            text=True,
+        )
+        os.chmod(compare_report_file, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(
                 f"Compare report for {self.name}\n"
                 f"Shapes: {len(self.untunedf)}\n"
@@ -982,8 +990,13 @@ class TunerCommon:
         if not args.compare:
             return None
 
-        candidate_root, candidate_ext = os.path.splitext(output_file)
-        compare_candidate_file = f"{candidate_root}.candidate{candidate_ext or '.csv'}"
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        base_name, candidate_ext = os.path.splitext(os.path.basename(output_file))
+        pid = os.getpid()
+        compare_candidate_file = os.path.join(
+            compare_dir, f"{base_name}.{pid}.candidate{candidate_ext or '.csv'}"
+        )
         if os.path.exists(output_file):
             shutil.copyfile(output_file, compare_candidate_file)
         elif os.path.exists(compare_candidate_file):
