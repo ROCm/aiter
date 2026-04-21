@@ -6,6 +6,7 @@
 #include "aiter_opus_plus.h"
 #include "dispatch_utils.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <c10/hip/HIPException.h>
 
 namespace aiter {
 
