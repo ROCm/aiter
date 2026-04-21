@@ -42,6 +42,10 @@ if is_flydsl_available():
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
+    from .kernels import (
+        compile_moe_gemm1,
+        compile_moe_gemm2
+    )
 
     from .gemm_kernels import flydsl_hgemm
 
@@ -51,6 +55,8 @@ if is_flydsl_available():
         "flydsl_preshuffle_gemm_a8",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "compile_moe_gemm1",
+        "compile_moe_gemm2",
         "flydsl_hgemm",
         "flydsl_gdr_decode",
     ]
