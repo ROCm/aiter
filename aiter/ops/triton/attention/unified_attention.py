@@ -63,7 +63,25 @@ def select_2d_config(
     #     num_warps = 2
     #     TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
 
-    max_num_stages_2d = 2 if head_size > 128 else 4
+    # low wavefronts, needs more pipeline depth to hide the long V-load latency
+    # num_warps=8, num_stages=3, waves_per_eu=1, PRELOAD_V=False
+    mla_like = (
+        all_decode
+        and head_size > 128
+        and block_size <= 16
+        and not arch.is_rdna
+    )
+
+    # high wavefronts, use more wavefronts to hide the long K/V latency
+    # num_warps=4, num_stages=1, waves_per_eu=2, PRELOAD_V=True
+    mla_like_many_ctas = (
+        mla_like
+        and num_2d_prgms * 16 > get_num_sms() * 23
+    )
+
+    # Cap num_stages at 2 for large head_size normally to avoid VGPR spills,            
+    # but MLA's narrower warp layout frees enough budget for 3 stages.
+    max_num_stages_2d = 3 if mla_like else (2 if head_size > 128 else 4)
 
     # base prefill, for short cases
     if not all_decode:
@@ -73,6 +91,8 @@ def select_2d_config(
         # to not have masking when loading KV
         TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
         if arch.is_rdna:
+            num_stages_2d, num_warps = 1, 4
+        elif mla_like_many_ctas:
             num_stages_2d, num_warps = 1, 4
         else:
             num_stages_2d, num_warps = 3, 8
@@ -87,6 +107,13 @@ def select_2d_config(
     BLOCK_Q = BLOCK_M // num_queries_per_kv
     num_stages_2d = min(max_num_stages_2d, num_stages_2d)
 
+    preload_v = mla_like_many_ctas
+
+    if mla_like_many_ctas:
+        waves_per_eu = 2
+    elif mla_like:
+        waves_per_eu = 1
+
     return {
         "BLOCK_M": BLOCK_M,
         "BLOCK_Q": BLOCK_Q,
@@ -94,7 +121,7 @@ def select_2d_config(
         "num_warps": num_warps,
         "num_stages": num_stages_2d,
         "waves_per_eu": waves_per_eu,
-        "PRELOAD_V": False,
+        "PRELOAD_V": preload_v,
     }
 
 
@@ -105,15 +132,25 @@ def select_3d_config(
     arch = get_arch()
 
     TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
+    mla_like = (
+        all_decode
+        and head_size > 128
+        and block_size <= 16
+        and not arch.is_rdna
+    )
 
     if arch.is_rdna:
         attn_warps = 2
         attn_stages = 1
         waves_per_eu = 2
-    elif all_decode:
-        attn_warps = 8
-        attn_stages = 2
+    elif mla_like:
+        attn_warps = 4
+        attn_stages = 3
         waves_per_eu = 2
+    elif all_decode:
+        attn_warps = 4
+        attn_stages = 2
+        waves_per_eu = 4
     else:
         attn_warps = 2
         attn_stages = 1
@@ -152,7 +189,16 @@ def use_2d_kernel(
     max_seqlen_k,
     target_num_prgms,
     num_2d_prgms,
+    block_size=None,
 ):
+    mla_like = (
+        all_decode
+        and head_size > 128
+        and block_size is not None
+        and block_size <= 16
+    )
+    if mla_like and max_seqlen_k <= 2048:
+        return True
     return (
         (sliding_window > 0)
         or (max_seqlen_k <= 512)
@@ -451,6 +497,7 @@ def unified_attention(
         max_seqlen_k,
         target_num_prgms,
         num_2d_prgms,
+        block_size=block_size,
     )
     if force_kernel is not None:
         _dispatch_2d = force_kernel == "2d"
