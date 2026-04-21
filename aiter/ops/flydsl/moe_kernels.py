@@ -510,6 +510,12 @@ def _s2_args_std(
 def _run_compiled(exe, args):
     """Call the JitFunction with the given args.
     JitFunction.__call__ handles compilation caching internally.
+
+    Some kernels (e.g. the gfx1250 fp8/a8w4 stage1 path) wrap the compiled
+    JIT function in a host-side ``_Stage1GateUpPackedWrapper`` that repacks
+    the weight and weight-scale tensors before dispatch. Calling ``exe(*args)``
+    works for both ``@flyc.jit`` functions and such host-side wrappers since
+    both are callable.
     """
     try:
         exe(*args)

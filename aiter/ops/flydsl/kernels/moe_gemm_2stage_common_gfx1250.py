@@ -376,13 +376,25 @@ def _pack_stage1_gate_up_tiles(tensor, *, experts: int, inter_dim: int, tile_n: 
             f"Stage1 gate/up packed layout requires inter_dim divisible by tile_n, got {inter_dim} and {tile_n}"
         )
 
+    # torch.cat does not implement some 1-byte float dtypes (e.g.
+    # Float8_e8m0fnu); operate through uint8 view if needed.
+    orig_dtype = tensor.dtype
+    _need_view_cast = tensor.element_size() == 1 and tensor.dtype not in (
+        torch.uint8, torch.int8
+    )
+    if _need_view_cast:
+        tensor = tensor.contiguous().view(torch.uint8)
+
     tensor_3d = tensor.contiguous().view(int(experts), int(2 * inter_dim), int(cols))
     gate = tensor_3d[:, :int(inter_dim), :]
     up = tensor_3d[:, int(inter_dim):, :]
     gate_tiles = gate.view(int(experts), int(inter_dim // tile_n), int(tile_n), int(cols))
     up_tiles = up.view(int(experts), int(inter_dim // tile_n), int(tile_n), int(cols))
     packed = torch.cat((gate_tiles, up_tiles), dim=2)
-    return packed.view(expected_rows, int(cols))
+    packed = packed.view(expected_rows, int(cols))
+    if _need_view_cast:
+        packed = packed.view(orig_dtype)
+    return packed
 
 
 class _Stage1GateUpPackedWrapper:
