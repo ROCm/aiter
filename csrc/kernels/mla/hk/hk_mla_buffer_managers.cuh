@@ -1176,7 +1176,7 @@ __device__ __forceinline__ uint32_t float_2_bf16_pair(uint32_t src_0, uint32_t s
 
 #if defined(__gfx950__)
     asm volatile("v_cvt_pk_bf16_f32 %0, v[%1], v[%2]" : "=v"(result) : "i"(src_0), "i"(src_1));
-#elif defined(__gfx94__)
+#elif defined(__gfx942__)
     static constexpr uint32_t FP32_NAN            = 0x7fff0000;
     static constexpr uint32_t ROUND_BIAS_FOR_BF16 = 0x7fff;
     static constexpr uint32_t MERGE_MASK          = 0xffff0000;

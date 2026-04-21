@@ -445,7 +445,7 @@ def mla_decode_fwd(
             nhead * max_seqlen_q == 128
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and page_size == 1
+            and page_size in (1, 64)
             and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
         )
 
