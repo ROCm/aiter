@@ -26,6 +26,7 @@ from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 
 aiter_lib = None
 
@@ -228,6 +229,8 @@ class AITER_CONFIG(object):
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
                 keys.append("cu_num")
+            if "gfx" in merge_df.columns and "gfx" not in keys:
+                keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
@@ -302,8 +305,8 @@ class AITER_CONFIG(object):
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
             op_tuned_file_list = [
                 p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*")
-                if (p.is_file() and "untuned" not in str(p))
+                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+                if (p.is_file() and "untuned" not in p.name)
             ]
 
             if not op_tuned_file_list:
@@ -778,7 +781,7 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
-        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
         if not torch_exclude:
@@ -1594,7 +1597,7 @@ def compile_ops(
                             )
                     return True
 
-                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, …).
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
                     import torch
 

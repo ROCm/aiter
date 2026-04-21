@@ -14,6 +14,7 @@ from aiter import logger
 from operator import itemgetter
 import time
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 
 INVALID_TIME = -1
 
@@ -329,16 +330,31 @@ class TunerCommon:
         if self.get_out_file(args.tune_file) == args.untune_file:
             # retune all shapes in tune_file
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
-            self.tunedf = self.untunedf[self.untunedf["cu_num"] != self.get_cu_num()]
-            self.untunedf = self.untunedf[self.untunedf["cu_num"] == self.get_cu_num()]
+            gfx = self.get_gfx()
+            cu_num = self.get_cu_num()
+            if "gfx" not in self.untunedf.columns:
+                self.untunedf["gfx"] = gfx
+            target_mask = (self.untunedf["gfx"] == gfx) & (
+                self.untunedf["cu_num"] == cu_num
+            )
+            self.tunedf = self.untunedf[~target_mask]
+            self.untunedf = self.untunedf[target_mask]
             self.untunedf = self.untunedf[self.keys]
         else:
             # retune shapes that are in both untune_file and tune_file
             untunedf = self.get_untuned_gemm_list(args.untune_file)
+            gfx = self.get_gfx()
+            cu_num = self.get_cu_num()
             if "cu_num" not in untunedf.columns:
-                untunedf["cu_num"] = self.get_cu_num()
+                untunedf["gfx"] = gfx
+                untunedf["cu_num"] = cu_num
             else:
-                untunedf = untunedf[untunedf["cu_num"] == self.get_cu_num()]
+                target_mask = untunedf["cu_num"] == cu_num
+                if "gfx" in untunedf.columns:
+                    target_mask = target_mask & (untunedf["gfx"] == gfx)
+                else:
+                    untunedf["gfx"] = gfx
+                untunedf = untunedf[target_mask]
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
 
@@ -401,6 +417,9 @@ class TunerCommon:
         device_properties = torch.cuda.get_device_properties(gpu)
         cu_num = device_properties.multi_processor_count
         return cu_num
+
+    def get_gfx(self):
+        return _chip_get_gfx()
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
@@ -947,9 +966,17 @@ class TunerCommon:
         if not args.compare or (total_batches <= 1 and len(self.untunedf) <= 30):
             return None
 
-        report_root, _ = os.path.splitext(output_file)
-        compare_report_file = f"{report_root}.compare.txt"
-        with open(compare_report_file, "w") as f:
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(output_file))[0]
+        fd, compare_report_file = tempfile.mkstemp(
+            prefix=f"{base_name}.",
+            suffix=".compare.txt",
+            dir=compare_dir,
+            text=True,
+        )
+        os.chmod(compare_report_file, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(
                 f"Compare report for {self.name}\n"
                 f"Shapes: {len(self.untunedf)}\n"
@@ -963,8 +990,13 @@ class TunerCommon:
         if not args.compare:
             return None
 
-        candidate_root, candidate_ext = os.path.splitext(output_file)
-        compare_candidate_file = f"{candidate_root}.candidate{candidate_ext or '.csv'}"
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        base_name, candidate_ext = os.path.splitext(os.path.basename(output_file))
+        pid = os.getpid()
+        compare_candidate_file = os.path.join(
+            compare_dir, f"{base_name}.{pid}.candidate{candidate_ext or '.csv'}"
+        )
         if os.path.exists(output_file):
             shutil.copyfile(output_file, compare_candidate_file)
         elif os.path.exists(compare_candidate_file):
@@ -1331,7 +1363,7 @@ class GemmCommonTuner(TunerCommon):
     def __init__(
         self,
         name,
-        key=["cu_num", "M", "N", "K"],
+        key=["gfx", "cu_num", "M", "N", "K"],
         resultList=[
             "kernelId",
             "splitK",
@@ -1358,6 +1390,7 @@ class GemmCommonTuner(TunerCommon):
             self.get_retune_gemm_list(args)
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
+            self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
@@ -1379,7 +1412,10 @@ class GemmCommonTuner(TunerCommon):
         info, time, err_ratio = results
         if time == -1:
             return 0, 0
-        cu_num, m, n, k, *rest = info[0]
+        if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
+            _gfx, cu_num, m, n, k, *rest = info[0]
+        else:  # legacy subclass key: (cu_num, m, n, k, ...)
+            cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -1486,7 +1522,10 @@ class GemmCommonTuner(TunerCommon):
         resultdf.to_csv(file, index=False, na_rep="Null")
 
     def set_run_iters(self, input, inputdtype):
-        cu_num, m, n, k, *rest = input
+        if len(input) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
+            _gfx, cu_num, m, n, k, *rest = input
+        else:  # legacy subclass key: (cu_num, m, n, k, ...)
+            cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
         if flops < 256 * 5120 * 256 * 2:
             self.num_warmup = 50
