@@ -241,7 +241,7 @@ class AiterAsmKernel: private AiterAsmKernelFast
         if(AITER_ASM_DIR != nullptr)
         {
             std::string full_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco_path;
-            AITER_LOG_INFO("RegisterKernel: " << kernel_name << " hsaco: " << full_path);
+            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: " << full_path);
 
             std::ifstream file(full_path, std::ios::binary | std::ios::ate);
 
@@ -262,7 +262,7 @@ class AiterAsmKernel: private AiterAsmKernelFast
             auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
             AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
             AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
-            AITER_LOG_INFO("RegisterKernel: " << kernel_name << " hsaco: [embedded] " << fname);
+            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: [embedded] " << fname);
             return hasco_obj->second.data();
 #else
             AITER_CHECK(AITER_ASM_DIR != nullptr, "AITER_ASM_DIR not set");
