@@ -2698,8 +2698,9 @@ def kernel_unified_attention_2d(
     cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
-    if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
-        return
+    # not needed when we calculate num prgs precisely
+    # if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
+    #     return
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
     offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
