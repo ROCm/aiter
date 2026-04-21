@@ -1285,12 +1285,17 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                 P residual_inp_pack = *(reinterpret_cast<P*>(residual_inp) + read_idx);
                 w_arr[n_iter]       = *(reinterpret_cast<P*>(weight) + n_iter * tnum + threadIdx.x);
                 A reduce_pack;
+                // Match vLLM's fused_add_rms_norm_kernel: bf16 + bf16 (single
+                // HW round) for the residual add, then upcast for variance.
+                // The previous code added in fp32 and rounded only at the
+                // residual_out store, so the variance reduction read an
+                // un-persisted value and drifted ~1 ULP/element. On
+                // MiniMax-M2.5 this caused the observed 4-7 pt gsm8k drop.
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
-                    float ar_out           = upcast_s(reduce_out_pack[i]);
-                    float res_inp          = upcast_s(residual_inp_pack[i]);
-                    float rms_inp          = ar_out + res_inp;
+                    T sum_bf16             = reduce_out_pack[i] + residual_inp_pack[i];
+                    float rms_inp          = upcast_s(sum_bf16);
                     rms_inp_f32[n_iter][i] = rms_inp;
                     reduce_pack[i]         = rms_inp * rms_inp;
                 }
@@ -1312,10 +1317,14 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
 #pragma unroll
                 for(int i = 0; i < pack_size; ++i)
                 {
+                    // x_f32 already came from upcast(bf16) above, so the
+                    // downcast back to T is a no-op round and matches the
+                    // value persisted via residual_out.
                     float x_f32     = rms_inp_f32[n_iter][i];
-                    float w_f32     = upcast_s(w_arr[n_iter][i]);
+                    T scaled        = downcast_s<T>(x_f32 * denom);
                     rmsnorm_inp[i]  = downcast_s<T>(x_f32);
-                    rmsnorm_rslt[i] = downcast_s<T>(x_f32 * w_f32 * denom);
+                    rmsnorm_rslt[i] = downcast_s<T>(upcast_s(scaled) *
+                                                    upcast_s(w_arr[n_iter][i]));
                 }
                 int write_idx = bid * (n / pack_size) + n_iter * tnum + threadIdx.x;
                 *(reinterpret_cast<P*>(results) + write_idx)      = rmsnorm_rslt;
@@ -1442,8 +1451,22 @@ ar_fusion_epilogue_rms_norm(O& out, A& in, P& weight, float eps, int hidden_dim,
 #pragma unroll
     for(int i = 0; i < PACK_SIZE; ++i)
     {
-        float out_ = in[i] * s_val * upcast_s(weight[i]);
-        out[i]     = downcast_s<OT>(out_);
+        if constexpr(std::is_same_v<OT, T>)
+        {
+            // Match vLLM unfused fused_add_rms_norm_kernel: two separate bf16
+            // rounds (`temp *= s_variance; temp *= weight`) instead of a
+            // single fp32 chain followed by one round. Required for accuracy
+            // parity on MiniMax-M2.5 -- the single-round form loses ~5 pt
+            // gsm8k vs the reference operator.
+            T scaled = downcast_s<T>(in[i] * s_val);
+            out[i]   = downcast_s<OT>(upcast_s(scaled) * upcast_s(weight[i]));
+        }
+        else
+        {
+            // Quant path (OT=float): keep the fp32 chain so the downstream
+            // quantization sees the highest-precision pre-quant value.
+            out[i] = downcast_s<OT>(in[i] * s_val * upcast_s(weight[i]));
+        }
     }
 }
 
@@ -1563,30 +1586,39 @@ __global__ void __launch_bounds__(1024, 1)
             }
         }
 
-        // Round allreduce result to bf16 and back to f32 before adding residual,
-        // matching the numerical behavior of the unfused (allreduce -> bf16 -> add residual) path.
-        // Without this, the extra f32 mantissa bits cause 1-ULP divergence that compounds across layers.
+        // Match vLLM's fused_add_rms_norm_kernel exactly: round AR to bf16,
+        // perform the residual add in bf16 (single HW round per element),
+        // store the rounded value to residual_out, AND read the SAME rounded
+        // value back into the variance/RMSNorm chain. The previous code did
+        // the residual add and variance reduction on un-rounded fp32 acc
+        // while persisting only the rounded bf16 to residual_out, which
+        // diverges from the reference operator and accumulates ~1 ULP per
+        // element across hidden_dim x layers. On MiniMax-M2.5 (hidden=3072,
+        // 31 layers, 2 norms/layer, TP=2) this drift caused ~7 pt gsm8k
+        // regression.
+        P ar_bf16, res, sum_bf16;
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
-            acc[v] = upcast_s(downcast_s<T>(acc[v]));
+            ar_bf16[v] = downcast_s<T>(acc[v]);
         }
 
-        P res = *reinterpret_cast<P*>(residual_inp + idx);
+        res = *reinterpret_cast<P*>(residual_inp + idx);
 
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
-            acc[v] += upcast_s(res[v]);
+            sum_bf16[v] = ar_bf16[v] + res[v];
         }
+
+        *reinterpret_cast<P*>(residual_out + idx) = sum_bf16;
 
 #pragma unroll
         for(int v = 0; v < pack_size; ++v)
         {
-            vec[v] = downcast_s<T>(acc[v]);
+            acc[v] = upcast_s(sum_bf16[v]);
         }
 
-        *reinterpret_cast<P*>(residual_out + idx) = vec;
         weight_p = *reinterpret_cast<P*>(weight + access_id_in_token);
     }
     // padded threads participate in reduction with zero acc but skip output writes
