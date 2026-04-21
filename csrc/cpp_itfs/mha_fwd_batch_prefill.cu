@@ -48,10 +48,11 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     int head_size_v  = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
 
-    // The 64-bit-load decision (>2GB KV cache → flat-load arm) is made per-arm
-    // inside the auto-generated dispatcher in fmha_batch_prefill_api.cpp, where
-    // each arm knows its own compile-time bn0 and dtype element size. The
-    // wrapper just forwards args; no runtime trait field for it.
+    // The kUseGlobalLoad decision (>2GB KV cache → use `global_load_lds_*`
+    // instead of SRD `buffer_load_*`) is made per-arm inside the auto-generated
+    // dispatcher in fmha_batch_prefill_api.cpp, where each arm knows its own
+    // compile-time bn0 and dtype element size. The wrapper just forwards args;
+    // no runtime trait field for it.
     auto traits = get_mha_batch_prefill_traits(head_size_q,
                                                head_size_v,
                                                q_dtype_str,
@@ -64,8 +65,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                                qscale_type,
                                                args.kv_memory_layout,
                                                args.kv_lookup_table,
-                                               args.page_block_size,
-                                               false /* skip_min_seqlen_q */);
+                                               args.page_block_size);
     return fmha_batch_prefill(traits, args, stream_config);
 }
 

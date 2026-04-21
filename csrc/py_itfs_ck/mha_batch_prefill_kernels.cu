@@ -822,7 +822,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                     "page_size=", args.page_block_size,
                     ", num_pages=", args.num_total_pages,
                     ", dtype=", dtype_str,
-                    ". If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < 128, "
+                    ". If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, "
                     "CDNA3+ GPU (MI300/MI350) is required.");
     }
     else

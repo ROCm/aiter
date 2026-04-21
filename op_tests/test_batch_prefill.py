@@ -1769,7 +1769,10 @@ def test_batch_prefill_large_kvcache(
     free_mem = torch.cuda.mem_get_info()[0]
     kv_len = num_blocks * page_size
     # Causal with attn_mask forces SDPA math backend which materializes
-    # [H_q, qo_len, kv_len] score + mask tensors. Use smaller qo_len to fit.
+    # [H_q, qo_len, kv_len] score + mask tensors. Magnitudes empirically chosen:
+    #   non-causal: 1024 -- flash backend, no full score matrix, headroom is large
+    #   causal:      128 -- math backend cliff: 3x [H_q, qo, kv] fp32 buffers must
+    #                      fit alongside K/V cache (kv_len up to ~5GB at this scale)
     qo_len = min(128, kv_len) if causal else min(1024, kv_len)
     # SDPA causal with attn_mask forces math backend: expanded mask + score matrix
     # + softmax intermediates, each [1, H_q, qo, kv] fp32. ~3x overhead empirically.
@@ -1922,6 +1925,10 @@ def test_batch_prefill_large_kvcache(
 
     cu_seqlens_q = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
     kv_indptr = torch.tensor([0, num_blocks], device="cuda", dtype=torch.int32)
+    # +256 padding is a batch_prefill ABI requirement: the kernel may speculatively
+    # read up to 256 entries past the last valid page index (one bn0=256 tile worth)
+    # before the bounds check kicks in. Padding with 0 keeps reads in-bounds; the
+    # values are masked out by causal/length logic and never affect the output.
     kv_page_indices = torch.nn.functional.pad(page_indices, (0, 256), value=0).to(
         "cuda"
     )
@@ -1947,8 +1954,12 @@ def test_batch_prefill_large_kvcache(
         kv_last_page_lens=kv_last_page_lens,
         **extra_kwargs,
     )
-    # Synchronize immediately to catch async GPU faults from CK kernel
-    # before they cascade to subsequent tests and trigger GPU reset.
+    # Synchronize immediately to catch async GPU faults from CK kernel before
+    # they cascade. Without this sync, an async fault can surface inside the
+    # next test's torch.cuda.empty_cache() (or any other CUDA call), causing
+    # the failure to be misattributed to that unrelated test -- and on bad
+    # faults the cascade can trigger a GPU reset that wipes out subsequent
+    # test results too.
     torch.cuda.synchronize()
     out = result[0] if isinstance(result, (list, tuple)) else result
 
