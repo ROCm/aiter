@@ -49,5 +49,5 @@ if is_flydsl_available():
         "compile_moe_gemm1",
         "compile_moe_gemm2",
         "flydsl_hgemm",
-        "flydsl_gdr_decode",
+        # "flydsl_gdr_decode",
     ]
