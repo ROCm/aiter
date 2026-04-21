@@ -2323,6 +2323,9 @@ class FmoeTuner(TunerCommon):
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
                 #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations → out_dtype="fp8"
                 #   a4w4 (a_dtype_str="fp4"): stage2 expects fp4 activations → out_dtype="fp4"
+                s1_tile_m = kparams["tile_m"]
+                if s1_tile_m != blockM:
+                    continue
                 if a_dtype_str == "fp8":
                     fp8_params = {
                         **kparams,
