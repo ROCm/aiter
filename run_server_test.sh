@@ -183,29 +183,22 @@ MANIFEST="$OUT_DIR/kernel_opt_worktrees.manifest"
 
 module_under_test="module_custom_all_reduce"
 
-# Seed a worktree's aiter/jit/ with pre-built .so files from the main repo, then
-# remove the module under test so it is rebuilt from the worktree's source.
+# Set up an isolated JIT cache for a worktree and export AITER_JIT_DIR pointing to it.
 #
-# Without this, git worktree add produces an empty aiter/jit/ (compiled .so files are
-# not tracked). The server JIT-builds some modules during startup, but others (e.g.
-# module_moe_sorting) are only needed during the first inference warmup pass, at which
-# point the import fails with ModuleNotFoundError because no .so exists and no build
-# was triggered for them.  Seeding from the baseline ensures every module except the
-# one being optimised is available immediately, matching the baseline environment.
+# aiter is installed as a package rooted at REPO_ROOT/aiter/jit/. Because Python
+# resolves the package to that fixed install path regardless of cwd, get_user_jit_dir()
+# always returns REPO_ROOT/aiter/jit/ — a shared cache used by every worktree.
+# Cleaning <worktree>/aiter/jit/ has no effect because the JIT system never writes there.
+#
+# The fix: set AITER_JIT_DIR to a per-worktree directory. get_user_jit_dir() checks
+# this env var first (core.py:383-387) and uses it as the exclusive JIT cache. Starting
+# from an empty directory forces all modules to recompile from the worktree's source.
 clean_jit() {
   local checkout_root=$1
-  local jit_dir="$checkout_root/aiter/jit"
-  local src_jit_dir="$REPO_ROOT/aiter/jit"
-  # Copy all pre-built .so files from the main repo into the worktree.
-  for so_file in "$src_jit_dir"/*.so; do
-    [[ -f "$so_file" ]] || continue
-    cp "$so_file" "$jit_dir/" 2>/dev/null || true
-  done
-  # Remove only the module under test so it gets freshly compiled from the worktree's code.
-  local jit_so="$jit_dir/$module_under_test.so"
-  local build_dir="$jit_dir/build/$module_under_test"
-  rm -f "$jit_so"
-  rm -rf "$build_dir"
+  local wt_jit_dir="$checkout_root/.jit_cache"
+  rm -rf "$wt_jit_dir"
+  mkdir -p "$wt_jit_dir"
+  export AITER_JIT_DIR="$wt_jit_dir"
 }
 
 require_git() {
@@ -226,7 +219,7 @@ start_openai_server_bg() {
   local server_log=$2
   mkdir -p "$(dirname "$server_log")"
   (
-    cd "$work_dir" && exec env PYTHONUNBUFFERED=1 python3 -m atom.entrypoints.openai_server \
+    cd "$work_dir" && exec env PYTHONUNBUFFERED=1 AITER_JIT_DIR="${AITER_JIT_DIR:-}" python3 -m atom.entrypoints.openai_server \
       --model "$SERVER_MODEL_PATH" \
       -tp "$SERVER_TP" --kv_cache_dtype fp8 \
       --host 0.0.0.0 --port "$SERVER_PORT"
@@ -361,6 +354,12 @@ run_benchmarks() {
   local work_dir=${3:-$REPO_ROOT}
   mkdir -p "$log_dir"
   local log="$log_dir/benchmark_${tag}.log"
+  # Use a per-worktree JIT cache so each checkout compiles its own modules.
+  # Always derive from work_dir so successive benchmark tags each get the right dir
+  # (build_phase exports AITER_JIT_DIR per worktree via clean_jit, but benchmark_phase
+  # may run standalone or iterate over multiple worktrees in a loop).
+  export AITER_JIT_DIR="$work_dir/.jit_cache"
+  mkdir -p "$AITER_JIT_DIR"
   local model="$SERVER_MODEL_PATH"
   local -a isl_osl_pairs=("1024,1024" "1024,8192" "8192,1024")
   local bench_runs=4
