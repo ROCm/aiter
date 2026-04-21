@@ -83,7 +83,9 @@ def get_flydsl_stage1_kernels(
         for tn in tile_ns:
             for tk in tile_ks:
                 for wpe in waves_per_eus:
-                    for kb in k_batches if wpe == 3 and tm in (16, 32) and is_fp4_a else [1]:
+                    for kb in (
+                        k_batches if wpe == 3 and tm in (16, 32) and is_fp4_a else [1]
+                    ):
                         for bnt in b_nts:
                             gate_onlys = (
                                 [False, True] if kb > 1 and is_fp4_a else [False]
