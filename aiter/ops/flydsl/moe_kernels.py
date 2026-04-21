@@ -68,7 +68,7 @@ def get_flydsl_stage1_kernels(
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [256]
-    tile_ms = [32, 64, 128]
+    tile_ms = [16, 32, 64, 128] if is_fp4_a else [32, 64, 128]
 
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
@@ -76,14 +76,14 @@ def get_flydsl_stage1_kernels(
     xcd_swizzles = [0, 4]
 
     for tm in tile_ms:
-        if tm == 32:
+        if tm <= 32:
             tile_ns = [32, 64, 128]
         else:
             tile_ns = [64, 128] if is_fp4_a else [128, 256]
         for tn in tile_ns:
             for tk in tile_ks:
                 for wpe in waves_per_eus:
-                    for kb in k_batches if wpe == 3 and tm == 32 and is_fp4_a else [1]:
+                    for kb in k_batches if wpe == 3 and tm in (16, 32) and is_fp4_a else [1]:
                         for bnt in b_nts:
                             gate_onlys = (
                                 [False, True] if kb > 1 and is_fp4_a else [False]
