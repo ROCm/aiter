@@ -11,11 +11,15 @@ from einops import rearrange
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, get_asm_dir
+from aiter.jit.core import (
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    get_asm_dir,
+)
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (
@@ -182,12 +186,22 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
         super().__init__(name, keys, resultList, description)
 
-    def _clear_op_caches(self):
-        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+    def run(self, args, fast_mode=False):
+        if getattr(args, "preshuffle", False):
+            self.ARG_DEFAULTS["config_env_name"] = (
+                "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
+            )
+            self.ARG_DEFAULTS["tune_file"] = (
+                f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}"
+            )
+        return super().run(args, fast_mode)
 
-        get_GEMM_config_with_quant_type.cache_clear()
-        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
-            get_GEMM_config_with_quant_type.file_cache.clear()
+    def _clear_op_caches(self):
+        from aiter.ops import gemm_op_a8w8 as _op
+
+        _op.get_CKGEMM_config.cache_clear()
+        _op._CKGEMM_CONFIG_CACHE.clear()
+        _op._CKGEMM_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         """
@@ -274,7 +288,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         block_per_cu,
         run_kwargs,
     ):
-        cu_num, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
         kernel_list = {
             k: v
@@ -341,7 +355,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        cu_num, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         kernel_list = (
             candidate_kernels_bpreshuffle_dict
             if preshuffleB
@@ -437,12 +451,18 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     )
                 ref = run_torch(x, weight, x_scale, w_scale)
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
+            finally:
+                torch.cuda.empty_cache()
         return results
 
     def get_gemm_a8w8_blockscale_asm_tune_task(
@@ -453,7 +473,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        cu_num, M, N, K = info_keys
+        gfx, cu_num, M, N, K = info_keys
         asm_kernel_list_csv = (
             f"{get_asm_dir()}/fp8gemm_blockscale/fp8gemm_bf16_blockscale.csv"
         )
@@ -526,6 +546,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         errRatio = args.errRatio
         block_per_cu = args.blockPerCu
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
         run_kwargs = {
             "num_warmup": args.warmup,
             "num_iters": args.iters,
@@ -539,7 +560,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             K = untunedf.loc[i, "K"]
             seed = seed + 1
             prev_task_count = len(task)
-            info_keys = (cu_num, M, N, K)
+            info_keys = (gfx, cu_num, M, N, K)
             lib = args.libtype
             if lib in ("ck", "both", "all"):
                 task.extend(
@@ -637,7 +658,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    key = ["cu_num", "M", "N", "K"]
+    key = ["gfx", "cu_num", "M", "N", "K"]
     resultList = [
         "libtype",
         "kernelId",

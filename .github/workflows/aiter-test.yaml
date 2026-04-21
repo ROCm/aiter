@@ -54,6 +54,10 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         uses: actions/checkout@v4
 
+      - name: Docker login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
       # - name: Prepare docker config
       #   run: |
       #     export DOCKER_CONFIG="$HOME/.docker"
@@ -129,7 +133,6 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
-          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           docker push $IMAGE_TAG
 
       - name: Success message
@@ -156,6 +159,7 @@ jobs:
         with:
           name: aiter-whl-main-${{ github.run_id }}
           path: dist/*.whl
+          retention-days: 14
 
       - name: Configure AWS credentials
         if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
@@ -221,6 +225,7 @@ jobs:
         with:
           name: aiter_shards
           path: aiter_shard_*.list
+          retention-days: 7
 
   standard:
     if: >-
@@ -400,6 +405,7 @@ jobs:
         with:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
           path: latest_test.log
+          retention-days: 7
 
       - name: Cleanup container
         if: always()
@@ -528,6 +534,7 @@ jobs:
         with:
           name: multigpu-test-${{ matrix.runner }}
           path: latest_test.log
+          retention-days: 7
 
       - name: Cleanup container
         if: always()

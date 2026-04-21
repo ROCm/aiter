@@ -12,12 +12,13 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm, memref, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.compiler.protocol import fly_values
-from flydsl.expr import arith, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, gpu, range_constexpr, const_expr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from .tensor_shim import GTensor, STensor, _to_raw, get_dtype_in_kernel
+from ..utils import get_shared_memory_per_block
 
 SPLIT_K_COUNTER_MAX_LEN = 128
 SPLIT_K_SIGNAL_STATE_COUNT = 3
@@ -74,11 +75,11 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
     def __call__(self, a_frag, b_frag, c_frag):
         if self.dtype == "bf16":
             return rocdl.mfma_f32_16x16x32_bf16(
-                T.vec(self.WMMA_C_FRAG_VALUES, T.f32), a_frag, b_frag, c_frag, 0, 0, 0
-            ).res
+                T.vec(self.WMMA_C_FRAG_VALUES, T.f32), [a_frag, b_frag, c_frag, 0, 0, 0]
+            )
         return rocdl.mfma_f32_16x16x32_f16(
-            T.vec(self.WMMA_C_FRAG_VALUES, T.f32), a_frag, b_frag, c_frag, 0, 0, 0
-        ).res
+            T.vec(self.WMMA_C_FRAG_VALUES, T.f32), [a_frag, b_frag, c_frag, 0, 0, 0]
+        )
 
 
 class OnlineScheduler:
@@ -178,6 +179,15 @@ def compile_hgemm_kernel(
     assert BLOCK_MN_SIZE % BLOCK_VECS == 0
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
+    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
+    KERNEL_NAME += "_NA" if not ASYNC_COPY else "_AS"
+    if B_PRE_SHUFFLE:
+        KERNEL_NAME += "_BP"
+    if IS_SPLIT_K:
+        KERNEL_NAME += f"_SPK{SPLIT_K}"
+    if B_TO_LDS:
+        KERNEL_NAME += "_BS"
+
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
     AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
@@ -188,21 +198,19 @@ def compile_hgemm_kernel(
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
         SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    assert SMEM_USE <= 163840
+    smem_limit = get_shared_memory_per_block(fallback_gfx=GPU_ARCH)
+    if SMEM_USE > smem_limit:
+        raise RuntimeError(
+            f"{KERNEL_NAME} requires {SMEM_USE} bytes LDS, "
+            f"but device limit is {smem_limit} bytes "
+            f"(arch={GPU_ARCH}, TILE_M={TILE_M}, TILE_N={TILE_N}, TILE_K={TILE_K}, "
+            f"SPLIT_K={SPLIT_K}, B_TO_LDS={B_TO_LDS})",
+        )
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_A_COUNT_AS = BLOCK_MK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
-
-    KERNEL_NAME = f"hgemm_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_S{STAGES}TN"
-    KERNEL_NAME += "_NA" if not ASYNC_COPY else "_AS"
-    if B_PRE_SHUFFLE:
-        KERNEL_NAME += "_BP"
-    if IS_SPLIT_K:
-        KERNEL_NAME += f"_SPK{SPLIT_K}"
-    if B_TO_LDS:
-        KERNEL_NAME += "_BS"
 
     @flyc.kernel
     def hgemm_kernel(
@@ -227,7 +235,7 @@ def compile_hgemm_kernel(
             base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,)
         )
         as_ = STensor(smem_a_ptr, dtype_, shape=(STAGES, BLOCK_M, BLOCK_K))
-        if B_TO_LDS:
+        if const_expr(B_TO_LDS):
             smem_b_ptr = SmemPtr(
                 base_ptr, smem_b_offset, dtype_, shape=(STAGES * BLOCK_N * BLOCK_K,)
             )
@@ -236,7 +244,7 @@ def compile_hgemm_kernel(
             base_ptr, smem_a_offset, dtype_, shape=(BLOCK_M * BLOCK_N,)
         )
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_M, BLOCK_N))
-        if B_PRE_SHUFFLE:
+        if const_expr(B_PRE_SHUFFLE):
             SHUFFLED_B_ = GTensor(
                 B,
                 dtype=dtype_,
@@ -248,7 +256,7 @@ def compile_hgemm_kernel(
                     LDG_VEC_SIZE,
                 ),
             )
-        if IS_SPLIT_K:
+        if const_expr(IS_SPLIT_K):
             COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
 
         tid = fx.Int32(fx.thread_idx.x)
@@ -595,7 +603,7 @@ def compile_hgemm_kernel(
                 b_k0 = b_k0_base + kk
                 for ii in range_constexpr(WARP_N_STEPS):
                     b_n0 = b_n0_base + ii
-                    if not B_PRE_SHUFFLE:
+                    if const_expr(not B_PRE_SHUFFLE):
                         warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
                         warp_atom_k_idx = kk * WARP_ATOM_K
                         n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
@@ -621,7 +629,7 @@ def compile_hgemm_kernel(
                     a_frag = a_frags[kk * WARP_M_STEPS + ii]
                     for jj in range_constexpr(WARP_N_STEPS):
                         b_frag = b_frags[kk * WARP_N_STEPS + jj]
-                        if MFMA_PER_WARP_K == 2:
+                        if const_expr(MFMA_PER_WARP_K == 2):
                             a_i64x2 = vector.bitcast(T.i64x2, a_frag)
                             a0_i64 = vector.extract(
                                 a_i64x2, static_position=[0], dynamic_position=[]
@@ -652,7 +660,7 @@ def compile_hgemm_kernel(
                             acc_in = c_frags_new[c_idx]
                             acc_mid = WMMA_IMPL(a_v0, b_v0, acc_in)
                             c_frags_new[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
-                        elif MFMA_PER_WARP_K == 1:
+                        elif const_expr(MFMA_PER_WARP_K == 1):
                             c_idx = ii * WARP_N_STEPS + jj
                             c_frags_new[c_idx] = WMMA_IMPL(
                                 a_frag, b_frag, c_frags_new[c_idx]
@@ -663,10 +671,10 @@ def compile_hgemm_kernel(
                             )
             return c_frags_new
 
-        if IS_SPLIT_K:
+        if const_expr(IS_SPLIT_K):
             zero_c()
 
-        if B_TO_LDS:
+        if const_expr(B_TO_LDS):
             ldg_sts_a_async(ks_begin, 0)
             ldg_sts_b_async(ks_begin, 0)
             gpu.barrier()
@@ -748,7 +756,7 @@ def compile_hgemm_kernel(
                 ldg_total = ldg_reg_a_count_ + WARP_K_STEPS * WARP_N_STEPS
                 mfma_ = OnlineScheduler(mfma_total, mfma_total)
                 ldg_ = OnlineScheduler(ldg_total, ldg_total)
-                if ASYNC_COPY:
+                if const_expr(ASYNC_COPY):
                     avg_mfma_count = (mfma_total + ldg_total - 1) // ldg_total
                     for _ in range_constexpr(ldg_total):
                         rocdl.sched_vmem(ldg_.consume(1))
@@ -774,13 +782,13 @@ def compile_hgemm_kernel(
                 c_frags = state[2 : 2 + C_FRAGS_LEN]
                 a_frags = state[2 + C_FRAGS_LEN : 2 + C_FRAGS_LEN + A_FRAGS_LEN]
                 b_frags = state[2 + C_FRAGS_LEN + A_FRAGS_LEN :]
-                if ASYNC_COPY:
+                if const_expr(ASYNC_COPY):
                     ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
                 else:
                     a_regs_next = ldg_a(k_offset + BLOCK_K)
                 b_frags_next = ldg_matrix_b(k_offset + BLOCK_K)
                 c_frags = block_mma_sync(a_frags, b_frags, c_frags)
-                if not ASYNC_COPY:
+                if const_expr(not ASYNC_COPY):
                     sts_a(a_regs_next, next_stage)
                 hot_loop_scheduler()
                 gpu.barrier()
@@ -812,7 +820,7 @@ def compile_hgemm_kernel(
                     )
                     cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
 
-        if IS_SPLIT_K:
+        if const_expr(IS_SPLIT_K):
             split_k_barrier()
             out_raw = fly_values(C)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
@@ -909,27 +917,4 @@ def compile_hgemm_kernel(
             stream=stream,
         )
 
-    _compile_hints = {
-        "llvm_options": {
-            "enable-post-misched": False,
-            "lsr-drop-solution": True,
-        },
-    }
-
-    def _launch(*args, **kwargs):
-        with CompilationContext.compile_hints(_compile_hints):
-            return launch_hgemm_kernel(*args, **kwargs)
-
-    _compile_cache = {}
-
-    def _compile(C, A, B, m, COUNTER, signal_state, stream):
-        with CompilationContext.compile_hints(_compile_hints):
-            if _compile_cache.get(m, None) is None:
-                _compile_cache[m] = flyc.compile(
-                    launch_hgemm_kernel, C, A, B, m, COUNTER, signal_state, stream
-                )
-            return _compile_cache[m]
-
-    _launch.compile = _compile
-
-    return _launch
+    return launch_hgemm_kernel
