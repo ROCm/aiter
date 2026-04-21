@@ -170,13 +170,11 @@ def swizzle_scales_gfx1250(data):
         4,
         PRESHUFFLE_FACTOR // 4,
         SCALE_K // SCALE_KWIDTH,
-        SCALE_KWIDTH
+        SCALE_KWIDTH,
     )
     data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
     data = data.view(
-        *data_shape[:-2],
-        N // PRESHUFFLE_FACTOR,
-        SCALE_K * PRESHUFFLE_FACTOR
+        *data_shape[:-2], N // PRESHUFFLE_FACTOR, SCALE_K * PRESHUFFLE_FACTOR
     )
     return data
 
@@ -200,17 +198,16 @@ def dynamic_nvfp4_quant_kv_cache(
     quant_head_size = head_size // 2
     scale_width = head_size // 16
 
-    print()
-
-    k_width = 16 // key_cache.element_size()
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    key_cache_shuffled = key_cache_shuffled.view(
-        -1, block_size, head_size
+    key_cache_shuffled = key_cache_shuffled.view(-1, block_size, head_size)
+    key_cache_shuffled, key_cache_shuffled_scale = torch_dynamic_mxfp4_quant(
+        key_cache_shuffled, is_nvfp4=True
     )
-    key_cache_shuffled, key_cache_shuffled_scale = torch_dynamic_mxfp4_quant(key_cache_shuffled, is_nvfp4 = True)
-    key_cache_shuffled_scale = key_cache_shuffled_scale.view(-1, num_kv_heads, block_size, scale_width)
+    key_cache_shuffled_scale = key_cache_shuffled_scale.view(
+        -1, num_kv_heads, block_size, scale_width
+    )
     key_cache_shuffled = shuffle_weight(key_cache_shuffled).view(
         -1, num_kv_heads, block_size * quant_head_size
     )
@@ -218,7 +215,11 @@ def dynamic_nvfp4_quant_kv_cache(
         -1, num_kv_heads, block_size * scale_width
     )
     key_cache_shuffled = torch.cat(
-        [key_cache_shuffled.view(torch.uint8), key_cache_shuffled_scale.view(torch.uint8)], dim = -1
+        [
+            key_cache_shuffled.view(torch.uint8),
+            key_cache_shuffled_scale.view(torch.uint8),
+        ],
+        dim=-1,
     ).contiguous()
     key_cache_shuffled = key_cache_shuffled.view(
         -1, num_kv_heads, block_size, quant_head_size + scale_width
@@ -227,26 +228,31 @@ def dynamic_nvfp4_quant_kv_cache(
     value_cache_shuffled = value_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    value_cache_shuffled = value_cache_shuffled.view(
-        -1, block_size, head_size
+    value_cache_shuffled = value_cache_shuffled.view(-1, block_size, head_size)
+    value_cache_shuffled, value_cache_shuffled_scale = torch_dynamic_mxfp4_quant(
+        value_cache_shuffled, is_nvfp4=True
     )
-    value_cache_shuffled, value_cache_shuffled_scale = torch_dynamic_mxfp4_quant(value_cache_shuffled, is_nvfp4 = True)
-    value_cache_shuffled_scale = value_cache_shuffled_scale.view(-1, num_kv_heads, block_size, scale_width)
+    value_cache_shuffled_scale = value_cache_shuffled_scale.view(
+        -1, num_kv_heads, block_size, scale_width
+    )
     value_cache_shuffled = shuffle_weight(value_cache_shuffled).view(
         -1, num_kv_heads, block_size * quant_head_size
     )
-    value_cache_shuffled_scale = swizzle_scales_gfx1250(value_cache_shuffled_scale).view(
-        -1, num_kv_heads, block_size * scale_width
-    )
+    value_cache_shuffled_scale = swizzle_scales_gfx1250(
+        value_cache_shuffled_scale
+    ).view(-1, num_kv_heads, block_size * scale_width)
     value_cache_shuffled = torch.cat(
-        [value_cache_shuffled.view(torch.uint8), value_cache_shuffled_scale.view(torch.uint8)], dim = -1
+        [
+            value_cache_shuffled.view(torch.uint8),
+            value_cache_shuffled_scale.view(torch.uint8),
+        ],
+        dim=-1,
     ).contiguous()
     value_cache_shuffled = value_cache_shuffled.view(
         -1, num_kv_heads, block_size, quant_head_size + scale_width
     )
-    print(key_cache_shuffled.shape, value_cache_shuffled.shape)
-    print(key_cache_shuffled_scale.shape, value_cache_shuffled_scale.shape)
     return key_cache_shuffled, value_cache_shuffled
+
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
 HEAD_SIZES = [128, 256]
@@ -382,14 +388,16 @@ def ref_paged_attn(
 )
 @pytest.mark.parametrize("num_heads", [(8, 1)])
 @pytest.mark.parametrize("head_size", [64])
-@pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("sliding_window", [None])
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, o_dtype, use_out_scale",
+    "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
     [
-        # (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
-        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, False),
-        (torch.uint8, torch.uint8, torch.bfloat16, False),
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
 )
 @pytest.mark.parametrize("soft_cap", [None])
@@ -458,21 +466,19 @@ def test_triton_unified_attn_3d(
     )
     query_scales = None
     if q_dtype == torch.uint8:
-        query = query / 20
-        query_q = query.view(-1, head_size)
-        query_q, query_scales = torch_dynamic_mxfp4_quant(query_q, is_nvfp4 = True)
-        print(f"{query_q.shape=}, {query_scales.shape=}")
-        query_q = query_q.view(-1, num_query_heads, head_size // 2)
+        query = query / 10
+        maybe_quant_query = query.view(-1, head_size)
+        maybe_quant_query, query_scales = torch_dynamic_mxfp4_quant(
+            maybe_quant_query, is_nvfp4=True
+        )
+        maybe_quant_query = maybe_quant_query.view(-1, num_query_heads, head_size // 2)
         query_scales = query_scales.view(-1, num_query_heads, head_size // 16)
-        print(f"{query_q.shape=}, {query_scales.shape=}")
-        e2m1_table = torch.tensor([
-            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-        ], dtype=torch.float32, device="cuda")
         query = query.to(e4m3_dtype)
     else:
+        # query = query / 10
         query = query.to(q_dtype)
-        query_q = query
-        e2m1_table = None
+        maybe_quant_query = query
+
     key_cache = torch.randn(
         num_blocks,
         block_size,
@@ -522,13 +528,10 @@ def test_triton_unified_attn_3d(
             1, start=1e-4, end=1.0, dtype=torch.float32, device="cuda"
         )
 
-    # tmp1, tmp2 = dynamic_nvfp4_quant_kv_cache(key_cache, value_cache)
-    # print(tmp1.shape, tmp2.shape)
-
     if shuffled_kv_cache:
         if kv_dtype == torch.uint8:
-            maybe_shuffled_key_cache, maybe_shuffled_value_cache = dynamic_nvfp4_quant_kv_cache(
-                key_cache, value_cache
+            maybe_shuffled_key_cache, maybe_shuffled_value_cache = (
+                dynamic_nvfp4_quant_kv_cache(key_cache, value_cache)
             )
             key_cache = key_cache.to(e4m3_dtype)
             value_cache = value_cache.to(e4m3_dtype)
@@ -545,7 +548,7 @@ def test_triton_unified_attn_3d(
         maybe_shuffled_value_cache = value_cache
 
     unified_attention(
-        q=query_q,
+        q=maybe_quant_query,
         k=maybe_shuffled_key_cache,
         v=maybe_shuffled_value_cache,
         out=output,
@@ -562,7 +565,6 @@ def test_triton_unified_attn_3d(
         k_descale=k_descale,
         v_descale=v_descale,
         q_scales=query_scales,
-        e2m1_table=e2m1_table,
         output_scale=output_scale,
         sinks=sinks,
         shuffled_kv_cache=shuffled_kv_cache,
