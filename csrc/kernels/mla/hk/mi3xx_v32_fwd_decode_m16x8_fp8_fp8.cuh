@@ -10,7 +10,7 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/python.h>
 
-template <typename q_t_, typename kv_t_, typename out_t_>
+template <typename q_t_, typename kv_t_, typename out_t_, int32_t kPageSize_ = 1>
 struct HkMlaDecodeFwdTraits
 {
     static constexpr int32_t kKvNumHead     = 1;
@@ -19,7 +19,9 @@ struct HkMlaDecodeFwdTraits
     static constexpr int32_t kQkRopeHeadDim = 64;
     static constexpr int32_t kQkHeadDim     = kQkNopeHeadDim + kQkRopeHeadDim;
     static constexpr int32_t kVoHeadDim     = kKvLoraRank;
-    static constexpr int32_t kPageSize      = 1;
+    static constexpr int32_t kPageSize      = kPageSize_;
+    static_assert(kPageSize >= 1 && (kPageSize & (kPageSize - 1)) == 0,
+                  "kPageSize must be a positive power of 2.");
     static constexpr int32_t kNumWarps      = 8;
     static constexpr int32_t kNumThreads    = kNumWarps * opus::get_warp_size();
     static constexpr int32_t kOccupancy     = 1;
@@ -62,6 +64,9 @@ struct HkMlaDecodeFwdParams
     Traits::gl_q query;
     Traits::gl_kv kv_buffer;
     const int32_t* p_kv_indices;
+    // Only read when kPageSize > 1 AND this work item ends at the batch tail
+    // (work_info.kv_offset == 0). Pass nullptr when kPageSize == 1.
+    const int32_t* p_kv_last_page_lens;
 
     // metadata
     const int32_t* p_work_indptr;
@@ -263,12 +268,37 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 2]);
         const int32_t qo_end = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 3]);
-        const int32_t kv_start = __builtin_amdgcn_readfirstlane(
+        const int32_t kv_start_page = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 4]);
-        const int32_t kv_end = __builtin_amdgcn_readfirstlane(
+        const int32_t kv_end_page = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 5]);
+        // kv_offset is in TOKEN units regardless of page_size: number of
+        // real KV tokens in this batch that come after this work item.
+        // kv_offset == 0 iff this work item ends at the batch tail.
         const int32_t kv_offset = __builtin_amdgcn_readfirstlane(
             params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 6]);
+
+        // Convert work_info page bounds to TOKEN space. When kPageSize == 1
+        // pages == tokens and we never touch p_kv_last_page_lens. When
+        // kPageSize > 1 and this is the batch tail (kv_offset == 0), the
+        // last page is partial and we clip with kv_last_page_lens[batch].
+        // The combined condition relies on compile-time folding of
+        // (T::kPageSize == 1) so the else branch (with the load) becomes
+        // dead code when kPageSize == 1.
+        const int32_t kv_start = kv_start_page * T::kPageSize;
+        int32_t kv_end;
+        if((T::kPageSize == 1) || (kv_offset != 0))
+        {
+            kv_end = kv_end_page * T::kPageSize;
+        }
+        else
+        {
+            const int32_t batch_idx = __builtin_amdgcn_readfirstlane(
+                params.p_work_info_set[work_idx * kSizeMlaWorkInfoInDw + 0]);
+            const int32_t last_page_len = __builtin_amdgcn_readfirstlane(
+                params.p_kv_last_page_lens[batch_idx]);
+            kv_end = (kv_end_page - 1) * T::kPageSize + last_page_len;
+        }
         // Per-warp causal offset: warp at qpos i must clamp kv_end to its
         // visible range. With kv_offset KV positions remaining after this
         // chunk, qpos i sees up to (kv_end + kv_offset - (Q - 1 - i)) =
@@ -285,11 +315,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         if(kv_len < T::kBlockN)
         {
             row_kv_ld =
-                get_kv_ld_row<true>(params.p_kv_indices, kv_ld_row_base_idx, kv_start, kv_end);
+                get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices, kv_ld_row_base_idx, kv_start, kv_end);
         }
         else
         {
-            row_kv_ld = get_kv_ld_row<false>(
+            row_kv_ld = get_kv_ld_row<false, T::kPageSize>(
                 params.p_kv_indices, kv_ld_row_base_idx, kv_start, kv_start + T::kBlockN);
         }
 
@@ -312,14 +342,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         int32_t row_kv_ld_next_next = -1;
         if(kv_len >= 2 * T::kBlockN)
         {
-            row_kv_ld_next_next = get_kv_ld_row<false>(params.p_kv_indices,
+            row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
                                                        kv_ld_row_base_idx,
                                                        kv_start + T::kBlockN,
                                                        kv_start + 2 * T::kBlockN);
         }
         else if(kv_len > T::kBlockN)
         {
-            row_kv_ld_next_next = get_kv_ld_row<true>(
+            row_kv_ld_next_next = get_kv_ld_row<true, T::kPageSize>(
                 params.p_kv_indices, kv_ld_row_base_idx, kv_start + T::kBlockN, kv_end);
         }
 
@@ -451,14 +481,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 {
                     if((kv_tile_start + 3 * T::kBlockN) <= kv_end)
                     {
-                        row_kv_ld_next_next = get_kv_ld_row<false>(params.p_kv_indices,
+                        row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
                                                                    kv_ld_row_base_idx,
                                                                    kv_tile_start + 2 * T::kBlockN,
                                                                    kv_tile_end + 2 * T::kBlockN);
                     }
                     else
                     {
-                        row_kv_ld_next_next = get_kv_ld_row<true>(params.p_kv_indices,
+                        row_kv_ld_next_next = get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices,
                                                                   kv_ld_row_base_idx,
                                                                   kv_tile_start + 2 * T::kBlockN,
                                                                   kv_end);
@@ -930,6 +960,8 @@ void mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
             Traits::kQkHeadDim),
         // kv_indices
         kv_page_indices.data_ptr<int32_t>(),
+        // kv_last_page_lens (only read by kernel when kPageSize > 1)
+        kv_last_page_lens.data_ptr<int32_t>(),
         // metadata
         work_indptr.data_ptr<int32_t>(),
         work_info_set.data_ptr<int32_t>(),
@@ -985,20 +1017,43 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
 
     if(q_is_fp8 && kv_is_fp8)
     {
-        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16>;
-        mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>(query,
-                                                 kv_buffer,
-                                                 qo_indptr,
-                                                 kv_indptr,
-                                                 kv_page_indices,
-                                                 kv_last_page_lens,
-                                                 work_indptr,
-                                                 work_info_set,
-                                                 max_seqlen_q,
-                                                 softmax_scale,
-                                                 split_output,
-                                                 split_lse,
-                                                 final_output);
+        const int32_t page_size = kv_buffer.size(1);
+
+#define DISPATCH_PAGE_SIZE(PS)                                                                  \
+    case PS:                                                                                    \
+    {                                                                                           \
+        using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16, PS>;            \
+        mla_v32_fwd_decode_m16x8_fp8_fp8<Traits>(query,                                         \
+                                                 kv_buffer,                                     \
+                                                 qo_indptr,                                     \
+                                                 kv_indptr,                                     \
+                                                 kv_page_indices,                               \
+                                                 kv_last_page_lens,                             \
+                                                 work_indptr,                                   \
+                                                 work_info_set,                                 \
+                                                 max_seqlen_q,                                  \
+                                                 softmax_scale,                                 \
+                                                 split_output,                                  \
+                                                 split_lse,                                     \
+                                                 final_output);                                 \
+        break;                                                                                  \
+    }
+
+        // Only page_size in {1, 64} are instantiated. 64 is the value used by
+        // FlashMLA, TRT-LLM-MLA and FlashInfer-MLA in vLLM/SGLang for typical
+        // DeepSeek deployments; 1 covers the unpaged path.
+        switch(page_size)
+        {
+            DISPATCH_PAGE_SIZE(1)
+            DISPATCH_PAGE_SIZE(64)
+            default:
+                TORCH_CHECK(false,
+                            "hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8: unsupported page_size ",
+                            page_size,
+                            " (supported: 1, 64).");
+        }
+
+#undef DISPATCH_PAGE_SIZE
     }
     else
     {

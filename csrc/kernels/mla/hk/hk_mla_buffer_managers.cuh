@@ -558,7 +558,11 @@ class QManagerV5 : public QManagerV4<T>
     }
 };
 
-template <bool kCheckBoundary>
+// kv_tile_start / kv_tile_end are in TOKEN units. For kPageSize > 1 the
+// per-lane row index is split into (page_idx, intra_page_off), then the
+// physical page number from p_kv_indices is converted back to a flat row
+// in the [num_page * kPageSize, ...] view.
+template <bool kCheckBoundary, int32_t kPageSize>
 __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
                                                  const int32_t row_base,
                                                  const int32_t kv_tile_start,
@@ -576,8 +580,19 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
     {
         const __amdgpu_buffer_rsrc_t rsrc = __builtin_amdgcn_make_buffer_rsrc(
             const_cast<void*>(static_cast<const void*>(p_kv_indices)), 0, 0xffffffff, 0x00020000);
-        row_kv_ld =
-            __builtin_amdgcn_raw_buffer_load_b32(rsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
+        if constexpr(kPageSize == 1)
+        {
+            row_kv_ld =
+                __builtin_amdgcn_raw_buffer_load_b32(rsrc, row_kv_ld_idx * sizeof(int32_t), 0, 0);
+        }
+        else
+        {
+            const uint32_t page_idx   = row_kv_ld_idx / kPageSize;
+            const uint32_t intra_page = row_kv_ld_idx % kPageSize;
+            const int32_t page_phys   = __builtin_amdgcn_raw_buffer_load_b32(
+                rsrc, page_idx * sizeof(int32_t), 0, 0);
+            row_kv_ld = page_phys * kPageSize + intra_page;
+        }
     }
 
     return row_kv_ld;
