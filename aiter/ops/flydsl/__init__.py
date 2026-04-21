@@ -27,6 +27,11 @@ if is_flydsl_available():
             "so its version cannot be validated."
         ) from exc
 
+    if not installed_flydsl_version:
+        raise ImportError(
+            "`flydsl` package metadata returned an empty version string."
+        )
+
     _base_version = installed_flydsl_version.split("+")[0].split(".dev")[0]
     if _base_version != _REQUIRED_FLYDSL_VERSION:
         raise ImportError(
