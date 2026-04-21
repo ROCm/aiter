@@ -358,7 +358,7 @@ struct __attribute__((packed)) fmha_fwd_v3_args
 
 // Simplified args struct for gfx950 FP8 FMHA kernel (f8_mha_hd128.sp3).
 // This kernel uses a flat BHSD layout with unified Q/K/V strides.
-// Limitations: no causal mask, no GQA, no variable seqlen, no descaling, no LSE.
+// Limitations: no causal mask, no GQA, no variable seqlen, no LSE.
 struct __attribute__((packed)) fmha_fwd_v3_fp8_950_args
 {
     void* ptr_o;
@@ -385,8 +385,12 @@ struct __attribute__((packed)) fmha_fwd_v3_fp8_950_args
     p3 _p10;
     unsigned int inst_addr_hi;
     p3 _p11;
-    float v_descale;
-    p3 _p12;
+    const void* ptr_q_descale;  // 0xC0
+    p2 _p12;
+    const void* ptr_k_descale;  // 0xD0
+    p2 _p13;
+    const void* ptr_v_descale;  // 0xE0
+    p2 _p14;
 };
 
 __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,

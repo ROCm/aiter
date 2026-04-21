@@ -275,10 +275,9 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         fp8_args.inst_addr_lo = static_cast<uint32_t>(q_addr & 0xFFFFFFFF);
         fp8_args.inst_addr_hi = static_cast<uint32_t>((q_addr >> 32) & 0xFFFFFFFF);
 
-        fp8_args.v_descale = 1.0f;
-        if (a.v_descale_ptr) {
-            hipMemcpy(&fp8_args.v_descale, a.v_descale_ptr, sizeof(float), hipMemcpyDeviceToHost);
-        }
+        fp8_args.ptr_q_descale = a.q_descale_ptr;
+        fp8_args.ptr_k_descale = a.k_descale_ptr;
+        fp8_args.ptr_v_descale = a.v_descale_ptr;
 
         return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
             void* args_ptr       = &fp8_args;
