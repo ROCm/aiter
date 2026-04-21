@@ -192,23 +192,18 @@ def mla_decode_fwd(
     persistent_mode = work_meta_data is not None
 
     io_transformed = False
-    forced_head_pad = False
-    o_out = o
+    # NOTE: nhead=8 -> 16 padding is now owned by the caller (SGLang
+    # AiterMlaBackend._pad_mla_q_8_to_16).  The forced_head_pad fallback
+    # that used to live here has been removed; callers must pass q with
+    # nhead in {16, 32, 128}.
     qseqlen_folded = False
 
-    if force_decode and nhead == 8:
-        forced_head_pad = True
-        padded_nhead = 16
-        q_padded = torch.zeros(
-            (total_s, padded_nhead, qk_head_dim), dtype=q.dtype, device=device
-        )
-        q_padded[:, :nhead, :] = q
-        o_padded = torch.empty(
-            (total_s, padded_nhead, v_head_dim), dtype=o.dtype, device=device
-        )
-        q = q_padded
-        o = o_padded
-        nhead = padded_nhead
+    # (removed legacy forced_head_pad branch - see note above.)
+    assert not (force_decode and nhead == 8), (
+        "mla_decode_fwd received nhead=8 but the legacy forced_head_pad "
+        "fallback has been removed.  The caller (e.g. SGLang AiterMlaBackend) "
+        "is now responsible for pre-padding q to nhead=16 before calling."
+    )
 
     if not persistent_mode:
         if num_kv_splits is None or num_kv_splits_indptr is None:
@@ -283,11 +278,6 @@ def mla_decode_fwd(
                 and nhead in [32, 64]
             )
         ):
-            if forced_head_pad:
-                o_out.copy_(o[:, :ori_nhead, :])
-                logits = logits[:, :, :ori_nhead, :]
-                attn_lse = attn_lse[:, :, :ori_nhead, :]
-                return logits.view(total_s, ori_nhead, v_head_dim), attn_lse
             return logits.view(total_s, nhead, v_head_dim), attn_lse
 
         Lv = v_head_dim
@@ -450,9 +440,6 @@ def mla_decode_fwd(
             o,
             final_lse,
         )
-
-    if forced_head_pad:
-        o_out.copy_(o[:, :ori_nhead, :])
 
     if io_transformed:
         if return_logits:
