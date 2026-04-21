@@ -70,6 +70,25 @@ namespace py = pybind11;
           "Activation function used in SwiGLU.",        \
           py::arg("out"),                               \
           py::arg("input"));                            \
+    m.def("swiglu_and_mul",                             \
+          &aiter::swiglu_and_mul,                       \
+          "Activation function used in GPT-OSS SwiGLU.",\
+          py::arg("out"),                               \
+          py::arg("input"));                            \
+    m.def("silu_and_mul_bias",                          \
+          &aiter::silu_and_mul_bias,                    \
+          "SiLU gating with per-expert bias.",          \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("expert_ids"),                        \
+          py::arg("bias"));                             \
+    m.def("swiglu_and_mul_bias",                        \
+          &aiter::swiglu_and_mul_bias,                  \
+          "SwiGLU gating with per-expert bias.",        \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("expert_ids"),                        \
+          py::arg("bias"));                             \
     m.def("scaled_silu_and_mul",                        \
           &aiter::scaled_silu_and_mul,                  \
           "Activation function used in scaled SwiGLU.", \
@@ -958,7 +977,8 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true);              \
+          py::arg("is_shuffled")       = true,         \
+          py::arg("bias")              = std::nullopt); \
                                                        \
     m.def("ck_moe_stage2",                             \
           &ck_moe_stage2,                              \
@@ -980,7 +1000,8 @@ namespace py = pybind11;
           py::arg("splitk")            = 1,            \
           py::arg("non_temporal_load") = false,        \
           py::arg("dst_type")          = std::nullopt, \
-          py::arg("is_shuffled")       = true);
+          py::arg("is_shuffled")       = true,         \
+          py::arg("bias")              = std::nullopt);
 
 #define MOE_CKTILE_2STAGES_PYBIND                    \
     m.def("cktile_moe_gemm1",                        \

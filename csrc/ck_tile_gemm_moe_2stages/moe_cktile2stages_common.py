@@ -27,6 +27,7 @@ act_dict = {
 
 dtype_dict = {
     "fp8": "ck_tile::fp8_t",
+    "fp16": "ck_tile::fp16_t",
     "bf16": "ck_tile::bf16_t",
     "float": "float",
     "fp4": "ck_tile::pk_fp4_t",

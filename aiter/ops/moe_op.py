@@ -233,6 +233,7 @@ def cmdGenFunc_ck_moe_stage(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    bias: Optional[Tensor] = None,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -275,6 +276,7 @@ def cmdGenFunc_ck_moe_stage2(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    bias: Optional[Tensor] = None,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -314,6 +316,7 @@ def ck_moe_stage1(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    bias: Optional[Tensor] = None,
 ) -> None: ...
 
 
@@ -338,6 +341,7 @@ def ck_moe_stage2(
     use_non_temporal_load: bool = False,
     dst_type: Optional[str] = None,
     is_shuffled: bool = True,
+    bias: Optional[Tensor] = None,
 ) -> None: ...
 
 
@@ -551,6 +555,7 @@ def ck_moe_stage1_fwd(
     splitk: Optional[int] = 1,
     use_non_temporal_load: Optional[bool] = False,
     dst_type: Optional[torch.dtype] = None,
+    bias: Optional[Tensor] = None,
 ):
     ck_moe_stage1(
         hidden_states,
@@ -572,6 +577,7 @@ def ck_moe_stage1_fwd(
         use_non_temporal_load,
         None if dst_type is None else dtype2str_dict[dst_type],
         is_shuffled=getattr(w1, "is_shuffled", False),
+        bias=bias,
     )
     return out
 
@@ -593,6 +599,7 @@ def ck_moe_stage2_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
     use_non_temporal_load: Optional[bool] = False,
+    bias: Optional[Tensor] = None,
 ):
     ck_moe_stage2(
         inter_states,
@@ -612,5 +619,6 @@ def ck_moe_stage2_fwd(
         activation.value,
         use_non_temporal_load=use_non_temporal_load,
         is_shuffled=getattr(w2, "is_shuffled", False),
+        bias=bias,
     )
     return out
