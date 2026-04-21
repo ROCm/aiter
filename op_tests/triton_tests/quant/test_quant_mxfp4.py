@@ -4,12 +4,8 @@
 import torch
 import pytest
 
-from aiter.ops.triton.quant.quant import (
-    dynamic_mxfp4_quant,
-)  # remove the last quant before merging
-from aiter.ops.triton.quant.quant import (
-    dynamic_nvfp4_quant,
-)  # remove the last quant before merging
+from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.ops.triton.quant import dynamic_nvfp4_quant
 from aiter.utility.fp4_utils import (
     dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant,
 )

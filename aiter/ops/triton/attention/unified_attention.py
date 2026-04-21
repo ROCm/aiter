@@ -238,6 +238,8 @@ def unified_attention(
     q_descale,
     k_descale,
     v_descale,
+    q_scales=None,
+    e2m1_table=None,
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
@@ -248,9 +250,6 @@ def unified_attention(
 ):
     assert causal, "Only causal attention is supported"
 
-    if sinks is not None:
-        assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
-
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
@@ -258,10 +257,42 @@ def unified_attention(
     q_dtype = q.dtype
     kv_cache_dtype = k.dtype
     num_tokens, num_query_heads, head_size = q.shape
+
+    print(sinks.shape, num_query_heads)
+
+    if sinks is not None:
+        assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
+
+    BLOCK_SCALES_SIZE = 16
+    FP8_DTYPE = BLOCK_SCALES_DTYPE = e4m3_dtype
+    if q_dtype == torch.uint8:
+        # A4W4
+        assert q_scales is not None and e2m1_table is not None and q_scales.dtype == e4m3_dtype
+        head_size = head_size * 2
+        QUERY_DTYPE="nvfp4"
+    elif q_dtype == e4m3_dtype:
+        QUERY_DTYPE = "fp8"
+    else:
+        QUERY_DTYPE = "bf16"
+    
+    if kv_cache_dtype == torch.uint8:
+        KV_CACHE_DTYPE = "nvfp4"
+    elif kv_cache_dtype == e4m3_dtype:
+        KV_CACHE_DTYPE = "fp8"
+    else:
+        KV_CACHE_DTYPE = "bf16"
+
     if shuffled_kv_cache:
-        # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
-        # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
-        num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
+        SCALE_K_WIDTH = 4
+        if kv_cache_dtype == torch.uint8:
+            num_blocks, num_kv_heads, block_size, _ = k.shape
+            K_WIDTH = 16
+            SCALE_K = head_size // 16
+            SCALE_K_WIDTH = min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
+        else:
+            # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
+            # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
+            num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
     else:
         # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
         num_blocks, block_size, num_kv_heads, _ = k.shape
@@ -428,6 +459,7 @@ def unified_attention(
                 segm_max_ptr=segm_max,
                 segm_expsum_ptr=segm_expsum,
                 query_ptr=q,
+                query_scales_ptr=q_scales,
                 key_cache_ptr=k,
                 value_cache_ptr=v,
                 sink_ptr=sinks,
@@ -448,8 +480,11 @@ def unified_attention(
                 num_blocks=num_blocks,
                 block_table_stride=block_table.stride(0),
                 max_num_blocks_per_seq=block_table.shape[1],
+                e2m1_table_ptr=e2m1_table,
                 query_stride_0=q.stride(0),
                 query_stride_1=q.stride(1),
+                query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
+                query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
                 qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
                 BLOCK_SIZE=block_size,
                 HEAD_SIZE=head_size,
@@ -475,10 +510,14 @@ def unified_attention(
                 ALL_DECODE=ALL_DECODE,
                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
                 K_WIDTH=K_WIDTH,
+                SCALE_K_WIDTH=SCALE_K_WIDTH,
                 WARP_SIZE=WARP_SIZE,
                 NUM_BLOCKS_GATHER_PER_TILE=NUM_BLOCKS_GATHER_PER_TILE,
-                IS_Q_FP8=(q_dtype == e4m3_dtype),
-                IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
+                QUERY_DTYPE=QUERY_DTYPE,
+                KV_CACHE_DTYPE=KV_CACHE_DTYPE,
+                BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
+                FP8_DTYPE=FP8_DTYPE,
+                BLOCK_SCALES_DTYPE=BLOCK_SCALES_DTYPE,
                 **attn_config,
             )
         else:
