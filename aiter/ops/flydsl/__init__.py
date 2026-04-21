@@ -42,10 +42,7 @@ if is_flydsl_available():
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
-    from .kernels import (
-        compile_moe_gemm1,
-        compile_moe_gemm2
-    )
+    from .kernels import compile_moe_gemm1, compile_moe_gemm2
 
     from .gemm_kernels import flydsl_hgemm
 
