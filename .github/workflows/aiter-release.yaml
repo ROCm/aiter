@@ -242,6 +242,7 @@ jobs:
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${{ steps.version.outputs.nightly_version }}" \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e ENABLE_CK=0 \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
             bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
@@ -249,6 +250,7 @@ jobs:
             docker exec \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e ENABLE_CK=0 \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
             bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
