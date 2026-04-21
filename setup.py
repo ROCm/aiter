@@ -437,6 +437,7 @@ setup_requires = [
     "psutil",
     "ninja",
     "setuptools_scm",
+    "vcs_versioning",  # transitive dep of setuptools_scm>=10
 ]
 if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
