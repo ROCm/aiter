@@ -811,7 +811,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DENABLE_FP8'"
+            "'-DENABLE_FP8'",
+            "'-D__Float4_e2m1fn_x2=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

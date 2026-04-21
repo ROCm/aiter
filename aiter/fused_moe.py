@@ -692,9 +692,15 @@ def _gfx1250_moe_stage1(
 
     if out is None:
         torch_out_dtype = dtypes.bf16 if out_dtype_str == "bf16" else dtypes.fp16
-        out = torch.empty(
+        out = torch.zeros(
             (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
         )
+    else:
+        # The FlyDSL stage1 kernel only writes slots listed in sorted_token_ids;
+        # any padding slot keeps whatever was in the caller's empty() buffer and
+        # leaks into stage2 as garbage (→ inf/nan). Match FlyDSL UT semantics by
+        # zero-initialising the output buffer up-front.
+        out.zero_()
 
     flat_a_scale = (
         a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
@@ -797,6 +803,11 @@ def _gfx1250_moe_stage2(
         out = torch.zeros(
             (token_num, model_dim), dtype=torch_out_dtype, device=dev
         )
+    else:
+        # Stage2 kernel uses atomic_add (accumulate=True) into `out`; if the
+        # caller passed an empty()-allocated buffer we must zero it first or
+        # the accumulated result is garbage.
+        out.zero_()
 
     flat_a_scale = (
         a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
@@ -1491,6 +1502,23 @@ def fused_moe_2stages(
         )
         a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
 
+    elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
+        # FlyDSL gfx1250 MoE GEMM kernels address scale_x with buffer size
+        # `tokens * K//32` in **source-token order** (see sx_nbytes in
+        # moe_gemm_2stage_mxscale_gfx1250.py); the kernel gathers the
+        # per-token scale via sorted_token_ids internally. The default
+        # aiter path (fused_dynamic_mxfp4_quant_moe_sort / mxfp4_moe_sort_fwd)
+        # returns a *pre-sorted* tile layout of shape (padded_sorted_size,
+        # K//32), which the FlyDSL kernel cannot address correctly and
+        # produces numerically uncorrelated output. Keep the quantization
+        # output in source-token layout for gfx1250.
+        from aiter.ops.quant import per_1x32_f4_quant
+        if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
+            a1 = hidden_states
+            a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
+        else:
+            a1, a1_scale = per_1x32_f4_quant(hidden_states, quant_dtype=dtypes.fp4x2)
+            a1_scale = a1_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
     elif quant_type == QuantType.per_1x32:
         if hidden_states.dtype == dtypes.fp4x2 and a1_scale is not None:
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
@@ -1605,6 +1633,14 @@ def fused_moe_2stages(
         a2_flat, a2_scale = per_1x32_f8_scale_f8_quant(
             a2_flat.to(dtypes.fp32), scale_type=dtypes.fp8_e8m0
         )
+        a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
+        a2 = a2_flat.view(token_num, topk, -1)
+    elif quant_type == QuantType.per_1x32 and get_gfx() == "gfx1250":
+        # Stage2 FlyDSL kernel expects scale_x in source order of shape
+        # (tokens*topk, inter_dim//32). See comment in stage1 path.
+        from aiter.ops.quant import per_1x32_f4_quant
+        a2_flat = a2.view(-1, inter_dim)
+        a2_flat, a2_scale = per_1x32_f4_quant(a2_flat, quant_dtype=dtypes.fp4x2)
         a2_scale = a2_scale.view(torch.uint8).view(dtypes.fp8_e8m0)
         a2 = a2_flat.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x32:

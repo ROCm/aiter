@@ -440,13 +440,34 @@ def _s2_args_std(
 def _run_compiled(exe, args):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+
+    Some kernels (e.g. the gfx1250 fp8/a8w4 stage1 path) wrap the compiled
+    JIT function in a host-side ``_Stage1GateUpPackedWrapper`` that repacks
+    the weight and weight-scale tensors before dispatch. ``flyc.compile``
+    only accepts a ``@flyc.jit`` function, so for such wrappers we fall back
+    to calling the wrapper directly — the wrapper delegates to the inner
+    jit function, which auto-compiles on the first call and caches.
     """
     cf = getattr(exe, "_aiter_cf", None)
     if cf is None:
-        cf = flyc.compile(exe, *args)
-        exe._aiter_cf = cf
+        if _is_flyc_jit(exe):
+            cf = flyc.compile(exe, *args)
+            exe._aiter_cf = cf
+        else:
+            # Host-side wrapper (e.g. _Stage1GateUpPackedWrapper).
+            exe(*args)
+            exe._aiter_cf = exe  # mark as "compiled", call via exe(*args) next time
+    elif cf is exe:
+        exe(*args)
     else:
         cf(*args)
+
+
+def _is_flyc_jit(fn):
+    """Return True if ``fn`` is a ``@flyc.jit``-decorated function (compilable)."""
+    # flyc.jit decorator produces instances that expose `_ensure_sig` and
+    # `_call_state_cache`; the host-side wrappers do not.
+    return hasattr(fn, "_ensure_sig") and hasattr(fn, "_call_state_cache")
 
 
 @functools.cache
