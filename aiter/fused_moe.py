@@ -12,6 +12,42 @@ import torch
 # from aiter import get_torch_quant as get_quant
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
+
+# --- Output buffer override (used by vLLM AiterExperts to skip a DtoD copy) -
+import threading as _threading
+from contextlib import contextmanager as _cm
+
+_moe_buf_override = _threading.local()
+
+
+@_cm
+def output_buffer_override(buf):
+    """Context manager: subsequent fused_moe calls in this thread will write
+    into `buf` instead of allocating a fresh moe_buf, when shape/dtype/device
+    match. Caller must guarantee `buf` is contiguous and outlives the call."""
+    setattr(_moe_buf_override, "buffer", buf)
+    try:
+        yield
+    finally:
+        setattr(_moe_buf_override, "buffer", None)
+
+
+def _maybe_take_override_buf(M: int, model_dim: int, dtype, device):
+    buf = getattr(_moe_buf_override, "buffer", None)
+    if buf is None:
+        return None
+    try:
+        if (
+            buf.shape == (M, model_dim)
+            and buf.dtype == dtype
+            and buf.device == device
+            and buf.is_contiguous()
+        ):
+            return buf
+    except Exception:
+        return None
+    return None
+# ---------------------------------------------------------------------------
 from aiter import logger
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
@@ -47,7 +83,9 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    moe_buf = _maybe_take_override_buf(M, model_dim, moebuf_dtype, device)
+    if moe_buf is None:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
     fwd_fn(
