@@ -13,6 +13,21 @@
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
+namespace {
+
+int to_ck_act_op(int activation)
+{
+    switch(static_cast<ActivationType>(activation))
+    {
+    case ActivationType::Gelu: return 0;
+    case ActivationType::Silu: return 1;
+    case ActivationType::Swiglu: return 2;
+    default: return activation;
+    }
+}
+
+} // namespace
+
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
@@ -61,7 +76,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    std::optional<int> splitk = 1,
                    bool nt = false,
                    std::optional<std::string> dst_type = std::nullopt,
-                   bool is_shuffled = true)
+                   bool is_shuffled = true,
+                   std::optional<torch::Tensor> bias = std::nullopt)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt << " " << block_m.value() << std::endl;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
@@ -78,6 +94,11 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                     "Out dtype only support BFloat16/Float16!")
     }
+    if(bias.has_value())
+    {
+        TORCH_CHECK(bias.value().dtype() == out.dtype(),
+                    "Bias dtype must match output dtype for CK MoE stage1.");
+    }
 
     int tokens = hidden_states.size(0);
     int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
@@ -88,7 +109,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     void *hidden_states_ptr = hidden_states.data_ptr();
     void *w1_ptr = w1.transpose(1, 2).data_ptr();
-    void *w2_ptr = w2.data_ptr();
+    void *bias_ptr = bias.has_value() ? bias.value().data_ptr() : nullptr;
     void *sorted_token_ids_ptr = sorted_token_ids.data_ptr();
     void *sorted_expert_ids_ptr = sorted_expert_ids.data_ptr();
     void *num_valid_ids_ptr = num_valid_ids.data_ptr();
@@ -97,7 +118,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     void *w1_scale_ptr = w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr;
     void *a1_scale_ptr = a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr;
     bool MulRoutedWeight = sorted_weights.has_value();
-    if (!hidden_states_ptr || !w1_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
+    if (!hidden_states_ptr || !w1_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
     {
         std::cerr << "detect null ptr !" << std::endl;
         return;
@@ -108,13 +129,13 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
+    activation = to_ck_act_op(activation);
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt);
+           hidden_states_ptr, w1_ptr, bias_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt);
 }
 
 void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
@@ -135,11 +156,17 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    std::optional<int> splitk = 1,
                    bool nt = false,
                    std::optional<std::string> dst_type = std::nullopt,
-                   bool is_shuffled = true)
+                   bool is_shuffled = true,
+                   std::optional<torch::Tensor> bias = std::nullopt)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage2 called!" << nt << " " << block_m.value() << std::endl;
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")
+    if(bias.has_value())
+    {
+        TORCH_CHECK(bias.value().dtype() == out.dtype(),
+                    "Bias dtype must match output dtype for CK MoE stage2.");
+    }
 
     int32_t splitk_local = splitk.has_value() ? splitk.value() : 1;
 
@@ -151,7 +178,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     int MPerBlock = block_m.value();
 
     void *inter_states_ptr = inter_states.data_ptr();
-    void *w1_ptr = w1.data_ptr();
+    void *bias_ptr = bias.has_value() ? bias.value().data_ptr() : nullptr;
     void *w2_ptr = w2.data_ptr();
     void *sorted_token_ids_ptr = sorted_token_ids.data_ptr();
     void *sorted_expert_ids_ptr = sorted_expert_ids.data_ptr();
@@ -162,7 +189,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     void *a2_scale_ptr = a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr;
     bool MulRoutedWeight = sorted_weights.has_value();
 
-    if (!inter_states_ptr || !w1_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
+    if (!inter_states_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
     {
         std::cerr << "detect null ptr !" << std::endl;
         return;
@@ -172,10 +199,10 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
+    activation = to_ck_act_op(activation);
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt);
+           inter_states_ptr, bias_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt);
 }

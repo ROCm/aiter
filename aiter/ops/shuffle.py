@@ -4,6 +4,11 @@
 import torch
 
 
+def _mark_shuffled(x: torch.Tensor) -> torch.Tensor:
+    x.is_shuffled = True
+    return x
+
+
 def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
     x_type = x.dtype
@@ -23,8 +28,7 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
-    x_.is_shuffled = True
-    return x_
+    return _mark_shuffled(x_)
 
 
 def shuffle_weight_NK(
@@ -78,7 +82,8 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
             src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
         )
     # print("interleaved shape:", interleaved.shape)
-    return interleaved.contiguous().view(src_type)
+    interleaved = interleaved.contiguous().view(src_type)
+    return _mark_shuffled(interleaved)
 
 
 def shuffle_scale_a16w4(
@@ -110,4 +115,4 @@ def shuffle_scale_a16w4(
         # Permute to: [E, N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]
         shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
     # print("shf_scale shape:", shfl_scale.shape)
-    return shfl_scale.view(*src.shape).contiguous()
+    return _mark_shuffled(shfl_scale.view(*src.shape).contiguous())
