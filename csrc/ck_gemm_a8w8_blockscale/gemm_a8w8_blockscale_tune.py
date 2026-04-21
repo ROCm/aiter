@@ -11,7 +11,11 @@ from einops import rearrange
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIG_GEMM_A8W8_BLOCKSCALE, get_asm_dir
+from aiter.jit.core import (
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+    AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+    get_asm_dir,
+)
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.ops.shuffle import shuffle_weight
@@ -181,6 +185,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         """
 
         super().__init__(name, keys, resultList, description)
+
+    def run(self, args, fast_mode=False):
+        if getattr(args, "preshuffle", False):
+            self.ARG_DEFAULTS["config_env_name"] = (
+                "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE"
+            )
+            self.ARG_DEFAULTS["tune_file"] = (
+                f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}"
+            )
+        return super().run(args, fast_mode)
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
@@ -437,12 +451,18 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     )
                 ref = run_torch(x, weight, x_scale, w_scale)
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
+            finally:
+                torch.cuda.empty_cache()
         return results
 
     def get_gemm_a8w8_blockscale_asm_tune_task(
