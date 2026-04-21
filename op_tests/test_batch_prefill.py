@@ -1705,6 +1705,7 @@ def reference_attention_kv_blockscale(
     return output.to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_cache_size_gb", [4.5])
 @pytest.mark.parametrize("page_size", [1, 16, 1024])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 8), (16, 8)])
@@ -1716,6 +1717,7 @@ def reference_attention_kv_blockscale(
 @pytest.mark.parametrize("scatter_pages", [False, True])
 @pytest.mark.parametrize("kv_layout", ["linear", "vectorized"])
 def test_batch_prefill_large_kvcache(
+    batch_size,
     kv_cache_size_gb,
     page_size,
     num_qo_heads,
@@ -1735,11 +1737,12 @@ def test_batch_prefill_large_kvcache(
     For page_size < kN0 (128), this validates the per-tile SRD rebase path.
 
     Args:
+        batch_size: Number of sequences. >1 partitions the >2GB page pool
+            across batches, exercising the per-sequence SRD rebase path.
         scatter_pages: If True, interleave page indices so adjacent logical
             tokens map to physically distant pages (stress-tests rebase).
         kv_layout: "linear" or "vectorized" KV cache memory layout.
     """
-    # TODO: add multi-batch test (batch_size > 1 with per-batch page ranges)
     # page_size=1 only supports linear layout (3D tensor)
     if page_size == 1 and kv_layout == "vectorized":
         pytest.skip("page_size=1 does not support vectorized layout")
@@ -1767,16 +1770,28 @@ def test_batch_prefill_large_kvcache(
 
     # Check available GPU memory
     free_mem = torch.cuda.mem_get_info()[0]
-    kv_len = num_blocks * page_size
+    # Per-batch page partition: uniform split, remainder absorbed by the last
+    # sequence to keep all kv_indptr deltas > 0 (zero-length sequences would be
+    # skipped by the kernel's per-batch dispatch and hide any rebase bug).
+    blocks_per_seq = [num_blocks // batch_size] * batch_size
+    blocks_per_seq[-1] += num_blocks % batch_size
+    kv_lens_per_seq = [bps * page_size for bps in blocks_per_seq]
+    max_kv_len_per_seq = max(kv_lens_per_seq)
     # Causal with attn_mask forces SDPA math backend which materializes
     # [H_q, qo_len, kv_len] score + mask tensors. Magnitudes empirically chosen:
     #   non-causal: 1024 -- flash backend, no full score matrix, headroom is large
     #   causal:      128 -- math backend cliff: 3x [H_q, qo, kv] fp32 buffers must
     #                      fit alongside K/V cache (kv_len up to ~5GB at this scale)
-    qo_len = min(128, kv_len) if causal else min(1024, kv_len)
+    # qo_len is per-batch; total qo tokens = batch_size * qo_len.
+    qo_len = min(128, max_kv_len_per_seq) if causal else min(1024, max_kv_len_per_seq)
+    total_qo_len = batch_size * qo_len
     # SDPA causal with attn_mask forces math backend: expanded mask + score matrix
-    # + softmax intermediates, each [1, H_q, qo, kv] fp32. ~3x overhead empirically.
-    sdpa_causal_mem = 3 * num_qo_heads * qo_len * kv_len * 4 if causal else 0
+    # + softmax intermediates, each [1, H_q, qo, kv_per_batch] fp32. ~3x overhead.
+    # The per-batch SDPA loop allocates one batch's worth at a time (kv_len
+    # divided by batch_size), then frees before the next iteration.
+    sdpa_causal_mem = (
+        3 * num_qo_heads * qo_len * max_kv_len_per_seq * 4 if causal else 0
+    )
     # GQA expands K/V from H_kv to H_q heads for SDPA reference
     gqa_ratio = num_qo_heads // num_kv_heads
     # Sequential pages reuse K/V directly; scattered need a gathered copy
@@ -1818,8 +1833,11 @@ def test_batch_prefill_large_kvcache(
     else:
         v_cache_bf16 = torch.randn(*kv_shape, device="cuda", dtype=dtype)
 
-    # Query
-    q_bf16 = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda", dtype=dtype)
+    # Query: flat [total_qo_len, H_q, D] layout matching mha_batch_prefill_func
+    # input contract. Per-batch slices recovered via cu_seqlens_q in the loop below.
+    q_bf16 = torch.randn(
+        total_qo_len, num_qo_heads, head_dim, device="cuda", dtype=dtype
+    )
 
     # Page indices: since the buffer exceeds INT32_MAX elements, these pages
     # naturally span the overflow boundary.
@@ -1838,60 +1856,70 @@ def test_batch_prefill_large_kvcache(
         page_indices = torch.arange(num_blocks, dtype=torch.int32)
 
     # --- Step 1: Compute SDPA reference FIRST (while bf16 data is alive) ---
-    # For sequential pages, use K/V directly (avoid copying the entire buffer).
-    if scatter_pages:
+    # Per-batch loop: each iteration gathers its slice of pages, runs SDPA,
+    # and frees intermediates before the next batch. Keeps peak memory at
+    # one batch's worth (vs. materializing the full multi-batch score tensor).
+    o_ref_list = []
+    page_offset = 0
+    for b in range(batch_size):
+        n_blocks_b = blocks_per_seq[b]
+        page_slice_b = page_indices[page_offset : page_offset + n_blocks_b]
+        page_offset += n_blocks_b
+        kv_len_b = kv_lens_per_seq[b]
+
+        # Always gather: even sequential pages need a per-batch slice to keep
+        # the multi-batch SDPA references aligned with the kernel's per-batch
+        # SRD rebase. (For batch_size=1 + sequential, this is just an alias
+        # of the full cache via the index slice.)
         if page_size == 1:
-            k_ref = k_cache_bf16[page_indices.long()]
-            v_ref = v_cache_bf16[page_indices.long()]
+            k_ref_b = k_cache_bf16[page_slice_b.long()]
+            v_ref_b = v_cache_bf16[page_slice_b.long()]
         else:
-            k_ref = k_cache_bf16[page_indices.long()].reshape(
+            k_ref_b = k_cache_bf16[page_slice_b.long()].reshape(
                 -1, num_kv_heads, head_dim
             )
-            v_ref = v_cache_bf16[page_indices.long()].reshape(
+            v_ref_b = v_cache_bf16[page_slice_b.long()].reshape(
                 -1, num_kv_heads, head_dim
             )
-    else:
-        if page_size == 1:
-            k_ref = k_cache_bf16
-            v_ref = v_cache_bf16
-        else:
-            k_ref = k_cache_bf16.reshape(-1, num_kv_heads, head_dim)
-            v_ref = v_cache_bf16.reshape(-1, num_kv_heads, head_dim)
 
-    # SDPA expects [batch, heads, seq, dim]
-    q_sdpa = q_bf16.unsqueeze(0).transpose(1, 2)
-    k_sdpa = k_ref.unsqueeze(0).transpose(1, 2)
-    v_sdpa = v_ref.unsqueeze(0).transpose(1, 2)
-    del k_ref, v_ref
+        q_b = q_bf16[b * qo_len : (b + 1) * qo_len]
 
-    # For GQA: expand K/V heads to match Q heads. Using enable_gqa=True with
-    # causal attn_mask forces SDPA math backend (materializes full score matrix,
-    # OOMs for large kv_len). Manual expansion lets SDPA use memory-efficient
-    # backend which computes attention tile-by-tile without materializing scores.
-    if num_qo_heads != num_kv_heads:
-        ratio = num_qo_heads // num_kv_heads
-        k_sdpa = k_sdpa.repeat_interleave(ratio, dim=1)
-        v_sdpa = v_sdpa.repeat_interleave(ratio, dim=1)
+        # SDPA expects [batch, heads, seq, dim]
+        q_sdpa = q_b.unsqueeze(0).transpose(1, 2)
+        k_sdpa = k_ref_b.unsqueeze(0).transpose(1, 2)
+        v_sdpa = v_ref_b.unsqueeze(0).transpose(1, 2)
+        del k_ref_b, v_ref_b
 
-    sdpa_kwargs = {}
-    if causal:
-        # CK batch prefill causal: Q is at the END of the KV context.
-        # Q[i] can see K[j] where j <= (kv_len - qo_len) + i.
-        # SDPA's is_causal assumes Q starts at the beginning, so we pass
-        # an explicit attn_mask instead.
-        offset = kv_len - qo_len
-        row_idx = torch.arange(qo_len, device="cuda").unsqueeze(1)
-        col_idx = torch.arange(kv_len, device="cuda").unsqueeze(0)
-        sdpa_kwargs["attn_mask"] = col_idx <= (offset + row_idx)
+        # GQA: manual K/V head expansion (see comment in non-multi-batch
+        # equivalent removed in this commit -- using enable_gqa=True with
+        # causal attn_mask forces SDPA math backend and OOMs for large kv_len).
+        if num_qo_heads != num_kv_heads:
+            ratio = num_qo_heads // num_kv_heads
+            k_sdpa = k_sdpa.repeat_interleave(ratio, dim=1)
+            v_sdpa = v_sdpa.repeat_interleave(ratio, dim=1)
 
-    o_ref = (
-        torch.nn.functional.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa, **sdpa_kwargs
+        sdpa_kwargs = {}
+        if causal:
+            # CK batch prefill causal: Q is at the END of the KV context.
+            # Q[i] can see K[j] where j <= (kv_len_b - qo_len) + i.
+            offset = kv_len_b - qo_len
+            row_idx = torch.arange(qo_len, device="cuda").unsqueeze(1)
+            col_idx = torch.arange(kv_len_b, device="cuda").unsqueeze(0)
+            sdpa_kwargs["attn_mask"] = col_idx <= (offset + row_idx)
+
+        o_b = (
+            torch.nn.functional.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, **sdpa_kwargs
+            )
+            .squeeze(0)
+            .transpose(0, 1)
         )
-        .squeeze(0)
-        .transpose(0, 1)
-    )
-    del q_sdpa, k_sdpa, v_sdpa, sdpa_kwargs
+        o_ref_list.append(o_b)
+        del q_sdpa, k_sdpa, v_sdpa, sdpa_kwargs
+        torch.cuda.empty_cache()
+
+    o_ref = torch.cat(o_ref_list, dim=0)
+    del o_ref_list
     torch.cuda.empty_cache()
 
     # --- Step 2: Prepare kernel inputs (quantize for FP8, free bf16 after) ---
@@ -1923,8 +1951,18 @@ def test_batch_prefill_large_kvcache(
             "vectorized",
         )
 
-    cu_seqlens_q = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
-    kv_indptr = torch.tensor([0, num_blocks], device="cuda", dtype=torch.int32)
+    # Multi-batch indptrs: cu_seqlens_q is the cumulative qo offset per batch
+    # (uniform qo_len), kv_indptr is the cumulative page count per batch.
+    cu_seqlens_q = torch.tensor(
+        [0] + [(i + 1) * qo_len for i in range(batch_size)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    kv_indptr = torch.tensor(
+        [0] + list(itertools.accumulate(blocks_per_seq)),
+        device="cuda",
+        dtype=torch.int32,
+    )
     # +256 padding is a batch_prefill ABI requirement: the kernel may speculatively
     # read up to 256 entries past the last valid page index (one bn0=256 tile worth)
     # before the bounds check kicks in. Padding with 0 keeps reads in-bounds; the
@@ -1932,7 +1970,9 @@ def test_batch_prefill_large_kvcache(
     kv_page_indices = torch.nn.functional.pad(page_indices, (0, 256), value=0).to(
         "cuda"
     )
-    kv_last_page_lens = torch.tensor([page_size], device="cuda", dtype=torch.int32)
+    kv_last_page_lens = torch.tensor(
+        [page_size] * batch_size, device="cuda", dtype=torch.int32
+    )
 
     # --- Step 3: Run CK kernel ---
     extra_kwargs = {}
@@ -1949,7 +1989,7 @@ def test_batch_prefill_large_kvcache(
         kv_indptr,
         kv_page_indices,
         qo_len,
-        kv_len,
+        max_kv_len_per_seq,
         causal=causal,
         kv_last_page_lens=kv_last_page_lens,
         **extra_kwargs,
@@ -1974,8 +2014,8 @@ def test_batch_prefill_large_kvcache(
             rtol=rtol,
             atol=atol,
             msg=lambda msg: (
-                f"[{input_dtype}] page_size={page_size} "
-                f"num_pages={num_blocks} "
+                f"[{input_dtype}] batch_size={batch_size} "
+                f"page_size={page_size} num_pages={num_blocks} "
                 f"(overflow at page {overflow_page}): {msg}"
             ),
         )
