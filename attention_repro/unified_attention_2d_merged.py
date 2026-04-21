@@ -1820,10 +1820,6 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
 def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     """Subtile-pipelined loop: K split seq dim, V split head dim, multi-buffer."""
     cfg: gl.constexpr = pgm.cfg
-    # Merged wait collapses the 4 per-iter async_wait(4) calls into a single async_wait(1)
-    # at the top of the iter. Valid when all TDMs complete FIFO (true on GFX1250) and the
-    # only still-pending TDM is safe to leave outstanding — default to N==3 to match the
-    # main loop's policy (N==2 has extra LDS WAR hazards).
     MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
     QK_scale = pgm.QK_scale
 
@@ -1831,12 +1827,12 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
     # Four rolling slot indices per iter j of the steady loop:
     #   buf_tile_cur   = slot for tile j     ( j   %N)
     #   buf_tile_next  = slot for tile j+1   ((j+1)%N)
-    #   buf_tile_next2 = slot for tile j+2   ((j+2)%N)   — aliases buf_tile_cur  for N=2
-    #   buf_tile_next3 = slot for tile j+3   ((j+3)%N)   — aliases buf_tile_cur  for N=3,
+    #   buf_tile_next2 = slot for tile j+2   ((j+2)%N)    aliases buf_tile_cur  for N=2
+    #   buf_tile_next3 = slot for tile j+3   ((j+3)%N)    aliases buf_tile_cur  for N=3,
     #                                                     aliases buf_tile_next for N=2
     # Per-iter roles:
     #   V read  (tile j)     sub 0,1 → buf_tile_cur
-    #   K read  (tile j+1)   sub 1   → buf_tile_next     (sub 0 already in k0 register)
+    #   K read  (tile j+1)   sub 1   → buf_tile_next
     #   K read  (tile j+2)   sub 0   → buf_tile_next2
     #   V store (tile j+1)   sub 0,1 → buf_tile_next
     #   K store (tile j+3)   sub 0,1 → buf_tile_next3
@@ -2062,8 +2058,6 @@ def attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1):
 # concat_subtile, same contiguous semantics used by attention_loop_subtile_split).
 # The loop runs in 4 stages per iter, each stage with exactly one WMMA
 # (QK sub 0, QK sub 1, PV sub 0, PV sub 1) and one slice of the inline softmax
-# — same compute shape as attention_loop_subtile_split, laid over the reordered
-# TDM pipeline from loop_variant 1.
 # ============================================================================
 
 @gluon.jit
