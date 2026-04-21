@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_NIGHTLY_INDEX = "https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/"
+FLYDSL_NIGHTLY_INDEX = "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/"
 FLYDSL_VERSION = "flydsl==0.1.4.dev20260420+656347f"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
