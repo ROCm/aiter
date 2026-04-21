@@ -285,6 +285,9 @@ def test_fmoe(
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
+    assert not (
+        err != 0 and logits_diff > 0.01
+    ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
 
     return {"us": us2, "err": err}
 
@@ -535,6 +538,15 @@ def _resolve_model_filter(requested):
 
 def _row_to_kwargs(row):
     # csv rows store already-effective dims, so pad defaults to 0.
+    q_type = _str2enum(row["q_type"], aiter.QuantType)
+    aq_dtype = _str2dtype(row["q_dtype_a"])
+    wq_dtype = _str2dtype(row["q_dtype_w"])
+    act_type = _effective_act_type(
+        q_type,
+        aq_dtype,
+        wq_dtype,
+        _str2enum(row["act_type"], aiter.ActivationType),
+    )
     return dict(
         dtype=_str2dtype(row["dtype"]),
         token=int(row["token"]),
@@ -542,10 +554,10 @@ def _row_to_kwargs(row):
         inter_dim=int(row["inter_dim"]),
         E=int(row["expert"]),
         topk=int(row["topk"]),
-        actType=_str2enum(row["act_type"], aiter.ActivationType),
-        qType=_str2enum(row["q_type"], aiter.QuantType),
-        AQDType=_str2dtype(row["q_dtype_a"]),
-        WQDType=_str2dtype(row["q_dtype_w"]),
+        actType=act_type,
+        qType=q_type,
+        AQDType=aq_dtype,
+        WQDType=wq_dtype,
         use_g1u1=dtypes.str2bool(str(row["use_g1u1"])),
         doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
         hidden_pad=0,
@@ -583,6 +595,12 @@ _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 
 
+def _effective_act_type(quant_type, aq_dtype, wq_dtype, act_type):
+    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+        return aiter.ActivationType.Swiglu
+    return act_type
+
+
 def _iter_legacy_cases():
     """Yield (kwargs, extras) for the original CLI-driven sweep."""
     extras = {"model": "legacy"}
@@ -606,7 +624,7 @@ def _iter_legacy_cases():
             inter_dim=inter_dim,
             E=args.expert,
             topk=args.topk,
-            actType=act_type,
+            actType=_effective_act_type(quant_type, aq_dtype, wq_dtype, act_type),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
