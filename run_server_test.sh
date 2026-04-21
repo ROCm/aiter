@@ -45,7 +45,7 @@ fi
 #   TRIAL_MODE      — if 1, run only a single ISL/OSL pair (8192,1024) with 1 benchmark iteration per tag instead of
 #                     3 pairs × 4 runs. Use this for a quick sanity check that the server starts and produces results
 #                     before committing to a full benchmark run. Default: 0.
-#   SERVER_READY_TIMEOUT_SEC — wait for OpenAI server log line (default: 300). If the message never appears, that benchmark tag is skipped as failed.
+#   SERVER_READY_TIMEOUT_SEC — wait for OpenAI server log line (default: 600). If the message never appears, that benchmark tag is skipped as failed.
 #   SERVER_READY_LINE — substring to wait for in the *server-only* log (default: uvicorn). Do not set to text you also write into that log.
 #
 # Benchmarks: once per tag (baseline or each worktree) the script starts the OpenAI server in the background, waits
@@ -103,7 +103,7 @@ if [[ -z "${WORKTREE_ROOT:-}" ]]; then
   fi
 fi
 BENCH_SCRIPT=${BENCH_SCRIPT:-"$REPO_PARENT/bench_serving/benchmark_serving.py"}
-SERVER_READY_TIMEOUT_SEC=${SERVER_READY_TIMEOUT_SEC:-300}
+SERVER_READY_TIMEOUT_SEC=${SERVER_READY_TIMEOUT_SEC:-600}
 SERVER_READY_LINE=${SERVER_READY_LINE:-"Server started successfully and ready to accept requests!"}
 SERVER_MODEL_PATH=${SERVER_MODEL_PATH:-/shared_inference/models/gpt-oss-120b/}
 SERVER_TP=${SERVER_TP:-8}
