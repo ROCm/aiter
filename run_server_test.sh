@@ -37,7 +37,6 @@ fi
 #                     Substituted into {{KERNEL_FILE}} placeholders in prompt files.
 #   KERNELS_TO_OPTIMIZE — space- or comma-separated kernel function names to pass to Claude.
 #                     Substituted into {{KERNELS_TO_OPTIMIZE}} placeholders in prompt files.
-#                     Default: cross_device_reduce_1stage cross_device_reduce_2stage
 #   PROMPTS_FILTER  — space- or comma-separated list of prompt filenames (basename, with or without extension) to include
 #                     in the build phase. Only matching files from PROMPTS_DIR are run. If unset, all prompts are used
 #                     and a warning is printed. Example: PROMPTS_FILTER="step1_optimize_bandwidth,step2_tune_occupancy"
@@ -70,38 +69,39 @@ fi
 # Flow:
 #
 #   parse env / validate args
-#         |
-#         +--[RUN_PHASE=benchmarks_only]-----------------------------+
-#         |                                                          |
-#   collect_prompts (from PROMPTS_DIR, filtered by PROMPTS_FILTER)  |
-#   resolve_baseline (git SHA of BASELINE_REF)                      |
-#         |                                                          |
-#     build_phase                                                    |
-#       |                                                            |
-#       +--[CLEAN_OUTPUT_BEFORE_BUILD=1]--> clean_output_and_worktrees_before_build
-#       +--[default]-------------------->  clear_worktrees_for_build
-#       |                                                            |
-#       +--------[individual]------------+--[accumulative]----------+|
-#       |  for each prompt:              |  git worktree add        ||
-#       |    git worktree add            |  ninja_jit_setup         ||
-#       |    ninja_jit_setup             |  for each prompt:        ||
-#       |    run_claude_prompt           |    run_claude_prompt     ||
-#       |    append_manifest_entry       |  append_manifest_entry   ||
-#       +--------------------------------+--------------------------+||
-#         |                                                          |
-#         +--[RUN_PHASE=build_only]--> exit                         |
-#         |                                                          |
-#     benchmark_phase  <--------------------------------------------+
-#       for baseline (REPO_ROOT) then each worktree in manifest:
-#         start_openai_server_bg
-#         wait_for_server_ready (timeout: SERVER_READY_TIMEOUT_SEC)
-#         for each ISL/OSL pair x N runs:
-#           run benchmark_serving.py → result_<tag>_isl<N>_osl<N>_*.json
-#         stop_openai_server
-#         |
-#   print_results_table (averages runs, compares tags side-by-side)
-#         |
-#        Done
+#   |
+#   |-- [benchmarks_only] -----------------.
+#   |                                       |
+#   collect_prompts                         |
+#   resolve_baseline (git SHA)              |
+#   |                                       |
+#   build_phase                             |
+#   |  |-- [CLEAN=1] --> clean output+worktrees
+#   |  |-- [default] --> clear_worktrees_for_build
+#   |  |
+#   |  |-- [individual] --------.     |-- [accumulative] ---------.
+#   |  |  for each prompt:      |     |  git worktree add         |
+#   |  |    git worktree add    |     |  ninja_jit_setup          |
+#   |  |    ninja_jit_setup     |     |  for each prompt:         |
+#   |  |    run_claude_prompt   |     |    run_claude_prompt      |
+#   |  |    append_manifest     |     |  append_manifest          |
+#   |  '------------------------'     '---------------------------'
+#   |
+#   |-- [build_only] --> exit
+#   |
+#   benchmark_phase  <-----------------------------------------'
+#   |  for baseline then each worktree in manifest:
+#   |    start_openai_server_bg
+#   |    wait_for_server_ready
+#   |    for each ISL/OSL pair x N runs:
+#   |      skip if result JSON already exists
+#   |      if server died: restart → wait_for_server_ready
+#   |      run benchmark_serving.py
+#   |    stop_openai_server
+#   |
+#   print_results_table
+#   |
+#   Done
 #
 set -euo pipefail
 
@@ -226,13 +226,6 @@ MANIFEST="$OUT_DIR/kernel_opt_worktrees.manifest"
 # The fix: set AITER_JIT_DIR to a per-worktree directory. get_user_jit_dir() checks
 # this env var first (core.py:383-387) and uses it as the exclusive JIT cache. Starting
 # from an empty directory forces all modules to recompile from the worktree's source.
-clean_jit() {
-  local checkout_root=$1
-  local wt_jit_dir="$checkout_root/.jit_cache"
-  rm -rf "$wt_jit_dir"
-  mkdir -p "$wt_jit_dir"
-  export AITER_JIT_DIR="$wt_jit_dir"
-}
 
 # ninja_jit_setup <checkout_root> [baseline_jit_dir]
 #
@@ -515,6 +508,21 @@ run_benchmarks() {
     exit 1
   fi
 
+  # Recovery: if all result files for this tag already exist, skip server startup entirely.
+  local _done=0 _total=0
+  for _pair in "${isl_osl_pairs[@]}"; do
+    local _isl=${_pair%%,*} _osl=${_pair##*,}
+    for _i in $(seq 1 "$bench_runs"); do
+      _total=$((_total + 1))
+      [[ -f "$log_dir/result_${tag}_isl${_isl}_osl${_osl}_conc${conc}_run${_i}.json" ]] && _done=$((_done + 1))
+    done
+  done
+  if [[ "$_done" -eq "$_total" ]]; then
+    echo "All ${_total} result(s) for tag=${tag} already exist in $log_dir — skipping server start." | tee -a "$log"
+    return 0
+  fi
+  [[ "$_done" -gt 0 ]] && echo "${_done}/${_total} result(s) for tag=${tag} already exist — those runs will be skipped." | tee -a "$log"
+
   : >"$server_log"
   local checkout_kind
   if [[ "$(cd "$work_dir" && pwd)" == "$(cd "$REPO_ROOT" && pwd)" ]]; then
@@ -569,6 +577,36 @@ run_benchmarks() {
     local osl=${pair##*,}
     for i in $(seq 1 "$bench_runs"); do
       local result_fn="result_${tag}_isl${isl}_osl${osl}_conc${conc}_run${i}.json"
+      # Recovery: skip this run if the result file already exists from a prior attempt.
+      if [[ -f "$log_dir/$result_fn" ]]; then
+        echo "Skipping isl=${isl} osl=${osl} run ${i}/${bench_runs} ($tag) — result already exists." | tee -a "$log"
+        continue
+      fi
+      # Recovery: if the server died since the last run, restart it before continuing.
+      if ! kill -0 "$server_pid" 2>/dev/null; then
+        echo "WARN: Server (pid $server_pid) died unexpectedly; restarting for tag=${tag}." | tee -a "$log" >&2
+        # Truncate the server log so wait_for_server_ready's grep doesn't match the old ready line.
+        : >"$server_log"
+        server_pid=$(start_openai_server_bg "$work_dir" "$server_log")
+        echo "Restarted server (new pid: $server_pid)" >>"$log"
+        set +e
+        wait_for_server_ready "$server_log" "$server_pid" "$SERVER_READY_TIMEOUT_SEC"
+        local restart_rc=$?
+        set -e
+        if [[ "$restart_rc" -ne 0 ]]; then
+          stop_openai_server "$server_pid"
+          local restart_reason
+          case "$restart_rc" in
+            1) restart_reason="timeout after ${SERVER_READY_TIMEOUT_SEC}s" ;;
+            2) restart_reason="server process exited before ready" ;;
+            3) restart_reason="fatal engine error" ;;
+            *) restart_reason="unknown (exit ${restart_rc})" ;;
+          esac
+          echo "ERROR: Restarted server failed to become ready (${restart_reason}). Aborting remaining benchmarks for tag=${tag}." | tee -a "$log" >&2
+          return 1
+        fi
+        echo "Restarted server is ready; resuming benchmarks." | tee -a "$log"
+      fi
       {
         echo "===== benchmark ${tag} isl=${isl} osl=${osl} run ${i}/${bench_runs} ====="
         echo "cwd: $work_dir"

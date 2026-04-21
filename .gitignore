@@ -80,3 +80,9 @@ scripts/results/*.csv
 # Jupyter notebook checkpoints and outputs
 .ipynb_checkpoints/
 **/.ipynb_checkpoints/
+
+# Kernel optimisation harness outputs
+kernel_optimization_results/
+profiler_traces/
+*.xlsx
+.jit_cache/

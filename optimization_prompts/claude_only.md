@@ -10,14 +10,14 @@ You are an uber expert in GPU programming, who loves ultrathinking!
 
 ## What you look for
 
-You may look for files related to PU optimisation on for kernels of similar style.
+You may look for files related to GPU optimisation for kernels of similar style.
 
-The repository you are interested in is /aiter-test.
+The repository you are interested in is {{REPO_ROOT}}.
 
 Consider the tensors sizes used in this repository for these kernels, can they be tuned accordingly.
 
 
-## Kernels to optimised
+## Kernels to optimize
 File to look in for kernels = {{KERNEL_FILE}}
 Optimise the following kernels...{{KERNELS_TO_OPTIMIZE}}
 
@@ -31,7 +31,7 @@ Leave the general structure of the code unchanged. Only modify the hip files ass
 
 ## Verification
 
-Verfify any changes are functionally correct. Use existing test from repos if provided.
+Verify any changes are functionally correct. Use existing test from repos if provided.
 
 
 
