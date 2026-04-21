@@ -333,14 +333,16 @@ namespace py = pybind11;
           py::arg("kv_cache"),                                                      \
           py::arg("slot_mapping"),                                                  \
           py::arg("quant_block_size"),                                              \
-          py::arg("scale_fmt"));                                                    \
+          py::arg("scale_fmt"),                                                     \
+          py::arg("preshuffle") = false);                                           \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
           py::arg("dst_k"),                                                         \
           py::arg("dst_scale"),                                                     \
           py::arg("block_table"),                                                   \
-          py::arg("cu_seq_lens"));                                                  \
+          py::arg("cu_seq_lens"),                                                   \
+          py::arg("preshuffle") = false);                                           \
     m.def("fused_qk_rope_concat_and_cache_mla",                                     \
           &aiter::fused_qk_rope_concat_and_cache_mla,                               \
           "fused_qk_rope_concat_and_cache_mla("                                     \
