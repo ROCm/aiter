@@ -43,7 +43,16 @@ def split_row_major_2d(index, minor_extent):
 
 
 def _buffer_load_vec(
-    buffer_ops, vector, rsrc, idx, *, elem_type, vec_elems, elem_bytes, offset_in_bytes
+    buffer_ops,
+    vector,
+    rsrc,
+    idx,
+    *,
+    elem_type,
+    vec_elems,
+    elem_bytes,
+    offset_in_bytes,
+    cache_modifier=0,
 ):
     """Load vec_elems elements via buffer_load dwordx[1,2,4] + bitcast."""
     elem_size = int(elem_bytes)
@@ -57,7 +66,9 @@ def _buffer_load_vec(
     else:
         idx_i32 = idx
 
-    i32_val = buffer_ops.buffer_load(rsrc, idx_i32, vec_width=vec_width, dtype=T.i32)
+    i32_val = buffer_ops.buffer_load(
+        rsrc, idx_i32, vec_width=vec_width, dtype=T.i32, cache_modifier=cache_modifier
+    )
     if vec_width == 1:
         i32_vec = vector.from_elements(T.vec(1, T.i32), [i32_val])
     else:
@@ -721,7 +732,9 @@ def _load_groupwise_scale(
         # (E, G//2, N, 2) layout: dword at [e, pair, n] holds bf16 scales
         # for groups 2*pair and 2*pair+1.
         pair_idx = group_idx >> fx.Index(1)  # group_idx // 2
-        # Dword index: same flat formula but with G//2 groups
+        # Flat dword index: expert_offset * (num_pairs-1) + n_global
+        # The (num_pairs-1) cancels the expert part of n_global:
+        #   e*N*(G//2-1) + (e*N + n_local) = e*N*G//2 + n_local
         num_pairs = num_groups // 2
         c_npm1 = fx.Index(num_pairs - 1)
         dword_base = expert_offset * c_npm1 + n_global
@@ -733,6 +746,9 @@ def _load_groupwise_scale(
         )
     else:
         # (E, G, N) layout with f32 dtype
+        # Flat index: expert_offset * (G-1) + n_global
+        # The (G-1) cancels the expert part of n_global:
+        #   e*N*(G-1) + (e*N + n_local) = e*N*G + n_local
         c_gm1 = fx.Index(num_groups - 1)
         base_scale = expert_offset * c_gm1 + n_global
         elem_idx = base_scale + group_idx * c_npe
