@@ -561,6 +561,7 @@ def compile_small_m_hgemm_kernel(
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
+        bs_ = None
 
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(
@@ -633,7 +634,7 @@ def compile_small_m_hgemm_kernel(
         zero_b_frag = vector.broadcast(B_FRAG_T, c_zero_d)
         c_frags = [acc_init] * (C_FRAGS_LEN * N_TILE_REPEAT)
 
-        def zero_c_tile(bias_g, tile_n_offset):
+        def zero_c_tile(c_g, bias_g, tile_n_offset):
             zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
@@ -650,7 +651,7 @@ def compile_small_m_hgemm_kernel(
                 )
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    C_.vec_store(
+                    c_g.vec_store(
                         (row_idx, tile_n_offset + n_local_idx), init_vec, LDG_VEC_SIZE
                     )
                     scf.YieldOp([])
@@ -916,8 +917,8 @@ def compile_small_m_hgemm_kernel(
                         )
             return c_frags_new
 
-        def store_split_k_tile(tile_n_offset):
-            out_raw = fly_values(C)[0]
+        def store_split_k_tile(c_tensor, c_g, c_s, tile_n_offset):
+            out_raw = fly_values(c_tensor)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
             out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
             for i in range_constexpr(LDG_REG_C_COUNT):
@@ -931,9 +932,9 @@ def compile_small_m_hgemm_kernel(
                 )
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    pk_val = c_s.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     linear_bytes_offset = (
-                        C_.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
+                        c_g.linear_offset((m_global_idx, n_global_idx)) * DTYPE_BYTES
                     )
                     vec2_ty = T.vec(2, dtype_)
                     for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
@@ -972,7 +973,7 @@ def compile_small_m_hgemm_kernel(
                         )
                     scf.YieldOp([])
 
-        def store_c_tile(bias_g, tile_n_offset):
+        def store_c_tile(bias_g, c_g, c_s, tile_n_offset):
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
@@ -983,13 +984,13 @@ def compile_small_m_hgemm_kernel(
                 )
                 cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
                 with ir.InsertionPoint(cond_boundary_if.then_block):
-                    vec = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    vec = c_s.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
                         bias_vec = bias_g.vec_load(
                             (tile_n_offset + n_local_idx,), LDG_VEC_SIZE
                         )
                         vec = vec + bias_vec
-                    C_.vec_store(
+                    c_g.vec_store(
                         (m_global_idx, tile_n_offset + n_local_idx), vec, LDG_VEC_SIZE
                     )
                     scf.YieldOp([])
@@ -997,7 +998,7 @@ def compile_small_m_hgemm_kernel(
         stmatrix_c_m_vec_idx = w_tid // WMMA_N * WMMA_C_FRAG_VALUES
         stmatrix_c_n_idx = w_tid % WMMA_N
 
-        def write_c_frags_to_lds(tile_c_frags_):
+        def write_c_frags_to_lds(c_s, tile_c_frags_):
             for ii in range_constexpr(WARP_M_STEPS):
                 warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
                 for jj in range_constexpr(WARP_N_STEPS):
@@ -1012,7 +1013,7 @@ def compile_small_m_hgemm_kernel(
                             static_position=[kk],
                             dynamic_position=[],
                         )
-                        cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
+                        c_s[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
 
         if const_expr(IS_SPLIT_K):
             cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
@@ -1024,7 +1025,7 @@ def compile_small_m_hgemm_kernel(
                             tile_actives[tile_i], results_=[], has_else=False
                         )
                         with ir.InsertionPoint(tile_init_if.then_block):
-                            zero_c_tile(BIAS_, tile_n_offsets[tile_i])
+                            zero_c_tile(C_, BIAS_, tile_n_offsets[tile_i])
                             scf.YieldOp([])
                     scf.YieldOp([])
                 rocdl.sched_barrier(0)
@@ -1052,7 +1053,7 @@ def compile_small_m_hgemm_kernel(
 
         if const_expr(B_TO_LDS):
 
-            def ldg_sts_b_async(k_offset, lds_stage, tile_n_offset):
+            def ldg_sts_b_async(bs_s, k_offset, lds_stage, tile_n_offset):
                 for i in range_constexpr(LDG_REG_B_COUNT_AS):
                     global_tid = BLOCK_THREADS * i + tid
                     n_local_idx = global_tid // LDG_B_X_THREADS_AS
@@ -1074,14 +1075,14 @@ def compile_small_m_hgemm_kernel(
                             T.i32, global_offset * DTYPE_BYTES
                         )
                         lds_offset = (
-                            bs_.linear_offset(
+                            bs_s.linear_offset(
                                 (fx.Index(lds_stage), n_local_idx, k_local_idx)
                             )
                             * DTYPE_BYTES
                         )
                         lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
                         lds_addr = (
-                            memref.extract_aligned_pointer_as_index(bs_.memptr)
+                            memref.extract_aligned_pointer_as_index(bs_s.memptr)
                             + lds_offset
                         )
                         lds_addr_ = rocdl.readfirstlane(
@@ -1099,7 +1100,7 @@ def compile_small_m_hgemm_kernel(
                         )
                         scf.YieldOp([])
 
-            def lds_matrix_b(lds_stage):
+            def lds_matrix_b(bs_s, lds_stage):
                 s = fx.Index(lds_stage)
                 b_frags = [0] * B_FRAGS_LEN
                 for ii in range_constexpr(WARP_N_STEPS):
@@ -1111,7 +1112,7 @@ def compile_small_m_hgemm_kernel(
                             warp_atom_k_idx + ldmatrix_b_k_vec_idx
                         ) * DTYPE_BYTES
                         col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                        vec = bs_.vec_load(
+                        vec = bs_s.vec_load(
                             (s, row, col_in_bytes // DTYPE_BYTES),
                             WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K,
                         )
@@ -1123,7 +1124,7 @@ def compile_small_m_hgemm_kernel(
                 if const_expr(IS_SPLIT_K):
                     cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
                     with ir.InsertionPoint(cond_ks0_if.then_block):
-                        zero_c_tile(BIAS_, tile_n_offset)
+                        zero_c_tile(C_, BIAS_, tile_n_offset)
                         scf.YieldOp([])
                     rocdl.sched_barrier(0)
                     gpu.barrier()
@@ -1136,7 +1137,7 @@ def compile_small_m_hgemm_kernel(
                     gpu.barrier()
 
                 ldg_sts_a_async(ks_begin, 0)
-                ldg_sts_b_async(ks_begin, 0, tile_n_offset)
+                ldg_sts_b_async(bs_, ks_begin, 0, tile_n_offset)
                 gpu.barrier()
 
                 def hot_loop_scheduler():
@@ -1192,10 +1193,10 @@ def compile_small_m_hgemm_kernel(
                         with ir.InsertionPoint(cond_if.then_block):
                             next_stage = 1 - current_stage
                             a_frags = lds_matrix_a(current_stage)
-                            b_frags = lds_matrix_b(current_stage)
+                            b_frags = lds_matrix_b(bs_, current_stage)
                             ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
                             ldg_sts_b_async(
-                                k_offset + BLOCK_K, next_stage, tile_n_offset
+                                bs_, k_offset + BLOCK_K, next_stage, tile_n_offset
                             )
                             c_frags_new = block_mma_sync(
                                 a_frags, b_frags, c_frags_local
@@ -1219,16 +1220,16 @@ def compile_small_m_hgemm_kernel(
                 current_stage = results[1]
                 c_frags_local = results[2 : 2 + C_FRAGS_LEN]
                 a_frags = lds_matrix_a(current_stage)
-                b_frags = lds_matrix_b(current_stage)
+                b_frags = lds_matrix_b(bs_, current_stage)
                 c_frags_local = block_mma_sync(a_frags, b_frags, c_frags_local)
 
-                write_c_frags_to_lds(c_frags_local)
+                write_c_frags_to_lds(cs_, c_frags_local)
                 gpu.barrier()
                 if const_expr(IS_SPLIT_K):
                     split_k_barrier(COUNTER, tile_counter_idx)
-                    store_split_k_tile(tile_n_offset)
+                    store_split_k_tile(C, C_, cs_, tile_n_offset)
                 else:
-                    store_c_tile(BIAS_, tile_n_offset)
+                    store_c_tile(BIAS_, C_, cs_, tile_n_offset)
                 gpu.barrier()
 
             for tile_i in range_constexpr(tile_group):
@@ -1359,13 +1360,13 @@ def compile_small_m_hgemm_kernel(
                     tile_actives[tile_i], results_=[], has_else=False
                 )
                 with ir.InsertionPoint(tile_store_if.then_block):
-                    write_c_frags_to_lds(tile_c_frags[tile_i])
+                    write_c_frags_to_lds(cs_, tile_c_frags[tile_i])
                     gpu.barrier()
                     if const_expr(IS_SPLIT_K):
                         split_k_barrier(COUNTER, tile_counter_indices[tile_i])
-                        store_split_k_tile(tile_n_offsets[tile_i])
+                        store_split_k_tile(C, C_, cs_, tile_n_offsets[tile_i])
                     else:
-                        store_c_tile(BIAS_, tile_n_offsets[tile_i])
+                        store_c_tile(BIAS_, C_, cs_, tile_n_offsets[tile_i])
                     gpu.barrier()
                     scf.YieldOp([])
 

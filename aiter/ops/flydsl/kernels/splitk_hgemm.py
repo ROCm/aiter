@@ -235,6 +235,7 @@ def compile_hgemm_kernel(
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
+        bs_ = None
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(
             base_ptr, smem_a_offset, dtype_, shape=(STAGES * BLOCK_M * BLOCK_K,)
@@ -292,7 +293,7 @@ def compile_hgemm_kernel(
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
 
-        def zero_c(bias_g, counter_tensor, counter_g):
+        def zero_c(bias_g, c_g, counter_tensor, counter_g):
             cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
@@ -314,7 +315,7 @@ def compile_hgemm_kernel(
                         cond_boundary, results_=[], has_else=False
                     )
                     with ir.InsertionPoint(cond_boundary_if.then_block):
-                        C_.vec_store(
+                        c_g.vec_store(
                             (row_idx, n_offset + n_local_idx), init_vec, LDG_VEC_SIZE
                         )
                         scf.YieldOp([])
@@ -612,11 +613,11 @@ def compile_hgemm_kernel(
             return c_frags_new
 
         if const_expr(IS_SPLIT_K):
-            zero_c(BIAS_, COUNTER, COUNTER_)
+            zero_c(BIAS_, C_, COUNTER, COUNTER_)
 
         if const_expr(B_TO_LDS):
 
-            def ldg_sts_b_async(k_offset, lds_stage):
+            def ldg_sts_b_async(bs_s, k_offset, lds_stage):
                 for i in range_constexpr(LDG_REG_B_COUNT_AS):
                     global_tid = BLOCK_THREADS * i + tid
                     n_local_idx = global_tid // LDG_B_X_THREADS_AS
@@ -636,14 +637,15 @@ def compile_hgemm_kernel(
                     )
                     global_offset = arith.index_cast(T.i32, global_offset)
                     lds_offset = (
-                        bs_.linear_offset(
+                        bs_s.linear_offset(
                             (fx.Index(lds_stage), n_local_idx, k_local_idx)
                         )
                         * DTYPE_BYTES
                     )
                     lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
                     lds_addr = (
-                        memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
+                        memref.extract_aligned_pointer_as_index(bs_s.memptr)
+                        + lds_offset
                     )
                     lds_addr_ = rocdl.readfirstlane(
                         T.i64, arith.index_cast(T.i64, lds_addr)
@@ -659,7 +661,7 @@ def compile_hgemm_kernel(
                         arith.constant(1, type=T.i32),
                     )
 
-            def lds_matrix_b(lds_stage):
+            def lds_matrix_b(bs_s, lds_stage):
                 s = fx.Index(lds_stage)
                 b_frags = [0] * (WARP_K_STEPS * WARP_N_STEPS)
                 for ii in range_constexpr(WARP_N_STEPS):
@@ -671,13 +673,14 @@ def compile_hgemm_kernel(
                             warp_atom_k_idx + ldmatrix_b_k_vec_idx
                         ) * DTYPE_BYTES
                         col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                        b_frags[kk * WARP_N_STEPS + ii] = bs_.vec_load(
+                        b_frags[kk * WARP_N_STEPS + ii] = bs_s.vec_load(
                             (s, row, col_in_bytes // DTYPE_BYTES),
                             WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K,
                         )
                 return b_frags
+
             ldg_sts_a_async(ks_begin, 0)
-            ldg_sts_b_async(ks_begin, 0)
+            ldg_sts_b_async(bs_, ks_begin, 0)
             gpu.barrier()
 
             def hot_loop_scheduler():
@@ -720,9 +723,9 @@ def compile_hgemm_kernel(
                     with ir.InsertionPoint(cond_if.then_block):
                         next_stage = 1 - current_stage
                         a_frags = lds_matrix_a(current_stage)
-                        b_frags = lds_matrix_b(current_stage)
+                        b_frags = lds_matrix_b(bs_, current_stage)
                         ldg_sts_a_async(k_offset + BLOCK_K, next_stage)
-                        ldg_sts_b_async(k_offset + BLOCK_K, next_stage)
+                        ldg_sts_b_async(bs_, k_offset + BLOCK_K, next_stage)
                         c_frags_new = block_mma_sync(a_frags, b_frags, c_frags)
                         hot_loop_scheduler()
                         gpu.barrier()
@@ -740,7 +743,7 @@ def compile_hgemm_kernel(
             current_stage = results[1]
             c_frags = results[2 : 2 + C_FRAGS_LEN]
             a_frags = lds_matrix_a(current_stage)
-            b_frags = lds_matrix_b(current_stage)
+            b_frags = lds_matrix_b(bs_, current_stage)
             c_frags = block_mma_sync(a_frags, b_frags, c_frags)
         else:
             sts_a(ldg_a(ks_begin), 0)
