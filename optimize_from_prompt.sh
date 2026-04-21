@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `sh run_server_test.sh` uses POSIX sh (often dash), which has no pipefail. Re-exec with bash.
+# `sh optimize_from_prompt.sh` uses POSIX sh (often dash), which has no pipefail. Re-exec with bash.
 if [ -z "${BASH_VERSION:-}" ]; then
   exec /usr/bin/env bash "$0" "$@"
 fi
@@ -7,7 +7,9 @@ fi
 # Kernel optimisation harness (git worktrees):
 #
 #   individual    — one worktree per prompt, each branched from BASELINE_REF; Claude CLI runs in that tree only.
-#   accumulative  — one combined worktree; prompts run in order on the same tree (combined optimisations).
+#   accumulative  — one worktree per prompt, each branching from the previous step's commit, so
+#                   worktree K contains the cumulative effect of prompts 1..K. Each step is
+#                   benchmarked independently to show the performance progression.
 #
 # Phases (RUN_PHASE):
 #   build_only           — create worktrees and run Claude CLI per prompt (no benchmarks).
@@ -59,12 +61,12 @@ fi
 #
 # Examples:
 #   Quick trial (sanity check, 1 size × 1 run):
-#     TRIAL_MODE=1 RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash run_server_test.sh
+#     TRIAL_MODE=1 RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash optimize_from_prompt.sh
 #   Clean prior OUT_DIR + worktrees then build:
-#     CLEAN_OUTPUT_BEFORE_BUILD=1 OUT_DIR=./kernel_optimization_results/my_run RUN_PHASE=build_only OPTIMIZE_MODE=individual bash run_server_test.sh
-#   Build only (individual):   RUN_PHASE=build_only OPTIMIZE_MODE=individual bash run_server_test.sh
-#   Build only (combined):     RUN_PHASE=build_only OPTIMIZE_MODE=accumulative bash run_server_test.sh
-#   Benchmarks only (reuse):   RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash run_server_test.sh
+#     CLEAN_OUTPUT_BEFORE_BUILD=1 OUT_DIR=./kernel_optimization_results/my_run RUN_PHASE=build_only OPTIMIZE_MODE=individual bash optimize_from_prompt.sh
+#   Build only (individual):   RUN_PHASE=build_only OPTIMIZE_MODE=individual bash optimize_from_prompt.sh
+#   Build only (combined):     RUN_PHASE=build_only OPTIMIZE_MODE=accumulative bash optimize_from_prompt.sh
+#   Benchmarks only (reuse):   RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash optimize_from_prompt.sh
 #
 # Flow:
 #
@@ -79,13 +81,14 @@ fi
 #   |  |-- [CLEAN=1] --> clean output+worktrees
 #   |  |-- [default] --> clear_worktrees_for_build
 #   |  |
-#   |  |-- [individual] --------.     |-- [accumulative] ---------.
-#   |  |  for each prompt:      |     |  git worktree add         |
-#   |  |    git worktree add    |     |  ninja_jit_setup          |
-#   |  |    ninja_jit_setup     |     |  for each prompt:         |
-#   |  |    run_claude_prompt   |     |    run_claude_prompt      |
-#   |  |    append_manifest     |     |  append_manifest          |
-#   |  '------------------------'     '---------------------------'
+#   |  |-- [individual] --------.     |-- [accumulative] -----------------------.
+#   |  |  for each prompt:      |     |  for each prompt (chains prev commit):  |
+#   |  |    git worktree add    |     |    git worktree add (from prev HEAD)     |
+#   |  |    ninja_jit_setup     |     |    clean JIT cache (full recompile)      |
+#   |  |    run_claude_prompt   |     |    run_claude_prompt                     |
+#   |  |    append_manifest     |     |    git commit changes                    |
+#   |  '------------------------'     |    append_manifest                       |
+#   |                                 '----------------------------------------'
 #   |
 #   |-- [build_only] --> exit
 #   |
@@ -942,22 +945,34 @@ build_phase() {
     done
   else
     mkdir -p "$WORKTREE_ROOT/accumulative"
-    local branch="kernel-opt/${TIMESTAMP}/accumulative/combined"
-    local wt_path="$WORKTREE_ROOT/accumulative/combined"
-    echo "=== Worktree (accumulative): $wt_path branch $branch ==="
-    git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "$baseline_sha"
-    ninja_jit_setup "$wt_path" "$REPO_ROOT/.jit_cache"
+    local prev_sha="$baseline_sha"
     local step=0
     for prompt_file in "${PROMPTS[@]}"; do
       step=$((step + 1))
       local slug
       slug=$(slugify "$prompt_file")
       local tag="step${step}_${slug}"
+      local branch="kernel-opt/${TIMESTAMP}/accumulative/${step}/${slug}"
+      local wt_path="$WORKTREE_ROOT/accumulative/${tag}"
+      echo "=== Worktree (accumulative step $step): $wt_path branch $branch (from $prev_sha) ==="
+      git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "$prev_sha"
+      # Use a clean JIT cache per step — seeding from the previous worktree's cache
+      # risks using stale build.ninja files that have the previous worktree's source
+      # paths baked in, causing the rebuild to compile the wrong source files.
+      # A clean cache forces a full recompile from this worktree's actual source.
+      mkdir -p "$wt_path/.jit_cache"
+      export AITER_JIT_DIR="$wt_path/.jit_cache"
       local agent_log="$OUT_DIR/optimized/$opt_subdir/${tag}_claude_cli.log"
       echo "=== Claude CLI: $prompt_file → $agent_log (cwd=$wt_path) ==="
       run_claude_prompt "$prompt_file" "$agent_log" "$wt_path"
+      # Commit Claude's changes so the next worktree can branch from this cumulative state.
+      git -C "$wt_path" add -A
+      if ! git -C "$wt_path" diff --cached --quiet; then
+        git -C "$wt_path" commit -m "accumulative step ${step}: ${slug}"
+      fi
+      prev_sha=$(git -C "$wt_path" rev-parse HEAD)
+      append_manifest_entry "$tag" "$wt_path"
     done
-    append_manifest_entry "accumulative_combined" "$wt_path"
   fi
   echo "Build phase done. Manifest: $MANIFEST"
 }
