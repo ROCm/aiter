@@ -414,20 +414,29 @@ def _iter_flydsl_csv_cases():
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "aiter", "configs"
     )
     paths = [os.path.join(cfg, "a8w8_bpreshuffle_tuned_gemm.csv")] + sorted(
-        glob.glob(os.path.join(cfg, "model_configs", "*a8w8_bpreshuffle_tuned_gemm*.csv"))
+        glob.glob(
+            os.path.join(cfg, "model_configs", "*a8w8_bpreshuffle_tuned_gemm*.csv")
+        )
     )
     for path in paths:
         name = os.path.basename(path)
         if "untuned" in name or "blockscale" in name:
             continue
         df = pd.read_csv(path)
-        rows = df[(df["gfx"] == gfx) & (df["cu_num"] == cu) & (df["libtype"] == "flydsl")]
+        rows = df[
+            (df["gfx"] == gfx) & (df["cu_num"] == cu) & (df["libtype"] == "flydsl")
+        ]
         aiter.logger.info("%s: %d flydsl rows for %s cu=%d", name, len(rows), gfx, cu)
         for _, row in rows.iterrows():
             q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
             yield dict(
-                dtype=dtypes.bf16, m=int(row["M"]), n=int(row["N"]), k=int(row["K"]),
-                quantDtype=q_dtype, pad_a=128, skip_ck=True,
+                dtype=dtypes.bf16,
+                m=int(row["M"]),
+                n=int(row["N"]),
+                k=int(row["K"]),
+                quantDtype=q_dtype,
+                pad_a=128,
+                skip_ck=True,
             )
 
 
