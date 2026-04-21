@@ -477,7 +477,7 @@ def _validate_with_hip(args):
     # covers both the explicit "-M -n -C" case and the default suite, so we
     # catch e.g. the default C=128 case (hidden_size below the HIP kernel's
     # residual_block * 2 = 512 lower bound) before any kernel launch.
-    for (M_, n_, C_) in get_benchmark_configs(args):
+    for M_, n_, C_ in get_benchmark_configs(args):
         # aiter.mhc_pre_big_fuse hardcodes hc_mult == 4 via TORCH_CHECK.
         if n_ != 4:
             logging.error(
@@ -485,7 +485,9 @@ def _validate_with_hip(args):
                 "aiter.mhc_pre_big_fuse hardcodes hc_mult == 4 "
                 "(static_assert in mhc_pre_big_fuse_kernel + runtime "
                 "TORCH_CHECK in mhc_pre_big_fuse).",
-                n_, M_, C_,
+                n_,
+                M_,
+                C_,
             )
             return 1
 
@@ -498,7 +500,10 @@ def _validate_with_hip(args):
                 "--with-hip requires n*C (hc_hidden_size) divisible by 64 "
                 "(got n=%d, C=%d, n*C=%d for M=%d). aiter.mhc_pre_gemm_sqrsum "
                 "requires hc_hidden_size %% tile_k == 0 for tile_k in {64, 128}.",
-                n_, C_, hc_hidden_size, M_,
+                n_,
+                C_,
+                hc_hidden_size,
+                M_,
             )
             return 1
 
@@ -514,7 +519,9 @@ def _validate_with_hip(args):
                 "dispatches with residual_block in {128, 256} and enforces "
                 "hidden_size %% residual_block == 0 && hidden_size >= "
                 "residual_block * 2 via TORCH_CHECK.",
-                C_, M_, n_,
+                C_,
+                M_,
+                n_,
             )
             return 1
 
