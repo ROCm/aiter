@@ -608,13 +608,22 @@ run_claude_prompt() {
   fi
   # Substitute {{KERNEL_FILE}} and {{KERNELS_TO_OPTIMIZE}} placeholders so prompt files
   # remain kernel-agnostic; the actual targets are driven by env vars.
+  # Fail fast if a placeholder is present but the corresponding variable is unset.
+  if [[ "$prompt_text" == *'{{KERNEL_FILE}}'* && -z "${KERNEL_FILE:-}" ]]; then
+    echo "ERROR: prompt $(basename "$prompt_file") contains {{KERNEL_FILE}} but KERNEL_FILE is not set." >&2
+    exit 1
+  fi
+  if [[ "$prompt_text" == *'{{KERNELS_TO_OPTIMIZE}}'* && -z "${KERNELS_TO_OPTIMIZE:-}" ]]; then
+    echo "ERROR: prompt $(basename "$prompt_file") contains {{KERNELS_TO_OPTIMIZE}} but KERNELS_TO_OPTIMIZE is not set." >&2
+    exit 1
+  fi
   local kernel_file_abs
   if [[ "${KERNEL_FILE:-}" == /* ]]; then
     # Absolute path: re-anchor to the worktree by replacing the repo root prefix.
     # e.g. /aiter-test/csrc/... → <worktree>/csrc/...
     kernel_file_abs="${KERNEL_FILE/#$REPO_ROOT/$workspace}"
   else
-    kernel_file_abs=""
+    kernel_file_abs="${KERNEL_FILE:-}"
   fi
   local kernels_formatted="" k
   # Normalise commas to spaces so both "a,b" and "a b" work as separators.
@@ -622,7 +631,6 @@ run_claude_prompt() {
     [[ -z "$k" ]] && continue
     kernels_formatted+=$'\n'"    ${k}"
   done
-  # (no fallback — if KERNELS_TO_OPTIMIZE is unset, {{KERNELS_TO_OPTIMIZE}} substitutes to empty)
   prompt_text="${prompt_text//\{\{REPO_ROOT\}\}/$workspace}"
   prompt_text="${prompt_text//\{\{KERNEL_FILE\}\}/$kernel_file_abs}"
   prompt_text="${prompt_text//\{\{KERNELS_TO_OPTIMIZE\}\}/$kernels_formatted}"
