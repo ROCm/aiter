@@ -11,6 +11,7 @@ Supports three benchmark modes:
 - "mhc_lite": mHC-lite using convex combination of permutations (exact doubly stochastic, faster)
 - "mhc": Full mHC with Sinkhorn-Knopp iterations (approximate doubly stochastic)
 - "sinkhorn_knopp_only": Benchmark only the Sinkhorn-Knopp kernel in isolation
+- `--with-hip`: adds the HIP kernel aiter.mhc_pre alongside the Triton "mhc" mode.
 """
 
 import sys
@@ -54,11 +55,32 @@ def get_benchmark_configs(args):
         #   C: hidden dimension per stream
         Ms = [2**i for i in range(10, 15)]
         n = 4
-        Cs = [128, 512, 4096, 2**15]
+        Cs = [512, 4096, 2**15]
         # Sort by C (hidden dimension) to show scaling across C values
         configs = sorted(list(product(Ms, [n], Cs)), key=lambda x: (x[2], x[0]))
 
     return configs
+
+
+def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n):
+    """Convert Triton-convention mhc inputs to HIP aiter.mhc_pre conventions.
+
+    Mapping:
+      M <-> m                  n <-> hc_mult              C <-> hidden_size
+      x (M, K=n*C)             <-> residual (m, hc_mult, hidden_size) bf16
+      phi (K, 2n+n^2)          <-> fn.T (fn is (hc_mult3, hc_hidden_size)) fp32
+      (alpha_pre/post/res)     <-> hc_scale (3,) fp32
+      bias                     <-> hc_base (hc_mult3,) fp32
+    """
+    M, K = x.shape
+    C = K // n
+    residual = x.view(M, n, C).contiguous().to(torch.bfloat16)
+    fn_hip = phi.T.contiguous().float()
+    hc_scale = torch.tensor(
+        [alpha_pre, alpha_post, alpha_res], dtype=torch.float32, device=x.device
+    )
+    hc_base = bias.to(torch.float32).contiguous()
+    return residual, fn_hip, hc_scale, hc_base
 
 
 def run_benchmark(args):
@@ -73,7 +95,7 @@ def run_benchmark(args):
 
     # Determine which metrics to report (following bench_diffusion_attention pattern)
     if args.metric == "all" or args.metric is None:
-        line_vals = [
+        metrics = [
             "time(ms)",
             "throughput(TFLOPS)",
             "bandwidth(GB/s)",
@@ -86,7 +108,13 @@ def run_benchmark(args):
             "bandwidth": "bandwidth(GB/s)",
             "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
         }
-        line_vals = [metric_map.get(args.metric, "throughput(TFLOPS)")]
+        metrics = [metric_map.get(args.metric, "throughput(TFLOPS)")]
+
+    backends = ["triton"] + (["hip"] if args.with_hip else [])
+    if args.with_hip:
+        line_vals = [f"{b}_{m}" for m in metrics for b in backends]
+    else:
+        line_vals = list(metrics)
 
     benchmark_name = get_caller_name_no_ext()
     if mode == "mhc_lite":
@@ -95,14 +123,26 @@ def run_benchmark(args):
         benchmark_name += f"_sinkhorn-{sinkhorn_iters}iters"
     elif mode == "sinkhorn_knopp_only":
         benchmark_name += f"_sinkhorn_only-{sinkhorn_iters}iters"
+    if args.with_hip:
+        benchmark_name += "_triton+hip"
 
+    _palette = [
+        ("red", "-"),
+        ("blue", "-"),
+        ("yellow", "-"),
+        ("green", "-"),
+        ("red", "--"),
+        ("blue", "--"),
+        ("yellow", "--"),
+        ("green", "--"),
+    ]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         line_arg="provider",
         line_vals=line_vals,
         line_names=line_vals,
-        styles=[("red", "-"), ("blue", "-"), ("yellow", "-"), ("green", "-")],
+        styles=_palette[: len(line_vals)],
         ylabel="",
         plot_name=benchmark_name,
         args={},
@@ -220,8 +260,37 @@ def run_benchmark(args):
             # Sinkhorn-only: read/write H_res matrix
             total_mem = 2 * M * n_squared * elem_size * sinkhorn_iters
 
+        backend = "hip" if provider.startswith("hip_") else "triton"
+
         # Create benchmark function
-        if mode == "mhc":
+        if mode == "mhc" and backend == "hip":
+            # Note: HIP additionally fuses the "apply pre" step
+            # (layer_input = sum_i residual[:, i] * H_pre[:, i]) which the
+            # shared total_flops/total_mem model does not account for, so
+            # hip_throughput(TFLOPS) / hip_bandwidth(GB/s) slightly
+            # underreport. hip_time(ms) is unambiguous.
+            import aiter  # noqa: F401  (side-effect: register module_mhc ops)
+
+            residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
+                x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
+            )
+            hip_device_ctx = torch.device(residual.device)
+
+            def fn():
+                with hip_device_ctx:
+                    return aiter.mhc_pre(
+                        residual,
+                        fn_hip,
+                        hc_scale,
+                        hc_base,
+                        rms_eps=1e-6,
+                        hc_pre_eps=0.0,
+                        hc_sinkhorn_eps=1e-6,
+                        hc_post_mult_value=2.0,  # parity with Triton's 2*sigmoid(H_post)
+                        sinkhorn_repeat=sinkhorn_iters,
+                    )
+
+        elif mode == "mhc":
 
             def fn():
                 return mhc(
@@ -339,6 +408,17 @@ def parse_args():
         default=20,
         help="Number of Sinkhorn-Knopp iterations for sinkhorn mode (default: 20)",
     )
+    parser.add_argument(
+        "--with-hip",
+        dest="with_hip",
+        action="store_true",
+        default=False,
+        help=(
+            "Also benchmark the HIP aiter.mhc_pre kernel "
+            "(mhc_pre_gemm_sqrsum + mhc_pre_big_fuse) alongside Triton. "
+            "Requires --mode mhc and --dtype bf16."
+        ),
+    )
 
     # Output options
     parser.add_argument(
@@ -365,9 +445,89 @@ def parse_args():
     return parser.parse_args()
 
 
+def _validate_with_hip(args):
+    """Reject unsupported --with-hip combinations up-front with kernel-named errors.
+
+    Returns 0 if args are acceptable, or a non-zero exit code suitable for sys.exit().
+    """
+    if not args.with_hip:
+        return 0
+
+    if args.mode != "mhc":
+        logging.error(
+            "--with-hip only supports --mode mhc (got %r). "
+            "The HIP kernel aiter.mhc_pre has no analogue for 'mhc_lite' "
+            "(no permutation-combination residual stream) or for "
+            "'sinkhorn_knopp_only' (Sinkhorn-Knopp is fused inside "
+            "aiter.mhc_pre_big_fuse, not exposed as a standalone HIP kernel).",
+            args.mode,
+        )
+        return 1
+
+    if args.dtype != "bf16":
+        logging.error(
+            "--with-hip only supports --dtype bf16 (got %r). "
+            "aiter.mhc_pre_gemm_sqrsum is template-instantiated for bf16 "
+            "residual only (with fp32 fn/hc_scale/hc_base).",
+            args.dtype,
+        )
+        return 1
+
+    # Validate every (M, n, C) that will actually be benchmarked. This
+    # covers both the explicit "-M -n -C" case and the default suite, so we
+    # catch e.g. the default C=128 case (hidden_size below the HIP kernel's
+    # residual_block * 2 = 512 lower bound) before any kernel launch.
+    for (M_, n_, C_) in get_benchmark_configs(args):
+        # aiter.mhc_pre_big_fuse hardcodes hc_mult == 4 via TORCH_CHECK.
+        if n_ != 4:
+            logging.error(
+                "--with-hip requires n == 4 (got n=%d for M=%d, C=%d). "
+                "aiter.mhc_pre_big_fuse hardcodes hc_mult == 4 "
+                "(static_assert in mhc_pre_big_fuse_kernel + runtime "
+                "TORCH_CHECK in mhc_pre_big_fuse).",
+                n_, M_, C_,
+            )
+            return 1
+
+        hc_hidden_size = n_ * C_
+        # aiter.mhc_pre_gemm_sqrsum: hc_hidden_size % tile_k == 0 for tile_k
+        # in {64, 128}. The Python dispatcher always selects a valid tile_k
+        # iff hc_hidden_size is at least 64-aligned.
+        if hc_hidden_size % 64 != 0:
+            logging.error(
+                "--with-hip requires n*C (hc_hidden_size) divisible by 64 "
+                "(got n=%d, C=%d, n*C=%d for M=%d). aiter.mhc_pre_gemm_sqrsum "
+                "requires hc_hidden_size %% tile_k == 0 for tile_k in {64, 128}.",
+                n_, C_, hc_hidden_size, M_,
+            )
+            return 1
+
+        # aiter.mhc_pre_big_fuse MHC_PRE_BIG_FUSE_KERNEL_DISPATCH:
+        #   m <= cu_num*12  -> residual_block = 256 (needs C % 256 == 0, C >= 512)
+        #   m >  cu_num*12  -> residual_block = 128 (needs C % 128 == 0, C >= 256)
+        # Use the strictest condition so the check is independent of cu_num
+        # (validated by the TORCH_CHECK inside MHC_PRE_BIG_FUSE_KERNEL_IMPL).
+        if C_ % 128 != 0 or C_ < 512:
+            logging.error(
+                "--with-hip requires C (hidden_size) divisible by 128 and "
+                ">= 512 (got C=%d for M=%d, n=%d). aiter.mhc_pre_big_fuse "
+                "dispatches with residual_block in {128, 256} and enforces "
+                "hidden_size %% residual_block == 0 && hidden_size >= "
+                "residual_block * 2 via TORCH_CHECK.",
+                C_, M_, n_,
+            )
+            return 1
+
+    return 0
+
+
 def main():
     """Main entry point."""
     args = parse_args()
+
+    rc = _validate_with_hip(args)
+    if rc != 0:
+        return rc
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for mHC Triton kernels...")
