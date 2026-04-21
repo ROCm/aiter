@@ -305,8 +305,8 @@ class AITER_CONFIG(object):
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
             op_tuned_file_list = [
                 p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*")
-                if (p.is_file() and "untuned" not in str(p))
+                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+                if (p.is_file() and "untuned" not in p.name)
             ]
 
             if not op_tuned_file_list:
