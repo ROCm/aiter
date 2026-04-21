@@ -702,7 +702,7 @@ def test_varlen_flash_attn_seq_padding(
     """End-to-end check that CK group-mode varlen path respects padded tokens."""
     torch.random.manual_seed(0)
 
-    nheads = 9
+    nheads = 8
     device = "cuda"
 
     assert nheads % gqa_ratio == 0
