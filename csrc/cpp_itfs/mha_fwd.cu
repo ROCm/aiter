@@ -264,7 +264,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         fp8_args.ptr_k       = a.k_ptr;
         fp8_args.ptr_v       = a.v_ptr;
         fp8_args.scalar      = a.scale_s;
-        fp8_args.log2e       = a.scale_s * 1.4426950408889634f;
+        fp8_args.log2e       = 1.4426950408889634f;
         fp8_args.seq_len     = a.seqlen_q;
         fp8_args.s_Ts        = cfg.ts_qo * a.stride_q; // bpe=1 for fp8
         fp8_args.s_Hs        = a.nhead_stride_q;        // bpe=1 for fp8
