@@ -67,6 +67,42 @@ fi
 #   Build only (combined):     RUN_PHASE=build_only OPTIMIZE_MODE=accumulative bash run_server_test.sh
 #   Benchmarks only (reuse):   RUN_PHASE=benchmarks_only OUT_DIR=./kernel_optimization_results/20260101_120000 bash run_server_test.sh
 #
+# Flow:
+#
+#   parse env / validate args
+#         |
+#         +--[RUN_PHASE=benchmarks_only]-----------------------------+
+#         |                                                          |
+#   collect_prompts (from PROMPTS_DIR, filtered by PROMPTS_FILTER)  |
+#   resolve_baseline (git SHA of BASELINE_REF)                      |
+#         |                                                          |
+#     build_phase                                                    |
+#       |                                                            |
+#       +--[CLEAN_OUTPUT_BEFORE_BUILD=1]--> clean_output_and_worktrees_before_build
+#       +--[default]-------------------->  clear_worktrees_for_build
+#       |                                                            |
+#       +--------[individual]------------+--[accumulative]----------+|
+#       |  for each prompt:              |  git worktree add        ||
+#       |    git worktree add            |  ninja_jit_setup         ||
+#       |    ninja_jit_setup             |  for each prompt:        ||
+#       |    run_claude_prompt           |    run_claude_prompt     ||
+#       |    append_manifest_entry       |  append_manifest_entry   ||
+#       +--------------------------------+--------------------------+||
+#         |                                                          |
+#         +--[RUN_PHASE=build_only]--> exit                         |
+#         |                                                          |
+#     benchmark_phase  <--------------------------------------------+
+#       for baseline (REPO_ROOT) then each worktree in manifest:
+#         start_openai_server_bg
+#         wait_for_server_ready (timeout: SERVER_READY_TIMEOUT_SEC)
+#         for each ISL/OSL pair x N runs:
+#           run benchmark_serving.py → result_<tag>_isl<N>_osl<N>_*.json
+#         stop_openai_server
+#         |
+#   print_results_table (averages runs, compares tags side-by-side)
+#         |
+#        Done
+#
 set -euo pipefail
 
 # User-local installs (pip --user, Claude Code CLI, etc.)
@@ -618,12 +654,20 @@ run_claude_prompt() {
     exit 1
   fi
   local kernel_file_abs
-  if [[ "${KERNEL_FILE:-}" == /* ]]; then
-    # Absolute path: re-anchor to the worktree by replacing the repo root prefix.
-    # e.g. /aiter-test/csrc/... → <worktree>/csrc/...
-    kernel_file_abs="${KERNEL_FILE/#$REPO_ROOT/$workspace}"
+  if [[ -n "${KERNEL_FILE:-}" ]]; then
+    if [[ "${KERNEL_FILE}" == /* ]]; then
+      # Absolute path: re-anchor to the worktree by replacing the repo root prefix.
+      # e.g. /aiter-test/csrc/... → <worktree>/csrc/...
+      kernel_file_abs="${KERNEL_FILE/#$REPO_ROOT/$workspace}"
+    else
+      # Relative path: resolve relative to the workspace root so Claude always
+      # receives an absolute path pointing into the worktree, not the baseline repo.
+      # Without this, Claude may resolve the relative path from the main repo root
+      # (via the worktree's .git pointer) and edit the baseline instead of the worktree copy.
+      kernel_file_abs="$workspace/$KERNEL_FILE"
+    fi
   else
-    kernel_file_abs="${KERNEL_FILE:-}"
+    kernel_file_abs=""
   fi
   local kernels_formatted="" k
   # Normalise commas to spaces so both "a,b" and "a b" work as separators.
