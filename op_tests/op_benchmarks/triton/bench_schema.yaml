@@ -77,3 +77,15 @@ benchmarks:
   fused-attention-fwd-d128-layoutbhsd-causal1-typefp16:
     input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
     output_columns: [upstream (TFLOPS), iglp_10 (TFLOPS), perf_report (TFLOPS)]
+  bench_pa_decode_gluon_normal_fp8_blk16_ql1:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+  bench_pa_decode_gluon_normal_fp8_blk16_ql4:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+  bench_pa_decode_gluon_normal_fp8_blk64_ql1:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+  bench_pa_decode_gluon_normal_fp8_blk64_ql4:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
