@@ -54,8 +54,10 @@ fi
 #   Trial mode (TRIAL_MODE=1): 1 pair (8192/1024) × 1 run = 1 invocation per tag — useful for a quick sanity check.
 #   The server is stopped between tags so GPU VRAM is fully released before the next checkout is tested.
 #
-# JIT: after each `git worktree add`, `clean_jit <checkout>` removes that tree’s
-#   aiter/jit/<module>.so and aiter/jit/build/<module> so the .so is rebuilt when that worktree is used (not before benchmarks).
+# JIT: after each `git worktree add`, `ninja_jit_setup <checkout> <baseline_jit_dir>` seeds the
+#   worktree’s .jit_cache from the baseline’s compiled .so files and build trees, then uses ninja
+#   depfiles (*.o.d) to detect stale modules. Only modules whose .cu/.cuh sources changed are
+#   rebuilt (AITER_REBUILD=2 incremental); unchanged modules load from cache instantly.
 #
 # Examples:
 #   Quick trial (sanity check, 1 size × 1 run):
@@ -199,6 +201,113 @@ clean_jit() {
   rm -rf "$wt_jit_dir"
   mkdir -p "$wt_jit_dir"
   export AITER_JIT_DIR="$wt_jit_dir"
+}
+
+# ninja_jit_setup <checkout_root> [baseline_jit_dir]
+#
+# Staleness-aware JIT cache setup using ninja depfiles.
+#
+# Sets AITER_JIT_DIR to <checkout_root>/.jit_cache.
+# If baseline_jit_dir is given and non-empty, seeds the worktree cache by
+# copying .so files and build/<module>/ trees from the baseline so that ninja
+# can do an incremental rebuild instead of recompiling from scratch.
+# Then scans *.o.d depfiles in each module's build dir; any module whose .so
+# is older than one of its transitive dependencies has its .so removed and
+# AITER_REBUILD=2 is exported so the Python JIT does an incremental rebuild.
+# Modules with up-to-date .so files are left in place (cache hit).
+# Falls back to full-rebuild behaviour if no .so files exist after seeding.
+ninja_jit_setup() {
+  local checkout_root=$1
+  local baseline_jit_dir=${2:-}
+  local wt_jit_dir="$checkout_root/.jit_cache"
+  mkdir -p "$wt_jit_dir"
+  export AITER_JIT_DIR="$wt_jit_dir"
+
+  # Seed from baseline cache if provided.
+  if [[ -n "$baseline_jit_dir" && -d "$baseline_jit_dir" ]]; then
+    echo "ninja_jit_setup: seeding $wt_jit_dir from baseline $baseline_jit_dir" >&2
+    # Copy .so files.
+    local f
+    for f in "$baseline_jit_dir"/*.so; do
+      [[ -f "$f" ]] || continue
+      cp -a "$f" "$wt_jit_dir/"
+    done
+    # Copy build/<module>/ trees (contains object files and depfiles for incremental rebuild).
+    if [[ -d "$baseline_jit_dir/build" ]]; then
+      cp -a "$baseline_jit_dir/build" "$wt_jit_dir/"
+    fi
+  fi
+
+  # Collect .so files present in the cache.
+  local -a so_files=()
+  while IFS= read -r -d '' f; do
+    so_files+=("$f")
+  done < <(find "$wt_jit_dir" -maxdepth 1 -name '*.so' -print0 2>/dev/null)
+
+  if [[ ${#so_files[@]} -eq 0 ]]; then
+    # No prior build and no baseline to seed from — full recompile is unavoidable.
+    echo "ninja_jit_setup: no cached .so files in $wt_jit_dir; falling back to clean_jit (full rebuild)." >&2
+    rm -rf "$wt_jit_dir"
+    mkdir -p "$wt_jit_dir"
+    return
+  fi
+
+  local stale_count=0
+  for so_file in "${so_files[@]}"; do
+    local module
+    module=$(basename "$so_file" .so)
+    local so_mtime
+    so_mtime=$(stat -c %Y "$so_file" 2>/dev/null) || continue
+
+    # Gather all depfiles for this module.
+    local build_dir="$wt_jit_dir/build/${module}/build"
+    local -a depfiles=()
+    while IFS= read -r -d '' df; do
+      depfiles+=("$df")
+    done < <(find "$build_dir" -maxdepth 1 -name '*.d' -print0 2>/dev/null)
+
+    if [[ ${#depfiles[@]} -eq 0 ]]; then
+      # No depfiles — can't check staleness; leave .so in place.
+      continue
+    fi
+
+    local is_stale=0
+    local stale_dep=""
+    for depfile in "${depfiles[@]}"; do
+      # Makefile depfile format: "target.o: dep1 dep2 dep3 ..."
+      # Extract dependency paths after the colon; handle backslash-continued lines.
+      local dep
+      while IFS= read -r dep; do
+        [[ -z "$dep" || "$dep" == *: ]] && continue
+        dep="${dep%\\}"                      # strip trailing backslash
+        dep="${dep#"${dep%%[! ]*}"}"         # ltrim
+        dep="${dep%"${dep##*[! ]}"}"         # rtrim
+        [[ -z "$dep" ]] && continue
+        [[ -f "$dep" ]] || continue
+        local dep_mtime
+        dep_mtime=$(stat -c %Y "$dep" 2>/dev/null) || continue
+        if (( dep_mtime > so_mtime )); then
+          is_stale=1
+          stale_dep="$dep"
+          break
+        fi
+      done < <(sed 's/^[^:]*: *//' "$depfile" | tr ' ' '\n')
+      [[ "$is_stale" -eq 1 ]] && break
+    done
+
+    if [[ "$is_stale" -eq 1 ]]; then
+      echo "ninja_jit_setup: $module stale (dep newer than .so: $stale_dep) — removing .so for incremental rebuild." >&2
+      rm -f "$so_file"
+      stale_count=$((stale_count + 1))
+    fi
+  done
+
+  if [[ "$stale_count" -gt 0 ]]; then
+    export AITER_REBUILD=2
+    echo "ninja_jit_setup: $stale_count module(s) stale; AITER_REBUILD=2 (incremental ninja rebuild)." >&2
+  else
+    echo "ninja_jit_setup: all cached modules up-to-date; no rebuild needed." >&2
+  fi
 }
 
 require_git() {
@@ -744,7 +853,7 @@ build_phase() {
       local wt_path="$WORKTREE_ROOT/individual/${tag}"
       echo "=== Worktree (individual): $wt_path branch $branch ==="
       git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "$baseline_sha"
-      clean_jit "$wt_path"
+      ninja_jit_setup "$wt_path" "$REPO_ROOT/.jit_cache"
       local agent_log="$OUT_DIR/optimized/$opt_subdir/${tag}_claude_cli.log"
       echo "=== Claude CLI: $prompt_file → $agent_log (cwd=$wt_path) ==="
       run_claude_prompt "$prompt_file" "$agent_log" "$wt_path"
@@ -756,7 +865,7 @@ build_phase() {
     local wt_path="$WORKTREE_ROOT/accumulative/combined"
     echo "=== Worktree (accumulative): $wt_path branch $branch ==="
     git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "$baseline_sha"
-    clean_jit "$wt_path"
+    ninja_jit_setup "$wt_path" "$REPO_ROOT/.jit_cache"
     local step=0
     for prompt_file in "${PROMPTS[@]}"; do
       step=$((step + 1))
