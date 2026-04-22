@@ -188,19 +188,24 @@ class AITER_CONFIG(object):
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
         import pandas as pd
 
-        q2_fallback_map = {
+        optional_fallback_map = {
             "q_type2": "q_type",
             "q_dtype_a2": "q_dtype_a",
             "q_dtype_w2": "q_dtype_w",
+            # Stage2 block-M split compatibility:
+            # old tuned csv only has block_m, new hybrid csv may carry block_m2.
+            "block_m2": "block_m",
+            # Future-proof split-k field rename compatibility.
+            "ksplit1": "ksplit",
         }
-        q2_cols = tuple(q2_fallback_map.keys())
+        q2_cols = ("q_type2", "q_dtype_a2", "q_dtype_w2")
         has_q2_in_any_source = False
 
         def normalize_optional_columns(df):
             # Some legacy tuned CSVs do not carry hybrid stage2 quant columns.
-            # Fill them from stage1 quant columns when available so mixed-schema
-            # files can still be merged and deduped safely.
-            for dst_col, src_col in q2_fallback_map.items():
+            # Fill optional fields from legacy counterparts when available so
+            # mixed-schema files can still be merged and deduped safely.
+            for dst_col, src_col in optional_fallback_map.items():
                 if dst_col not in df.columns:
                     if src_col in df.columns:
                         df[dst_col] = df[src_col]
@@ -262,7 +267,7 @@ class AITER_CONFIG(object):
             dedup_keys = keys + ["_tag"] if has_tag else keys
             missing_dedup_keys = [k for k in dedup_keys if k not in merge_df.columns]
             for k in missing_dedup_keys:
-                src = q2_fallback_map.get(k)
+                src = optional_fallback_map.get(k)
                 if src is not None and src in merge_df.columns:
                     merge_df[k] = merge_df[src]
 

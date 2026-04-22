@@ -317,21 +317,72 @@ def fused_moe_(
         q_type2=q_type2,
     )
 
-    block_size_M = metadata.block_m if block_size_M is None else block_size_M
-    # Ensure block_size_M is int (metadata.block_m from CSV may be float)
-    if block_size_M is not None:
-        block_size_M = int(block_size_M)
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids,
-        topk_weight,
-        global_E,
-        model_dim,
-        dtype,
-        block_size_M,
-        expert_mask,
-        num_local_tokens,
-        moe_sorting_dispatch_policy,
-    )
+    if metadata.run_1stage:
+        block_size_M1 = metadata.block_m if block_size_M is None else block_size_M
+        block_size_M2 = block_size_M1
+    else:
+        if block_size_M is None:
+            block_size_M1 = metadata.block_m
+            block_size_M2 = metadata.block_m2
+        else:
+            block_size_M1 = block_size_M
+            block_size_M2 = block_size_M
+
+    block_size_M1 = int(block_size_M1)
+    block_size_M2 = int(block_size_M2)
+
+    if metadata.run_1stage or block_size_M1 == block_size_M2:
+        sorted_ids1, sorted_weights1, sorted_expert_ids1, num_valid_ids1, moe_buf = (
+            moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M1,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+            )
+        )
+        sorted_ids2 = sorted_ids1
+        sorted_weights2 = sorted_weights1
+        sorted_expert_ids2 = sorted_expert_ids1
+        num_valid_ids2 = num_valid_ids1
+    else:
+        sorted_ids1, sorted_weights1, sorted_expert_ids1, num_valid_ids1, _ = moe_sorting(
+            topk_ids,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M1,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+        )
+        sorted_ids2, sorted_weights2, sorted_expert_ids2, num_valid_ids2, moe_buf = (
+            moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M2,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+            )
+        )
+        # Different block_m can legitimately produce different padded valid-id
+        # counts, so do not enforce equality across the two sorting passes.
+        if int(num_valid_ids1[0].item()) != int(num_valid_ids2[0].item()):
+            pass
+            # logger.warning(
+            #     f"[fused_moe] dual-sorting valid-id counts differ with "
+            #     f"block_m(stage1)={block_size_M1}, block_m2(stage2)={block_size_M2}: "
+            #     f"{int(num_valid_ids1[0].item())} vs {int(num_valid_ids2[0].item())}"
+            # )
 
     if metadata.run_1stage:
         return metadata.stage1(
@@ -339,13 +390,13 @@ def fused_moe_(
             w1,
             w2,
             topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
+            sorted_ids1,
+            sorted_weights1,
+            sorted_expert_ids1,
+            num_valid_ids1,
             moe_buf,
             isG1U1,
-            block_size_M,
+            block_size_M1,
             # activation=activation,
             # quant_type=quant_type,
             q_dtype_a=q_dtype_a,
@@ -365,13 +416,13 @@ def fused_moe_(
             w1,
             w2,
             topk,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
+            sorted_ids1,
+            sorted_weights1,
+            sorted_expert_ids1,
+            num_valid_ids1,
             moe_buf,
             isG1U1,
-            block_size_M,
+            block_size_M1,
             activation=activation,
             quant_type=quant_type,
             doweight_stage1=doweight_stage1,
@@ -384,6 +435,11 @@ def fused_moe_(
             w2_scale=w2_scale,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
+            sorted_ids2=sorted_ids2,
+            sorted_weights2=sorted_weights2,
+            sorted_expert_ids2=sorted_expert_ids2,
+            num_valid_ids2=num_valid_ids2,
+            block_size_M2=block_size_M2,
             num_local_tokens=num_local_tokens,
             # following for cktile support
             hidden_pad=hidden_pad,
@@ -650,10 +706,15 @@ class MOEMetadata:
     stage2: Callable
     block_m: int
     ksplit: int
+    block_m2: Optional[int] = None
     run_1stage: bool = False
     has_bias: bool = False
     use_non_temporal_load: bool = True
     fuse_fp4_quant: bool = False
+
+    def __post_init__(self):
+        if self.block_m2 is None:
+            self.block_m2 = self.block_m
 
 
 def _flydsl_stage1_wrapper(
@@ -957,7 +1018,12 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    def _is_missing_number(value):
+        # CSV values may come in as None/NaN; both should fall back to defaults.
+        return value is None or (isinstance(value, float) and value != value)
+
     use_non_temporal_load = False
+    block_m2 = None
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
         kernelName1 = ""
@@ -1000,14 +1066,22 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
+        block_m2 = int(block_m)
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
             f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
-        block_m = cfg["block_m"]
+        cfg_block_m = cfg.get("block_m", BLOCK_SIZE_M)
+        if _is_missing_number(cfg_block_m):
+            cfg_block_m = BLOCK_SIZE_M
+        block_m2 = cfg.get("block_m2", cfg_block_m)
+        if _is_missing_number(block_m2):
+            block_m2 = cfg_block_m
+        block_m = int(cfg_block_m)
+        block_m2 = int(block_m2)
         if int(os.environ.get("AITER_KSPLIT", "0")) != -1:
-            ksplit = cfg["ksplit"]
+            ksplit = cfg.get("ksplit1", cfg.get("ksplit", 0))
         else:
             ksplit = 0
         kernelName1 = cfg["kernelName1"]
@@ -1047,7 +1121,8 @@ def get_2stage_cfgs(
             None,
             block_m,
             ksplit,
-            run_1stage,
+            block_m2=block_m2,
+            run_1stage=run_1stage,
         )
     is_flydsl1 = bool(kernelName1) and kernelName1.startswith("flydsl_")
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
@@ -1089,7 +1164,8 @@ def get_2stage_cfgs(
             stage2_func,
             block_m,
             int(ksplit),
-            run_1stage,
+            block_m2=block_m2,
+            run_1stage=run_1stage,
             fuse_fp4_quant=_s1_fq and q_type2 == QuantType.per_1x32,
         )
     if (
@@ -1097,6 +1173,7 @@ def get_2stage_cfgs(
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
     ):
+        _bm_cktile = get_block_m()
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
@@ -1111,10 +1188,11 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             ),
-            get_block_m(),
+            _bm_cktile,
             ksplit,
-            False,
-            True,
+            block_m2=_bm_cktile,
+            run_1stage=False,
+            has_bias=True,
         )
     elif (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -1123,6 +1201,7 @@ def get_2stage_cfgs(
         and ksplit > 1
         and is_shuffled
     ):
+        _bm_cktile = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
@@ -1137,9 +1216,10 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             ),
-            16 if token < 2048 else 32 if token < 16384 else 64,
+            _bm_cktile,
             ksplit,
-            run_1stage,
+            block_m2=_bm_cktile,
+            run_1stage=run_1stage,
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
@@ -1182,7 +1262,8 @@ def get_2stage_cfgs(
             stage2_func,
             block_m,
             int(ksplit),
-            run_1stage,
+            block_m2=block_m2,
+            run_1stage=run_1stage,
         )
 
     # TODO: remove when stage2 support more size
@@ -1190,6 +1271,7 @@ def get_2stage_cfgs(
     if block_m not in tmpList:
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
+        block_m2 = block_m
 
     return MOEMetadata(
         functools.partial(
@@ -1206,7 +1288,8 @@ def get_2stage_cfgs(
         ),
         block_m,
         ksplit,
-        run_1stage,
+        block_m2=block_m2,
+        run_1stage=run_1stage,
     )
 
 
@@ -1235,6 +1318,11 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    sorted_ids2=None,
+    sorted_weights2=None,
+    sorted_expert_ids2=None,
+    num_valid_ids2=None,
+    block_size_M2=None,
     num_local_tokens: Optional[torch.tensor] = None,
     # following for cktile support
     hidden_pad=0,
@@ -1249,6 +1337,16 @@ def fused_moe_2stages(
     q_dtype_a2 = q_dtype_a if q_dtype_a2 is None else q_dtype_a2
     q_dtype_w2 = w2.dtype if q_dtype_w2 is None else q_dtype_w2
     token_num, _ = hidden_states.shape
+    if sorted_ids2 is None:
+        sorted_ids2 = sorted_ids
+    if sorted_weights2 is None:
+        sorted_weights2 = sorted_weights
+    if sorted_expert_ids2 is None:
+        sorted_expert_ids2 = sorted_expert_ids
+    if num_valid_ids2 is None:
+        num_valid_ids2 = num_valid_ids
+    if block_size_M2 is None:
+        block_size_M2 = block_size_M
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=q_dtype_w2)
     dtype = moe_out.dtype
     device = hidden_states.device
@@ -1407,11 +1505,11 @@ def fused_moe_2stages(
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
             a2,
-            sorted_ids=sorted_ids,
-            num_valid_ids=num_valid_ids,
+            sorted_ids=sorted_ids2,
+            num_valid_ids=num_valid_ids2,
             token_num=token_num,
             topk=topk,
-            block_size=block_size_M,
+            block_size=block_size_M2,
             num_rows=num_local_tokens,
         )
         a2 = a2.view(token_num, topk, -1)
@@ -1438,17 +1536,17 @@ def fused_moe_2stages(
         a2,
         w1,
         w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
+        sorted_ids2,
+        sorted_expert_ids2,
+        num_valid_ids2,
         moe_out,
         topk,
         w2_scale=(
             w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
         ),
         a2_scale=a2_scale,
-        block_m=block_size_M,
-        sorted_weights=sorted_weights if not doweight_stage1 else None,
+        block_m=block_size_M2,
+        sorted_weights=sorted_weights2 if not doweight_stage1 else None,
         **extra_stage2_args,
     )
 

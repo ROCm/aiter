@@ -2828,6 +2828,7 @@ class FmoeTuner(TunerCommon):
             )
             stage2_profileDF = stage2_profileDF.rename(
                 columns={
+                    "block_m": "block_m2",
                     "kernelName": "kernelName2",
                     "err": "err2",
                     "us": "us2",
@@ -2860,6 +2861,7 @@ class FmoeTuner(TunerCommon):
             empty_1stage_profileDF["us2"] = 0
             empty_1stage_profileDF["tflops2"] = 0
             empty_1stage_profileDF["bw2"] = 0
+            empty_1stage_profileDF["block_m2"] = asm_1stage_profileDF["block_m"]
             asm_1stage_profileDF = pd.concat(
                 [asm_1stage_profileDF, empty_1stage_profileDF], axis=1
             )
@@ -2884,10 +2886,30 @@ class FmoeTuner(TunerCommon):
                     "q_dtype_a2",
                     "q_dtype_w2",
                     "q_type2",
-                    "block_m",
                 ],
                 how="inner",
             )
+            # `_fq` stage1 kernels fuse FP4 quant/sort and currently only support
+            # FP4 stage2 quant path with the same block-M layout.
+            _is_fq_s1 = profileDF["kernelName1"].astype(str).str.contains("_fq")
+            _is_q2_per_1x32 = profileDF["q_type2"].astype(str) == str(
+                QuantType.per_1x32
+            )
+            _invalid_fq_q2 = _is_fq_s1 & ~_is_q2_per_1x32
+            if _invalid_fq_q2.any():
+                print(
+                    "  drop incompatible _fq candidates with q_type2 != per_1x32:",
+                    int(_invalid_fq_q2.sum()),
+                )
+                profileDF = profileDF.loc[~_invalid_fq_q2].reset_index(drop=True)
+
+            _invalid_fq_mixed_bm = _is_fq_s1 & (profileDF["block_m"] != profileDF["block_m2"])
+            if _invalid_fq_mixed_bm.any():
+                print(
+                    "  drop incompatible _fq candidates with block_m != block_m2:",
+                    int(_invalid_fq_mixed_bm.sum()),
+                )
+                profileDF = profileDF.loc[~_invalid_fq_mixed_bm].reset_index(drop=True)
             profileDF["run_1stage"] = 0
             profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
             if len(profileDF) == 0:
@@ -2913,6 +2935,7 @@ class FmoeTuner(TunerCommon):
                         q_dtype_a2,
                         q_dtype_w2 if q_dtype_w2 != torch.int4 else "torch.int4",
                         q_type2,
+                        0,
                         0,
                         0,
                         self.INVALID_TIME,
@@ -3002,7 +3025,9 @@ class FmoeTuner(TunerCommon):
                 tmpprofileDF.to_csv(args.profile_file, index=False)
             best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
             print(
-                f"Tuning result for {key} is {best_one['block_m'] ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
+                f"Tuning result for {key} is "
+                f"{(best_one['block_m'], best_one.get('block_m2', best_one['block_m'])) ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} "
+                f"{best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
             )
             best_one["act_type"] = str(best_one["act_type"])
             best_one["q_type"] = str(best_one["q_type"])
@@ -3037,6 +3062,7 @@ class FmoeTuner(TunerCommon):
                     .drop(columns=["stage", "ksplit"])
                     .rename(
                         columns={
+                            "block_m": "block_m2",
                             "kernelName": "kernelName2",
                             "err": "err2",
                             "us": "us2",
@@ -3047,7 +3073,7 @@ class FmoeTuner(TunerCommon):
                 )
                 _join_keys = [
                     c for c in self.keys if c in _nf_s1.columns and c in _nf_s2.columns
-                ] + ["block_m"]
+                ]
                 non_flydsl_df = pd.merge(_nf_s1, _nf_s2, on=_join_keys, how="inner")
                 if len(non_flydsl_df) > 0:
                     if q_type == QuantType.per_1x32 and us_qs_cache:
@@ -3139,6 +3165,7 @@ if __name__ == "__main__":
     ]
     resultList = [
         "block_m",
+        "block_m2",
         "ksplit",
         "us1",
         "kernelName1",
