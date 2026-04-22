@@ -28,6 +28,8 @@ NUM_BLOCKS = [
 ]
 SLIDING_WINDOWS = [None]
 
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH == "gfx1250" 
+
 
 def shuffle_kv_cache(
     key_cache: torch.Tensor,
@@ -147,8 +149,8 @@ def generate_data(
         dtype=torch.float32,
         device="cpu",
     )
-    value_cache = torch.randn_like(key_cache).to(kv_dtype)
-    key_cache = key_cache.to(kv_dtype)
+    value_cache_orig = torch.randn_like(key_cache).to(kv_dtype)
+    key_cache_orig = key_cache.to(kv_dtype)
     cu_query_lens = torch.tensor(
         [0] + query_lens, dtype=torch.int32, device="cpu"
     ).cumsum(dim=0, dtype=torch.int32)
@@ -183,10 +185,14 @@ def generate_data(
         v_descale = torch.tensor(1.0).to("cpu")
 
     if shuffled_kv_cache:
-        key_cache, value_cache = shuffle_kv_cache(key_cache, value_cache)
+        key_cache, value_cache = shuffle_kv_cache(key_cache_orig, value_cache_orig)
+    else:
+        key_cache, value_cache = key_cache_orig, value_cache_orig
 
     return (
         query,
+        key_cache_orig,
+        value_cache_orig,
         key_cache,
         value_cache,
         sinks,
@@ -353,7 +359,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "shuffled_kv_cache",
     [
-        False,
+        True, False,
     ],
 )
 @pytest.mark.parametrize(
@@ -365,7 +371,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "loop_variant",
     [
-        1,
+        3,
     ],
 )
 @torch.inference_mode()
@@ -410,11 +416,16 @@ def test_gluon_unified_attn_2d_noncausal(
     num_query_heads = num_heads[0]
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
+    num_buffers = 3
+    if loop_variant == 0:
+        num_buffers = 2
     # NOTE: for now, skip paged access
     remove_indirect_access=False
 
     (
         query,
+        key_cache_orig,
+        value_cache_orig,
         key_cache,
         value_cache,
         sinks,
@@ -468,12 +479,12 @@ def test_gluon_unified_attn_2d_noncausal(
         shuffled_kv_cache=shuffled_kv_cache,
         remove_indirect_access=remove_indirect_access,
         loop_variant=loop_variant,
-        num_buffers=3,
+        num_buffers=num_buffers,
     )
     ref_output = ref_paged_attn(
         query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
         query_lens=query_lens,
         kv_lens=kv_lens,
         block_tables=block_tables,
