@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD
+from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD, maybe_autotune
 from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 
@@ -138,7 +138,7 @@ def fused_cumsum_kkt(
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@maybe_autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
         for BK in [32, 64]

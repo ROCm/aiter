@@ -22,6 +22,7 @@ from ..gated_delta_rule_utils import (
     USE_CUDA_GRAPH,
     autotune_cache_kwargs,
     check_shared_mem,
+    maybe_autotune,
 )
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
@@ -39,7 +40,7 @@ NUM_STAGES_FWD = [2, 3] if IS_AMD else [2, 3, 4]
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@maybe_autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
@@ -295,7 +296,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@maybe_autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
@@ -653,7 +654,7 @@ def chunk_gated_delta_rule_fwd_h(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@maybe_autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
@@ -990,7 +991,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-@triton.autotune(
+@maybe_autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]

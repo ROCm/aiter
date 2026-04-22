@@ -13,14 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD
+from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD, maybe_autotune
 from ..utils import prepare_chunk_indices
 from ..utils.op import exp
 from ..utils.solve_tril import FLA_TRIL_PRECISION
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
+@maybe_autotune(
     configs=[
         triton.Config({}, num_warps=nw, num_stages=ns)
         for nw in [2, 4, 8]
