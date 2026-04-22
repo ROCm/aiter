@@ -11,12 +11,15 @@ except ImportError:
 
 
 @triton.jit
-def _rmsmorm_op(row, weight, n_cols, epsilon):
+def _rmsmorm_op(row, weight, n_cols, epsilon, GEMMA_NORM: tl.constexpr = False):
     row_norm = row * row
     row_norm = tl.sum(row_norm, axis=-1)
     norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
 
-    rms_norm = row * norm_factor * weight
+    if GEMMA_NORM:
+        rms_norm = row * norm_factor * (1.0 + weight)
+    else:
+        rms_norm = row * norm_factor * weight
     return rms_norm
 
 
@@ -77,6 +80,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
     FIRST_INPUT_RES: tl.constexpr,
     FIRST_INPUT_OUT: tl.constexpr,
     RMSNORM_CONVERT_TO_INP1_TYPE: tl.constexpr,
+    GEMMA_NORM: tl.constexpr = False,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -99,7 +103,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
         inp1 = inp1 + res1
 
     w1 = tl.load(weight1_ptr + n_offs, mask=mask1, other=0.0).to(tl.float32)
-    norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
+    norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1, GEMMA_NORM)
 
     if FIRST_INPUT_OUT:
         mask1 = n_offs < inp1_n_cols
@@ -132,7 +136,7 @@ def _fused_rms_fp8_per_tensor_static_quant_kernel(
             cache_modifier=".cg",
         ).to(tl.float32)
         w2 = tl.load(weight2_ptr + n_offs, mask=mask2, other=0.0).to(tl.float32)
-        norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2)
+        norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2, GEMMA_NORM)
         tl.store(
             out2_ptr + m_pid * out2_row_stride + n_offs * out2_col_stride,
             norm2,
@@ -188,6 +192,7 @@ def _fused_rms_fp8_group_quant_kernel(
     HAVE_SECOND_INPUT: tl.constexpr,
     FIRST_INPUT_RES: tl.constexpr,
     FIRST_INPUT_OUT: tl.constexpr,
+    GEMMA_NORM: tl.constexpr = False,
 ):
     m_pid = tl.program_id(0)
     n_offs = tl.arange(0, BLOCK_SIZE_N)
@@ -211,7 +216,7 @@ def _fused_rms_fp8_group_quant_kernel(
 
     w1 = tl.load(weight1_ptr + n_offs, mask=mask1, other=0.0).to(tl.float32)
 
-    norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
+    norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1, GEMMA_NORM)
 
     if FIRST_INPUT_OUT:
         mask1 = n_offs < inp1_n_cols
@@ -249,7 +254,7 @@ def _fused_rms_fp8_group_quant_kernel(
             cache_modifier=".cg",
         ).to(tl.float32)
         w2 = tl.load(weight2_ptr + n_offs, mask=mask2, other=0.0).to(tl.float32)
-        norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2)
+        norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2, GEMMA_NORM)
         tl.store(
             out2_ptr + m_pid * out2_row_stride + n_offs * out2_col_stride,
             norm2,
@@ -520,6 +525,7 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
     HAS_SPLITK: tl.constexpr,
     NUM_SPLITK: tl.constexpr,
     NUM_SPLITK_POW2: tl.constexpr,
+    GEMMA_NORM: tl.constexpr = False,
 ):
     m_pid = tl.program_id(0)
 
@@ -579,7 +585,7 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
 
         w1 = tl.load(weight1_ptr + n1_offs, mask=mask1, other=other1).to(tl.float32)
 
-        norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
+        norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1, GEMMA_NORM)
 
         if FIRST_INPUT_OUT:
             tl.store(
@@ -662,7 +668,7 @@ def _fused_reduce_rms_fp8_group_quant_kernel(
                     cache_modifier=".cg",
                 ).to(tl.float32)
             w2 = tl.load(weight2_ptr + n2_offs, mask=mask2, other=other2).to(tl.float32)
-            norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2)
+            norm2 = _rmsmorm_op(inp2, w2, inp2_n_cols, eps2, GEMMA_NORM)
             tl.store(
                 out2_ptr + m_pid * out2_row_stride + n2_offs * out2_col_stride,
                 norm2,

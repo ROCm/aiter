@@ -33,6 +33,7 @@ def fused_rms_fp8_per_tensor_static_quant(
     res1=None,
     output_unquantized_inp1=False,
     rmsnorm_convert_to_inp1_type=False,
+    gemma_norm=False,
 ):
     """
     This op contains several steps:
@@ -152,6 +153,7 @@ def fused_rms_fp8_per_tensor_static_quant(
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
         RMSNORM_CONVERT_TO_INP1_TYPE=rmsnorm_convert_to_inp1_type,
+        GEMMA_NORM=gemma_norm,
         num_warps=num_warps,
     )
 
@@ -170,6 +172,7 @@ def fused_rms_fp8_group_quant(
     res1=None,
     output_unquantized_inp1=False,
     transpose_scale=False,
+    gemma_norm=False,
 ):
     """
     This op contains several steps:
@@ -183,6 +186,7 @@ def fused_rms_fp8_group_quant(
     - transpose_scale: If True, return scale with shape (M, cdiv(N1, group_size)) but stored in
                       column-major (transposed) memory layout. Equivalent to:
                       scale.transpose(0, 1).contiguous().view(*scale.shape)
+    - gemma_norm: If True, use Gemma-style RMSNorm: x * rsqrt(mean(x^2) + eps) * (1 + weight)
 
     Returns:
     - out1_fp8: The output matrix with shape (M, N1).
@@ -319,6 +323,7 @@ def fused_rms_fp8_group_quant(
         HAVE_SECOND_INPUT=(inp2 is not None),
         FIRST_INPUT_RES=(res1 is not None),
         FIRST_INPUT_OUT=output_unquantized_inp1,
+        GEMMA_NORM=gemma_norm,
         num_warps=num_warps,
     )
     # When transpose_scale=True, view the transposed buffer back to original shape
@@ -520,6 +525,7 @@ def fused_reduce_rms_fp8_group_quant(
     output_unquantized_inp1=False,
     out3=None,
     transpose_scale=False,
+    gemma_norm=False,
 ):
     """
     This op contains several steps:
@@ -735,6 +741,7 @@ def fused_reduce_rms_fp8_group_quant(
         HAS_SPLITK=HAS_SPLITK,
         NUM_SPLITK=SPK,
         NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
+        GEMMA_NORM=gemma_norm,
         num_warps=num_warps,
     )
     # When transpose_scale=True, view the transposed buffer back to original shape

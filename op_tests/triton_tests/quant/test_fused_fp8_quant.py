@@ -191,6 +191,73 @@ def test_fused_rms_fp8_group_quant(M: int, N1: int, N2: int, dtype):
     torch.testing.assert_close(y1_upcast_torch, y1_upcast_triton, atol=0.1, rtol=0.1)
 
 
+def gemma_rmsnorm(input, weight, eps=1e-6):
+    row_norm = input * input
+    row_norm = torch.sum(row_norm, dim=-1)
+    norm_factor = torch.rsqrt((row_norm / input.shape[1]) + eps)
+    rms_norm = input * norm_factor[:, None] * (1.0 + weight[None, :])
+    return rms_norm
+
+
+def run_torch_rms_fp8_group_quant_gemma(
+    x1, w1, eps1, x2, w2, eps2, res1, dtype_quant, group_size
+):
+    s = x1 + res1
+    y1 = gemma_rmsnorm(s, w1, eps1)
+    y2 = gemma_rmsnorm(x2, w2, eps2)
+    y1_q, y1_s = per_token_fp8_group_quant(y1, dtype_quant, group_size)
+    return (y1_q, y1_s), y1.to(x1.dtype), y2.to(x1.dtype), s.to(x1.dtype)
+
+
+@pytest.mark.parametrize("M", [1, 32, 256])
+@pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_rms_fp8_group_quant_gemma_norm(M: int, N1: int, N2: int, dtype):
+    group_size = 128
+    dtype_quant = aiter.dtypes.fp8
+    x1, w1, x2, w2, res1 = generate_fused_rms_quant_data(M, N1, N2, dtype)
+
+    (
+        (y1_q_torch, y1_s_torch),
+        y1_torch,
+        y2_torch,
+        y1_res_torch,
+    ) = run_torch_rms_fp8_group_quant_gemma(
+        x1, w1, 1e-6, x2, w2, 1e-6, res1, dtype_quant, group_size
+    )
+
+    (
+        (y1_q_triton, y1_s_triton),
+        y1_triton,
+        y2_triton,
+        y1_res_triton,
+    ) = fused_rms_fp8_group_quant(
+        x1,
+        w1,
+        1e-6,
+        inp2=x2,
+        inp2_weight=w2,
+        inp2_epsilon=1e-6,
+        group_size=group_size,
+        dtype_quant=dtype_quant,
+        res1=res1,
+        output_unquantized_inp1=True,
+        gemma_norm=True,
+    )
+
+    torch.testing.assert_close(y1_torch, y1_triton, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(y2_torch, y2_triton, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(y1_res_torch, y1_res_triton, atol=0.1, rtol=0.1)
+
+    y1_upcast_torch = upcast(
+        y1_q_torch, y1_s_torch, dtype=torch.float32, group_size=group_size
+    )
+    y1_upcast_triton = upcast(
+        y1_q_triton, y1_s_triton, dtype=torch.float32, group_size=group_size
+    )
+    torch.testing.assert_close(y1_upcast_torch, y1_upcast_triton, atol=0.1, rtol=0.1)
+
+
 def rmsnorm_fp8_quantization_ref(x, w, x_scale, eps, rocm_fp8_dtype):
     rms_out = rmsnorm(x.to(torch.float32), w.to(torch.float32), eps).to(x.dtype)
     quant_out = per_tensor_fp8_static_quant(
