@@ -3,6 +3,7 @@
 
 #include "mla.h"
 #include "hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh"
+#include "hk/mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh"
 
 void hk_mla_decode_fwd(
     torch::Tensor& query,
@@ -23,20 +24,48 @@ void hk_mla_decode_fwd(
 
     if ((num_head * max_seqlen_q) == 128)
     {
-        hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
-            query,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_page_indices,
-            kv_last_page_lens,
-            work_indptr,
-            work_info_set,
-            max_seqlen_q,
-            softmax_scale,
-            split_output,
-            split_lse,
-            final_output);
+        const std::string gfx = get_gpu_arch();
+        if (gfx == "gfx942")
+        {
+            hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(
+                query,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_page_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                softmax_scale,
+                split_output,
+                split_lse,
+                final_output);
+        }
+        else if (gfx == "gfx950")
+        {
+            hk_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(
+                query,
+                kv_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_page_indices,
+                kv_last_page_lens,
+                work_indptr,
+                work_info_set,
+                max_seqlen_q,
+                softmax_scale,
+                split_output,
+                split_lse,
+                final_output);
+        }
+        else
+        {
+            TORCH_CHECK(
+                false,
+                "hk_mla_decode_fwd: unsupported GPU arch '", gfx,
+                "' (supported: gfx942, gfx950).");
+        }
     }
     else
     {
