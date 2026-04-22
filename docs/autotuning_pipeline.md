@@ -10,9 +10,9 @@ In the Aiter repository, there are tuning scripts designed for various shapes, s
 
 Running these scripts generates tuned results, which are stored in the `aiter/configs` directory, for example: `aiter/configs/a8w8_tuned_batched_gemm.csv`. These CSV files are compiled during the Aiter installation process and are referenced when using Aiter operators.
 
-Based on this, we provide CI pipelines to generate and use these tuned CSV files:
+Based on this, we provide two CI paths: one for generating tuned CSVs on demand, and one for validating the tuning infrastructure every day.
 
-- [Manual Pipeline](https://github.com/ROCm/aiter/actions/workflows/operators-tuning.yaml): Allows users to select specific shapes to tune and choose whether to upload the results to the Aiter repository.
+- [Manual Pipeline](https://github.com/ROCm/aiter/actions/workflows/operators-tuning.yaml): Uses the current untuned CSV inputs to generate refreshed tuned CSV artifacts. This is the workflow to run when you want to benchmark operators, inspect CSV diffs, and decide whether to update tracked configs.
 
     1. Navigate to the Autotuning Pipelines GitHub Actions workflow page: https://github.com/ROCm/aiter/actions/workflows/operators-tuning.yaml
     
@@ -32,4 +32,20 @@ Based on this, we provide CI pipelines to generate and use these tuned CSV files
 
         ![Aiter Autotuning CI Pipeline - 2](https://raw.githubusercontent.com/ROCm/aiter/main/docs/images/autotuning_ci_pipeline_2.jpeg)
 
-- Scheduled Pipeline: Runs nightly or weekly to generate all tuned CSV files and automatically upload the results to the Aiter repository.
+- [Nightly Validation Pipeline](https://github.com/ROCm/aiter/actions/workflows/tuning-tests.yaml): Runs the `op_tests/tuning_tests` suite on a schedule to validate the tuning infrastructure introduced in PR #2734 without rewriting repository CSVs.
+
+    1. The workflow has a daily `schedule` and also supports `workflow_dispatch` for manual reruns.
+
+    2. It mirrors the tuning test plan in `op_tests/tuning_tests/README.md`:
+        - CPU validation on `ubuntu-latest`:
+          - `test_csv_validation.py`
+          - `test_tuner_infra.py`
+          - `test_mp_tuner_logic.py`
+        - GPU validation on `aiter-1gpu-runner`:
+          - `test_tune_pipeline.py`
+          - `test_run_config.py`
+          - preshuffle regression check using `TUNE_TEST_FAMILY=a8w8_blockscale_bpreshuffle`
+
+    3. The workflow uploads unittest logs and `/tmp/tuning_test_reports/` as artifacts so nightly failures can be diagnosed without regenerating tuned CSVs.
+
+    4. Unlike the manual tuning pipeline, this workflow does not call `op_tune.sh`, does not mutate tracked CSV files, and is intended only to verify that the tuning stack and existing tuned configs remain healthy in CI.
