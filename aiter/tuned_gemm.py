@@ -73,6 +73,30 @@ def get_GEMM_A16W16_config_():
     return gemm_dict
 
 
+def is_skinny_default_shape(
+    M: int,
+    N: int,
+    K: int,
+    dtype,
+    cu_num: Optional[int] = None,
+):
+    if isinstance(dtype, str):
+        dtype = eval(dtype)
+    cu_num = get_cu_num() if cu_num is None else cu_num
+    return (
+        dtype in [dtypes.fp16, dtypes.bf16]
+        and K % 8 == 0
+        and (
+            (
+                ((M == 1 and N <= 2 * cu_num) or (M > 1 and M <= 4 and N <= cu_num))
+                and K <= 9216
+            )
+            or ((M > 4 and M <= 8 and N <= cu_num) and K <= 5120)
+            or ((M > 8 and M <= 16 and N <= cu_num) and K <= 256)
+        )
+    )
+
+
 @functools.lru_cache(maxsize=4096)
 def get_GEMM_A16W16_config(
     M: int,
@@ -118,7 +142,7 @@ def get_GEMM_A16W16_config(
             if config is None:
                 continue
             if AITER_LOG_TUNED_CONFIG:
-                kernelName = config["kernelName"] if config["libtype"] == "asm" else ""
+                kernelName = config["kernelName"] if config["libtype"] != "hipblaslt" else ""
                 logger.info(
                     f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
                 )
@@ -151,19 +175,11 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif eval(dtype) in [dtypes.fp16, dtypes.bf16] and K % 8 == 0:
-            if (
-                ((M == 1 and N <= 2 * cu_num) or (M > 1 and M <= 4 and N <= cu_num))
-                and K <= 9216
-                or (M > 4 and M <= 8 and N <= cu_num)
-                and K <= 5120
-                or (M > 8 and M <= 16 and N <= cu_num)
-                and K <= 256
-            ):
-                # soltype, solution_idx = 3, 2
-                default_config["libtype"] = "skinny"
-                default_config["solidx"] = 2
-                default_config["kernelName"] = ""
+        elif is_skinny_default_shape(M, N, K, dtype, cu_num):
+            # soltype, solution_idx = 3, 2
+            default_config["libtype"] = "skinny"
+            default_config["solidx"] = 2
+            default_config["kernelName"] = ""
         if not default_config:
             default_config["libtype"] = "torch"
             default_config["solidx"] = 0
@@ -402,7 +418,7 @@ def torch_gemm(
             )
         except RuntimeError:
             out = (
-                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
+                F.linear(inp, weights)
                 * scale_a
                 * scale_b
             )
