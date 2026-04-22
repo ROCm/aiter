@@ -335,7 +335,7 @@ class AttentionConfig:
 @aggregate
 class AsyncKVLoaderConfig:
     """Derived blocked / shared-memory layouts for the async KV load path.
-
+    Only tuned for CDNA4.
     Non-shuffled: 2D (HEAD_SIZE, TILE_SIZE) / (TILE_SIZE, HEAD_SIZE) tile layouts
     from _make_cdna4_kv_load_layouts.
 
@@ -348,16 +348,23 @@ class AsyncKVLoaderConfig:
     blocked_v: gl.constexpr
     shared_k_layout: gl.constexpr
     shared_v_layout: gl.constexpr
+    REMOVE_INDIRECT_ACCESS: gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(self, cfg):
+    def __init__(self, cfg, REMOVE_INDIRECT_ACCESS):
         if cfg.SHUFFLED_KV_CACHE:
+            # Shape (NUM_KV_BLOCKS, BLOCK_SIZE*HEAD_SIZE): one slab per physical
+            # block that contributes to the tile. NUM_KV_BLOCKS=1 for AsyncKVLoader
+            # (non-gather), >1 for AsyncGatherKVLoader.
             slab = cfg.BLOCK_SIZE * cfg.HEAD_SIZE
-            spt = max(1, slab // (cfg.NUM_WARPS * cfg.WARP_SIZE))
+            wpc_outer = min(cfg.NUM_KV_BLOCKS, cfg.NUM_WARPS)
+            wpc_inner = max(1, cfg.NUM_WARPS // wpc_outer)
+            spt_outer = max(1, cfg.NUM_KV_BLOCKS // wpc_outer)
+            spt_inner = max(1, slab // (cfg.WARP_SIZE * wpc_inner))
             blocked = gl.BlockedLayout(
-                size_per_thread=[1, spt],
+                size_per_thread=[spt_outer, spt_inner],
                 threads_per_warp=[1, cfg.WARP_SIZE],
-                warps_per_cta=[1, cfg.NUM_WARPS],
+                warps_per_cta=[wpc_outer, wpc_inner],
                 order=[1, 0],
             )
             shared = gl.SwizzledSharedLayout(
@@ -375,6 +382,7 @@ class AsyncKVLoaderConfig:
             self.blocked_v = gl.constexpr(blocked_v)
             self.shared_k_layout = gl.constexpr(shared_k)
             self.shared_v_layout = gl.constexpr(shared_v)
+        self.REMOVE_INDIRECT_ACCESS = gl.constexpr(REMOVE_INDIRECT_ACCESS)
 
 
 @aggregate
@@ -424,6 +432,7 @@ class AsyncKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         stride_k_cache_0,
@@ -434,21 +443,21 @@ class AsyncKVLoader:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
-        block_table_stride,
+        REMOVE_INDIRECT_ACCESS,
     ):
-        kv_cfg = AsyncKVLoaderConfig(cfg)
+        kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         if cfg.SHUFFLED_KV_CACHE:
             # Shuffled: each (block, kv_head) slab is contiguous BLOCK_SIZE*HEAD_SIZE
-            # elements. Load as one flat row per buffer; unshuffle on read.
+            # elements. Load as NUM_KV_BLOCKS rows per buffer; unshuffle on read.
             SLAB: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE
             k_shared = gl.allocate_shared_memory(
                 key_cache_ptr.type.element_ty,
-                [2, 1, SLAB],
+                [2, cfg.NUM_KV_BLOCKS, SLAB],
                 layout=kv_cfg.shared_k_layout,
             )
             v_shared = gl.allocate_shared_memory(
                 value_cache_ptr.type.element_ty,
-                [2, 1, SLAB],
+                [2, cfg.NUM_KV_BLOCKS, SLAB],
                 layout=kv_cfg.shared_v_layout,
             )
             # stride_{k,v}_cache_1 is the per-slab stride for the shuffled layout
@@ -578,7 +587,10 @@ class AsyncKVLoader:
 
     @gluon.jit
     def load_block_ids(self, i):
-        return gl.load(self.block_tables_ptr_shifted + i) * self.stride_k_cache_0
+        if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
+            return i * self.stride_k_cache_0
+        else:
+            return gl.load(self.block_tables_ptr_shifted + i) * self.stride_k_cache_0
 
     @gluon.jit
     def lds_unshuffle_k(self, buffer_id):
@@ -683,6 +695,7 @@ class AsyncGatherKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
+        block_table_stride,
         kv_head_idx,
         num_blocks,
         stride_k_cache_0,
@@ -693,38 +706,64 @@ class AsyncGatherKVLoader:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
-        block_table_stride,
+        REMOVE_INDIRECT_ACCESS,
     ):
-        kv_cfg = AsyncKVLoaderConfig(cfg)
-        k_shared = gl.allocate_shared_memory(
-            key_cache_ptr.type.element_ty,
-            [2, cfg.HEAD_SIZE, cfg.TILE_SIZE],
-            layout=kv_cfg.shared_k_layout,
-        )
-        v_shared = gl.allocate_shared_memory(
-            value_cache_ptr.type.element_ty,
-            [2, cfg.TILE_SIZE, cfg.HEAD_SIZE],
-            layout=kv_cfg.shared_v_layout,
-        )
+        kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
+        if cfg.SHUFFLED_KV_CACHE:
+            # Shuffled gather: load NUM_KV_BLOCKS slabs per tile into LDS,
+            # unshuffle on read.
+            SLAB: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE
+            k_shared = gl.allocate_shared_memory(
+                key_cache_ptr.type.element_ty,
+                [2, cfg.NUM_KV_BLOCKS, SLAB],
+                layout=kv_cfg.shared_k_layout,
+            )
+            v_shared = gl.allocate_shared_memory(
+                value_cache_ptr.type.element_ty,
+                [2, cfg.NUM_KV_BLOCKS, SLAB],
+                layout=kv_cfg.shared_v_layout,
+            )
+            # Reuse k_head_d_offset / v_head_d_offset as the scalar head-base:
+            # kv_head_idx * stride_{k,v}_cache_1. Reuse offs_n_k/v as the
+            # slab-internal arange (0..SLAB-1) with layout sliced from blocked_k/v.
+            k_head_d_offset = kv_head_idx * stride_k_cache_1
+            v_head_d_offset = kv_head_idx * stride_v_cache_1
+            offs_n_k = gl.arange(
+                0, SLAB, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
+            )[None, :]
+            offs_n_v = gl.arange(
+                0, SLAB, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
+            )[None, :]
+        else:
+            k_shared = gl.allocate_shared_memory(
+                key_cache_ptr.type.element_ty,
+                [2, cfg.HEAD_SIZE, cfg.TILE_SIZE],
+                layout=kv_cfg.shared_k_layout,
+            )
+            v_shared = gl.allocate_shared_memory(
+                value_cache_ptr.type.element_ty,
+                [2, cfg.TILE_SIZE, cfg.HEAD_SIZE],
+                layout=kv_cfg.shared_v_layout,
+            )
 
-        # Precompute head + d-dimension offsets (tile-independent).
-        # The N-dimension within-block offset is computed per tile in load methods,
-        # so it works for both TILE_SIZE > BLOCK_SIZE and TILE_SIZE < BLOCK_SIZE.
-        offs_d_k = gl.arange(
-            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_k)
-        )[:, None]
-        offs_n_k = gl.arange(
-            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
-        )[None, :]
-        k_head_d_offset = kv_head_idx * stride_k_cache_2 + offs_d_k * stride_k_cache_3
+            # Precompute head + d-dimension offsets (tile-independent).
+            # The N-dimension within-block offset is computed per tile in load methods,
+            # so it works for both TILE_SIZE > BLOCK_SIZE and TILE_SIZE < BLOCK_SIZE.
+            offs_d_k = gl.arange(
+                0, cfg.HEAD_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_k)
+            )[:, None]
+            offs_n_k = gl.arange(
+                0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
+            )[None, :]
+            k_head_d_offset = kv_head_idx * stride_k_cache_2 + offs_d_k * stride_k_cache_3
 
-        offs_d_v = gl.arange(
-            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
-        )[None, :]
-        offs_n_v = gl.arange(
-            0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
-        )[:, None]
-        v_head_d_offset = kv_head_idx * stride_v_cache_2 + offs_d_v * stride_v_cache_3
+            offs_d_v = gl.arange(
+                0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
+            )[None, :]
+            offs_n_v = gl.arange(
+                0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
+            )[:, None]
+            v_head_d_offset = kv_head_idx * stride_v_cache_2 + offs_d_v * stride_v_cache_3
 
         return AsyncGatherKVLoader(
             cfg,
@@ -748,40 +787,49 @@ class AsyncGatherKVLoader:
 
     @gluon.jit
     def load_k_to_shared(self, tile_idx, buffer_id):
-        # Compute full sequence offset per element, then derive block table
-        # index and within-block offset. Works for any TILE_SIZE vs BLOCK_SIZE.
-        if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
-            seq_offset_k = tile_idx * self.cfg.TILE_SIZE + self.offs_n_k
-            # assumption: block table never contains OOB index
-            # vllm initialize block table with 0s, and pad with 0s.
-            # KV cache never shrinks.
-            # so as long as we are in bound of block table, we should have
-            # corresponding kv page.
-            # The goal is to do the kv loading without masking
-            block_table_idx = gl.minimum(
-                seq_offset_k // self.cfg.BLOCK_SIZE,
-                self.block_table_stride - 1,
+        if self.cfg.SHUFFLED_KV_CACHE:
+            # tile_idx is a NUM_KV_BLOCKS-vector of physical block indices
+            # (from load_block_ids). Build (NUM_KV_BLOCKS, SLAB) offset tensor.
+            k_offset = (
+                tile_idx[:, None] * self.stride_k_cache_0
+                + self.k_head_d_offset
+                + self.offs_n_k
             )
-            within_block_k = (
-                seq_offset_k % self.cfg.BLOCK_SIZE
-            ) * self.stride_k_cache_1
         else:
-            block_table_idx = gl.full(
-                [
-                    self.cfg.BLOCK_SIZE,
-                ],
-                tile_idx,
-                dtype=gl.int32,
-                layout=gl.SliceLayout(0, self.kv_cfg.blocked_k),
-            )[None, :]
-            within_block_k = self.offs_n_k * self.stride_k_cache_1
-        block_ids = gl.amd.cdna4.buffer_load(
-            ptr=self.block_tables_ptr_shifted,
-            offsets=block_table_idx,
-        )
-        k_offset = (
-            self.k_head_d_offset + within_block_k + block_ids * self.stride_k_cache_0
-        )
+            # Compute full sequence offset per element, then derive block table
+            # index and within-block offset. Works for any TILE_SIZE vs BLOCK_SIZE.
+            if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
+                seq_offset_k = tile_idx * self.cfg.TILE_SIZE + self.offs_n_k
+                # assumption: block table never contains OOB index
+                # vllm initialize block table with 0s, and pad with 0s.
+                # KV cache never shrinks.
+                # so as long as we are in bound of block table, we should have
+                # corresponding kv page.
+                # The goal is to do the kv loading without masking
+                block_table_idx = gl.minimum(
+                    seq_offset_k // self.cfg.BLOCK_SIZE,
+                    self.block_table_stride - 1,
+                )
+                within_block_k = (
+                    seq_offset_k % self.cfg.BLOCK_SIZE
+                ) * self.stride_k_cache_1
+            else:
+                block_table_idx = gl.full(
+                    [
+                        self.cfg.BLOCK_SIZE,
+                    ],
+                    tile_idx,
+                    dtype=gl.int32,
+                    layout=gl.SliceLayout(0, self.kv_cfg.blocked_k),
+                )[None, :]
+                within_block_k = self.offs_n_k * self.stride_k_cache_1
+            block_ids = gl.amd.cdna4.buffer_load(
+                ptr=self.block_tables_ptr_shifted,
+                offsets=block_table_idx,
+            )
+            k_offset = (
+                self.k_head_d_offset + within_block_k + block_ids * self.stride_k_cache_0
+            )
 
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -800,32 +848,39 @@ class AsyncGatherKVLoader:
 
     @gluon.jit
     def load_v_to_shared(self, tile_idx, buffer_id):
-        if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
-            seq_offset_v = tile_idx * self.cfg.TILE_SIZE + self.offs_n_v
-            block_table_idx = gl.minimum(
-                seq_offset_v // self.cfg.BLOCK_SIZE,
-                self.block_table_stride - 1,
+        if self.cfg.SHUFFLED_KV_CACHE:
+            v_offset = (
+                tile_idx[:, None] * self.stride_v_cache_0
+                + self.v_head_d_offset
+                + self.offs_n_v
             )
-            within_block_v = (
-                seq_offset_v % self.cfg.BLOCK_SIZE
-            ) * self.stride_v_cache_1
         else:
-            block_table_idx = gl.full(
-                [
-                    self.cfg.BLOCK_SIZE,
-                ],
-                tile_idx,
-                dtype=gl.int32,
-                layout=gl.SliceLayout(1, self.kv_cfg.blocked_v),
-            )[:, None]
-            within_block_v = self.offs_n_v * self.stride_v_cache_1
-        block_ids = gl.amd.cdna4.buffer_load(
-            ptr=self.block_tables_ptr_shifted,
-            offsets=block_table_idx,
-        )
-        v_offset = (
-            self.v_head_d_offset + within_block_v + block_ids * self.stride_v_cache_0
-        )
+            if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
+                seq_offset_v = tile_idx * self.cfg.TILE_SIZE + self.offs_n_v
+                block_table_idx = gl.minimum(
+                    seq_offset_v // self.cfg.BLOCK_SIZE,
+                    self.block_table_stride - 1,
+                )
+                within_block_v = (
+                    seq_offset_v % self.cfg.BLOCK_SIZE
+                ) * self.stride_v_cache_1
+            else:
+                block_table_idx = gl.full(
+                    [
+                        self.cfg.BLOCK_SIZE,
+                    ],
+                    tile_idx,
+                    dtype=gl.int32,
+                    layout=gl.SliceLayout(1, self.kv_cfg.blocked_v),
+                )[:, None]
+                within_block_v = self.offs_n_v * self.stride_v_cache_1
+            block_ids = gl.amd.cdna4.buffer_load(
+                ptr=self.block_tables_ptr_shifted,
+                offsets=block_table_idx,
+            )
+            v_offset = (
+                self.v_head_d_offset + within_block_v + block_ids * self.stride_v_cache_0
+            )
 
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -845,23 +900,81 @@ class AsyncGatherKVLoader:
     @gluon.jit
     def load_k_from_shared(self, wait_count, target_dtype, buffer_id):
         gl.amd.cdna4.async_copy.wait_group(wait_count)
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(
-            self.k_shared.index(buffer_id), self.cfg.k_layout
-        ).to(target_dtype)
+        if self.cfg.SHUFFLED_KV_CACHE:
+            return (
+                self.lds_unshuffle_k(buffer_id)
+                .load(layout=self.cfg.k_layout)
+            ).to(target_dtype)
+        else:
+            return gl.amd.cdna4.async_copy.load_shared_relaxed(
+                self.k_shared.index(buffer_id), self.cfg.k_layout
+            ).to(target_dtype)
 
     @gluon.jit
     def load_v_from_shared(self, wait_count, target_dtype, buffer_id):
         gl.amd.cdna4.async_copy.wait_group(wait_count)
-        return gl.amd.cdna4.async_copy.load_shared_relaxed(
-            self.v_shared.index(buffer_id), self.cfg.v_layout
-        ).to(target_dtype)
+        if self.cfg.SHUFFLED_KV_CACHE:
+            return (
+                self.lds_unshuffle_v(buffer_id)
+                .load(layout=self.cfg.v_layout)
+            ).to(target_dtype)
+        else:
+            return gl.amd.cdna4.async_copy.load_shared_relaxed(
+                self.v_shared.index(buffer_id), self.cfg.v_layout
+            ).to(target_dtype)
 
     @gluon.jit
     def load_block_ids(self, i):
-        # TODO: It is better to do actual loading here
-        # but need to handle different index layouts for k and v
-        # return tile index, per-element block lookups happen in load_k/v_to_shared
-        return i
+        if self.cfg.SHUFFLED_KV_CACHE:
+            # Pre-gather NUM_KV_BLOCKS physical block indices for tile i.
+            offs = gl.arange(
+                0, self.cfg.NUM_KV_BLOCKS,
+                layout=gl.SliceLayout(1, self.kv_cfg.blocked_k),
+            )
+            if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
+                return i * self.cfg.NUM_KV_BLOCKS + offs
+            else:
+                # Bound tile index so i*NUM_KV_BLOCKS+offs stays inside block_table.
+                i = gl.minimum(i, self.block_table_stride // self.cfg.NUM_KV_BLOCKS - 1)
+                return gl.load(
+                    self.block_tables_ptr_shifted + i * self.cfg.NUM_KV_BLOCKS + offs
+                )
+        else:
+            # Non-shuffled gather: per-element block table lookups happen in
+            # load_k/v_to_shared. Pass the tile index through.
+            return i
+
+    @gluon.jit
+    def lds_unshuffle_k(self, buffer_id):
+        # (NUM_KV_BLOCKS, BS*D) -> (NUM_KV_BLOCKS, D/x, BS, x)
+        # -> permute (0,2,1,3) -> (NUM_KV_BLOCKS, BS, D/x, x)
+        # -> reshape -> (TILE_SIZE, HEAD_SIZE) -> permute -> (HEAD_SIZE, TILE_SIZE)
+        return (
+            self.k_shared.index(buffer_id)
+            .reshape((
+                self.cfg.NUM_KV_BLOCKS,
+                self.cfg.HEAD_SIZE // self.cfg.K_WIDTH_QK,
+                self.cfg.BLOCK_SIZE,
+                self.cfg.K_WIDTH_QK,
+            ))
+            .permute((0, 2, 1, 3))
+            .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
+            .permute((1, 0))
+        )
+
+    @gluon.jit
+    def lds_unshuffle_v(self, buffer_id):
+        return (
+            self.v_shared.index(buffer_id)
+            .reshape((
+                self.cfg.NUM_KV_BLOCKS,
+                self.cfg.BLOCK_SIZE // self.cfg.K_WIDTH_PV,
+                self.cfg.HEAD_SIZE,
+                self.cfg.K_WIDTH_PV,
+            ))
+            .permute((0, 1, 3, 2))
+            .reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
+        )
 
 
 @aggregate
@@ -2785,7 +2898,7 @@ def kernel_unified_attention_2d(
             KVLoader: gl.constexpr = TDMGatherKVLoader
     else:
         if TILE_SIZE == BLOCK_SIZE:
-            KVLoader: gl.constexpr = AsyncKVLoader
+            KVLoader: gl.constexpr = AsyncGatherKVLoader
         else:
             KVLoader: gl.constexpr = AsyncGatherKVLoader
 
@@ -2944,10 +3057,6 @@ def unified_attention(
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
-        # AsyncGatherKVLoader does not support shuffled — gather across blocks
-        # conflicts with the x-interleaved inner dim.
-        assert use_tdm or num_kv_blocks == 1, \
-            "shuffled_kv_cache with num_kv_blocks > 1 requires use_tdm=True"
         num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
     else:
         if new_kv_layout:
