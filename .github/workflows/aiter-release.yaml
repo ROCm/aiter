@@ -1,11 +1,8 @@
 name: Aiter Release Package
-# Build Aiter precompiled kernel wheels (.whl) for Python 3.10/3.12,
-# push a Docker image with prebaked kernels, upload wheels to S3 and
-# GitHub Release.
+
+description: This workflow builds the Aiter Python package as .whl files for Python 3.10 and 3.12, and uploads them as artifacts.
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       commit:
@@ -22,11 +19,11 @@ on:
       docker_image_py310:
         description: 'Docker image for Python 3.10 build'
         required: true
-        default: 'rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta'
+        default: 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1'
       docker_image_py312:
         description: 'Docker image for Python 3.12 build'
         required: true
-        default: 'rocm/vllm-dev:nightly'
+        default: 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1'
       docker_password_secret:
         description: 'Docker password secret for docker login'
         required: true
@@ -38,7 +35,7 @@ on:
       docker_username:
         description: 'Docker username for docker login'
         required: true
-        default: 'rocmshard'
+        default: 'rocmshared'
       gpu_archs:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
@@ -46,32 +43,86 @@ on:
       runner:
         description: 'Select build host'
         required: true
-        default: 'aiter-k8s-build'
+        default: 'build-only-aiter'
         type: choice
         options:
           - build-only-aiter
-          - aiter-mi300-1gpu
-          - aiter-mi325-1gpu
+          - linux-aiter-mi35x-1
           - linux-aiter-mi355-1
           - aiter-1gpu-runner
-          - aiter-k8s-build
-      skip_github_release:
-        description: 'Skip creating GitHub Release (for test builds)'
+      release_type:
+        description: 'Release type for S3 publishing (leave empty for artifacts only)'
+        type: choice
+        required: false
+        default: ''
+        options:
+          - ''
+          - nightlies
+          - devreleases
+      add_date_stamp:
+        description: 'Add date stamp to version (+yyyymmdd)'
         type: boolean
         default: false
+      use_manylinux:
+        description: 'Use pytorch/manylinux2_28-builder ROCm image (AlmaLinux 8 + devtoolset, glibc 2.28). Produces wheels ABI-compatible with vLLM/Ubuntu 22 containers.'
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      release_type:
+        description: 'Release type for S3 publishing'
+        type: string
+        required: true
+      docker_image_py310:
+        description: 'Docker image for Python 3.10 build'
+        type: string
+        required: true
+      docker_image_py312:
+        description: 'Docker image for Python 3.12 build'
+        type: string
+        required: true
+      build_py310:
+        description: 'Build Python 3.10 wheel'
+        type: boolean
+        required: false
+        default: true
+      build_py312:
+        description: 'Build Python 3.12 wheel'
+        type: boolean
+        required: false
+        default: true
+      gpu_archs:
+        description: 'GPU architectures'
+        type: string
+        required: false
+        default: 'gfx942;gfx950'
+      runner:
+        description: 'Build host'
+        type: string
+        required: false
+        default: 'build-only-aiter'
+      add_date_stamp:
+        description: 'Add date stamp to version'
+        type: boolean
+        required: false
+        default: false
+      use_manylinux:
+        description: 'Use pytorch/manylinux2_28-builder ROCm image for ABI-compatible wheels'
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      wheel_names:
+        description: 'Space-separated list of built wheel filenames'
+        value: ${{ jobs.collect.outputs.wheel_names }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
 
-env:
-  GPU_ARCHS: ${{ github.event.inputs.gpu_archs || 'gfx942;gfx950' }}
-  DOCKER_USERNAME: ${{ github.event.inputs.docker_username || 'rocmshard' }}
-  DOCKER_PASSWORD_SECRET: ${{ github.event.inputs.docker_password_secret || 'DOCKER_PASSWORD' }}
-
 jobs:
   build_whl_package:
-    runs-on: ${{ github.event.inputs.runner || 'aiter-k8s-build' }}
+    runs-on: ${{ inputs.runner || github.event.inputs.runner }}
     permissions:
       id-token: write
       contents: read
@@ -81,20 +132,26 @@ jobs:
       matrix:
         include:
           - python_version: "3.10"
-            docker_image: ${{ github.event.inputs.docker_image_py310 || 'rocm/7.0-preview:rocm7.0_preview_ubuntu_22.04_vllm_0.10.1_instinct_beta' }}
-            build_enabled: ${{ github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true || github.event_name == 'push' }}
+            docker_image: ${{ inputs.docker_image_py310 || github.event.inputs.docker_image_py310 }}
+            build_enabled: ${{ (inputs.build_py310 != false && inputs.release_type != '') || github.event.inputs.build_py310 == 'true' || github.event.inputs.build_py310 == true }}
           - python_version: "3.12"
-            docker_image: ${{ github.event.inputs.docker_image_py312 || 'rocm/vllm-dev:nightly' }}
-            build_enabled: ${{ github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true || github.event_name == 'push' }}
+            docker_image: ${{ inputs.docker_image_py312 || github.event.inputs.docker_image_py312 }}
+            build_enabled: ${{ (inputs.build_py312 != false && inputs.release_type != '') || github.event.inputs.build_py312 == 'true' || github.event.inputs.build_py312 == true }}
 
     env:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
+      GPU_ARCHS: ${{ inputs.gpu_archs || github.event.inputs.gpu_archs }}
+      RELEASE_TYPE: ${{ inputs.release_type || github.event.inputs.release_type }}
+      ADD_DATE_STAMP: ${{ inputs.add_date_stamp || github.event.inputs.add_date_stamp }}
+      USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
 
     steps:
       - name: Checkout aiter repo
         if: ${{ matrix.build_enabled }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history and tags for version generation
 
       - name: Checkout to user-specified commit (if provided)
         if: ${{ matrix.build_enabled }}
@@ -117,26 +174,42 @@ jobs:
           git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Docker login
-        if: ${{ matrix.build_enabled }}
+        if: ${{ matrix.build_enabled && github.event.inputs.docker_password_secret != '' }}
         run: |
           set -ex
-          echo "${{ secrets[env.DOCKER_PASSWORD_SECRET] }}" | docker login -u "${{ env.DOCKER_USERNAME }}" --password-stdin
+          echo "${{ secrets[github.event.inputs.docker_password_secret] }}" | docker login -u "${{ github.event.inputs.docker_username }}" --password-stdin
+
+      - name: Generate version with date stamp
+        if: ${{ matrix.build_enabled && env.ADD_DATE_STAMP == 'true' }}
+        id: version
+        run: |
+          DATE_STAMP=$(date +%Y%m%d)
+          BASE_VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' | sed 's/\.post[0-9]*$//' || echo "0.1.0")
+          NIGHTLY_VERSION="${BASE_VERSION}+${DATE_STAMP}"
+          echo "nightly_version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "Building version: ${NIGHTLY_VERSION}"
 
       - name: Run the container
         if: ${{ matrix.build_enabled }}
         run: |
           set -ex
           echo "Starting container: aiter_build_${{ matrix.python_version }}"
+          # The manylinux2_28-builder image has no ENTRYPOINT but a default
+          # CMD of /bin/bash, which exits immediately for `docker run -d`.
+          # Force a long-lived `sleep infinity` so subsequent `docker exec`
+          # invocations succeed for both legacy and manylinux images.
           docker run -dt \
           --shm-size=16G \
           --network=host \
+          --entrypoint="" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_build_${{ matrix.python_version }} \
-          ${{ env.BUILD_DOCKER_IMAGE }}
+          ${{ env.BUILD_DOCKER_IMAGE }} \
+          sleep infinity
 
-      - name: Install Dependencies
-        if: ${{ matrix.build_enabled }}
+      - name: Install Dependencies (legacy rocm/pytorch image)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
         run: |
           set -e
           echo "Install Dependencies"
@@ -145,73 +218,254 @@ jobs:
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 -r requirements.txt
 
-      - name: Install ninja
-        if: ${{ matrix.build_enabled }}
+      - name: Pin setuptools_scm (legacy)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
         run: |
           set -e
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          pip install --timeout=60 --retries=10 "setuptools_scm<10"
+
+      - name: Install ninja (legacy)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
+        run: |
+          set -e
+          echo "Install ninja"
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
           pip install --timeout=60 --retries=10 ninja
 
-      - name: Build Aiter with precompiled kernels
-        if: ${{ matrix.build_enabled }}
+      - name: Pin setuptools-scm (legacy)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
         run: |
           set -e
-          echo "Building aiter whl with PREBUILD_KERNELS=1 for Python ${{ matrix.python_version }}..."
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          bash -c 'PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCHS }}" python3 setup.py bdist_wheel && ls -lh dist/*.whl'
+          pip install --timeout=60 --retries=10 'setuptools-scm<10'
 
-      - name: Verify prebuilt kernels in wheel
-        if: ${{ matrix.build_enabled }}
+      - name: Build Aiter (legacy)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
         run: |
           set -e
-          echo "=== Prebuilt kernel validation ==="
-          # Install the wheel and validate from /tmp to avoid importing the source tree
-          docker exec \
-          -w /workspace \
-          aiter_build_${{ matrix.python_version }} \
-          bash -c '
-            pip install dist/*.whl --force-reinstall
-          '
-          docker exec \
-          -w /tmp \
-          aiter_build_${{ matrix.python_version }} \
-          bash -c '
-            SITE_PKG=$(python3 -c "import aiter, os; print(os.path.dirname(aiter.__file__))")
-            KERNEL_COUNT=$(find "$SITE_PKG/jit" -name "*.so" 2>/dev/null | wc -l)
-            echo "Prebuilt kernel .so files: $KERNEL_COUNT"
-            if [ "$KERNEL_COUNT" -lt 10 ]; then
-              echo "::error::Prebuild FAILED: expected >= 10 kernel .so files, found $KERNEL_COUNT"
-              echo "This wheel will require JIT compilation at runtime and may cause OOM."
-              exit 1
-            else
-              echo "::notice::Prebuild OK: $KERNEL_COUNT kernels compiled"
-            fi
-            WHL_SIZE=$(du -sh /workspace/dist/*.whl | cut -f1)
-            echo "Wheel size: $WHL_SIZE (prebuilt wheels are typically >100MB)"
-          '
+          echo "Building aiter whl packages for Python ${{ matrix.python_version }}..."
 
-      - name: Smoke test - import and version
-        if: ${{ matrix.build_enabled }}
+          if [ "${{ env.ADD_DATE_STAMP }}" = "true" ] && [ -n "${{ steps.version.outputs.nightly_version }}" ]; then
+            echo "Using version: ${{ steps.version.outputs.nightly_version }}"
+            docker exec \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${{ steps.version.outputs.nightly_version }}" \
+            -e PREBUILD_KERNELS=1 \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+          else
+            docker exec \
+            -e PREBUILD_KERNELS=1 \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c "python3 setup.py bdist_wheel && ls dist/*.whl"
+          fi
+
+      # ============================================================
+      # manylinux2_28 build path (pytorch/manylinux2_28-builder:rocmX)
+      # ============================================================
+      # Produces wheels that obey the manylinux_2_28 ABI contract
+      # (glibc 2.28, libstdc++ from system / no GLIBCXX > 3.4.25 in
+      # devtoolset-static path), making them dlopen-safe inside
+      # Ubuntu 22 based vLLM containers (libstdc++ tops out at
+      # GLIBCXX_3.4.30 there). See issue #2843.
+      # ============================================================
+
+      - name: Resolve manylinux Python path
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX == 'true' }}
+        id: ml_py
         run: |
           set -e
-          echo "Validating wheel installation and import..."
-          # Run from /tmp so Python imports from site-packages, not the source tree
+          PY="${PYTHON_VERSION/./}"  # 3.12 -> 312
+          PYBIN="/opt/python/cp${PY}-cp${PY}/bin"
+          echo "pybin=${PYBIN}" >> "$GITHUB_OUTPUT"
+          echo "Using python: ${PYBIN}/python"
+
+      - name: Install Dependencies (manylinux)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX == 'true' }}
+        env:
+          PYBIN: ${{ steps.ml_py.outputs.pybin }}
+        run: |
+          set -e
+          # Detect ROCm flavor of the builder image to pick a torch index
+          # Image tag looks like pytorch/manylinux2_28-builder:rocm7.2
+          IMG="${BUILD_DOCKER_IMAGE}"
+          ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.1 / rocm7.0
+          ROCM_NUM="${ROCM_TAG#rocm}"      # 7.2
+          TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_NUM}"
+          echo "Torch index: ${TORCH_INDEX}"
           docker exec \
-          -w /tmp \
-          aiter_build_${{ matrix.python_version }} \
-          bash -c '
-            python3 -c "
-import aiter
-print(f\"aiter version: {aiter.__version__}\")
-from aiter.ops.triton import gemm_afp4wfp4
-print(\"triton gemm import OK\")
-" &&
-            echo "Smoke test PASSED"
-          '
+            -w /workspace \
+            -e PYBIN="${PYBIN}" \
+            -e TORCH_INDEX="${TORCH_INDEX}" \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c '
+              set -e
+              ${PYBIN}/pip install --upgrade --timeout=60 --retries=10 pip
+              ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" torch
+              # flydsl publishes only manylinux_2_35 wheels which cannot install
+              # on AlmaLinux 8 (glibc 2.28). FlyDSL AOT pre-compilation in
+              # setup.py is wrapped in try/except and is skipped gracefully when
+              # flydsl is missing, so we drop it here. The resulting wheel still
+              # contains all CK-free + Triton kernels; only the optional
+              # FlyDSL AOT cache is omitted (kernels JIT on first use).
+              grep -v "^flydsl" requirements.txt > /tmp/requirements-no-flydsl.txt
+              ${PYBIN}/pip install --timeout=60 --retries=10 -r /tmp/requirements-no-flydsl.txt
+              ${PYBIN}/pip install --timeout=60 --retries=10 "setuptools_scm<10" ninja auditwheel patchelf
+            '
+
+      - name: Build Aiter (manylinux)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX == 'true' }}
+        env:
+          PYBIN: ${{ steps.ml_py.outputs.pybin }}
+        run: |
+          set -e
+          echo "Building aiter whl in pytorch/manylinux2_28-builder for Python ${PYTHON_VERSION}..."
+
+          # Compose SETUPTOOLS_SCM_PRETEND_VERSION
+          # post2 + cherry-pick #2645 test build — version pinned for v0.1.12.post2.dev2645 dispatch from this side branch
+          BASE_VER="0.1.12.post2.dev2645"
+          # Tag the wheel so it is unambiguously the manylinux build
+          IMG="${BUILD_DOCKER_IMAGE}"
+          ROCM_TAG="${IMG##*:}"
+          PRETEND_VER="${BASE_VER}+${ROCM_TAG}.manylinux_2_28"
+          echo "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VER}"
+
+          docker exec \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION="${PRETEND_VER}" \
+            -e PREBUILD_KERNELS=1 \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e PYBIN="${PYBIN}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c '
+              set -e
+              # gcc-toolset-13 is the default manylinux_2_28 toolchain
+              source /opt/rh/gcc-toolset-13/enable 2>/dev/null || true
+              export PATH="${PYBIN}:${PATH}"
+              python --version
+              which python gcc
+              gcc --version | head -1
+              python setup.py bdist_wheel
+              ls dist/*.whl
+            '
+
+      - name: Repair wheel for manylinux compliance
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX == 'true' }}
+        env:
+          PYBIN: ${{ steps.ml_py.outputs.pybin }}
+        run: |
+          set -e
+          docker exec \
+            -e PYBIN="${PYBIN}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c '
+              set -e
+              mkdir -p dist-repaired
+              # We exclude the ROCm and torch shared libs from bundling.
+              # ROCm libs ship in the consumer container; torch libs are
+              # provided by the user-installed PyTorch wheel.
+              EXCLUDES=(
+                --exclude libamdhip64.so.7
+                --exclude libamdhip64.so
+                --exclude libhsa-runtime64.so.1
+                --exclude libhsa-runtime64.so
+                --exclude librocblas.so
+                --exclude librocsparse.so
+                --exclude librocsolver.so
+                --exclude libhipblas.so
+                --exclude libhipblaslt.so
+                --exclude librccl.so.1
+                --exclude librccl.so
+                --exclude libMIOpen.so.1
+                --exclude libMIOpen.so
+                --exclude libtorch.so
+                --exclude libtorch_cpu.so
+                --exclude libtorch_hip.so
+                --exclude libtorch_python.so
+                --exclude libc10.so
+                --exclude libc10_hip.so
+              )
+              for whl in dist/*.whl; do
+                echo "=== auditwheel show (raw) ==="
+                ${PYBIN}/auditwheel show "${whl}" || true
+                echo "=== auditwheel repair ==="
+                ${PYBIN}/auditwheel repair "${whl}" "${EXCLUDES[@]}" \
+                  --plat manylinux_2_28_x86_64 -w dist-repaired/
+              done
+              echo "=== Repaired wheels ==="
+              ls -lh dist-repaired/
+              # Replace original dist with repaired copies (keeps existing
+              # downstream upload logic untouched).
+              rm -f dist/*.whl
+              mv dist-repaired/*.whl dist/
+              ls -lh dist/
+            '
+
+      - name: Verify wheel symbol floor (auditwheel + objdump)
+        if: ${{ matrix.build_enabled && env.USE_MANYLINUX == 'true' }}
+        env:
+          PYBIN: ${{ steps.ml_py.outputs.pybin }}
+        run: |
+          set -e
+          # Hard ceilings:
+          #   GLIBCXX <= 3.4.29  (Ubuntu 22 / vLLM container ships up to 3.4.30)
+          #   GLIBC   <= 2.34   (Ubuntu 22 ships 2.35; 2.34 is a safety margin)
+          docker exec \
+            -e PYBIN="${PYBIN}" \
+            -w /workspace \
+            aiter_build_${{ matrix.python_version }} \
+            bash -c '
+              set -e
+              MAX_GLIBCXX_MINOR=29
+              MAX_GLIBC_MAJOR=2
+              MAX_GLIBC_MINOR=34
+              fail=0
+              for whl in dist/*.whl; do
+                echo "============================================="
+                echo "Wheel: ${whl}"
+                echo "============================================="
+                ${PYBIN}/auditwheel show "${whl}" || true
+                tmpd=$(mktemp -d)
+                ${PYBIN}/python -m zipfile -e "${whl}" "${tmpd}"
+                # Check every shared object under aiter/
+                while IFS= read -r so; do
+                  syms=$(objdump -p "${so}" 2>/dev/null | grep -oE "GLIBC(_2|XX_3\.4)\.[0-9]+" | sort -V | uniq)
+                  max_gxx=$(echo "${syms}" | grep -oE "GLIBCXX_3\.4\.[0-9]+" | awk -F. "{print \$3}" | sort -n | tail -1)
+                  max_gxx=${max_gxx:-0}
+                  max_gc=$(echo "${syms}" | grep -oE "GLIBC_2\.[0-9]+" | awk -F. "{print \$2}" | sort -n | tail -1)
+                  max_gc=${max_gc:-0}
+                  status=OK
+                  if [ "${max_gxx}" -gt "${MAX_GLIBCXX_MINOR}" ]; then
+                    status="FAIL(GLIBCXX_3.4.${max_gxx} > 3.4.${MAX_GLIBCXX_MINOR})"
+                    fail=1
+                  fi
+                  if [ "${max_gc}" -gt "${MAX_GLIBC_MINOR}" ]; then
+                    status="${status} FAIL(GLIBC_${MAX_GLIBC_MAJOR}.${max_gc} > 2.${MAX_GLIBC_MINOR})"
+                    fail=1
+                  fi
+                  printf "  %-80s GLIBCXX=3.4.%-3s GLIBC=2.%-3s %s\n" "${so#${tmpd}/}" "${max_gxx}" "${max_gc}" "${status}"
+                done < <(find "${tmpd}" -type f -name "*.so" -o -name "*.so.*")
+                rm -rf "${tmpd}"
+              done
+              if [ "${fail}" -ne 0 ]; then
+                echo ""
+                echo "ERROR: one or more shared objects exceed the manylinux_2_28 / vLLM compat symbol floor"
+                exit 1
+              fi
+              echo ""
+              echo "All shared objects pass GLIBCXX <= 3.4.${MAX_GLIBCXX_MINOR} and GLIBC <= 2.${MAX_GLIBC_MINOR}"
+            '
 
       - name: Upload whl file as artifact
         if: ${{ matrix.build_enabled }}
@@ -219,39 +473,35 @@ print(\"triton gemm import OK\")
         with:
           name: aiter-whl-packages-py${{ matrix.python_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: dist/*.whl
+          retention-days: 14
 
-      # Push a tagged Docker image for release builds (matches CI nightly pattern)
-      - name: Commit and push release Docker image
-        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+      - name: Build summary
+        if: ${{ matrix.build_enabled && always() }}
+        env:
+          SUMMARY_DOCKER_IMAGE: ${{ matrix.docker_image }}
+          SUMMARY_PYTHON_VERSION: ${{ matrix.python_version }}
+          SUMMARY_RELEASE_TYPE: ${{ env.RELEASE_TYPE }}
+          SUMMARY_GPU_ARCHS: ${{ env.GPU_ARCHS }}
+          SUMMARY_WHEEL_DIR: dist
         run: |
-          set -ex
-          TAG="${GITHUB_REF#refs/tags/}"
-          COMMIT_SHA=$(git rev-parse --short HEAD)
-          IMAGE_BASE="rocm/aiter-ci"
+          if [ -f .github/scripts/generate_summary.py ]; then
+            python3 .github/scripts/generate_summary.py build
+          else
+            echo "## Build Summary - Python ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Docker Image**: ${{ matrix.docker_image }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Release Type**: ${{ env.RELEASE_TYPE }}" >> $GITHUB_STEP_SUMMARY
+            ls -lh dist/*.whl | awk '{print "- " $9}' >> $GITHUB_STEP_SUMMARY || true
+          fi
 
-          # Commit the container with installed wheel as a new image
-          docker commit aiter_build_${{ matrix.python_version }} \
-            ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }}
-
-          # Also tag with commit SHA for traceability
-          docker tag \
-            ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }} \
-            ${IMAGE_BASE}:pre-build-${COMMIT_SHA}-py${{ matrix.python_version }}
-
-          docker push ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }}
-          docker push ${IMAGE_BASE}:pre-build-${COMMIT_SHA}-py${{ matrix.python_version }}
-          echo "Pushed: ${IMAGE_BASE}:${TAG}-py${{ matrix.python_version }}"
-
-      # Upload wheel to S3 (same path as nightly, with release subfolder)
       - name: Configure AWS credentials
-        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ matrix.build_enabled && env.RELEASE_TYPE != '' && github.repository_owner == 'ROCm' && !github.event.pull_request.head.repo.fork }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: us-east-1
-          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
+          role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-${{ env.RELEASE_TYPE }}
 
       - name: Install AWS CLI
-        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ matrix.build_enabled && env.RELEASE_TYPE != '' && github.repository_owner == 'ROCm' && !github.event.pull_request.head.repo.fork }}
         run: |
           if ! command -v aws &> /dev/null; then
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
@@ -260,93 +510,43 @@ print(\"triton gemm import OK\")
             rm -rf awscliv2.zip aws
           fi
 
-      - name: Upload wheels to S3
-        if: ${{ matrix.build_enabled && startsWith(github.ref, 'refs/tags/v') }}
+      - name: Upload wheels to S3 staging
+        if: ${{ matrix.build_enabled && env.RELEASE_TYPE != '' && github.repository_owner == 'ROCm' && !github.event.pull_request.head.repo.fork }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          # Derive S3 arch prefix from GPU_ARCHS (e.g. "gfx942;gfx950" -> "gfx942-gfx950")
-          ARCH_PREFIX=$(echo "${{ env.GPU_ARCHS }}" | tr ';' '-')
           for WHL in dist/*.whl; do
             WHL_NAME=$(basename ${WHL})
-            echo "Uploading ${WHL_NAME} to S3 (arch: ${ARCH_PREFIX})..."
-            # Upload to release-specific path
-            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-releases/${ARCH_PREFIX}/${TAG}/${WHL_NAME}
-            # Also upload to staging for downstream CI compatibility
-            aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/${ARCH_PREFIX}/${WHL_NAME}
+            echo "Uploading ${WHL_NAME} to S3 staging..."
+            aws s3 cp ${WHL} s3://framework-whls-${{ env.RELEASE_TYPE }}/whl-staging/gfx942-gfx950/${WHL_NAME}
           done
-          echo "Wheels uploaded to S3 (releases + staging)"
+          echo "Wheel uploaded to S3 staging"
 
       - name: Cleanup container
         if: always()
         run: |
           docker rm -f aiter_build_${{ matrix.python_version }} || true
 
-  # Generate changelog and create GitHub Release on tag push
-  create_release:
-    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.event.inputs.skip_github_release != 'true' }}
+  collect:
+    if: ${{ inputs.release_type != '' }}
     needs: build_whl_package
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-
+      contents: read
+      actions: read
+    outputs:
+      wheel_names: ${{ steps.collect-wheels.outputs.wheel_names }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history for changelog generation
-
-      - name: Generate changelog
-        id: changelog
-        run: |
-          set -e
-          TAG="${GITHUB_REF#refs/tags/}"
-
-          # If a hand-written RELEASE_NOTES file exists, use it and skip generation
-          if [ -f "RELEASE_NOTES_${TAG}.md" ]; then
-            cp "RELEASE_NOTES_${TAG}.md" /tmp/release_notes.md
-            echo "Using hand-written release notes: RELEASE_NOTES_${TAG}.md"
-            exit 0
-          fi
-
-          # Find previous tag (may be empty on first release)
-          PREV_TAG=$(git tag --sort=-version:refname | grep -v "$TAG" | head -1 || true)
-
-          if [ -z "$PREV_TAG" ]; then
-            echo "No previous tag found. Generating notes from full history."
-            echo "# ${TAG} Release Notes" > /tmp/release_notes.md
-            echo "" >> /tmp/release_notes.md
-            echo "Initial release." >> /tmp/release_notes.md
-          elif [ -f "scripts/generate_changelog.sh" ]; then
-            echo "Generating changelog: ${PREV_TAG}..${TAG}"
-            bash scripts/generate_changelog.sh "$PREV_TAG" "$TAG" /tmp/release_notes.md
-          else
-            echo "Generating changelog: ${PREV_TAG}..${TAG}"
-            echo "# ${TAG} Release Notes" > /tmp/release_notes.md
-            echo "" >> /tmp/release_notes.md
-            git log "${PREV_TAG}..${TAG}" --format="- %s" >> /tmp/release_notes.md
-          fi
-
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/whl-artifacts
-          pattern: aiter-whl-packages-*
+          pattern: aiter-whl-packages-py*
+          path: all-wheels
+          merge-multiple: true
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Collect wheel names
+        id: collect-wheels
         run: |
-          set -e
-          TAG="${GITHUB_REF#refs/tags/}"
-
-          # Collect all .whl files
-          WHL_FILES=$(find /tmp/whl-artifacts -name "*.whl" -type f)
-          echo "Found wheels:"
-          echo "$WHL_FILES"
-
-          # Create release with notes and attach wheels
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --notes-file /tmp/release_notes.md \
-            $WHL_FILES
-          echo "GitHub Release created: $TAG"
+          cd all-wheels
+          WHEELS=$(ls *.whl | tr '\n' ' ')
+          echo "wheel_names=${WHEELS}" >> $GITHUB_OUTPUT
+          echo "Built wheels: ${WHEELS}"
+          ls -lh *.whl
