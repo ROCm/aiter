@@ -457,12 +457,12 @@ def _moe_gemm_a8w4(
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 3)
 
     # Register pre-load prologue: wait for tile 0 then read it into cur_x/cur_w/cur_w_scales.
-    cur_x = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        x_buffer.index(read_idx % NUM_BUFFERS), DOT_LAYOUT_X
-    )
-    cur_w = gl.amd.cdna4.async_copy.load_shared_relaxed(
-        w_buffer.index(read_idx % NUM_BUFFERS).permute((1, 0)), DOT_LAYOUT_W
-    )
+    cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+    cur_w = (
+            w_buffer.index(read_idx % NUM_BUFFERS)
+            .permute((1, 0))
+            .load(layout=DOT_LAYOUT_W)
+        )
     w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         w_scales_buffer_slice = unswizzle_mx_scale_gfx1250(
@@ -472,7 +472,7 @@ def _moe_gemm_a8w4(
             PRESHUFFLE_FACTOR,
             SCALE_KWIDTH,
         )
-    cur_w_scales = gl.amd.cdna4.async_copy.load_shared_relaxed(w_scales_buffer_slice, DOT_LAYOUT_W_SCALES)
+    cur_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
     read_idx += 1
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
@@ -506,11 +506,11 @@ def _moe_gemm_a8w4(
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 3)
 
-        next_x = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            x_buffer.index(read_idx % NUM_BUFFERS), DOT_LAYOUT_X
-        )
-        next_w = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            w_buffer.index(read_idx % NUM_BUFFERS).permute((1, 0)), DOT_LAYOUT_W
+        next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        next_w = (
+            w_buffer.index(read_idx % NUM_BUFFERS)
+            .permute((1, 0))
+            .load(layout=DOT_LAYOUT_W)
         )
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
@@ -521,7 +521,7 @@ def _moe_gemm_a8w4(
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
             )
-        next_w_scales = gl.amd.cdna4.async_copy.load_shared_relaxed(w_scales_buffer_slice, DOT_LAYOUT_W_SCALES)
+        next_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 
         cur_x = next_x
         cur_w = next_w
@@ -533,11 +533,11 @@ def _moe_gemm_a8w4(
     for k_ep in gl.static_range(NUM_BUFFERS - 2):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - k_ep) * 3)
 
-        next_x = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            x_buffer.index(read_idx % NUM_BUFFERS), DOT_LAYOUT_X
-        )
-        next_w = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            w_buffer.index(read_idx % NUM_BUFFERS).permute((1, 0)), DOT_LAYOUT_W
+        next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
+        next_w = (
+            w_buffer.index(read_idx % NUM_BUFFERS)
+            .permute((1, 0))
+            .load(layout=DOT_LAYOUT_W)
         )
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
@@ -548,7 +548,7 @@ def _moe_gemm_a8w4(
                 PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
             )
-        next_w_scales = gl.amd.cdna4.async_copy.load_shared_relaxed(w_scales_buffer_slice, DOT_LAYOUT_W_SCALES)
+        next_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
 
         acc = gl.amd.gfx1250.wmma_scaled(cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
         cur_x = next_x
