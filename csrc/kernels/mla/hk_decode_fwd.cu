@@ -41,8 +41,8 @@ void hk_mla_decode_fwd(
     else
     {
         TORCH_CHECK(
-            num_head == 128,
-            "hk_mla_decode_fwd currently supports only num_head == 128, but got num_head = ",
-            num_head);
+            false,
+            "hk_mla_decode_fwd requires num_head * max_seqlen_q == 128, got num_head = ",
+            num_head, ", max_seqlen_q = ", max_seqlen_q);
     }
 }
