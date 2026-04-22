@@ -1,0 +1,266 @@
+name: Tuning Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Select the README test command to run
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - level01
+          - tune_pipeline
+          - run_config
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKER_IMAGE: rocm/pytorch:latest
+  GPU_ARCHS: gfx950
+  REPORT_DIR: tuning_test_reports
+  LOG_DIR: .github/test-logs/tuning-tests
+
+jobs:
+  cpu-validation:
+    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
+    name: README Level 0+1
+    runs-on: linux-aiter-mi35x-1
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync CK submodule
+        run: |
+          set -ex
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Clean up ROCm processes
+        run: ./.github/scripts/clean_up_rocm.sh
+
+      - name: Start container
+        run: |
+          set -ex
+          mkdir -p "${LOG_DIR}" "${REPORT_DIR}"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/$REPORT_DIR:/tmp/tuning_test_reports" \
+            -w /workspace \
+            --name tuning_tests_level01 \
+            $DOCKER_IMAGE
+
+      - name: Setup Aiter
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -w /workspace \
+            tuning_tests_level01 \
+            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
+      - name: Run README level 0+1 suite
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e PYTHONUNBUFFERED=1 \
+            -w /workspace \
+            tuning_tests_level01 \
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_csv_validation op_tests.tuning_tests.test_tuner_infra op_tests.tuning_tests.test_mp_tuner_logic -v 2>&1 | tee /workspace/${LOG_DIR}/level01.log"
+
+      - name: Upload level 0+1 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuning-tests-level01-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ${{ env.LOG_DIR }}/level01.log
+            ${{ env.REPORT_DIR }}/
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f tuning_tests_level01 || true
+
+      - name: Clean up ROCm processes
+        if: always()
+        run: ./.github/scripts/clean_up_rocm.sh
+
+  gpu-pipeline:
+    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
+    name: README Level 2 Pipeline
+    runs-on: linux-aiter-mi35x-1
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync CK submodule
+        run: |
+          set -ex
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Clean up ROCm processes
+        run: ./.github/scripts/clean_up_rocm.sh
+
+      - name: Start container
+        run: |
+          set -ex
+          mkdir -p "${LOG_DIR}" "${REPORT_DIR}"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/$REPORT_DIR:/tmp/tuning_test_reports" \
+            -w /workspace \
+            --name tuning_tests_pipeline \
+            $DOCKER_IMAGE
+
+      - name: Setup Aiter
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -w /workspace \
+            tuning_tests_pipeline \
+            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
+      - name: Run README tune pipeline suite
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e PYTHONUNBUFFERED=1 \
+            -w /workspace \
+            tuning_tests_pipeline \
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v 2>&1 | tee /workspace/${LOG_DIR}/tune-pipeline.log"
+
+      - name: Upload pipeline artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuning-tests-tune-pipeline-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ${{ env.LOG_DIR }}/tune-pipeline.log
+            ${{ env.REPORT_DIR }}/
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f tuning_tests_pipeline || true
+
+      - name: Clean up ROCm processes
+        if: always()
+        run: ./.github/scripts/clean_up_rocm.sh
+
+  gpu-run-config:
+    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
+    name: README Level 2 Run Config
+    runs-on: linux-aiter-mi35x-1
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Sync CK submodule
+        run: |
+          set -ex
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Clean up ROCm processes
+        run: ./.github/scripts/clean_up_rocm.sh
+
+      - name: Start container
+        run: |
+          set -ex
+          mkdir -p "${LOG_DIR}" "${REPORT_DIR}"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/$REPORT_DIR:/tmp/tuning_test_reports" \
+            -w /workspace \
+            --name tuning_tests_run_config \
+            $DOCKER_IMAGE
+
+      - name: Setup Aiter
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -w /workspace \
+            tuning_tests_run_config \
+            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
+      - name: Run README run_config suite
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e PYTHONUNBUFFERED=1 \
+            -w /workspace \
+            tuning_tests_run_config \
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_run_config -v 2>&1 | tee /workspace/${LOG_DIR}/run-config.log"
+
+      - name: Upload run_config artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuning-tests-run-config-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ${{ env.LOG_DIR }}/run-config.log
+            ${{ env.REPORT_DIR }}/
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f tuning_tests_run_config || true
+
+      - name: Clean up ROCm processes
+        if: always()
+        run: ./.github/scripts/clean_up_rocm.sh
