@@ -189,7 +189,7 @@ class FmoeTuner(TunerCommon):
                 weight, quant_dtype=dtypes.i8, dtypeMax=7
             )
         elif qType == QuantType.per_1x32 and quant_dtype == dtypes.i4x2:
-            return per_1x32_i4_quant(weight)
+            weight_qt, weight_scale = per_1x32_i4_quant(weight)
         else:
             torch_quant = aiter.get_torch_quant(qType)
             weight_qt, weight_scale = torch_quant(weight, quant_dtype=quant_dtype)
