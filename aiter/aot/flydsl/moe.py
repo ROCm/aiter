@@ -113,8 +113,7 @@ def _precompile_to_cache(
     waves_per_eu: int = 3,
     k_batch: int = 1,
     b_nt: int = 2,
-    gate_only: bool = False,
-    fuse_fp4_quant: bool = False,
+    gate_mode: str = "separated",
     mode: str = "atomic",
     persist: bool = False,
     sort_block_m: int = 0,
@@ -128,8 +127,10 @@ def _precompile_to_cache(
     No dependency on HIP ops (moe_sorting, shuffle_weight, etc.).
     """
     import torch
+    from flydsl.expr.typing import Stream
 
-    dev = torch.device("cuda")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    stream = torch.cuda.current_stream() if torch.cuda.is_available() else Stream(0)
     is_fp4 = b_dtype == "fp4"
     tokens = tile_m
     E = experts
@@ -174,6 +175,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    stream=stream,
                 )
             else:
                 out = torch.zeros(
@@ -199,6 +201,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
+                    stream=stream,
                 )
 
             exe = compile_flydsl_moe_stage1(
@@ -216,9 +219,7 @@ def _precompile_to_cache(
                 waves_per_eu=waves_per_eu,
                 k_batch=k_batch,
                 b_nt=b_nt,
-                gate_only=gate_only,
-                fuse_fp4_quant=fuse_fp4_quant and not _is_splitk,
-                fuse_sort_scale=fuse_fp4_quant and not _is_splitk,
+                gate_mode=gate_mode,
             )
             _run_compiled(exe, args)
 
@@ -253,6 +254,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    stream=stream,
                 )
             else:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
@@ -274,6 +276,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
+                    stream=stream,
                 )
 
             exe = compile_flydsl_moe_stage2(
