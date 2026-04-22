@@ -179,7 +179,7 @@ def get_flydsl_stage2_kernels(
 
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
-    for a in ("fp8", "fp4", "fp16"):
+    for a in ("fp8", "fp4", "fp16", "bf16"):
         for b in ("fp4",):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
@@ -219,7 +219,29 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    if b_dtype == "fp4":
+    if b_dtype == "fp4" and a_dtype in ("fp16", "bf16"):
+        from .kernels.a16w4_moe_gemm_2stage import compile_a16w4_moe_gemm1
+
+        return compile_a16w4_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            out_dtype=out_dtype,
+            act=act,
+            enable_bias=enable_bias,
+            model_dim_pad=model_dim_pad,
+            inter_dim_pad=inter_dim_pad,
+            gate_only=gate_only,
+            gate_up_interleave=gate_up_interleave,
+            k_batch=k_batch,
+            waves_per_eu=waves_per_eu,
+        )
+    elif b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
 
         return compile_mixed_moe_gemm1(
