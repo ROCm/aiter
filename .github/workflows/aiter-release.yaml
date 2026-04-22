@@ -216,6 +216,7 @@ jobs:
             python3 -V
             pip3 -V
             python3 -m pip install --upgrade pip
+            python3 -m pip install --upgrade setuptools wheel
             python3 -m pip install --timeout=120 --retries=10 \
               torch==2.11.0 --index-url https://download.pytorch.org/whl/rocm7.2
             python3 -c "import torch; print(\"torch:\", torch.__version__)"
