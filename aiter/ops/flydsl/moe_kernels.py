@@ -460,6 +460,42 @@ def _s1_args_std(
     )
 
 
+def _s1_args_a16w4(
+    out,
+    a,
+    w,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    token_num,
+    n_in,
+    k_in,
+    size_expert_ids_in,
+    dev,
+    bias=None,
+):
+    """Args for compile_a16w4_moe_gemm1: no a_scale, no out_scale_sorted."""
+    _bias = bias if bias is not None else torch.empty(0, device=dev, dtype=torch.float32)
+    return (
+        _view_safe(out),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(w_scale),
+        sorted_ids,
+        sorted_expert_ids,
+        sorted_weights,
+        num_valid_ids,
+        _bias,
+        token_num,
+        n_in,
+        k_in,
+        size_expert_ids_in,
+        torch.cuda.current_stream(),
+    )
+
+
 def _s2_args_fp4(
     target,
     a,
@@ -766,10 +802,28 @@ def flydsl_moe_stage1(
 
     _kernel_out = tmp_out if _is_splitk else out
     is_fp4 = b_dtype == "fp4"
+    _is_a16w4 = is_fp4 and a_dtype in ("fp16", "bf16")
     _n_in = inter_dim * 2 if is_fp4 else inter_dim
     _k_in = model_dim
 
-    if is_fp4:
+    if _is_a16w4:
+        args = _s1_args_a16w4(
+            _kernel_out.view(-1),
+            a.view(-1),
+            w1.view(-1),
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            token_num,
+            _n_in,
+            _k_in,
+            _grid_y,
+            dev,
+            bias=bias,
+        )
+    elif is_fp4:
         args = _s1_args_fp4(
             _kernel_out.view(-1),
             a.view(-1),
