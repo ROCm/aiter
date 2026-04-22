@@ -164,22 +164,22 @@ def run_aiter_qk_norm_rope_cache_quant_shuffle(
 
     aiter.fused_qk_norm_rope_cache_quant_shuffle(
         qkv,
-        num_heads_q,
-        num_heads_k,
-        num_heads_v,
-        head_size,
-        eps,
-        qw,
-        kw,
-        cos_sin,
-        is_neox_style,
-        positions,
-        k_cache,
-        v_cache,
-        slot_mapping,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        num_heads_v=num_heads_v,
+        head_dim=head_size,
+        eps=eps,
+        qw=qw,
+        kw=kw,
+        cos_sin_cache=cos_sin,
+        is_neox_style=is_neox_style,
+        pos_ids=positions,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
     q_size = num_heads_q * head_size
@@ -189,6 +189,425 @@ def run_aiter_qk_norm_rope_cache_quant_shuffle(
     qkv = qkv.view(num_tokens, q_size + k_size + v_size)
     q, k, v = qkv.split([q_size, k_size, v_size], dim=-1)
     return q, k, v, k_cache, v_cache
+
+
+@perftest()
+def run_aiter_qk_norm_rope_cache_quant_shuffle_separate(
+    qkv: Tensor,
+    qw: Tensor,
+    kw: Tensor,
+    cos_sin: Tensor,
+    positions: Tensor,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_size: int,
+    is_neox_style: bool,
+    eps: float,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    slot_mapping: Tensor,
+    kv_cache_dtype: str,
+    k_scale: Tensor,
+    v_scale: Tensor,
+):
+    """Same as run_aiter_qk_norm_rope_cache_quant_shuffle but exercises q/k/v inputs."""
+    q_size = num_heads_q * head_size
+    k_size = num_heads_k * head_size
+    v_size = num_heads_v * head_size
+    qkv_c = qkv.clone()
+    qkv_2d = qkv_c.view(num_tokens, q_size + k_size + v_size)
+    # 与 concat qkv 同一块存储上 split 出的视图（通常非 contiguous）
+    q = qkv_2d[:, :q_size]
+    k = qkv_2d[:, q_size : q_size + k_size]
+    v = qkv_2d[:, q_size + k_size :]
+    aiter.fused_qk_norm_rope_cache_quant_shuffle(
+        None,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        num_heads_v=num_heads_v,
+        head_dim=head_size,
+        eps=eps,
+        qw=qw,
+        kw=kw,
+        cos_sin_cache=cos_sin,
+        is_neox_style=is_neox_style,
+        pos_ids=positions,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        q=q,
+        k=k,
+        v=v,
+    )
+    return q, k, v, k_cache, v_cache
+
+
+@benchmark()
+def test_shuffle_separate_inputs_match_concat_qkv():
+    """fused_qk_norm_rope_cache_quant_shuffle: q/k/v path matches legacy concatenated qkv."""
+    dtype = torch.bfloat16
+    num_tokens = 11
+    num_heads_q = num_heads_k = num_heads_v = 2
+    head_size = 128
+    is_neox_style = False
+    eps = 1e-6
+    kv_cache_dtype = "auto"
+    num_blocks = 4
+    page_size = 16
+    max_positions = 4096
+
+    k_cache = torch.randn(
+        [num_blocks, page_size, num_heads_k, head_size],
+        dtype=dtype,
+        device="cuda",
+    )
+    v_cache = torch.randn(
+        [num_blocks, page_size, num_heads_v, head_size],
+        dtype=dtype,
+        device="cuda",
+    )
+    x = 16 // k_cache.element_size()
+    k_cache = (
+        k_cache.view([num_blocks, page_size, num_heads_k, head_size // x, x])
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
+    slot_mapping = torch.randperm(num_tokens, dtype=torch.int64, device="cuda")
+    k_scale = torch.zeros(
+        [num_blocks, num_heads_k, page_size], dtype=torch.float32, device="cuda"
+    )
+    v_scale = torch.zeros(
+        [num_blocks, num_heads_v, page_size], dtype=torch.float32, device="cuda"
+    )
+    qkv = torch.randn(
+        (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    qw = torch.randn(head_size, dtype=dtype, device="cuda")
+    kw = torch.randn(head_size, dtype=dtype, device="cuda")
+    cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
+    positions = torch.randint(
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    k_cache_c = k_cache.clone()
+    v_cache_c = v_cache.clone()
+    k_scale_c = k_scale.clone()
+    v_scale_c = v_scale.clone()
+    qkv_c = qkv.clone()
+
+    (q1, k1, v1, kc1, vc1), _ = run_aiter_qk_norm_rope_cache_quant_shuffle(
+        qkv,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        eps,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+    )
+
+    (q2, k2, v2, kc2, vc2), _ = run_aiter_qk_norm_rope_cache_quant_shuffle_separate(
+        qkv_c,
+        qw,
+        kw,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_size,
+        is_neox_style,
+        eps,
+        k_cache_c,
+        v_cache_c,
+        slot_mapping,
+        kv_cache_dtype,
+        k_scale_c,
+        v_scale_c,
+    )
+
+    checkAllclose(q1, q2, msg="q separate vs qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(k1, k2, msg="k separate vs qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(v1, v2, msg="v separate vs qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(kc1.float(), kc2.float(), msg="k_cache", rtol=1e-2, atol=0.05)
+    checkAllclose(vc1.float(), vc2.float(), msg="v_cache", rtol=1e-2, atol=0.05)
+    checkAllclose(k_scale, k_scale_c, msg="k_scale", rtol=1e-2, atol=0.05)
+    checkAllclose(v_scale, v_scale_c, msg="v_scale", rtol=1e-2, atol=0.05)
+
+
+@benchmark()
+def test_shuffle_noncontiguous_qkv_matches_contiguous():
+    """q/k/v 仅从拼接 qkv 的 view 上 slice 得到（同一行存储、stride0 为总宽，通常非 contiguous），与 concat qkv 路径一致。"""
+    dtype = torch.bfloat16
+    num_tokens = 11
+    num_heads_q = num_heads_k = num_heads_v = 2
+    head_size = 128
+    is_neox_style = False
+    eps = 1e-6
+    kv_cache_dtype = "auto"
+    num_blocks = 4
+    page_size = 16
+    max_positions = 4096
+
+    k_cache = torch.randn(
+        [num_blocks, page_size, num_heads_k, head_size],
+        dtype=dtype,
+        device="cuda",
+    )
+    v_cache = torch.randn(
+        [num_blocks, page_size, num_heads_v, head_size],
+        dtype=dtype,
+        device="cuda",
+    )
+    x = 16 // k_cache.element_size()
+    k_cache = (
+        k_cache.view([num_blocks, page_size, num_heads_k, head_size // x, x])
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
+    slot_mapping = torch.randperm(num_tokens, dtype=torch.int64, device="cuda")
+    k_scale = torch.zeros(
+        [num_blocks, num_heads_k, page_size], dtype=torch.float32, device="cuda"
+    )
+    v_scale = torch.zeros(
+        [num_blocks, num_heads_v, page_size], dtype=torch.float32, device="cuda"
+    )
+    qw = torch.randn(head_size, dtype=dtype, device="cuda")
+    kw = torch.randn(head_size, dtype=dtype, device="cuda")
+    cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
+    positions = torch.randint(
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    qs = num_heads_q * head_size
+    ks = num_heads_k * head_size
+    vs = num_heads_v * head_size
+    total = qs + ks + vs
+    flat = torch.randn((num_tokens, total), dtype=dtype, device="cuda")
+
+    buf_ref = flat.clone()
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    k_scale_ref = k_scale.clone()
+    v_scale_ref = v_scale.clone()
+    (q_ref, k_ref, v_ref, kc_ref, vc_ref), _ = (
+        run_aiter_qk_norm_rope_cache_quant_shuffle(
+            buf_ref,
+            qw,
+            kw,
+            cos_sin,
+            positions,
+            num_tokens,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_size,
+            is_neox_style,
+            eps,
+            k_cache_ref,
+            v_cache_ref,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale_ref,
+            v_scale_ref,
+        )
+    )
+
+    buf = flat.clone()
+    k_cache_a = k_cache.clone()
+    v_cache_a = v_cache.clone()
+    k_scale_a = k_scale.clone()
+    v_scale_a = v_scale.clone()
+    qkv_2d = buf.view(num_tokens, total)
+    q_nc = qkv_2d[:, :qs]
+    k_nc = qkv_2d[:, qs : qs + ks]
+    v_nc = qkv_2d[:, qs + ks :]
+    assert not q_nc.is_contiguous()
+    assert not k_nc.is_contiguous()
+    assert not v_nc.is_contiguous()
+
+    aiter.fused_qk_norm_rope_cache_quant_shuffle(
+        qkv=None,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        num_heads_v=num_heads_v,
+        head_dim=head_size,
+        eps=eps,
+        qw=qw,
+        kw=kw,
+        cos_sin_cache=cos_sin,
+        is_neox_style=is_neox_style,
+        pos_ids=positions,
+        k_cache=k_cache_a,
+        v_cache=v_cache_a,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=k_scale_a,
+        v_scale=v_scale_a,
+        q=q_nc,
+        k=k_nc,
+        v=v_nc,
+    )
+
+    checkAllclose(q_nc, q_ref, msg="q split-view vs concat qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(k_nc, k_ref, msg="k split-view vs concat qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(v_nc, v_ref, msg="v split-view vs concat qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(
+        k_cache_a.float(), kc_ref.float(), msg="k_cache", rtol=1e-2, atol=0.05
+    )
+    checkAllclose(
+        v_cache_a.float(), vc_ref.float(), msg="v_cache", rtol=1e-2, atol=0.05
+    )
+    checkAllclose(k_scale_a, k_scale_ref, msg="k_scale", rtol=1e-2, atol=0.05)
+    checkAllclose(v_scale_a, v_scale_ref, msg="v_scale", rtol=1e-2, atol=0.05)
+
+
+@benchmark()
+def test_shuffle_when_qkv_and_qkv_tensors_both_passed_uses_qk_v():
+    """同时传入拼接 qkv 与 q/k/v 时走 q/k/v；qkv 内容应被忽略。"""
+    dtype = torch.bfloat16
+    num_tokens = 9
+    num_heads_q = num_heads_k = num_heads_v = 2
+    head_size = 128
+    is_neox_style = False
+    eps = 1e-6
+    kv_cache_dtype = "auto"
+    num_blocks = 3
+    page_size = 16
+    max_positions = 2048
+
+    def make_kv_caches():
+        kc = torch.randn(
+            [num_blocks, page_size, num_heads_k, head_size],
+            dtype=dtype,
+            device="cuda",
+        )
+        vc = torch.randn(
+            [num_blocks, page_size, num_heads_v, head_size],
+            dtype=dtype,
+            device="cuda",
+        )
+        x_ = 16 // kc.element_size()
+        kc = (
+            kc.view([num_blocks, page_size, num_heads_k, head_size // x_, x_])
+            .permute(0, 2, 3, 1, 4)
+            .contiguous()
+        )
+        vc = vc.permute(0, 2, 3, 1).contiguous()
+        return kc, vc
+
+    slot_mapping = torch.randperm(num_tokens, dtype=torch.int64, device="cuda")
+    qkv_truth = torch.randn(
+        (num_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    qw = torch.randn(head_size, dtype=dtype, device="cuda")
+    kw = torch.randn(head_size, dtype=dtype, device="cuda")
+    cos_sin = torch.randn((max_positions, head_size), dtype=dtype, device="cuda")
+    positions = torch.randint(
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    qs = int(num_heads_q * head_size)
+    ks = int(num_heads_k * head_size)
+    vs = int(num_heads_v * head_size)
+    flat = qkv_truth.view(num_tokens, qs + ks + vs)
+    q_src = flat[:, :qs].contiguous()
+    k_src = flat[:, qs : qs + ks].contiguous()
+    v_src = flat[:, qs + ks :].contiguous()
+
+    k_cache_a, v_cache_a = make_kv_caches()
+    k_scale_a = torch.zeros(
+        [num_blocks, num_heads_k, page_size], dtype=torch.float32, device="cuda"
+    )
+    v_scale_a = torch.zeros(
+        [num_blocks, num_heads_v, page_size], dtype=torch.float32, device="cuda"
+    )
+    qkv_decoy = torch.randn_like(qkv_truth)
+
+    q_a, k_a, v_a = q_src.clone(), k_src.clone(), v_src.clone()
+    aiter.fused_qk_norm_rope_cache_quant_shuffle(
+        qkv_decoy,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        num_heads_v=num_heads_v,
+        head_dim=head_size,
+        eps=eps,
+        qw=qw,
+        kw=kw,
+        cos_sin_cache=cos_sin,
+        is_neox_style=is_neox_style,
+        pos_ids=positions,
+        k_cache=k_cache_a,
+        v_cache=v_cache_a,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=k_scale_a,
+        v_scale=v_scale_a,
+        q=q_a,
+        k=k_a,
+        v=v_a,
+    )
+
+    k_cache_b, v_cache_b = make_kv_caches()
+    k_scale_b = torch.zeros_like(k_scale_a)
+    v_scale_b = torch.zeros_like(v_scale_a)
+    q_b, k_b, v_b = q_src.clone(), k_src.clone(), v_src.clone()
+    aiter.fused_qk_norm_rope_cache_quant_shuffle(
+        qkv_truth.clone(),
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        num_heads_v=num_heads_v,
+        head_dim=head_size,
+        eps=eps,
+        qw=qw,
+        kw=kw,
+        cos_sin_cache=cos_sin,
+        is_neox_style=is_neox_style,
+        pos_ids=positions,
+        k_cache=k_cache_b,
+        v_cache=v_cache_b,
+        slot_mapping=slot_mapping,
+        kv_cache_dtype=kv_cache_dtype,
+        k_scale=k_scale_b,
+        v_scale=v_scale_b,
+        q=q_b,
+        k=k_b,
+        v=v_b,
+    )
+
+    checkAllclose(q_a, q_b, msg="q decoy vs truth qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(k_a, k_b, msg="k decoy vs truth qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(v_a, v_b, msg="v decoy vs truth qkv", rtol=1e-2, atol=0.05)
+    checkAllclose(
+        k_cache_a.float(), k_cache_b.float(), msg="k_cache", rtol=1e-2, atol=0.05
+    )
+    checkAllclose(
+        v_cache_a.float(), v_cache_b.float(), msg="v_cache", rtol=1e-2, atol=0.05
+    )
+    checkAllclose(k_scale_a, k_scale_b, msg="k_scale", rtol=1e-2, atol=0.05)
+    checkAllclose(v_scale_a, v_scale_b, msg="v_scale", rtol=1e-2, atol=0.05)
 
 
 @perftest(num_iters=2)
