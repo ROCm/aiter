@@ -3,9 +3,9 @@
 # Copyright (c) 2024, Tri Dao.
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Launchers for **causal conv1d update** fast paths.
+"""Launchers for **causal conv1d update** single-token paths.
 
-``causal_conv1d_update_fast`` updates ``conv_state`` **in place** inside the Triton kernel
+``causal_conv1d_update_single_token`` updates ``conv_state`` **in place** inside the Triton kernel
 (the "update" in the name), then writes the convolution output into ``x``/``out`` as in vLLM.
 """
 
@@ -15,9 +15,9 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.causal_conv1d import PAD_SLOT_ID
-from aiter.ops.triton._triton_kernels.causal_conv1d_update_fast import (
-    _causal_conv1d_update_fast_kernel,
-    _reshape_causal_conv1d_update_fast_kernel,
+from aiter.ops.triton._triton_kernels.causal_conv1d_update_single_token import (
+    _causal_conv1d_update_single_token_kernel,
+    _reshape_causal_conv1d_update_single_token_kernel,
 )
 
 
@@ -25,7 +25,7 @@ def _default_conv_state_indices(batch: int, device: torch.device) -> torch.Tenso
     return torch.arange(batch, device=device, dtype=torch.int32)
 
 
-def causal_conv1d_update_fast(
+def causal_conv1d_update_single_token(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
@@ -66,6 +66,7 @@ def causal_conv1d_update_fast(
         batch = conv_state_indices.size(0)
         dim = x.size(1)
         seqlen = max_query_len
+    assert seqlen == 1, f"the single_token version only support seqlen to be 1, got {seqlen}"
     _, width = weight.shape
     num_cache_lines, _, state_len = conv_state.size()
 
@@ -107,7 +108,7 @@ def causal_conv1d_update_fast(
     def grid(META):
         return (batch, triton.cdiv(dim, META["BLOCK_N"]))
 
-    _causal_conv1d_update_fast_kernel[grid](
+    _causal_conv1d_update_single_token_kernel[grid](
         x,
         weight,
         bias,
@@ -147,7 +148,7 @@ def causal_conv1d_update_fast(
     return out.to(original_x_dtype)
 
 
-def fused_reshape_causal_conv1d_update_fast(
+def fused_reshape_causal_conv1d_update_single_token(
     x: torch.Tensor,
     num_actual_tokens: int,
     num_k_heads: int,
@@ -199,6 +200,7 @@ def fused_reshape_causal_conv1d_update_fast(
     if unsqueeze:
         x = x.unsqueeze(-1)
     _, qkvz_dim, seqlen = x.shape
+    assert seqlen == 1, f"the single_token version only support seqlen to be 1, got {seqlen}"
     batch = num_actual_tokens
     _, width = weight.shape
     head_dim = head_k_dim + head_k_dim + head_v_dim * num_v_heads // num_k_heads
@@ -264,7 +266,7 @@ def fused_reshape_causal_conv1d_update_fast(
             1 + num_program_write_z + triton.cdiv(dim, META["BLOCK_N"]),
         )
 
-    _reshape_causal_conv1d_update_fast_kernel[grid](
+    _reshape_causal_conv1d_update_single_token_kernel[grid](
         x,
         ba,
         z_out,

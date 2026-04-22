@@ -4,14 +4,14 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# Kernels for causal_conv1d **update** fast paths: ``conv_state`` is updated in place.
+# Kernels for causal_conv1d **update** single-token paths: ``conv_state`` is updated in place.
 
 import triton
 import triton.language as tl
 
 
 @triton.jit()
-def _causal_conv1d_update_fast_kernel(
+def _causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)
     w_ptr,  # (dim, width)
@@ -208,7 +208,7 @@ def _causal_conv1d_update_fast_kernel(
 
 
 @triton.jit()
-def _reshape_causal_conv1d_update_fast_kernel(
+def _reshape_causal_conv1d_update_single_token_kernel(
     # Pointers to matrices
     x_ptr,  # (num_tokens, dim+z_dim, seqlen) where seqlen=1
     ba_ptr,

@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for ``causal_conv1d_update_fast`` / ``fused_reshape_causal_conv1d_update_fast``.
+"""Tests for ``causal_conv1d_update_single_token`` / ``fused_reshape_causal_conv1d_update_single_token``.
 
-``causal_conv1d_update_fast`` updates ``conv_state`` in place; the reference mirrors
-``_causal_conv1d_update_fast_kernel`` (non-APC), not ``causal_conv1d_update_ref``.
+``causal_conv1d_update_single_token`` updates ``conv_state`` in place; the reference mirrors
+``_causal_conv1d_update_single_token_kernel`` (non-APC), not ``causal_conv1d_update_ref``.
 Shape extras that used to live in smoke tests are folded into
-``test_causal_conv1d_update_fast_matches_ref`` (see ``_causal_conv1d_update_fast_ref_cases``).
+``test_causal_conv1d_update_single_token_matches_ref`` (see ``_causal_conv1d_update_single_token_ref_cases``).
 """
 
 from __future__ import annotations
@@ -20,9 +20,9 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.causal_conv1d import PAD_SLOT_ID
-from aiter.ops.triton.causal_conv1d_update_fast import (
-    causal_conv1d_update_fast,
-    fused_reshape_causal_conv1d_update_fast,
+from aiter.ops.triton.causal_conv1d_update_single_token import (
+    causal_conv1d_update_single_token,
+    fused_reshape_causal_conv1d_update_single_token,
 )
 
 cuda_ok = pytest.mark.skipif(
@@ -36,7 +36,7 @@ def seed_everything(seed: int = 0) -> None:
     torch.manual_seed(seed)
 
 
-def ref_causal_conv1d_update_fast(
+def ref_causal_conv1d_update_single_token(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
@@ -45,7 +45,7 @@ def ref_causal_conv1d_update_fast(
     conv_state_indices: torch.Tensor,
     pad_slot_id: int | None,
 ) -> torch.Tensor:
-    """Python port of ``_causal_conv1d_update_fast_kernel`` (non-APC, 1D indices).
+    """Python port of ``_causal_conv1d_update_single_token_kernel`` (non-APC, 1D indices).
 
     Mutates ``conv_state`` in place (like the Triton kernel). Clones ``x`` only for
     ``out`` leaves non-updated timesteps equal to the input.
@@ -133,7 +133,7 @@ def _logical_feat_to_qkvz_col_v2(
     return h * head_qkvz_dim + 2 * hk + r
 
 
-def ref_fused_reshape_causal_conv1d_update_fast(
+def ref_fused_reshape_causal_conv1d_update_single_token(
     x: torch.Tensor,
     num_actual_tokens: int,
     num_k_heads: int,
@@ -150,7 +150,7 @@ def ref_fused_reshape_causal_conv1d_update_fast(
     conv_state_indices: torch.Tensor | None,
     pad_slot_id: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reference: extract b/a/z like the kernel, build logical QKV, run ``ref_causal_conv1d_update_fast``."""
+    """Reference: extract b/a/z like the kernel, build logical QKV, run ``ref_causal_conv1d_update_single_token``."""
     num_tokens = x.shape[0]
     hv_ratio = num_v_heads // num_k_heads
     head_dim = head_k_dim + head_k_dim + head_v_dim * hv_ratio
@@ -206,7 +206,7 @@ def ref_fused_reshape_causal_conv1d_update_fast(
         cidx = torch.arange(num_actual_tokens, device=device, dtype=torch.int32)
     else:
         cidx = conv_state_indices
-    out_lin = ref_causal_conv1d_update_fast(
+    out_lin = ref_causal_conv1d_update_single_token(
         x_lin,
         cs,
         weight,
@@ -227,28 +227,28 @@ def ref_fused_reshape_causal_conv1d_update_fast(
     )
 
 
-def _causal_conv1d_update_fast_ref_cases():
-    """Cartesian core grid plus former smoke shapes (width=3, small dim, seqlen=2)."""
+def _causal_conv1d_update_single_token_ref_cases():
+    """Cartesian core grid plus former smoke shapes (width=3, small dim); seqlen fixed to 1 for single-token API."""
     out = []
+    seqlen = 1
     for itype in (torch.float32, torch.bfloat16):
         for silu_activation in (True, False):
             for has_bias in (True, False):
-                for seqlen in (1, 8):
-                    for width in (2, 4):
-                        out.append(
-                            pytest.param(
-                                1,
-                                1024,
-                                width,
-                                seqlen,
-                                itype,
-                                silu_activation,
-                                has_bias,
-                                id=f"b1-d1024-w{width}-s{seqlen}-"
-                                f"silu{silu_activation}-bias{has_bias}-"
-                                f"{'fp32' if itype == torch.float32 else 'bf16'}",
-                            )
+                for width in (2, 4):
+                    out.append(
+                        pytest.param(
+                            1,
+                            1024,
+                            width,
+                            seqlen,
+                            itype,
+                            silu_activation,
+                            has_bias,
+                            id=f"b1-d1024-w{width}-s{seqlen}-"
+                            f"silu{silu_activation}-bias{has_bias}-"
+                            f"{'fp32' if itype == torch.float32 else 'bf16'}",
                         )
+                    )
     out.extend(
         [
             pytest.param(
@@ -265,11 +265,11 @@ def _causal_conv1d_update_fast_ref_cases():
                 1,
                 128,
                 4,
-                2,
+                1,
                 torch.bfloat16,
                 True,
                 True,
-                id="smoke-b1-d128-w4-s2-bf16",
+                id="smoke-b1-d128-w4-s1-bf16",
             ),
         ]
     )
@@ -287,9 +287,9 @@ def _causal_conv1d_update_fast_ref_cases():
         "silu_activation",
         "has_bias",
     ),
-    _causal_conv1d_update_fast_ref_cases(),
+    _causal_conv1d_update_single_token_ref_cases(),
 )
-def test_causal_conv1d_update_fast_matches_ref(
+def test_causal_conv1d_update_single_token_matches_ref(
     batch, dim, width, seqlen, itype, silu_activation, has_bias
 ):
     device = "cuda"
@@ -307,10 +307,10 @@ def test_causal_conv1d_update_fast_matches_ref(
     activation = None if not silu_activation else "silu"
     cidx = torch.arange(batch, dtype=torch.int32, device=device)
 
-    out_ref = ref_causal_conv1d_update_fast(
+    out_ref = ref_causal_conv1d_update_single_token(
         x, conv_ref, weight, bias, activation, cidx, PAD_SLOT_ID
     )
-    out_tr = causal_conv1d_update_fast(
+    out_tr = causal_conv1d_update_single_token(
         x_tr,
         conv_tr,
         weight,
@@ -331,7 +331,7 @@ def test_causal_conv1d_update_fast_matches_ref(
         (2, 4, 16, 8, 6, 3, 4),
     ],
 )
-def test_fused_reshape_causal_conv1d_update_fast_matches_ref(
+def test_fused_reshape_causal_conv1d_update_single_token_matches_ref(
     num_k_heads,
     num_v_heads,
     head_k_dim,
@@ -366,7 +366,7 @@ def test_fused_reshape_causal_conv1d_update_fast_matches_ref(
     core_ref = core.clone()
     cs_ref_init = conv_state.clone()
     out_ref, b_ref, a_ref, z_r, c_r, cs_ref = (
-        ref_fused_reshape_causal_conv1d_update_fast(
+        ref_fused_reshape_causal_conv1d_update_single_token(
             x,
             num_actual_tokens,
             num_k_heads,
@@ -388,7 +388,7 @@ def test_fused_reshape_causal_conv1d_update_fast_matches_ref(
     z_tr = z_out.clone()
     core_tr = core.clone()
     cs_tr = conv_state.clone()
-    out_tr, b_tr, a_tr = fused_reshape_causal_conv1d_update_fast(
+    out_tr, b_tr, a_tr = fused_reshape_causal_conv1d_update_single_token(
         x,
         num_actual_tokens,
         num_k_heads,
