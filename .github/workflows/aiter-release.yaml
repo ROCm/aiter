@@ -312,7 +312,14 @@ jobs:
               set -e
               ${PYBIN}/pip install --upgrade --timeout=60 --retries=10 pip
               ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" torch
-              ${PYBIN}/pip install --timeout=60 --retries=10 -r requirements.txt
+              # flydsl publishes only manylinux_2_35 wheels which cannot install
+              # on AlmaLinux 8 (glibc 2.28). FlyDSL AOT pre-compilation in
+              # setup.py is wrapped in try/except and is skipped gracefully when
+              # flydsl is missing, so we drop it here. The resulting wheel still
+              # contains all CK-free + Triton kernels; only the optional
+              # FlyDSL AOT cache is omitted (kernels JIT on first use).
+              grep -v "^flydsl" requirements.txt > /tmp/requirements-no-flydsl.txt
+              ${PYBIN}/pip install --timeout=60 --retries=10 -r /tmp/requirements-no-flydsl.txt
               ${PYBIN}/pip install --timeout=60 --retries=10 "setuptools_scm<10" ninja auditwheel patchelf
             '
 
