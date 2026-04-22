@@ -45,7 +45,7 @@ def test_fmoe_sqi8(
         print("skip tests for unsupported platform")
         return
 
-    x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device) * 0.001
+    x0 = torch.randn(num_tokens, model_dim, dtype=torch.bfloat16, device=device) * 0.01
 
     if use_smoothquant:
         # shared_smoothquant_up : share smooth scales between all experts
@@ -72,8 +72,8 @@ def test_fmoe_sqi8(
             [num_experts, 1, inter_dim], dtype=torch.float32, device=device
         )
 
-    w1_f32 = torch.randn(num_experts, inter_dim, model_dim, dtype=torch.float32) * 0.001
-    w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32) * 0.001
+    w1_f32 = torch.randn(num_experts, inter_dim, model_dim, dtype=torch.float32) * 0.01
+    w2_f32 = torch.randn(num_experts, model_dim, inter_dim, dtype=torch.float32) * 0.01
 
     w1, fc1_scale = smooth_quant_w(w1_f32, fc1_smooth_scale)
     w2, fc2_scale = smooth_quant_w(w2_f32, fc2_smooth_scale)
@@ -83,18 +83,6 @@ def test_fmoe_sqi8(
     x1 = ret_topk.values.to(torch.float32)
     x2 = ret_topk.indices.to(torch.int32)
 
-    ref0 = torch_moe(
-        x0,
-        w1_f32,
-        w2_f32,
-        x1,
-        x2,
-        None,
-        None,
-        None,
-        None,
-        activation=ActivationType.Gelu,
-    )
     ref1 = torch_moe(
         x0,
         w1,
@@ -108,7 +96,7 @@ def test_fmoe_sqi8(
         activation=ActivationType.Gelu,
     )
 
-    ret, dt = run_perftest(
+    ret1, dt1 = run_perftest(
         fused_moe_gelu_sqi8,
         x0,
         w1,
@@ -119,18 +107,34 @@ def test_fmoe_sqi8(
         fc2_scale,
         fc1_smooth_scale if use_smoothquant else None,
         fc2_smooth_scale if use_smoothquant else None,
+        quant_output=False,
     )
 
-    err0 = checkAllclose(ref0, ret, rtol=1e-3, atol=1e-3, msg="check with ref0")
-    err1 = checkAllclose(ref1, ret, rtol=1e-3, atol=1e-3, msg="check with ref1")
+    # with internal quant of stage2 output
+    ret2, dt2 = run_perftest(
+        fused_moe_gelu_sqi8,
+        x0,
+        w1,
+        w2,
+        x1,
+        x2,
+        fc1_scale,
+        fc2_scale,
+        fc1_smooth_scale if use_smoothquant else None,
+        fc2_smooth_scale if use_smoothquant else None,
+        quant_output=True,
+    )
 
-    logits_diff0 = calc_diff(ref0, ret)
-    logits_diff1 = calc_diff(ref1, ret)
+    err1 = checkAllclose(ref1, ret1, rtol=1e-3, atol=1e-3, msg="check ret1 with ref")
+    err2 = checkAllclose(ref1, ret2, rtol=1e-3, atol=1e-3, msg="check ret2 with ref")
+
+    logits_diff1 = calc_diff(ref1, ret1)
+    logits_diff2 = calc_diff(ref1, ret2)
     print(
-        f"{num_tokens=} {model_dim=} {inter_dim=} {num_experts=} {topk=} {use_smoothquant=} {shared_smooth_up=} {logits_diff0=:.6f}, {logits_diff1=:.6f}, {err0=:.6f}, {err1=:.6f}, {dt:.0f} us"
+        f"{num_tokens=} {model_dim=} {inter_dim=} {num_experts=} {topk=} {use_smoothquant=} {shared_smooth_up=} {logits_diff1=:.6f}, {logits_diff2=:.6f}, {err1=:.6f}, {err2=:.6f}, {dt1:.0f} us {dt2:.0f} us"
     )
-    assert logits_diff0 < 0.01
     assert logits_diff1 < 0.01
+    assert logits_diff2 < 0.01
 
     if use_smoothquant:
         smooth_info = "shared-up" if shared_smooth_up else "per-expert"
@@ -144,7 +148,9 @@ def test_fmoe_sqi8(
         "topk": topk,
         "smooth": smooth_info,
         "diff": logits_diff1,
-        "time(us)": f"{dt:.0f}",
+        "time(us)": f"{dt1:.0f}",
+        "diff-quant-out": logits_diff2,
+        "time-quant-out(us)": f"{dt2:.0f}",
     }
     return ret
 
@@ -179,5 +185,5 @@ if __name__ == "__main__":
         import pandas as pd
 
         print(pd.DataFrame(summary).to_markdown(index=False))
-    except Exception:
-        pass
+    except Exception as e:
+        print(e)

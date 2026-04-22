@@ -3,10 +3,15 @@ from ctypes.util import find_library
 import functools
 import torch
 import os
+import subprocess
+
+_is_hip_library_api_supported_ = False
 
 
 @functools.cache
 def get_amdhip():
+    global _is_hip_library_api_supported_
+
     try:
         lib = ctypes.CDLL(find_library("amdhip64"))
     except Exception as e:
@@ -39,36 +44,40 @@ def get_amdhip():
     lib.hipGetErrorString.argtypes = [ctypes.c_int32]
     lib.hipGetErrorString.restype = ctypes.c_char_p
 
-    lib.hipLibraryLoadFromFile.restype = ctypes.c_int32
-    lib.hipLibraryLoadFromFile.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.c_char_p,
-        ctypes.c_void_p,  # hipJitOption *jitOptions
-        ctypes.c_void_p,  # void **jitOptionsValues
-        ctypes.c_uint32,  # unsigned int numJitOptions,
-        ctypes.c_void_p,  # hipLibraryOption *libraryOptions
-        ctypes.c_void_p,  # void **libraryOptionValues
-        ctypes.c_uint32,  # unsigned int numLibraryOptions
-    ]
+    try:
+        lib.hipLibraryLoadFromFile.restype = ctypes.c_int32
+        lib.hipLibraryLoadFromFile.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_char_p,
+            ctypes.c_void_p,  # hipJitOption *jitOptions
+            ctypes.c_void_p,  # void **jitOptionsValues
+            ctypes.c_uint32,  # unsigned int numJitOptions,
+            ctypes.c_void_p,  # hipLibraryOption *libraryOptions
+            ctypes.c_void_p,  # void **libraryOptionValues
+            ctypes.c_uint32,  # unsigned int numLibraryOptions
+        ]
 
-    lib.hipLibraryGetKernelCount.restype = ctypes.c_int32
-    lib.hipLibraryGetKernelCount.argtypes = [
-        ctypes.POINTER(ctypes.c_uint32),  # unsigned int *count,
-        ctypes.c_void_p,  # hipLibrary_t library
-    ]
+        lib.hipLibraryGetKernelCount.restype = ctypes.c_int32
+        lib.hipLibraryGetKernelCount.argtypes = [
+            ctypes.POINTER(ctypes.c_uint32),  # unsigned int *count,
+            ctypes.c_void_p,  # hipLibrary_t library
+        ]
 
-    lib.hipLibraryEnumerateKernels.restype = ctypes.c_int32
-    lib.hipLibraryEnumerateKernels.argtypes = [
-        ctypes.POINTER(ctypes.c_void_p),  # hipKernel_t *kernels
-        ctypes.c_uint32,  # unsigned int numKernels,
-        ctypes.c_void_p,  # hipLibrary_t library
-    ]
+        lib.hipLibraryEnumerateKernels.restype = ctypes.c_int32
+        lib.hipLibraryEnumerateKernels.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),  # hipKernel_t *kernels
+            ctypes.c_uint32,  # unsigned int numKernels,
+            ctypes.c_void_p,  # hipLibrary_t library
+        ]
 
-    lib.hipKernelGetName.restype = ctypes.c_int32
-    lib.hipKernelGetName.argtypes = [
-        ctypes.POINTER(ctypes.c_char_p),  # const char **name
-        ctypes.c_void_p,  # hipKernel_t kernel
-    ]
+        lib.hipKernelGetName.restype = ctypes.c_int32
+        lib.hipKernelGetName.argtypes = [
+            ctypes.POINTER(ctypes.c_char_p),  # const char **name
+            ctypes.c_void_p,  # hipKernel_t kernel
+        ]
+        _is_hip_library_api_supported_ = True
+    except Exception:
+        _is_hip_library_api_supported_ = False
 
     return lib
 
@@ -87,12 +96,41 @@ def get_lib(lib_fpath):
     hip = get_amdhip()
     p_lib = ctypes.c_void_p()
     hip_check_error(
-        hip.hipLibraryLoadFromFile(
-            ctypes.byref(p_lib), lib_fpath.encode("utf-8"), None, None, 0, None, None, 0
+        (
+            hip.hipLibraryLoadFromFile(
+                ctypes.byref(p_lib),
+                lib_fpath.encode("utf-8"),
+                None,
+                None,
+                0,
+                None,
+                None,
+                0,
+            )
+            if _is_hip_library_api_supported_
+            else hip.hipModuleLoad(ctypes.byref(p_lib), lib_fpath.encode("utf-8"))
         ),
         lib_fpath,
     )
     return p_lib
+
+
+@functools.cache
+def get_all_kernel_names(co_path):
+    # we need both demangle & symbol name for loading & argtype parsing
+    dynamic_syms_raw = subprocess.check_output(
+        ["/opt/rocm/llvm/bin/llvm-objdump", "--dynamic-syms", co_path]
+    ).decode("utf-8")
+    kernel_names = []
+    for line_raw in dynamic_syms_raw.splitlines():
+        ls = line_raw.split()
+        if len(ls) < 7:
+            continue
+        if ls[3] != ".text":
+            continue
+        symbol_name = line_raw.split()[6]
+        kernel_names.append(symbol_name)
+    return kernel_names
 
 
 @functools.cache
@@ -118,41 +156,37 @@ def get_kernel(kernel_path_prefix, constexpr_args: tuple = ()):
 
     p_lib = get_lib(lib_fpath)
 
-    kernel_cnt = ctypes.c_uint32()
-    hip_check_error(hip.hipLibraryGetKernelCount(ctypes.byref(kernel_cnt), p_lib))
+    if _is_hip_library_api_supported_:
+        kernel_cnt = ctypes.c_uint32()
+        hip_check_error(hip.hipLibraryGetKernelCount(ctypes.byref(kernel_cnt), p_lib))
 
-    assert kernel_cnt.value > 0
-    kernels = (ctypes.c_void_p * kernel_cnt.value)()
+        assert kernel_cnt.value > 0
+        kernels = (ctypes.c_void_p * kernel_cnt.value)()
 
-    hip_check_error(hip.hipLibraryEnumerateKernels(kernels, kernel_cnt, p_lib))
+        hip_check_error(hip.hipLibraryEnumerateKernels(kernels, kernel_cnt, p_lib))
 
-    selected_kernel = None
-    selected_kernel_name = ""
-    for k in kernels:
-        p_name = ctypes.c_char_p()
-        hip_check_error(hip.hipKernelGetName(ctypes.byref(p_name), k))
-        assert p_name.value is not None
-        cur_kernel_name = p_name.value.decode("utf-8")
-        if kernel_name in cur_kernel_name:
-            selected_kernel = k
-            selected_kernel_name = cur_kernel_name
-
-    assert selected_kernel is not None, f"{cur_kernel_name=} {kernel_name=}"
-
-    if 0:
-        hip.hipLibraryUnload(p_lib)
-        p_module = ctypes.c_void_p()
-        hip_check_error(
-            hip.hipModuleLoad(ctypes.byref(p_module), lib_fpath.encode("utf-8"))
-        )
-        p_func = ctypes.c_void_p()
-        hip_check_error(
-            hip.hipModuleGetFunction(
-                ctypes.byref(p_func), p_module, selected_kernel_name.encode("utf-8")
-            )
-        )
+        p_func = None
+        for k in kernels:
+            p_name = ctypes.c_char_p()
+            hip_check_error(hip.hipKernelGetName(ctypes.byref(p_name), k))
+            assert p_name.value is not None
+            cur_kernel_name = p_name.value.decode("utf-8")
+            if kernel_name in cur_kernel_name:
+                p_func = k
+                break
     else:
-        p_func = selected_kernel
+        p_func = None
+        for cur_kernel_name in get_all_kernel_names(lib_fpath):
+            if kernel_name in cur_kernel_name:
+                p_func = ctypes.c_void_p()
+                hip_check_error(
+                    hip.hipModuleGetFunction(
+                        ctypes.byref(p_func), p_lib, cur_kernel_name.encode("utf-8")
+                    )
+                )
+                break
+
+    assert p_func is not None, f"kernel {kernel_name} is not found in {lib_fpath}"
 
     def CallableKernel(
         gridDims: list[int],
