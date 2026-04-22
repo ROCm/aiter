@@ -409,15 +409,16 @@ def test_gemm_mxfp4_nopad_gfx1250(
         dtype,
         layout=layout,
         output=output,
-        shuffle_scales_fg=False,
+        shuffle_scales_fg=True,
         shuffle_weight_fg=False,
     )
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
-    # Pass raw w and raw scales — no preshuffle needed
+    # Raw weights (no preshuffle) + preshuffled scales (so the kernel can
+    # issue direct buffer_loads into registers with contiguous per-warp reads).
     triton_out = gemm_afp4wfp4_nopad(
-        x, w, x_scales, w_scales, dtype,
+        x, w, x_scales_shuffled, w_scales_shuffled, dtype,
         y if y is not None else torch.empty_like(torch_out),
     )
 
