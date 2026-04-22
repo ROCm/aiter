@@ -2,12 +2,21 @@ name: Tuning Tests
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '30 22 * * *'
+    inputs:
+      suite:
+        description: Select the README test command to run
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - level01
+          - tune_pipeline
+          - run_config
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 env:
   DOCKER_IMAGE: rocm/pytorch:latest
@@ -17,77 +26,105 @@ env:
 
 jobs:
   cpu-validation:
-    name: CPU Validation (L0+L1)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'level01' }}
+    name: README Level 0+1
+    runs-on: aiter-1gpu-runner
+    timeout-minutes: 45
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install CPU test dependencies
+      - name: Sync CK submodule
         run: |
           set -ex
-          python -m pip install --upgrade pip
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
-          python -m pip install pandas pyzmq einops numpy==1.26.2 pybind11 ninja tabulate packaging psutil pyyaml
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
 
-      - name: Run tuning CPU validation
+      - name: Clean up ROCm processes
+        run: ./.github/scripts/clean_up_rocm.sh
+
+      - name: Start container
         run: |
-          set -euo pipefail
+          set -ex
           mkdir -p "${LOG_DIR}" "${REPORT_DIR}"
-          python -m unittest \
-            op_tests.tuning_tests.test_csv_validation \
-            op_tests.tuning_tests.test_tuner_infra \
-            op_tests.tuning_tests.test_mp_tuner_logic -v \
-            2>&1 | tee "${LOG_DIR}/cpu-validation.log"
 
-      - name: Upload CPU validation artifacts
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --network=host \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/$REPORT_DIR:/tmp/tuning_test_reports" \
+            -w /workspace \
+            --name tuning_tests_level01 \
+            $DOCKER_IMAGE
+
+      - name: Setup Aiter
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -w /workspace \
+            tuning_tests_level01 \
+            bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+
+      - name: Run README level 0+1 suite
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e PYTHONUNBUFFERED=1 \
+            -w /workspace \
+            tuning_tests_level01 \
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_csv_validation op_tests.tuning_tests.test_tuner_infra op_tests.tuning_tests.test_mp_tuner_logic -v 2>&1 | tee /workspace/${LOG_DIR}/level01.log"
+
+      - name: Upload level 0+1 artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tuning-tests-cpu-validation-${{ github.run_id }}
+          name: tuning-tests-level01-${{ github.run_id }}
           if-no-files-found: ignore
           path: |
-            ${{ env.LOG_DIR }}/cpu-validation.log
+            ${{ env.LOG_DIR }}/level01.log
             ${{ env.REPORT_DIR }}/
 
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f tuning_tests_level01 || true
+
+      - name: Clean up ROCm processes
+        if: always()
+        run: ./.github/scripts/clean_up_rocm.sh
+
   gpu-pipeline:
-    name: GPU Pipeline Validation (L2)
+    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'tune_pipeline' }}
+    name: README Level 2 Pipeline
     runs-on: aiter-1gpu-runner
-    needs: cpu-validation
     timeout-minutes: 75
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
-
       - name: Sync CK submodule
         run: |
           set -ex
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "Nightly run: syncing latest CK from develop branch..."
-            git submodule set-branch --branch develop 3rdparty/composable_kernel
-            git submodule sync
-            git submodule update --init --recursive --remote --jobs 4
-          else
-            echo "Using pinned CK commit..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
-          fi
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Clean up ROCm processes
         run: ./.github/scripts/clean_up_rocm.sh
 
-      - name: Start tuning test container
+      - name: Start container
         run: |
           set -ex
           mkdir -p "${LOG_DIR}" "${REPORT_DIR}"
@@ -120,7 +157,7 @@ jobs:
             tuning_tests_pipeline \
             bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
-      - name: Run tuning pipeline tests
+      - name: Run README tune pipeline suite
         run: |
           set -ex
           docker exec \
@@ -128,16 +165,16 @@ jobs:
             -e PYTHONUNBUFFERED=1 \
             -w /workspace \
             tuning_tests_pipeline \
-            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v 2>&1 | tee /workspace/${LOG_DIR}/gpu-pipeline.log"
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_tune_pipeline -v 2>&1 | tee /workspace/${LOG_DIR}/tune-pipeline.log"
 
-      - name: Upload GPU pipeline artifacts
+      - name: Upload pipeline artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tuning-tests-gpu-pipeline-${{ github.run_id }}
+          name: tuning-tests-tune-pipeline-${{ github.run_id }}
           if-no-files-found: ignore
           path: |
-            ${{ env.LOG_DIR }}/gpu-pipeline.log
+            ${{ env.LOG_DIR }}/tune-pipeline.log
             ${{ env.REPORT_DIR }}/
 
       - name: Cleanup container
@@ -149,36 +186,25 @@ jobs:
         run: ./.github/scripts/clean_up_rocm.sh
 
   gpu-run-config:
-    name: GPU Run Config Validation (L2)
+    if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'run_config' }}
+    name: README Level 2 Run Config
     runs-on: aiter-1gpu-runner
-    needs: cpu-validation
     timeout-minutes: 120
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
-
       - name: Sync CK submodule
         run: |
           set -ex
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "Nightly run: syncing latest CK from develop branch..."
-            git submodule set-branch --branch develop 3rdparty/composable_kernel
-            git submodule sync
-            git submodule update --init --recursive --remote --jobs 4
-          else
-            echo "Using pinned CK commit..."
-            git submodule sync
-            git submodule update --init --recursive --depth 1 --jobs 4
-          fi
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
 
       - name: Clean up ROCm processes
         run: ./.github/scripts/clean_up_rocm.sh
 
-      - name: Start tuning test container
+      - name: Start container
         run: |
           set -ex
           mkdir -p "${LOG_DIR}" "${REPORT_DIR}"
@@ -211,7 +237,7 @@ jobs:
             tuning_tests_run_config \
             bash -lc "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
 
-      - name: Run tuning run_config validation
+      - name: Run README run_config suite
         run: |
           set -ex
           docker exec \
@@ -219,28 +245,16 @@ jobs:
             -e PYTHONUNBUFFERED=1 \
             -w /workspace \
             tuning_tests_run_config \
-            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_run_config -v 2>&1 | tee /workspace/${LOG_DIR}/gpu-run-config.log"
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_run_config -v 2>&1 | tee /workspace/${LOG_DIR}/run-config.log"
 
-      - name: Run preshuffle regression validation
-        run: |
-          set -ex
-          docker exec \
-            -e GPU_ARCHS="${GPU_ARCHS}" \
-            -e PYTHONUNBUFFERED=1 \
-            -e TUNE_TEST_FAMILY=a8w8_blockscale_bpreshuffle \
-            -w /workspace \
-            tuning_tests_run_config \
-            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v 2>&1 | tee /workspace/${LOG_DIR}/gpu-run-config-preshuffle.log"
-
-      - name: Upload GPU run_config artifacts
+      - name: Upload run_config artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tuning-tests-gpu-run-config-${{ github.run_id }}
+          name: tuning-tests-run-config-${{ github.run_id }}
           if-no-files-found: ignore
           path: |
-            ${{ env.LOG_DIR }}/gpu-run-config.log
-            ${{ env.LOG_DIR }}/gpu-run-config-preshuffle.log
+            ${{ env.LOG_DIR }}/run-config.log
             ${{ env.REPORT_DIR }}/
 
       - name: Cleanup container

@@ -1,33 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import argparse
-import os
-
 import torch
-
-try:
-    from ..jit.utils.chip_info import get_gfx
-except Exception:
-    def get_gfx():
-        gpu_archs = os.getenv("GPU_ARCHS", "")
-        if gpu_archs and gpu_archs.lower() != "native":
-            return gpu_archs.split(";")[0]
-        return "gfx942"
-
-try:
-    from ..ops.enum import QuantType, ActivationType
-except Exception:
-    class QuantType:
-        No = "QuantType.No"
-        per_Tensor = "QuantType.per_Tensor"
-        per_Token = "QuantType.per_Token"
-        per_1x128 = "QuantType.per_1x128"
-
-    class ActivationType:
-        Silu = "Silu"
-        Gelu = "Gelu"
-
+from ..jit.utils.chip_info import get_gfx
+from ..jit.core import compile_ops
+from ..ops.enum import QuantType, ActivationType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
+import argparse
 
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},

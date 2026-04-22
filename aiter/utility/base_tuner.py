@@ -13,7 +13,8 @@ from abc import abstractmethod
 from aiter import logger
 from operator import itemgetter
 import time
-from . import dtypes
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 
 INVALID_TIME = -1
 
@@ -25,7 +26,7 @@ def _read_csv(filepath, **kwargs):
     df = pd.read_csv(filepath, **kwargs)
     df.columns = df.columns.str.strip()
     df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
-    str_cols = df.select_dtypes(include=["object", "string"]).columns
+    str_cols = df.select_dtypes(include=["object"]).columns
     for col in str_cols:
         df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
     df.dropna(how="all", inplace=True)
@@ -373,8 +374,6 @@ class TunerCommon:
         """ for shapes already tuned, we update the result inplace"""
         if df_updates.empty:
             return df_old
-        df_old = self._ensure_key_columns(df_old.copy())
-        df_updates = self._ensure_key_columns(df_updates.copy())
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
         # print(df_updates)
@@ -387,10 +386,9 @@ class TunerCommon:
             "_tmp_key"
         ].tolist()
         for key in matched_keys:
-            row_idx = df_old.index[df_old["_tmp_key"] == key][0]
-            update_row = df_updates.loc[df_updates["_tmp_key"] == key].iloc[0]
-            update_cols = [col for col in update_row.index if col in df_old.columns]
-            df_old.loc[row_idx, update_cols] = update_row[update_cols].values
+            df_old.loc[df_old.index[df_old["_tmp_key"] == key][0]] = df_updates.loc[
+                df_updates["_tmp_key"] == key
+            ].values[0]
         if unmatched_keys:
             unmatched_rows = df_updates[
                 df_updates["_tmp_key"].isin(unmatched_keys)
@@ -402,7 +400,6 @@ class TunerCommon:
 
     def sortResults(self, tune_file, issorted, values):
         tunedf = _read_csv(tune_file)
-        tunedf = self._ensure_key_columns(tunedf)
         if issorted:
             tunedf = tunedf.sort_values(by=values)
         dedup_keys = self.keys
@@ -422,28 +419,7 @@ class TunerCommon:
         return cu_num
 
     def get_gfx(self):
-        try:
-            from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
-
-            return _chip_get_gfx()
-        except Exception:
-            gpu_archs = os.getenv("GPU_ARCHS", "")
-            if gpu_archs and gpu_archs.lower() != "native":
-                return gpu_archs.split(";")[0]
-            return "gfx942"
-
-    def _normalize_keys(self, keys):
-        keys = tuple(keys)
-        if len(keys) == len(self.keys):
-            return keys
-        if "gfx" in self.keys and len(keys) + 1 == len(self.keys):
-            return (self.get_gfx(),) + keys
-        return keys
-
-    def _ensure_key_columns(self, df):
-        if "gfx" in self.keys and "gfx" not in df.columns:
-            df["gfx"] = self.get_gfx()
-        return df
+        return _chip_get_gfx()
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
@@ -1530,7 +1506,6 @@ class GemmCommonTuner(TunerCommon):
             else:
                 kernelName = str(resolved)
             tflops, bw = self.calculate(el)
-            keys = self._normalize_keys(keys)
             key_dict = dict(zip(self.keys, keys))
 
             if len(results) == self.topk:
