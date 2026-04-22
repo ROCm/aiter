@@ -5,6 +5,9 @@ from functools import lru_cache
 
 import torch
 
+import aiter
+import aiter.ops.triton.gluon.triton_version as tv
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
@@ -37,10 +40,6 @@ except Exception:
     ir = None
     CompilationContext = None
     _mlir_arith = None
-
-import aiter
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-import aiter.ops.triton.gluon.triton_version as tv
 
 GLUON_JIT_KERNEL_ENABLED = True
 try:
