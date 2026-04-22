@@ -26,7 +26,6 @@ def matmul_launch_metadata(grid, kernel, args):
     nbits = X.dtype.itemsize * 8
     ret["name"] = f"{kernel.name} [{repr('M', M)}, {repr('N', N)}, {repr('K', K)}]"
     gindx = args.get("GatherIndx", None)
-    # sindx = args.get("WriteBackIndx", None)
     if gindx is not None:
         ret["name"] += "_layer1"
     else:
@@ -35,15 +34,14 @@ def matmul_launch_metadata(grid, kernel, args):
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
         ret["name"] += "_swiglu"
-    if args["Quant_static_scale"] is not None:
-        ret["name"] += "_quant"
+    # if args["Quant_static_scale"] is not None:
+    #    ret["name"] += "_quant"
 
     fM = n_tokens
     fK = K if K is not None else n_tokens
     ret[f"flops{nbits}"] = 2.0 * fM * N * fK
 
     gindx = args.get("GatherIndx", None)
-    # sindx = args.get("WriteBackIndx", None)
     n_x_bytes = X.numel() * X.element_size()
     n_y_bytes = Y.numel() * Y.element_size()
     if hist is not None:
