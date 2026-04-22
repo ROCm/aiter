@@ -4317,10 +4317,9 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
 
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
-    if PS and not (SLIDING_WINDOW > 0):
+    if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
-
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
             if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
                 grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
@@ -5269,6 +5268,8 @@ def pa_decode_gluon(
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
 
+    if sliding_window > 0 and kv_block_size != 1024:
+        max_context_partition_num = 1
     grid = (batch_size, num_kv_heads, max_context_partition_num)
 
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
@@ -5309,34 +5310,36 @@ def pa_decode_gluon(
     one_shot = max_context_partition_num <= 1 and not (
         sliding_window > 0 and kv_block_size == 1024
     )
-    if exp_sums is None:
-        exp_sums = torch.empty(
-            batch_size,
-            num_kv_heads,
-            max_context_partition_num,
-            equivalent_query_group_size,
-            device=query.device,
-            dtype=aiter.dtypes.fp32,
-        )
-    if max_logits is None:
-        max_logits = torch.empty(
-            batch_size,
-            num_kv_heads,
-            max_context_partition_num,
-            equivalent_query_group_size,
-            device=query.device,
-            dtype=aiter.dtypes.fp32,
-        )
-    if temporary_output is None:
-        temporary_output = torch.empty(
-            batch_size,
-            num_kv_heads,
-            max_context_partition_num,
-            equivalent_query_group_size,
-            head_size,
-            device=query.device,
-            dtype=query.dtype,
-        )
+
+    if max_context_partition_num > 1:
+        if exp_sums is None:
+            exp_sums = torch.empty(
+                batch_size,
+                num_kv_heads,
+                max_context_partition_num,
+                equivalent_query_group_size,
+                device=query.device,
+                dtype=aiter.dtypes.fp32,
+            )
+        if max_logits is None:
+            max_logits = torch.empty(
+                batch_size,
+                num_kv_heads,
+                max_context_partition_num,
+                equivalent_query_group_size,
+                device=query.device,
+                dtype=aiter.dtypes.fp32,
+            )
+        if temporary_output is None:
+            temporary_output = torch.empty(
+                batch_size,
+                num_kv_heads,
+                max_context_partition_num,
+                equivalent_query_group_size,
+                head_size,
+                device=query.device,
+                dtype=query.dtype,
+            )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
     stride_query_scale_bs = 0
