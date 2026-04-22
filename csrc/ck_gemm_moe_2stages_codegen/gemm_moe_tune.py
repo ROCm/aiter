@@ -2393,10 +2393,6 @@ class FmoeTuner(TunerCommon):
             if blockM not in [32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
-                ktm = kparams["tile_m"]
-                if ktm != blockM:
-                    continue
-
                 is_splitk = kparams.get("k_batch", 1) > 1
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
@@ -2504,10 +2500,32 @@ class FmoeTuner(TunerCommon):
                 if blockM % s2_tile_m != 0:
                     continue
                 # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
-                if s2_tile_m != blockM:
+                if s2_tile_m != blockM and s2_tile_m != blockM // 2:
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
+
+                s2_ref_kwargs = {}
+                s2_compare_fn = None
+                if a_dtype_str == "fp8":
+                    s2_compare_fn = cosine_diff_compare
+                    # Use bf16 stage1 output (idx 20) and a2_scale=None (idx 21)
+                    # so torch ref takes the a16w4 path instead of mxfp4_to_f32.
+                    s2_ref_args = (
+                        [20, 10, 11, 12, 13, 21, 4, 22],
+                        dtype,
+                        q_type,
+                        doweight_stage1,
+                    )
+                else:
+                    s2_ref_args = (
+                        [0, 10, 11, 12, 13, 3, 4, 22],
+                        dtype,
+                        q_type,
+                        doweight_stage1,
+                    )
+                s2_ref_func = FmoeTuner.run_torch_moe_stage2
+
                 tasks_flydsl.append(
                     (
                         (info, "stage2", s2_kname, blockM),
@@ -2530,7 +2548,7 @@ class FmoeTuner(TunerCommon):
                         ),
                         FmoeTuner.run_flydsl_stage2_out,
                         (
-                            [0, 17, 5, 6, 7, 8, 19, 14, 9],
+                            [0, 17, 5, 6, 7, 8, 19, 14, 9, 22],
                             dtype,
                             topk,
                             s2_kparams,
@@ -2539,18 +2557,13 @@ class FmoeTuner(TunerCommon):
                             act_type,
                         ),
                         {},
-                        FmoeTuner.run_torch_moe_stage2,
-                        (
-                            [0, 10, 11, 12, 13, 3, 4],
-                            dtype,
-                            q_type,
-                            doweight_stage1,
-                        ),
-                        {},
+                        s2_ref_func,
+                        s2_ref_args,
+                        s2_ref_kwargs,
                         (None),
                         0.01,
                         0.01,
-                        True,
+                        s2_compare_fn,
                     )
                 )
 
