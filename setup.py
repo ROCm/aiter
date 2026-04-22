@@ -13,7 +13,8 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.4"
+FLYDSL_NIGHTLY_INDEX = "https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/"
+FLYDSL_VERSION = "flydsl==0.1.4.dev20260420+656347f"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -58,7 +59,11 @@ if not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
 
-        if pkg_version("flydsl") != FLYDSL_VERSION.split("==")[1]:
+        _installed = pkg_version("flydsl")
+        _expected = FLYDSL_VERSION.split("==")[1]
+        _installed_base = _installed.split("+")[0].split(".dev")[0]
+        _expected_base = _expected.split("+")[0].split(".dev")[0]
+        if _installed_base != _expected_base:
             raise ImportError("version mismatch")
     except Exception:
         subprocess.check_call(
@@ -67,6 +72,8 @@ if not IS_WINDOWS and is_develop_mode():
                 "-m",
                 "pip",
                 "install",
+                "--extra-index-url",
+                FLYDSL_NIGHTLY_INDEX,
                 FLYDSL_VERSION,
             ]
         )
@@ -458,7 +465,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
+        "flydsl>=0.1.4",
     ]
 
 setup(

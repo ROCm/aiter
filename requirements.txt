@@ -1,3 +1,4 @@
+--extra-index-url https://rocm.frameworks-devreleases.amd.com/whl/gfx942-gfx950/
 pandas
 pytest
 psutil
@@ -6,4 +7,4 @@ pyyaml
 einops
 pybind11>=3.0.1
 ninja
-flydsl==0.1.4
+flydsl==0.1.4.dev20260420+656347f

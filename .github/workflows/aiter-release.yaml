@@ -209,7 +209,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install --timeout=60 --retries=10 "setuptools_scm<10"
+          pip install --timeout=60 --retries=10 "setuptools_scm>=10"
 
       - name: Install ninja
         if: ${{ matrix.build_enabled }}
@@ -228,7 +228,7 @@ jobs:
           docker exec \
           -w /workspace \
           aiter_build_${{ matrix.python_version }} \
-          pip install --timeout=60 --retries=10 'setuptools-scm<10'
+          pip install --timeout=60 --retries=10 'setuptools-scm>=10'
 
       - name: Build Aiter
         if: ${{ matrix.build_enabled }}
