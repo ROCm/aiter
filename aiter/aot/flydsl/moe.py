@@ -28,7 +28,12 @@ import os
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    collect_aot_jobs,
+    compile_only_env,
+    job_identity,
+    override_env,
+)
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
@@ -45,6 +50,7 @@ from aiter.ops.flydsl.moe_kernels import (
 DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
 ]
+MOE_AOT_ARCH = "gfx950"
 
 
 def parse_csv(csv_path: str):
@@ -313,22 +319,28 @@ def compile_one_config(
         f"model_dim={model_dim} inter_dim={inter_dim} "
         f"E={experts} topk={topk}"
     )
-    result = {"kernel_name": kernel_name, "shape": shape_str, "compile_time": None}
+    result = {
+        "kernel_name": kernel_name,
+        "shape": shape_str,
+        "compile_time": None,
+        "compile_arch": MOE_AOT_ARCH,
+    }
 
     t0 = time.time()
     try:
-        _precompile_to_cache(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            **kwargs,
-        )
+        with override_env("ARCH", MOE_AOT_ARCH):
+            _precompile_to_cache(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=experts,
+                topk=topk,
+                **kwargs,
+            )
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}")
+        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={MOE_AOT_ARCH}")
     except Exception as e:
-        print(f"  [FAIL] compile  {shape_str}: {e}")
+        print(f"  [FAIL] compile  {shape_str}  arch={MOE_AOT_ARCH}: {e}")
 
     return result
 
@@ -356,13 +368,12 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
-    arch = os.environ.get("ARCH", "(auto-detect)")
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
 
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
-
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
@@ -371,6 +382,7 @@ def main():
     print(f"  Stage1 jobs:  {len(stage1_jobs)}")
     print(f"  Stage2 jobs:  {len(stage2_jobs)}")
     print(f"  Total jobs:   {len(all_jobs)}")
+    print(f"  Compile arch: {MOE_AOT_ARCH}")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)

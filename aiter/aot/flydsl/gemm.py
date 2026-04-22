@@ -38,7 +38,12 @@ from typing import Dict, Optional
 
 import flydsl.expr as fx
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    collect_aot_jobs,
+    compile_only_env,
+    job_identity,
+    override_env,
+)
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
@@ -56,6 +61,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
 ]
+GEMM_AOT_ARCH = "gfx950"
 
 _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
@@ -342,22 +348,24 @@ def compile_one_config(
         "kind": kind,
         "shape": shape_str,
         "compile_time": None,
+        "compile_arch": GEMM_AOT_ARCH,
     }
 
     t0 = time.time()
     try:
-        if kind == "hgemm":
-            _compile_hgemm_to_cache(m=m, n=n, k=k, **kwargs)
-        elif kind == "preshuffle":
-            _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
-        else:
-            raise ValueError(f"Unknown GEMM AOT kind: {kind}")
+        with override_env("ARCH", GEMM_AOT_ARCH):
+            if kind == "hgemm":
+                _compile_hgemm_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "preshuffle":
+                _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            else:
+                raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}")
+        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={GEMM_AOT_ARCH}")
     except Exception as e:
-        print(f"  [FAIL] compile  {shape_str}: {e}")
+        print(f"  [FAIL] compile  {shape_str}  arch={GEMM_AOT_ARCH}: {e}")
 
     return result
 
@@ -400,6 +408,7 @@ def main():
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
+    print(f"  Compile arch:     {GEMM_AOT_ARCH}")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch}")
     print("=" * 72)

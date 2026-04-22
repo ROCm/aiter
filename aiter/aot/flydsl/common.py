@@ -70,3 +70,19 @@ def compile_only_env() -> Iterator[None]:
             os.environ.pop("COMPILE_ONLY", None)
         else:
             os.environ["COMPILE_ONLY"] = prev
+
+
+@contextmanager
+def override_env(var_name: str, value: str | None) -> Iterator[None]:
+    prev = os.environ.get(var_name)
+    if value is None:
+        os.environ.pop(var_name, None)
+    else:
+        os.environ[var_name] = value
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(var_name, None)
+        else:
+            os.environ[var_name] = prev
