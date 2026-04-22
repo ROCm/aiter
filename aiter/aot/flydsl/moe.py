@@ -127,10 +127,10 @@ def _precompile_to_cache(
     No dependency on HIP ops (moe_sorting, shuffle_weight, etc.).
     """
     import torch
-    from flydsl.expr.typing import Stream
 
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    stream = torch.cuda.current_stream() if torch.cuda.is_available() else Stream(0)
+    _has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    dev = torch.device("cuda") if _has_cuda else torch.device("cpu")
+    _stream = torch.cuda.current_stream() if _has_cuda else 0
     is_fp4 = b_dtype == "fp4"
     tokens = tile_m
     E = experts
@@ -175,7 +175,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
-                    stream=stream,
+                    stream=_stream,
                 )
             else:
                 out = torch.zeros(
@@ -201,7 +201,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
-                    stream=stream,
+                    stream=_stream,
                 )
 
             exe = compile_flydsl_moe_stage1(
@@ -254,7 +254,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
-                    stream=stream,
+                    stream=_stream,
                 )
             else:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
@@ -276,7 +276,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
-                    stream=stream,
+                    stream=_stream,
                 )
 
             exe = compile_flydsl_moe_stage2(

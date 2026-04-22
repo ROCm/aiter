@@ -363,6 +363,8 @@ def _s1_args_fp4(
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         _view_safe(out),
         _view_safe(a),
@@ -379,7 +381,7 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
-        torch.cuda.current_stream() if stream is None else stream,
+        stream,
     )
 
 
@@ -399,6 +401,8 @@ def _s1_args_std(
     size_expert_ids_in,
     stream=None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         out,
         a,
@@ -413,7 +417,7 @@ def _s1_args_std(
         n_in,
         k_in,
         size_expert_ids_in,
-        torch.cuda.current_stream() if stream is None else stream,
+        stream,
     )
 
 
@@ -440,6 +444,8 @@ def _s2_args_fp4(
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         _view_safe(target),
         _view_safe(a),
@@ -455,7 +461,7 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
-        torch.cuda.current_stream() if stream is None else stream,
+        stream,
     )
 
 
@@ -475,6 +481,8 @@ def _s2_args_std(
     blocks,
     stream=None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         target,
         a,
@@ -489,7 +497,7 @@ def _s2_args_std(
         n_in,
         k_in,
         blocks,
-        torch.cuda.current_stream() if stream is None else stream,
+        stream,
     )
 
 
