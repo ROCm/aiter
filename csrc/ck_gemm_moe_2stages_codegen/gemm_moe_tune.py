@@ -35,8 +35,8 @@ from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
-    per_1x32_i4_quant,
 )
+from aiter.ops.quant import per_1x32_i4_quant
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx

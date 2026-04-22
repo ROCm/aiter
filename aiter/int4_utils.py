@@ -38,29 +38,6 @@ def convert_int8_to_uint32_int4(tensor: torch.Tensor) -> torch.Tensor:
     return merged.view(dtype=torch.uint32)
 
 
-def per_1x32_i4_quant(weight, group_size=32):
-    """Groupwise int4 [-7, 7] symmetric quantization along the last dim.
-
-    Input  : weight       [..., N, K]
-    Output : weight_qt    int8 container, same shape [..., N, K], values in [-7, 7]
-             weight_scale bf16, shape [..., K // group_size, N] (G/N transposed)
-    """
-    *batch_dims, N, K = weight.shape
-    G = K // group_size
-    w_groups = weight.view(*batch_dims, N, G, group_size)
-    w_group_max = w_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
-    w_scale_raw = (w_group_max / 7.0).squeeze(-1)
-    weight_qt = (
-        (w_groups / w_scale_raw.unsqueeze(-1))
-        .round()
-        .clamp(-7, 7)
-        .to(dtypes.i8)
-        .view(*batch_dims, N, K)
-    )
-    weight_scale = w_scale_raw.transpose(-1, -2).contiguous().to(dtypes.bf16)
-    return weight_qt, weight_scale
-
-
 def rearrange_4bit_elements(tensor):
     """
     GPU-optimized version for rearranging 4-bit segments within 32-bit integers

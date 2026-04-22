@@ -8,9 +8,9 @@ from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
-    per_1x32_i4_quant,
     rearrange_4bit_elements,
 )
+from aiter.ops.quant import per_1x32_i4_quant
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
 import argparse
