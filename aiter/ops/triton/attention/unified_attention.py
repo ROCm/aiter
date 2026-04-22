@@ -22,16 +22,12 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
-    is_quantized=False,
 ):
     arch = get_arch()
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    # TILE_SIZE >= 32 is required: TILE_SIZE=16 causes Triton compiler
-    # crashes for FP8 on gfx950 (unsupported 16x16 FP8 MFMA) and
-    # correctness failures for BF16 with BLOCK_M=16.
     TILE_SIZE = 32 if arch.is_rdna else 64
     waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
 
@@ -43,7 +39,9 @@ def select_2d_config(
     # pure decode config
     else:
         # to not have masking when loading KV
-        TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
+        TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        if head_size <= 192:
+            TILE_SIZE = max(32, TILE_SIZE)
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
@@ -52,8 +50,6 @@ def select_2d_config(
     # large prefill config
     if max_seqlen_q >= 256:
         BLOCK_M = 64 if arch.is_rdna else 128
-        if is_quantized and not arch.is_rdna:
-            TILE_SIZE = 128
         num_stages_2d, num_warps = 1, 4
 
     BLOCK_Q = BLOCK_M // num_queries_per_kv
@@ -74,11 +70,13 @@ def select_3d_config(
 ):
     reduce_num_warps = 2
     attn_warps = 2
-    TILE_SIZE = max(32, min(64, triton.next_power_of_2(block_size)))
+    TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    if head_size <= 128 or (head_size <= 192 and element_size < 2):
+        TILE_SIZE = max(32, TILE_SIZE)
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
-    MIN_SEGMENTS = 8
+    MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
     num_segments = max(num_segments, MIN_SEGMENTS)
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
@@ -187,7 +185,6 @@ def unified_attention(
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = int(max_seqlen_q) == 1
-    is_quantized = q_descale is not None
     # if batch contains a prefill
     if use_2d_kernel(
         head_size_qk,
@@ -207,7 +204,6 @@ def unified_attention(
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
-            is_quantized=is_quantized,
         )
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
@@ -270,7 +266,7 @@ def unified_attention(
 
     else:
         attn_config, reduce_config = select_3d_config(
-            head_size_qk,
+            head_size_qk + rope_size,
             block_size,
             q.element_size(),
             max_seqlen_k,
