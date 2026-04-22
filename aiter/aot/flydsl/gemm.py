@@ -36,6 +36,8 @@ import sys
 import time
 from typing import Dict, Optional
 
+import flydsl.expr as fx
+
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx
@@ -184,8 +186,20 @@ def _compile_executable_to_cache(exe, *args) -> None:
 
         compile_fn = flyc.compile
         args = (exe, *args)
-    with compile_only_env():
-        compile_fn(*args)
+    try:
+        with compile_only_env():
+            compile_fn(*args)
+    except Exception:
+        # FlyDSL compilation can leak ir.Context on failure; clean it up so later
+        # kernels do not inherit a broken compilation state.
+        try:
+            from flydsl._mlir import ir
+
+            while ir.Context.current is not None:
+                ir.Context.current.__exit__(None, None, None)
+        except Exception:
+            pass
+        raise
 
 
 def _compile_hgemm_to_cache(
@@ -218,11 +232,16 @@ def _compile_hgemm_to_cache(
 
     import torch
 
-    dev = torch.device("cuda")
+    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
 
-    current_gfx = get_gfx()
-    if target_gfx != current_gfx:
+    current_gfx = None
+    try:
+        current_gfx = get_gfx()
+    except Exception:
+        pass
+    if current_gfx is not None and target_gfx != current_gfx:
         print(
             f"  [WARN] Kernel targets {target_gfx} but current target is {current_gfx}; "
             "compiling with current target parameters"
@@ -237,7 +256,7 @@ def _compile_hgemm_to_cache(
         device=dev,
         dtype=torch.int32,
     )
-    stream = torch.cuda.current_stream(device=dev)
+    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
 
     exe = compile_flydsl_hgemm_kernel(
         dtype,
@@ -285,7 +304,8 @@ def _compile_preshuffle_to_cache(
 
     import torch
 
-    dev = torch.device("cuda")
+    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
     out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
 
     # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
@@ -294,7 +314,7 @@ def _compile_preshuffle_to_cache(
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
-    stream = torch.cuda.current_stream(device=dev)
+    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
 
     exe = compile_preshuffle_gemm_a8(
         N=n,
@@ -365,7 +385,7 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
-    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or get_gfx()
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
 
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
