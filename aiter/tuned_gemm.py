@@ -441,22 +441,40 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
+    stages = config.get("stages", config.get("stage", 2))
+    fused_bias = None
+    if (
+        bias is not None
+        and (otype is None or otype == inp.dtype)
+        and bias.dtype == inp.dtype
+    ):
+        fused_bias = bias
     out = aiter.ops.flydsl.gemm_kernels.flydsl_hgemm(
         inp,
         weights,
+        bias=fused_bias,
+        kernel_family=config.get("kernel_family"),
         tile_m=config["tile_m"],
         tile_n=config["tile_n"],
         tile_k=config["tile_k"],
         split_k=config["split_k"],
         block_m_warps=config["block_m_warps"],
         block_n_warps=config["block_n_warps"],
+        n_tile_repeat=config.get("n_tile_repeat", 1),
+        persistent_n_tiles=config.get("persistent_n_tiles", 1),
+        waves_per_eu=config.get("waves_per_eu", 0),
+        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
+        stages=stages,
+        async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
         b_preshuffle=config["b_preshuffle"],
+        c_to_lds=config.get("c_to_lds", False),
     )
+
+    if bias is not None and fused_bias is None:
+        out = out.to(bias.dtype) + bias
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
-    if bias is not None:
-        out = out + bias
     return out
 
 
