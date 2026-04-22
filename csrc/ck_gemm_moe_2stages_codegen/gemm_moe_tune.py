@@ -35,6 +35,7 @@ from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,
+    per_1x32_i4_quant,
 )
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
@@ -188,21 +189,7 @@ class FmoeTuner(TunerCommon):
                 weight, quant_dtype=dtypes.i8, dtypeMax=7
             )
         elif qType == QuantType.per_1x32 and quant_dtype == dtypes.i4x2:
-            # a16wi4: groupwise quantize to int4 [-7, 7] with group_size=32
-            group_size = 32
-            w_groups = weight.view(E, dim1, dim2 // group_size, group_size)
-            w_group_max = w_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
-            w_scale_raw = (w_group_max / 7.0).squeeze(-1)  # [E, dim1, G]
-            weight_qt = (
-                (w_groups / w_scale_raw.unsqueeze(-1))
-                .round()
-                .clamp(-7, 7)
-                .to(dtypes.i8)
-            )
-            weight_qt = weight_qt.view(E, dim1, dim2)
-            # Scale: [E, K//32, N] = permuted from [E, N, G]
-            weight_scale = w_scale_raw.permute(0, 2, 1).to(dtypes.bf16)  # [E, G, N]
-            return weight_qt, weight_scale
+            return per_1x32_i4_quant(weight)
         else:
             torch_quant = aiter.get_torch_quant(qType)
             weight_qt, weight_scale = torch_quant(weight, quant_dtype=quant_dtype)

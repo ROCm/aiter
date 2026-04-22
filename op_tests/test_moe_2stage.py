@@ -8,6 +8,7 @@ from aiter import dtypes
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
+    per_1x32_i4_quant,
     rearrange_4bit_elements,
 )
 from aiter.utility import fp4_utils
@@ -101,30 +102,10 @@ def test_fmoe(
     elif (
         qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
     ):  # a16wi4: int4 weights, bf16 activations
-        # Groupwise quantization: quantize each group of 32 K-elements to int4 [-7, 7]
-        group_size = 32
-        N1 = inter_dim * 2 if use_g1u1 else inter_dim
-        # w1: [E, N1, model_dim] -> groups along K
-        w1_groups = w1.view(E, N1, model_dim // group_size, group_size)
-        w1_group_max = (
-            w1_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
-        )  # [E, N1, G, 1]
-        w1_scale_raw = (w1_group_max / 7.0).squeeze(-1)  # [E, N1, G]
-        w1_qt = (
-            (w1_groups / w1_scale_raw.unsqueeze(-1)).round().clamp(-7, 7).to(dtypes.i8)
-        )
-        w1_qt = w1_qt.view(E, N1, model_dim).view(dtypes.i4x2)
-        # Scale: [E, K//32, N] = permuted from [E, N, G]
-        w1_scale = w1_scale_raw.permute(0, 2, 1).to(dtypes.bf16)  # [E, G, N]
-        # w2: [E, model_dim, inter_dim] -> groups along K (=inter_dim)
-        w2_groups = w2.view(E, model_dim, inter_dim // group_size, group_size)
-        w2_group_max = w2_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
-        w2_scale_raw = (w2_group_max / 7.0).squeeze(-1)  # [E, model_dim, G2]
-        w2_qt = (
-            (w2_groups / w2_scale_raw.unsqueeze(-1)).round().clamp(-7, 7).to(dtypes.i8)
-        )
-        w2_qt = w2_qt.view(E, model_dim, inter_dim).view(dtypes.i4x2)
-        w2_scale = w2_scale_raw.permute(0, 2, 1).to(dtypes.bf16)  # [E, G2, model_dim]
+        w1_qt, w1_scale = per_1x32_i4_quant(w1)
+        w1_qt = w1_qt.view(dtypes.i4x2)
+        w2_qt, w2_scale = per_1x32_i4_quant(w2)
+        w2_qt = w2_qt.view(dtypes.i4x2)
     elif qType == aiter.QuantType.per_128x128:
 
         def weight_per_128x128_quant(weight, quant_dtype):
