@@ -185,6 +185,7 @@ class AttentionConfig:
     RCP_LN2: gl.constexpr
     QK_SCALE: gl.constexpr
     SOFTMAX_SCALE: gl.constexpr
+    USE_SINKS: gl.constexpr 
     WARP_SIZE: gl.constexpr
     NUM_WARPS: gl.constexpr
     qk_layout: gl.constexpr
@@ -227,6 +228,7 @@ class AttentionConfig:
         NUM_KV_HEADS,
         SLIDING_WINDOW,
         SCALE,
+        USE_SINKS,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
         ALL_DECODE,
@@ -264,6 +266,8 @@ class AttentionConfig:
         self.CAUSAL = gl.constexpr(CAUSAL)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
         self.LOOP_VARIANT = gl.constexpr(LOOP_VARIANT)
+        self.USE_SINKS = gl.constexpr(USE_SINKS)
+
         if ARCH_NAME == "gfx1250":
             assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
 
@@ -311,6 +315,7 @@ class AttentionConfig:
                 )
             )
             self.K_WIDTH_PV = gl.constexpr(16) if self.FP8_DOT else gl.constexpr(4)
+            
         self.q_layout = gl.constexpr(gl.DotOperandLayout(0, self.qk_layout, self.K_WIDTH_QK))
         self.k_layout = gl.constexpr(gl.DotOperandLayout(1, self.qk_layout, self.K_WIDTH_QK))
         self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, self.K_WIDTH_PV))
@@ -1753,8 +1758,8 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part0(self, S, M):
         # more numerically stable
-        if self.cfg.ARCH_NAME == "gfx950":
-            return softmax_part0_cdna4(self, S, M)
+        # if self.cfg.ARCH_NAME == "gfx950" and self.cfg.USE_SINKS:
+        #     return self.softmax_part0_cdna4(S, M)
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
@@ -2798,6 +2803,7 @@ def kernel_unified_attention_2d(
         NUM_KV_HEADS,
         SLIDING_WINDOW,
         SCALE,
+        USE_SINKS,
         USE_LOAD_BUFFER_OP,
         USE_STORE_BUFFER_OP,
         ALL_DECODE,
@@ -2947,13 +2953,20 @@ def kernel_unified_attention_2d(
             kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m_pv % cfg.NUM_QUERIES_PER_KV
         )
         query_mask_1_pv = query_offset_1_pv < NUM_QUERY_HEADS
-
         M = gl.amd.cdna4.buffer_load(
                 ptr=sink_ptr,
                 offsets=query_offset_1_pv,
                 mask=query_mask_1_pv,
                 other=float("-inf"),
             ).to(dtype=gl.float32) / SCALE
+        # # Softmax verison is different for cdna4 for num. stability
+        # if ARCH_NAME == "gfx950":
+        #     M = M * cfg.RCP_LN2
+        #     M = M d
+        # else:
+        #     M = M / SCALE
+
+        
 
     L = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
