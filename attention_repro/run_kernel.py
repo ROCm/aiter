@@ -38,13 +38,14 @@ parser.add_argument('--remove_indirect_access', type=int, default=1, help='')
 parser.add_argument('--num_buffers', type=int, default=2, help='')
 parser.add_argument('--loop_variant', type=int, default=1, help='')
 parser.add_argument('--causal', type=int, default=1, help='')
+parser.add_argument('--shuffled_kv_cache', type=int, default=0, help='')
+
 args = parser.parse_args()
 print(args)
 
 args.window_size = 0
 args.num_kv_blocks = 1
 args.use_tdm = 1
-args.shuffled_kv_cache = 0
 
 block_size = args.block_size
 soft_cap = None
@@ -53,18 +54,25 @@ seq_lens = [(args.seq_q_l, args.seq_kv_l)] * args.bs
 q_dtype = torch.bfloat16
 kv_dtype = torch.bfloat16
 
-(maybe_quantized_query, maybe_quantized_key_cache, maybe_quantized_value_cache, 
-            sinks, output, 
-            cu_query_lens,
-            kv_lens,
-            max_query_len,
-            max_kv_len,
-            scale,
-            window_size,
-            block_tables,
-            q_descale, k_descale, v_descale, output_scale) = generate_data(seq_lens, num_blocks=1024, block_size=block_size, head_size=args.head_size, 
-                                                             num_heads=(args.num_heads_q, args.num_heads_k), sliding_window=args.window_size,
-                                                             q_dtype=q_dtype, kv_dtype=kv_dtype, shuffled_kv_cache=args.shuffled_kv_cache, remove_indirect_access=args.remove_indirect_access,)
+# q_dtype = e4m3_dtype
+# kv_dtype = e4m3_dtype
+
+(query,
+key_cache_orig,
+value_cache_orig,
+key_cache,
+value_cache,
+sinks, output, 
+cu_query_lens,
+kv_lens,
+max_query_len,
+max_kv_len,
+scale,
+window_size,
+block_tables,
+q_descale, k_descale, v_descale, output_scale) = generate_data(seq_lens, num_blocks=128, block_size=block_size, head_size=args.head_size, 
+                                                    num_heads=(args.num_heads_q, args.num_heads_k), sliding_window=args.window_size,
+                                                    q_dtype=q_dtype, kv_dtype=kv_dtype, shuffled_kv_cache=args.shuffled_kv_cache, remove_indirect_access=args.remove_indirect_access,)
 output_scale = None
 print("After generate data")
 print("--------------------------------")
@@ -86,9 +94,9 @@ if new_kv_layout:
     maybe_quantized_value_cache = maybe_quantized_value_cache.permute(0, 2, 1, 3)
 
 func = lambda:  gluon_unified_attention_2d(
-        q=maybe_quantized_query.cuda(),
-        k=maybe_quantized_key_cache.cuda(),
-        v=maybe_quantized_value_cache.cuda(),
+        q=query.cuda(),
+        k=key_cache.cuda(),
+        v=value_cache.cuda(),
         out=output.cuda(),
         cu_seqlens_q=cu_query_lens.cuda(),
         seqused_k=kv_lens.cuda(),

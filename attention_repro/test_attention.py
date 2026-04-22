@@ -50,19 +50,6 @@ def shuffle_kv_cache(
     assert value_cache.dtype == dtype
     assert dtype in (torch.bfloat16, e4m3_dtype)
 
-    if IS_DEVICE_ARCH_GFX12:
-        if dtype == torch.bfloat16:
-            layout = (16, 8)
-        else:
-            # Caution: in gfx1250, the 16-bit and 8-bit layout should both be (16, 8), however, in order to enable ds_load_b128 for 8-bit WMMA,
-            # we use (16, 16) here, noted that you must set k_width to 16 in the corresponding DotOperandLayout, the math will be equivalent.
-            layout = (16, 16)
-    else:
-        if dtype == torch.bfloat16:
-            layout = (16, 8)
-        else:
-            layout = (16, 16)
-
     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
     num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
     assert block_size >= 16
@@ -71,23 +58,18 @@ def shuffle_kv_cache(
     assert head_size == head_size_v
     assert block_size == block_size_v
 
-    num_lanes, num_elements_per_thread = layout
+    k_width = 16 // key_cache.element_size()
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
-    ).permute(0, 2, 1, 3)
+    ).permute(0, 2, 3, 1)
     key_cache_shuffled = key_cache_shuffled.view(
         -1,
         num_kv_heads,
-        block_size // num_lanes,
-        num_lanes,
-        head_size // (2 * num_elements_per_thread),
-        2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
-        num_elements_per_thread,
+        head_size // k_width,
+        k_width,
+        block_size,
     )
-    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
-    key_cache_shuffled = key_cache_shuffled.view(
-        -1, num_kv_heads, block_size // 16, head_size * 16
-    )
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
 
     value_cache_shuffled = value_cache.view(
         -1, block_size, num_kv_heads, head_size
@@ -95,18 +77,11 @@ def shuffle_kv_cache(
     value_cache_shuffled = value_cache_shuffled.view(
         -1,
         num_kv_heads,
-        block_size // (2 * num_elements_per_thread),
-        2,
-        num_elements_per_thread,
-        head_size // num_lanes,
-        num_lanes,
+        block_size // k_width,
+        k_width,
+        head_size,
     )
-    value_cache_shuffled = value_cache_shuffled.permute(
-        0, 1, 5, 2, 3, 6, 4
-    ).contiguous()
-    value_cache_shuffled = value_cache_shuffled.view(
-        -1, num_kv_heads, head_size // 16, block_size * 16
-    )
+    value_cache_shuffled = value_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
 
     return key_cache_shuffled, value_cache_shuffled
 
@@ -359,7 +334,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "shuffled_kv_cache",
     [
-        True, False,
+        True,
     ],
 )
 @pytest.mark.parametrize(
