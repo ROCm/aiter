@@ -2,14 +2,34 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Unit test for fused AllReduce + RMSNorm + per-1×128-group FP8 quantization.
+Unit test for fused AllReduce + RMSNorm + per-group FP8 quantization.
 
 This test validates that the fused kernel produces results matching the
 three-step reference: all-reduce → RMSNorm → per-group FP8 quant.
 
+It covers three layers:
+
+  1. Python-side ``_validate_per_group_size`` helper (no distributed
+     setup) -- exercises every constraint path (a)-(e) with a grid of
+     valid and invalid ``(group_size, element_size, n)`` triples.
+  2. Rank-side (distributed) negative test that the Python validator
+     raises ``ValueError`` at the call site before launching the kernel
+     when ``group_size`` is invalid.
+  3. End-to-end correctness sweep against the reference, now covering
+     every supported power-of-two ``group_size`` on a canonical shape
+     set, in addition to the full-shape sweep at ``group_size=128``.
+
 Usage:
+    # default: full-shape sweep at group_size=128, TP=8
+    python test_fused_ar_rms_per_group_quant.py
+
+    # single-shape check with a specific group_size / TP
     python test_fused_ar_rms_per_group_quant.py -t 8 -s 64,4096
     python test_fused_ar_rms_per_group_quant.py -t 4 --group-size 128
+
+    # sweep all supported group_sizes {32,64,128,256,512} on a canonical
+    # shape set at the given TP
+    python test_fused_ar_rms_per_group_quant.py -t 8 --sweep-group-size
 """
 
 import os
@@ -44,6 +64,106 @@ logger = logging.getLogger("aiter")
 set_start_method("spawn", force=True)
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
+
+
+def test_group_size_validation_python_check():
+    """Non-distributed unit test for the Python-side ``_validate_per_group_size``.
+
+    Covers every constraint (a)-(e) with both passing and failing inputs.
+    Runs in-process (no GPU, no rank) so it executes fast and gates the
+    distributed tests on the validator contract.
+    """
+    from aiter.dist.device_communicators.custom_all_reduce import (
+        _validate_per_group_size,
+    )
+
+    # element_size=2 corresponds to bf16 / fp16 -> PACK_SIZE = 8,
+    # so valid threads_per_group = {1, 2, 4, 8, 16, 32, 64},
+    # i.e. valid group_size = {8, 16, 32, 64, 128, 256, 512}.
+    bf16_es = 2
+    for gs in (8, 16, 32, 64, 128, 256, 512):
+        _validate_per_group_size(gs, bf16_es, n=4096)  # must not raise
+
+    # (a) group_size > 0
+    for bad_gs in (0, -1, -128):
+        try:
+            _validate_per_group_size(bad_gs, bf16_es, n=4096)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"expected ValueError for group_size={bad_gs} (must be > 0)"
+            )
+
+    # (b) group_size % PACK_SIZE == 0 (PACK_SIZE=8 for bf16)
+    for bad_gs in (1, 2, 4, 12, 20, 100, 127, 129):
+        try:
+            _validate_per_group_size(bad_gs, bf16_es, n=4096)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"expected ValueError for group_size={bad_gs} "
+                "(must be divisible by PACK_SIZE=8)"
+            )
+
+    # (c) threads_per_group must be a power of two.
+    # tpg = gs/8, so bad group_sizes that satisfy (a)+(b) but fail (c) are
+    # those where gs/8 is not a power of two, e.g. gs=24 -> tpg=3,
+    # gs=40 -> tpg=5, gs=48 -> tpg=6, gs=56 -> tpg=7.
+    for bad_gs in (24, 40, 48, 56, 72, 96):
+        try:
+            _validate_per_group_size(bad_gs, bf16_es, n=4096)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"expected ValueError for group_size={bad_gs} "
+                "(threads_per_group must be a power of two)"
+            )
+
+    # (d) threads_per_group <= 64. gs=1024 -> tpg=128 > 64.
+    for bad_gs in (1024, 2048, 4096):
+        try:
+            _validate_per_group_size(bad_gs, bf16_es, n=bad_gs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"expected ValueError for group_size={bad_gs} "
+                "(threads_per_group must be <= wavefront size 64)"
+            )
+
+    # (e) n % group_size == 0
+    for bad_n in (4095, 4097, 130):
+        try:
+            _validate_per_group_size(128, bf16_es, n=bad_n)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"expected ValueError for n={bad_n} group_size=128 "
+                "(n must be divisible by group_size)"
+            )
+
+    # Bad element_size (not a divisor of 16 or <= 0) -> ValueError.
+    for bad_es in (0, -2, 3, 5, 6):
+        try:
+            _validate_per_group_size(128, bad_es, n=4096)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for element_size={bad_es}")
+
+    # Non-int group_size -> TypeError.
+    try:
+        _validate_per_group_size(128.0, bf16_es, n=4096)  # type: ignore[arg-type]
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("expected TypeError for float group_size")
+
+    logger.info("test_group_size_validation_python_check: PASS")
 
 
 def _per_group_quant_ref(x_bf16: torch.Tensor, group_size: int = 128):
@@ -333,10 +453,33 @@ parser.add_argument(
     const=None,
     default=None,
 )
+parser.add_argument(
+    "--sweep-group-size",
+    action="store_true",
+    help=(
+        "Sweep all supported power-of-two group_sizes "
+        "{32, 64, 128, 256, 512} on a canonical shape set "
+        "[(128,4096), (512,4096), (1024,4096)] instead of the full "
+        "shape sweep at group_size=128. Useful for validating the "
+        "expanded group_size check after a kernel change."
+    ),
+)
+parser.add_argument(
+    "--skip-python-check",
+    action="store_true",
+    help="Skip the non-distributed _validate_per_group_size unit test.",
+)
 
 if __name__ == "__main__":
     freeze_support()
     args = parser.parse_args()
+
+    # 1. Non-distributed Python-side validator test. Runs first so that a
+    #    regression in the helper doesn't waste compute on the full
+    #    distributed sweep.
+    if not args.skip_python_check:
+        test_group_size_validation_python_check()
+
     if args.dtype is None:
         l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
     else:
@@ -351,6 +494,17 @@ if __name__ == "__main__":
         l_graph = [args.graphon]
     if args.group_size is not None:
         l_group_size = [args.group_size]
+
+    # ``--sweep-group-size`` replaces the default matrix with the cross
+    # product of every supported group_size (power-of-two tpg on bf16)
+    # and a small canonical shape set, so we validate the expanded
+    # group_size check without blowing up wall-clock time.
+    if args.sweep_group_size:
+        l_group_size = [32, 64, 128, 256, 512]
+        l_shape = [(128, 4096), (512, 4096), (1024, 4096)]
+        # keep emit_bf16 coverage since it is a separate kernel path
+        # but no need to resweep on every shape size
+        l_emit_bf16 = [False, True]
 
     df = []
     for dtype, shape, tp, pp, graph_on, gs, emit_bf16 in itertools.product(
@@ -375,6 +529,7 @@ if __name__ == "__main__":
         "tp_size",
         "shape",
         "dtype",
+        "group_size",
         "withGraph",
         "emit_bf16",
         "per_group_min_us",

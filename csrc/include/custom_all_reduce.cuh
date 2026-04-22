@@ -3216,10 +3216,60 @@ void dispatchFusedAllReduceRMSNormQuantPerGroup(hipStream_t stream,
                                  "of " +
                                  std::to_string(d));
     }
+    // Per-group FP8 quant kernel constraints. The fused epilogue
+    // ``ar_fusion_epilogue_per_group`` uses a butterfly ``__shfl_xor``
+    // intra-group abs-max reduction with packed 16B loads, which imposes
+    // the following requirements on ``group_size``:
+    //
+    //   (a) group_size > 0
+    //   (b) group_size % PACK_SIZE == 0            (PACK_SIZE = 16/sizeof(T))
+    //   (c) (group_size / PACK_SIZE) is a power of two
+    //   (d) (group_size / PACK_SIZE) <= wavefront size (64 on CDNA)
+    //   (e) n % group_size == 0
+    //
+    // Without (a)-(d) the kernel would silently produce wrong scales
+    // (ill-formed butterfly stride, cross-warp shuffles, or a fractional
+    // pack per group); without (e) ``num_groups = n / group_size`` would
+    // not be an integer. Reject up front with an actionable message.
+    constexpr int kPackSize      = 16 / sizeof(T);
+    constexpr int kWavefrontSize = 64; // AMD CDNA wavefront width (gfx94x / gfx950)
+    if(group_size <= 0)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size > 0, got group_size=" +
+            std::to_string(group_size));
+    }
+    if(group_size % kPackSize != 0)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size divisible by PACK_SIZE=" +
+            std::to_string(kPackSize) + " (16/sizeof(T)), got group_size=" +
+            std::to_string(group_size));
+    }
+    int const threads_per_group_check = group_size / kPackSize;
+    if((threads_per_group_check & (threads_per_group_check - 1)) != 0)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size/PACK_SIZE to be a power of two "
+            "(butterfly __shfl_xor reduction), got group_size=" +
+            std::to_string(group_size) +
+            " PACK_SIZE=" + std::to_string(kPackSize) +
+            " threads_per_group=" + std::to_string(threads_per_group_check));
+    }
+    if(threads_per_group_check > kWavefrontSize)
+    {
+        throw std::runtime_error(
+            "per-group quant requires group_size/PACK_SIZE <= wavefront size (" +
+            std::to_string(kWavefrontSize) +
+            "), got group_size=" + std::to_string(group_size) +
+            " PACK_SIZE=" + std::to_string(kPackSize) +
+            " threads_per_group=" + std::to_string(threads_per_group_check));
+    }
     if(n % group_size != 0)
     {
-        throw std::runtime_error("per-group quant requires n divisible by group_size, n=" +
-                                 std::to_string(n) + " group_size=" + std::to_string(group_size));
+        throw std::runtime_error(
+            "per-group quant requires n divisible by group_size, n=" +
+            std::to_string(n) + " group_size=" + std::to_string(group_size));
     }
     RankData* ptrs   = get_buffer_RD(stream, input);
     auto pack_size   = 16 / sizeof(T);

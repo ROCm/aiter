@@ -17,7 +17,7 @@
 
 import pickle
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -44,6 +44,73 @@ def is_weak_contiguous(inp: torch.Tensor):
         inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
         == inp.numel() * inp.element_size()
     )
+
+
+# Wavefront width on AMD CDNA / gfx94x / gfx950. ``__shfl_xor`` in the
+# fused per-group FP8 quant epilogue is scoped to a single wavefront, so
+# ``threads_per_group = group_size / PACK_SIZE`` must fit inside it.
+_AITER_AR_WAVEFRONT_SIZE = 64
+
+
+def _validate_per_group_size(group_size: int, element_size: int, n: int) -> None:
+    """Validate ``group_size`` for the fused AR + RMSNorm + per-group FP8
+    quant kernel. Mirrors the C++ host dispatcher checks in
+    ``dispatchFusedAllReduceRMSNormQuantPerGroup`` so callers fail fast
+    with a clear Python-level ``ValueError`` (rather than a generic
+    ``RuntimeError`` from the extension, which aborts CUDA-graph capture
+    asynchronously).
+
+    The fused epilogue imposes five constraints on ``group_size``:
+
+    (a) ``group_size > 0``
+    (b) ``group_size % PACK_SIZE == 0`` with ``PACK_SIZE = 16 // element_size``
+        (each thread owns a full 16-byte pack, so a group must be made of
+        whole packs).
+    (c) ``threads_per_group = group_size / PACK_SIZE`` must be a power of two
+        (butterfly ``__shfl_xor`` reduction strides ``{tpg/2, tpg/4, ..., 1}``).
+    (d) ``threads_per_group`` must fit inside a wavefront
+        (``<= 64`` on AMD CDNA); cross-warp shuffles do not exist on HIP.
+    (e) ``n % group_size == 0`` so ``num_groups = n / group_size`` is an
+        integer.
+    """
+    if not isinstance(group_size, int):
+        raise TypeError(
+            f"per-group quant group_size must be int, got {type(group_size).__name__}"
+        )
+    if group_size <= 0:
+        raise ValueError(
+            f"per-group quant requires group_size > 0, got group_size={group_size}"
+        )
+    if element_size <= 0 or 16 % element_size != 0:
+        raise ValueError(
+            "per-group quant requires an element_size that divides 16 "
+            f"(bf16/fp16: 2), got element_size={element_size}"
+        )
+    pack_size = 16 // element_size
+    if group_size % pack_size != 0:
+        raise ValueError(
+            f"per-group quant requires group_size divisible by PACK_SIZE="
+            f"{pack_size} (16 // element_size), got group_size={group_size}"
+        )
+    threads_per_group = group_size // pack_size
+    if threads_per_group & (threads_per_group - 1) != 0:
+        raise ValueError(
+            "per-group quant requires group_size/PACK_SIZE to be a power of "
+            "two (butterfly __shfl_xor reduction), got "
+            f"group_size={group_size} PACK_SIZE={pack_size} "
+            f"threads_per_group={threads_per_group}"
+        )
+    if threads_per_group > _AITER_AR_WAVEFRONT_SIZE:
+        raise ValueError(
+            "per-group quant requires group_size/PACK_SIZE <= wavefront size "
+            f"({_AITER_AR_WAVEFRONT_SIZE}), got group_size={group_size} "
+            f"PACK_SIZE={pack_size} threads_per_group={threads_per_group}"
+        )
+    if n % group_size != 0:
+        raise ValueError(
+            f"per-group quant requires n divisible by group_size, "
+            f"got n={n} group_size={group_size}"
+        )
 
 
 class IPCBuffer:
@@ -742,8 +809,14 @@ class CustomAllreduce:
         use_1stage: bool = False,
         emit_bf16: bool = False,
     ):
-        res_out = torch.empty_like(inp)
         K = inp.shape[-1]
+        # Fail fast on bad ``group_size`` at the Python boundary. Mirrors
+        # the C++ host dispatcher checks; catching it here surfaces a
+        # synchronous ``ValueError`` instead of a post-launch
+        # ``RuntimeError`` that would only fire at CUDA-graph replay and
+        # would be much harder to attribute to the offending call site.
+        _validate_per_group_size(group_size, inp.element_size(), K)
+        res_out = torch.empty_like(inp)
         num_groups = K // group_size
         out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
         scale_out = torch.empty(
@@ -794,8 +867,12 @@ class CustomAllreduce:
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
                 return self.fused_ar_rms_per_group_quant(
-                    input, residual_inp, w=weight, eps=eps,
-                    group_size=group_size, registered=True,
+                    input,
+                    residual_inp,
+                    w=weight,
+                    eps=eps,
+                    group_size=group_size,
+                    registered=True,
                     use_1stage=use_1stage,
                     emit_bf16=emit_bf16,
                 )
@@ -805,7 +882,8 @@ class CustomAllreduce:
                 dummy_out = torch.zeros(input.shape, dtype=fp8, device=input.device)
                 dummy_scale = torch.zeros(
                     input.shape[:-1] + (num_groups,),
-                    dtype=torch.float32, device=input.device,
+                    dtype=torch.float32,
+                    device=input.device,
                 )
                 if emit_bf16:
                     return (
@@ -817,8 +895,12 @@ class CustomAllreduce:
                 return dummy_out, torch.zeros_like(input), dummy_scale
         else:
             return self.fused_ar_rms_per_group_quant(
-                input, residual_inp, w=weight, eps=eps,
-                group_size=group_size, registered=False,
+                input,
+                residual_inp,
+                w=weight,
+                eps=eps,
+                group_size=group_size,
+                registered=False,
                 use_1stage=use_1stage,
                 emit_bf16=emit_bf16,
             )
