@@ -19,12 +19,17 @@ def get_gemm_mxfp4_nopad_layouts(
     K_GROUPS = BLOCK_K // SCALE_GROUP_ELEMS
     BLOCK_K_BYTES = BLOCK_K // FP4_ELEMS_PER_BYTE
 
+    # Non-preshuffled scales: tiles_per_warp=1 pattern from the gfx1250
+    # reference (triton-dev .../examples/gluon/mxfp_gemm_gfx1250.py). The
+    # preshuffle variant uses tiles_per_warp=2 (warp_bases doubled, reg_bases
+    # non-empty) to match scales packed in 32-row groups; using that pattern
+    # with raw scales gives the wrong thread→scale mapping.
     if num_warps == 2:
         warp_bases = [[0, 1]]
         reg_bases = []
     elif num_warps == 4:
-        warp_bases = [[0, 2], [2, 0]]
-        reg_bases = [[1, 0], [0, 1]]
+        warp_bases = [[0, 1], [1, 0]]
+        reg_bases = []
     else:
         warp_bases = [[0, 1], [0, 2], [1, 0]]
         reg_bases = []
@@ -490,28 +495,20 @@ def gemm_mxfp4_nopad_gfx1250(
     if NUM_BUFFERS > 2:
         gl.amd.sched_barrier(0)
 
-    # TDM Store: accumulator → shared memory → global memory.
-    SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+    # TODO: switch to TDM async_store once the register→LDS store path works
+    # for the scaled-WMMA acc layout (instr_shape=[16,16,128], reg_bases=[]).
+    # Attempts with both PaddedSharedLayout and SwizzledSharedLayout — with and
+    # without a convert_layout to BlockedLayout — left ~2% of elements
+    # corrupted, always clustered on the last N-tile column band.
+    out_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M).to(gl.int64)
+    out_n = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N).to(gl.int64)
+    mask = (out_m[:, None] < M) & (out_n[None, :] < N)
+    c_offsets = (
+        out_m[:, None] * stride_c_m + out_n[None, :] * stride_c_n
+    ).to(gl.int32)
+    gl.amd.gfx1250.buffer_store(
+        stored_value=accumulator.to(c_ptr.type.element_ty),
+        ptr=c_ptr,
+        offsets=c_offsets,
+        mask=mask,
     )
-    c_buffer = gl.allocate_shared_memory(
-        c_ptr.type.element_ty,
-        shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
-        layout=SHARED_LAYOUT_C,
-    )
-    c_buffer.store(accumulator.to(c_ptr.type.element_ty))
-
-    # Ensure all wavefronts have finished writing to LDS before TDM reads it.
-    gl.barrier()
-
-    c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=c_ptr,
-        shape=(M, N),
-        strides=(stride_c_m, stride_c_n),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        layout=SHARED_LAYOUT_C,
-    )
-    gl.amd.gfx1250.tdm.async_store(
-        c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], c_buffer
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
