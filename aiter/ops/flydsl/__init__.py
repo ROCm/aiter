@@ -8,7 +8,7 @@ Kernel compilation and public APIs are only available when a compatible
 whether the optional dependency exists before relying on FlyDSL kernels.
 """
 
-from importlib.metadata import PackageNotFoundError, version
+from packaging.version import Version
 
 from .utils import is_flydsl_available
 
@@ -19,13 +19,13 @@ __all__ = [
 ]
 
 if is_flydsl_available():
-    try:
-        installed_flydsl_version = version("flydsl")
-    except PackageNotFoundError as exc:
+    import flydsl as _flydsl
+
+    installed_flydsl_version = getattr(_flydsl, "__version__", None)
+    if installed_flydsl_version is None:
         raise ImportError(
-            "`flydsl` is importable but package metadata is unavailable, "
-            "so its version cannot be validated."
-        ) from exc
+            "`flydsl` is importable but its version cannot be determined."
+        )
 
     if not installed_flydsl_version:
         raise ImportError("`flydsl` package metadata returned an empty version string.")
@@ -34,7 +34,7 @@ if is_flydsl_available():
     if _base_version != _REQUIRED_FLYDSL_VERSION:
         raise ImportError(
             "Unsupported `flydsl` version: "
-            f"expected `{_REQUIRED_FLYDSL_VERSION}`, "
+            f"expected >=`{_MIN_FLYDSL_VERSION}`, "
             f"got `{installed_flydsl_version}`."
         )
 
