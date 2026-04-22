@@ -983,7 +983,15 @@ class Gemm:
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "hipblaslt", "triton", "flydsl", "torch", "skinny"]:
+        if value not in [
+            "all",
+            "asm",
+            "hipblaslt",
+            "triton",
+            "flydsl",
+            "torch",
+            "skinny",
+        ]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 

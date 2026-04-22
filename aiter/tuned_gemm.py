@@ -418,7 +418,7 @@ def torch_gemm(
             )
         except RuntimeError:
             out = (
-                F.linear(inp, weights)
+                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
                 * scale_a
                 * scale_b
             )
