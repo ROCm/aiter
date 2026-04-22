@@ -219,7 +219,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
                     bias_bf16_vals = tl.load(bias_bf16_ptr + offs_b_bf16_n).to(
                         dtype=acc_dtype
                     )
-                    accumulator_bf16 = accumulator_bf16 + bias_bf16_vals[None, :]
+                    accumulator_bf16 += bias_bf16_vals[None, :]
 
             for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
                 if EVEN_K:
