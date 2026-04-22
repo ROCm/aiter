@@ -28,13 +28,19 @@ import os
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    aot_compile_device,
+    aot_compile_stream,
+    collect_aot_jobs,
+    compile_executable_to_cache,
+    compile_only_env,
+    job_identity,
+)
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
-    _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
     _s2_args_fp4,
@@ -113,11 +119,15 @@ def _precompile_to_cache(
     waves_per_eu: int = 3,
     k_batch: int = 1,
     b_nt: int = 2,
-    gate_only: bool = False,
-    fuse_fp4_quant: bool = False,
+    gate_mode: str = "separated",
     mode: str = "atomic",
     persist: bool = False,
     sort_block_m: int = 0,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
+    enable_bias: bool = False,
+    a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
     **kwargs,
 ):
     """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
@@ -129,7 +139,8 @@ def _precompile_to_cache(
     """
     import torch
 
-    dev = torch.device("cuda")
+    dev = aot_compile_device()
+    stream = aot_compile_stream(dev)
     is_fp4 = b_dtype == "fp4"
     tokens = tile_m
     E = experts
@@ -174,6 +185,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    stream=stream,
                 )
             else:
                 out = torch.zeros(
@@ -199,6 +211,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
+                    stream=stream,
                 )
 
             exe = compile_flydsl_moe_stage1(
@@ -216,11 +229,14 @@ def _precompile_to_cache(
                 waves_per_eu=waves_per_eu,
                 k_batch=k_batch,
                 b_nt=b_nt,
-                gate_only=gate_only,
-                fuse_fp4_quant=fuse_fp4_quant and not _is_splitk,
-                fuse_sort_scale=fuse_fp4_quant and not _is_splitk,
+                gate_mode=gate_mode,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
+                enable_bias=enable_bias,
+                a_scale_one=a_scale_one,
+                xcd_swizzle=xcd_swizzle,
             )
-            _run_compiled(exe, args)
+            compile_executable_to_cache(exe, *args)
 
         elif stage == 2:
             accumulate = mode != "reduce"
@@ -253,6 +269,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    stream=stream,
                 )
             else:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
@@ -274,6 +291,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
+                    stream=stream,
                 )
 
             exe = compile_flydsl_moe_stage2(
@@ -291,8 +309,13 @@ def _precompile_to_cache(
                 accumulate=accumulate,
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
+                b_nt=b_nt,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
+                xcd_swizzle=xcd_swizzle,
+                enable_bias=enable_bias,
             )
-            _run_compiled(exe, args)
+            compile_executable_to_cache(exe, *args)
 
 
 def compile_one_config(

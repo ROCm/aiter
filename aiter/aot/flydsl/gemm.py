@@ -36,7 +36,13 @@ import sys
 import time
 from typing import Dict, Optional
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    aot_compile_device,
+    aot_compile_stream,
+    collect_aot_jobs,
+    compile_executable_to_cache,
+    job_identity,
+)
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
@@ -178,14 +184,7 @@ def _torch_dtype_for_kernel(dtype_name: str):
 
 
 def _compile_executable_to_cache(exe, *args) -> None:
-    compile_fn = getattr(exe, "compile", None)
-    if compile_fn is None:
-        import flydsl.compiler as flyc
-
-        compile_fn = flyc.compile
-        args = (exe, *args)
-    with compile_only_env():
-        compile_fn(*args)
+    compile_executable_to_cache(exe, *args)
 
 
 def _compile_hgemm_to_cache(
@@ -218,7 +217,7 @@ def _compile_hgemm_to_cache(
 
     import torch
 
-    dev = torch.device("cuda")
+    dev = aot_compile_device()
     torch_dtype = _torch_dtype_for_kernel(dtype)
 
     current_gfx = get_gfx()
@@ -237,7 +236,7 @@ def _compile_hgemm_to_cache(
         device=dev,
         dtype=torch.int32,
     )
-    stream = torch.cuda.current_stream(device=dev)
+    stream = aot_compile_stream(dev)
 
     exe = compile_flydsl_hgemm_kernel(
         dtype,
@@ -285,7 +284,7 @@ def _compile_preshuffle_to_cache(
 
     import torch
 
-    dev = torch.device("cuda")
+    dev = aot_compile_device()
     out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
 
     # FlyDSL preshuffle kernels consume raw quantized bytes for fp8/int8 paths.
@@ -294,7 +293,7 @@ def _compile_preshuffle_to_cache(
     out = torch.empty((m * n,), device=dev, dtype=out_torch_dtype)
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
-    stream = torch.cuda.current_stream(device=dev)
+    stream = aot_compile_stream(dev)
 
     exe = compile_preshuffle_gemm_a8(
         N=n,

@@ -378,6 +378,10 @@ if PREBUILD_KERNELS != 0:
                     )
                     fail = len(results) - ok
                     print(f"[aiter] {label}: compiled {ok} ok, {fail} failed")
+                    assert fail == 0, (
+                        f"{label} failed for {fail} kernel(s). "
+                        "See compile log above for the failing cases."
+                    )
 
             from aiter.aot.flydsl.moe import (
                 DEFAULT_CSVS as MOE_DEFAULT_CSVS,
@@ -408,7 +412,7 @@ if PREBUILD_KERNELS != 0:
             import traceback
 
             traceback.print_exc()
-            print(f"[aiter] FlyDSL AOT skipped: {e}")
+            raise AssertionError(f"[aiter] FlyDSL AOT failed: {e}") from e
 
 
 class NinjaBuildExtension(build_ext):
