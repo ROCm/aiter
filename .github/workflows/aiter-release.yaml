@@ -332,11 +332,8 @@ jobs:
           echo "Building aiter whl in pytorch/manylinux2_28-builder for Python ${PYTHON_VERSION}..."
 
           # Compose SETUPTOOLS_SCM_PRETEND_VERSION
-          if [ "${ADD_DATE_STAMP}" = "true" ] && [ -n "${{ steps.version.outputs.nightly_version }}" ]; then
-            BASE_VER="${{ steps.version.outputs.nightly_version }}"
-          else
-            BASE_VER="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.1.0)"
-          fi
+          # post2 release build — version pinned for v0.1.12.post2 dispatch from this side branch
+          BASE_VER="0.1.12.post2"
           # Tag the wheel so it is unambiguously the manylinux build
           IMG="${BUILD_DOCKER_IMAGE}"
           ROCM_TAG="${IMG##*:}"
