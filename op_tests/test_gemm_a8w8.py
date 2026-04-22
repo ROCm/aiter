@@ -4,10 +4,10 @@
 import torch
 import torch.nn.functional as F
 import random
-import glob
 import os
 import aiter
 from aiter import dtypes
+from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import hipb_mm, hipb_create_extension
@@ -409,35 +409,29 @@ def test_skinny_gemm_a8w8_pertoken_quant():
 
 
 def _iter_flydsl_csv_cases():
+    """Yield test_gemm kwargs for every flydsl row in the merged bpreshuffle tuned CSV."""
     gfx, cu = get_gfx(), get_cu_num()
-    cfg = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "aiter", "configs"
+    merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    df = pd.read_csv(merged_csv)
+    rows = df[(df["gfx"] == gfx) & (df["cu_num"] == cu) & (df["libtype"] == "flydsl")]
+    aiter.logger.info(
+        "%d flydsl rows for %s cu=%d from %s",
+        len(rows),
+        gfx,
+        cu,
+        os.path.basename(merged_csv),
     )
-    paths = [os.path.join(cfg, "a8w8_bpreshuffle_tuned_gemm.csv")] + sorted(
-        glob.glob(
-            os.path.join(cfg, "model_configs", "*a8w8_bpreshuffle_tuned_gemm*.csv")
+    for _, row in rows.iterrows():
+        q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
+        yield dict(
+            dtype=dtypes.bf16,
+            m=int(row["M"]),
+            n=int(row["N"]),
+            k=int(row["K"]),
+            quantDtype=q_dtype,
+            pad_a=128,
+            skip_ck=True,
         )
-    )
-    for path in paths:
-        name = os.path.basename(path)
-        if "untuned" in name or "blockscale" in name:
-            continue
-        df = pd.read_csv(path)
-        rows = df[
-            (df["gfx"] == gfx) & (df["cu_num"] == cu) & (df["libtype"] == "flydsl")
-        ]
-        aiter.logger.info("%s: %d flydsl rows for %s cu=%d", name, len(rows), gfx, cu)
-        for _, row in rows.iterrows():
-            q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
-            yield dict(
-                dtype=dtypes.bf16,
-                m=int(row["M"]),
-                n=int(row["N"]),
-                k=int(row["K"]),
-                quantDtype=q_dtype,
-                pad_a=128,
-                skip_ck=True,
-            )
 
 
 # ---------------------------------------------------------------------------
