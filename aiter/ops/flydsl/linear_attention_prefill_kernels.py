@@ -10,11 +10,11 @@ import torch
 from .kernels.chunk_gated_delta_h import chunk_gated_delta_rule_fwd_h_flydsl
 
 __all__ = [
-    "flydsl_chunk_gated_delta_rule_fwd_h",
+    "flydsl_gdr_prefill",
 ]
 
 
-def flydsl_chunk_gated_delta_rule_fwd_h(
+def flydsl_gdr_prefill(
     k: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,

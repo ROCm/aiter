@@ -26,7 +26,7 @@ if not is_flydsl_available():
 
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        flydsl_chunk_gated_delta_rule_fwd_h,
+        flydsl_gdr_prefill,
     )
     from aiter.ops.flydsl.kernels import (
         chunk_gated_delta_h as flydsl_chunk_gated_delta_h_mod,
@@ -811,7 +811,7 @@ class TestCorrectness:
         context_lens = _build_context_lens(full_prompt_len)
         k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, tp=tp)
 
-        h_fly, vn_fly, fs_fly = flydsl_chunk_gated_delta_rule_fwd_h(
+        h_fly, vn_fly, fs_fly = flydsl_gdr_prefill(
             k,
             w_c,
             u_c,

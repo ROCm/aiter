@@ -1,11 +1,8 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
 Gated Delta Net K5 hidden-state recurrence kernel using the @flyc.kernel API.
-
-Mirrors the Triton `chunk_gated_delta_rule_fwd_kernel_h_opt3` from ATOM/FLA,
-rewritten in FlyDSL for AMD GPUs (gfx942/gfx950).
 
 For each chunk t (serial over NT chunks):
   1. Store h snapshot for downstream K6

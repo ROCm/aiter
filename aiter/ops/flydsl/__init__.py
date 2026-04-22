@@ -39,7 +39,7 @@ if is_flydsl_available():
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     # from .linear_attention_kernels import flydsl_gdr_decode
-    from .linear_attention_prefill_kernels import flydsl_chunk_gated_delta_rule_fwd_h
+    from .linear_attention_prefill_kernels import flydsl_gdr_prefill
 
     __all__ += [
         "flydsl_preshuffle_gemm_a8",
@@ -47,5 +47,5 @@ if is_flydsl_available():
         "flydsl_moe_stage2",
         "flydsl_hgemm",
         # "flydsl_gdr_decode",
-        "flydsl_chunk_gated_delta_rule_fwd_h",
+        "flydsl_gdr_prefill",
     ]
