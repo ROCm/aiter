@@ -657,7 +657,6 @@ def gemm_afp4wfp4_nopad(
     if config is None:
         config, _ = _get_config(M, N, K_cfg, True)
 
-    config["SPLITK_BLOCK_SIZE"] = K_elems
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
     if y is None:
@@ -665,24 +664,48 @@ def gemm_afp4wfp4_nopad(
 
     if config["BLOCK_SIZE_K"] >= K_elems:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(K_elems)
-        config["SPLITK_BLOCK_SIZE"] = K_elems
 
     grid = lambda META: (
-        META["NUM_KSPLIT"]
-        * triton.cdiv(M, META["BLOCK_SIZE_M"])
+        triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
+    # w has logical shape (N, K_bytes). Detect its physical layout so the
+    # kernel can consume it without a forced copy. `b_kn = w.T` is just a
+    # stride-view of the same memory.
+    b_kn = w.T
+    if w.stride(1) == 1:
+        # w is (N, K_bytes) K-contiguous → b_kn is (K_bytes, N) stride (1, K_bytes).
+        physical_kn = False
+    elif w.stride(0) == 1:
+        # w is (N, K_bytes) N-contiguous → b_kn is (K_bytes, N) stride (N, 1).
+        physical_kn = True
+    else:
+        raise ValueError(
+            f"w must be contiguous in at least one dimension, got strides {w.stride()}"
+        )
+
     layouts = get_gemm_mxfp4_nopad_layouts(
         config["num_warps"], config["BLOCK_SIZE_M"],
-        config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
+        config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"],
+        physical_kn=physical_kn)
 
-    # B in (K_bytes, N) for TDM; scales must be contiguous
-    b_kn = w.T.contiguous()
     x_scales_c = x_scales.contiguous()
     w_scales_c = w_scales.contiguous()
 
-    config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
+    # Drop config keys the kernel doesn't take: splitk is unsupported here,
+    # and num_stages/waves_per_eu/matrix_instr_nonkdim/cache_modifier are unused.
+    _DROP_KEYS = (
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "SPLITK_BLOCK",
+        "GROUP_SIZE_M",
+        "num_stages",
+        "waves_per_eu",
+        "matrix_instr_nonkdim",
+        "cache_modifier",
+    )
+    kernel_config = {k: v for k, v in config.items() if k not in _DROP_KEYS}
     _gluon_gemm_mxfp4_nopad_gfx1250[grid](
         x_fp4,
         b_kn,
@@ -694,14 +717,14 @@ def gemm_afp4wfp4_nopad(
         x_fp4.stride(1),
         b_kn.stride(0),
         b_kn.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
         y.stride(-2),
         y.stride(-1),
         x_scales_c.stride(0),
         x_scales_c.stride(1),
         w_scales_c.stride(0),
         w_scales_c.stride(1),
-        **config,
+        PHYSICAL_KN=physical_kn,
+        **kernel_config,
         **layouts,
     )
     return y
