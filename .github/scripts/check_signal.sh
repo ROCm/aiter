@@ -6,16 +6,11 @@
 
 set -euo pipefail
 
-ARTIFACT_NAME="checks-signal-${GITHUB_SHA:-${1:-}}"
 CHECKS_WORKFLOW_NAME="${CHECKS_WORKFLOW_NAME:-Checks}"
+CHECKS_SIGNAL_ARTIFACT_PREFIX="${CHECKS_SIGNAL_ARTIFACT_PREFIX:-checks-signal}"
 MAX_RETRIES="${MAX_RETRIES:-5}"
 RETRY_INTERVAL_SECONDS="${RETRY_INTERVAL_SECONDS:-30}"
 REPO="${GITHUB_REPOSITORY:-}"
-
-if [ -z "${ARTIFACT_NAME#checks-signal-}" ]; then
-  echo "GITHUB_SHA or an explicit SHA argument is required."
-  exit 1
-fi
 
 get_target_branch() {
   if [ -n "${GITHUB_HEAD_REF:-}" ]; then
@@ -91,12 +86,40 @@ find_checks_run_id() {
     gh_args+=(--branch "${target_branch}")
   fi
 
-  if [ -n "${GITHUB_EVENT_NAME:-}" ]; then
+  # Nightly workflows reuse the Checks result from the push run on the same SHA.
+  if [ -n "${GITHUB_EVENT_NAME:-}" ] && [ "${GITHUB_EVENT_NAME}" != "schedule" ]; then
     gh_args+=(--event "${GITHUB_EVENT_NAME}")
   fi
 
   gh "${gh_args[@]}" \
     --jq "(map(select(.headSha == \"${target_head_sha}\")) | first | .databaseId) // empty"
+}
+
+find_signal_artifact_name() {
+  local run_id="$1"
+
+  gh api "repos/${REPO}/actions/runs/${run_id}/artifacts" | python3 -c '
+import json
+import sys
+
+prefix = sys.argv[1]
+data = json.load(sys.stdin)
+
+matching = sorted(
+    (
+        artifact
+        for artifact in data.get("artifacts", [])
+        if not artifact.get("expired")
+        and (
+            artifact.get("name") == prefix
+            or artifact.get("name", "").startswith(f"{prefix}-")
+        )
+    ),
+    key=lambda artifact: artifact.get("created_at", ""),
+)
+
+print(matching[-1]["name"] if matching else "")
+' "${CHECKS_SIGNAL_ARTIFACT_PREFIX}"
 }
 
 for i in $(seq 1 "${MAX_RETRIES}"); do
@@ -105,19 +128,24 @@ for i in $(seq 1 "${MAX_RETRIES}"); do
 
   RUN_ID="$(find_checks_run_id || true)"
   if [ -n "${RUN_ID}" ]; then
-    echo "Attempt ${i}: Downloading artifact '${ARTIFACT_NAME}' from run ${RUN_ID}..."
-    if gh run download "${RUN_ID}" --repo "${REPO}" --name "${ARTIFACT_NAME}"; then
-      if [ -f checks_signal.txt ]; then
-        echo "Artifact ${ARTIFACT_NAME} downloaded successfully."
-        SIGNAL="$(head -n 1 checks_signal.txt)"
-        if [ "${SIGNAL}" = "success" ]; then
-          echo "Pre-checks passed, continuing workflow."
-          exit 0
-        fi
+    ARTIFACT_NAME="$(find_signal_artifact_name "${RUN_ID}" || true)"
+    if [ -z "${ARTIFACT_NAME}" ]; then
+      echo "Attempt ${i}: No ${CHECKS_SIGNAL_ARTIFACT_PREFIX} artifact found in run ${RUN_ID} yet."
+    else
+      echo "Attempt ${i}: Downloading artifact '${ARTIFACT_NAME}' from run ${RUN_ID}..."
+      if gh run download "${RUN_ID}" --repo "${REPO}" --name "${ARTIFACT_NAME}"; then
+        if [ -f checks_signal.txt ]; then
+          echo "Artifact ${ARTIFACT_NAME} downloaded successfully."
+          SIGNAL="$(head -n 1 checks_signal.txt)"
+          if [ "${SIGNAL}" = "success" ]; then
+            echo "Pre-checks passed, continuing workflow."
+            exit 0
+          fi
 
-        echo "Pre-checks failed, skipping workflow. Details:"
-        tail -n +2 checks_signal.txt
-        exit 78  # 78 = neutral/skip
+          echo "Pre-checks failed, skipping workflow. Details:"
+          tail -n +2 checks_signal.txt
+          exit 78  # 78 = neutral/skip
+        fi
       fi
     fi
   else
