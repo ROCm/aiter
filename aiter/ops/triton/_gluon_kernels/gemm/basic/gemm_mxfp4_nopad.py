@@ -495,20 +495,18 @@ def gemm_mxfp4_nopad_gfx1250(
     if NUM_BUFFERS > 2:
         gl.amd.sched_barrier(0)
 
-    # TODO: switch to TDM async_store once the register→LDS store path works
-    # for the scaled-WMMA acc layout (instr_shape=[16,16,128], reg_bases=[]).
-    # Attempts with both PaddedSharedLayout and SwizzledSharedLayout — with and
-    # without a convert_layout to BlockedLayout — left ~2% of elements
-    # corrupted, always clustered on the last N-tile column band.
-    out_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M).to(gl.int64)
-    out_n = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N).to(gl.int64)
-    mask = (out_m[:, None] < M) & (out_n[None, :] < N)
-    c_offsets = (
-        out_m[:, None] * stride_c_m + out_n[None, :] * stride_c_n
-    ).to(gl.int32)
+    # C store: build the offset tensor in the accumulator's own layout so
+    # buffer_store doesn't have to convert between layouts. Using
+    # SliceLayout(axis, wmma_acc_layout) keeps offs_c aligned with the
+    # accumulator's distribution.
+    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_acc_layout)
+    )
+    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_acc_layout)
+    )
+    offs_c = stride_c_m * offs_cm[:, None] + stride_c_n * offs_cn[None, :]
+    mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     gl.amd.gfx1250.buffer_store(
-        stored_value=accumulator.to(c_ptr.type.element_ty),
-        ptr=c_ptr,
-        offsets=c_offsets,
-        mask=mask,
+        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
     )
