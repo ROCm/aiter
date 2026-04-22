@@ -139,7 +139,8 @@ def get_kernel_config_gluon(m, n, k, routing_data):
             num_warps = 4
 
     else:
-        block_n = 512
+        block_n = 256
+        block_k = 256
         num_warps = 4
 
     ret = {
@@ -512,11 +513,9 @@ def main():
 
     parser = argparse.ArgumentParser(description="Run MoE GEMM A8W4 test")
     parser.add_argument("--M", type=int, default=32)
-    # parser.add_argument("--N", type=int, default=1024)
-    # parser.add_argument("--K", type=int, default=1024)
-    # parser.add_argument("--N", type=int, default=8192)
-    # parser.add_argument("--K", type=int, default=2880)
-    parser.add_argument("--N", type=int, default=5780)
+    # parser.add_argument("--N", type=int, default=512)
+    # parser.add_argument("--K", type=int, default=512)
+    parser.add_argument("--N", type=int, default=5760)
     parser.add_argument("--K", type=int, default=2880)
     # parser.add_argument("--N", type=int, default=6144)
     # parser.add_argument("--K", type=int, default=3072)
@@ -623,37 +622,37 @@ def main():
         gammas, args.apply_swiglu,
     )
 
-    # block_k = config['block_k']
-    # block_n = config['block_n']
-    # K_padded = 3072
-    # N_padded = 6144
+    block_k = config['block_k']
+    block_n = config['block_n']
+    K_padded = 3072
+    N_padded = 6144
 
-    # xK = x_tri.shape[1]
-    # x_pad = torch.zeros((in_m, K_padded), dtype=x_tri.dtype, device=device)
-    # x_pad[:, :xK] = x_tri
-    # x_tri = x_pad[:, :xK]
+    xK = x_tri.shape[1]
+    x_pad = torch.zeros((in_m, K_padded), dtype=x_tri.dtype, device=device)
+    x_pad[:, :xK] = x_tri
+    x_tri = x_pad[:, :xK]
 
-    # wK, wN = w_tri.shape[1], w_tri.shape[2]
-    # w_pad = torch.zeros((args.E, N_padded, K_padded // 2), dtype=w_tri.dtype, device=device)
-    # w_pad = w_pad.transpose(1, 2)
-    # w_pad[:, :wK, :wN] = w_tri
-    # w_tri = w_pad[:, :wK, :wN]
+    wK, wN = w_tri.shape[1], w_tri.shape[2]
+    w_pad = torch.zeros((args.E, N_padded, K_padded // 2), dtype=w_tri.dtype, device=device)
+    w_pad = w_pad.transpose(1, 2)
+    w_pad[:, :wK, :wN] = w_tri
+    w_tri = w_pad[:, :wK, :wN]
 
-    # sK, sN = w_scale_tri.shape[1], w_scale_tri.shape[2]
-    # ws_pad = torch.zeros((args.E, N_padded, sK), dtype=w_scale_tri.dtype, device=device)
-    # ws_pad = ws_pad.transpose(1, 2)
-    # ws_pad[:, :sK, :sN] = w_scale_tri
-    # w_scale_tri = ws_pad[:, :sK, :sN]
+    sK, sN = w_scale_tri.shape[1], w_scale_tri.shape[2]
+    ws_pad = torch.zeros((args.E, N_padded, sK), dtype=w_scale_tri.dtype, device=device)
+    ws_pad = ws_pad.transpose(1, 2)
+    ws_pad[:, :sK, :sN] = w_scale_tri
+    w_scale_tri = ws_pad[:, :sK, :sN]
 
-    # bias_pad = torch.zeros((args.E, N_padded), dtype=bias.dtype, device=device)
-    # bias_pad[:, :args.N] = bias
-    # bias = bias_pad[:, :args.N]
+    bias_pad = torch.zeros((args.E, N_padded), dtype=bias.dtype, device=device)
+    bias_pad[:, :args.N] = bias
+    bias = bias_pad[:, :args.N]
 
-    # print(f"  Stride padding: K {args.K}->{K_padded}, N {args.N}->{N_padded}")
-    # print(f"  x_tri       shape={tuple(x_tri.shape)}  stride={x_tri.stride()}")
-    # print(f"  w_tri       shape={tuple(w_tri.shape)}  stride={w_tri.stride()}")
-    # print(f"  w_scale_tri shape={tuple(w_scale_tri.shape)}  stride={w_scale_tri.stride()}")
-    # print(f"  bias        shape={tuple(bias.shape)}  stride={bias.stride()}")
+    print(f"  Stride padding: K {args.K}->{K_padded}, N {args.N}->{N_padded}")
+    print(f"  x_tri       shape={tuple(x_tri.shape)}  stride={x_tri.stride()}")
+    print(f"  w_tri       shape={tuple(w_tri.shape)}  stride={w_tri.stride()}")
+    print(f"  w_scale_tri shape={tuple(w_scale_tri.shape)}  stride={w_scale_tri.stride()}")
+    print(f"  bias        shape={tuple(bias.shape)}  stride={bias.stride()}")
 
     quant_static_scale = None
     out_dtype = torch.bfloat16
@@ -676,8 +675,8 @@ def main():
         swizzle_mx_scale,
         out_dtype,
         args.apply_swiglu,
-        # unpadded_N=args.N,
-        # unpadded_K=args.K,
+        unpadded_N=args.N,
+        unpadded_K=args.K,
     )
     if args.fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
