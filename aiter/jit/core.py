@@ -188,21 +188,47 @@ class AITER_CONFIG(object):
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
         import pandas as pd
 
+        q2_fallback_map = {
+            "q_type2": "q_type",
+            "q_dtype_a2": "q_dtype_a",
+            "q_dtype_w2": "q_dtype_w",
+        }
+        q2_cols = tuple(q2_fallback_map.keys())
+        has_q2_in_any_source = False
+
+        def normalize_optional_columns(df):
+            # Some legacy tuned CSVs do not carry hybrid stage2 quant columns.
+            # Fill them from stage1 quant columns when available so mixed-schema
+            # files can still be merged and deduped safely.
+            for dst_col, src_col in q2_fallback_map.items():
+                if dst_col not in df.columns:
+                    if src_col in df.columns:
+                        df[dst_col] = df[src_col]
+                    else:
+                        df[dst_col] = pd.NA
+            return df
+
         for i, path in enumerate(path_list):
             if not os.path.exists(path):
                 logger.info(f"path {i+1}: {path} (not exist)")
                 continue
 
             df = pd.read_csv(path)
+            if any(col in df.columns for col in q2_cols):
+                has_q2_in_any_source = True
+            df = normalize_optional_columns(df)
             if source_pairs:
                 base_path, base_df = source_pairs[0]
                 base_cols = [c for c in base_df.columns if c != "_tag"]
                 new_cols = [c for c in df.columns if c != "_tag"]
-                if base_cols != new_cols:
+                if set(base_cols) != set(new_cols):
                     raise ValueError(
                         f"Column mismatch between {base_path} and {path}, "
                         f"{base_cols}, {new_cols}"
                     )
+                if base_cols != new_cols:
+                    # Keep deterministic column order for downstream concat/write.
+                    df = df.reindex(columns=base_df.columns, fill_value=pd.NA)
 
             source_pairs.append((path, df))
 
@@ -228,7 +254,44 @@ class AITER_CONFIG(object):
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
                 keys.append("cu_num")
+            # If any source file carries stage2 quant columns, dedup must include
+            # q2 dimensions to distinguish hybrid entries (stage1 same, stage2 different).
+            if has_q2_in_any_source:
+                keys = keys + [c for c in q2_cols if c not in keys]
+
             dedup_keys = keys + ["_tag"] if has_tag else keys
+            missing_dedup_keys = [k for k in dedup_keys if k not in merge_df.columns]
+            for k in missing_dedup_keys:
+                src = q2_fallback_map.get(k)
+                if src is not None and src in merge_df.columns:
+                    merge_df[k] = merge_df[src]
+
+            if has_q2_in_any_source:
+                missing_q2 = [k for k in q2_cols if k not in merge_df.columns]
+                if missing_q2:
+                    raise RuntimeError(
+                        f"Dedup requires q2 keys {q2_cols} because at least one source config "
+                        f"contains q2 columns, but these keys are still missing after normalization: "
+                        f"{missing_q2}"
+                    )
+
+            still_missing = [k for k in dedup_keys if k not in merge_df.columns]
+            if still_missing:
+                fallback_keys = [k for k in dedup_keys if k in merge_df.columns]
+                logger.warning(
+                    f"Missing dedup keys {still_missing} when merging '{merge_name}'. "
+                    f"Fallback to available keys: {fallback_keys}"
+                )
+                dedup_keys = fallback_keys
+
+            if not dedup_keys:
+                raise RuntimeError(
+                    f"No usable dedup keys found when merging '{merge_name}'."
+                )
+            logger.info(
+                f"Dedup keys for '{merge_name}': include_q2={has_q2_in_any_source}, "
+                f"keys={dedup_keys}"
+            )
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())
@@ -242,35 +305,17 @@ class AITER_CONFIG(object):
                     )
 
                 # Auto-dedup: globally determine best row (lowest 'us') per shape
-                best_row_index = set(
-                    merge_df.sort_values("us", kind="stable")
-                    .drop_duplicates(subset=dedup_keys, keep="first")
-                    .index
+                best_df = merge_df.sort_values("us", kind="stable").drop_duplicates(
+                    subset=dedup_keys, keep="first"
                 )
-
-                saved_files = []
-                offset = 0
-                for src_path, src_df in source_pairs:
-                    start, end = offset, offset + len(src_df)
-                    offset = end
-                    file_rows = merge_df.iloc[start:end]
-                    new_src_df = file_rows[
-                        file_rows.index.isin(best_row_index)
-                    ].reset_index(drop=True)
-                    if len(new_src_df) < len(src_df):
-                        new_src_df.to_csv(src_path, index=False)
-                        saved_files.append(
-                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
-                        )
-                saved_info = (
-                    "\n".join(saved_files) if saved_files else "  (no files updated)"
-                )
-                raise RuntimeError(
+                removed = len(merge_df) - len(best_df)
+                # Keep deterministic merged row order while preserving selected winners.
+                merge_df = best_df.sort_index(kind="stable").reset_index(drop=True)
+                logger.warning(
                     f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
-                    f"Updated files:\n{saved_info}"
+                    f"Auto-resolved in merged config only (kept lowest 'us', removed {removed} rows). "
+                    f"Source config files are unchanged.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
                 )
         else:
             logger.warning(
@@ -305,6 +350,16 @@ class AITER_CONFIG(object):
                 for p in model_config_dir.glob(f"*{tuned_file_name}*")
                 if (p.is_file() and "untuned" not in str(p))
             ]
+            # Default FMOE merge also includes optional hybrid profile table.
+            if tuned_file_name == "tuned_fmoe":
+                hybrid_cfg = Path(f"{AITER_ROOT_DIR}/aiter/configs/tuned_hybrid_fmoe.csv")
+                if hybrid_cfg.is_file():
+                    op_tuned_file_list.append(hybrid_cfg)
+                    # De-duplicate while keeping deterministic order for stable logs.
+                    op_tuned_file_list = sorted(
+                        list({str(p): p for p in op_tuned_file_list}.values()),
+                        key=lambda p: str(p),
+                    )
 
             if not op_tuned_file_list:
                 config_file = default_file

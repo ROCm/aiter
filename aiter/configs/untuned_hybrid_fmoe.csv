@@ -1,0 +1,5 @@
+token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,q_dtype_a2,q_dtype_w2,q_type2
+20480,4096,1536,400,20,ActivationType.Gelu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,0,0,torch.int8,torch.int8,QuantType.per_Token
+20480,4096,1536,400,20,ActivationType.Gelu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,0,0,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32
+20480,4096,1536,400,20,ActivationType.Gelu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,0,0,torch.int8,torch.int8,QuantType.per_Token
+20480,4096,1536,400,20,ActivationType.Gelu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,0,0,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32

@@ -106,11 +106,18 @@ def moe_sorting(
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=2048)
-def get_inter_dim(w1_shape, w2_shape):
+def get_inter_dim(w1_shape, w2_shape, q_dtype_w=None):
     E, _, model_dim = w1_shape
     E, model_dim, inter_dim = w2_shape
 
-    int4_war = model_dim // w1_shape[-1]
+    if q_dtype_w is None:
+        int4_war = model_dim // w1_shape[-1]
+    elif q_dtype_w == dtypes.fp4x2:
+        int4_war = 2
+    elif q_dtype_w == torch.uint32:
+        int4_war = model_dim // w1_shape[-1]
+    else:
+        int4_war = 1
     inter_dim *= int4_war
     return E, model_dim, inter_dim
 
@@ -130,6 +137,9 @@ def fused_moe(
     w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    q_type2: Optional[QuantType] = None,
+    q_dtype_a2: Optional[torch.dtype] = None,
+    q_dtype_w2: Optional[torch.dtype] = None,
     # following for tuning
     block_size_M=None,
     num_local_tokens: Optional[torch.tensor] = None,
@@ -158,6 +168,9 @@ def fused_moe(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        q_type2=q_type2.value if isinstance(q_type2, QuantType) else q_type2,
+        q_dtype_a2=q_dtype_a2,
+        q_dtype_w2=q_dtype_w2,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
@@ -184,6 +197,9 @@ def fused_moe_fake(
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    q_type2: Optional[int] = None,
+    q_dtype_a2: Optional[torch.dtype] = None,
+    q_dtype_w2: Optional[torch.dtype] = None,
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
@@ -218,6 +234,9 @@ def fused_moe_(
     w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    q_type2: Optional[int] = None,
+    q_dtype_a2: Optional[torch.dtype] = None,
+    q_dtype_w2: Optional[torch.dtype] = None,
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
@@ -231,11 +250,13 @@ def fused_moe_(
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
+    q_type2 = quant_type if q_type2 is None else QuantType(q_type2)
     if block_size_M == -1:
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    q_dtype_w2 = w2.dtype if q_dtype_w2 is None else q_dtype_w2
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=q_dtype_w2)
 
     assert w1.shape[1] in [
         inter_dim,
@@ -253,6 +274,7 @@ def fused_moe_(
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
+    q_type2 = quant_remap.get(q_type2, q_type2)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
@@ -272,6 +294,7 @@ def fused_moe_(
                 q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
+    q_dtype_a2 = q_dtype_a if q_dtype_a2 is None else q_dtype_a2
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -289,6 +312,9 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
         isShuffled,
+        q_dtype_a2=q_dtype_a2,
+        q_dtype_w2=q_dtype_w2,
+        q_type2=q_type2,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -351,6 +377,9 @@ def fused_moe_(
             doweight_stage1=doweight_stage1,
             q_dtype_a=q_dtype_a,
             q_dtype_w=q_dtype_w,
+            q_type2=q_type2,
+            q_dtype_a2=q_dtype_a2,
+            q_dtype_w2=q_dtype_w2,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             a1_scale=a1_scale,
@@ -451,7 +480,7 @@ def fused_moe_1stage(
                 a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
-        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=w2.dtype)
         if quant_type == QuantType.per_1x32:
             a1_scale = mxfp4_moe_sort_fwd(
                 a1_scale,
@@ -648,7 +677,7 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    _, _, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=w2.dtype)
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
     if activation == ActivationType.Swiglu:
         act = "swiglu"
@@ -750,7 +779,18 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     is_shuffled=True,
+    q_dtype_a2=None,
+    q_dtype_w2=None,
+    q_type2=None,
 ):
+    # Hybrid quant: stage2 triple defaults to stage1's when not provided.
+    if q_dtype_a2 is None:
+        q_dtype_a2 = q_dtype_a
+    if q_dtype_w2 is None:
+        q_dtype_w2 = q_dtype_w
+    if q_type2 is None:
+        q_type2 = q_type
+
     _INDEX_COLS = [
         "cu_num",
         "token",
@@ -765,7 +805,23 @@ def get_2stage_cfgs(
         "q_type",
         "use_g1u1",
         "doweight_stage1",
+        "q_dtype_a2",
+        "q_dtype_w2",
+        "q_type2",
     ]
+
+    def _backfill_stage2_cols(df):
+        """Old csv has no _2 columns -> stage2 triple equals stage1 triple."""
+        for src, dst in (
+            ("q_dtype_a", "q_dtype_a2"),
+            ("q_dtype_w", "q_dtype_w2"),
+            ("q_type", "q_type2"),
+        ):
+            if dst not in df.columns:
+                df[dst] = df[src]
+            else:
+                df[dst] = df[dst].fillna(df[src])
+        return df
 
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -773,6 +829,7 @@ def get_2stage_cfgs(
         df = pd.read_csv(tune_file)
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
+        df = _backfill_stage2_cols(df)
         df = df.set_index(_INDEX_COLS).to_dict("index")
         return df
 
@@ -795,6 +852,7 @@ def get_2stage_cfgs(
         if fb_df.empty:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
+        fb_df = _backfill_stage2_cols(fb_df.copy())
         result = fb_df.set_index(_INDEX_COLS).to_dict("index")
         _flydsl_fallback_cache[tune_file] = result
         return result
@@ -821,18 +879,47 @@ def get_2stage_cfgs(
         str(q_type),
         use_g1u1,
         doweight_stage1,
+        str(q_dtype_a2),
+        str(q_dtype_w2),
+        str(q_type2),
     )
 
     def MainFunc():
+        # Detect whether the existing file already has the hybrid _2 columns.
+        # Old files only carry 12 base columns; appending 15-col rows would
+        # break pandas. We honor the existing header so legacy files keep
+        # working when hybrid mode is not requested.
+        is_hybrid = (
+            (str(q_dtype_a2), str(q_dtype_w2), str(q_type2))
+            != (str(q_dtype_a), str(q_dtype_w), str(q_type))
+        )
+        has_hybrid_header = False
+        if os.path.getsize(untune_file) > 0:
+            with open(untune_file, "r") as fr:
+                first_line = fr.readline().strip()
+            has_hybrid_header = "q_type2" in first_line.split(",")
         with open(untune_file, "a") as f:
             if os.path.getsize(untune_file) == 0:
                 f.write(
-                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,q_dtype_a2,q_dtype_w2,q_type2"
                 )
+                has_hybrid_header = True
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
-            f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-            )
+            q_dtype_w2s = q_dtype_w2 if q_dtype_w2 != torch.uint32 else "torch.int4"
+            base_row = f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
+            if has_hybrid_header:
+                f.write(
+                    f"{base_row},{q_dtype_a2},{q_dtype_w2s},{q_type2}"
+                )
+            else:
+                if is_hybrid:
+                    raise RuntimeError(
+                        f"hybrid quant requested ({q_dtype_a}->{q_dtype_a2}, "
+                        f"{q_dtype_w}->{q_dtype_w2}, {q_type}->{q_type2}) but "
+                        f"{untune_file} uses legacy header without _2 columns. "
+                        "Migrate the file or remove it to enable hybrid mode."
+                    )
+                f.write(base_row)
         logger.info("\033[34m Start tuning fmoe")
         os.system(
             f"{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
@@ -993,7 +1080,7 @@ def get_2stage_cfgs(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
-                quant_type=q_type,
+                quant_type=q_type2,
                 use_non_temporal_load=use_non_temporal_load,
             )
 
@@ -1003,7 +1090,7 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            fuse_fp4_quant=_s1_fq,
+            fuse_fp4_quant=_s1_fq and q_type2 == QuantType.per_1x32,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -1079,7 +1166,7 @@ def get_2stage_cfgs(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
                 activation=activation,
-                quant_type=q_type,
+                quant_type=q_type2,
                 use_non_temporal_load=use_non_temporal_load,
             )
         return MOEMetadata(
@@ -1115,7 +1202,7 @@ def get_2stage_cfgs(
             aiter.ck_moe_stage2_fwd,
             kernelName=kernelName2,
             activation=activation,
-            quant_type=q_type,
+            quant_type=q_type2,
         ),
         block_m,
         ksplit,
@@ -1141,6 +1228,9 @@ def fused_moe_2stages(
     # following for quant
     q_dtype_a=None,
     q_dtype_w=None,
+    q_type2=None,
+    q_dtype_a2=None,
+    q_dtype_w2=None,
     w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
@@ -1153,8 +1243,13 @@ def fused_moe_2stages(
     bias2=None,
 ):
     quant_func = get_quant(quant_type)
+    q_type2 = quant_type if q_type2 is None else QuantType(q_type2)
+    q_type2 = quant_remap.get(q_type2, q_type2)
+    quant_func2 = get_quant(q_type2)
+    q_dtype_a2 = q_dtype_a if q_dtype_a2 is None else q_dtype_a2
+    q_dtype_w2 = w2.dtype if q_dtype_w2 is None else q_dtype_w2
     token_num, _ = hidden_states.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=q_dtype_w2)
     dtype = moe_out.dtype
     device = hidden_states.device
     is_shuffled = getattr(w1, "is_shuffled", False)
@@ -1174,6 +1269,9 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
         is_shuffled,
+        q_dtype_a2=q_dtype_a2,
+        q_dtype_w2=q_dtype_w2,
+        q_type2=q_type2,
     )
     if (
         quant_type == QuantType.per_1x32
@@ -1286,26 +1384,26 @@ def fused_moe_2stages(
             .reshape(token_num, topk, -1)
         )
     elif (
-        quant_type == QuantType.per_1x32
+        q_type2 == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
         and (
-            q_dtype_a in [dtypes.bf16, dtypes.fp16]
+            q_dtype_a2 in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
         a2_scale = None
     elif (
-        quant_type == aiter.QuantType.per_1x32
+        q_type2 == aiter.QuantType.per_1x32
         and dtype in [dtypes.bf16]
-        and q_dtype_a == dtypes.fp8
+        and q_dtype_a2 == dtypes.fp8
         and w1.dtype == dtypes.fp4x2
         and activation == aiter.ActivationType.Swiglu
     ):
         a2 = a2.to(dtypes.fp8)
         a2_scale = a1_scale
-    elif quant_type == QuantType.per_1x32:
+    elif q_type2 == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
             a2,
@@ -1317,7 +1415,7 @@ def fused_moe_2stages(
             num_rows=num_local_tokens,
         )
         a2 = a2.view(token_num, topk, -1)
-    elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+    elif q_type2 == QuantType.per_1x128 and quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         a2_v = a2[:token_num, :, :]
         a2_scale = (
             a2[token_num:, ...]
@@ -1327,10 +1425,10 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     else:
-        a2, a2_scale = quant_func(
+        a2, a2_scale = quant_func2(
             a2,
             scale=a2_scale,
-            quant_dtype=q_dtype_a,
+            quant_dtype=q_dtype_a2,
             num_rows=num_local_tokens,
             num_rows_factor=topk,
         )
@@ -1388,7 +1486,7 @@ def asm_stage1(
         out = out.view(dtype)
     device = out.device
     token_num, _, _ = out.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=w2.dtype)
 
     if quant_type == QuantType.per_Tensor:
         a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)
@@ -1523,7 +1621,7 @@ def torch_moe_stage1(
     B, D = hidden_states.shape
     topk = topk_weight.shape[1]
     N = w1.shape[1]
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=w2.dtype)
     if quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
@@ -1622,7 +1720,7 @@ def torch_moe_stage2(
     doweight=True,
 ):
     ctype = dtypes.fp32  # compute type
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape, q_dtype_w=w2.dtype)
     if quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
