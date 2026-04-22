@@ -23,11 +23,12 @@ import triton
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from .tensor_shim import GTensor, STensor, _to_raw
@@ -40,16 +41,9 @@ def _llvm_lds_ptr_ty():
     return ir.Type.parse("!llvm.ptr<3>")
 
 
-def _llvm_exp2_f32(x):
-    """Emit llvm.exp2.f32 intrinsic directly (maps to single v_exp_f32 on AMD)."""
-    x_raw = _to_raw(x)
-    return _llvm.call_intrinsic(ir.F32Type.get(), "llvm.exp2.f32", [x_raw], [], [])
-
-
 def _fast_exp(x):
-    """exp(x) via exp2(x * log2(e)) using the LLVM intrinsic."""
-    log2e = arith.constant(_LOG2E, type=T.f32)
-    return _llvm_exp2_f32(arith.mulf(x, log2e))
+    """exp(x) via exp2(x * log2(e)), maps to single v_exp_f32 on AMD."""
+    return rocdl.exp2(T.f32, x * _LOG2E)
 
 
 def _mfma_bf16_16x16x32(a_bf16x8, b_bf16x8, acc_f32x4):
@@ -138,7 +132,8 @@ def compile_chunk_gated_delta_h(
     LDS_H_ELEMS = K * LDS_H_STRIDE
     LDS_H_BYTES = LDS_H_ELEMS * 2
 
-    allocator = SmemAllocator(None, arch="gfx942", global_sym_name="gdn_h_smem")
+    GPU_ARCH = get_rocm_arch()
+    allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="gdn_h_smem")
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
@@ -170,12 +165,12 @@ def compile_chunk_gated_delta_h(
         T_flat: fx.Int32,
         N_val: fx.Int32,
     ):
-        i_v = arith.index_cast(T.i32, gpu.block_id("x"))
-        i_nh = arith.index_cast(T.i32, gpu.block_id("y"))
+        i_v = fx.block_idx.x
+        i_nh = fx.block_idx.y
         i_n = i_nh // fx.Int32(H)
         i_h = i_nh % fx.Int32(H)
 
-        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        tid = fx.thread_idx.x
         wid = tid // fx.Int32(WARP_SIZE)
         lane = tid % fx.Int32(WARP_SIZE)
 
@@ -186,12 +181,12 @@ def compile_chunk_gated_delta_h(
         g_ = GTensor(g_tensor, dtype=T.f32, shape=(-1,))
 
         vn_ = GTensor(v_new_tensor, dtype=T.bf16, shape=(-1,))
-        if USE_INITIAL_STATE:
+        if const_expr(USE_INITIAL_STATE):
             h0_ = GTensor(h0_tensor, dtype=T.f32, shape=(-1,))
-        if STORE_FINAL_STATE:
+        if const_expr(STORE_FINAL_STATE):
             ht_ = GTensor(ht_tensor, dtype=T.f32, shape=(-1,))
 
-        if IS_VARLEN:
+        if const_expr(IS_VARLEN):
             cu_ = GTensor(cu_seqlens_tensor, dtype=T.i32, shape=(-1,))
             co_ = GTensor(chunk_offsets_tensor, dtype=T.i32, shape=(-1,))
 
@@ -250,7 +245,7 @@ def compile_chunk_gated_delta_h(
         tr_col_sub = lane % fx.Int32(4)
 
         # -- Prologue: compute bos, T_local, NT, boh --
-        if IS_VARLEN:
+        if const_expr(IS_VARLEN):
             bos = cu_[fx.Index(i_n)]
             eos = cu_[fx.Index(i_n) + fx.Index(1)]
             T_local = eos - bos
@@ -272,8 +267,8 @@ def compile_chunk_gated_delta_h(
         k_base = (bos * fx.Int32(Hg) + i_h // fx.Int32(gqa_ratio)) * fx.Int32(K)
         stride_k = fx.Int32(Hg * K)
 
-        if WU_CONTIGUOUS:
-            if IS_VARLEN:
+        if const_expr(WU_CONTIGUOUS):
+            if const_expr(IS_VARLEN):
                 v_base = (i_h * T_flat + bos) * fx.Int32(V)
                 w_base = (i_h * T_flat + bos) * fx.Int32(K)
             else:
@@ -287,14 +282,14 @@ def compile_chunk_gated_delta_h(
             stride_v = fx.Int32(H * V)
             stride_w = fx.Int32(H * K)
 
-        if IS_VARLEN:
+        if const_expr(IS_VARLEN):
             vn_base = (i_h * T_flat + bos) * fx.Int32(V)
         else:
             vn_base = ((i_n * fx.Int32(H) + i_h) * T_flat) * fx.Int32(V)
 
-        if USE_INITIAL_STATE:
+        if const_expr(USE_INITIAL_STATE):
             h0_base = i_nh * fx.Int32(V * K)
-        if STORE_FINAL_STATE:
+        if const_expr(STORE_FINAL_STATE):
             ht_base = i_nh * fx.Int32(V * K)
 
         # -- MFMA lane mapping for 16x16 tiles --
@@ -316,7 +311,7 @@ def compile_chunk_gated_delta_h(
                 h_accs.append(acc_zero)
 
         # -- Load initial state if provided --
-        if USE_INITIAL_STATE:
+        if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT):
                     h0_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
@@ -432,7 +427,7 @@ def compile_chunk_gated_delta_h(
                     )
 
             # Prefetch g values (overlap with MFMA below)
-            if USE_G:
+            if const_expr(USE_G):
                 next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
                 last_idx_raw = arith.select(
                     arith.cmpi(arith.CmpIPredicate.slt, next_chunk_end, T_local),
@@ -523,7 +518,7 @@ def compile_chunk_gated_delta_h(
                 vn_frags.append(arith.subf(u_f32, bv_val))
 
             # -- 2b. Store v_new (pre-gating) for output --
-            if SAVE_NEW_VALUE:
+            if const_expr(SAVE_NEW_VALUE):
                 for nr in range_constexpr(N_REPEAT):
                     vn_val = vn_frags[nr]
                     vn_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
@@ -548,7 +543,7 @@ def compile_chunk_gated_delta_h(
                             scf.YieldOp([])
 
             # -- 3. Gating -- g values prefetched before MFMA --
-            if USE_G:
+            if const_expr(USE_G):
                 g_last = g_last_prefetch
                 exp_g_last = _fast_exp(g_last)
 
@@ -677,7 +672,7 @@ def compile_chunk_gated_delta_h(
         h_accs_final = list(results[:NUM_H_ACCS])
 
         # -- Epilogue: store final state --
-        if STORE_FINAL_STATE:
+        if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT):
                     acc_idx = kb * N_REPEAT + nr
