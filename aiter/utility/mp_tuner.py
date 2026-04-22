@@ -271,25 +271,6 @@ def get_pid():
     return mp.current_process().pid
 
 
-def _task_desc(task_group, k):
-    """Extract human-readable problem-size + kernel from task_group[k]."""
-    try:
-        task = task_group[k]
-        if isinstance(task, list):
-            task = task[0]
-        info, stage, kname, blockM = task[0]
-        token, model_dim, inter_dim, expert, topk = (
-            info[1],
-            info[2],
-            info[3],
-            info[4],
-            info[5],
-        )
-        return f"[{stage} {kname} blockM={blockM} token={token} M={model_dim} N={inter_dim} E={expert} topk={topk}]"
-    except Exception:
-        return ""
-
-
 def mp_tuner(
     tasks,
     in_datas,
@@ -461,7 +442,7 @@ def mp_tuner(
                     if elapsed > timeout:
                         consecutive_timeouts += 1
 
-                        error_msg = f"[!] Task {k} {_task_desc(task_group, k)} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
+                        error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
                         print(error_msg)
                         failed_tasks.append((k, "timeout"))
 
@@ -493,7 +474,7 @@ def mp_tuner(
                 is_accelerator_error = _is_accelerator_error(e)
                 # not restart as this is not root use
                 if is_mapping_error:
-                    error_msg = f"[Mapping Error] Task {k} {_task_desc(task_group, k)} - Process PID not in GPU map: {error_type} - {e}"
+                    error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
                     dummy_failed_tasks.append((k, "mapping error"))
                 elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
@@ -501,7 +482,7 @@ def mp_tuner(
                     # more tasks on the same bad GPU. Break immediately to trigger restart and
                     # terminate the pool before that worker processes further tasks (same as when
                     # fault used to hang and timeout would eventually break).
-                    error_msg = f"\033[1;31m[GPU Fault]\033[0m Task {k} {_task_desc(task_group, k)} failed with {error_type}: {e}"
+                    error_msg = f"\033[1;31m[GPU Fault]\033[0m Task {k} failed with {error_type}: {e}"
                     print(error_msg, flush=True)
                     failed_tasks.append((k, "accelerator error"))
                     dummy_results = []
@@ -513,7 +494,7 @@ def mp_tuner(
                     pool_restart_needed = True
                     break
                 else:
-                    error_msg = f"[Failed] Task {k} {_task_desc(task_group, k)} failed with {error_type}: {e}"
+                    error_msg = f"[Failed] Task {k} failed with {error_type}: {e}"
                     failed_tasks.append((k, "unknown error"))
 
                     # Always record a dummy result so reconstruction never sees an empty list
