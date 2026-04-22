@@ -69,7 +69,6 @@ class AiterCommunicator:
 
             self._shmem = iris.iris(
                 heap_size=self._HEAP_SIZE,
-                coord_backend="gloo",
             )
         except Exception as e:
             logger.warning("Failed to initialize Allreduce: %s", e)
@@ -86,39 +85,39 @@ class AiterCommunicator:
         if os.environ.get("AITER_COMMS_PROBE_HEAP_ALLOC") == "1":
             try:
                 probe = self._shmem.empty((1, 8192), dtype=torch.float16)
-                logger.critical(
+                logger.debug(
                     "[AiterCommunicator] probe heap alloc OK (refresh_peer_access triggered) data_ptr=%x",
                     probe.data_ptr(),
                 )
                 workspace = self._shmem.ccl.all_reduce_preamble(probe, probe)
-                logger.critical(
+                logger.debug(
                     "[AiterCommunicator] probe preamble OK workspace=%s",
                     type(workspace).__name__,
                 )
                 workspace = self._shmem.ccl.all_reduce(probe, probe, workspace=workspace)
-                logger.critical("[AiterCommunicator] probe all_reduce OK")
+                logger.debug("[AiterCommunicator] probe all_reduce OK")
                 del probe, workspace
             except Exception as e:
-                logger.critical("[AiterCommunicator] probe FAILED: %s", e)
+                logger.debug("[AiterCommunicator] probe FAILED: %s", e)
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self.disabled or self._shmem is None:
-            logger.critical("[AiterCommunicator] reject: disabled=%s shmem=%s", self.disabled, self._shmem is not None)
+            logger.debug("[AiterCommunicator] reject: disabled=%s shmem=%s", self.disabled, self._shmem is not None)
             return False
         if os.environ.get("AITER_COMMS_FORCE_FALLBACK") == "1":
-            logger.critical("[AiterCommunicator] reject: AITER_COMMS_FORCE_FALLBACK=1")
+            logger.debug("[AiterCommunicator] reject: AITER_COMMS_FORCE_FALLBACK=1")
             return False
         if inp.dtype not in self._SUPPORTED_DTYPES:
-            logger.critical("[AiterCommunicator] reject: dtype=%s", inp.dtype)
+            logger.debug("[AiterCommunicator] reject: dtype=%s", inp.dtype)
             return False
         if not inp.is_contiguous():
-            logger.critical("[AiterCommunicator] reject: noncontig shape=%s", tuple(inp.shape))
+            logger.debug("[AiterCommunicator] reject: noncontig shape=%s", tuple(inp.shape))
             return False
         # if inp.shape[0] > self._MAX_NUM_TOKENS:
         #     return False
         buf_size = inp.numel() * inp.element_size()
         if buf_size * 2 > self._HEAP_SIZE:
-            logger.critical("[AiterCommunicator] reject: oversize buf=%d heap=%d", buf_size, self._HEAP_SIZE)
+            logger.debug("[AiterCommunicator] reject: oversize buf=%d heap=%d", buf_size, self._HEAP_SIZE)
             return False
         return True
 
@@ -134,7 +133,7 @@ class AiterCommunicator:
         self._call_count += 1
         if self._buf_shape != shape or self._buf_dtype != dtype:
             self._realloc_count += 1
-            logger.critical(
+            logger.debug(
                 "[AiterCommunicator] _get_buffers REALLOC #%d (call #%d) old=%s new=%s dtype=%s",
                 self._realloc_count,
                 self._call_count,
