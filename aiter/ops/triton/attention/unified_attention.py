@@ -28,7 +28,7 @@ def select_2d_config(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-    TILE_SIZE = 32 if arch.is_rdna else 64
+    TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
     waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
 
     max_num_stages_2d = 2 if head_size > 128 else 4
@@ -71,6 +71,7 @@ def select_3d_config(
     reduce_num_warps = 2
     attn_warps = 2
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+    # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
     if head_size <= 128 or (head_size <= 192 and element_size < 2):
         TILE_SIZE = max(32, TILE_SIZE)
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
@@ -132,6 +133,7 @@ def unified_attention(
     v_descale,
     alibi_slopes=None,
     output_scale=None,
+    # Optional tensor for sinks
     qq_bias=None,
     sinks=None,
     rope_size=None,
