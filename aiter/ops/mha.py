@@ -119,6 +119,8 @@ def common_mha_fwd_fake_tensors(
     head_size_v = v.size(3)
     seqlen_k = k.size(1)
 
+    _is_gfx950_fp8 = get_gfx() == "gfx950" and q.dtype == dtypes.fp8
+
     if out is not None:
         if q.dtype != dtypes.fp8:
             assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
@@ -132,12 +134,20 @@ def common_mha_fwd_fake_tensors(
         ), "Output tensor has incorrect shape"
     else:
         out_dtype = dtypes.bf16 if q.dtype == dtypes.fp8 else q.dtype
-        out = torch.empty(
-            (batch_size, seqlen_q, num_heads, head_size_v),
-            dtype=out_dtype,
-            device=q.device,
-            requires_grad=q.requires_grad,
-        )
+        if _is_gfx950_fp8:
+            out = torch.empty(
+                (batch_size, num_heads, seqlen_q, head_size_v),
+                dtype=out_dtype,
+                device=q.device,
+                requires_grad=q.requires_grad,
+            ).transpose(1, 2)
+        else:
+            out = torch.empty(
+                (batch_size, seqlen_q, num_heads, head_size_v),
+                dtype=out_dtype,
+                device=q.device,
+                requires_grad=q.requires_grad,
+            )
 
     if return_softmax_lse:
         softmax_lse = torch.empty(
