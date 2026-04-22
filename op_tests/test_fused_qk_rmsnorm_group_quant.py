@@ -22,6 +22,14 @@ def _rmsnorm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     return F.rms_norm(x.float(), (x.shape[-1],), w.float(), eps).to(x.dtype)
 
 
+def _gemma_rmsnorm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """Gemma-style RMSNorm: x * rsqrt(mean(x^2) + eps) * (1 + w)."""
+    xf = x.float()
+    variance = xf.pow(2).mean(dim=-1, keepdim=True)
+    normed = xf * torch.rsqrt(variance + eps)
+    return (normed * (1.0 + w.float())).to(x.dtype)
+
+
 def _fp4x2_hip_supported_gfx() -> set[str]:
     # Opus fp4 cast path is only implemented for architectures with fp4 builtins.
     return {"gfx950", "gfx1250"}
@@ -114,9 +122,11 @@ def run_torch_ref(
     res1: torch.Tensor | None,
     transpose_scale: bool,
     quant_out_dtype: torch.dtype = dtypes.fp8,
+    gemma_norm: bool = False,
 ):
     x1_in = x1 if res1 is None else x1 + res1
-    x1_norm = _rmsnorm_ref(x1_in, x1_weight, x1_epsilon)
+    norm_fn = _gemma_rmsnorm_ref if gemma_norm else _rmsnorm_ref
+    x1_norm = norm_fn(x1_in, x1_weight, x1_epsilon)
     if quant_out_dtype == dtypes.fp8:
         x1_q, x1_s = _per_token_group_fp8_quant_ref(x1_norm, group_size, dtypes.fp8)
     elif quant_out_dtype == dtypes.fp4x2:
@@ -134,7 +144,7 @@ def run_torch_ref(
     x2_norm = None
     if x2 is not None:
         assert x2_weight is not None
-        x2_norm = _rmsnorm_ref(
+        x2_norm = norm_fn(
             x2, x2_weight, x2_epsilon if x2_epsilon is not None else x1_epsilon
         )
     return (x1_q, x1_s), x1_norm, x2_norm, x1_in
@@ -262,6 +272,7 @@ def run_hip(
     output_unquantized_inp1: bool,
     transpose_scale: bool,
     quant_out_dtype: torch.dtype,
+    gemma_norm: bool = False,
 ):
     m, n1 = x1.shape
     num_scale_cols = n1 // group_size
@@ -300,6 +311,7 @@ def run_hip(
         res1,
         group_size,
         transpose_scale,
+        gemma_norm,
     )
     return (x1_q, x1_s), x1_u, x2_out, res_out
 
@@ -725,6 +737,143 @@ def test_fused_qk_rmsnorm_group_quant(
     }
 
 
+def test_fused_qk_rmsnorm_group_quant_gemma_norm(
+    dtype: torch.dtype,
+    token: int,
+    num_head1: int,
+    num_head2: int,
+    add_residual: bool,
+    head_dim: int = 128,
+    group_size: int = 128,
+    output_unquantized_inp1: bool = False,
+    transpose_scale: bool = True,
+):
+    """Test gemma_norm=True path of fused_qk_rmsnorm_group_quant (HIP kernel only)."""
+    m = token
+    n1 = num_head1 * head_dim
+    n2 = num_head2 * head_dim
+    assert n1 % group_size == 0
+
+    # Build strided inputs (same as main test)
+    split_tail_dim = head_dim
+    if n2 > 0:
+        assert n2 % group_size == 0
+        full_qk = (
+            torch.randn((m, n1 + n2 + split_tail_dim), dtype=dtype, device="cuda") / 10
+        )
+        x1, x2, _ = torch.split(full_qk, [n1, n2, split_tail_dim], dim=1)
+    else:
+        full_q = torch.randn((m, n1 + split_tail_dim), dtype=dtype, device="cuda") / 10
+        x1, _ = torch.split(full_q, [n1, split_tail_dim], dim=1)
+        x2 = None
+
+    # Use zeros-initialized weight (Gemma convention: weight starts at 0, so (1+w)=1)
+    # Then add small random values to make the test non-trivial
+    x1_weight = torch.randn(n1, dtype=dtype, device="cuda") * 0.1
+    x2_weight = torch.randn(n2, dtype=dtype, device="cuda") * 0.1 if n2 > 0 else None
+
+    if add_residual:
+        full_res = (
+            torch.randn((m, n1 + split_tail_dim), dtype=dtype, device="cuda") / 10
+        )
+        res1, _ = torch.split(full_res, [n1, split_tail_dim], dim=1)
+    else:
+        res1 = None
+
+    # Reference with gemma_norm=True
+    torch_out = run_torch_ref(
+        x1,
+        x1_weight,
+        1e-6,
+        x2,
+        x2_weight,
+        1e-6 if n2 > 0 else None,
+        group_size,
+        res1,
+        transpose_scale,
+        dtypes.fp8,
+        gemma_norm=True,
+    )
+
+    # HIP kernel with gemma_norm=True
+    hip_out, _ = run_hip(
+        x1,
+        x1_weight,
+        1e-6,
+        x2,
+        x2_weight,
+        1e-6 if n2 > 0 else None,
+        group_size,
+        res1,
+        output_unquantized_inp1,
+        transpose_scale,
+        dtypes.fp8,
+        gemma_norm=True,
+    )
+
+    (x1_q_torch, x1_s_torch), x1_torch, x2_torch, res_torch = torch_out
+    (x1_q_hip, x1_s_hip), x1_hip, x2_hip, res_hip = hip_out
+
+    # Dequantize and compare
+    q_atol, q_rtol = 0.05, 0.05
+    x1_deq_torch = _upcast_group_fp8(
+        x1_q_torch,
+        _recover_row_major_scale(x1_s_torch, transpose_scale),
+        group_size,
+    )
+    x1_deq_hip = _upcast_group_fp8(
+        x1_q_hip,
+        _recover_row_major_scale(x1_s_hip, transpose_scale),
+        group_size,
+    )
+    checkAllclose(
+        x1_deq_torch,
+        x1_deq_hip,
+        rtol=q_rtol,
+        atol=q_atol,
+        msg=f"[gemma_norm] dequantized x1 torch vs hip, m={m}, n1={n1}, n2={n2}",
+    )
+
+    if x2 is not None:
+        checkAllclose(
+            x2_torch,
+            x2_hip,
+            rtol=0.02,
+            atol=0.02,
+            msg=f"[gemma_norm] x2 torch vs hip, m={m}, n2={n2}",
+        )
+
+    if res1 is not None:
+        checkAllclose(
+            res_torch,
+            res_hip,
+            rtol=0.02,
+            atol=0.02,
+            msg=f"[gemma_norm] residual torch vs hip, m={m}, n1={n1}",
+        )
+
+    if output_unquantized_inp1:
+        checkAllclose(
+            x1_torch,
+            x1_hip,
+            rtol=0.02,
+            atol=0.02,
+            msg=f"[gemma_norm] unquantized x1 torch vs hip, m={m}, n1={n1}",
+        )
+
+    aiter.logger.info(
+        "[gemma_norm PASS] dtype=%s token=%d num_head1=%d num_head2=%d "
+        "head_dim=%d residual=%s unquantized=%s",
+        dtype,
+        token,
+        num_head1,
+        num_head2,
+        head_dim,
+        add_residual,
+        output_unquantized_inp1,
+    )
+
+
 if __name__ == "__main__":
     l_dtype = ["bf16"]
     l_quant_type = ["fp8"]
@@ -941,3 +1090,30 @@ if __name__ == "__main__":
         "fused_qk_rmsnorm_group_quant summary (time/err/bw, markdown):\n%s",
         focus_df.to_markdown(index=False),
     )
+
+    # --- Gemma-norm tests (HIP kernel only, fp8) ---
+    aiter.logger.info("=== Running gemma_norm=True tests ===")
+    gemma_tokens = [32, 256]
+    gemma_heads1 = [12]
+    gemma_heads2 = [0, 4]
+    gemma_residual = [False, True]
+    gemma_unquantized = [False, True]
+    for dtype in [dtypes.d_dtypes[k] for k in l_dtype]:
+        for head_dim in l_head_dim:
+            for token in gemma_tokens:
+                for nh1 in gemma_heads1:
+                    for nh2 in gemma_heads2:
+                        for res in gemma_residual:
+                            for unq in gemma_unquantized:
+                                test_fused_qk_rmsnorm_group_quant_gemma_norm(
+                                    dtype=dtype,
+                                    token=token,
+                                    num_head1=nh1,
+                                    num_head2=nh2,
+                                    add_residual=res,
+                                    head_dim=head_dim,
+                                    group_size=args.group_size,
+                                    output_unquantized_inp1=unq,
+                                    transpose_scale=True,
+                                )
+    aiter.logger.info("=== All gemma_norm=True tests passed ===")
