@@ -142,7 +142,9 @@ def get_GEMM_A16W16_config(
             if config is None:
                 continue
             if AITER_LOG_TUNED_CONFIG:
-                kernelName = config["kernelName"] if config["libtype"] != "hipblaslt" else ""
+                kernelName = (
+                    config["kernelName"] if config["libtype"] != "hipblaslt" else ""
+                )
                 logger.info(
                     f"shape is M:{M}, N:{N}, K:{K} {dtype=} {otype=} {bias=}, {scaleAB=}, {bpreshuffle=} found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE}, libtype is {config['libtype']}, kernel name is {kernelName}"
                 )
