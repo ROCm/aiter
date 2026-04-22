@@ -2,7 +2,7 @@
 <img src="docs/assets/aiter_logo.png" alt="AITER" width="400">
 
 [![CI](https://github.com/ROCm/aiter/actions/workflows/aiter-test.yaml/badge.svg)](https://github.com/ROCm/aiter/actions/workflows/aiter-test.yaml)
-[![Release](https://github.com/ROCm/aiter/actions/workflows/aiter-release.yaml/badge.svg)](https://github.com/ROCm/aiter/actions/workflows/aiter-release.yaml)
+[![Release](https://img.shields.io/github/v/release/ROCm/aiter)](https://github.com/ROCm/aiter/releases)
 [![Docs](https://img.shields.io/badge/Docs-rocm.github.io%2Faiter-blue)](https://rocm.github.io/aiter)
 [![GitHub](https://img.shields.io/github/stars/ROCm/aiter?style=social)](https://github.com/ROCm/aiter)
 
@@ -28,6 +28,7 @@
 - **[2025]** [Accelerated LLM Inference with vLLM 0.9.x and ROCm](https://rocm.blogs.amd.com/software-tools-optimization/vllm-0.9.x-rocm/README.html)
 - **[2025]** [Accelerate DeepSeek-R1 Inference: Integrate AITER into SGLang](https://rocm.blogs.amd.com/artificial-intelligence/aiter-intergration-s/README.html)
 - **[2025/08]** [AITER-Enabled MLA Layer Inference on AMD Instinct MI300X](https://rocm.blogs.amd.com/software-tools-optimization/aiter-mla/README.html)
+- **[2025/08]** [Tutorial: MLA Decoding Kernel of the AITER Library to Accelerate LLM Inference](https://rocm.docs.amd.com/projects/ai-developer-hub/en/latest/notebooks/gpu_dev_optimize/aiter_mla_decode_kernel.html)
 - **[2025/03]** [Accelerating DeepSeek Inference with AMD MI300 — Microsoft](https://techcommunity.microsoft.com/blog/azure-ai-foundry-blog/accelerating-deepseek-inference-with-amd-mi300-a-collaborative-breakthrough/4407673)
 - **[2025/03]** [AITER: AI Tensor Engine For ROCm — Launch Announcement](https://rocm.blogs.amd.com/software-tools-optimization/aiter-ai-tensor-engine/README.html)
 
@@ -109,6 +110,10 @@ Or install all optional dependencies at once:
 ```bash
 pip install -r requirements.txt
 ```
+
+### Opus — Lightweight C++ Template for Kernel Development
+
+[Opus](csrc/include/opus/) is a single-header C++ template library (`opus.hpp`) for writing HIP kernels on AMD GPUs — vectorized load/store, layout abstractions, and MFMA wrappers with a strong focus on **build time optimization** (up to 61x faster than standard torch extension builds). See the [Opus README](csrc/include/opus/README.md) and [`op_tests/opus/`](op_tests/opus/) for details.
 
 ### Triton-based Communication (Iris)
 
