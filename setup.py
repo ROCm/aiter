@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.3.1"
+FLYDSL_VERSION = "flydsl==0.1.4"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -437,6 +437,7 @@ setup_requires = [
     "psutil",
     "ninja",
     "setuptools_scm",
+    "vcs_versioning",  # transitive dep of setuptools_scm>=10
 ]
 if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
