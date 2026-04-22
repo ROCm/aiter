@@ -1752,6 +1752,9 @@ class AttentionProgram:
 
     @gluon.jit
     def softmax_part0(self, S, M):
+        # more numerically stable
+        if self.cfg.ARCH_NAME == "gfx950":
+            return softmax_part0_cdna4(self, S, M)
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
@@ -1760,6 +1763,15 @@ class AttentionProgram:
         p = gl.exp2(q_shifted)
         m_diff_scaled = M * self.QK_scale - m_ij_scaled
         alpha = gl.exp2(m_diff_scaled)
+        return p, alpha, m_ij
+
+    @gluon.jit
+    def softmax_part0_cdna4(self, S, M):
+        S = S * self.QK_scale
+        m_ij = gl.maximum(M, gl.max(S, axis=1))
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        p = gl.exp2(S - m_ij[:, None])
+        alpha = gl.exp2(M - m_ij)
         return p, alpha, m_ij
 
     @gluon.jit
