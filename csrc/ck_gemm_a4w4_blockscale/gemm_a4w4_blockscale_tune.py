@@ -182,12 +182,18 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 err_ratio = checkAllclose(
                     out[:M].to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
                 )
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
+            finally:
+                torch.cuda.empty_cache()
         return results
 
     def calculate(self, results, bpes=(1 / 2, 1 / 2, 2)):
