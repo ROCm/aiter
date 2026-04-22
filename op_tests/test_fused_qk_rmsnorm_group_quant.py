@@ -328,6 +328,7 @@ def test_fused_qk_rmsnorm_group_quant(
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = True,
     quant_out_dtype: torch.dtype = dtypes.fp8,
+    gemma_norm: bool = False,
 ):
     assert token > 0
     assert num_head1 > 0
@@ -470,10 +471,14 @@ def test_fused_qk_rmsnorm_group_quant(
         res1,
         transpose_scale,
         quant_out_dtype,
+        gemma_norm=gemma_norm,
     )
-    has_triton_fp8 = quant_out_dtype == dtypes.fp8
+    has_triton_fp8 = quant_out_dtype == dtypes.fp8 and not gemma_norm
     has_triton_fp4 = (
-        quant_out_dtype == dtypes.fp4x2 and group_size == 32 and not transpose_scale
+        quant_out_dtype == dtypes.fp4x2
+        and group_size == 32
+        and not transpose_scale
+        and not gemma_norm
     )
     has_triton = has_triton_fp8 or has_triton_fp4
     if has_triton_fp8:
@@ -518,6 +523,7 @@ def test_fused_qk_rmsnorm_group_quant(
         output_unquantized_inp1,
         transpose_scale,
         quant_out_dtype,
+        gemma_norm=gemma_norm,
     )
 
     (x1_q_torch, x1_s_torch), x1_torch, x2_torch, res_torch = torch_out
@@ -542,10 +548,14 @@ def test_fused_qk_rmsnorm_group_quant(
         x1_deq_hip = _upcast_group_fp8(
             x1_q_hip, _recover_row_major_scale(x1_s_hip, transpose_scale), group_size
         )
-        x1_deq_triton = _upcast_group_fp8(
-            x1_q_triton,
-            _recover_row_major_scale(x1_s_triton, transpose_scale),
-            group_size,
+        x1_deq_triton = (
+            _upcast_group_fp8(
+                x1_q_triton,
+                _recover_row_major_scale(x1_s_triton, transpose_scale),
+                group_size,
+            )
+            if has_triton
+            else None
         )
     elif quant_out_dtype == dtypes.fp4x2:
         q_atol = 0.5
@@ -737,143 +747,6 @@ def test_fused_qk_rmsnorm_group_quant(
     }
 
 
-def test_fused_qk_rmsnorm_group_quant_gemma_norm(
-    dtype: torch.dtype,
-    token: int,
-    num_head1: int,
-    num_head2: int,
-    add_residual: bool,
-    head_dim: int = 128,
-    group_size: int = 128,
-    output_unquantized_inp1: bool = False,
-    transpose_scale: bool = True,
-):
-    """Test gemma_norm=True path of fused_qk_rmsnorm_group_quant (HIP kernel only)."""
-    m = token
-    n1 = num_head1 * head_dim
-    n2 = num_head2 * head_dim
-    assert n1 % group_size == 0
-
-    # Build strided inputs (same as main test)
-    split_tail_dim = head_dim
-    if n2 > 0:
-        assert n2 % group_size == 0
-        full_qk = (
-            torch.randn((m, n1 + n2 + split_tail_dim), dtype=dtype, device="cuda") / 10
-        )
-        x1, x2, _ = torch.split(full_qk, [n1, n2, split_tail_dim], dim=1)
-    else:
-        full_q = torch.randn((m, n1 + split_tail_dim), dtype=dtype, device="cuda") / 10
-        x1, _ = torch.split(full_q, [n1, split_tail_dim], dim=1)
-        x2 = None
-
-    # Use zeros-initialized weight (Gemma convention: weight starts at 0, so (1+w)=1)
-    # Then add small random values to make the test non-trivial
-    x1_weight = torch.randn(n1, dtype=dtype, device="cuda") * 0.1
-    x2_weight = torch.randn(n2, dtype=dtype, device="cuda") * 0.1 if n2 > 0 else None
-
-    if add_residual:
-        full_res = (
-            torch.randn((m, n1 + split_tail_dim), dtype=dtype, device="cuda") / 10
-        )
-        res1, _ = torch.split(full_res, [n1, split_tail_dim], dim=1)
-    else:
-        res1 = None
-
-    # Reference with gemma_norm=True
-    torch_out = run_torch_ref(
-        x1,
-        x1_weight,
-        1e-6,
-        x2,
-        x2_weight,
-        1e-6 if n2 > 0 else None,
-        group_size,
-        res1,
-        transpose_scale,
-        dtypes.fp8,
-        gemma_norm=True,
-    )
-
-    # HIP kernel with gemma_norm=True
-    hip_out, _ = run_hip(
-        x1,
-        x1_weight,
-        1e-6,
-        x2,
-        x2_weight,
-        1e-6 if n2 > 0 else None,
-        group_size,
-        res1,
-        output_unquantized_inp1,
-        transpose_scale,
-        dtypes.fp8,
-        gemma_norm=True,
-    )
-
-    (x1_q_torch, x1_s_torch), x1_torch, x2_torch, res_torch = torch_out
-    (x1_q_hip, x1_s_hip), x1_hip, x2_hip, res_hip = hip_out
-
-    # Dequantize and compare
-    q_atol, q_rtol = 0.05, 0.05
-    x1_deq_torch = _upcast_group_fp8(
-        x1_q_torch,
-        _recover_row_major_scale(x1_s_torch, transpose_scale),
-        group_size,
-    )
-    x1_deq_hip = _upcast_group_fp8(
-        x1_q_hip,
-        _recover_row_major_scale(x1_s_hip, transpose_scale),
-        group_size,
-    )
-    checkAllclose(
-        x1_deq_torch,
-        x1_deq_hip,
-        rtol=q_rtol,
-        atol=q_atol,
-        msg=f"[gemma_norm] dequantized x1 torch vs hip, m={m}, n1={n1}, n2={n2}",
-    )
-
-    if x2 is not None:
-        checkAllclose(
-            x2_torch,
-            x2_hip,
-            rtol=0.02,
-            atol=0.02,
-            msg=f"[gemma_norm] x2 torch vs hip, m={m}, n2={n2}",
-        )
-
-    if res1 is not None:
-        checkAllclose(
-            res_torch,
-            res_hip,
-            rtol=0.02,
-            atol=0.02,
-            msg=f"[gemma_norm] residual torch vs hip, m={m}, n1={n1}",
-        )
-
-    if output_unquantized_inp1:
-        checkAllclose(
-            x1_torch,
-            x1_hip,
-            rtol=0.02,
-            atol=0.02,
-            msg=f"[gemma_norm] unquantized x1 torch vs hip, m={m}, n1={n1}",
-        )
-
-    aiter.logger.info(
-        "[gemma_norm PASS] dtype=%s token=%d num_head1=%d num_head2=%d "
-        "head_dim=%d residual=%s unquantized=%s",
-        dtype,
-        token,
-        num_head1,
-        num_head2,
-        head_dim,
-        add_residual,
-        output_unquantized_inp1,
-    )
-
-
 if __name__ == "__main__":
     l_dtype = ["bf16"]
     l_quant_type = ["fp8"]
@@ -994,6 +867,11 @@ if __name__ == "__main__":
     parser.add_argument("--group_size", type=int, default=128)
     parser.add_argument("--output_unquantized_inp1", action="store_true")
     parser.add_argument("--transpose_scale", action="store_true")
+    parser.add_argument(
+        "--gemma_norm",
+        action="store_true",
+        help="Test gemma-style RMSNorm: x * rsqrt(mean(x^2)+eps) * (1+w) instead of standard * w.",
+    )
     args = parser.parse_args()
 
     if args.dtype is not None:
@@ -1081,6 +959,7 @@ if __name__ == "__main__":
                                     output_unquantized_inp1=args.output_unquantized_inp1,
                                     transpose_scale=args.transpose_scale,
                                     quant_out_dtype=quant_out_dtype,
+                                    gemma_norm=args.gemma_norm,
                                 )
                                 df.append(row)
 
@@ -1090,30 +969,3 @@ if __name__ == "__main__":
         "fused_qk_rmsnorm_group_quant summary (time/err/bw, markdown):\n%s",
         focus_df.to_markdown(index=False),
     )
-
-    # --- Gemma-norm tests (HIP kernel only, fp8) ---
-    aiter.logger.info("=== Running gemma_norm=True tests ===")
-    gemma_tokens = [32, 256]
-    gemma_heads1 = [12]
-    gemma_heads2 = [0, 4]
-    gemma_residual = [False, True]
-    gemma_unquantized = [False, True]
-    for dtype in [dtypes.d_dtypes[k] for k in l_dtype]:
-        for head_dim in l_head_dim:
-            for token in gemma_tokens:
-                for nh1 in gemma_heads1:
-                    for nh2 in gemma_heads2:
-                        for res in gemma_residual:
-                            for unq in gemma_unquantized:
-                                test_fused_qk_rmsnorm_group_quant_gemma_norm(
-                                    dtype=dtype,
-                                    token=token,
-                                    num_head1=nh1,
-                                    num_head2=nh2,
-                                    add_residual=res,
-                                    head_dim=head_dim,
-                                    group_size=args.group_size,
-                                    output_unquantized_inp1=unq,
-                                    transpose_scale=True,
-                                )
-    aiter.logger.info("=== All gemma_norm=True tests passed ===")
