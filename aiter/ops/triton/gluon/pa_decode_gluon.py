@@ -9,6 +9,35 @@ import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
 
+FLYDSL_PS_REDUCE_AVAILABLE = True
+try:
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl.expr import arith, gpu, rocdl, buffer_ops, range_constexpr
+    from flydsl.expr.typing import T, Int32
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+    from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+    from flydsl._mlir import ir
+    from flydsl.compiler.kernel_function import CompilationContext
+    from flydsl._mlir.dialects import arith as _mlir_arith
+except Exception:
+    FLYDSL_PS_REDUCE_AVAILABLE = False
+    flyc = None
+    fx = None
+    arith = None
+    gpu = None
+    rocdl = None
+    buffer_ops = None
+    range_constexpr = None
+    T = None
+    Int32 = None
+    SmemAllocator = None
+    SmemPtr = None
+    get_hip_arch = None
+    ir = None
+    CompilationContext = None
+    _mlir_arith = None
+
 import aiter
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 import aiter.ops.triton.gluon.triton_version as tv
@@ -3864,10 +3893,10 @@ def paged_attention_decode_v2_gluon_dot_kernel(
 
 @triton.jit
 def paged_attention_decode_ps_reduce_kernel(
-    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
-    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    output_ptr,  # [num_seqs, query_seq_len, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_seq_len * query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_seq_len * query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_seq_len * query_group_size, head_size]
     sink_token_ptr,  # [num_query_heads]
     stride_output_bs,
     stride_output_len,
@@ -3882,148 +3911,86 @@ def paged_attention_decode_ps_reduce_kernel(
     stride_logits_group,
     head_size,
     context_partition_num,
-    query_seq_len,
     query_group_size,
-    QUERY_SEQ_LEN_POW2: tl.constexpr,
-    ONE_QUERY_GROUP_SIZE_POW2: tl.constexpr,
     HEAD_SIZE_POW2: tl.constexpr,
     USE_SINKS: tl.constexpr,
     MAX_CONTEXT_PARTITION_NUM: tl.constexpr,
 ):
     """
-    Triton reduction kernel for paged attention decode that combines partial results.
+    Triton port of FlyDSL `compile_pa_decode_sw_reduce`.
 
-    This version uses a fixed MAX_CONTEXT_PARTITION_NUM=16 and loops through partitions
-    in chunks to handle arbitrary numbers of context partitions.
-
-    This kernel performs the final reduction by:
-    1. Finding global maximum logits across partitions (first pass)
-    2. Rescaling exponential sums for numerical stability (second pass)
-    3. Computing normalized attention probabilities (second pass)
-    4. Weighted summation of partial logits (second pass)
-
-    Args:
-        output_ptr: Output tensor for final attention results
-        exp_sums_ptr: Exponential sums from partial computations
-        max_logits_ptr: Maximum logits from partial computations
-        logits_ptr: Partial logit tensors from each sequence partition
-        context_lengths_ptr: Sequence lengths for each sequence
-        Various stride parameters for tensor access
-        Compile-time constants for kernel configuration (no MAX_CONTEXT_PARTITION_NUM needed)
+    Grid = (num_seqs, num_kv_heads, query_seq_len * query_group_size).
+    Each program reduces one flattened `(query_idx, group_idx)` slice across all
+    partition slots, then accumulates the corresponding head vector.
     """
-
-    # ==================== INITIALIZATION ====================
-    QUERY_GROUP_SIZE_POW2: tl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
     sequence_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
+    eqgs_idx = tl.program_id(2)
 
-    # Generate coordinate ranges
-    head_size_offsets = tl.arange(0, HEAD_SIZE_POW2)
-    output_len_offsets = tl.arange(0, QUERY_SEQ_LEN_POW2)
-    output_group_offsets = tl.arange(0, ONE_QUERY_GROUP_SIZE_POW2)
-    query_group_offsets_mtp = tl.arange(0, QUERY_GROUP_SIZE_POW2)
-    # Convert MTP layout indices to continuous indices for reading from temporary_output
-    query_len_idx = query_group_offsets_mtp // ONE_QUERY_GROUP_SIZE_POW2
-    group_idx_in_len = query_group_offsets_mtp % ONE_QUERY_GROUP_SIZE_POW2
-
-    if USE_SINKS:
-        # sink_token_ptr is per-query-head: [num_query_heads] where
-        # num_query_heads = num_kv_heads * query_group_size. It is shared across
-        # query positions, so we only index by (kv_head_idx, group_idx_in_len).
-        sink_token_values = tl.load(
-            sink_token_ptr + kv_head_idx * query_group_size + output_group_offsets,
-            mask=output_group_offsets < query_group_size,
-            other=float("-inf"),
-        )
-    # Calculate number of iterations needed
-    query_group_mask = (output_len_offsets[:, None] < query_seq_len) & (
-        output_group_offsets[None, :] < query_group_size
-    )
-    query_group_mask = tl.reshape(query_group_mask, [QUERY_GROUP_SIZE_POW2])
-    # ==================== FIRST PASS: FIND GLOBAL MAX ====================
-    # Loop through partitions in chunks of MAX_CONTEXT_PARTITION_NUM.
-    # NOTE: We must chunk here to avoid exceeding Triton's max tensor numel.
+    LOG2_E: tl.constexpr = 1.4426950408889634
     partition_offsets = tl.arange(0, MAX_CONTEXT_PARTITION_NUM)
-    query_group_offsets = query_len_idx * query_group_size + group_idx_in_len
-    # Calculate offsets for exponential sums and max logits
+    head_offsets = tl.arange(0, HEAD_SIZE_POW2)
+    partition_mask = partition_offsets < context_partition_num
+    head_mask = head_offsets < head_size
+
+    query_idx = eqgs_idx // query_group_size
+    group_idx = eqgs_idx % query_group_size
+
     exp_sums_offsets = (
         sequence_idx * stride_exp_sums_seq
         + kv_head_idx * stride_exp_sums_head
-        + partition_offsets[:, None] * stride_exp_sums_part
-        + query_group_offsets[None, :]
+        + partition_offsets * stride_exp_sums_part
+        + eqgs_idx
+    )
+    partition_max_logits = tl.load(
+        max_logits_ptr + exp_sums_offsets, mask=partition_mask, other=float("-inf")
+    )
+    partition_exp_sums = tl.load(
+        exp_sums_ptr + exp_sums_offsets, mask=partition_mask, other=0.0
     )
 
-    # Create mask for valid partitions and query groups
-    exp_sums_mask = (
-        partition_offsets[:, None] < context_partition_num
-    ) & query_group_mask[None, :]
+    global_max = tl.max(partition_max_logits, axis=0)
+    partition_scales = tl.math.exp2((partition_max_logits - global_max) * LOG2_E)
+    partition_scales = tl.where(partition_mask, partition_scales, 0.0)
+    scaled_exp_sums = partition_exp_sums * partition_scales
+    global_exp_sum = tl.sum(scaled_exp_sums, axis=0)
 
-    # Load max logits and exp_sums for this chunk
-    max_logits = tl.load(
-        max_logits_ptr + exp_sums_offsets, mask=exp_sums_mask, other=float("-inf")
-    )
-    exp_sums = tl.load(exp_sums_ptr + exp_sums_offsets, mask=exp_sums_mask, other=0.0)
-    # Calculate output tensor offsets
-    global_max = tl.max(max_logits, axis=0)
-    output_offsets = (
-        sequence_idx * stride_output_bs
-        + output_len_offsets[:, None, None] * stride_output_len
-        + kv_head_idx * stride_output_kv_head
-        + output_group_offsets[None, :, None] * stride_output_group_size
-        + head_size_offsets[None, None, :]
-    )
+    # Preserve existing sink semantics for multi-partition PS reduce.
+    if USE_SINKS:
+        sink_token_value = tl.load(
+            sink_token_ptr + kv_head_idx * query_group_size + group_idx
+        )
+        global_exp_sum += tl.math.exp2(
+            (sink_token_value.to(tl.float32) - global_max) * LOG2_E
+        )
 
-    # Create mask for valid output storage
-    output_mask = (
-        (output_len_offsets[:, None, None] < query_seq_len)
-        & (output_group_offsets[None, :, None] < query_group_size)
-        & (head_size_offsets[None, None, :] < head_size)
-    )
-    # Update global maximum and rescale accumulated exp sums accordingly
+    safe_global_exp_sum = tl.where(global_exp_sum > 0, global_exp_sum, 1.0)
+    partition_weights = scaled_exp_sums / safe_global_exp_sum
+
     logits_offsets = (
         sequence_idx * stride_logits_seq
         + kv_head_idx * stride_logits_head
-        + partition_offsets[:, None, None] * stride_logits_part
-        + query_group_offsets[None, :, None] * stride_logits_group
-        + head_size_offsets[None, None, :]
+        + partition_offsets[:, None] * stride_logits_part
+        + eqgs_idx * stride_logits_group
+        + head_offsets[None, :]
     )
-    logits_mask = (
-        partition_offsets[:, None] < context_partition_num
-    ) & query_group_mask[None, :]
-
-    partial_logits = tl.load(
-        logits_ptr + logits_offsets, mask=logits_mask[:, :, None], other=0.0
+    logits_mask = partition_mask[:, None] & head_mask[None, :]
+    partial_logits = tl.load(logits_ptr + logits_offsets, mask=logits_mask, other=0.0)
+    final_output = tl.sum(
+        partial_logits.to(tl.float32) * partition_weights[:, None], axis=0
     )
 
-    exp_sums *= tl.exp(max_logits - global_max[None, :])
-    global_exp_sum = tl.sum(exp_sums, axis=0)
-
-    if USE_SINKS:
-        sink_token_values = tl.broadcast_to(
-            sink_token_values[None, :], [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2]
-        )
-        sink_token_values = tl.reshape(sink_token_values, [QUERY_GROUP_SIZE_POW2])
-        global_exp_sum += tl.exp(sink_token_values.to(tl.float32) - global_max)
-
-    # ==================== SECOND PASS: COMPUTE RESCALED EXP SUMS AND ACCUMULATE ====================
-    attention_probs = exp_sums / global_exp_sum[None, :]
-    attention_probs = tl.reshape(
-        attention_probs, (MAX_CONTEXT_PARTITION_NUM, QUERY_GROUP_SIZE_POW2, 1)
+    output_offsets = (
+        sequence_idx * stride_output_bs
+        + query_idx * stride_output_len
+        + kv_head_idx * stride_output_kv_head
+        + group_idx * stride_output_group_size
+        + head_offsets
     )
-    final_output = tl.sum(partial_logits.to(tl.float32) * attention_probs, axis=0)
-
-    # ==================== FINAL OUTPUT STORING ====================
-    # 3D output path
-    # Output shape: [batch_size, query_length, num_kv_heads, query_group_size, head_size]
-    final_output = tl.reshape(
-        final_output, [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
-    )
-
-    # Store final output to global memory
     tl.store(
         output_ptr + output_offsets,
         final_output.to(output_ptr.dtype.element_ty),
-        mask=output_mask,
+        mask=head_mask,
     )
 
 
@@ -4495,6 +4462,539 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     )
 
 
+def _flydsl_dtype_str(dtype: torch.dtype) -> str:
+    if dtype == torch.float32:
+        return "f32"
+    if dtype == torch.float16:
+        return "f16"
+    if dtype == torch.bfloat16:
+        return "bf16"
+    raise ValueError(f"Unsupported FlyDSL dtype: {dtype!r}")
+
+
+@lru_cache(maxsize=256)
+def compile_pa_decode_ps_reduce_flydsl(
+    *,
+    max_context_partition_num: int,
+    query_seq_len: int,
+    query_group_size: int,
+    head_size: int,
+    output_dtype_str: str,
+    logits_dtype_str: str,
+    sink_dtype_str: str,
+    use_sinks: bool,
+):
+    if not FLYDSL_PS_REDUCE_AVAILABLE:
+        raise ImportError("FlyDSL is unavailable for pa_decode PS reduce")
+
+    FLYDSL_WARP_SIZE = 64
+    FLYDSL_LOG2E = 1.4426950408889634
+
+    block_threads = head_size
+    assert block_threads > 0, "head_size must be positive"
+    assert block_threads <= 1024, "head_size must fit in one workgroup"
+    reduce_width = (
+        1
+        if max_context_partition_num <= 1
+        else 1 << ((max_context_partition_num - 1).bit_length())
+    )
+    reduce_shuffle_offsets = [off for off in [32, 16, 8, 4, 2, 1] if off < reduce_width]
+    red_slots = max(1, (block_threads + FLYDSL_WARP_SIZE - 1) // FLYDSL_WARP_SIZE)
+    arch = get_hip_arch()
+    allocator = SmemAllocator(None, arch=arch, global_sym_name="pa_ps_sw_reduce_smem")
+    red_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = red_off + red_slots * 4
+    part_weights_off = allocator._align(allocator.ptr, 16)
+    allocator.ptr = part_weights_off + max_context_partition_num * 4
+
+    @flyc.kernel(known_block_size=(block_threads, 1, 1))
+    def pa_decode_ps_reduce_flydsl_kernel(
+        output_ptr: fx.Tensor,
+        exp_sums_ptr: fx.Tensor,
+        max_logits_ptr: fx.Tensor,
+        logits_ptr: fx.Tensor,
+        sink_token_ptr: fx.Tensor,
+        stride_output_bs: Int32,
+        stride_output_len: Int32,
+        stride_output_kv_head: Int32,
+        stride_output_group_size: Int32,
+        stride_exp_sums_seq: Int32,
+        stride_exp_sums_head: Int32,
+        stride_exp_sums_part: Int32,
+        stride_logits_seq: Int32,
+        stride_logits_head: Int32,
+        stride_logits_part: Int32,
+        stride_logits_group: Int32,
+    ):
+        tid = gpu.thread_idx.x
+        batch_idx = gpu.block_idx.x
+        kv_head_idx = gpu.block_idx.y
+        eqgs_idx = gpu.block_idx.z
+
+        smem_base = allocator.get_base()
+        red_scratch = SmemPtr(smem_base, red_off, T.f32, shape=(red_slots,))
+        red_scratch.get()
+        if max_context_partition_num > FLYDSL_WARP_SIZE:
+            part_weights_lds = SmemPtr(
+                smem_base, part_weights_off, T.f32, shape=(max_context_partition_num,)
+            )
+            part_weights_lds.get()
+
+        out_rsrc = buffer_ops.create_buffer_resource(output_ptr, max_size=True)
+        es_rsrc = buffer_ops.create_buffer_resource(exp_sums_ptr, max_size=True)
+        ml_rsrc = buffer_ops.create_buffer_resource(max_logits_ptr, max_size=True)
+        logits_rsrc = buffer_ops.create_buffer_resource(logits_ptr, max_size=True)
+        if use_sinks:
+            sink_rsrc = buffer_ops.create_buffer_resource(sink_token_ptr, max_size=True)
+
+        c_zero_f = arith.constant(0.0, type=T.f32)
+        c_one_f = arith.constant(1.0, type=T.f32)
+        c_neg_inf = arith.constant(float("-inf"), type=T.f32)
+        c_log2e = arith.constant(FLYDSL_LOG2E, type=T.f32)
+        fm_fast = arith.FastMathFlags.fast
+        c_zero_i = arith.constant(0, type=T.i32)
+        c_w = arith.constant(FLYDSL_WARP_SIZE, type=T.i32)
+        c_wave_mask = arith.constant(FLYDSL_WARP_SIZE - 1, type=T.i32)
+        c_wave_shift = arith.constant(6, type=T.i32)
+        c_red_slots = arith.constant(red_slots, type=T.i32)
+        lane = tid & c_wave_mask
+        wave = tid >> c_wave_shift
+        c_qgs = arith.constant(query_group_size, type=T.i32)
+        group_idx = eqgs_idx % c_qgs
+
+        def _wave_reduce_max_full(val):
+            red = val
+            for sh in [32, 16, 8, 4, 2, 1]:
+                red = red.maximumf(red.shuffle_xor(arith.constant(sh, type=T.i32), c_w))
+            return red
+
+        def _wave_reduce_sum_full(val):
+            red = val
+            for sh in [32, 16, 8, 4, 2, 1]:
+                red = red.addf(
+                    red.shuffle_xor(arith.constant(sh, type=T.i32), c_w),
+                    fastmath=fm_fast,
+                )
+            return red
+
+        def _block_reduce(val, mode):
+            if red_slots == 1:
+                return (
+                    _wave_reduce_max_full(val)
+                    if mode == "max"
+                    else _wave_reduce_sum_full(val)
+                )
+
+            neutral = c_neg_inf if mode == "max" else c_zero_f
+            w = (
+                _wave_reduce_max_full(val)
+                if mode == "max"
+                else _wave_reduce_sum_full(val)
+            )
+
+            if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
+                wave_idx = arith.index_cast(T.index, wave)
+                red_scratch.store(w, [wave_idx])
+            gpu.barrier()
+
+            if arith.cmpi(arith.CmpIPredicate.eq, wave, c_zero_i):
+                in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_red_slots)
+                lane_safe = arith.select(in_range, lane, c_zero_i)
+                lane_safe_idx = arith.index_cast(T.index, lane_safe)
+                red_val = red_scratch.load([lane_safe_idx])
+                red_val = arith.select(in_range, red_val, neutral)
+                red_val = (
+                    _wave_reduce_max_full(red_val)
+                    if mode == "max"
+                    else _wave_reduce_sum_full(red_val)
+                )
+                if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
+                    red_scratch.store(red_val, [arith.constant(0, index=True)])
+            gpu.barrier()
+
+            return red_scratch.load([arith.constant(0, index=True)])
+
+        if max_context_partition_num <= FLYDSL_WARP_SIZE:
+            c_part_num = arith.constant(max_context_partition_num, type=T.i32)
+            c_reduce_width = arith.constant(reduce_width, type=T.i32)
+            c_four = arith.constant(4, type=T.i32)
+
+            def _wave_reduce_max(val):
+                red = val
+                for sh in reduce_shuffle_offsets:
+                    red = red.maximumf(
+                        red.shuffle_xor(arith.constant(sh, type=T.i32), c_w)
+                    )
+                return red
+
+            def _wave_reduce_sum(val):
+                red = val
+                for sh in reduce_shuffle_offsets:
+                    red = red.addf(
+                        red.shuffle_xor(arith.constant(sh, type=T.i32), c_w),
+                        fastmath=fm_fast,
+                    )
+                return red
+
+            lane_in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_part_num)
+            lane_in_reduce = arith.cmpi(arith.CmpIPredicate.slt, lane, c_reduce_width)
+            part_sum = c_zero_f
+            part_max = c_neg_inf
+            if lane_in_reduce:
+                part_i32 = arith.select(lane_in_range, lane, c_zero_i)
+                es_off = (
+                    batch_idx * stride_exp_sums_seq
+                    + kv_head_idx * stride_exp_sums_head
+                    + part_i32 * stride_exp_sums_part
+                    + eqgs_idx
+                )
+                part_sum_raw = buffer_ops.buffer_load(
+                    es_rsrc, es_off, vec_width=1, dtype=T.f32
+                )
+                part_max_raw = buffer_ops.buffer_load(
+                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                )
+                part_sum = arith.select(lane_in_range, part_sum_raw, c_zero_f)
+                part_max = arith.select(lane_in_range, part_max_raw, c_neg_inf)
+
+            global_max = _wave_reduce_max(part_max)
+            part_scale = arith.select(
+                lane_in_range,
+                ((part_max - global_max) * c_log2e).exp2(fastmath=fm_fast),
+                c_zero_f,
+            )
+            scaled_sum = part_sum * part_scale
+            global_exp_sum = _wave_reduce_sum(scaled_sum)
+            if use_sinks:
+                sink_off = kv_head_idx * c_qgs + group_idx
+                if sink_dtype_str == "f32":
+                    sink_value = buffer_ops.buffer_load(
+                        sink_rsrc, sink_off, vec_width=1, dtype=T.f32
+                    )
+                elif sink_dtype_str == "f16":
+                    sink_value_raw = buffer_ops.buffer_load(
+                        sink_rsrc, sink_off, vec_width=1, dtype=T.f16
+                    )
+                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
+                else:
+                    sink_value_raw = buffer_ops.buffer_load(
+                        sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
+                    )
+                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
+                global_exp_sum = global_exp_sum + (
+                    (sink_value - global_max) * c_log2e
+                ).exp2(fastmath=fm_fast)
+            safe_global_exp_sum = arith.select(
+                global_exp_sum > c_zero_f,
+                global_exp_sum,
+                c_one_f,
+            )
+            weight_local = scaled_sum / safe_global_exp_sum
+            weight_local_i32 = arith.bitcast(T.i32, weight_local)
+
+            acc = c_zero_f
+            for part_idx in range_constexpr(max_context_partition_num):
+                part_i32 = arith.constant(part_idx, type=T.i32)
+                bcast_addr = part_i32 * c_four
+                weight_i32 = rocdl.ds_bpermute(
+                    T.i32, arith.unwrap(bcast_addr), arith.unwrap(weight_local_i32)
+                )
+                weight = arith.bitcast(T.f32, weight_i32)
+                logits_off = (
+                    batch_idx * stride_logits_seq
+                    + kv_head_idx * stride_logits_head
+                    + part_i32 * stride_logits_part
+                    + eqgs_idx * stride_logits_group
+                    + tid
+                )
+                if logits_dtype_str == "f32":
+                    part_logits = buffer_ops.buffer_load(
+                        logits_rsrc, logits_off, vec_width=1, dtype=T.f32
+                    )
+                elif logits_dtype_str == "f16":
+                    part_logits_raw = buffer_ops.buffer_load(
+                        logits_rsrc, logits_off, vec_width=1, dtype=T.f16
+                    )
+                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                else:
+                    part_logits_raw = buffer_ops.buffer_load(
+                        logits_rsrc, logits_off, vec_width=1, dtype=T.bf16
+                    )
+                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                acc = acc + part_logits * weight
+        else:
+            global_max = c_neg_inf
+            for chunk_base in range(0, max_context_partition_num, block_threads):
+                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
+                c_chunk_size = arith.constant(chunk_size, type=T.i32)
+                c_chunk_base = arith.constant(chunk_base, type=T.i32)
+                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
+                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
+                es_off = (
+                    batch_idx * stride_exp_sums_seq
+                    + kv_head_idx * stride_exp_sums_head
+                    + part_i32 * stride_exp_sums_part
+                    + eqgs_idx
+                )
+                part_max_raw = buffer_ops.buffer_load(
+                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                )
+                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
+                chunk_max = _block_reduce(part_max, "max")
+                global_max = global_max.maximumf(chunk_max)
+
+            global_exp_sum = c_zero_f
+            for chunk_base in range(0, max_context_partition_num, block_threads):
+                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
+                c_chunk_size = arith.constant(chunk_size, type=T.i32)
+                c_chunk_base = arith.constant(chunk_base, type=T.i32)
+                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
+                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
+                es_off = (
+                    batch_idx * stride_exp_sums_seq
+                    + kv_head_idx * stride_exp_sums_head
+                    + part_i32 * stride_exp_sums_part
+                    + eqgs_idx
+                )
+                part_sum_raw = buffer_ops.buffer_load(
+                    es_rsrc, es_off, vec_width=1, dtype=T.f32
+                )
+                part_max_raw = buffer_ops.buffer_load(
+                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                )
+                part_sum = arith.select(in_chunk, part_sum_raw, c_zero_f)
+                part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
+                part_scale = arith.select(
+                    in_chunk,
+                    ((part_max - global_max) * c_log2e).exp2(fastmath=fm_fast),
+                    c_zero_f,
+                )
+                chunk_sum = _block_reduce(part_sum * part_scale, "sum")
+                global_exp_sum = global_exp_sum + chunk_sum
+
+            if use_sinks:
+                sink_off = kv_head_idx * c_qgs + group_idx
+                if sink_dtype_str == "f32":
+                    sink_value = buffer_ops.buffer_load(
+                        sink_rsrc, sink_off, vec_width=1, dtype=T.f32
+                    )
+                elif sink_dtype_str == "f16":
+                    sink_value_raw = buffer_ops.buffer_load(
+                        sink_rsrc, sink_off, vec_width=1, dtype=T.f16
+                    )
+                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
+                else:
+                    sink_value_raw = buffer_ops.buffer_load(
+                        sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
+                    )
+                    sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
+                global_exp_sum = global_exp_sum + (
+                    (sink_value - global_max) * c_log2e
+                ).exp2(fastmath=fm_fast)
+
+            safe_global_exp_sum = arith.select(
+                global_exp_sum > c_zero_f,
+                global_exp_sum,
+                c_one_f,
+            )
+
+            for chunk_base in range(0, max_context_partition_num, block_threads):
+                chunk_size = min(block_threads, max_context_partition_num - chunk_base)
+                c_chunk_size = arith.constant(chunk_size, type=T.i32)
+                c_chunk_base = arith.constant(chunk_base, type=T.i32)
+                in_chunk = arith.cmpi(arith.CmpIPredicate.slt, tid, c_chunk_size)
+                part_i32 = arith.select(in_chunk, tid + c_chunk_base, c_zero_i)
+                es_off = (
+                    batch_idx * stride_exp_sums_seq
+                    + kv_head_idx * stride_exp_sums_head
+                    + part_i32 * stride_exp_sums_part
+                    + eqgs_idx
+                )
+                part_sum_raw = buffer_ops.buffer_load(
+                    es_rsrc, es_off, vec_width=1, dtype=T.f32
+                )
+                part_max_raw = buffer_ops.buffer_load(
+                    ml_rsrc, es_off, vec_width=1, dtype=T.f32
+                )
+                if in_chunk:
+                    part_sum = part_sum_raw
+                    part_max = part_max_raw
+                    part_scale = ((part_max - global_max) * c_log2e).exp2(
+                        fastmath=fm_fast
+                    )
+                    weight = (part_sum * part_scale) / safe_global_exp_sum
+                    part_idx_idx = arith.index_cast(T.index, part_i32)
+                    part_weights_lds.store(weight, [part_idx_idx])
+
+            gpu.barrier()
+
+            acc = c_zero_f
+            for part_idx in range_constexpr(max_context_partition_num):
+                part_i32 = arith.constant(part_idx, type=T.i32)
+                part_idx_idx = arith.constant(part_idx, index=True)
+                weight = part_weights_lds.load([part_idx_idx])
+                logits_off = (
+                    batch_idx * stride_logits_seq
+                    + kv_head_idx * stride_logits_head
+                    + part_i32 * stride_logits_part
+                    + eqgs_idx * stride_logits_group
+                    + tid
+                )
+                if logits_dtype_str == "f32":
+                    part_logits = buffer_ops.buffer_load(
+                        logits_rsrc, logits_off, vec_width=1, dtype=T.f32
+                    )
+                elif logits_dtype_str == "f16":
+                    part_logits_raw = buffer_ops.buffer_load(
+                        logits_rsrc, logits_off, vec_width=1, dtype=T.f16
+                    )
+                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                else:
+                    part_logits_raw = buffer_ops.buffer_load(
+                        logits_rsrc, logits_off, vec_width=1, dtype=T.bf16
+                    )
+                    part_logits = _mlir_arith.ExtFOp(T.f32, part_logits_raw).result
+                acc = acc + part_logits * weight
+
+        query_idx = eqgs_idx // c_qgs
+        group_idx = eqgs_idx % c_qgs
+        out_off = (
+            batch_idx * stride_output_bs
+            + query_idx * stride_output_len
+            + kv_head_idx * stride_output_kv_head
+            + group_idx * stride_output_group_size
+            + tid
+        )
+        if output_dtype_str == "f32":
+            out_val = acc
+        elif output_dtype_str == "f16":
+            out_val = arith.trunc_f(T.f16, acc)
+        else:
+            out_val = arith.trunc_f(T.bf16, acc)
+        buffer_ops.buffer_store(out_val, out_rsrc, out_off)
+
+    @flyc.jit
+    def launch_pa_decode_ps_reduce_flydsl(
+        output,
+        exp_sums,
+        max_logits,
+        logits,
+        sink_token,
+        stride_output_bs,
+        stride_output_len,
+        stride_output_kv_head,
+        stride_output_group_size,
+        stride_exp_sums_seq,
+        stride_exp_sums_head,
+        stride_exp_sums_part,
+        stride_logits_seq,
+        stride_logits_head,
+        stride_logits_part,
+        stride_logits_group,
+        batch_size,
+        num_kv_heads,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        pa_decode_ps_reduce_flydsl_kernel(
+            output,
+            exp_sums,
+            max_logits,
+            logits,
+            sink_token,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_seq,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_seq,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+        ).launch(
+            grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
+            block=(block_threads, 1, 1),
+            stream=stream,
+        )
+
+    return {
+        "launch": launch_pa_decode_ps_reduce_flydsl,
+        "kernel": pa_decode_ps_reduce_flydsl_kernel,
+        "allocator": allocator,
+    }
+
+
+def launch_pa_decode_ps_reduce_flydsl(
+    output_ptr,
+    exp_sums_ptr,
+    max_logits_ptr,
+    logits_ptr,
+    sink_token_ptr,
+    stride_output_bs,
+    stride_output_len,
+    stride_output_kv_head,
+    stride_output_group_size,
+    stride_exp_sums_seq,
+    stride_exp_sums_head,
+    stride_exp_sums_part,
+    stride_logits_seq,
+    stride_logits_head,
+    stride_logits_part,
+    stride_logits_group,
+    query_seq_len,
+    query_group_size,
+    head_size,
+    context_partition_num,
+):
+    if logits_ptr.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ImportError(
+            "FlyDSL PS reduce fallback: only bf16/fp16/fp32 logits supported"
+        )
+
+    compiled = compile_pa_decode_ps_reduce_flydsl(
+        max_context_partition_num=context_partition_num,
+        query_seq_len=query_seq_len,
+        query_group_size=query_group_size,
+        head_size=head_size,
+        output_dtype_str=_flydsl_dtype_str(output_ptr.dtype),
+        logits_dtype_str=_flydsl_dtype_str(logits_ptr.dtype),
+        sink_dtype_str=_flydsl_dtype_str(
+            output_ptr.dtype if sink_token_ptr is None else sink_token_ptr.dtype
+        ),
+        use_sinks=sink_token_ptr is not None,
+    )
+
+    if sink_token_ptr is None:
+        sink_token_ptr = torch.empty(
+            0, dtype=output_ptr.dtype, device=output_ptr.device
+        )
+    compiled["launch"](
+        output_ptr,
+        exp_sums_ptr,
+        max_logits_ptr,
+        logits_ptr,
+        sink_token_ptr,
+        stride_output_bs,
+        stride_output_len,
+        stride_output_kv_head,
+        stride_output_group_size,
+        stride_exp_sums_seq,
+        stride_exp_sums_head,
+        stride_exp_sums_part,
+        stride_logits_seq,
+        stride_logits_head,
+        stride_logits_part,
+        stride_logits_group,
+        output_ptr.shape[0],
+        output_ptr.shape[2],
+    )
+
+
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
     grid,
     output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
@@ -4530,38 +5030,57 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     Args:
         All parameters from the reduction kernel plus execution grid configuration
     """
-    QUERY_SEQ_LEN_POW2 = triton.next_power_of_2(query_seq_len)
-    ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
     if PS:
-        paged_attention_decode_ps_reduce_kernel[grid](
-            output_ptr,
-            exp_sums_ptr,
-            max_logits_ptr,
-            logits_ptr,
-            sink_token_ptr,
-            stride_output_bs,
-            stride_output_len,
-            stride_output_kv_head,
-            stride_output_group_size,
-            stride_exp_sums_seq,
-            stride_exp_sums_head,
-            stride_exp_sums_part,
-            stride_logits_seq,
-            stride_logits_head,
-            stride_logits_part,
-            stride_logits_group,
-            query_seq_len=query_seq_len,
-            query_group_size=query_group_size,
-            head_size=head_size,
-            context_partition_num=context_partition_num,
-            QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
-            ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
-            HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-            USE_SINKS=sink_token_ptr is not None,
-            # Use a small fixed chunk to avoid exceeding Triton's max tensor numel.
-            # NOTE: 16 can exceed shared-mem limits for (qg=64, head=128); 8 is safe.
-            MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
-        )
+        try:
+            launch_pa_decode_ps_reduce_flydsl(
+                output_ptr,
+                exp_sums_ptr,
+                max_logits_ptr,
+                logits_ptr,
+                sink_token_ptr,
+                stride_output_bs,
+                stride_output_len,
+                stride_output_kv_head,
+                stride_output_group_size,
+                stride_exp_sums_seq,
+                stride_exp_sums_head,
+                stride_exp_sums_part,
+                stride_logits_seq,
+                stride_logits_head,
+                stride_logits_part,
+                stride_logits_group,
+                query_seq_len=query_seq_len,
+                query_group_size=query_group_size,
+                head_size=head_size,
+                context_partition_num=context_partition_num,
+            )
+            return
+        except ImportError:
+            ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
+            paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
+                output_ptr,
+                exp_sums_ptr,
+                max_logits_ptr,
+                logits_ptr,
+                sink_token_ptr,
+                stride_output_bs,
+                stride_output_len,
+                stride_output_kv_head,
+                stride_output_group_size,
+                stride_exp_sums_seq,
+                stride_exp_sums_head,
+                stride_exp_sums_part,
+                stride_logits_seq,
+                stride_logits_head,
+                stride_logits_part,
+                stride_logits_group,
+                query_group_size=query_group_size,
+                head_size=head_size,
+                context_partition_num=context_partition_num,
+                HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+                USE_SINKS=sink_token_ptr is not None,
+                MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
+            )
     else:
         paged_attention_decode_v2_reduce_kernel[grid](
             output_ptr,
