@@ -657,7 +657,6 @@ def gemm_afp4wfp4_nopreshuffle(
     if config is None:
         config, _ = _get_config(M, N, K_cfg, True)
 
-    config["SPLITK_BLOCK_SIZE"] = K_elems
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
     if y is None:
@@ -665,11 +664,9 @@ def gemm_afp4wfp4_nopreshuffle(
 
     if config["BLOCK_SIZE_K"] >= K_elems:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(K_elems)
-        config["SPLITK_BLOCK_SIZE"] = K_elems
 
     grid = lambda META: (
-        META["NUM_KSPLIT"]
-        * triton.cdiv(M, META["BLOCK_SIZE_M"])
+        triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
@@ -682,7 +679,9 @@ def gemm_afp4wfp4_nopreshuffle(
     x_scales_c = x_scales.contiguous()
     w_scales_c = w_scales.contiguous()
 
-    config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
+    for key in ("NUM_KSPLIT", "SPLITK_BLOCK_SIZE", "SPLITK_BLOCK"):
+        config.pop(key, None)
+
     _gluon_gemm_mxfp4_nopreshuffle_gfx1250[grid](
         x_fp4,
         w,
@@ -694,7 +693,6 @@ def gemm_afp4wfp4_nopreshuffle(
         x_fp4.stride(1),
         w.stride(0),
         w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
         y.stride(-2),
         y.stride(-1),
         x_scales_c.stride(0),

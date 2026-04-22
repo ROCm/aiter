@@ -40,7 +40,7 @@ def get_gemm_mxfp4_nopreshuffle_layouts(
         instr_shape=[16, 16, 128],
     )
 
-    # PaddedSharedLayout for A and B — matches farlukas pattern
+    # PaddedSharedLayout for A and B
     # W stored as (N, K_bytes) in LDS, loaded with .permute((1,0))
     PAD_A = 256 if BLOCK_K_BYTES <= 256 else BLOCK_K_BYTES
     shared_A = gl.PaddedSharedLayout.with_identity_for(
@@ -68,36 +68,15 @@ def get_gemm_mxfp4_nopreshuffle_layouts(
         "b_scale_layout": b_scale_layout,
     }
 
-
-@gluon.jit
-def store_c_tile(
-    c_ptr, tile_m, tile_n, split_k_id, M, N,
-    stride_c_k, stride_c_m, stride_c_n,
-    BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, acc,
-):
-    out_m = tile_m * BLOCK_M + gl.arange(0, BLOCK_M).to(gl.int64)
-    out_n = tile_n * BLOCK_N + gl.arange(0, BLOCK_N).to(gl.int64)
-    mask = (out_m[:, None] < M) & (out_n[None, :] < N)
-    c_offsets = (
-        out_m[:, None] * stride_c_m
-        + out_n[None, :] * stride_c_n
-        + split_k_id * stride_c_k
-    ).to(gl.int32)
-    gl.amd.gfx1250.buffer_store(
-        stored_value=acc.to(c_ptr.type.element_ty),
-        ptr=c_ptr, offsets=c_offsets, mask=mask,
-    )
-
-
 _repr = make_kernel_repr(
     "_gemm_mxfp4_nopreshuffle_gfx1250_kernel",
     ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M",
      "num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim",
-     "cache_modifier", "NUM_KSPLIT", "NUM_BUFFERS"],
+     "cache_modifier", "NUM_BUFFERS"],
 )
 
 
-@gluon.jit(repr=_repr, loop_carried_load_percent=0)
+@gluon.jit(repr=_repr)
 def gemm_mxfp4_nopreshuffle_gfx1250(
     a_fp4_ptr,
     b_ptr,
@@ -107,16 +86,13 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
     M, N, K_elems,
     stride_a_m, stride_a_kbytes,
     stride_b_n, stride_b_k,
-    stride_c_k, stride_c_m, stride_c_n,
+    stride_c_m, stride_c_n,
     stride_as_m, stride_as_k,
     stride_bs_n, stride_bs_k,
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
-    NUM_KSPLIT: gl.constexpr,
-    SPLITK_BLOCK_SIZE: gl.constexpr,
-    SPLITK_BLOCK: gl.constexpr,
     num_warps: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     waves_per_eu: gl.constexpr,
@@ -136,7 +112,6 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
     SCALE_GROUP_ELEMS: gl.constexpr = 32
 
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
-    SPLITK_BYTES: gl.constexpr = SPLITK_BLOCK // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
 
     gl.static_assert(BLOCK_SIZE_K % 32 == 0)
@@ -144,18 +119,12 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
-    split_k_id = pid % NUM_KSPLIT
-    tile_linear = pid // NUM_KSPLIT
-    tile_m = tile_linear // tiles_n
-    tile_n = tile_linear - tile_m * tiles_n
+    tile_m = pid // tiles_n
+    tile_n = pid - tile_m * tiles_n
 
     K_bytes = K_elems // FP4_ELEMS_PER_BYTE
-    split_k0_bytes = split_k_id * SPLITK_BYTES
-    if split_k0_bytes >= K_bytes:
-        return
-
-    k_tiles: gl.constexpr = (SPLITK_BYTES + BLOCK_K_BYTES - 1) // BLOCK_K_BYTES
-    split_k0_groups = split_k_id * (SPLITK_BLOCK // 32)
+    k_scale_cols = K_elems // SCALE_GROUP_ELEMS
+    k_tiles = gl.cdiv(K_bytes, BLOCK_K_BYTES)
 
     # LDS — all operands through LDS via TDM (4 ops per tile)
     # B stored as (N, K_bytes), loaded with .permute((1,0))
@@ -184,8 +153,6 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
         base=b_ptr, shape=(N, K_bytes),
         strides=(stride_b_n, stride_b_k),
         block_shape=(BLOCK_SIZE_N, BLOCK_K_BYTES), layout=shared_B)
-
-    k_scale_cols = K_elems // SCALE_GROUP_ELEMS
     as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=a_scale_ptr, shape=(M, k_scale_cols),
         strides=(stride_as_m, stride_as_k),
@@ -199,26 +166,24 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
     compute_idx = 0
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_acc_layout)
 
-    NUM_TDM_OPS: gl.constexpr = 4  # A, B, AS, BS per tile
+    NUM_TDM_OPS: gl.constexpr = 4 
 
     # ---- TDM Prologue ----
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if load_idx < k_tiles:
-            slot_p = load_idx % NUM_BUFFERS
-            k_tile_p = load_idx
-            a_offs = [tile_m * BLOCK_SIZE_M, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
-            b_offs = [tile_n * BLOCK_SIZE_N, split_k0_bytes + k_tile_p * BLOCK_K_BYTES]
-            g0 = split_k0_groups + k_tile_p * K_GROUPS
-            as_offs = [tile_m * BLOCK_SIZE_M, g0]
-            bs_offs = [tile_n * BLOCK_SIZE_N, g0]
+            slot = load_idx % NUM_BUFFERS
+            a_offs = [tile_m * BLOCK_SIZE_M, load_idx * BLOCK_K_BYTES]
+            b_offs = [tile_n * BLOCK_SIZE_N, load_idx * BLOCK_K_BYTES]
+            as_offs = [tile_m * BLOCK_SIZE_M, load_idx * K_GROUPS]
+            bs_offs = [tile_n * BLOCK_SIZE_N, load_idx * K_GROUPS]
 
-            gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot_p), pred=1)
-            gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot_p), pred=1)
-            gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_AS.index(slot_p), pred=1)
-            gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BS.index(slot_p), pred=1)
+            gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(slot), pred=1)
+            gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(slot), pred=1)
+            gl.amd.gfx1250.tdm.async_load(as_desc, as_offs, smem_AS.index(slot), pred=1)
+            gl.amd.gfx1250.tdm.async_load(bs_desc, bs_offs, smem_BS.index(slot), pred=1)
         load_idx += 1
 
-    # Register pre-load prologue: wait for tile 0 then read into cur_*.
+    # Register pre-load prologue: wait for tile 0 then read into cur
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_TDM_OPS)
 
     cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -237,11 +202,10 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
         acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
 
         # Issue TDM for the tile (NUM_BUFFERS-1) steps ahead
-        a_offs = [tile_m * BLOCK_SIZE_M, split_k0_bytes + load_idx * BLOCK_K_BYTES]
-        b_offs = [tile_n * BLOCK_SIZE_N, split_k0_bytes + load_idx * BLOCK_K_BYTES]
-        g0 = split_k0_groups + load_idx * K_GROUPS
-        as_offs = [tile_m * BLOCK_SIZE_M, g0]
-        bs_offs = [tile_n * BLOCK_SIZE_N, g0]
+        a_offs = [tile_m * BLOCK_SIZE_M, load_idx * BLOCK_K_BYTES]
+        b_offs = [tile_n * BLOCK_SIZE_N, load_idx * BLOCK_K_BYTES]
+        as_offs = [tile_m * BLOCK_SIZE_M, load_idx * K_GROUPS]
+        bs_offs = [tile_n * BLOCK_SIZE_N, load_idx * K_GROUPS]
 
         gl.amd.gfx1250.tdm.async_load(a_desc, a_offs, smem_A.index(load_idx % NUM_BUFFERS), pred=1)
         gl.amd.gfx1250.tdm.async_load(b_desc, b_offs, smem_B.index(load_idx % NUM_BUFFERS), pred=1)
@@ -252,18 +216,16 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
 
         load_idx += 1
 
-        # Pre-load NEXT tile — static_range gives compile-time slot → ds_load_b128
+        # Pre-load NEXT tile
         next_slot = (compute_idx + 1) % NUM_BUFFERS
-        for buf_i in gl.static_range(NUM_BUFFERS):
-            if next_slot == buf_i:
-                cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    smem_A.index(buf_i), layout=dot_a_layout)
-                cur_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    smem_B.index(buf_i).permute([1, 0]), layout=dot_b_layout)
-                cur_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    smem_AS.index(buf_i), layout=a_scale_layout)
-                cur_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    smem_BS.index(buf_i), layout=b_scale_layout)
+        cur_A = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            smem_A.index(next_slot), layout=dot_a_layout)
+        cur_B = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            smem_B.index(next_slot).permute([1, 0]), layout=dot_b_layout)
+        cur_AS = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            smem_AS.index(next_slot), layout=a_scale_layout)
+        cur_BS = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            smem_BS.index(next_slot), layout=b_scale_layout)
         compute_idx += 1
 
     # ---- Epilogue ---- no more TDM; drain remaining NUM_BUFFERS-1 tiles.
@@ -290,12 +252,12 @@ def gemm_mxfp4_nopreshuffle_gfx1250(
     # Final WMMA for the last pre-loaded tile
     acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
 
-    if NUM_BUFFERS > 2:
-        gl.amd.sched_barrier(0)
-
-    store_c_tile(
-        c_ptr=c_ptr, tile_m=tile_m, tile_n=tile_n,
-        split_k_id=split_k_id, M=M, N=N,
-        stride_c_k=stride_c_k, stride_c_m=stride_c_m, stride_c_n=stride_c_n,
-        BLOCK_M=BLOCK_SIZE_M, BLOCK_N=BLOCK_SIZE_N, acc=acc,
+    out_m = tile_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M).to(gl.int64)
+    out_n = tile_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N).to(gl.int64)
+    mask = (out_m[:, None] < M) & (out_n[None, :] < N)
+    c_offsets = (out_m[:, None] * stride_c_m + out_n[None, :] * stride_c_n).to(gl.int32)
+    
+    gl.amd.gfx1250.buffer_store(
+        stored_value=acc.to(c_ptr.type.element_ty),
+        ptr=c_ptr, offsets=c_offsets, mask=mask,
     )
