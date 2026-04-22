@@ -1533,8 +1533,6 @@ def _write_ninja_file_to_build_library(
     extra_cuda_cflags = [flag.strip() for flag in extra_cuda_cflags]
     extra_ldflags = [flag.strip() for flag in extra_ldflags]
     extra_include_paths = [flag.strip() for flag in extra_include_paths]
-    if torch_exclude and is_python_module:
-        raise ValueError("torch-free build does not support python modules")
 
     system_includes = []
     if not torch_exclude:
