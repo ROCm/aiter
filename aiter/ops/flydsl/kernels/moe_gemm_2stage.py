@@ -766,7 +766,7 @@ def compile_moe_gemm1(
                     For groupwise variants, each entry also includes per-group scales:
                       (packs0[ni], packs1[ni], scales0[ni], scales1[ni])
                     """
-                    if is_int4_bf16_groupwise:
+                    if const_expr(is_int4_bf16_groupwise):
                         # W4A16 groupwise: load raw packed32 + scale; defer dequant to compute_tile.
                         raw_data = []
                         for ku in range_constexpr(k_unroll):
@@ -796,7 +796,7 @@ def compile_moe_gemm1(
                                 raw_ku.append((packed32, scale_val))
                             raw_data.append(raw_ku)
                         return raw_data
-                    elif is_int4_bf16:
+                    elif const_expr(is_int4_bf16):
                         # W4A16 per-row: load raw packed32; defer dequant to compute_tile.
                         raw_data = []
                         for ku in range_constexpr(k_unroll):
@@ -947,7 +947,7 @@ def compile_moe_gemm1(
                     # Optional: prefetch epilogue scales while we are about to run the last MFMA tile,
                     # matching the preshuffle GEMM pattern of overlapping scale loads with MFMA.
                     epilogue_pf = None
-                    if prefetch_epilogue and not use_groupwise_scale:
+                    if const_expr(prefetch_epilogue and not use_groupwise_scale):
                         expert_off_pf = expert_off_idx
                         sw_gate_pf = []
                         sw_up_pf = []
@@ -988,16 +988,16 @@ def compile_moe_gemm1(
                         return vector.bitcast(T.bf16x8, v2)
 
                     def mfma_k64(acc_in, a0, a1, b0, b1):
-                        if _use_mfma_k32:
+                        if const_expr(_use_mfma_k32):
                             # gfx950: single 16x16x32 MFMA consuming all 128 bits (K=32 f16/bf16)
-                            if is_f16:
+                            if const_expr(is_f16):
                                 av = _i64x2_to_v8f16(a0, a1)
                                 bv = _i64x2_to_v8f16(b0, b1)
                             else:
                                 av = _i64x2_to_v8bf16(a0, a1)
                                 bv = _i64x2_to_v8bf16(b0, b1)
                             return mfma_fn(mfma_res_ty, [av, bv, acc_in, 0, 0, 0])
-                        if is_f16:
+                        if const_expr(is_f16):
                             a0v = _i64_to_v4f16(a0)
                             a1v = _i64_to_v4f16(a1)
                             b0v = _i64_to_v4f16(b0)
@@ -1024,7 +1024,7 @@ def compile_moe_gemm1(
                             _math_fma(scale_vec, _uw(f32_partial_vec), _uw(f32_acc_vec))
                         )
 
-                    if is_int4_bf16 or is_int4_bf16_groupwise:
+                    if const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
                         # W4A16: deferred dequant -- unpack int4->bf16 right before MFMA
                         # to minimize VGPR lifetime of dequantized bf16 values.
                         _pending_gate_up = None
@@ -1418,10 +1418,10 @@ def compile_moe_gemm1(
                 inter_i32_v = fx.Int32(inter_dim)
                 mask24_i32 = fx.Int32(0xFFFFFF)
 
-                if use_groupwise_scale:
+                if const_expr(use_groupwise_scale):
                     sw_gate_vals = [arith.constant(1.0, type=T.f32)] * num_acc_n
                     sw_up_vals = [arith.constant(1.0, type=T.f32)] * num_acc_n
-                elif epilogue_pf is not None:
+                elif const_expr(epilogue_pf is not None):
                     sw_gate_vals, sw_up_vals = epilogue_pf
                 else:
                     sw_gate_vals = []
@@ -1465,8 +1465,8 @@ def compile_moe_gemm1(
 
                 # --- Split-K epilogue: two-pass gate/up with atomic fadd ---
                 # bf16 split-K uses bf16 atomics; other dtypes use f32 atomics.
-                if _is_splitk:
-                    if lds_out is None:
+                if const_expr(_is_splitk):
+                    if const_expr(lds_out is None):
                         raise RuntimeError(
                             "Split-K epilogue requires lds_out (CShuffle)"
                         )
@@ -1713,8 +1713,8 @@ def compile_moe_gemm1(
                     )
                     return
 
-                if use_cshuffle_epilog_flag:
-                    if lds_out is None:
+                if const_expr(use_cshuffle_epilog_flag):
+                    if const_expr(lds_out is None):
                         raise RuntimeError(
                             "CShuffle epilogue enabled but lds_out is not allocated/aliased."
                         )

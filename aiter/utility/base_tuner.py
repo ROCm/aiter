@@ -590,8 +590,9 @@ class TunerCommon:
             return "OK", ""
         if status.startswith("error:"):
             return "ERROR", status[len("error:") :].strip()
-        if status == "mismatch":
-            return "MISMATCH", "output mismatch vs reference"
+        if status.startswith("mismatch"):
+            detail = status[len("mismatch") :].lstrip(":").strip()
+            return "MISMATCH", detail or "output mismatch vs reference"
         if not status:
             return "UNKNOWN", ""
         return status.upper(), ""
@@ -602,6 +603,22 @@ class TunerCommon:
             value = row.get(key, "")
             parts.append(f"{key}={value}")
         return "keys: " + ", ".join(parts)
+
+    def _emit_repro_csv(self, failed_repros, report_file=None):
+        """Emit a copy-pasteable CSV block for reproducing failed shapes."""
+        if not failed_repros:
+            return
+        untuned_keys = [k for k in self.keys if k != "cu_num"]
+        csv_header = ",".join(untuned_keys)
+        lines = [
+            "",
+            f"============= Repro CSV ({len(failed_repros)} failed shapes) =============",
+            "Copy the lines below into a CSV file to reproduce:",
+            csv_header,
+        ]
+        for kd in failed_repros:
+            lines.append(",".join(str(kd.get(k, "")) for k in untuned_keys))
+        self._emit_report_lines(lines, report_file)
 
     def _get_benchmark_e2e_us(self, row, suffix=""):
         return getattr(row, f"benchmark_e2e_us{suffix}", -1)
@@ -631,8 +648,9 @@ class TunerCommon:
             header = f"{'Shape':<40} | {'E2E(us)':>10} | {'Status':>8}"
         lines.append(header)
         lines.append("-" * len(header))
+        failed_repros = []
         if results_df.empty:
-            for r in results:
+            for idx, r in enumerate(results):
                 shape_str = r.get("shape", "unknown")
                 e2e_us = r.get("e2e_us", -1)
                 status = r.get("status", "unknown")
@@ -640,8 +658,22 @@ class TunerCommon:
                 e2e_str = f"{e2e_us:.2f}" if e2e_us > 0 else "N/A"
                 lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
                 if status_detail:
-                    lines.append(f"{'':<40} | {'':>10} | {'reason: ' + status_detail}")
+                    lines.append(f"reason: {status_detail}")
+                if status_summary in ("ERROR", "MISMATCH"):
+                    if shapes_df is not None and idx < len(shapes_df):
+                        key_dict = {
+                            k: shapes_df.iloc[idx].get(k, "") for k in self.keys
+                        }
+                    elif self.untunedf is not None and idx < len(self.untunedf):
+                        key_dict = {
+                            k: self.untunedf.iloc[idx].get(k, "") for k in self.keys
+                        }
+                    else:
+                        key_dict = {}
+                    if key_dict:
+                        failed_repros.append(key_dict)
             self._emit_report_lines(lines, report_file)
+            self._emit_repro_csv(failed_repros, report_file)
             return
         for row in results_df.itertuples(index=False):
             shape_str = getattr(row, "shape", "unknown")
@@ -661,14 +693,14 @@ class TunerCommon:
                 )
             else:
                 lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
-            lines.append(
-                self._format_benchmark_keys(
-                    {key: getattr(row, key, "") for key in self.keys}
-                )
-            )
+            key_dict = {key: getattr(row, key, "") for key in self.keys}
+            lines.append(self._format_benchmark_keys(key_dict))
             if status_detail:
                 lines.append(f"reason: {status_detail}")
+            if status_summary in ("ERROR", "MISMATCH"):
+                failed_repros.append(key_dict)
         self._emit_report_lines(lines, report_file)
+        self._emit_repro_csv(failed_repros, report_file)
 
     def _print_comparison(self, pre_results, post_results, report_file=None):
         """Print comparison to stdout or append it to a report file."""
@@ -703,6 +735,7 @@ class TunerCommon:
         header = f"{'Shape':<40} | {'Pre-E2E(us)':>13} | {'Post-E2E(us)':>14} | {'Speedup':>8} | {'Status':>8}"
         lines.append(header)
         lines.append("-" * len(header))
+        compare_failed_repros = []
         for row in comparison_df.itertuples(index=False):
             shape = getattr(row, "shape", "unknown")
             pre_us = self._get_benchmark_e2e_us(row, "_pre")
@@ -730,14 +763,14 @@ class TunerCommon:
             lines.append(
                 f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status_summary:>8}"
             )
-            lines.append(
-                self._format_benchmark_keys(
-                    {key: getattr(row, key, "") for key in self.keys}
-                )
-            )
+            key_dict = {key: getattr(row, key, "") for key in self.keys}
+            lines.append(self._format_benchmark_keys(key_dict))
             if status_detail:
                 lines.append(f"reason: {status_detail}")
+            if status_summary in ("ERROR", "MISMATCH"):
+                compare_failed_repros.append(key_dict)
         self._emit_report_lines(lines, report_file)
+        self._emit_repro_csv(compare_failed_repros, report_file)
 
     def _benchmark_results_to_df(self, results, shapes_df=None):
         columns = self.keys + [
@@ -845,67 +878,100 @@ class TunerCommon:
             )
             return
 
-        lines = [
-            (
-                "============= Compare-Gated CSV Updates ============="
-                if apply_updates
-                else "============= Compare-Gated CSV Update Preview ============="
-            )
-        ]
+        # Count actions
+        update_count = len(comparison[comparison["update_reason"] == "threshold_met"])
+        no_baseline_count = len(
+            comparison[comparison["update_reason"] == "no_baseline"]
+        )
+        skip_count = len(comparison[comparison["update_reason"] == "skip"])
+        total = len(comparison)
+
         target_desc = tuned_file if tuned_file else "tuned csv"
-        lines.append(
-            (
-                f"Threshold: improve >= {threshold_percent:.2f}% to update {target_desc}"
-                if apply_updates
-                else f"Threshold: improve >= {threshold_percent:.2f}% would update {target_desc} with --update_improved"
-            )
-        )
-        lines.append(
-            (
-                "Rows with no valid pre-run baseline but passing post-run will also update."
-                if apply_updates
-                else "Rows with no valid pre-run baseline but passing post-run would also update."
-            )
-        )
-        header = f"{'Shape':<40} | {'Pre-E2E':>10} | {'Post-E2E':>10} | {'Improve':>9} | {'Action':>18}"
-        lines.append(header)
-        lines.append("-" * len(header))
-        for row in comparison.itertuples(index=False):
-            pre_str = (
-                f"{row.pre_us:.2f}"
-                if pd.notna(row.pre_us) and row.pre_us > 0
-                else "N/A"
-            )
-            post_str = (
-                f"{row.post_us:.2f}"
-                if pd.notna(row.post_us) and row.post_us > 0
-                else "N/A"
-            )
-            improve_str = (
-                f"{row.improvement_pct:.2f}%"
-                if pd.notna(row.improvement_pct)
-                else "N/A"
-            )
-            if row.update_reason == "threshold_met":
-                action = "UPDATE"
-            elif row.update_reason == "no_baseline":
-                action = "UPDATE_NO_BASELINE"
-            else:
-                action = "SKIP"
-            lines.append(
-                f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
-            )
-            lines.append(
-                self._format_benchmark_keys(
-                    {key: getattr(row, key, "") for key in self.keys}
+        verb = "Updated" if apply_updates else "Would update"
+
+        lines = [
+            "============= Compare Report =============",
+            f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
+            f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}",
+            f"Threshold: >= {threshold_percent:.1f}% improvement to update {target_desc}",
+            "",
+        ]
+
+        # Updated shapes first
+        if update_count + no_baseline_count > 0:
+            lines.append(f"--- {verb} ({update_count + no_baseline_count} shapes) ---")
+            header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>18}"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for row in comparison.itertuples(index=False):
+                if row.update_reason == "skip":
+                    continue
+                pre_str = (
+                    f"{row.pre_us:.2f}"
+                    if pd.notna(row.pre_us) and row.pre_us > 0
+                    else "N/A"
                 )
-            )
-            pre_summary, pre_detail = self._split_benchmark_status(row.pre_status)
-            post_summary, post_detail = self._split_benchmark_status(row.post_status)
-            if pre_detail:
-                lines.append(f"pre-{pre_summary.lower()}: {pre_detail}")
-            if post_detail:
-                lines.append(f"post-{post_summary.lower()}: {post_detail}")
+                post_str = (
+                    f"{row.post_us:.2f}"
+                    if pd.notna(row.post_us) and row.post_us > 0
+                    else "N/A"
+                )
+                improve_str = (
+                    f"{row.improvement_pct:.2f}%"
+                    if pd.notna(row.improvement_pct)
+                    else "N/A"
+                )
+                action = "UPDATE" if row.update_reason == "threshold_met" else "NEW"
+                lines.append(
+                    f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
+                )
+            lines.append("")
+
+        # Skipped shapes
+        if skip_count > 0:
+            lines.append(f"--- Skipped ({skip_count} shapes) ---")
+            header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Reason':>18}"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for row in comparison.itertuples(index=False):
+                if row.update_reason != "skip":
+                    continue
+                pre_str = (
+                    f"{row.pre_us:.2f}"
+                    if pd.notna(row.pre_us) and row.pre_us > 0
+                    else "N/A"
+                )
+                post_str = (
+                    f"{row.post_us:.2f}"
+                    if pd.notna(row.post_us) and row.post_us > 0
+                    else "N/A"
+                )
+                improve_str = (
+                    f"{row.improvement_pct:.2f}%"
+                    if pd.notna(row.improvement_pct)
+                    else "N/A"
+                )
+                pre_summary, _ = self._split_benchmark_status(row.pre_status)
+                post_summary, post_detail = self._split_benchmark_status(
+                    row.post_status
+                )
+                if post_summary in ("ERROR", "MISMATCH"):
+                    reason = f"post-{post_summary.lower()}"
+                elif (
+                    pd.notna(row.improvement_pct)
+                    and row.improvement_pct < threshold_percent
+                ):
+                    reason = f"< {threshold_percent:.1f}% improve"
+                else:
+                    reason = "no improvement"
+                lines.append(
+                    f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {reason:>18}"
+                )
+
+        if not apply_updates:
+            lines.append("")
+            lines.append("Re-run with --update_improved to apply.")
+
         self._emit_report_lines(lines, report_file)
 
     def _merge_compare_filtered_results(self, base_file, candidate_file, comparison):
