@@ -23,7 +23,8 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 # ---------------
 # initialize data
@@ -81,10 +82,6 @@ def init_compute_data(
     else:
         gamma = None
     return x, w, bias, gamma
-
-
-def dtype_str_to_torch(dtype_str: str) -> torch.dtype:
-    return torch.uint8 if dtype_str == "float4_e2m1" else getattr(torch, dtype_str)
 
 
 def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=True):
@@ -171,7 +168,6 @@ class Case:
     m: int
     n: int
     k: int
-    act_dtype_str: str
     n_expts_tot: int = 1
     n_expts_act: int = 1
     hbm_swizzling: bool = False
@@ -182,29 +178,29 @@ class Case:
     [
         tuple(getattr(case, f.name) for f in fields(Case))
         for case in [
-            Case(4, 4, 8, "bfloat16", 2, 1),
-            Case(4, 4, 8, "bfloat16", 8, 2),
-            Case(4, 4, 8, "bfloat16", 128, 4),
-            Case(4, 1024, 3072, "bfloat16", 128, 4),
-            Case(32, 6144, 3072, "bfloat16", 128, 4),
-            Case(16, 1024, 1024, "bfloat16", 128, 4),
-            Case(16, 256, 256, "bfloat16", 128, 4),
-            Case(4096, 256, 256, "bfloat16", 128, 4),
-            Case(1024, 3072, 512, "bfloat16", 128, 4),
-            Case(4096, 3072, 3072, "bfloat16", 128, 4),
-            Case(8192, 3072, 3072, "bfloat16", 128, 4),
-            Case(300, 400, 800, "bfloat16", 8, 4),
-            Case(1000, 704, 800, "bfloat16", 8, 2),
-            Case(4097, 1024, 1024, "bfloat16", 128, 4),
-            Case(32, 6144, 3072, "bfloat16", 128, 4, hbm_swizzling=True),
-            Case(32, 6144, 3072, "bfloat16", 8, 4, hbm_swizzling=True),
-            Case(16, 1024, 1024, "bfloat16", 128, 4, hbm_swizzling=True),
-            Case(16, 1024, 1024, "bfloat16", 2, 1, hbm_swizzling=True),
-            Case(16, 256, 256, "bfloat16", 128, 4, hbm_swizzling=True),
-            Case(1024, 3072, 512, "bfloat16", 128, 4, hbm_swizzling=True),
-            Case(4096, 256, 256, "bfloat16", 128, 4, hbm_swizzling=True),
-            Case(4097, 1024, 1024, "bfloat16", 128, 4, hbm_swizzling=True),
-            Case(8192, 3072, 3072, "bfloat16", 128, 4, hbm_swizzling=True),
+            Case(4, 4, 8, 2, 1),
+            Case(4, 4, 8, 8, 2),
+            Case(4, 4, 8, 128, 4),
+            Case(4, 1024, 3072, 128, 4),
+            Case(32, 6144, 3072, 128, 4),
+            Case(16, 1024, 1024, 128, 4),
+            Case(16, 256, 256, 128, 4),
+            Case(4096, 256, 256, 128, 4),
+            Case(1024, 3072, 512, 128, 4),
+            Case(4096, 3072, 3072, 128, 4),
+            Case(8192, 3072, 3072, 128, 4),
+            Case(300, 400, 800, 8, 4),
+            Case(1000, 704, 800, 8, 2),
+            Case(4097, 1024, 1024, 128, 4),
+            Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
+            Case(32, 6144, 3072, 8, 4, hbm_swizzling=True),
+            Case(16, 1024, 1024, 128, 4, hbm_swizzling=True),
+            Case(16, 1024, 1024, 2, 1, hbm_swizzling=True),
+            Case(16, 256, 256, 128, 4, hbm_swizzling=True),
+            Case(1024, 3072, 512, 128, 4, hbm_swizzling=True),
+            Case(4096, 256, 256, 128, 4, hbm_swizzling=True),
+            Case(4097, 1024, 1024, 128, 4, hbm_swizzling=True),
+            Case(8192, 3072, 3072, 128, 4, hbm_swizzling=True),
         ]
     ],
 )
@@ -229,16 +225,15 @@ def test_op(
     apply_swiglu,
     n_expts_tot,
     n_expts_act,
-    act_dtype_str,
     hbm_swizzling,
     device="cuda",
 ):
 
-    if get_arch() != "gfx950":
-        pytest.skip("float8 x mx only supported on CDNA4")
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
 
     if hbm_swizzling:
-        if get_arch() != "gfx950":
+        if not arch_info.is_mx_scale_preshuffling_avail():
             pytest.skip(
                 "Scale preshuffling on AMD GPU has not been emulated on non-CDNA4 arch yet."
             )
@@ -249,16 +244,17 @@ def test_op(
 
     torch.manual_seed(0)
 
-    weight_dtype_str = "mxfloat4_e2m1"
-    weight_mxfp = weight_dtype_str.startswith("mx")
-    if weight_mxfp:
-        weight_dtype_str = weight_dtype_str[2:]
+    weight_dtype_str = "mxfp4_e2m1"
+    weight_dtype = str_to_torch_dtype[weight_dtype_str]
 
-    weight_dtype = dtype_str_to_torch(weight_dtype_str)
-    # act_dtype = dtype_str_to_torch(act_dtype_str)
     m, rdata, gindx, sindx = init_routing_data(
         m, n_expts_tot, n_expts_act, do_gather, do_scatter, device=device
     )
+
+    # x: (m, k)
+    # w: (num_expts_tot, k, n)
+    # bias: (num_expts_tot, n)
+    # gammas: (m*num_expts_act)
     x_tri, w_tri, bias_tri, gammas = init_compute_data(
         m,
         n,
@@ -286,6 +282,7 @@ def test_op(
     x_mx_scales_tri = None
     out_dtype = torch.bfloat16
     x_static_scale = None
+    quant_static_scale = None
     maxtol = 4e-1
     rmstol = 4e-2
 
@@ -293,7 +290,6 @@ def test_op(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
 
-    quant_static_scale = None
     tri_y = moe_gemm_a16w4(
         x_tri,
         w_tri,

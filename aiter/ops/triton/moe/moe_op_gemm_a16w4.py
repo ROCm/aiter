@@ -216,7 +216,7 @@ def moe_gemm_a16w4(
     x_scales,  # This argument is for API compatibility with lower-precision data types. For a16, this should be set to None
     w_scales,
     x_static_scale=None,  # This argument is for API compatibility with lower-precision data types. For a16, this should be set to None
-    quant_static_scale=None,
+    quant_static_scale=None,  # This argument is for API compatibility with lower-precision data types. For a16, this should be set to None
     bias=None,
     routing_data: RoutingData | None = None,
     gather_indx=None,
@@ -236,15 +236,10 @@ def moe_gemm_a16w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
-    x_has_mx = x_scales is not None
-    if x_has_mx:
-        assert x.stride(-1) == 1, "'x' must be row-major when it has data-type mxfp"
-    if x_has_mx:
-        stride_x_mx_m = x_scales.stride(0)
-        stride_x_mx_k = x_scales.stride(1)
-    else:
-        stride_x_mx_m = 0
-        stride_x_mx_k = 0
+    assert x_scales is None, "x_scales must be none"
+    assert x_static_scale is None, "x_static_scale must be none"
+    assert quant_static_scale is None, "quant_static_scale must be none"
+
     # determine shapes
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
@@ -253,6 +248,7 @@ def moe_gemm_a16w4(
         N = unpadded_N
     if unpadded_K and block_m == 16:
         K = unpadded_K
+
     # compute optimization flags
     config = get_kernel_config(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
@@ -270,6 +266,7 @@ def moe_gemm_a16w4(
         reduction_n_matmul = 1
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
+
     # allocate output memory
     y, y_final = allocate_output(
         x,
@@ -284,16 +281,19 @@ def moe_gemm_a16w4(
         config["split_k"],
     )
     stride_bias = None if bias is None else bias.stride(0)
+
     # moe metadata
     expt_data = routing_data.expt_data
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
     expt_block_pid_map = None if expt_data is None else expt_data.block_pid_map
+
     # spmd grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
+
     # launch kernel
     _moe_gemm_a16w4[(grid,)](
         y,
@@ -303,9 +303,6 @@ def moe_gemm_a16w4(
         x,
         x.stride(0),
         x.stride(1),
-        x_scales,
-        stride_x_mx_m,
-        stride_x_mx_k,
         w,
         w.stride(0),
         w.stride(1),
@@ -314,8 +311,6 @@ def moe_gemm_a16w4(
         w_scales.stride(0),
         w_scales.stride(1),
         w_scales.stride(2),
-        x_static_scale,
-        quant_static_scale,
         bias,
         stride_bias,
         gammas,
@@ -350,6 +345,7 @@ def moe_gemm_a16w4(
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"],
     )
+
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None
@@ -366,6 +362,7 @@ def moe_gemm_a16w4(
         reduction_n_reduction,
         out_dtype=out_dtype,
     )
+
     return y_final
 
 
@@ -406,6 +403,7 @@ def moe_gemm_torch(
     if w.ndim == 2:
         w = w.view(1, *w.shape)
     n_expts_act = routing_data.n_expts_act
+
     # memory offsets
     if routing_data.n_expts_tot > 1:
         sizes = routing_data.expt_hist
@@ -414,6 +412,7 @@ def moe_gemm_torch(
         offs = list(itertools.pairwise(off))
     else:
         offs = [[0, x.shape[0]] for _ in range(w.shape[0])]
+
     # compute
     n_rows = x.shape[0] if gather_indx is None else gather_indx.shape[0]
     n_cols = w.shape[-1] // 2 if apply_swiglu else w.shape[-1]
@@ -433,6 +432,7 @@ def moe_gemm_torch(
         y[lo:hi, :] = out
     if scatter_indx is None:
         return y
+
     # accumulate output from all experts
     n_rows = y.shape[0] // n_expts_act
     out = torch.zeros((n_rows, y.shape[-1]), dtype=torch.float32, device=x.device)
