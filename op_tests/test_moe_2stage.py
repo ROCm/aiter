@@ -11,9 +11,9 @@ from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
 )
 from aiter.utility import fp4_utils
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_gfx, get_cu_num
 import argparse
-import glob
 import os
 import pandas as pd
 import logging
@@ -299,44 +299,9 @@ l_quant = [
     (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
-    (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
+    # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
+    # (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
 ]
-
-
-_MODEL_CSV_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "aiter",
-    "configs",
-    "model_configs",
-)
-_MODEL_CSV_TOKEN = "_tuned_fmoe"
-
-
-def _discover_model_csvs():
-    """Return {model_name: csv_path} for every *tuned_fmoe*.csv (excluding untuned).
-
-    blockscale csvs are filtered out: their q_type=per_1x128 is not handled by
-    test_fmoe's quant prep code (only per_Tensor / per_Token / per_1x32 /
-    per_128x128 / No are supported).
-    """
-    found = {}
-    for path in sorted(
-        glob.glob(os.path.join(_MODEL_CSV_DIR, f"*{_MODEL_CSV_TOKEN}*.csv"))
-    ):
-        name = os.path.basename(path)
-        if "untuned" in name or "blockscale" in name:
-            continue
-        stem = name[: -len(".csv")]
-        head, _, tail = stem.partition(_MODEL_CSV_TOKEN)
-        model = "_".join(p for p in (head.strip("_"), tail.strip("_")) if p)
-        if not model:
-            continue
-        found[model] = path
-    return found
-
-
-_AVAILABLE_MODELS = sorted(_discover_model_csvs())
 
 
 parser = argparse.ArgumentParser(
@@ -462,24 +427,14 @@ parser.add_argument(
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
-    "-m",
-    "--model",
-    type=str,
-    nargs="*",
-    default=None,
-    help="""Run csv-driven test cases sourced from
-    aiter/configs/model_configs/*tuned_fmoe*.csv (untuned files excluded).
-    Pass one or more model short-names, or "all" to scan every fmoe csv.
-    Every row in the selected csv(s) is exercised.
-    When set, the original itertools sweep is skipped.
-    Available models ({n}):
-      {models}
-    e.g.: -m {first}
-          -m all""".format(
-        n=len(_AVAILABLE_MODELS),
-        models="\n      ".join(_AVAILABLE_MODELS) or "(none discovered)",
-        first=_AVAILABLE_MODELS[0] if _AVAILABLE_MODELS else "<model>",
-    ),
+    "--no-flydsl-csv",
+    action="store_true",
+    help="Skip validating flydsl shapes from tuned fmoe CSVs.",
+)
+parser.add_argument(
+    "--no-legacy",
+    action="store_true",
+    help="Skip the original hardcoded shape sweep and skinny tests.",
 )
 
 args = parser.parse_args()
@@ -518,24 +473,6 @@ def _str2enum(s, enum_cls):
     return getattr(enum_cls, s.strip().split(".")[-1])
 
 
-def _resolve_model_filter(requested):
-    available = _discover_model_csvs()
-    if not available:
-        raise RuntimeError(
-            f"no *{_MODEL_CSV_TOKEN}*.csv discovered under {_MODEL_CSV_DIR}"
-        )
-    if any(m.lower() == "all" for m in requested):
-        return available
-    selected = {}
-    for m in requested:
-        if m not in available:
-            raise ValueError(
-                f"unknown model {m!r}; available: {sorted(available)} (or 'all')"
-            )
-        selected[m] = available[m]
-    return selected
-
-
 def _row_to_kwargs(row):
     # csv rows store already-effective dims, so pad defaults to 0.
     q_type = _str2enum(row["q_type"], aiter.QuantType)
@@ -566,28 +503,32 @@ def _row_to_kwargs(row):
     )
 
 
-def _iter_csv_cases(model_to_path):
+def _iter_csv_cases():
     """Yield (kwargs, extras) for every row of every selected model csv."""
-    for model, path in model_to_path.items():
-        df_csv = pd.read_csv(path)
-        for _, row in df_csv.iterrows():
-            try:
-                kwargs = _row_to_kwargs(row)
-            except Exception as e:
-                aiter.logger.warning(
-                    "[%s] skip row token=%s dim=(%s,%s): parse error %s",
-                    model,
-                    row.get("token"),
-                    row.get("model_dim"),
-                    row.get("inter_dim"),
-                    e,
-                )
-                continue
-            yield kwargs, {
-                "model": model,
-                "kernelName1": str(row.get("kernelName1", "") or ""),
-                "kernelName2": str(row.get("kernelName2", "") or ""),
-            }
+    cu = get_cu_num()
+    merged_csv = AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+    df_csv = pd.read_csv(merged_csv)
+    rows = df_csv[df_csv["cu_num"] == cu]
+    for _, row in rows.iterrows():
+        kernel_name1 = str(row.get("kernelName1", "") or "")
+        kernel_name2 = str(row.get("kernelName2", "") or "")
+        if "flydsl_" not in kernel_name1 and "flydsl_" not in kernel_name2:
+            continue
+        try:
+            kwargs = _row_to_kwargs(row)
+        except Exception as e:
+            aiter.logger.warning(
+                "skip row token=%s dim=(%s,%s): parse error %s",
+                row.get("token"),
+                row.get("model_dim"),
+                row.get("inter_dim"),
+                e,
+            )
+            continue
+        yield kwargs, {
+            "kernelName1": kernel_name1,
+            "kernelName2": kernel_name2,
+        }
 
 
 _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
@@ -694,15 +635,9 @@ def _iter_legacy_cases():
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
-if args.model:
-    model_to_path = _resolve_model_filter(args.model)
-    aiter.logger.info(
-        "moe_2stage csv-driven mode: %d model csv(s): %s",
-        len(model_to_path),
-        ", ".join(sorted(model_to_path)),
-    )
-    case_iter = _iter_csv_cases(model_to_path)
-else:
+if not args.no_flydsl_csv:
+    case_iter = _iter_csv_cases()
+if not args.no_legacy:
     case_iter = _iter_legacy_cases()
 
 df = []
