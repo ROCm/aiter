@@ -35,11 +35,11 @@ except ImportError:
     # ignore iglp hint
     @gluon.jit
     def _amd_iglp_sched_barrier(tensor, inst_mask):
-        pass
+        return tensor
 
     @gluon.jit
     def _amd_iglp_sched_group_barrier(tensor, inst_mask, cnt, _):
-        pass
+        return tensor
 
     @gluon.jit
     def _amd_set_prio(value, prio):
