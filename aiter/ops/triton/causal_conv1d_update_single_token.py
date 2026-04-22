@@ -66,7 +66,9 @@ def causal_conv1d_update_single_token(
         batch = conv_state_indices.size(0)
         dim = x.size(1)
         seqlen = max_query_len
-    assert seqlen == 1, f"the single_token version only support seqlen to be 1, got {seqlen}"
+    assert (
+        seqlen == 1
+    ), f"the single_token version only support seqlen to be 1, got {seqlen}"
     _, width = weight.shape
     num_cache_lines, _, state_len = conv_state.size()
 
@@ -200,7 +202,9 @@ def fused_reshape_causal_conv1d_update_single_token(
     if unsqueeze:
         x = x.unsqueeze(-1)
     _, qkvz_dim, seqlen = x.shape
-    assert seqlen == 1, f"the single_token version only support seqlen to be 1, got {seqlen}"
+    assert (
+        seqlen == 1
+    ), f"the single_token version only support seqlen to be 1, got {seqlen}"
     batch = num_actual_tokens
     _, width = weight.shape
     head_dim = head_k_dim + head_k_dim + head_v_dim * num_v_heads // num_k_heads
