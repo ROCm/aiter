@@ -1,6 +1,5 @@
 <div align="center">
 <img src="docs/assets/aiter_logo.png" alt="AITER" width="400">
-
 <br>
 
 [![CI](https://github.com/ROCm/aiter/actions/workflows/aiter-test.yaml/badge.svg)](https://github.com/ROCm/aiter/actions/workflows/aiter-test.yaml)
