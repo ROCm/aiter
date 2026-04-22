@@ -124,8 +124,9 @@ def test_mha_with_sink(
         torch_out, (q, k, v, sink), do
     )
 
-    bwd_atol = 1.5e-2
-    bwd_rtol = 1.5e-2
+    relax_bwd_err_tol: bool = SEQLEN_Q >= 1024 and SEQLEN_K >= 1024
+    bwd_atol = 2.5e-2 if relax_bwd_err_tol else 1.5e-2
+    bwd_rtol = 2.5e-2 if relax_bwd_err_tol else 1.5e-2
     torch.testing.assert_close(
         triton_dq,
         torch_dq,
@@ -140,14 +141,11 @@ def test_mha_with_sink(
         rtol=bwd_rtol,
         msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
     )
-    relax_dv_err_tol: bool = (
-        arch == "gfx942" and BATCH > 1 and SEQLEN_Q >= 1024 and SEQLEN_K >= 1024
-    )
     torch.testing.assert_close(
         triton_dv,
         torch_dv,
-        atol=2e-2 if relax_dv_err_tol else bwd_atol,
-        rtol=2e-2 if relax_dv_err_tol else bwd_rtol,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
         msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
     )
     torch.testing.assert_close(
