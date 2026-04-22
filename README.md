@@ -1,10 +1,12 @@
 <div align="center">
 <img src="docs/assets/aiter_logo.png" alt="AITER" width="400">
 
+<br>
+
 [![CI](https://github.com/ROCm/aiter/actions/workflows/aiter-test.yaml/badge.svg)](https://github.com/ROCm/aiter/actions/workflows/aiter-test.yaml)
 [![Release](https://img.shields.io/github/v/release/ROCm/aiter)](https://github.com/ROCm/aiter/releases)
 [![Docs](https://img.shields.io/badge/Docs-rocm.github.io%2Faiter-blue)](https://rocm.github.io/aiter)
-[![GitHub](https://img.shields.io/github/stars/ROCm/aiter?style=social)](https://github.com/ROCm/aiter)
+[![Last Commit](https://img.shields.io/github/last-commit/ROCm/aiter)](https://github.com/ROCm/aiter/commits)
 
 </div>
 
