@@ -35,10 +35,10 @@ def shuffle_weight_NK(
         kPerLane *= 2
     assert (
         x.shape[-2] % inst_N == 0
-    ), f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % N_WARP_TILE }"
+    ), f"{x.shape[-2]} % {inst_N} == {x.shape[-2] % inst_N }"
     assert (
         x.shape[-1] % inst_K == 0
-    ), f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % K_WARP_TILE }"
+    ), f"{x.shape[-1]} % {inst_K} == {x.shape[-1] % inst_K }"
 
     x_ = x
     x_ = x_.view(
@@ -132,9 +132,7 @@ def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:
     return out.view(-1).to(torch.int8)
 
 
-def shuffle_scale_for_int4(
-    scale: torch.Tensor, group_size: int = 32
-) -> torch.Tensor:
+def shuffle_scale_for_int4(scale: torch.Tensor, group_size: int = 32) -> torch.Tensor:
     """Prepare groupwise scale tensor for W4A16 int4 kernel.
 
     Input: scale tensor of shape ``[E, num_groups, N]``.

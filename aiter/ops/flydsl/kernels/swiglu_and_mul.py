@@ -21,7 +21,7 @@ per iteration, avoiding read-modify-write races.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, vector, range_constexpr
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
@@ -43,13 +43,9 @@ def _swiglu_scalar(g, u, limit_f32, neg_limit_f32, neg_alpha_log2e, c1_f32):
     u_clamped = arith.maximumf(arith.minimumf(u, limit_f32), neg_limit_f32)
 
     t = g_clamped * neg_alpha_log2e
-    emu = llvm.call_intrinsic(
-        f32, "llvm.amdgcn.exp2.f32", [t], [], []
-    )
+    emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
     den = c1_f32 + emu
-    sig = llvm.call_intrinsic(
-        f32, "llvm.amdgcn.rcp.f32", [den], [], []
-    )
+    sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
     return g_clamped * sig * (u_clamped + c1_f32)
 
 
@@ -69,8 +65,8 @@ def build_swiglu_and_mul_module(inter_dim: int):
 
     @flyc.kernel
     def swiglu_and_mul_kernel(
-        x: fx.Tensor,      # (rows, inter_dim*2) bf16, interleaved layout
-        out: fx.Tensor,     # (rows, inter_dim)   bf16
+        x: fx.Tensor,  # (rows, inter_dim*2) bf16, interleaved layout
+        out: fx.Tensor,  # (rows, inter_dim)   bf16
         num_rows: Int32,
     ):
         bid = fx.block_idx.x
@@ -130,8 +126,12 @@ def build_swiglu_and_mul_module(inter_dim: int):
                         # byte offset -> dword offset for buffer_load
                         gate_byte_off = gate_col * arith.constant(elem_bytes, type=i32)
                         up_byte_off = up_col * arith.constant(elem_bytes, type=i32)
-                        gate_dw_off = in_row_dw_base + (gate_byte_off >> arith.constant(2, type=i32))
-                        up_dw_off = in_row_dw_base + (up_byte_off >> arith.constant(2, type=i32))
+                        gate_dw_off = in_row_dw_base + (
+                            gate_byte_off >> arith.constant(2, type=i32)
+                        )
+                        up_dw_off = in_row_dw_base + (
+                            up_byte_off >> arith.constant(2, type=i32)
+                        )
 
                         gate_raw_dw = buffer_ops.buffer_load(
                             in_rsrc, gate_dw_off, vec_width=1, dtype=i32
@@ -141,20 +141,36 @@ def build_swiglu_and_mul_module(inter_dim: int):
                         )
 
                         # Extract correct bf16 half from dword
-                        gate_is_hi = (gate_byte_off >> arith.constant(1, type=i32)) & arith.constant(1, type=i32)
-                        up_is_hi = (up_byte_off >> arith.constant(1, type=i32)) & arith.constant(1, type=i32)
+                        gate_is_hi = (
+                            gate_byte_off >> arith.constant(1, type=i32)
+                        ) & arith.constant(1, type=i32)
+                        up_is_hi = (
+                            up_byte_off >> arith.constant(1, type=i32)
+                        ) & arith.constant(1, type=i32)
 
-                        gate_shifted = gate_raw_dw >> (gate_is_hi * arith.constant(16, type=i32))
-                        up_shifted = up_raw_dw >> (up_is_hi * arith.constant(16, type=i32))
+                        gate_shifted = gate_raw_dw >> (
+                            gate_is_hi * arith.constant(16, type=i32)
+                        )
+                        up_shifted = up_raw_dw >> (
+                            up_is_hi * arith.constant(16, type=i32)
+                        )
 
                         mask16 = arith.constant(0xFFFF, type=i32)
                         # Place bf16 in upper 16 bits of f32 (bf16 -> f32 bitcast)
-                        g_f32 = arith.bitcast(f32, (gate_shifted & mask16) << arith.constant(16, type=i32))
-                        u_f32 = arith.bitcast(f32, (up_shifted & mask16) << arith.constant(16, type=i32))
+                        g_f32 = arith.bitcast(
+                            f32, (gate_shifted & mask16) << arith.constant(16, type=i32)
+                        )
+                        u_f32 = arith.bitcast(
+                            f32, (up_shifted & mask16) << arith.constant(16, type=i32)
+                        )
 
                         r = _swiglu_scalar(
-                            g_f32, u_f32, limit_f32, neg_limit_f32,
-                            neg_alpha_log2e, c1_f32
+                            g_f32,
+                            u_f32,
+                            limit_f32,
+                            neg_limit_f32,
+                            neg_alpha_log2e,
+                            c1_f32,
                         )
                         r_bf16 = arith.trunc_f(T.bf16, r)
                         r_i16 = arith.bitcast(T.i16, r_bf16)
