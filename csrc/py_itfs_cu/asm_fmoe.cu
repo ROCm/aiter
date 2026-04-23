@@ -71,8 +71,7 @@ struct __attribute__((packed)) KernelArgs
 class FMoeKernel
 {
     private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
+    AiterAsmKernel kernel;
     uint32_t sub_GU             = 512;
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
@@ -82,9 +81,8 @@ class FMoeKernel
     FMoeKernel(const char* name,
                const char* hsaco,
                uint32_t sub_GU             = 512,
-               uint32_t num_persistent_tgs = 0)
+               uint32_t num_persistent_tgs = 0) : kernel(name, hsaco)
     {
-        load_asm_kernel(name, hsaco, module, kernel_func);
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
@@ -180,11 +178,6 @@ class FMoeKernel
         args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
         args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
 
-        void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
-                          &args,
-                          HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          &arg_size,
-                          HIP_LAUNCH_PARAM_END};
         int bdx;
         int gdx;
         int gdy;
@@ -208,13 +201,27 @@ class FMoeKernel
 
         if constexpr(switchGxy)
         {
-            HIP_CALL(hipModuleLaunchKernel(
-                kernel_func, gdy, gdx, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
+            kernel.launch_kernel({&args,
+                                  &arg_size,
+                                  gdy, // gdx
+                                  gdx, // gdy
+                                  gdz, // gdz
+                                  bdx, // bdx
+                                  1,   // bdy
+                                  1,   // bdz
+                                  stream});
         }
         else
         {
-            HIP_CALL(hipModuleLaunchKernel(
-                kernel_func, gdx, gdy, gdz, bdx, 1, 1, 0, stream, nullptr, (void**)&config));
+            kernel.launch_kernel({&args,
+                                  &arg_size,
+                                  gdx, // gdx
+                                  gdy, // gdy
+                                  gdz, // gdz
+                                  bdx, // bdx
+                                  1,   // bdy
+                                  1,   // bdz
+                                  stream});
         }
     };
 };
@@ -231,7 +238,7 @@ FMoeKernel* get_heuristic_kernel(
     std::string arch_id         = get_gpu_arch();
     std::string selectedKl      = kernel_name.empty() ? "" : arch_id + kernel_name;
     int vskip                   = 1;
-    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, FMoeKernel> impl_ptr_map;
 
     const char* vs_env_value = std::getenv("AITER_ENABLE_VSKIP");
     if(vs_env_value != nullptr && std::string(vs_env_value) == "0")
@@ -285,15 +292,13 @@ FMoeKernel* get_heuristic_kernel(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
-        auto result         = impl_ptr_map.emplace(name, nullptr);
         if(cfg.ps == 1)
             num_persistent_tgs = cfg.tg_num_perCU * num_cu;
         else
             num_persistent_tgs = 0;
-        if(result.second)
-            result.first->second =
-                std::make_unique<FMoeKernel>(name, co_name, cfg.subGU_n, num_persistent_tgs);
-        impl_ptr = result.first->second.get();
+
+        impl_ptr = &impl_ptr_map.get_or_create(
+            name, [&]() { return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs); });
     }
     else
         AITER_CHECK(false, __func__, " not find kernel " + selectedKl);
@@ -406,7 +411,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     ActivationType act = static_cast<ActivationType>(activation);
     FMoeKernel* impl_ptr = nullptr;
     int inter_dim        = down->size(2);
-    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, FMoeKernel> impl_ptr_map;
 
     struct FMoeKernelConfig
     {
@@ -482,13 +487,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             const char* name    = config.name.c_str();
             const char* co_name = config.co_name.c_str();
 
-            auto result = impl_ptr_map.emplace(name, nullptr);
-            if(result.second)
-            {
-                result.first->second =
-                    std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
-            }
-            impl_ptr = result.first->second.get();
+            impl_ptr = &impl_ptr_map.get_or_create(
+                name, [&]() { return FMoeKernel(name, co_name, config.tile_size); });
         }
     }
     impl_ptr->launch_kernel<1, 2>(out,
@@ -545,7 +545,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     int inter_dim        = down->size(2);
     inter_dim *= model_dim / gate->size(2);
     int sub_X_cnt = sorted_expert_ids->size(0);
-    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+    static SynchronizedCache<std::string_view, FMoeKernel> impl_ptr_map;
     std::string kernel_name_str = kernel_name ? kernel_name : "";
 
     if(gate->dtype() == AITER_DTYPE_u32 || gate->dtype() == AITER_DTYPE_i32) // int4

@@ -201,6 +201,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                 ? 2
                 : 1; // determined by scale shuffle pattern
 
+        static_assert(!FlatmmConfig::TiledMMAPermuteN,
+                      "TiledMMAPermuteN=true requires PermuteNEpilogue, not CShuffleEpilogue");
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ComputeDataType,
                                              ComputeDataType,
@@ -221,7 +223,6 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                              FlatmmConfig::NumWaveGroups,
                                              false,
                                              1,
-                                             FlatmmConfig::TiledMMAPermuteN,
                                              BlockedXDLN_PerWarp>>;
 
         using CodegenFlatmmPipeline = std::conditional_t<

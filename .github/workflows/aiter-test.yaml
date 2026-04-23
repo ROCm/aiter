@@ -17,7 +17,8 @@ on:
     - cron: '0 22 * * *'  # 6:00 AM Beijing Time (UTC+8)
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Keep scheduled main runs from blocking push-triggered validation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -53,6 +54,10 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         uses: actions/checkout@v4
 
+      - name: Docker login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
       # - name: Prepare docker config
       #   run: |
       #     export DOCKER_CONFIG="$HOME/.docker"
@@ -71,7 +76,7 @@ jobs:
           RUN pip install --upgrade pandas zmq einops numpy==1.26.2
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip install --upgrade "ninja>=1.11.1"
-          RUN pip install --upgrade "setuptools_scm<9"
+          RUN pip install --upgrade setuptools_scm
           RUN pip install tabulate
           RUN pip list
 
@@ -92,8 +97,8 @@ jobs:
                 echo "Pinned CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"; \
               fi \
            && pip install -r requirements.txt \
-           && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }} and PREBUILD_KERNELS: 1" \
-           && PREBUILD_KERNELS=1 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
+           && echo "Prebuilding kernels with GPU_ARCHS: ${{ env.GPU_ARCH_LIST }}, PREBUILD_KERNELS: 1, and MAX_JOBS: 128" \
+           && PREBUILD_KERNELS=1 MAX_JOBS=128 GPU_ARCHS="${{ env.GPU_ARCH_LIST }}" python setup.py bdist_wheel \
            && pip install dist/*.whl \
            && echo "Prebuilding kernels completed"
 
@@ -128,7 +133,6 @@ jobs:
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
-          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           docker push $IMAGE_TAG
 
       - name: Success message
@@ -155,6 +159,7 @@ jobs:
         with:
           name: aiter-whl-main-${{ github.run_id }}
           path: dist/*.whl
+          retention-days: 14
 
       - name: Configure AWS credentials
         if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
@@ -173,7 +178,7 @@ jobs:
             rm -rf awscliv2.zip aws
           fi
 
-      - name: Upload wheels to S3
+      - name: Upload wheels and latest main manifest to S3
         if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
         run: |
           for WHL in dist/*.whl; do
@@ -182,6 +187,25 @@ jobs:
             aws s3 cp ${WHL} s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/${WHL_NAME}
           done
           echo "Wheels uploaded to S3 staging"
+
+          MANIFEST_WHL=$(ls -t dist/amd_aiter*.whl 2>/dev/null | head -1)
+          if [ -z "$MANIFEST_WHL" ]; then
+            echo "ERROR: No amd_aiter wheel found in dist/"
+            exit 1
+          fi
+
+          MANIFEST_WHL_NAME=$(basename "$MANIFEST_WHL")
+          MANIFEST_WHL_URL="https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950/${MANIFEST_WHL_NAME}"
+          MANIFEST_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          python3 -c "import json, pathlib, sys; pathlib.Path('latest-main-wheel.json').write_text(json.dumps({'branch': sys.argv[1], 'timestamp': sys.argv[2], 'commit': sys.argv[3], 'wheel_name': sys.argv[4], 'wheel_url': sys.argv[5]}, indent=2) + '\n', encoding='utf-8')" \
+            "$GITHUB_REF_NAME" "$MANIFEST_TIMESTAMP" "$GITHUB_SHA" "$MANIFEST_WHL_NAME" "$MANIFEST_WHL_URL"
+
+          aws s3 cp latest-main-wheel.json \
+            s3://framework-whls-nightlies/whl-staging/gfx942-gfx950/main/latest.json \
+            --content-type application/json
+
+          echo "Uploaded latest main wheel manifest for ${MANIFEST_WHL_NAME}"
 
   split_aiter_tests:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
@@ -201,6 +225,7 @@ jobs:
         with:
           name: aiter_shards
           path: aiter_shard_*.list
+          retention-days: 7
 
   standard:
     if: >-
@@ -232,24 +257,24 @@ jobs:
             label: MI35X
             shard_total: 5
             shard_idx: 4
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
             shard_total: 5
             shard_idx: 0
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
             shard_total: 5
             shard_idx: 1
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
             shard_total: 5
             shard_idx: 2
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
             shard_total: 5
             shard_idx: 3
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
             shard_total: 5
             shard_idx: 4
     runs-on: ${{ matrix.runner }}
@@ -380,6 +405,7 @@ jobs:
         with:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
           path: latest_test.log
+          retention-days: 7
 
       - name: Cleanup container
         if: always()
@@ -410,7 +436,7 @@ jobs:
           echo "Checking Standard Test Results..."
           all_passed=true
           for shard in {0..4}; do
-            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
+            for runner in {linux-aiter-mi35x-1,linux-aiter-mi300x-1}; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
@@ -435,8 +461,8 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-8
             label: MI35X
-          - runner: aiter-8gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-8
+            label: MI300X
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -508,6 +534,7 @@ jobs:
         with:
           name: multigpu-test-${{ matrix.runner }}
           path: latest_test.log
+          retention-days: 7
 
       - name: Cleanup container
         if: always()

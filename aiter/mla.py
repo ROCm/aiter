@@ -20,7 +20,8 @@ import os
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,
+    O,  # noqa: E741
+    Final_lse,
     qo_indptr,
     kv_indptr,
     num_kv_splits_indptr,
@@ -29,7 +30,9 @@ def _fwd_kernel_stage2_asm(
     stride_mid_os: tl.int64,
     stride_obs: tl.int64,
     stride_oh: tl.int64,
+    stride_lse_bs: tl.int64,
     MAYBE_FINAL_OUT: tl.constexpr,
+    HAS_FINAL_LSE: tl.constexpr,
     BATCH_NUM: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -57,7 +60,6 @@ def _fwd_kernel_stage2_asm(
         if FINAL_OUT:
             input_ptr = Mid_O.to(tl.pointer_type(O.type.element_ty))
             out = tl.load(
-                # input_ptr + offs_v + stride_mid_ob * Lv,
                 input_ptr
                 + Lv * (cur_qo * stride_mid_os + cur_head * stride_mid_oh)
                 + offs_d,
@@ -96,6 +98,11 @@ def _fwd_kernel_stage2_asm(
                 acc / e_sum,
                 mask=mask_d,
             )
+            if HAS_FINAL_LSE:
+                tl.store(
+                    Final_lse + cur_qo * stride_lse_bs + cur_head,
+                    e_max + tl.log(e_sum),
+                )
 
 
 @functools.lru_cache()
@@ -205,6 +212,12 @@ def mla_decode_fwd(
             if (
                 nhead == 128 and q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8
             )
+            or (
+                nhead == 64
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+                and max_seqlen_q == 1
+            )
             else mgc
         )
 
@@ -232,7 +245,11 @@ def mla_decode_fwd(
         attn_lse = torch.empty(
             (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
-        final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        final_lse = (
+            torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+            if return_lse
+            else None
+        )
 
         aiter.mla_decode_stage1_asm_fwd(
             q,
@@ -252,31 +269,34 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
-            None,
+            final_lse,
             q_scale,
             kv_scale,
         )
 
         if num_kv_splits == 1 and (
-            q.dtype == dtypes.fp8
-            or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
-            or (
-                q.dtype == dtypes.bf16
-                and kv_buffer.dtype == dtypes.bf16
-                and nhead in [32, 64]
-            )
+            q.dtype == dtypes.fp8 or (q.dtype == dtypes.bf16 and max_seqlen_q == 4)
         ):
-            return logits.view(total_s, nhead, v_head_dim), attn_lse
+            lse = final_lse if return_lse else attn_lse
+            return logits.view(total_s, nhead, v_head_dim), lse
 
         Lv = v_head_dim
         BLOCK_DV = triton.next_power_of_2(Lv)
         grid = (bs, nhead)
         extra_kargs = {"waves_per_eu": 4}
 
+        has_final_lse = final_lse is not None
+        final_lse_buf = (
+            final_lse
+            if has_final_lse
+            else torch.empty((1,), dtype=dtypes.fp32, device=device)
+        )
+
         _fwd_kernel_stage2_asm[grid](
             logits,
             attn_lse,
             o,
+            final_lse_buf,
             qo_indptr,
             kv_indptr,
             num_kv_splits_indptr,
@@ -285,7 +305,9 @@ def mla_decode_fwd(
             attn_lse.stride(1),
             o.stride(0),
             o.stride(1),
+            final_lse_buf.stride(0) if has_final_lse else 0,
             MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
+            HAS_FINAL_LSE=has_final_lse,
             BATCH_NUM=bs,
             BLOCK_DV=BLOCK_DV,
             Lv=Lv,
@@ -311,6 +333,19 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 4
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead == 32
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and max_seqlen_q == 2
+            )
+            or (
+                get_gfx() == "gfx950"
+                and nhead * max_seqlen_q % 128 == 0
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
             )
             or (
                 get_gfx() == "gfx950"
@@ -505,11 +540,10 @@ def mla_prefill_fwd(
     num_kv_splits=None,  # for experts only!!!
 ):
     device = q.device
+    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
-
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     bs, nhead, v_head_dim = o.shape
 
     num_kv_splits = 1
