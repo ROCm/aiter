@@ -36,16 +36,6 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.moe_kernels import (
-    compile_flydsl_moe_stage1,
-    compile_flydsl_moe_stage2,
-    get_flydsl_kernel_params,
-    _run_compiled,
-    _s1_args_fp4,
-    _s1_args_std,
-    _s2_args_fp4,
-    _s2_args_std,
-)
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -66,6 +56,7 @@ def parse_csv(csv_path: str):
     """
     jobs = []
     seen = set()
+    get_flydsl_kernel_params = None
 
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
@@ -95,6 +86,9 @@ def parse_csv(csv_path: str):
                 if key in seen:
                     continue
                 seen.add(key)
+
+                if get_flydsl_kernel_params is None:
+                    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
                 params = get_flydsl_kernel_params(name)
                 if params is None:
@@ -159,6 +153,13 @@ def _precompile_to_cache(
         get_cu_num.cache_clear()
 
         if stage == 1:
+            from aiter.ops.flydsl.moe_kernels import (
+                _run_compiled,
+                _s1_args_fp4,
+                _s1_args_std,
+                compile_flydsl_moe_stage1,
+            )
+
             _is_splitk = k_batch > 1
             n_in = inter_dim * 2 if is_fp4 else inter_dim
             k_in = model_dim
@@ -239,6 +240,13 @@ def _precompile_to_cache(
             _run_compiled(exe, args)
 
         elif stage == 2:
+            from aiter.ops.flydsl.moe_kernels import (
+                _run_compiled,
+                _s2_args_fp4,
+                _s2_args_std,
+                compile_flydsl_moe_stage2,
+            )
+
             accumulate = mode != "reduce"
             _persist_m = -1 if persist else 4
             n_in = model_dim

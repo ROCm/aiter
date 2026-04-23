@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
-from ..jit.core import compile_ops
 from ..ops.enum import QuantType, ActivationType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse

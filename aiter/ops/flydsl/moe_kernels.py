@@ -7,11 +7,16 @@ import functools
 import re
 
 from typing import Dict, Optional
-from aiter.utility import dtypes
 
 import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
+
+
+def _get_dtypes():
+    from aiter.utility import dtypes
+
+    return dtypes
 
 _SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
 
@@ -601,6 +606,7 @@ def flydsl_moe_stage1(
     _need_fp8 = out_dtype == "fp8"
     _fuse_any_quant = _need_fp4 or _need_fp8
     _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
+    dtypes = _get_dtypes()
 
     if _need_fp4:
         torch_out_dtype = dtypes.fp4x2
