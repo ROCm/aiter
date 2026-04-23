@@ -181,6 +181,8 @@ reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num
                          const slot_mapping_t* __restrict__ slot_mapping, // [num_tokens]
                          const int key_stride,
                          const int value_stride,
+                         const int64_t key_cache_stride0,
+                         const int64_t value_cache_stride0,
                          const int num_heads,
                          const int head_size,
                          const int block_size,
@@ -212,7 +214,7 @@ reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num
         const int x_idx       = head_offset / x;
         const int x_offset    = head_offset % x;
 
-        const int64_t tgt_key_idx = block_idx * num_heads * (head_size / x) * block_size * x +
+        const int64_t tgt_key_idx = block_idx * key_cache_stride0 +
                                     head_idx * (head_size / x) * block_size * x +
                                     x_idx * block_size * x + block_offset * x + x_offset;
         int64_t tgt_value_idx;
@@ -220,13 +222,13 @@ reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num
         { //[num_blocks, num_heads, block_size/X, head_size, X]
             const int x_idx_v    = block_offset / x;
             const int x_offset_v = block_offset % x;
-            tgt_value_idx        = block_idx * num_heads * head_size * block_size +
+            tgt_value_idx        = block_idx * value_cache_stride0 +
                             head_idx * head_size * block_size + x_idx_v * head_size * x +
                             head_offset * x + x_offset_v;
         }
         else
         { //[num_blocks, num_heads, head_size, block_size]
-            tgt_value_idx = block_idx * num_heads * head_size * block_size +
+            tgt_value_idx = block_idx * value_cache_stride0 +
                             head_idx * head_size * block_size + head_offset * block_size +
                             block_offset;
         }
@@ -334,6 +336,8 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const int64_t* __restrict__ slot_mapping,       // [num_tokens]
     const int key_stride,
     const int value_stride,
+    const int64_t k_cache_stride0,
+    const int64_t v_cache_stride0,
     const int num_heads,
     const int head_size,
     const int block_size,
@@ -451,7 +455,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
         const int x_idx    = i_d / x;
         const int x_offset = i_d % x;
 
-        const int64_t tgt_key_idx = block_idx * num_heads * (head_size / x) * block_size * x +
+        const int64_t tgt_key_idx = block_idx * k_cache_stride0 +
                                     head_idx * (head_size / x) * block_size * x +
                                     x_idx * block_size * x + block_offset * x + x_offset;
         int64_t tgt_value_idx;
@@ -459,13 +463,13 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
         { //[num_blocks, num_heads, block_size/X, head_size, X]
             const int x_idx_v    = block_offset / x;
             const int x_offset_v = block_offset % x;
-            tgt_value_idx        = block_idx * num_heads * head_size * block_size +
+            tgt_value_idx        = block_idx * v_cache_stride0 +
                             head_idx * head_size * block_size + x_idx_v * head_size * x + i_d * x +
                             x_offset_v;
         }
         else
         { //[num_blocks, num_heads, head_size, block_size]
-            tgt_value_idx = block_idx * num_heads * head_size * block_size +
+            tgt_value_idx = block_idx * v_cache_stride0 +
                             head_idx * head_size * block_size + i_d * block_size + block_offset;
         }
         key_cache[tgt_key_idx]     = opus::cast<cache_t>(k_local_dim[i]);
@@ -2601,6 +2605,8 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
                                      slot_mapping.data_ptr<int64_t>(),                           \
                                      key_stride,                                                 \
                                      value_stride,                                               \
+                                     k_cache_stride0,                                            \
+                                     v_cache_stride0,                                            \
                                      num_heads,                                                  \
                                      head_size,                                                  \
                                      block_size,                                                 \
@@ -2617,6 +2623,8 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
                                      slot_mapping.data_ptr<int64_t>(),                           \
                                      key_stride,                                                 \
                                      value_stride,                                               \
+                                     k_cache_stride0,                                            \
+                                     v_cache_stride0,                                            \
                                      num_heads,                                                  \
                                      head_size,                                                  \
                                      block_size,                                                 \
@@ -2645,6 +2653,9 @@ void reshape_and_cache(
 
     int key_stride   = key.stride(0);
     int value_stride = value.stride(0);
+
+    int64_t k_cache_stride0 = key_cache.stride(0);
+    int64_t v_cache_stride0 = value_cache.stride(0);
 
     dim3 grid(num_tokens);
     dim3 block(std::min(num_heads * head_size, 512));
@@ -2730,6 +2741,8 @@ void reshape_and_cache_flash(
                 slot_mapping.data_ptr<int64_t>(),                                                  \
                 key_stride,                                                                        \
                 value_stride,                                                                      \
+                k_cache_stride0,                                                                   \
+                v_cache_stride0,                                                                   \
                 num_heads,                                                                         \
                 head_size,                                                                         \
                 block_size,                                                                        \
@@ -2750,6 +2763,8 @@ void reshape_and_cache_flash(
                 slot_mapping.data_ptr<int64_t>(),                                                  \
                 key_stride,                                                                        \
                 value_stride,                                                                      \
+                k_cache_stride0,                                                                   \
+                v_cache_stride0,                                                                   \
                 num_heads,                                                                         \
                 head_size,                                                                         \
                 block_size,                                                                        \
@@ -3020,6 +3035,8 @@ void reshape_and_cache_with_pertoken_quant(
     int block_size    = key_cache.size(3);
     int x             = key_cache.size(4);
     int max_kv_tokens = k_dequant_scales.size(1);
+    int64_t k_cache_stride0 = key_cache.stride(0);
+    int64_t v_cache_stride0 = value_cache.stride(0);
     TORCH_CHECK(head_size <= 512, __func__, " Unsupported head_size: ", head_size);
 
     int key_stride   = key.stride(0);
