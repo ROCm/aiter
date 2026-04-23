@@ -41,20 +41,20 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    name: Sglang Integration Test (1 GPU)
+    name: Sglang Model E2E Test (8 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi300x-1
-            label: MI300X
+          - runner: linux-aiter-mi35x-8
+            label: MI35X
 
     env:
-      SGL_BRANCH: v0.5.10
-      GPU_ARCH: gfx942
-      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi325-gpu-1
+      SGL_BRANCH: v0.5.10.post1
+      GPU_ARCH: gfx950
+      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi35x-gpu-8
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -167,8 +167,10 @@ jobs:
         run: |
           cd "${SGLANG_WORKSPACE}"
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Install aiter under test
+        id: install_aiter_under_test
         run: |
           set -ex
           docker exec ci_sglang bash -lc "
@@ -185,15 +187,97 @@ jobs:
             pip show amd-aiter || pip show aiter
           "
 
-      - name: Evaluate Accuracy
-        timeout-minutes: 120
+      - name: Accuracy Test MI35x (8-GPU DeepSeek-R1-MXFP4)
+        id: deepseek_r1_mxfp4_accuracy
+        timeout-minutes: 130
+        continue-on-error: true
         run: |
           set -ex
           cd "${SGLANG_WORKSPACE}"
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" python3 -c 'import os; print({k: os.environ.get(k) for k in ("GPU_ARCHS", "SGLANG_USE_AITER")})'
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER=0 python3 registered/eval/test_eval_accuracy_large.py
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/quant/test_eval_fp8_accuracy.py
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/models/test_qwen_models.py
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 --nightly --timeout-per-file 7200 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x (8-GPU DeepSeek-R1-MXFP4)
+        id: deepseek_r1_mxfp4_perf
+        timeout-minutes: 180
+        continue-on-error: true
+        run: |
+          set -ex
+          cd "${SGLANG_WORKSPACE}"
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Accuracy + Performance Test MI35x (8-GPU Qwen3-235B-MXFP4)
+        id: qwen3_235b_mxfp4
+        timeout-minutes: 70
+        continue-on-error: true
+        run: |
+          set -ex
+          cd "${SGLANG_WORKSPACE}"
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-8-gpu-mi35x-qwen3-235b-mxfp4 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Accuracy Test MI35x (8-GPU DeepSeek-V3.2)
+        id: deepseek_v32_accuracy
+        timeout-minutes: 70
+        continue-on-error: true
+        run: |
+          set -ex
+          cd "${SGLANG_WORKSPACE}"
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x (8-GPU DeepSeek-V3.2 Basic)
+        id: deepseek_v32_perf
+        timeout-minutes: 100
+        continue-on-error: true
+        run: |
+          set -ex
+          cd "${SGLANG_WORKSPACE}"
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-basic --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Check model E2E results
+        if: ${{ always() && steps.install_aiter_under_test.conclusion == 'success' }}
+        run: |
+          failed=0
+
+          check_step() {
+            local name="$1"
+            local outcome="$2"
+            if [ "$outcome" != "success" ]; then
+              echo "Failed: $name ($outcome)"
+              failed=1
+            fi
+          }
+
+          check_step "deepseek-r1-mxfp4 accuracy" "${{ steps.deepseek_r1_mxfp4_accuracy.outcome }}"
+          check_step "deepseek-r1-mxfp4 perf" "${{ steps.deepseek_r1_mxfp4_perf.outcome }}"
+          check_step "qwen3-235b-mxfp4" "${{ steps.qwen3_235b_mxfp4.outcome }}"
+          check_step "deepseek-v32 accuracy" "${{ steps.deepseek_v32_accuracy.outcome }}"
+          check_step "deepseek-v32 perf" "${{ steps.deepseek_v32_perf.outcome }}"
+
+          exit $failed
 
       - name: Clean Up
         if: always()
