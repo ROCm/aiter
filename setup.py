@@ -326,7 +326,7 @@ if PREBUILD_KERNELS != 0:
                 core_args = one
             else:
                 rest.append(one)
-        
+
         if core_args is not None:
             build_one_module(core_args)
 
