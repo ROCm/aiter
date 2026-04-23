@@ -9,6 +9,17 @@ from contextlib import contextmanager
 import os
 from typing import Any, Callable, Iterator
 
+_CU_NUM_TO_ARCH = {
+    80: "gfx942",
+    304: "gfx942",
+    256: "gfx950",
+}
+
+
+def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
+    """Map compute-unit count to GPU architecture string."""
+    return _CU_NUM_TO_ARCH.get(cu_num, default)
+
 
 def job_identity(job: dict[str, Any]) -> tuple:
     return tuple(sorted(job.items()))

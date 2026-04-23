@@ -316,12 +316,7 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM in parallel, before CK) ---
-        for _name in list(sys.modules):
-            if _name == "jit" or _name.startswith("jit."):
-                _pkg = f"aiter.{_name}"
-                if _pkg not in sys.modules:
-                    sys.modules[_pkg] = sys.modules[_name]
-
+        sys.path.insert(0, this_dir)
         from aiter.aot.flydsl.common import start_aot, wait_aot
 
         flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")

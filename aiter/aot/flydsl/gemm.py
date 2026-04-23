@@ -41,6 +41,7 @@ import flydsl.expr as fx
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
+    cu_num_to_arch,
     job_identity,
     override_env,
 )
@@ -60,7 +61,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
 ]
-GEMM_AOT_ARCH = "gfx950"
+GEMM_AOT_ARCH_DEFAULT = "gfx950"
 
 _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
@@ -136,6 +137,7 @@ def parse_csv(csv_path: str):
             m = int(row["M"])
             n = int(row["N"])
             k = int(row["K"])
+            cu_num = int(row.get("cu_num", "0"))
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
@@ -158,6 +160,7 @@ def parse_csv(csv_path: str):
                 "m": m,
                 "n": n,
                 "k": k,
+                "cu_num": cu_num,
                 "has_bias": _parse_bool(row.get("bias")),
                 **params,
             }
@@ -309,25 +312,24 @@ def _compile_preshuffle_to_cache(
 
 
 def compile_one_config(
-    kernel_name: str, kind: str, m: int, n: int, k: int, **kwargs
+    kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
+    aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
         "kind": kind,
         "shape": shape_str,
         "compile_time": None,
-        "compile_arch": GEMM_AOT_ARCH,
+        "compile_arch": aot_arch,
     }
 
     t0 = time.time()
     try:
-        with override_env("ARCH", GEMM_AOT_ARCH), override_env(
-            "FLYDSL_GPU_ARCH", GEMM_AOT_ARCH
-        ):
+        with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
             if kind == "hgemm":
-                _compile_hgemm_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_hgemm_to_cache(m=m, n=n, k=k, target_gfx=aot_arch, **kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             else:
@@ -335,9 +337,9 @@ def compile_one_config(
 
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={GEMM_AOT_ARCH}")
+        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
     except Exception as e:
-        print(f"  [FAIL] compile  {shape_str}  arch={GEMM_AOT_ARCH}: {e}")
+        print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result
 
@@ -380,7 +382,7 @@ def main():
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
-    print(f"  Compile arch:     {GEMM_AOT_ARCH}")
+    print(f"  Compile arch:     (from cu_num)")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch}")
     print("=" * 72)
