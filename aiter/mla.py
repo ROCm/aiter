@@ -198,11 +198,21 @@ def mla_decode_fwd(
     # nhead in {16, 32, 128}.
     qseqlen_folded = False
 
-    # (removed legacy forced_head_pad branch - see note above.)
-    assert not (force_decode and nhead == 8), (
+    # PR 2852: gfx942 bf16 nhead=8 qlen=2 has a native kernel
+    # (mla_dec_stage1_bf16_a16w16_subQ16_mqa16_ps). All other nhead=8
+    # traffic must be pre-padded by the caller (SGLang _pad_mla_q_8_to_16).
+    natively_supported_nh8 = (
+        get_gfx() == "gfx942"
+        and nhead == 8
+        and q.dtype == dtypes.bf16
+        and kv_buffer.dtype == dtypes.bf16
+        and max_seqlen_q == 2
+    )
+    assert natively_supported_nh8 or not (force_decode and nhead == 8), (
         "mla_decode_fwd received nhead=8 but the legacy forced_head_pad "
-        "fallback has been removed.  The caller (e.g. SGLang AiterMlaBackend) "
-        "is now responsible for pre-padding q to nhead=16 before calling."
+        "fallback has been removed. The caller (SGLang AiterMlaBackend) "
+        "is responsible for pre-padding q to nhead=16, except for the "
+        "gfx942 bf16 qlen=2 native kernel (PR 2852)."
     )
 
     if not persistent_mode:
@@ -323,6 +333,13 @@ def mla_decode_fwd(
                 and q.dtype == dtypes.fp8
                 and kv_buffer.dtype == dtypes.fp8
                 and max_seqlen_q == 4
+            )
+            or (
+                get_gfx() == "gfx942"
+                and nhead == 8
+                and q.dtype == dtypes.bf16
+                and kv_buffer.dtype == dtypes.bf16
+                and max_seqlen_q == 2
             )
         ):
             # Natively support cases
