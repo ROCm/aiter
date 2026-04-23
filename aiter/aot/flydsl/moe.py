@@ -154,6 +154,7 @@ def _precompile_to_cache(
     with compile_only_env(), override_env("CU_NUM", _cu_num_str):
         # Clear cached CU count so get_cu_num() re-reads the env var.
         from aiter.jit.utils.chip_info import get_cu_num
+
         get_cu_num.cache_clear()
 
         if stage == 1:
