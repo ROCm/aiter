@@ -301,7 +301,8 @@ jobs:
           IMG="${BUILD_DOCKER_IMAGE}"
           ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.1 / rocm7.0
           ROCM_NUM="${ROCM_TAG#rocm}"      # 7.2
-          TORCH_INDEX="https://download.pytorch.org/whl/rocm${ROCM_NUM}"
+          # v0.1.12.post2 ABI-pinned to vllm/vllm-openai-rocm:v0.19.1 PyTorch (2.10 series, no c10::cuda::getCurrentCUDAStream symbol)
+          TORCH_INDEX="https://download.pytorch.org/whl/rocm7.1"
           echo "Torch index: ${TORCH_INDEX}"
           docker exec \
             -w /workspace \
@@ -311,7 +312,7 @@ jobs:
             bash -c '
               set -e
               ${PYBIN}/pip install --upgrade --timeout=60 --retries=10 pip
-              ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" torch
+              ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" "torch==2.10.0+rocm7.1"
               # flydsl publishes only manylinux_2_35 wheels which cannot install
               # on AlmaLinux 8 (glibc 2.28). FlyDSL AOT pre-compilation in
               # setup.py is wrapped in try/except and is skipped gracefully when
@@ -332,15 +333,12 @@ jobs:
           echo "Building aiter whl in pytorch/manylinux2_28-builder for Python ${PYTHON_VERSION}..."
 
           # Compose SETUPTOOLS_SCM_PRETEND_VERSION
-          if [ "${ADD_DATE_STAMP}" = "true" ] && [ -n "${{ steps.version.outputs.nightly_version }}" ]; then
-            BASE_VER="${{ steps.version.outputs.nightly_version }}"
-          else
-            BASE_VER="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.1.0)"
-          fi
+          # post2 + cherry-pick #2645 test build — version pinned for v0.1.12.post2.dev2645 dispatch from this side branch
+          BASE_VER="0.1.12.post2"
           # Tag the wheel so it is unambiguously the manylinux build
           IMG="${BUILD_DOCKER_IMAGE}"
           ROCM_TAG="${IMG##*:}"
-          PRETEND_VER="${BASE_VER}+${ROCM_TAG}.manylinux_2_28"
+          PRETEND_VER="${BASE_VER}+${ROCM_TAG}.manylinux_2_28.torch210"
           echo "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VER}"
 
           docker exec \
