@@ -74,6 +74,7 @@ def parse_csv(csv_path: str):
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
+            cu_num = int(row.get("cu_num", "0"))
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -87,6 +88,7 @@ def parse_csv(csv_path: str):
                     "experts": experts,
                     "topk": topk,
                     "doweight_stage1": doweight_stage1,
+                    "cu_num": cu_num,
                 }
                 key = job_identity(job)
                 if key in seen:
@@ -123,6 +125,7 @@ def _precompile_to_cache(
     mode: str = "atomic",
     persist: bool = False,
     sort_block_m: int = 0,
+    cu_num: int = 0,
     **kwargs,
 ):
     """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
@@ -147,7 +150,12 @@ def _precompile_to_cache(
     num_valid_ids = torch.zeros(1, device=dev, dtype=torch.int32)
     sw = torch.zeros(tokens * topk, device=dev, dtype=torch.float32)
 
-    with compile_only_env():
+    _cu_num_str = str(cu_num) if cu_num > 0 else None
+    with compile_only_env(), override_env("CU_NUM", _cu_num_str):
+        # Clear cached CU count so get_cu_num() re-reads the env var.
+        from aiter.jit.utils.chip_info import get_cu_num
+        get_cu_num.cache_clear()
+
         if stage == 1:
             _is_splitk = k_batch > 1
             n_in = inter_dim * 2 if is_fp4 else inter_dim
