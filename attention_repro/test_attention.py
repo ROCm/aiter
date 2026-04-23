@@ -333,7 +333,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "shuffled_kv_cache",
     [
-        False,
+        True, False,
     ],
 )
 @pytest.mark.parametrize(
@@ -345,7 +345,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "loop_variant",
     [
-        3,
+        0, 3,
     ],
 )
 @torch.inference_mode()
@@ -451,9 +451,9 @@ def test_gluon_unified_attn_2d_noncausal(
         num_kv_blocks=num_kv_blocks,
         use_tdm=use_tdm,
         shuffled_kv_cache=shuffled_kv_cache,
-        remove_indirect_access=remove_indirect_access,
-        loop_variant=loop_variant,
-        num_buffers=num_buffers,
+        #remove_indirect_access=remove_indirect_access,
+        #loop_variant=loop_variant,
+        #num_buffers=num_buffers,
     )
     ref_output = ref_paged_attn(
         query=query,

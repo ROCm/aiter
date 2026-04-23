@@ -3119,7 +3119,6 @@ def unified_attention(
     ARCH_NAME = arch_info.get_arch()
 
     assert softcap == 0, "Softcap is not supported"
-    assert num_buffers == 2 or num_buffers == 3, "num_buffers should be either 2 or 3"
     if shuffled_kv_cache:
         assert ARCH_NAME == "gfx1250", "Only gfx1250 supported for KV cache preshuffling"
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
@@ -3152,6 +3151,9 @@ def unified_attention(
         TILE_SIZE = BLOCK_SIZE
         num_buffers = 3
         use_tdm = 1
+        waves_per_eu = 1
+    assert num_buffers == 2 or num_buffers == 3, "num_buffers should be either 2 or 3"
+
     TILE_SIZE = BLOCK_SIZE * num_kv_blocks
     BLOCK_M = block_m
     SLIDING_WINDOW = 1 + window_size[0]
