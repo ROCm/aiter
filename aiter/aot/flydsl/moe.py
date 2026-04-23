@@ -134,9 +134,8 @@ def _precompile_to_cache(
     """
     import torch
 
-    _has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if _has_cuda else torch.device("cpu")
-    _stream = torch.cuda.current_stream() if _has_cuda else 0
+    dev = torch.device("cpu")
+    _stream = 0
     is_fp4 = b_dtype == "fp4"
     tokens = tile_m
     E = experts
@@ -328,7 +327,7 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", MOE_AOT_ARCH):
+        with override_env("ARCH", MOE_AOT_ARCH), override_env("FLYDSL_GPU_ARCH", MOE_AOT_ARCH):
             _precompile_to_cache(
                 model_dim=model_dim,
                 inter_dim=inter_dim,

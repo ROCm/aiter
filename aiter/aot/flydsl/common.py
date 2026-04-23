@@ -49,7 +49,7 @@ def compile_only_env() -> Iterator[None]:
 
     _dlpack_patched = False
     _orig_dlpack = None
-    if not torch.cuda.is_available():
+    if not (torch.cuda.is_available() and torch.cuda.device_count() > 0):
         _orig_dlpack = torch.Tensor.__dlpack__
 
         def _cpu_safe_dlpack(self, *args, **kwargs):
@@ -79,6 +79,14 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
         os.environ.pop(var_name, None)
     else:
         os.environ[var_name] = value
+
+    if var_name in ("FLYDSL_GPU_ARCH", "HSA_OVERRIDE_GFX_VERSION"):
+        try:
+            from flydsl.runtime.device import get_rocm_arch
+            get_rocm_arch.cache_clear()
+        except (ImportError, AttributeError):
+            pass
+
     try:
         yield
     finally:
@@ -86,3 +94,10 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ.pop(var_name, None)
         else:
             os.environ[var_name] = prev
+
+        if var_name in ("FLYDSL_GPU_ARCH", "HSA_OVERRIDE_GFX_VERSION"):
+            try:
+                from flydsl.runtime.device import get_rocm_arch
+                get_rocm_arch.cache_clear()
+            except (ImportError, AttributeError):
+                pass
