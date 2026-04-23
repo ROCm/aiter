@@ -211,7 +211,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((gfx, cu_num, M, N, K), kernel_idx, splitK, "")
+                    info = ((gfx, cu_num, M, N, K), i, splitK, "")
                     task.append(
                         (
                             info,
