@@ -2,12 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import os
+from contextlib import contextmanager
 from typing import Union
 
 import torch
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
+
+# Match CustomAllreduce default (8 MB).
+_DEFAULT_MAX_SIZE = 8 * 1024 * 1024
 
 
 def _iris_available() -> bool:
@@ -29,35 +33,41 @@ def _rocm_arch_available() -> bool:
 
 
 class AiterCommunicator:
-    """
-    Aiter communicator using Iris CCL GPU-initiated communication.
+    """Aiter communicator using Iris CCL GPU-initiated communication.
 
-    Uses the Iris symmetric heap for collective operations. Input tensors
-    are copied into symmetric heap buffers, reduced, and copied back.
+    API mirrors CustomAllreduce: __init__(group, device, max_size),
+    should_allreduce, all_reduce (out-of-place), capture, plus disabled.
     """
 
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     _HEAP_SIZE = 2**33  # 8 GB
-    _MAX_NUM_TOKENS = 512
 
     def __init__(
         self,
+        group: ProcessGroup,
         device: Union[int, str, torch.device],
+        max_size: int = _DEFAULT_MAX_SIZE,
     ) -> None:
         self.disabled = True
+        self.group = group
+        self.max_size = max_size
+        self._IS_CAPTURING = False
         self._shmem = None
         self._workspace = None
-
-        # Copy-path buffers
         self._input_buf = None
         self._buf_shape = None
         self._buf_dtype = None
-        self._realloc_count = 0
-        self._call_count = 0
+
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+        assert isinstance(device, torch.device)
+        self.device = device
 
         if not _rocm_arch_available():
-            logger.debug("Allreduce only supported on ROCm MI300/MI350 series.")
+            logger.debug("AiterCommunicator disabled: unsupported ROCm arch")
             return
 
         if not _iris_available():
@@ -67,80 +77,47 @@ class AiterCommunicator:
         try:
             import iris
 
-            self._shmem = iris.iris(
-                heap_size=self._HEAP_SIZE,
-            )
+            self._shmem = iris.iris(heap_size=self._HEAP_SIZE)
         except Exception as e:
             logger.warning("Failed to initialize Allreduce: %s", e)
             return
 
         world_size = self._shmem.num_ranks
-
         if world_size not in self._SUPPORTED_WORLD_SIZES:
-            logger.debug("Allreduce not supported for world_size=%d", world_size)
+            logger.debug(
+                "AiterCommunicator disabled: world_size=%d not in %s",
+                world_size,
+                self._SUPPORTED_WORLD_SIZES,
+            )
             return
 
         self.disabled = False
-
-        if os.environ.get("AITER_COMMS_PROBE_HEAP_ALLOC") == "1":
-            try:
-                probe = self._shmem.empty((1, 8192), dtype=torch.float16)
-                logger.debug(
-                    "[AiterCommunicator] probe heap alloc OK (refresh_peer_access triggered) data_ptr=%x",
-                    probe.data_ptr(),
-                )
-                workspace = self._shmem.ccl.all_reduce_preamble(probe, probe)
-                logger.debug(
-                    "[AiterCommunicator] probe preamble OK workspace=%s",
-                    type(workspace).__name__,
-                )
-                workspace = self._shmem.ccl.all_reduce(probe, probe, workspace=workspace)
-                logger.debug("[AiterCommunicator] probe all_reduce OK")
-                del probe, workspace
-            except Exception as e:
-                logger.debug("[AiterCommunicator] probe FAILED: %s", e)
+        logger.info(
+            "AiterCommunicator ready: world_size=%d heap=%dGB max_size=%dMB",
+            world_size,
+            self._HEAP_SIZE >> 30,
+            self.max_size >> 20,
+        )
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self.disabled or self._shmem is None:
-            logger.debug("[AiterCommunicator] reject: disabled=%s shmem=%s", self.disabled, self._shmem is not None)
-            return False
-        if os.environ.get("AITER_COMMS_FORCE_FALLBACK") == "1":
-            logger.debug("[AiterCommunicator] reject: AITER_COMMS_FORCE_FALLBACK=1")
-            return False
-        if inp.dtype not in self._SUPPORTED_DTYPES:
-            logger.debug("[AiterCommunicator] reject: dtype=%s", inp.dtype)
             return False
         if not inp.is_contiguous():
-            logger.debug("[AiterCommunicator] reject: noncontig shape=%s", tuple(inp.shape))
             return False
-        # if inp.shape[0] > self._MAX_NUM_TOKENS:
-        #     return False
-        buf_size = inp.numel() * inp.element_size()
-        if buf_size * 2 > self._HEAP_SIZE:
-            logger.debug("[AiterCommunicator] reject: oversize buf=%d heap=%d", buf_size, self._HEAP_SIZE)
+        inp_size = inp.numel() * inp.element_size()
+        if inp_size % 16 != 0:
+            return False
+        if inp_size >= self.max_size:
+            return False
+        if inp.dtype not in self._SUPPORTED_DTYPES:
+            return False
+        if inp_size * 2 > self._HEAP_SIZE:
             return False
         return True
 
-    def _validate_input(self, inp: torch.Tensor) -> None:
-        """Validate tensor before allreduce."""
-        assert self._shmem is not None, "Communicator not initialized"
-        assert inp.is_cuda, f"Input must be on GPU, got {inp.device}"
-        assert inp.is_contiguous(), "Input must be contiguous"
-        assert inp.dtype in self._SUPPORTED_DTYPES, f"Unsupported dtype: {inp.dtype}"
-
     def _get_buffers(self, shape, dtype):
-        """Get or allocate symmetric heap buffers. Reuses if shape/dtype match."""
-        self._call_count += 1
         if self._buf_shape != shape or self._buf_dtype != dtype:
-            self._realloc_count += 1
-            logger.debug(
-                "[AiterCommunicator] _get_buffers REALLOC #%d (call #%d) old=%s new=%s dtype=%s",
-                self._realloc_count,
-                self._call_count,
-                self._buf_shape,
-                tuple(shape),
-                dtype,
-            )
+            assert self._shmem is not None
             self._input_buf = self._shmem.empty(shape, dtype=dtype)
             self._buf_shape = shape
             self._buf_dtype = dtype
@@ -148,28 +125,39 @@ class AiterCommunicator:
         return self._input_buf
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        self._validate_input(inp)
+        # Out-of-place: stage into symmetric heap buffer, reduce in place
+        # there, copy back to a fresh output. Matches CustomAllreduce.
+        assert self._shmem is not None
         try:
+            out = torch.empty_like(inp)
             input_buf = self._get_buffers(inp.shape, inp.dtype)
             input_buf.copy_(inp)
 
             if self._workspace is None:
                 self._workspace = self._shmem.ccl.all_reduce_preamble(
-                    input_buf,
-                    input_buf,
+                    input_buf, input_buf
                 )
             self._workspace = self._shmem.ccl.all_reduce(
                 input_buf, input_buf, workspace=self._workspace, async_op=True
             )
 
-            inp.copy_(input_buf)
-            return inp
+            out.copy_(input_buf)
+            return out
         except Exception as e:
             logger.error(
-                "[AiterCommunicator] all_reduce raised shape=%s dtype=%s capturing=%s: %s",
+                "AiterCommunicator.all_reduce failed: shape=%s dtype=%s "
+                "capturing=%s err=%s",
                 tuple(inp.shape),
                 inp.dtype,
                 torch.cuda.is_current_stream_capturing(),
                 e,
             )
             raise
+
+    @contextmanager
+    def capture(self):
+        try:
+            self._IS_CAPTURING = True
+            yield
+        finally:
+            self._IS_CAPTURING = False
