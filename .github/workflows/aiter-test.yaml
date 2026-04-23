@@ -27,6 +27,7 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   AITER_TEST: "op_tests"
+  AITER_SKIP_PERF: ${{ github.event_name == 'pull_request' && '1' || '0' }}
 
 jobs:
   check-signal:
@@ -382,11 +383,13 @@ jobs:
           set -ex
           if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
             docker exec \
+            -e AITER_SKIP_PERF=${{ env.AITER_SKIP_PERF }} \
             -w /workspace \
             aiter_test \
             bash -c "MAX_JOBS=64 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
           else
             docker exec \
+            -e AITER_SKIP_PERF=${{ env.AITER_SKIP_PERF }} \
             -w /workspace \
             aiter_test \
             bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
@@ -523,6 +526,7 @@ jobs:
         run: |
           set -ex
           docker exec \
+          -e AITER_SKIP_PERF=${{ env.AITER_SKIP_PERF }} \
           -e MULTIGPU=TRUE \
           -w /workspace \
           aiter_test \
