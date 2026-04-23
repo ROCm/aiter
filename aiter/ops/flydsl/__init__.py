@@ -38,7 +38,6 @@ if is_flydsl_available():
         flydsl_moe_stage1,
         flydsl_moe_stage2,
     )
-
     from .rmsnorm import(
             flydsl_rmsnorm
     )

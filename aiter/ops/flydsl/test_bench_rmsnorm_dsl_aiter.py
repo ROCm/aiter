@@ -90,10 +90,10 @@ def _check_result(
     max_delta = (ref_f - test_f).abs().max().item()
     close_mask = torch.isclose(ref_f, test_f, atol=atol, rtol=rtol)
     pct_close = close_mask.float().mean().item() * 100.0
-    passed = pct_close >= pass_pct
+    passed = close_mask.all().item()
 
     print(
-        f"  max_delta={max_delta:.6f}, {pct_close:.2f}% close (atol={atol}, rtol={rtol})"
+        f"  max_delta={max_delta:.6f}, {pct_close:.2f}% close (atol={atol}, rtol={rtol}) "
     )
     print(f"  ref  sample:  {ref_f.reshape(-1)[:8]}")
     print(f"  test sample: {test_f.reshape(-1)[:8]}")
@@ -102,7 +102,7 @@ def _check_result(
     return passed, max_delta, pct_close
 
 
-def _bench_gpu_us(fn, warmup=20, iters=100):
+def _bench_gpu_us(fn, warmup=20, iters=500):
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -205,10 +205,10 @@ def bench_aiter_vs_flydsl(
 
     def run_flydsl():
         flydsl_rmsnorm(x, gamma, eps)
-
-    aiter_us = _bench_gpu_us(run_aiter, warmup=warmup, iters=iters)
-    flydsl_us = _bench_gpu_us(run_flydsl, warmup=warmup, iters=iters)
-
+    with torch.inference_mode():
+        aiter_us = _bench_gpu_us(run_aiter, warmup=warmup, iters=iters)
+        flydsl_us = _bench_gpu_us(run_flydsl, warmup=warmup, iters=iters)
+    torch.cuda.synchronize()
     speedup = aiter_us / flydsl_us if flydsl_us > 0 else float("inf")
 
     print(f"  AITER  : {aiter_us:.2f} us")
