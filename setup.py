@@ -133,9 +133,9 @@ if not _is_metadata_only() and not IS_WINDOWS:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
-    sys.path.insert(0, this_dir)
-    from aiter.jit import core
-    from aiter.jit.utils.cpp_extension import IS_HIP_EXTENSION
+    sys.path.insert(0, f"{this_dir}/aiter/")
+    from jit import core
+    from jit.utils.cpp_extension import IS_HIP_EXTENSION
 
     # Determine build target
     if BUILD_TARGET == "auto":
@@ -217,10 +217,10 @@ if PREBUILD_KERNELS != 0:
             "skip precompilation in this environment"
         )
     else:
-        from aiter.jit.utils.mha_recipes import (
+        from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
-        from aiter.jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
+        from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
         import glob
 
         exclude_ops = get_exclude_ops()
@@ -303,7 +303,7 @@ if PREBUILD_KERNELS != 0:
                 verbose=False,
                 is_python_module=True,
                 is_standalone=False,
-                torch_exclude=one_opt_args.get("torch_exclude", False),
+                torch_exclude=False,
                 third_party=one_opt_args["third_party"],
             )
 
@@ -316,16 +316,19 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM in parallel, before CK) ---
-        sys.path.insert(0, this_dir)
-        aiter_jit_dir = os.path.join(this_dir, "aiter", "jit")
-        os.environ.setdefault("AITER_JIT_DIR", aiter_jit_dir)
-        if aiter_jit_dir not in sys.path:
-            sys.path.insert(0, aiter_jit_dir)
-        from aiter.aot.flydsl.common import start_aot, wait_aot
+        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+        os.environ["AITER_AOT_IMPORT"] = "1"
+        try:
+            from aiter.aot.flydsl.common import start_aot, wait_aot
 
-        flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-        _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
-        wait_aot(_flydsl_pool, _flydsl_futures)
+            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+            _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
+            wait_aot(_flydsl_pool, _flydsl_futures)
+        finally:
+            if _prev_aot_import is None:
+                os.environ.pop("AITER_AOT_IMPORT", None)
+            else:
+                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:

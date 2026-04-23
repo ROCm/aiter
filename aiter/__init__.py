@@ -57,6 +57,7 @@ def getLogger():
 
 
 logger = getLogger()
+AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
 _flydsl_cache = os.path.join(os.path.dirname(__file__), "jit", "flydsl_cache")
@@ -65,6 +66,8 @@ if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ
 
 if sys.platform == "win32":
     logger.info("Windows: CK and HIP ops are not available. Triton ops only.")
+elif AITER_AOT_IMPORT:
+    from .jit import core as core  # noqa: E402
 else:
     try:
         from .jit import core as core  # noqa: E402
@@ -113,16 +116,21 @@ else:
             e,
         )
 
-# Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
-try:
-    from .ops.triton.comms import (
-        IrisCommContext,  # noqa: F401
-        calculate_heap_size,  # noqa: F401
-        reduce_scatter,  # noqa: F401
-        all_gather,  # noqa: F401
-        reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
-        IRIS_COMM_AVAILABLE,  # noqa: F401
-    )
-except (ImportError, AttributeError):
-    # Iris or triton not available, skip import
+# Import Triton-based communication primitives from ops.triton.comms
+# (optional, only if Iris is available). Skip during AOT bootstrap so importing
+# `aiter.aot.*` does not pull in runtime-heavy modules.
+if not AITER_AOT_IMPORT:
+    try:
+        from .ops.triton.comms import (
+            IrisCommContext,  # noqa: F401
+            calculate_heap_size,  # noqa: F401
+            reduce_scatter,  # noqa: F401
+            all_gather,  # noqa: F401
+            reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
+            IRIS_COMM_AVAILABLE,  # noqa: F401
+        )
+    except (ImportError, AttributeError):
+        # Iris or triton not available, skip import
+        IRIS_COMM_AVAILABLE = False
+else:
     IRIS_COMM_AVAILABLE = False
