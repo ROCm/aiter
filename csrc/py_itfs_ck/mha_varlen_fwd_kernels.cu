@@ -144,6 +144,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                         q_descale_ptr,
                         k_descale_ptr,
                         v_descale_ptr,
+                        nullptr, // descale_packed_ptr
                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                         has_lse ? softmax_lse.data_ptr() : nullptr,
                         out.data_ptr(),

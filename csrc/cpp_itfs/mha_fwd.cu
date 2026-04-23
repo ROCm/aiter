@@ -7,6 +7,20 @@
 #include <string>
 
 namespace aiter {
+
+__global__ void precompute_descale_kernel(
+    const float* __restrict__ qk_prescaled_ptr,
+    const float* __restrict__ v_descale_ptr,
+    float* __restrict__ out)
+{
+    float qk = qk_prescaled_ptr[0];
+    float log2e = qk * 1.4426950408889634f;
+    out[0] = qk;
+    out[1] = v_descale_ptr[0];
+    out[2] = log2e;
+    out[3] = log2e;
+}
+
 #if FAV3_ON
 
 int get_cfg_mask_type(const mha_fwd_args& a)
@@ -275,9 +289,17 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         fp8_args.inst_addr_lo = static_cast<uint32_t>(q_addr & 0xFFFFFFFF);
         fp8_args.inst_addr_hi = static_cast<uint32_t>((q_addr >> 32) & 0xFFFFFFFF);
 
-        fp8_args.ptr_q_descale = a.q_descale_ptr;
-        fp8_args.ptr_k_descale = a.k_descale_ptr;
-        fp8_args.ptr_v_descale = a.v_descale_ptr;
+        // q_descale_ptr → Python-allocated float[4] output buffer
+        // k_descale_ptr → qk_prescaled (softmax_scale * q_descale * k_descale)
+        // v_descale_ptr → raw v_descale
+        // Precompute writes {prescaled, v_descale, log2e, log2e} to output buffer.
+        if(a.q_descale_ptr && a.k_descale_ptr && a.v_descale_ptr) {
+            precompute_descale_kernel<<<1, 1, 0, s.stream_id_>>>(
+                static_cast<const float*>(a.k_descale_ptr),
+                static_cast<const float*>(a.v_descale_ptr),
+                static_cast<float*>(const_cast<void*>(a.q_descale_ptr)));
+        }
+        fp8_args.ptr_descale_packed = a.q_descale_ptr;
 
         return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
             void* args_ptr       = &fp8_args;

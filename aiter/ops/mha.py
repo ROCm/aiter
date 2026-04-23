@@ -1342,6 +1342,12 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
+        if q_descale is not None:
+            qk_prescaled = softmax_scale * q_descale * k_descale
+            descale_buf = torch.empty(4, dtype=torch.float32, device=q.device)
+        else:
+            qk_prescaled = None
+            descale_buf = None
         out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
@@ -1357,8 +1363,8 @@ def _flash_attn_forward(
             out,
             bias,
             alibi_slopes,
-            q_descale,
-            k_descale,
+            descale_buf,
+            qk_prescaled,
             v_descale,
             None,
         )

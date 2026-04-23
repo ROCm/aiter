@@ -104,7 +104,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
     if (q_descale_.has_value()) {
         auto q_descale = q_descale_.value();
         CHECK_DEVICE(q_descale);
-        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
+        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({4}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
         if (q_descale.dim() == 2) {
             batch_stride_descale_q = q_descale.stride(0);
             nhead_stride_descale_q = q_descale.stride(1);
