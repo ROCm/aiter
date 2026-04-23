@@ -127,6 +127,12 @@ class AiterCommunicator:
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         # Out-of-place: stage into symmetric heap buffer, reduce in place
         # there, copy back to a fresh output. Matches CustomAllreduce.
+        # The two_shot variant fuses an end-barrier into the AR kernel
+        # itself (peer-flag handshake on the symmetric heap before exit),
+        # mirroring cross_device_reduce_1stage's barrier_at_end. No
+        # wrapper-level sync needed — async_op=True skips the host barrier
+        # and the kernel-internal rendezvous keeps cross-rank skew from
+        # leaking into downstream ops.
         assert self._shmem is not None
         try:
             out = torch.empty_like(inp)
@@ -141,7 +147,8 @@ class AiterCommunicator:
                 input_buf,
                 input_buf,
                 workspace=self._workspace,
-                async_op=self._IS_CAPTURING,
+                async_op=True,
+                end_barrier=True,
             )
 
             out.copy_(input_buf)
