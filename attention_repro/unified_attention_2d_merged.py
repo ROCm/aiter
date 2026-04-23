@@ -3131,6 +3131,7 @@ def unified_attention(
     assert softcap == 0, "Softcap is not supported"
     assert num_buffers == 2 or num_buffers == 3, "num_buffers should be either 2 or 3"
     if shuffled_kv_cache:
+        assert ARCH_NAME == "gfx1250", "Only gfx1250 supported for KV cache preshuffling"
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
         num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
@@ -3144,23 +3145,23 @@ def unified_attention(
             BLOCK_SIZE = k.shape[1]
             NUM_KV_HEADS = k.shape[2]
 
-    # if ARCH_NAME == "gfx950":
-    #     loop_variant = 0
-    #     if Q_FP8 and KV_FP8:
-    #         waves_per_eu = 4 if HEAD_SIZE < 128 else 3
-    #     else:
-    #         waves_per_eu = 4 if HEAD_SIZE < 128 else 2
-    #     num_warps = 4
-    #     block_m = 128
-    #     TILE_SIZE = 64
-    #     USE_TDM = 0
-    # else:
-    #     loop_variant = 3
-    #     num_warps = 4
-    #     block_m = 128
-    #     TILE_SIZE = BLOCK_SIZE
-    #     num_buffers = 3
-    #     use_tdm = 1
+    if ARCH_NAME == "gfx950":
+        loop_variant = 0
+        if Q_FP8 and KV_FP8:
+            waves_per_eu = 4 if HEAD_SIZE < 128 else 3
+        else:
+            waves_per_eu = 4 if HEAD_SIZE < 128 else 2
+        num_warps = 4
+        block_m = 128
+        TILE_SIZE = 64
+        USE_TDM = 0
+    else:
+        loop_variant = 3
+        num_warps = 4
+        block_m = 128
+        TILE_SIZE = BLOCK_SIZE
+        num_buffers = 3
+        use_tdm = 1
     TILE_SIZE = BLOCK_SIZE * num_kv_blocks
     BLOCK_M = block_m
     SLIDING_WINDOW = 1 + window_size[0]
