@@ -49,7 +49,7 @@ on:
           - build-only-aiter
           - linux-aiter-mi35x-1
           - linux-aiter-mi355-1
-          - aiter-1gpu-runner
+          - linux-aiter-mi300x-1
       release_type:
         description: 'Release type for S3 publishing (leave empty for artifacts only)'
         type: choice
