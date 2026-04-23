@@ -135,6 +135,11 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
     seen: Set[Tuple] = set()
     results: List[Dict] = []
     for row in _get_tuned_fmoe_rows():
+        kn1 = (row.get("kernelName1") or "").strip()
+        kn2 = (row.get("kernelName2") or "").strip()
+        if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
+            continue
+
         c_dtype = _normalize_dtype(row["dtype"])
         a_dtype = _normalize_dtype(row.get("q_dtype_a") or row["dtype"])
         b_dtype = _normalize_dtype(row.get("q_dtype_w") or row["dtype"])
