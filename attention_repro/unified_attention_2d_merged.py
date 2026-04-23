@@ -1767,15 +1767,28 @@ class AttentionProgram:
 
     @gluon.jit
     def softmax_part0(self, S, M):
+        # more numerically stable
+        # TODO: investigate why
+        if self.cfg.ARCH_NAME == "gfx950" and self.cfg.USE_SINKS:
+            return softmax_part0_cdna4(self, S, M)
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         # Guard against all-masked rows
-        #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
         p = gl.exp2(q_shifted)
         m_diff_scaled = M * self.QK_scale - m_ij_scaled
         alpha = gl.exp2(m_diff_scaled)
+        return p, alpha, m_ij
+    
+    @gluon.jit
+    def softmax_part0_cdna4(self, S, M):
+        S = S * self.QK_scale
+        m_ij = gl.maximum(M, gl.max(S, axis=1))
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        p = gl.exp2(S - m_ij[:, None])
+        alpha = gl.exp2(M - m_ij)
         return p, alpha, m_ij
 
     @gluon.jit
@@ -1783,7 +1796,7 @@ class AttentionProgram:
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         # Same guard as softmax_part0 — avoid NaN from -inf - (-inf).
-        #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
         q_shifted = q_shifted.reshape(self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 2, 2)
@@ -2111,9 +2124,9 @@ def attention_loop_reordered(pgm, kv_loader, q, M, L, acc):
     """
     cfg: gl.constexpr = pgm.cfg
     # Merged TDM waits require 3 buffers so V_{i+1} can stay pending
-    MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
+    MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3 and pgm.cfg.ARCH_NAME == "gfx1250"
     MERGE_EPI_TDM_WAITS: gl.constexpr = False
-    SPLIT_SOFTMAX0: gl.constexpr = True
+    SPLIT_SOFTMAX0: gl.constexpr = pgm.cfg.ARCH_NAME == "gfx1250"
     SPLIT_SOFTMAX0_EPI: gl.constexpr = False
     # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
     #   buf_tile_cur   -> tile i     ( i   %N)
@@ -2980,8 +2993,13 @@ def kernel_unified_attention_2d(
                 offsets=query_offset_1_pv,
                 mask=query_mask_1_pv,
                 other=float("-inf"),
-            ).to(dtype=gl.float32) / SCALE
-        
+            ).to(dtype=gl.float32)
+        # NOTE: See softmax0 why
+        if cfg.ARCH_NAME == "gfx950" and LOOP_VARIANT < 2:
+            M = M * cfg.RCP_LN2
+        else:
+            M = M / SCALE
+
 
     L = gl.full(
         [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
