@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _mxfp4_quant_op,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.gluon.quant_mxfp4 import _dynamic_mxfp4_quant_kernel_gluon
 
 __all__ = [
     "static_per_tensor_quant_fp8_i8",
@@ -193,7 +194,8 @@ def dynamic_mxfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    _dynamic_mxfp4_quant_kernel[grid](
+    _dynamic_mxfp4_quant_kernel_gluon[grid](
+    #_dynamic_mxfp4_quant_kernel[grid](
         x,
         x_fp4,
         blockscale_e8m0,

@@ -4,7 +4,6 @@
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def _static_per_tensor_quant_fp8_i8_kernel(
     qx_ptr,

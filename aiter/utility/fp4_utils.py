@@ -6,7 +6,6 @@ from torch import Tensor
 import triton
 import triton.language as tl
 
-
 def f32_to_mxfp4(x):
     FP4_EBITS, FP4_MBITS = 2, 1
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
@@ -437,7 +436,7 @@ def dynamic_mxfp4_quant(
 
     BLOCK_SIZE = 128
     grid = (triton.cdiv(M, BLOCK_SIZE), scaleN)
-    _dynamic_mxfp4_quant_kernel_asm_layout[grid](
+    kernel = _dynamic_mxfp4_quant_kernel_asm_layout[grid](
         x,
         x_fp4,
         blockscale_e8m0,
@@ -454,6 +453,7 @@ def dynamic_mxfp4_quant(
         SCALING_MODE=0,
         SHUFFLE=shuffle,
     )
+    #print(kernel.asm["ttgir"])
 
     if not shuffle:
         # Trim the padding if not shuffled
