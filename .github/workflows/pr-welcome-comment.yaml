@@ -24,13 +24,12 @@ jobs:
             **Runs automatically on every PR:**
             - ✅ Pre-checks (submodule verification, code formatting)
             - ✅ Aiter op tests (gfx942 + gfx950)
-            - ✅ Triton tests (only when \`aiter/ops/triton/**\` or related paths are changed)
+            - ✅ Triton tests on MI35X (only when \`aiter/ops/triton/**\` or related paths are changed)
 
             **Extended tests (opt-in via labels):**
 
             | Label | Tests |
             |-------|-------|
-            | \`ci:triton-355\` | Run Triton tests on MI355 in addition to MI300X |
             | \`ci:sglang\` | SGLang integration tests |
             | \`ci:atom\` | ATOM benchmark (DeepSeek-R1 + GPT-OSS) |
             | \`ci:vllm\` | vLLM benchmark |
