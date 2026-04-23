@@ -196,6 +196,8 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
             std::conditional_t<UseDoubleSmemBuffer && PreshuffleB,
                                ck_tile::WPABQuantBPipelineAgBgCrV2<PipelineProblem>,
                                ck_tile::ABQuantGemmPipelineAgBgCrCompV3<PipelineProblem>>>;
+        static_assert(!GemmConfig::TiledMMAPermuteN_v,
+                      "TiledMMAPermuteN=true requires PermuteNEpilogue, not CShuffleEpilogue");
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
             ck_tile::CShuffleEpilogueProblem<ADataType,
                                              BDataType,
@@ -215,8 +217,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
                                              transpose_c,
                                              1,
                                              false,
-                                             1,
-                                             GemmConfig::TiledMMAPermuteN_v>>;
+                                             1>>;
 
         using Kernel =
             ck_tile::QuantGemmKernel<TilePartitioner, GemmPipeline, GemmEpilogue, QuantMode>;
@@ -237,7 +238,7 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         }
         using k_attr_t = ck_tile::kernel_attr<eight_waves>;
         ck_tile::launch_kernel(
-            ck_tile::stream_config{nullptr /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
+            ck_tile::stream_config{at::hip::getCurrentHIPStream() /*stream_id*/, false /*time_kernel*/, 1 /*log_level*/},
             ck_tile::make_kernel<GemmConfig::BlockPerCu_v, k_attr_t>(
                 Kernel{}, grids, blocks, 0, kargs));
     };

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import pytest
 import logging
@@ -7,11 +7,17 @@ import numpy as np
 import math
 from aiter.test_mha_common import (
     attention_ref,
+    attention_ref_block_sparse,
 )
+from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_wrapper_func,
+    get_sage_fwd_configs,
+)
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.attention.fav3_sage import fav3_sage_wrapper_func
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
+    get_sage_fwd_configs_mxfp4,
 )
 
 logging.basicConfig(level=logging.DEBUG)
@@ -197,7 +203,6 @@ def input_helper(
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_sage(
     BATCH: int,
@@ -205,10 +210,10 @@ def test_sage(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
     layout: str,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ = 128
     torch.cuda.empty_cache()
 
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
@@ -231,7 +236,7 @@ def test_sage(
         v,
         softmax_scale,
         causal=False,
-        inference_mode=True,
+        return_lse=False,
         layout=layout,
     )
 
@@ -267,6 +272,186 @@ def test_sage(
     )
 
 
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(128, 128), (64, 128)],
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(2, 2), (16, 16)])
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_none(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """With block_lut=None, output must match non-sparse path (backward compat)."""
+    torch.cuda.empty_cache()
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        block_lut=None,
+    )
+    triton_out_full = fav3_sage_wrapper_func(
+        q, k, v, softmax_scale, causal=False, return_lse=False, layout=layout
+    )
+    check_attention_outputs(
+        triton_out,
+        triton_out_full,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(256, 256)],
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_vs_reference(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """Block-sparse output matches reference that applies the same block mask."""
+    torch.cuda.empty_cache()
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+    # Diagonal block mask: Q block qb attends only to KV block qb (and qb-1 for a small band)
+    block_attn_mask = torch.zeros(
+        BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda"
+    )
+    for qb in range(num_q_blocks):
+        for kb in range(num_kv_blocks):
+            if abs(qb - kb) <= 1:
+                block_attn_mask[:, qb, kb] = True
+
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        block_lut=block_lut,
+    )
+
+    torch_out, _, _ = attention_ref_block_sparse(
+        q, k, v, block_attn_mask, BLOCK_M, BLOCK_N
+    )
+    assert triton_out.shape == torch_out.shape
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("layout", ["bshd"])
+def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
+    """When a Q block has no KV blocks allowed, that block's output is zero."""
+    torch.cuda.empty_cache()
+    BATCH, SEQLEN_Q, SEQLEN_K = 1, 256, 256
+    NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 4, 4, 128
+    config = get_sage_fwd_configs()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+    # First Q block attends to nothing; others attend to all KV blocks
+    block_attn_mask = torch.ones(
+        BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda"
+    )
+    block_attn_mask[:, 0, :] = False
+
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
+    softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
+    triton_out = fav3_sage_wrapper_func(
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal=False,
+        return_lse=False,
+        layout=layout,
+        block_lut=block_lut,
+    )
+    torch_out, _, _ = attention_ref_block_sparse(
+        q, k, v, block_attn_mask, BLOCK_M, BLOCK_N
+    )
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -275,24 +460,21 @@ def test_sage(
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("layout", ["bhsd"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("qsmooth", [True, False])
-@pytest.mark.parametrize("hadamard_rotate", [True])  # TODO: hadamard expected to be on
 def test_sage_mxfp4(
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    layout: str,
     causal: bool,
     qsmooth: bool,
-    hadamard_rotate: bool,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ = 128
+    layout = "bhsd"
+    hadamard_rotate = True  # hadamard expected to be on
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -343,6 +525,203 @@ def test_sage_mxfp4(
         print(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
+
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=1.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(256, 256), (256, 512)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(2, 2), (16, 16)])
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bhsd"])
+def test_sage_mxfp4_block_sparse_none(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """With block_lut=None, MXFP4 output must match non-sparse path."""
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+    triton_out = fav3_sage_mxfp4_wrapper(
+        q, k, v, causal=False, layout=layout, hadamard_rotation=True, block_lut=None
+    )
+    triton_out_full = fav3_sage_mxfp4_wrapper(
+        q, k, v, causal=False, layout=layout, hadamard_rotation=True
+    )
+    check_attention_outputs(
+        triton_out,
+        triton_out_full,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=0.5,
+    )
+
+
+@pytest.mark.parametrize("BATCH", [1, 2])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(512, 512)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("layout", ["bhsd"])
+def test_sage_mxfp4_block_sparse_vs_reference(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    layout: str,
+    dtype=torch.bfloat16,
+):
+    """Block-sparse MXFP4 output matches reference that applies the same block mask."""
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    config = get_sage_fwd_configs_mxfp4()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    # Band mask: Q block qb attends to KV blocks within distance 1
+    block_attn_mask = torch.zeros(
+        BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda"
+    )
+    for qb in range(num_q_blocks):
+        for kb in range(num_kv_blocks):
+            if abs(qb - kb) <= 1:
+                block_attn_mask[:, qb, kb] = True
+
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
+    triton_out = fav3_sage_mxfp4_wrapper(
+        q,
+        k,
+        v,
+        causal=False,
+        layout=layout,
+        hadamard_rotation=True,
+        block_lut=block_lut,
+    )
+
+    # Reference expects bshd
+    if layout == "bhsd":
+        q_ref = q.permute(0, 2, 1, 3).contiguous()
+        k_ref = k.permute(0, 2, 1, 3).contiguous()
+        v_ref = v.permute(0, 2, 1, 3).contiguous()
+    else:
+        q_ref, k_ref, v_ref = q, k, v
+
+    torch_out, _, _ = attention_ref_block_sparse(
+        q_ref, k_ref, v_ref, block_attn_mask, BLOCK_M, BLOCK_N
+    )
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
+
+    assert triton_out.shape == torch_out.shape
+    check_attention_outputs(
+        triton_out,
+        torch_out,
+        fp8=True,
+        atol=ATOL_fp8,
+        rtol=RTOL_fp8,
+        max_diff_percentage=1.5,
+    )
+
+
+@pytest.mark.parametrize("layout", ["bhsd"])
+def test_sage_mxfp4_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
+    """When a Q block has no KV blocks allowed, that block's output is zero."""
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    BATCH, SEQLEN_Q, SEQLEN_K = 1, 512, 512
+    NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 4, 4, 128
+    config = get_sage_fwd_configs_mxfp4()
+    BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
+    num_q_blocks = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    num_kv_blocks = (SEQLEN_K + BLOCK_N - 1) // BLOCK_N
+
+    q, k, v = input_helper(
+        BATCH,
+        NUM_Q_HEADS,
+        NUM_K_HEADS,
+        SEQLEN_Q,
+        SEQLEN_K,
+        HEAD_SZ,
+        HEAD_SZ,
+        dtype,
+        layout,
+    )
+
+    # First Q block attends to nothing; others attend to all KV blocks
+    block_attn_mask = torch.ones(
+        BATCH, num_q_blocks, num_kv_blocks, dtype=torch.bool, device="cuda"
+    )
+    block_attn_mask[:, 0, :] = False
+
+    block_lut = block_attn_mask_to_ragged_lut(block_attn_mask, num_heads=NUM_Q_HEADS)
+    triton_out = fav3_sage_mxfp4_wrapper(
+        q,
+        k,
+        v,
+        causal=False,
+        layout=layout,
+        hadamard_rotation=True,
+        block_lut=block_lut,
+    )
+
+    if layout == "bhsd":
+        q_ref = q.permute(0, 2, 1, 3).contiguous()
+        k_ref = k.permute(0, 2, 1, 3).contiguous()
+        v_ref = v.permute(0, 2, 1, 3).contiguous()
+    else:
+        q_ref, k_ref, v_ref = q, k, v
+
+    torch_out, _, _ = attention_ref_block_sparse(
+        q_ref, k_ref, v_ref, block_attn_mask, BLOCK_M, BLOCK_N
+    )
+    if layout == "bhsd":
+        torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
 
     check_attention_outputs(
         triton_out,

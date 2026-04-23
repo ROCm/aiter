@@ -6,7 +6,7 @@
 #include <torch/all.h>
 
 #include "dispatch_utils.h"
-#include "hip_compat.h"
+#include "aiter_hip_common.h"
 #include "hip_reduce.h"
 #include "py_itfs_common.h"
 
@@ -323,7 +323,7 @@ template <typename scalar_t,
           typename cache_t,
           typename dequant_scale_t,
           bool asmLayout = false,
-          int wg_size    = 64>
+          int wg_size_    = -1>
 __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const scalar_t* __restrict__ key,   // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value, // [num_tokens, num_heads, head_size]
@@ -342,11 +342,12 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const int max_kv_tokens)
 {
     float dtypeMax              = static_cast<float>(opus::finfo<cache_t>::max());
-    const int32_t tokens_per_wg = wg_size / warpSize;
+    constexpr int wg_size = wg_size_ == -1 ? WARP_SIZE : wg_size_;
+    const int32_t tokens_per_wg = wg_size / WARP_SIZE;
 
     // every wave compute one token, one head, all the headim
-    int wave_id = threadIdx.x / warpSize;
-    int lane_id = threadIdx.x % warpSize;
+    int wave_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
 
     const int64_t token_idx = static_cast<int64_t>(blockIdx.x * tokens_per_wg + wave_id);
     const int32_t head_idx  = blockIdx.y;
@@ -373,7 +374,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
 #pragma unroll
     for(int i_d = 0; i_d < local_dim_elems; i_d++)
     {
-        int current_d           = lane_id + i_d * warpSize;
+        int current_d           = lane_id + i_d * WARP_SIZE;
         const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
         const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
         if(current_d < head_size)
@@ -407,10 +408,11 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     }();
     float v_max = wave_reduce(v_local_max, f_max_f32);
 
-    float k_token_scale          = k_max / dtypeMax;
-    float v_token_scale          = v_max / dtypeMax;
-    float k_token_scale_inverted = 1.0 / k_token_scale;
-    float v_token_scale_inverted = 1.0 / v_token_scale;
+    constexpr float k_pertoken_quant_scale_eps = 1e-12f;
+    float k_token_scale = k_max / dtypeMax;
+    float v_token_scale = v_max / dtypeMax;
+    float k_token_scale_inverted = 1.0f / fmaxf(k_token_scale, k_pertoken_quant_scale_eps);
+    float v_token_scale_inverted = 1.0f / fmaxf(v_token_scale, k_pertoken_quant_scale_eps);
 
 #pragma unroll
     for(int i_d = 0; i_d < local_dim_elems; i_d++)
@@ -441,7 +443,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     {
         // const int head_idx = i / head_size;
         // const int head_offset = i % head_size;
-        int i_d = lane_id + i * warpSize;
+        int i_d = lane_id + i * WARP_SIZE;
         if(i_d >= head_size)
         {
             break;
@@ -1305,16 +1307,16 @@ template <typename scalar_t, typename cache_t, bool IS_NEOX>
       // GPT-NeoX style rotary embedding.
       x_index = rot_offset;
       y_index = embed_dim + rot_offset;
-      cos = VLLM_LDG(cos_ptr + x_index);
-      sin = VLLM_LDG(sin_ptr + x_index);
+      cos = *(cos_ptr + x_index);
+      sin = *(sin_ptr + x_index);
     }
     else
     {
       // GPT-J style rotary embedding.
       x_index = 2 * rot_offset;
       y_index = 2 * rot_offset + 1;
-      cos = VLLM_LDG(cos_ptr + x_index / 2);
-      sin = VLLM_LDG(sin_ptr + x_index / 2);
+      cos = *(cos_ptr + x_index / 2);
+      sin = *(sin_ptr + x_index / 2);
     }
 
     const scalar_t x = arr_in[x_index];
@@ -1474,16 +1476,16 @@ inline __device__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel_impl(
       // GPT-NeoX style rotary embedding.
       x_index = threadIdx.x;
       y_index = embed_dim + threadIdx.x;
-      cos = cos_ptr[x_index];//VLLM_LDG(cos_ptr + x_index);
-      sin = sin_ptr[x_index];//VLLM_LDG(sin_ptr + x_index);
+      cos = cos_ptr[x_index];//*(cos_ptr + x_index);
+      sin = sin_ptr[x_index];//*(sin_ptr + x_index);
     }
     else
     {
       // GPT-J style rotary embedding.
       x_index = 2 * threadIdx.x;
       y_index = 2 * threadIdx.x + 1;
-      cos = cos_ptr[x_index/2];//VLLM_LDG(cos_ptr + x_index / 2);
-      sin = sin_ptr[x_index/2];//VLLM_LDG(sin_ptr + x_index / 2);
+      cos = cos_ptr[x_index/2];//*(cos_ptr + x_index / 2);
+      sin = sin_ptr[x_index/2];//*(sin_ptr + x_index / 2);
     }
     const int64_t token_head_in = token_idx * q_pe_stride_0 + head_idx * q_pe_stride_1;
     const int rot_offset = threadIdx.x;
@@ -1758,16 +1760,16 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
             // GPT-NeoX style rotary embedding.
             x_index = rot_offset;
             y_index = embed_dim + rot_offset;
-            cos = VLLM_LDG(cos_ptr + x_index);
-            sin = VLLM_LDG(sin_ptr + x_index);
+            cos = *(cos_ptr + x_index);
+            sin = *(sin_ptr + x_index);
           }
           else
           {
             // GPT-J style rotary embedding.
             x_index = 2 * rot_offset;
             y_index = 2 * rot_offset + 1;
-            cos = VLLM_LDG(cos_ptr + x_index / 2);
-            sin = VLLM_LDG(sin_ptr + x_index / 2);
+            cos = *(cos_ptr + x_index / 2);
+            sin = *(sin_ptr + x_index / 2);
           }
 
           const int r_head_idx = q_vec_idx / 32;//embed_dim;
@@ -2110,13 +2112,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;  // *2
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // K RoPE: load, compute, store
@@ -2166,13 +2168,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // Q RoPE: load, compute, store
@@ -2416,13 +2418,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // K RoPE
@@ -2472,13 +2474,13 @@ __global__ void fuse_qk_rope_concat_and_cache_mla_per_head_kernel(
           if constexpr (is_neox) {
             x_idx = rot_off;
             y_idx = embed_dim + rot_off;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + x_idx));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + x_idx));
+            f32_cos = static_cast<float>(*(cos_ptr + x_idx));
+            f32_sin = static_cast<float>(*(sin_ptr + x_idx));
           } else {
             x_idx = rot_off << 1;
             y_idx = x_idx + 1;
-            f32_cos = static_cast<float>(VLLM_LDG(cos_ptr + (x_idx >> 1)));
-            f32_sin = static_cast<float>(VLLM_LDG(sin_ptr + (x_idx >> 1)));
+            f32_cos = static_cast<float>(*(cos_ptr + (x_idx >> 1)));
+            f32_sin = static_cast<float>(*(sin_ptr + (x_idx >> 1)));
           }
           
           // Q RoPE
@@ -3024,7 +3026,7 @@ void reshape_and_cache_with_pertoken_quant(
     int value_stride = value.stride(0);
 
     dim3 grid(num_tokens, num_heads);
-    dim3 block(64);
+    dim3 block(WARP_SIZE);
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(key));
     const hipStream_t stream = at::hip::getCurrentHIPStream();
 

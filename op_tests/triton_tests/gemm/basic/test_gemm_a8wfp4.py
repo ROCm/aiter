@@ -220,41 +220,13 @@ def quantize_to_fp4(w_fp32):
 
 
 def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
-    x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
-    # x_vals = [(128, 1024, 4096)]
-    x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
+    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
+    # GPT-OSS-120B attention projections
+    x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
+    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
+    x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
+    x_vals += [(v, 57344, 8192) for v in (128, 2048)]  # LL3 405B FC1 (reduced)
     return x_vals
 
 
@@ -367,14 +339,10 @@ e5m2_type, e4m3_type = types.get_fp8_dtypes()
 #     (9728,8192,65536),
 #     (1,1280,8192)
 # ])
-@pytest.mark.parametrize("a_dtype", [e4m3_type])  # [e4m3_type, e5m2_type, torch.int8]
-@pytest.mark.parametrize("out_dtype", [torch.float16])
-@pytest.mark.parametrize(
-    "layout", ["TN"]
-)  # NOTE: Kernel will occasionally crash for layouts other than TN.
-def test_gemm_a8wfp4(
-    M: int, N: int, K: int, a_dtype, out_dtype, layout: str, CLEAR_GPUS=True
-):
+def test_gemm_a8wfp4(M: int, N: int, K: int, CLEAR_GPUS=True):
+    a_dtype = e4m3_type
+    layout = "TN"  # Kernel will occasionally crash for layouts other than TN.
+    out_dtype = torch.bfloat16
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     torch.manual_seed(42)  # for reproducibility

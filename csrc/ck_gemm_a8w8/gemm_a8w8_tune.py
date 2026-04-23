@@ -56,7 +56,17 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
+            columns=[
+                "gfx",
+                "cu_num",
+                "M",
+                "N",
+                "K",
+                "kernelId",
+                "splitK",
+                "us",
+                "kernelName",
+            ]
         )
     return tunedf
 
@@ -99,6 +109,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",
+        "config_env_name": "AITER_CONFIG_GEMM_A8W8",
     }
 
     def getKernelName(self, kernelId):
@@ -106,11 +117,68 @@ class GemmA8W8Tuner(GemmCommonTuner):
             return None
         return kernels_list[kernelId].name
 
+    def _clear_op_caches(self):
+        from aiter.ops import gemm_op_a8w8 as _op
+
+        _op.get_GEMM_config_with_quant_type.cache_clear()
+        _op._GEMM_QUANT_TYPE_CACHE.clear()
+        _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
+
     def _setup_specific_arguments(self):
         pass
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
+
+    def run_config(self, args):
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            q_dtype_w = untunedf.loc[i, "q_dtype_w"]
+            shape_str = f"({M}, {N}, {K}, {q_dtype_w})"
+            try:
+                x, weight, x_scale, w_scale, out = generate_data(
+                    M, N, K, 0, dtypes.bf16, eval(q_dtype_w)
+                )
+                out, us = run_perftest(
+                    gemm_a8w8,
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = gemm_a8w8_ref(
+                    x,
+                    weight,
+                    x_scale,
+                    w_scale,
+                    dtype=dtypes.bf16,
+                    q_dtype_w=eval(q_dtype_w),
+                )
+                err_ratio = checkAllclose(
+                    out.to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
 
     def tune(
         self,
@@ -118,12 +186,12 @@ class GemmA8W8Tuner(GemmCommonTuner):
         tunedf,
         args,
     ):
-        issorted = args.sort
         useSplitK = args.splitK
         mp_num = args.mp
-        shape_grouped = False
+        shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
 
         task = []
         tasks_data = []
@@ -140,7 +208,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
             kernels_num = len(kernels_list)
             total_kernel_nums = 0
-            info_keys = (cu_num, M, N, K, q_dtype_w)
+            info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
 
             for j in range(kernels_num):
                 kernel = kernels_list[j]
@@ -199,7 +267,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 if __name__ == "__main__":
 
     ## use default key and resultList with q_dtype_w support
-    key = ["cu_num", "M", "N", "K", "q_dtype_w"]
+    key = ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
     resultList = [
         "kernelId",
         "splitK",
