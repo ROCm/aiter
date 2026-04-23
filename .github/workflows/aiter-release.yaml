@@ -334,11 +334,11 @@ jobs:
 
           # Compose SETUPTOOLS_SCM_PRETEND_VERSION
           # post2 + cherry-pick #2645 test build — version pinned for v0.1.12.post2.dev2645 dispatch from this side branch
-          BASE_VER="0.1.12.post2.dev2645torch210"
+          BASE_VER="0.1.12.post2.dev2645"
           # Tag the wheel so it is unambiguously the manylinux build
           IMG="${BUILD_DOCKER_IMAGE}"
           ROCM_TAG="${IMG##*:}"
-          PRETEND_VER="${BASE_VER}+${ROCM_TAG}.manylinux_2_28"
+          PRETEND_VER="${BASE_VER}+${ROCM_TAG}.manylinux_2_28.torch210"
           echo "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VER}"
 
           docker exec \
