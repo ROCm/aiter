@@ -103,9 +103,6 @@ def parse_csv(csv_path: str):
     return jobs
 
 
-_aot_compiled_exes: set = set()
-
-
 def _precompile_to_cache(
     stage: int,
     model_dim: int,
@@ -229,9 +226,7 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 gate_mode=gate_mode,
             )
-            if id(exe) not in _aot_compiled_exes:
-                _run_compiled(exe, args)
-                _aot_compiled_exes.add(id(exe))
+            _run_compiled(exe, args)
 
         elif stage == 2:
             accumulate = mode != "reduce"
@@ -305,9 +300,7 @@ def _precompile_to_cache(
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
             )
-            if id(exe) not in _aot_compiled_exes:
-                _run_compiled(exe, args)
-                _aot_compiled_exes.add(id(exe))
+            _run_compiled(exe, args)
 
 
 def compile_one_config(
