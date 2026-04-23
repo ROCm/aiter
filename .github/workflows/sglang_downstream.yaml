@@ -103,59 +103,12 @@ jobs:
           )
           PY
 
-      - name: Resolve SGLang base image
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          import urllib.request
-
-          prefixes = [
-              "v0.5.10-rocm700-mi30x-",
-              "v0.5.10rc0-rocm700-mi30x-",
-          ]
-          matches = {prefix: [] for prefix in prefixes}
-          patterns = {
-              prefix: re.compile(rf"^{re.escape(prefix)}\d{{8}}(?:-preview)?$")
-              for prefix in prefixes
-          }
-          next_url = "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100"
-
-          while next_url:
-              with urllib.request.urlopen(next_url, timeout=30) as resp:
-                  data = json.load(resp)
-              for item in data.get("results", []):
-                  name = item["name"]
-                  for prefix in prefixes:
-                      if patterns[prefix].match(name):
-                          matches[prefix].append(name)
-              next_url = data.get("next")
-
-          chosen_tag = None
-          for prefix in prefixes:
-              if matches[prefix]:
-                  chosen_tag = sorted(matches[prefix], reverse=True)[0]
-                  break
-
-          if not chosen_tag:
-              raise SystemExit("No public MI30X SGLang image found for v0.5.10.")
-
-          image = f"rocm/sgl-dev:{chosen_tag}"
-          print(f"Resolved SGLang base image: {image}")
-          if chosen_tag.startswith("v0.5.10rc0-"):
-              print("Using v0.5.10rc0 image because no public v0.5.10 MI30X tag was found.")
-
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
-              fh.write(f"SGL_IMAGE={image}\n")
-          PY
-
       - name: Start CI container
         run: |
           set -ex
           docker rm -f ci_sglang || true
           cd "${SGLANG_WORKSPACE}"
-          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${SGL_IMAGE}"
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh
           docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python'
 
       - name: Setup pip config
