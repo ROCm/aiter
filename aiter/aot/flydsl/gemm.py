@@ -382,7 +382,7 @@ def main():
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
-    print(f"  Compile arch:     (from cu_num)")
+    print("  Compile arch:     (from cu_num)")
     print(f"  Cache dir:        {cache_dir}")
     print(f"  Target arch:      {arch}")
     print("=" * 72)

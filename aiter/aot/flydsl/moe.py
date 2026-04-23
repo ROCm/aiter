@@ -399,7 +399,7 @@ def main():
     print(f"  Stage1 jobs:  {len(stage1_jobs)}")
     print(f"  Stage2 jobs:  {len(stage2_jobs)}")
     print(f"  Total jobs:   {len(all_jobs)}")
-    print(f"  Compile arch: (from cu_num)")
+    print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)
