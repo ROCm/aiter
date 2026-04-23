@@ -527,7 +527,7 @@ class AsyncKVLoader:
         )
 
     @gluon.jit
-    def load_k_to_shared(self, k_offset, buffer_id):
+    def load_k_to_shared(self, k_offset, buffer_id=0):
         # Async copy K tile from global to shared memory
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -545,7 +545,7 @@ class AsyncKVLoader:
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
-    def load_v_to_shared(self, v_offset, buffer_id):
+    def load_v_to_shared(self, v_offset, buffer_id=0):
         # Async copy V tile from global to shared memory
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
@@ -563,9 +563,10 @@ class AsyncKVLoader:
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
-    def load_k_from_shared(self, wait_count, target_dtype, buffer_id):
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
         # Wait for async K copy and load from shared memory
-        gl.amd.cdna4.async_copy.wait_group(wait_count)
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             return (
                 self.lds_unshuffle_k(buffer_id)
@@ -577,9 +578,10 @@ class AsyncKVLoader:
             ).to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(self, wait_count, target_dtype, buffer_id):
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
         # Wait for async V copy and load from shared memory
-        gl.amd.cdna4.async_copy.wait_group(wait_count)
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             return (
                 self.lds_unshuffle_v(buffer_id)
@@ -791,12 +793,12 @@ class AsyncGatherKVLoader:
         )
 
     @gluon.jit
-    def load_k_to_shared(self, tile_idx, buffer_id):
+    def load_k_to_shared(self, k_offset, buffer_id=0):
         if self.cfg.SHUFFLED_KV_CACHE:
-            # tile_idx is a NUM_KV_BLOCKS-vector of physical block indices
+            # k_offset is a NUM_KV_BLOCKS-vector of physical block indices
             # (from load_block_ids). Build (NUM_KV_BLOCKS, SLAB) offset tensor.
-            k_offset = (
-                tile_idx[:, None] * self.stride_k_cache_0
+            k_offset_tensor = (
+                k_offset[:, None] * self.stride_k_cache_0
                 + self.k_head_d_offset
                 + self.offs_n_k
             )
@@ -804,7 +806,7 @@ class AsyncGatherKVLoader:
             # Compute full sequence offset per element, then derive block table
             # index and within-block offset. Works for any TILE_SIZE vs BLOCK_SIZE.
             if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
-                seq_offset_k = tile_idx * self.cfg.TILE_SIZE + self.offs_n_k
+                seq_offset_k = k_offset * self.cfg.TILE_SIZE + self.offs_n_k
                 # assumption: block table never contains OOB index
                 # vllm initialize block table with 0s, and pad with 0s.
                 # KV cache never shrinks.
@@ -823,7 +825,7 @@ class AsyncGatherKVLoader:
                     [
                         self.cfg.BLOCK_SIZE,
                     ],
-                    tile_idx,
+                    k_offset,
                     dtype=gl.int32,
                     layout=gl.SliceLayout(0, self.kv_cfg.blocked_k),
                 )[None, :]
@@ -832,7 +834,7 @@ class AsyncGatherKVLoader:
                 ptr=self.block_tables_ptr_shifted,
                 offsets=block_table_idx,
             )
-            k_offset = (
+            k_offset_tensor = (
                 self.k_head_d_offset + within_block_k + block_ids * self.stride_k_cache_0
             )
 
@@ -840,28 +842,28 @@ class AsyncGatherKVLoader:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.k_shared.index(buffer_id),
                 self.key_cache_ptr,
-                k_offset,
+                k_offset_tensor,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
             gl.amd.cdna4.async_copy.global_load_to_shared(
                 self.k_shared.index(buffer_id),
-                self.key_cache_ptr + k_offset,
+                self.key_cache_ptr + k_offset_tensor,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
-    def load_v_to_shared(self, tile_idx, buffer_id):
+    def load_v_to_shared(self, v_offset, buffer_id=0):
         if self.cfg.SHUFFLED_KV_CACHE:
-            v_offset = (
-                tile_idx[:, None] * self.stride_v_cache_0
+            v_offset_tensor = (
+                v_offset[:, None] * self.stride_v_cache_0
                 + self.v_head_d_offset
                 + self.offs_n_v
             )
         else:
             if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
-                seq_offset_v = tile_idx * self.cfg.TILE_SIZE + self.offs_n_v
+                seq_offset_v = v_offset * self.cfg.TILE_SIZE + self.offs_n_v
                 block_table_idx = gl.minimum(
                     seq_offset_v // self.cfg.BLOCK_SIZE,
                     self.block_table_stride - 1,
@@ -874,7 +876,7 @@ class AsyncGatherKVLoader:
                     [
                         self.cfg.BLOCK_SIZE,
                     ],
-                    tile_idx,
+                    v_offset,
                     dtype=gl.int32,
                     layout=gl.SliceLayout(1, self.kv_cfg.blocked_v),
                 )[:, None]
@@ -883,7 +885,7 @@ class AsyncGatherKVLoader:
                 ptr=self.block_tables_ptr_shifted,
                 offsets=block_table_idx,
             )
-            v_offset = (
+            v_offset_tensor = (
                 self.v_head_d_offset + within_block_v + block_ids * self.stride_v_cache_0
             )
 
@@ -891,20 +893,21 @@ class AsyncGatherKVLoader:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.v_shared.index(buffer_id),
                 self.value_cache_ptr,
-                v_offset,
+                v_offset_tensor,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
             gl.amd.cdna4.async_copy.global_load_to_shared(
                 self.v_shared.index(buffer_id),
-                self.value_cache_ptr + v_offset,
+                self.value_cache_ptr + v_offset_tensor,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
-    def load_k_from_shared(self, wait_count, target_dtype, buffer_id):
-        gl.amd.cdna4.async_copy.wait_group(wait_count)
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             return (
                 self.lds_unshuffle_k(buffer_id)
@@ -916,8 +919,9 @@ class AsyncGatherKVLoader:
             ).to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(self, wait_count, target_dtype, buffer_id):
-        gl.amd.cdna4.async_copy.wait_group(wait_count)
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             return (
                 self.lds_unshuffle_v(buffer_id)
@@ -1147,7 +1151,7 @@ class TDMKVLoader:
         )
 
     @gluon.jit
-    def load_k_to_shared(self, k_offset, buffer_id):
+    def load_k_to_shared(self, k_offset, buffer_id=0):
         if self.cfg.SHUFFLED_KV_CACHE:
             offsets = [
                 (k_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
@@ -1163,7 +1167,7 @@ class TDMKVLoader:
         )
 
     @gluon.jit
-    def load_v_to_shared(self, v_offset, buffer_id):
+    def load_v_to_shared(self, v_offset, buffer_id=0):
         if self.cfg.SHUFFLED_KV_CACHE:
             offsets = [
                 (v_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32),
@@ -1179,7 +1183,7 @@ class TDMKVLoader:
         )
 
     @gluon.jit
-    def load_k_from_shared(self, wait_count, target_dtype, buffer_id, skip_wait: gl.constexpr = False):
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
         if not skip_wait:
             gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
@@ -1195,7 +1199,7 @@ class TDMKVLoader:
             ).to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(self, wait_count, target_dtype, buffer_id, skip_wait: gl.constexpr = False):
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
         if not skip_wait:
             gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
@@ -1356,7 +1360,7 @@ class TDMGatherKVLoader:
         )
 
     @gluon.jit
-    def load_k_to_shared(self, k_offset, buffer_id):
+    def load_k_to_shared(self, k_offset, buffer_id=0):
         src_row_indices = (k_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
             gl.int32
         )
@@ -1365,7 +1369,7 @@ class TDMGatherKVLoader:
         )
 
     @gluon.jit
-    def load_v_to_shared(self, v_offset, buffer_id):
+    def load_v_to_shared(self, v_offset, buffer_id=0):
         src_row_indices = (v_offset * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(
             gl.int32
         )
@@ -1374,8 +1378,9 @@ class TDMGatherKVLoader:
         )
 
     @gluon.jit
-    def load_k_from_shared(self, wait_count, target_dtype, buffer_id):
-        gl.amd.gfx1250.tdm.async_wait(wait_count)
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        if not skip_wait:
+            gl.amd.gfx1250.tdm.async_wait(wait_count)
         return (
             self.k_shared.index(buffer_id)
             .reshape([self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE])
@@ -1384,8 +1389,9 @@ class TDMGatherKVLoader:
         ).to(target_dtype)
 
     @gluon.jit
-    def load_v_from_shared(self, wait_count, target_dtype, buffer_id):
-        gl.amd.gfx1250.tdm.async_wait(wait_count)
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        if not skip_wait:
+            gl.amd.gfx1250.tdm.async_wait(wait_count)
         return (self.v_shared.index(buffer_id)
                 .reshape([self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE])
                 .load(layout=self.cfg.v_layout)
@@ -3016,12 +3022,14 @@ def kernel_unified_attention_2d(
         M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
 
     elif LOOP_VARIANT == 2:
+        gl.static_assert(cfg.ARCH_NAME == "gfx1250", "For loop variant 2, only gfx1250 is supported")
         gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 2, NUM_BUFFERS should be 2 or 3")
         acc0 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
         acc1 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
         M, L, acc = attention_loop_subtile_split(pgm, kv_loader, q, M, L, acc0, acc1)
 
     elif LOOP_VARIANT == 3:
+        gl.static_assert(cfg.ARCH_NAME == "gfx1250", "For loop variant 3, only gfx1250 is supported")
         gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 3, NUM_BUFFERS should be 2 or 3")
         acc0 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
         acc1 = gl.zeros([BLOCK_M, HEAD_SIZE // 2], dtype=gl.float32, layout=cfg.pv_layout)
