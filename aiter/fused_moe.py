@@ -767,6 +767,7 @@ class MOEMetadata:
     fuse_quant: str = ""
     stage2_has_bias: bool = False
     flat: bool = False
+    skip_inter_quant: bool = False
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1206,6 +1207,12 @@ def get_2stage_cfgs(
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
             return 32
+        elif q_dtype_a == dtypes.fp4x2:
+            # MXFP4 fused quant+sort requires block_size % 32 == 0.
+            # block_m=64 is significantly faster than 32 for fp4x2 on
+            # gfx950 across all tested batch sizes (up to 1.5x for
+            # prefill).  128 is not supported by current CKTile stage2.
+            return 64
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
@@ -1451,6 +1458,7 @@ def get_2stage_cfgs(
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
+        and q_dtype_a not in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
         and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
@@ -1486,6 +1494,40 @@ def get_2stage_cfgs(
             run_1stage,
             has_bias=activation == ActivationType.Swiglu,
             stage2_has_bias=activation == ActivationType.Swiglu,
+        )
+    elif (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and q_dtype_a in [dtypes.fp4x2]
+        and q_dtype_w in [dtypes.fp4x2]
+    ):
+        # Stage1 uses JIT CK (DeviceMoeGemmMXBPreShuffle) which correctly
+        # handles fp4x2 activations x fp4x2 weights.  CKTile AOT stage1 is
+        # still broken (AQUANT_Pipeline misinterprets fp4 as fp8).
+        #
+        # Stage2 uses CKTile AOT with bf16 activations x fp4x2 weights
+        # (a16w4 path) which avoids the costly intermediate bf16->fp4x2
+        # quantization kernel between stages.  For decode (small M) this
+        # eliminates a full kernel launch + memory round-trip.
+        #
+        # NOTE: w1 must be pre-shuffled with shuffle_weight_a16w4(w1, 16, True)
+        # and w1_scale with shuffle_scale_a16w4(w1_scale, E, True).
+        return MOEMetadata(
+            functools.partial(
+                ck_moe_stage1,
+                quant_type=q_type,
+                activation=activation,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            get_block_m(),
+            0,
+            False,
+            skip_inter_quant=True,
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
@@ -1775,6 +1817,7 @@ def fused_moe_2stages(
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and activation == ActivationType.Swiglu
             or (metadata.ksplit > 1 and is_shuffled)
+            or metadata.skip_inter_quant
         )
     ):
         a2_scale = None
@@ -1832,23 +1875,72 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    metadata.stage2(
-        a2,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        moe_out,
-        topk,
-        w2_scale=(
-            w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
-        ),
-        a2_scale=a2_scale,
-        block_m=block_size_M,
-        sorted_weights=sorted_weights if not doweight_stage1 else None,
-        **extra_stage2_args,
+    w2_scale_stage2 = (
+        w2_scale.view(dtypes.fp8_e8m0) if w2.dtype == dtypes.fp4x2 else w2_scale
     )
+    sorted_weights_stage2 = sorted_weights if not doweight_stage1 else None
+
+    try:
+        metadata.stage2(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            w2_scale=w2_scale_stage2,
+            a2_scale=a2_scale,
+            block_m=block_size_M,
+            sorted_weights=sorted_weights_stage2,
+            **extra_stage2_args,
+        )
+    except RuntimeError as e:
+        # Some TP-sharded MXFP4 MoE tuples on gfx950 can fail in CK stage2
+        # with an unsupported device_gemm configuration. Fall back to cktile
+        # stage2 for the same problem shape to preserve functionality.
+        fallback_enabled = os.environ.get("AITER_MOE_STAGE2_CK_FALLBACK", "1") != "0"
+        ck_unsupported = "device_gemm" in str(e)
+        can_fallback = (
+            fallback_enabled
+            and ck_unsupported
+            and quant_type == QuantType.per_1x32
+            and activation == ActivationType.Silu
+            and dtype in [dtypes.bf16, dtypes.fp16]
+            and w1.dtype == dtypes.fp4x2
+            and w2.dtype == dtypes.fp4x2
+        )
+
+        if not can_fallback:
+            raise
+
+        logger.warning(
+            "[fused_moe] CK stage2 failed, retry with cktile stage2: "
+            f"err={e}; token={token_num}, topk={topk}, model_dim={model_dim}, "
+            f"inter_dim={inter_dim}, expert={E}, block_m={block_size_M}, "
+            f"ksplit={metadata.ksplit}, q_type={quant_type}, act={activation}, "
+            f"dtype={dtype}, q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w}"
+        )
+
+        cktile_moe_stage2(
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+            w2_scale=w2_scale_stage2,
+            a2_scale=a2_scale,
+            block_m=block_size_M,
+            activation=activation,
+            sorted_weights=sorted_weights_stage2,
+            n_pad_zeros=hidden_pad // 64 * 64,
+            k_pad_zeros=intermediate_pad // 128 * 128,
+            **extra_stage2_args,
+        )
 
     return moe_out
 
@@ -2208,6 +2300,16 @@ def torch_moe_stage2(
         hidden_states = hidden_states.view(a2_shape)
 
         w2_shape = w2.shape
+        # Some TP-sharded models carry padded per_1x32 scale groups in w2_scale.
+        # Align scale groups to runtime inter_dim groups for robust torch fallback.
+        w2_scale = w2_scale.view(E, model_dim, -1)
+        w2_groups = inter_dim // 32
+        if w2_scale.shape[2] > w2_groups:
+            w2_scale = w2_scale[:, :, :w2_groups]
+        elif w2_scale.shape[2] < w2_groups:
+            pad = w2_groups - w2_scale.shape[2]
+            w2_scale = torch.nn.functional.pad(w2_scale, (0, pad), value=1.0)
+
         w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
             E, model_dim, inter_dim // 32, 1
         )
@@ -2333,8 +2435,12 @@ def cktile_moe_stage1(
     needs_post_activation = split_k > 1
     # Split-k reduces into a token-topk workspace and applies activation after
     # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
-    workspace_rows = token_num * topk
     if needs_post_activation:
+        # CKTile kernel zeros this buffer via hipMemsetAsync when split_k > 1.
+        # Must be large enough to cover sorted_token_ids (= max_num_tokens_padded),
+        # otherwise the kernel overflows and corrupts adjacent memory.
+        # Mirror the fix from ck_moe_stage1 (ROCm/aiter#2508).
+        workspace_rows = min(token_num * topk * block_m, sorted_token_ids.shape[0])
         tmp_out = torch.zeros(
             (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
         )
