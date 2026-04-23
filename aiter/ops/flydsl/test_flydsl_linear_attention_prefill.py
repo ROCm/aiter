@@ -54,6 +54,7 @@ class PrefillArgs:
     Hv: int
     tp: int
     full_prompt_len: int
+    model_name: str = ""
     BT: int = 64
     max_num_batched_tokens: int = 32768
     dtype: torch.dtype = torch.bfloat16
@@ -69,7 +70,8 @@ class PrefillArgs:
         return self.Hv // self.tp
 
     def __repr__(self):
-        tag = f"K{self.K}_V{self.V}_Hk{self.Hk}_Hv{self.Hv}"
+        tag = self.model_name + "_" if self.model_name else ""
+        tag += f"K{self.K}_V{self.V}_Hk{self.Hk}_Hv{self.Hv}"
         tag += f"_TP{self.tp}_T{self.full_prompt_len}"
         if not self.is_varlen:
             tag += "_novarlen"
@@ -79,7 +81,7 @@ class PrefillArgs:
 
 
 NUM_WARMUP = 5
-NUM_ITERS = 100
+NUM_ITERS = 50
 
 PREFILL_PARAMS = [
     # non-varlen + no final state
@@ -90,6 +92,7 @@ PREFILL_PARAMS = [
         Hv=32,
         tp=1,
         full_prompt_len=2500,
+        model_name="Qwen3.5-35B",
         is_varlen=False,
         output_final_state=False,
         max_num_batched_tokens=2500,
@@ -101,12 +104,87 @@ PREFILL_PARAMS = [
         Hv=32,
         tp=1,
         full_prompt_len=60000,
+        model_name="Qwen3.5-35B",
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens=60000,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=32,
+        tp=2,
+        full_prompt_len=2500,
+        model_name="Qwen3.5-35B",
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens=2500,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=32,
+        tp=2,
+        full_prompt_len=60000,
+        model_name="Qwen3.5-35B",
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens=60000,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=1,
+        full_prompt_len=2500,
+        model_name="Qwen3.5-397B",
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens=2500,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=1,
+        full_prompt_len=60000,
+        model_name="Qwen3.5-397B",
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens=60000,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=2,
+        full_prompt_len=2500,
+        model_name="Qwen3.5-397B",
+        is_varlen=False,
+        output_final_state=False,
+        max_num_batched_tokens=2500,
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=2,
+        full_prompt_len=60000,
+        model_name="Qwen3.5-397B",
         is_varlen=False,
         output_final_state=False,
         max_num_batched_tokens=60000,
     ),
     # varlen + final_state (default path)
-    PrefillArgs(K=128, V=128, Hk=16, Hv=64, tp=8, full_prompt_len=8192),
+    PrefillArgs(
+        K=128, V=128, Hk=16, Hv=64, tp=8, full_prompt_len=8192, model_name="UT"
+    ),
 ]
 
 
@@ -1429,15 +1507,17 @@ class TestPerformance:
             cu_seqlens=cu,
         )
 
+        us_triton_opt3 = _bench_fn(triton_opt3_launch)
         us_fly = _bench_fn(flydsl_launch)
         us_triton_vk = _bench_fn(triton_vk_launch)
-        us_triton_opt3 = _bench_fn(triton_opt3_launch)
 
         speedup_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
         speedup_opt3 = us_triton_opt3 / us_fly if us_fly > 0 else float("inf")
 
         _perf_results.append(
             {
+                "Model": args.model_name or "-",
+                "TP": args.tp,
                 "K": args.K,
                 "V": args.V,
                 "Hg": args.Hg,
@@ -1459,6 +1539,8 @@ def _print_perf_table():
         return
 
     cols = [
+        ("Model", 16),
+        ("TP", 4),
         ("K", 5),
         ("V", 5),
         ("Hg", 4),
