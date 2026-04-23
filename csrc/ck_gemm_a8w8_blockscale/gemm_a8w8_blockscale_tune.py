@@ -477,10 +477,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         block_per_cu = args.blockPerCu
         cu_num = self.get_cu_num()
         gfx = self.get_gfx()
-        run_kwargs = {
-            "num_warmup": args.warmup,
-            "num_iters": args.iters,
-        }
         task = []
         tasks_data = []  # [(kernel_nums, datas)]
         seed = 10000
@@ -489,7 +485,6 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             N = untunedf.loc[i, "N"]
             K = untunedf.loc[i, "K"]
             seed = seed + 1
-            prev_task_count = len(task)
             info_keys = (gfx, cu_num, M, N, K)
             lib = args.libtype
             if lib in ("ck", "both", "all"):
