@@ -211,6 +211,7 @@ class AttentionConfig:
     K_WIDTH_QK: gl.constexpr
     K_WIDTH_PV: gl.constexpr
     CAUSAL: gl.constexpr
+    NUM_MASKED_TILES: gl.constexpr
     NUM_BUFFERS: gl.constexpr
     LOOP_VARIANT: gl.constexpr
 
@@ -268,6 +269,9 @@ class AttentionConfig:
         self.LOOP_VARIANT = gl.constexpr(LOOP_VARIANT)
         self.USE_SINKS = gl.constexpr(USE_SINKS)
 
+        # calculate how many masked tiles we need, upper bound
+        QUERY_SPAN = gl.constexpr((self.BLOCK_M - 1) // self.NUM_QUERIES_PER_KV + 1)
+        self.NUM_MASKED_TILES = gl.constexpr(max(1, ((QUERY_SPAN + self.TILE_SIZE - 1) // self.TILE_SIZE)))
         if ARCH_NAME == "gfx1250":
             assert NUM_WARPS == 2 or NUM_WARPS == 4 or NUM_WARPS == 8
 
@@ -2620,6 +2624,7 @@ def attention_loop_tensor_subtile_split(
     qk0 = pgm.compute_qk_subtile(k0_s)
     p1 = gl.exp2(qk1_shifted)
     acc0 = acc0 * alpha[:, None]
+
     v_wait: gl.constexpr = 2
     v = kv_loader.load_v_from_shared(
         wait_count=v_wait, buffer_id=buf_tile_cur,
