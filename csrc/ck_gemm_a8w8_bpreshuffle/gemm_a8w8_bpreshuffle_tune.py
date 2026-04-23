@@ -533,7 +533,6 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             K = untunedf.loc[i, "K"]
             q_dtype_w = untunedf.loc[i, "q_dtype_w"]
             seed = seed + 1
-            prev_task_count = len(task)
             info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
             if "all" in args.libtype or "ck" in args.libtype:
                 task.extend(
