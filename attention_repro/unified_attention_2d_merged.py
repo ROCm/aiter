@@ -3083,18 +3083,7 @@ def unified_attention(
     new_kv_layout=False,
     num_kv_blocks=1,
     use_tdm=True,
-    waves_per_eu=1,
     shuffled_kv_cache=False,
-    num_warps=4,
-    block_m=128,
-    remove_indirect_access=False,
-    num_buffers=2,
-    # Loop variant selector:
-    #   0 = double_buf (gather_shuffle style, safe/masked split)
-    #   1 = new_order (4-deep pipeline)
-    #   2 = subtile_split (subtile multi-buffer pipeline)
-    #   3 = subtile_split with merged LDS (subtile multi-buffer pipeline)
-    loop_variant=0,
 ):
     """
     Run the unified attention kernel with a paged KV cache.
@@ -3120,6 +3109,7 @@ def unified_attention(
         sinks: Sinks tensor [num_query_heads,]
         loop_variant: 0=double_buf, 1=new_order, 2=subtile_split
     """
+    remove_indirect_access = False
     NUM_SEQS = len(seqused_k)
     NUM_Q_HEADS = q.shape[1]
     HEAD_SIZE = q.shape[2]
