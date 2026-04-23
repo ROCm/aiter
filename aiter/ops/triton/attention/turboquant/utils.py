@@ -29,8 +29,6 @@ All operations are vectorized (no Python loops over elements).
 from __future__ import annotations
 
 import math
-from typing import Tuple
-
 import torch
 
 

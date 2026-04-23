@@ -19,9 +19,6 @@ Run with:
 """
 
 from __future__ import annotations
-
-import math
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -40,8 +37,6 @@ from aiter.ops.triton.attention.turboquant.rotation import (
 from aiter.ops.triton.attention.turboquant.codebook import (
     get_codebook,
     generate_lloyd_max_codebook,
-    SUPPORTED_HEAD_DIMS,
-    SUPPORTED_BITS,
 )
 from aiter.ops.triton.attention.turboquant.quantizer import (
     TurboQuantMSE,
@@ -151,8 +146,6 @@ class TestRotationMatrices:
         """S should be Gaussian, NOT orthogonal (Sᵀ S ≠ I in general)."""
         clear_cache()
         S = get_qjl_matrix(head_dim, DEVICE)
-        eye = torch.eye(head_dim)
-        product = S.T @ S
         # For a d×d Gaussian matrix scaled by 1/d, Sᵀ S ≈ I/d * d = I but with variance
         # The key check is that it is NOT exactly orthogonal
         # We just verify S exists and has the right shape
@@ -195,7 +188,6 @@ class TestCodebook:
         """Lloyd-Max on a symmetric distribution should produce symmetric centroids."""
         cb = get_codebook(head_dim, bits, device=DEVICE)
         # cb[i] + cb[n-1-i] ≈ 0
-        n = len(cb)
         sym_error = (cb + cb.flip(0)).abs().max().item()
         assert sym_error < 0.05, \
             f"head_dim={head_dim} bits={bits}: symmetry error {sym_error:.4f}"

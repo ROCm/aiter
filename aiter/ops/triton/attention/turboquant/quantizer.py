@@ -153,7 +153,6 @@ class TurboQuantMSE(nn.Module):
         Returns:
             CompressedKeys with packed MSE indices and L2 norms.
         """
-        batch_shape = x.shape[:-1]
         d = self.head_dim
 
         # Compute and store L2 norms for reconstruction
@@ -282,8 +281,6 @@ class TurboQuantProd(TurboQuantMSE):
         sketch = r @ self.S.T             # (..., d)  (equiv to (S @ r.T).T)
         signs_bool = (sketch >= 0)         # (..., d)  bool
 
-        # Pack sign bits: 1 byte per 8 dimensions
-        d = self.head_dim
         # Reshape to (..., d//8, 8) and pack into uint8
         signs_uint8 = _pack_signs(signs_bool)  # (..., d//8)
 
