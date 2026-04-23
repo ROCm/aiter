@@ -278,7 +278,9 @@ class TunerCommon:
             for df in df_list[1:]:
                 for c in df.columns:
                     if c not in all_cols:
-                        insert_before = "tflops" if "tflops" in all_cols else all_cols[-1]
+                        insert_before = (
+                            "tflops" if "tflops" in all_cols else all_cols[-1]
+                        )
                         all_cols.insert(all_cols.index(insert_before), c)
             _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
             for j in range(len(df_list)):
