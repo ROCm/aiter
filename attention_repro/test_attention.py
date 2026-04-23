@@ -267,7 +267,6 @@ def ref_paged_attn(
 
     return out.to(orig_dtype)
 
-
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -276,7 +275,7 @@ def ref_paged_attn(
         ],
         [(567, 275), (34, 345)],
         [(1, 411), (12, 701), (1,456), (1, 133), (2, 343)],
-        [(777, 777)],
+        [(777, 777), (454, 345), (1, 134), (1024, 1024)],
     ],
 )
 @pytest.mark.parametrize(
@@ -334,7 +333,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize(
     "shuffled_kv_cache",
     [
-        True,
+        False,
     ],
 )
 @pytest.mark.parametrize(
@@ -367,7 +366,7 @@ def test_gluon_unified_attn_2d_noncausal(
     loop_variant: int,
 ) -> None:
 
-    causal = False
+    causal = True
 
     if DEVICE_ARCH not in (
         "gfx950",
@@ -380,10 +379,10 @@ def test_gluon_unified_attn_2d_noncausal(
         pytest.skip(f"{DEVICE_ARCH} does not have TDM gather")
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
-    if shuffled_kv_cache and (not use_tdm or num_kv_blocks != 1):
-        pytest.skip(
-            "Shuffled KV cache is only supported with TDM and num_kv_blocks == 1"
-        )
+    # if shuffled_kv_cache and (not use_tdm or num_kv_blocks != 1):
+    #     pytest.skip(
+    #         "Shuffled KV cache is only supported with TDM and num_kv_blocks == 1"
+    #     )
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]

@@ -11,9 +11,10 @@ waves_per_eu=1
 num_warps=4
 block_m=128
 num_buffers=3
-causal=0
+causal=1
 loop_variant=3
 remove_indirect_access=1
+shuffled_kv_cache=0
 # export LLIR_REMOVE_DS_WAIT_0="loop"
 # export LLIR_REMOVE_BARRIER=1
 rm -rf ~/.triton/cache/bash
@@ -35,4 +36,5 @@ python3 run_kernel.py \
 --num_heads_k $num_heads_k \
 --bs $bs \
 --seq_q_l $seq_q_l \
---seq_kv_l $seq_kv_l
+--seq_kv_l $seq_kv_l \
+--shuffled_kv_cache $shuffled_kv_cache
