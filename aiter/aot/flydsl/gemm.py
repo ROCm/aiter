@@ -353,7 +353,9 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", GEMM_AOT_ARCH), override_env("FLYDSL_GPU_ARCH", GEMM_AOT_ARCH):
+        with override_env("ARCH", GEMM_AOT_ARCH), override_env(
+            "FLYDSL_GPU_ARCH", GEMM_AOT_ARCH
+        ):
             if kind == "hgemm":
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "preshuffle":

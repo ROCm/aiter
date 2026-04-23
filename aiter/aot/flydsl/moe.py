@@ -327,7 +327,9 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", MOE_AOT_ARCH), override_env("FLYDSL_GPU_ARCH", MOE_AOT_ARCH):
+        with override_env("ARCH", MOE_AOT_ARCH), override_env(
+            "FLYDSL_GPU_ARCH", MOE_AOT_ARCH
+        ):
             _precompile_to_cache(
                 model_dim=model_dim,
                 inter_dim=inter_dim,

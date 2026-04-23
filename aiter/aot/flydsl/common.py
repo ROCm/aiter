@@ -83,6 +83,7 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
     if var_name in ("FLYDSL_GPU_ARCH", "HSA_OVERRIDE_GFX_VERSION"):
         try:
             from flydsl.runtime.device import get_rocm_arch
+
             get_rocm_arch.cache_clear()
         except (ImportError, AttributeError):
             pass
@@ -98,6 +99,7 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
         if var_name in ("FLYDSL_GPU_ARCH", "HSA_OVERRIDE_GFX_VERSION"):
             try:
                 from flydsl.runtime.device import get_rocm_arch
+
                 get_rocm_arch.cache_clear()
             except (ImportError, AttributeError):
                 pass
