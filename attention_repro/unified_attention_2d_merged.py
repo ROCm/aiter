@@ -20,7 +20,7 @@ float8_info = torch.finfo(e4m3_dtype)
 
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
-_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.NONE)
 
 @gluon.jit
 def elementwise_max_prop_nan(a, b):
@@ -1734,8 +1734,18 @@ class AttentionProgram:
         )
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(self.q, k, S)
-        else:
+        elif not self.cfg.FP8_DOT:
             return gl.amd.cdna4.mfma(self.q, k, S)
+        else:
+            return gl.amd.cdna4.mfma_scaled(
+                a=self.q,
+                a_scale=None,
+                a_format="e4m3",
+                b=k,
+                b_scale=None,
+                b_format="e4m3",
+                acc=S,
+            )
 
     @gluon.jit
     def apply_mask_qk(self, S, j):
@@ -1757,11 +1767,9 @@ class AttentionProgram:
 
     @gluon.jit
     def softmax_part0(self, S, M):
-        # more numerically stable
-        # if self.cfg.ARCH_NAME == "gfx950" and self.cfg.USE_SINKS:
-        #     return self.softmax_part0_cdna4(S, M)
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
+        # Guard against all-masked rows
         #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
@@ -1771,18 +1779,10 @@ class AttentionProgram:
         return p, alpha, m_ij
 
     @gluon.jit
-    def softmax_part0_cdna4(self, S, M):
-        S = S * self.QK_scale
-        m_ij = gl.maximum(M, gl.max(S, axis=1))
-        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
-        p = gl.exp2(S - m_ij[:, None])
-        alpha = gl.exp2(M - m_ij)
-        return p, alpha, m_ij
-
-    @gluon.jit
     def softmax_part0_w_split(self, S, M):
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
+        # Same guard as softmax_part0 — avoid NaN from -inf - (-inf).
         #m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
@@ -1828,11 +1828,26 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
-        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=True)
+        # NOTE: right pv_k_width would turn this one trivial for gfx950 as well
+        # but preshufling may not work
+        assert_trivial: gl.constexpr = (
+            True if self.cfg.ARCH_NAME == "gfx1250" else False
+        )
+        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=assert_trivial)
         if self.cfg.ARCH_NAME == "gfx1250":
             return gl.amd.gfx1250.wmma(p, v, acc)
-        else:
+        elif not self.cfg.FP8_DOT:
             return gl.amd.cdna4.mfma(p, v, acc)
+        else:
+            return gl.amd.cdna4.mfma_scaled(
+                a=p,
+                a_scale=None,
+                a_format="e4m3",
+                b=v,
+                b_scale=None,
+                b_format="e4m3",
+                acc=acc,
+            )
 
     @gluon.jit
     def store_output(
@@ -2714,13 +2729,15 @@ def find_seq_idx(
     target_idx,
     num_seqs,
     BLOCK_Q: gl.constexpr,
+    use_q_block_mode: tl.constexpr = True,
+
 ):
     left = 0
     right = num_seqs
     while left < right:
         mid = (left + right) // 2
         val = gl.load(query_start_len_ptr + mid)
-        mid_val = val // BLOCK_Q + mid
+        mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
         if mid_val <= target_idx:
             left = mid + 1
         else:
@@ -2840,8 +2857,8 @@ def kernel_unified_attention_2d(
     cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
     # Not needed when num programs is computed precisely
-    # if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
-    #     return
+    if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
+        return
 
     offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
     offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
@@ -2880,7 +2897,12 @@ def kernel_unified_attention_2d(
             + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV
             + 1
         )
-        max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
+        # Clamp to [1, seq_len]. The lower bound handles the degenerate case
+        # where every query in this M-block has an empty causally-allowed key
+        # set (happens when cur_batch_query_len > kv_len and q_pos+context_len<0
+        # for the whole block). Forcing tile_end >= 1 keeps the loop-final
+        # "last masked tile" well-defined (j=0 with all-mask, not j=-N).
+        max_seq_prefix_len = gl.maximum(1, gl.minimum(max_seq_prefix_len, seq_len))
     else:
         max_seq_prefix_len = seq_len
 
@@ -2959,13 +2981,6 @@ def kernel_unified_attention_2d(
                 mask=query_mask_1_pv,
                 other=float("-inf"),
             ).to(dtype=gl.float32) / SCALE
-        # # Softmax verison is different for cdna4 for num. stability
-        # if ARCH_NAME == "gfx950":
-        #     M = M * cfg.RCP_LN2
-        #     M = M d
-        # else:
-        #     M = M / SCALE
-
         
 
     L = gl.full(
@@ -3099,11 +3114,11 @@ def unified_attention(
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
     total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
-    # Exact block count
-    q_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    q_lens_cpu = q_lens.cpu()
-    total_query_blocks = sum((q_lens_cpu[i].item() + BLOCK_Q - 1) // BLOCK_Q for i in range(NUM_SEQS))
-
+    # # Exact block count
+    # TODO: this requires editing the binary search 
+    # q_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+    # q_lens_cpu = q_lens.cpu()
+    # total_query_blocks = sum((q_lens_cpu[i].item() + BLOCK_Q - 1) // BLOCK_Q for i in range(NUM_SEQS))
     assert num_kv_blocks & (num_kv_blocks - 1) == 0, "num_kv_blocks must be a power of 2"
     TILE_SIZE = num_kv_blocks * BLOCK_SIZE
     ARCH_NAME = arch_info.get_arch()
