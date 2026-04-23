@@ -68,7 +68,6 @@ class AttentionConfig:
     Q_SCALES_DOT_LAYOUT: gl.constexpr
     K_SCALES_DOT_LAYOUT: gl.constexpr
     V_SCALES_DOT_LAYOUT: gl.constexpr
-    P_SCALES_DOT_LAYOUT: gl.constexpr
 
     # Layout for loading Q
     Q_LOAD_LAYOUT: gl.constexpr
@@ -79,8 +78,6 @@ class AttentionConfig:
     K_SHARED_LAYOUT: gl.constexpr
     V_SHARED_LAYOUT: gl.constexpr
     GATHER_BLOCKED_LAYOUT: gl.constexpr
-    K_LOAD_LAYOUT: gl.constexpr
-    V_LOAD_LAYOUT: gl.constexpr
 
     q_cache_modifier: gl.constexpr
     kv_cache_modifier: gl.constexpr
@@ -239,6 +236,7 @@ class AttentionConfig:
                 instr_shape=[16, 16, instr_width_pv],
             )
         )
+
         if self.KV_CACHE_DTYPE == "nvfp4":
             # if NUM_WARPS == 1:
             #     warp_bases_qk_packed = []
@@ -306,6 +304,7 @@ class AttentionConfig:
                 k_width=self.K_WIDTH,
             )
         )
+
         if self.KV_CACHE_DTYPE == "nvfp4":
             self.Q_SCALES_DOT_LAYOUT = gl.constexpr(
                 gl.amd.gfx1250.get_wmma_scale_layout(
@@ -323,14 +322,6 @@ class AttentionConfig:
                 )
             )
 
-            self.P_SCALES_DOT_LAYOUT = gl.constexpr(
-                gl.amd.gfx1250.get_wmma_scale_layout(
-                    self.P_DOT_LAYOUT,
-                    [self.BLOCK_M, self.TILE_SIZE // self.BLOCK_SCALES_SIZE],
-                    scale_factor=16,
-                )
-            )
-
             self.V_SCALES_DOT_LAYOUT = gl.constexpr(
                 gl.amd.gfx1250.get_wmma_scale_layout(
                     self.V_DOT_LAYOUT,
@@ -341,7 +332,6 @@ class AttentionConfig:
         else:
             self.Q_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.K_SCALES_DOT_LAYOUT = gl.constexpr(None)
-            self.P_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.V_SCALES_DOT_LAYOUT = gl.constexpr(None)
 
         assert (
@@ -442,17 +432,6 @@ class AttentionConfig:
                 order=[1, 0],
             )
         )
-
-        if self.SHUFFLED_KV_CACHE:
-            if self.NUM_BLOCKS_GATHER_PER_TILE == 1:
-                self.K_LOAD_LAYOUT = gl.constexpr(None)
-                self.V_LOAD_LAYOUT = gl.constexpr(None)
-            else:
-                self.K_LOAD_LAYOUT = gl.constexpr(None)
-                self.V_LOAD_LAYOUT = gl.constexpr(None)
-        else:
-            self.K_LOAD_LAYOUT = gl.constexpr(None)
-            self.V_LOAD_LAYOUT = gl.constexpr(None)
 
         self.q_cache_modifier = gl.constexpr(".cg")
         self.kv_cache_modifier = gl.constexpr(".cg")
@@ -857,6 +836,8 @@ class AttentionProgram:
             [cfg.NUM_STAGES] + v_desc.block_shape,
             layout=cfg.V_SHARED_LAYOUT,
         )
+        k_scales_shared = None
+        v_scales_shared = None
         if cfg.KV_CACHE_DTYPE == "nvfp4":
             k_scales_shared = gl.allocate_shared_memory(
                 k_scales_desc.dtype,
@@ -868,9 +849,6 @@ class AttentionProgram:
                 [cfg.NUM_STAGES] + v_scales_desc.block_shape,
                 layout=cfg.V_SHARED_LAYOUT,
             )
-        else:
-            k_scales_shared = None
-            v_scales_shared = None
 
         # Calculate tile range
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
@@ -1156,8 +1134,8 @@ class AttentionProgram:
                 .reshape(
                     (
                         self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // self.cfg.K_WIDTH,
-                        (self.cfg.HEAD_SIZE // 2) // (2 * 16),
+                        self.cfg.BLOCK_SIZE // 16,
+                        (self.cfg.HEAD_SIZE // 2) // (2 * self.cfg.K_WIDTH),
                         2,
                         16,
                         self.cfg.K_WIDTH,
@@ -1191,8 +1169,8 @@ class AttentionProgram:
                 .reshape(
                     (
                         self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // self.cfg.K_WIDTH,
-                        (self.cfg.HEAD_SIZE // 2) // (2 * 16),
+                        self.cfg.BLOCK_SIZE // 16,
+                        (self.cfg.HEAD_SIZE // 2) // (2 * self.cfg.K_WIDTH),
                         2,
                         16,
                         self.cfg.K_WIDTH,
@@ -1898,6 +1876,12 @@ def _unified_attention_gluon_kernel_3d(
     else:
         HEAD_SIZE_LOAD: gl.constexpr = HEAD_SIZE
 
+    q_shared = gl.allocate_shared_memory(
+        query_ptr.type.element_ty,
+        shape=[BLOCK_M, HEAD_SIZE_LOAD],
+        layout=cfg.Q_SHARED_LAYOUT,
+    )
+
     # load Q
     offs_q_m_load = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.Q_LOAD_LAYOUT))
     offs_q_d_load = gl.arange(
@@ -1918,11 +1902,6 @@ def _unified_attention_gluon_kernel_3d(
     dim_mask_load = gl.full((1,), 1, dtype=tl.int1)
     query_mask_0_load = query_pos_load < cur_batch_query_len
     query_mask_1_load = query_offset_1_load < cfg.NUM_QUERY_HEADS
-    q_shared = gl.allocate_shared_memory(
-        query_ptr.type.element_ty,
-        shape=[BLOCK_M, HEAD_SIZE_LOAD],
-        layout=cfg.Q_SHARED_LAYOUT,
-    )
     Q_load = gl.amd.cdna4.buffer_load(
         ptr=query_ptr,
         offsets=query_offset_load.to(gl.int32),
@@ -2168,7 +2147,7 @@ def _unified_attention_gluon_kernel_3d(
 
     if KV_CACHE_DTYPE == "nvfp4":
         v = pgm.tdm_shared_load_v(wait_count=1, buffer_id=buffer_id)
-        v_scales = pgm.tdm_shared_load_v_scales(wait_count=4, buffer_id=buffer_id).to(
+        v_scales = pgm.tdm_shared_load_v_scales(wait_count=0, buffer_id=buffer_id).to(
             e4m3_dtype, bitcast=True
         )
     else:

@@ -261,7 +261,6 @@ def unified_attention(
         assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
 
     BLOCK_SCALES_SIZE = 16
-    FP8_DTYPE = BLOCK_SCALES_DTYPE = e4m3_dtype
     if q_dtype == torch.uint8:
         # A4W4
         assert q_scales is not None and q_scales.dtype == e4m3_dtype
@@ -292,7 +291,6 @@ def unified_attention(
             # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
             # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
             num_blocks, num_kv_heads, _, block_size, K_WIDTH = k.shape
-            print(K_WIDTH)
     else:
         # key_cache and value_cache: num_blocks, block_size, num_kv_heads, head_size
         num_blocks, block_size, num_kv_heads, _ = k.shape
@@ -452,7 +450,6 @@ def unified_attention(
             segm_expsum = out  # dummy ptr
 
         if IS_DEVICE_ARCH_GFX12:
-            print(attn_config)
             _unified_attention_gluon_kernel_3d[
                 (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
             ](

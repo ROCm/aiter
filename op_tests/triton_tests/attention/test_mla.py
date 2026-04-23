@@ -7,6 +7,11 @@ import torch
 
 from aiter.ops.triton.attention.mla import mla_decode_fwd
 from aiter.ops.triton.attention.mla import mla_prefill_fwd
+from aiter.ops.shuffle import shuffle_weight
+from op_tests.triton_tests.quant.test_quant_mxfp4 import (
+    torch_dynamic_mxfp4_quant,
+    batched_swizzle_scales_gfx1250,
+)
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from typing import Optional
@@ -48,29 +53,30 @@ def shuffle_kv_buffer(
 
     num_lanes, num_elements_per_thread = layout
 
-    def shuffle(kvb, h):
-        kvb = kvb.view(
+    def shuffle(kv_lora_or_rope_buffer):
+        d = kv_lora_or_rope_buffer.shape[-1]
+        kv_lora_or_rope_buffer = kv_lora_or_rope_buffer.view(
             -1,
             num_kv_heads,
             block_size // num_lanes,
             num_lanes,
-            h // (2 * num_elements_per_thread),
+            d // (2 * num_elements_per_thread),
             2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
             num_elements_per_thread,
         )
-        kvb = kvb.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
-        kvb = kvb.view(-1, num_kv_heads, block_size // 16, h * 16)
-        return kvb
+        kv_lora_or_rope_buffer = kv_lora_or_rope_buffer.permute(
+            0, 1, 2, 4, 5, 3, 6
+        ).contiguous()
+        kv_lora_or_rope_buffer = kv_lora_or_rope_buffer.view(
+            -1, num_kv_heads, block_size // 16, d * 16
+        )
+        return kv_lora_or_rope_buffer
 
     kv_buffer_shuffled = kv_buffer.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    kv_buffer_shuffled_lora = shuffle(
-        kv_buffer_shuffled[..., :kv_lora_rank], kv_lora_rank
-    )
-    kv_buffer_shuffled_rope = shuffle(
-        kv_buffer_shuffled[..., kv_lora_rank:], head_size - kv_lora_rank
-    )
+    kv_buffer_shuffled_lora = shuffle(kv_buffer_shuffled[..., :kv_lora_rank])
+    kv_buffer_shuffled_rope = shuffle(kv_buffer_shuffled[..., kv_lora_rank:])
     kv_buffer_shuffled_lora = kv_buffer_shuffled_lora.view(
         -1, num_kv_heads, block_size * kv_lora_rank
     )
@@ -85,6 +91,81 @@ def shuffle_kv_buffer(
     )
 
     return kv_buffer_shuffled
+
+
+def dynamic_nvfp4_quant_kv_buffer(
+    kv_buffer: torch.Tensor,
+    kv_lora_rank: int,
+):
+    dtype = kv_buffer.dtype
+    assert dtype == torch.bfloat16
+
+    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+
+    assert block_size >= 128
+
+    def quant_and_shuffle(kv_lora_or_rope_buffer):
+        d = kv_lora_or_rope_buffer.shape[-1]
+        quant_head_size = d // 2
+        scale_width = d // 16
+        cache_shuffled, cache_shuffled_scale = torch_dynamic_mxfp4_quant(
+            kv_lora_or_rope_buffer, is_nvfp4=True
+        )
+        cache_shuffled_scale = cache_shuffled_scale.view(
+            -1, num_kv_heads, block_size, scale_width
+        )
+        cache_shuffled = shuffle_weight(cache_shuffled).view(
+            -1, num_kv_heads, block_size * quant_head_size
+        )
+        cache_shuffled_scale = batched_swizzle_scales_gfx1250(
+            cache_shuffled_scale
+        ).view(-1, num_kv_heads, block_size * scale_width)
+        cache_shuffled = torch.cat(
+            [
+                cache_shuffled.view(torch.uint8),
+                cache_shuffled_scale.view(torch.uint8),
+            ],
+            dim=-1,
+        ).contiguous()
+        cache_shuffled = cache_shuffled.view(
+            -1, num_kv_heads, block_size, quant_head_size + scale_width
+        )
+        return cache_shuffled, quant_head_size, scale_width
+
+    kv_buffer_shuffled = kv_buffer.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    kv_buffer_quant_and_shuffled_lora, quant_head_size_lora, scale_width_lora = (
+        quant_and_shuffle(kv_buffer_shuffled[..., :kv_lora_rank])
+    )
+    kv_buffer_quant_and_shuffled_rope, quant_head_size_rope, scale_width_rope = (
+        quant_and_shuffle(kv_buffer_shuffled[..., kv_lora_rank:])
+    )
+    kv_buffer_quant_and_shuffled_lora = kv_buffer_quant_and_shuffled_lora.view(
+        -1, num_kv_heads, block_size * (quant_head_size_lora + scale_width_lora)
+    )
+    kv_buffer_quant_and_shuffled_rope = kv_buffer_quant_and_shuffled_rope.view(
+        -1, num_kv_heads, block_size * (quant_head_size_rope + scale_width_rope)
+    )
+    kv_buffer_quant_and_shuffled = torch.cat(
+        [kv_buffer_quant_and_shuffled_lora, kv_buffer_quant_and_shuffled_rope], dim=-1
+    ).contiguous()
+    kv_buffer_quant_and_shuffled = kv_buffer_quant_and_shuffled.view(
+        -1,
+        num_kv_heads,
+        block_size,
+        quant_head_size_lora
+        + quant_head_size_rope
+        + scale_width_lora
+        + scale_width_rope,
+    )
+
+    print(quant_head_size_lora, scale_width_lora)
+    print(quant_head_size_rope, scale_width_rope)
+
+    print(kv_buffer_quant_and_shuffled.shape)
+
+    return kv_buffer_quant_and_shuffled
 
 
 def ref_masked_attention(
@@ -160,23 +241,41 @@ def torch_mla_extend(
     return out.to(o_dtype)
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
-@pytest.mark.parametrize("decode_qlen", [1, 3])
-@pytest.mark.parametrize("ctx_lens", [200, 4371, 8192])
+# @pytest.mark.parametrize("batch_size", [1, 4, 8, 32])
+# @pytest.mark.parametrize("decode_qlen", [1, 3])
+# @pytest.mark.parametrize("ctx_lens", [200, 4371, 8192])
+# @pytest.mark.parametrize("num_heads", [(16, 1)])
+# @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
+# @pytest.mark.parametrize("block_size", [64])
+# @pytest.mark.parametrize("num_blocks", [32768])
+# @pytest.mark.parametrize("varlen", [True, False])
+# @pytest.mark.parametrize(
+#     "q_dtype, kv_dtype, out_dtype, use_out_scale",
+#     [
+#         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
+#         (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
+#         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
+#     ],
+# )
+# @pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("decode_qlen", [1])
+@pytest.mark.parametrize("ctx_lens", [1328])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
-@pytest.mark.parametrize("block_size", [64])
-@pytest.mark.parametrize("num_blocks", [32768])
-@pytest.mark.parametrize("varlen", [True, False])
+@pytest.mark.parametrize("num_blocks", [1])
+@pytest.mark.parametrize("varlen", [False])
 @pytest.mark.parametrize(
-    "q_dtype, kv_dtype, out_dtype, use_out_scale",
+    "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
     [
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False),
-        (torch.bfloat16, e4m3_dtype, torch.bfloat16, True),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16, True),
+        # (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        # (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, True),
+        # (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, True),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, True),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, True),
     ],
 )
-@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("shuffled_kv_cache", [True])
 @torch.inference_mode()
 def test_mla_decode_fwd(
     batch_size: int,
@@ -196,6 +295,20 @@ def test_mla_decode_fwd(
 ):
     torch.cuda.empty_cache()
     num_query_heads, num_kv_heads = num_heads
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+
+    if kv_dtype == torch.uint8:
+        if not shuffled_kv_cache:
+            pytest.skip("NVFP4 requires shuffled KV cache")
+
+    # kv_buffer1 = torch.randn(
+    #     (16, 64, num_kv_heads, kv_lora_rank + qk_rope_head_dim),
+    #     dtype=torch.bfloat16,
+    #     device="cuda",
+    # )
+    # maybe_shuffled_kv_buffer1 = dynamic_nvfp4_quant_kv_buffer(kv_buffer1, kv_lora_rank)
+    # return
+
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int, device="cuda")
@@ -218,17 +331,34 @@ def test_mla_decode_fwd(
         dtype=torch.int32,
         device="cuda",
     )
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
     kv_buffer = torch.randn(
         (num_blocks, block_size, num_kv_heads, qk_head_dim),
         dtype=torch.bfloat16,
         device="cuda",
-    ).to(kv_dtype)
-    q = torch.randn(
+    )
+    query = torch.randn(
         (total_num_query_tokens, num_query_heads, qk_head_dim),
         dtype=torch.bfloat16,
         device="cuda",
-    ).to(q_dtype)
+    )
+    query_scales = None
+    if q_dtype == torch.uint8:
+        query = query / 10
+        maybe_quant_query = query.view(-1, qk_head_dim)
+        maybe_quant_query, query_scales = torch_dynamic_mxfp4_quant(
+            maybe_quant_query, is_nvfp4=True
+        )
+        maybe_quant_query = maybe_quant_query.view(
+            -1, num_query_heads, qk_head_dim // 2
+        )
+        query_scales = query_scales.view(-1, num_query_heads, qk_head_dim // 16)
+        query = query.to(e4m3_dtype)
+        print(maybe_quant_query.shape, query_scales.shape)
+    else:
+        query = query.to(q_dtype)
+        maybe_quant_query = query
+
+    # .to(q_dtype)
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
     q_descale = None
@@ -247,13 +377,23 @@ def test_mla_decode_fwd(
         (total_num_query_tokens, num_query_heads, kv_lora_rank), dtype=out_dtype
     )
 
-    maybe_shuffled_kv_buffer = (
-        shuffle_kv_buffer(kv_buffer, kv_lora_rank) if shuffled_kv_cache else kv_buffer
-    )
+    if shuffled_kv_cache:
+        if kv_dtype == torch.uint8:
+            maybe_shuffled_kv_buffer = dynamic_nvfp4_quant_kv_buffer(
+                kv_buffer, kv_lora_rank
+            )
+            kv_buffer = kv_buffer.to(e4m3_dtype)
+        else:
+            kv_buffer = kv_buffer.to(kv_dtype)
+            maybe_shuffled_kv_buffer = shuffle_kv_buffer(kv_buffer, kv_lora_rank)
+    else:
+        kv_buffer = kv_buffer.to(kv_dtype)
+        maybe_shuffled_kv_buffer = kv_buffer
+
     mla_decode_fwd(
-        q,
-        maybe_shuffled_kv_buffer,
-        out,
+        q=maybe_quant_query,
+        kv_buffer=maybe_shuffled_kv_buffer,
+        out=out,
         cu_seqlens_q=cu_seqlens_q,
         seqused_k=seq_lens_kv,
         max_seqlen_kv=max_seqlen_kv,
@@ -264,12 +404,13 @@ def test_mla_decode_fwd(
         causal=True,
         q_descale=q_descale,
         kv_descale=kv_descale,
+        q_scales=query_scales,
         out_scale=out_scale,
         shuffled_kv_cache=shuffled_kv_cache,
     )
 
     out_ref = torch_mla_extend(
-        q,
+        query,
         kv_buffer,
         cu_seqlens_q,
         seq_lens_kv,

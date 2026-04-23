@@ -132,8 +132,8 @@ def mla_prefill_fwd(
     causal: bool,
     q_descale,
     kv_descale,
-    out_scale,
-    shuffled_kv_cache: bool,
+    out_scale=None,
+    shuffled_kv_cache: bool = False,
 ):
     assert causal, "Only causal attention is supported"
     assert (
@@ -256,21 +256,62 @@ def mla_decode_fwd(
     causal: bool,
     q_descale,
     kv_descale,
-    out_scale,
-    shuffled_kv_cache: bool,
+    q_scales=None,
+    out_scale=None,
+    shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
 ):
     assert causal, "Only causal attention is supported"
+    q_dtype = q.dtype
+    kv_buffer_dtype = kv_buffer.dtype
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
+
+    BLOCK_SCALES_SIZE = 16
+    if q_dtype == torch.uint8:
+        # A4W4
+        assert q_scales is not None and q_scales.dtype == e4m3_dtype
+        qk_head_dim = qk_head_dim * 2
+        QUERY_DTYPE = "nvfp4"
+    elif q_dtype == e4m3_dtype:
+        QUERY_DTYPE = "fp8"
+    else:
+        QUERY_DTYPE = "bf16"
+
+    if kv_buffer_dtype == torch.uint8:
+        KV_CACHE_DTYPE = "nvfp4"
+    elif kv_buffer_dtype == e4m3_dtype:
+        KV_CACHE_DTYPE = "fp8"
+    else:
+        KV_CACHE_DTYPE = "bf16"
+
+    print(QUERY_DTYPE, KV_CACHE_DTYPE)
+
     if shuffled_kv_cache:
-        num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+        SCALE_K_WIDTH_LORA = 4
+        SCALE_K_WIDTH_ROPE = 4
+        if kv_buffer_dtype == torch.uint8:
+            num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
+            K_WIDTH = 16
+            SCALE_K_LORA = kv_lora_rank // 16
+            SCALE_K_ROPE = qk_rope_head_dim // 16
+            SCALE_K_WIDTH_LORA = (
+                min(16, triton.next_power_of_2(SCALE_K_LORA))
+                if SCALE_K_LORA >= 4
+                else SCALE_K_LORA
+            )
+            SCALE_K_WIDTH_ROPE = (
+                min(16, triton.next_power_of_2(SCALE_K_ROPE))
+                if SCALE_K_ROPE >= 4
+                else SCALE_K_ROPE
+            )
+        else:
+            num_blocks, num_kv_heads, block_size, _ = kv_buffer.shape
     else:
         num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
+
     num_seqs = len(seqused_k)
     num_tokens_per_seq = total_num_tokens // num_seqs
     num_queries_per_kv = num_query_heads // num_kv_heads
-    q_dtype = q.dtype
-    kv_buffer_dtype = kv_buffer.dtype
 
     assert (
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
@@ -348,6 +389,7 @@ def mla_decode_fwd(
             segm_max_ptr=segm_max,
             segm_expsum_ptr=segm_expsum,
             query_ptr=q,
+            query_scales_ptr=q_scales,
             kv_buffer_ptr=kv_buffer,
             block_tables_ptr=block_tables,
             seq_lens_ptr=seqused_k,
@@ -359,13 +401,13 @@ def mla_decode_fwd(
             block_tables_stride=block_tables.stride(0),
             query_stride_0=q.stride(0),
             query_stride_1=q.stride(1),
+            query_scales_stride_0=q_scales.stride(0) if q_scales is not None else 0,
+            query_scales_stride_1=q_scales.stride(1) if q_scales is not None else 0,
             KV_LORA_RANK=kv_lora_rank,
             QK_ROPE_HEAD_DIM=qk_rope_head_dim,
             stride_kv_buffer_0=kv_buffer.stride(0),
             stride_kv_buffer_1=kv_buffer.stride(1),
-            stride_kv_buffer_2=kv_buffer.stride(
-                2
-            ),  # * (16 if shuffled_kv_cache else 1),
+            stride_kv_buffer_2=kv_buffer.stride(2),
             stride_kv_buffer_3=kv_buffer.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_tokens_per_seq=num_tokens_per_seq,
@@ -374,8 +416,13 @@ def mla_decode_fwd(
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
-            IS_Q_FP8=(q_dtype == e4m3_dtype),
-            IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
+            SHUFFLED_KV_CACHE=shuffled_kv_cache,
+            K_WIDTH=K_WIDTH,
+            SCALE_K_WIDTH_LORA=SCALE_K_WIDTH_LORA,
+            SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
+            QUERY_DTYPE=QUERY_DTYPE,
+            KV_CACHE_DTYPE=KV_CACHE_DTYPE,
+            BLOCK_SCALES_SIZE=BLOCK_SCALES_SIZE,
             **attn_config,
         )
     else:

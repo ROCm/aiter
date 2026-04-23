@@ -9,7 +9,10 @@ import triton
 
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.shuffle import shuffle_weight
-from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from op_tests.triton_tests.quant.test_quant_mxfp4 import (
+    torch_dynamic_mxfp4_quant,
+    batched_swizzle_scales_gfx1250,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 
@@ -158,27 +161,6 @@ def shuffle_kv_cache(
     return key_cache_shuffled, value_cache_shuffled
 
 
-def swizzle_scales_gfx1250(data):
-    data_shape = data.shape
-    N = data_shape[-2]
-    SCALE_K = data_shape[-1]
-    PRESHUFFLE_FACTOR = 128
-    SCALE_KWIDTH = min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
-    data = data.view(
-        -1,
-        N // PRESHUFFLE_FACTOR,
-        4,
-        PRESHUFFLE_FACTOR // 4,
-        SCALE_K // SCALE_KWIDTH,
-        SCALE_KWIDTH,
-    )
-    data = data.permute(0, 1, 4, 3, 2, 5).contiguous()
-    data = data.view(
-        *data_shape[:-2], N // PRESHUFFLE_FACTOR, SCALE_K * PRESHUFFLE_FACTOR
-    )
-    return data
-
-
 def dynamic_nvfp4_quant_kv_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -195,63 +177,45 @@ def dynamic_nvfp4_quant_kv_cache(
     assert head_size == head_size_v
     assert block_size == block_size_v
 
-    quant_head_size = head_size // 2
-    scale_width = head_size // 16
-
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    key_cache_shuffled = key_cache_shuffled.view(-1, block_size, head_size)
-    key_cache_shuffled, key_cache_shuffled_scale = torch_dynamic_mxfp4_quant(
-        key_cache_shuffled, is_nvfp4=True
-    )
-    key_cache_shuffled_scale = key_cache_shuffled_scale.view(
-        -1, num_kv_heads, block_size, scale_width
-    )
-    key_cache_shuffled = shuffle_weight(key_cache_shuffled).view(
-        -1, num_kv_heads, block_size * quant_head_size
-    )
-    key_cache_shuffled_scale = swizzle_scales_gfx1250(key_cache_shuffled_scale).view(
-        -1, num_kv_heads, block_size * scale_width
-    )
-    key_cache_shuffled = torch.cat(
-        [
-            key_cache_shuffled.view(torch.uint8),
-            key_cache_shuffled_scale.view(torch.uint8),
-        ],
-        dim=-1,
-    ).contiguous()
-    key_cache_shuffled = key_cache_shuffled.view(
-        -1, num_kv_heads, block_size, quant_head_size + scale_width
-    )
-
     value_cache_shuffled = value_cache.view(
         -1, block_size, num_kv_heads, head_size
     ).permute(0, 2, 1, 3)
-    value_cache_shuffled = value_cache_shuffled.view(-1, block_size, head_size)
-    value_cache_shuffled, value_cache_shuffled_scale = torch_dynamic_mxfp4_quant(
-        value_cache_shuffled, is_nvfp4=True
-    )
-    value_cache_shuffled_scale = value_cache_shuffled_scale.view(
-        -1, num_kv_heads, block_size, scale_width
-    )
-    value_cache_shuffled = shuffle_weight(value_cache_shuffled).view(
-        -1, num_kv_heads, block_size * quant_head_size
-    )
-    value_cache_shuffled_scale = swizzle_scales_gfx1250(
-        value_cache_shuffled_scale
-    ).view(-1, num_kv_heads, block_size * scale_width)
-    value_cache_shuffled = torch.cat(
-        [
-            value_cache_shuffled.view(torch.uint8),
-            value_cache_shuffled_scale.view(torch.uint8),
-        ],
-        dim=-1,
-    ).contiguous()
-    value_cache_shuffled = value_cache_shuffled.view(
-        -1, num_kv_heads, block_size, quant_head_size + scale_width
-    )
-    return key_cache_shuffled, value_cache_shuffled
+
+    quant_head_size = head_size // 2
+    scale_width = head_size // 16
+
+    def quant_and_shuffle(key_or_value_cache):
+        cache_shuffled, cache_shuffled_scale = torch_dynamic_mxfp4_quant(
+            key_or_value_cache, is_nvfp4=True
+        )
+        cache_shuffled_scale = cache_shuffled_scale.view(
+            -1, num_kv_heads, block_size, scale_width
+        )
+        cache_shuffled = shuffle_weight(cache_shuffled).view(
+            -1, num_kv_heads, block_size * quant_head_size
+        )
+        cache_shuffled_scale = batched_swizzle_scales_gfx1250(
+            cache_shuffled_scale
+        ).view(-1, num_kv_heads, block_size * scale_width)
+        cache_shuffled = torch.cat(
+            [
+                cache_shuffled.view(torch.uint8),
+                cache_shuffled_scale.view(torch.uint8),
+            ],
+            dim=-1,
+        ).contiguous()
+        cache_shuffled = cache_shuffled.view(
+            -1, num_kv_heads, block_size, quant_head_size + scale_width
+        )
+        return cache_shuffled
+
+    key_cache_quant_and_shuffled = quant_and_shuffle(key_cache_shuffled)
+    value_cache_quant_and_shuffled = quant_and_shuffle(value_cache_shuffled)
+
+    return key_cache_quant_and_shuffled, value_cache_quant_and_shuffled
 
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
