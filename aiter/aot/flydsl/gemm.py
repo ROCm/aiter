@@ -46,6 +46,9 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
+from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
+from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -122,7 +125,6 @@ def parse_csv(csv_path: str):
     """Parse a GEMM tuned CSV and return a list of unique FlyDSL compile jobs."""
     jobs = []
     seen = set()
-    get_flydsl_splitk_hgemm_kernel_params = None
 
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
@@ -140,10 +142,6 @@ def parse_csv(csv_path: str):
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
             elif kernel_name.startswith("flydsl_gemm"):
-                if get_flydsl_splitk_hgemm_kernel_params is None:
-                    from aiter.ops.flydsl.gemm_kernels import (
-                        get_flydsl_splitk_hgemm_kernel_params,
-                    )
                 params = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
                 if params is not None:
                     params = dict(params)
@@ -223,7 +221,6 @@ def _compile_hgemm_to_cache(
     del kwargs, out_dtype
 
     import torch
-    from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 
     has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
     dev = torch.device("cuda") if has_cuda else torch.device("cpu")
@@ -285,7 +282,6 @@ def _compile_preshuffle_to_cache(
     del kwargs
 
     import torch
-    from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 
     has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
     dev = torch.device("cuda") if has_cuda else torch.device("cpu")

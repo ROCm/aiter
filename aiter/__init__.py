@@ -116,21 +116,16 @@ else:
             e,
         )
 
-# Import Triton-based communication primitives from ops.triton.comms
-# (optional, only if Iris is available). Skip during AOT bootstrap so importing
-# `aiter.aot.*` does not pull in runtime-heavy modules.
-if not AITER_AOT_IMPORT:
-    try:
-        from .ops.triton.comms import (
-            IrisCommContext,  # noqa: F401
-            calculate_heap_size,  # noqa: F401
-            reduce_scatter,  # noqa: F401
-            all_gather,  # noqa: F401
-            reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
-            IRIS_COMM_AVAILABLE,  # noqa: F401
-        )
-    except (ImportError, AttributeError):
-        # Iris or triton not available, skip import
-        IRIS_COMM_AVAILABLE = False
-else:
+# Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
+try:
+    from .ops.triton.comms import (
+        IrisCommContext,  # noqa: F401
+        calculate_heap_size,  # noqa: F401
+        reduce_scatter,  # noqa: F401
+        all_gather,  # noqa: F401
+        reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
+        IRIS_COMM_AVAILABLE,  # noqa: F401
+    )
+except (ImportError, AttributeError):
+    # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False
