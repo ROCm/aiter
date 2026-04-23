@@ -32,7 +32,11 @@ Phase 1 exports (core quantization infrastructure, no Triton kernels):
 """
 
 from .codebook import get_codebook, pregenerate_all_codebooks
-from .rotation import get_rotation_matrix, get_qjl_matrix, clear_cache as clear_rotation_cache
+from .rotation import (
+    get_rotation_matrix,
+    get_qjl_matrix,
+    clear_cache as clear_rotation_cache,
+)
 from .quantizer import (
     TurboQuantMSE,
     TurboQuantProd,

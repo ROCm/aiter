@@ -62,16 +62,26 @@ def _rand_unit_vecs(n: int, d: int, seed: int = 0) -> torch.Tensor:
 # 1. Bit-packing round-trips
 # ---------------------------------------------------------------------------
 
+
 class TestBitPacking:
 
-    @pytest.mark.parametrize("bits,d", [
-        (2, 64), (2, 128), (2, 63),   # d not multiple of 4
-        (3, 64), (3, 128), (3, 65),   # d not multiple of 8
-        (4, 64), (4, 128), (4, 127),  # d not multiple of 2
-    ])
+    @pytest.mark.parametrize(
+        "bits,d",
+        [
+            (2, 64),
+            (2, 128),
+            (2, 63),  # d not multiple of 4
+            (3, 64),
+            (3, 128),
+            (3, 65),  # d not multiple of 8
+            (4, 64),
+            (4, 128),
+            (4, 127),  # d not multiple of 2
+        ],
+    )
     def test_round_trip(self, bits, d):
         """pack → unpack must recover original indices exactly."""
-        n_levels = 2 ** bits
+        n_levels = 2**bits
         torch.manual_seed(42)
         indices = torch.randint(0, n_levels, (8, d), dtype=torch.int64)
 
@@ -79,8 +89,9 @@ class TestBitPacking:
         recovered = unpack_indices(packed, bits, d)
 
         assert recovered.shape == (8, d), f"shape mismatch: {recovered.shape}"
-        assert (recovered == indices).all(), \
-            f"bits={bits} d={d}: max diff {(recovered - indices).abs().max()}"
+        assert (
+            recovered == indices
+        ).all(), f"bits={bits} d={d}: max diff {(recovered - indices).abs().max()}"
 
     @pytest.mark.parametrize("bits,d", [(2, 128), (3, 128), (4, 128)])
     def test_packed_dtype(self, bits, d):
@@ -94,8 +105,9 @@ class TestBitPacking:
         """Packed tensor length matches packed_size()."""
         indices = torch.zeros(1, d, dtype=torch.int64)
         packed = pack_indices(indices, bits)
-        assert packed.shape[-1] == packed_size(d, bits), \
-            f"bits={bits} d={d}: packed {packed.shape[-1]} != expected {packed_size(d, bits)}"
+        assert packed.shape[-1] == packed_size(
+            d, bits
+        ), f"bits={bits} d={d}: packed {packed.shape[-1]} != expected {packed_size(d, bits)}"
 
     @pytest.mark.parametrize("bits", [2, 3, 4])
     def test_batch_dims(self, bits):
@@ -111,6 +123,7 @@ class TestBitPacking:
 # 2. Rotation matrix orthogonality
 # ---------------------------------------------------------------------------
 
+
 class TestRotationMatrices:
 
     @pytest.mark.parametrize("head_dim", [64, 128, 256])
@@ -120,8 +133,9 @@ class TestRotationMatrices:
         Pi = get_rotation_matrix(head_dim, DEVICE)
         eye = torch.eye(head_dim)
         product = Pi.cpu().T @ Pi.cpu()
-        assert torch.allclose(product, eye, atol=1e-5), \
-            f"head_dim={head_dim}: max deviation {(product - eye).abs().max():.2e}"
+        assert torch.allclose(
+            product, eye, atol=1e-5
+        ), f"head_dim={head_dim}: max deviation {(product - eye).abs().max():.2e}"
 
     @pytest.mark.parametrize("head_dim", [64, 128])
     def test_pi_deterministic(self, head_dim):
@@ -164,17 +178,26 @@ class TestRotationMatrices:
 # 3. Codebook generation
 # ---------------------------------------------------------------------------
 
+
 class TestCodebook:
 
-    @pytest.mark.parametrize("head_dim,bits", [
-        (64, 2), (64, 3), (64, 4),
-        (128, 2), (128, 3), (128, 4),
-    ])
+    @pytest.mark.parametrize(
+        "head_dim,bits",
+        [
+            (64, 2),
+            (64, 3),
+            (64, 4),
+            (128, 2),
+            (128, 3),
+            (128, 4),
+        ],
+    )
     def test_codebook_shape(self, head_dim, bits):
         """Codebook must have exactly 2^bits entries."""
         cb = get_codebook(head_dim, bits, device=DEVICE)
-        assert cb.shape == (2 ** bits,), \
-            f"head_dim={head_dim} bits={bits}: got shape {cb.shape}"
+        assert cb.shape == (
+            2**bits,
+        ), f"head_dim={head_dim} bits={bits}: got shape {cb.shape}"
 
     @pytest.mark.parametrize("head_dim,bits", [(128, 2), (128, 3), (128, 4)])
     def test_codebook_sorted(self, head_dim, bits):
@@ -189,8 +212,9 @@ class TestCodebook:
         cb = get_codebook(head_dim, bits, device=DEVICE)
         # cb[i] + cb[n-1-i] ≈ 0
         sym_error = (cb + cb.flip(0)).abs().max().item()
-        assert sym_error < 0.05, \
-            f"head_dim={head_dim} bits={bits}: symmetry error {sym_error:.4f}"
+        assert (
+            sym_error < 0.05
+        ), f"head_dim={head_dim} bits={bits}: symmetry error {sym_error:.4f}"
 
     @pytest.mark.parametrize("bits", [2, 3, 4])
     def test_codebook_reproducible(self, bits):
@@ -210,11 +234,19 @@ class TestCodebook:
 # 4. TurboQuantMSE compress / decompress accuracy
 # ---------------------------------------------------------------------------
 
+
 class TestTurboQuantMSE:
 
-    @pytest.mark.parametrize("head_dim,bits", [
-        (64, 2), (64, 4), (128, 3), (128, 4), (256, 4),
-    ])
+    @pytest.mark.parametrize(
+        "head_dim,bits",
+        [
+            (64, 2),
+            (64, 4),
+            (128, 3),
+            (128, 4),
+            (256, 4),
+        ],
+    )
     def test_decompress_shape(self, head_dim, bits):
         """Decompressed shape must match original."""
         clear_cache()
@@ -224,9 +256,14 @@ class TestTurboQuantMSE:
         x_hat = mse.decompress(compressed)
         assert x_hat.shape == x.shape
 
-    @pytest.mark.parametrize("head_dim,bits", [
-        (128, 4), (128, 3), (128, 2),
-    ])
+    @pytest.mark.parametrize(
+        "head_dim,bits",
+        [
+            (128, 4),
+            (128, 3),
+            (128, 2),
+        ],
+    )
     def test_cos_sim_increases_with_bits(self, head_dim, bits):
         """Higher bits must give better cosine similarity."""
         clear_cache()
@@ -238,8 +275,7 @@ class TestTurboQuantMSE:
             x_hat = mse.decompress(compressed)
             cos = F.cosine_similarity(x, x_hat, dim=-1).mean().item()
             results[b] = cos
-        assert results[2] < results[3] < results[4], \
-            f"cos_sim not monotone: {results}"
+        assert results[2] < results[3] < results[4], f"cos_sim not monotone: {results}"
 
     @pytest.mark.parametrize("head_dim,bits", [(128, 4)])
     def test_high_bit_cos_sim(self, head_dim, bits):
@@ -279,6 +315,7 @@ class TestTurboQuantMSE:
 # 5. TurboQuantProd inner-product unbiasedness
 # ---------------------------------------------------------------------------
 
+
 class TestTurboQuantProd:
 
     def test_score_shape(self):
@@ -308,7 +345,7 @@ class TestTurboQuantProd:
         q = q / q.norm()
         k = _rand_unit_vecs(n_keys, d, seed=10)
 
-        true_scores = (q @ k.T).squeeze(0)    # (n_keys,)
+        true_scores = (q @ k.T).squeeze(0)  # (n_keys,)
 
         compressed = prod.compress(k)
         est_scores = prod.inner_product_score(q, compressed).squeeze(0)  # (n_keys,)
@@ -344,13 +381,15 @@ class TestTurboQuantProd:
         prod_err = (prod_scores - true_ip).abs().mean().item()
 
         # Prod should be at least as good; allow small slack due to randomness
-        assert prod_err <= mse_err * 1.05, \
-            f"Prod (err={prod_err:.4f}) worse than MSE (err={mse_err:.4f})"
+        assert (
+            prod_err <= mse_err * 1.05
+        ), f"Prod (err={prod_err:.4f}) worse than MSE (err={mse_err:.4f})"
 
 
 # ---------------------------------------------------------------------------
 # 6. ValueQuantizer
 # ---------------------------------------------------------------------------
+
 
 class TestValueQuantizer:
 
@@ -400,14 +439,16 @@ class TestValueQuantizer:
         v = torch.randn(64, 128)
         compressed = vq.compress(v)
         from aiter.ops.triton.attention.turboquant.utils import unpack_indices
+
         indices = unpack_indices(compressed.indices, bits, 128)
         assert indices.min() >= 0
-        assert indices.max() < 2 ** bits
+        assert indices.max() < 2**bits
 
 
 # ---------------------------------------------------------------------------
 # 7. Distortion scaling (Theorem 3)
 # ---------------------------------------------------------------------------
+
 
 class TestDistortionScaling:
     """
@@ -432,32 +473,40 @@ class TestDistortionScaling:
         # Each extra bit should reduce MSE significantly
         ratio_2_3 = mses[2] / mses[3]
         ratio_3_4 = mses[3] / mses[4]
-        assert ratio_2_3 > 1.5, \
-            f"3-bit not significantly better than 2-bit: ratio={ratio_2_3:.2f}"
-        assert ratio_3_4 > 1.5, \
-            f"4-bit not significantly better than 3-bit: ratio={ratio_3_4:.2f}"
+        assert (
+            ratio_2_3 > 1.5
+        ), f"3-bit not significantly better than 2-bit: ratio={ratio_2_3:.2f}"
+        assert (
+            ratio_3_4 > 1.5
+        ), f"4-bit not significantly better than 3-bit: ratio={ratio_3_4:.2f}"
 
 
 # ---------------------------------------------------------------------------
 # 8. Compression ratio
 # ---------------------------------------------------------------------------
 
+
 class TestCompressionRatio:
 
-    @pytest.mark.parametrize("head_dim,key_bits,value_bits,expected_min", [
-        (128, 3, 2, 3.5),
-        (128, 4, 4, 2.5),
-        (256, 3, 2, 3.5),
-    ])
+    @pytest.mark.parametrize(
+        "head_dim,key_bits,value_bits,expected_min",
+        [
+            (128, 3, 2, 3.5),
+            (128, 4, 4, 2.5),
+            (256, 3, 2, 3.5),
+        ],
+    )
     def test_ratio_in_range(self, head_dim, key_bits, value_bits, expected_min):
         ratio = compression_ratio(head_dim, key_bits, value_bits)
-        assert ratio >= expected_min, \
-            f"head_dim={head_dim} k={key_bits}b v={value_bits}b: ratio={ratio:.2f} < {expected_min}"
+        assert (
+            ratio >= expected_min
+        ), f"head_dim={head_dim} k={key_bits}b v={value_bits}b: ratio={ratio:.2f} < {expected_min}"
 
     def test_higher_bits_lower_ratio(self):
         """More bits → lower compression ratio (less compression)."""
         r_aggressive = compression_ratio(128, 2, 2)
         r_moderate = compression_ratio(128, 3, 2)
         r_conservative = compression_ratio(128, 4, 4)
-        assert r_aggressive > r_moderate > r_conservative, \
-            f"Ratios not monotone: {r_aggressive:.2f} {r_moderate:.2f} {r_conservative:.2f}"
+        assert (
+            r_aggressive > r_moderate > r_conservative
+        ), f"Ratios not monotone: {r_aggressive:.2f} {r_moderate:.2f} {r_conservative:.2f}"

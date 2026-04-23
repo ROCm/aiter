@@ -31,10 +31,10 @@ from __future__ import annotations
 import math
 import torch
 
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
     """
@@ -120,7 +120,9 @@ def compression_ratio(head_dim: int, key_bits: int, value_bits: int) -> float:
     # Values: (value_bits * d) bits + 2*(d//32) bytes for scales+zeros
     group_size = 32
     n_groups = head_dim // group_size
-    val_compressed = math.ceil(head_dim * value_bits / 8) + n_groups * 2 * 2  # scale+zero fp16
+    val_compressed = (
+        math.ceil(head_dim * value_bits / 8) + n_groups * 2 * 2
+    )  # scale+zero fp16
 
     total_compressed = key_compressed + val_compressed
     total_original = 2 * bf16_bytes_per_vector  # K + V
@@ -130,6 +132,7 @@ def compression_ratio(head_dim: int, key_bits: int, value_bits: int) -> float:
 # ---------------------------------------------------------------------------
 # 2-bit packing: 4 indices per byte
 # ---------------------------------------------------------------------------
+
 
 def _pack_2bit(indices: torch.Tensor) -> torch.Tensor:
     """Pack 2-bit indices: 4 per byte, LSB-first."""
@@ -147,10 +150,10 @@ def _pack_2bit(indices: torch.Tensor) -> torch.Tensor:
     idx = idx.reshape(*batch_shape, d_padded // 4, 4)
     # bits 0-1, 2-3, 4-5, 6-7
     packed = (
-        (idx[..., 0] & 0x03) |
-        ((idx[..., 1] & 0x03) << 2) |
-        ((idx[..., 2] & 0x03) << 4) |
-        ((idx[..., 3] & 0x03) << 6)
+        (idx[..., 0] & 0x03)
+        | ((idx[..., 1] & 0x03) << 2)
+        | ((idx[..., 2] & 0x03) << 4)
+        | ((idx[..., 3] & 0x03) << 6)
     )
     return packed.to(torch.uint8)
 
@@ -172,6 +175,7 @@ def _unpack_2bit(packed: torch.Tensor, d: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # 4-bit packing: 2 indices per byte
 # ---------------------------------------------------------------------------
+
 
 def _pack_4bit(indices: torch.Tensor) -> torch.Tensor:
     """Pack 4-bit indices: 2 per byte, lower nibble first."""
@@ -209,6 +213,7 @@ def _unpack_4bit(packed: torch.Tensor, d: int) -> torch.Tensor:
 #   Byte 2: a5[2:2] | a6[2:0]<<1 | a7[2:0]<<4
 # This is the standard 3-bit tight packing across a group of 8.
 
+
 def _pack_3bit(indices: torch.Tensor) -> torch.Tensor:
     """Pack 3-bit indices: 8 per 3 bytes."""
     d = indices.shape[-1]
@@ -226,7 +231,12 @@ def _pack_3bit(indices: torch.Tensor) -> torch.Tensor:
     a = [idx[..., i] for i in range(8)]
 
     b0 = (a[0] & 0x07) | ((a[1] & 0x07) << 3) | ((a[2] & 0x03) << 6)
-    b1 = ((a[2] >> 2) & 0x01) | ((a[3] & 0x07) << 1) | ((a[4] & 0x07) << 4) | ((a[5] & 0x01) << 7)
+    b1 = (
+        ((a[2] >> 2) & 0x01)
+        | ((a[3] & 0x07) << 1)
+        | ((a[4] & 0x07) << 4)
+        | ((a[5] & 0x01) << 7)
+    )
     b2 = ((a[5] >> 1) & 0x03) | ((a[6] & 0x07) << 2) | ((a[7] & 0x07) << 5)
 
     # Stack as (..., groups, 3) then flatten to (..., groups*3)

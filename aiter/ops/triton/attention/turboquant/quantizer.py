@@ -47,10 +47,10 @@ from .codebook import get_codebook
 from .rotation import get_rotation_matrix, get_qjl_matrix
 from .utils import pack_indices, unpack_indices
 
-
 # ---------------------------------------------------------------------------
 # Compressed data containers
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class CompressedKeys:
@@ -64,9 +64,10 @@ class CompressedKeys:
       bits        : int                        — bits per coordinate
       head_dim    : int                        — original d
     """
-    mse_indices: torch.Tensor   # (*batch, d_packed) uint8
-    norms: torch.Tensor         # (*batch,)          fp16
-    Pi: torch.Tensor            # (d, d)             fp32
+
+    mse_indices: torch.Tensor  # (*batch, d_packed) uint8
+    norms: torch.Tensor  # (*batch,)          fp16
+    Pi: torch.Tensor  # (d, d)             fp32
     bits: int
     head_dim: int
 
@@ -80,9 +81,10 @@ class CompressedKeysProd(CompressedKeys):
       res_norms : (*batch,)       fp16   — ||r||
       S         : (d, d)          fp32   — QJL projection matrix (shared)
     """
-    qjl_signs: torch.Tensor   # (*batch, d//8)  uint8
-    res_norms: torch.Tensor   # (*batch,)        fp16
-    S: torch.Tensor           # (d, d)           fp32
+
+    qjl_signs: torch.Tensor  # (*batch, d//8)  uint8
+    res_norms: torch.Tensor  # (*batch,)        fp16
+    S: torch.Tensor  # (d, d)           fp32
 
 
 @dataclass
@@ -97,9 +99,10 @@ class CompressedValues:
       group_size  : int
       head_dim    : int
     """
-    indices: torch.Tensor    # (*batch, d_packed)         uint8
-    scales: torch.Tensor     # (*batch, d // group_size)  fp16
-    zeros: torch.Tensor      # (*batch, d // group_size)  fp16
+
+    indices: torch.Tensor  # (*batch, d_packed)         uint8
+    scales: torch.Tensor  # (*batch, d // group_size)  fp16
+    zeros: torch.Tensor  # (*batch, d // group_size)  fp16
     bits: int
     group_size: int
     head_dim: int
@@ -108,6 +111,7 @@ class CompressedValues:
 # ---------------------------------------------------------------------------
 # TurboQuantMSE — Algorithm 1
 # ---------------------------------------------------------------------------
+
 
 class TurboQuantMSE(nn.Module):
     """
@@ -132,7 +136,7 @@ class TurboQuantMSE(nn.Module):
 
         self.head_dim = head_dim
         self.bits = bits
-        self.n_levels = 2 ** bits
+        self.n_levels = 2**bits
 
         dev = device or torch.device("cpu")
         Pi = get_rotation_matrix(head_dim, dev, seed=seed)
@@ -221,6 +225,7 @@ class TurboQuantMSE(nn.Module):
 # TurboQuantProd — Algorithm 2
 # ---------------------------------------------------------------------------
 
+
 class TurboQuantProd(TurboQuantMSE):
     """
     Unbiased inner-product key compressor: MSE quantization + QJL residual.
@@ -272,14 +277,14 @@ class TurboQuantProd(TurboQuantMSE):
         base = super().compress(x)
 
         # Reconstruct x̂ to compute residual
-        x_hat = super().decompress(base)   # (..., d)
+        x_hat = super().decompress(base)  # (..., d)
 
         # Residual
-        r = x.float() - x_hat             # (..., d)
+        r = x.float() - x_hat  # (..., d)
 
         # QJL sketch: sign(S @ r)
-        sketch = r @ self.S.T             # (..., d)  (equiv to (S @ r.T).T)
-        signs_bool = (sketch >= 0)         # (..., d)  bool
+        sketch = r @ self.S.T  # (..., d)  (equiv to (S @ r.T).T)
+        signs_bool = sketch >= 0  # (..., d)  bool
 
         # Reshape to (..., d//8, 8) and pack into uint8
         signs_uint8 = _pack_signs(signs_bool)  # (..., d//8)
@@ -320,11 +325,11 @@ class TurboQuantProd(TurboQuantMSE):
         # --- MSE score ---
         # <q, k_hat> = k_norm / sqrt(d) * (q @ Πᵀ) · codebook[idx]
         # because k_hat = (codebook[idx] / sqrt(d)) @ Π * k_norm
-        q_rot = q.float() @ self.Pi.T          # (..._q, d)
+        q_rot = q.float() @ self.Pi.T  # (..._q, d)
         k_indices = unpack_indices(
             compressed.mse_indices, compressed.bits, d
-        )                                       # (..._k, d)
-        k_rot_hat = self.codebook[k_indices]    # (..._k, d) — codebook (sqrt(d)) scale
+        )  # (..._k, d)
+        k_rot_hat = self.codebook[k_indices]  # (..._k, d) — codebook (sqrt(d)) scale
         # Divide by sqrt(d) to account for the coordinate scaling applied at compress time
         mse_score = (q_rot.unsqueeze(-2) * k_rot_hat).sum(dim=-1) / math.sqrt(d)
         mse_score = mse_score * compressed.norms.float()
@@ -332,11 +337,9 @@ class TurboQuantProd(TurboQuantMSE):
         # --- QJL correction for <q, r> ---
         # Estimator: ||r|| * (S @ q) · sign(S @ r) / d
         # q_sketch stays continuous (NOT binarized) — lower variance than sign(Sq)·sign(Sr)
-        q_sketch = q.float() @ self.S.T        # (..._q, d)  continuous
+        q_sketch = q.float() @ self.S.T  # (..._q, d)  continuous
 
-        k_signs = _unpack_signs(
-            compressed.qjl_signs, d
-        )                                       # (..._k, d)  bool
+        k_signs = _unpack_signs(compressed.qjl_signs, d)  # (..._k, d)  bool
         k_signs_float = k_signs.float() * 2 - 1  # {-1, +1}
 
         # (S @ q) · sign(S @ r)
@@ -350,6 +353,7 @@ class TurboQuantProd(TurboQuantMSE):
 # ---------------------------------------------------------------------------
 # ValueQuantizer — group-wise affine quantization for V tensors
 # ---------------------------------------------------------------------------
+
 
 class ValueQuantizer(nn.Module):
     """
@@ -375,7 +379,7 @@ class ValueQuantizer(nn.Module):
             raise ValueError(f"ValueQuantizer bits must be 2 or 4; got {bits}")
         self.bits = bits
         self.group_size = group_size
-        self.n_levels = 2 ** bits
+        self.n_levels = 2**bits
 
     # ------------------------------------------------------------------
     def compress(self, v: torch.Tensor) -> CompressedValues:
@@ -400,22 +404,22 @@ class ValueQuantizer(nn.Module):
         # Reshape to (..., n_groups, group_size) for group-wise stats
         v_grouped = v.float().reshape(*batch_shape, n_groups, self.group_size)
 
-        v_min = v_grouped.min(dim=-1).values   # (..., n_groups)
-        v_max = v_grouped.max(dim=-1).values   # (..., n_groups)
+        v_min = v_grouped.min(dim=-1).values  # (..., n_groups)
+        v_max = v_grouped.max(dim=-1).values  # (..., n_groups)
 
         # Affine scale and zero-point
-        scale = (v_max - v_min) / (self.n_levels - 1)          # (..., n_groups)
+        scale = (v_max - v_min) / (self.n_levels - 1)  # (..., n_groups)
         scale = scale.clamp(min=1e-8)
-        zero = v_min                                            # (..., n_groups)
+        zero = v_min  # (..., n_groups)
 
         # Quantize: integer in [0, n_levels - 1]
-        v_shifted = v_grouped - zero.unsqueeze(-1)              # (..., n_groups, g)
+        v_shifted = v_grouped - zero.unsqueeze(-1)  # (..., n_groups, g)
         indices = (v_shifted / scale.unsqueeze(-1)).round().clamp(0, self.n_levels - 1)
-        indices = indices.to(torch.uint8)                       # (..., n_groups, g)
+        indices = indices.to(torch.uint8)  # (..., n_groups, g)
 
         # Flatten back and pack
-        indices_flat = indices.reshape(*batch_shape, d)         # (..., d)
-        packed = pack_indices(indices_flat, self.bits)          # (..., d_packed)
+        indices_flat = indices.reshape(*batch_shape, d)  # (..., d)
+        packed = pack_indices(indices_flat, self.bits)  # (..., d_packed)
 
         return CompressedValues(
             indices=packed,
@@ -447,10 +451,12 @@ class ValueQuantizer(nn.Module):
         )  # (..., d)  int64
 
         batch_shape = indices_flat.shape[:-1]
-        indices_grouped = indices_flat.reshape(*batch_shape, n_groups, g)  # (..., n_g, g)
+        indices_grouped = indices_flat.reshape(
+            *batch_shape, n_groups, g
+        )  # (..., n_g, g)
 
-        scale = compressed.scales.float()   # (..., n_groups)
-        zero = compressed.zeros.float()     # (..., n_groups)
+        scale = compressed.scales.float()  # (..., n_groups)
+        zero = compressed.zeros.float()  # (..., n_groups)
 
         # Dequantize
         v_hat = indices_grouped.float() * scale.unsqueeze(-1) + zero.unsqueeze(-1)
@@ -462,6 +468,7 @@ class ValueQuantizer(nn.Module):
 # ---------------------------------------------------------------------------
 # Helper: sign bit-packing
 # ---------------------------------------------------------------------------
+
 
 def _pack_signs(signs_bool: torch.Tensor) -> torch.Tensor:
     """
@@ -481,7 +488,9 @@ def _pack_signs(signs_bool: torch.Tensor) -> torch.Tensor:
     # (..., d//8, 8) — last dim is 8 bits per byte
     bits = signs_bool.reshape(*batch_shape, d // 8, 8).to(torch.uint8)
     # Pack: multiply by powers of 2 and sum
-    powers = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8, device=signs_bool.device)
+    powers = torch.tensor(
+        [1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8, device=signs_bool.device
+    )
     packed = (bits * powers).sum(dim=-1).to(torch.uint8)  # (..., d//8)
     return packed
 
@@ -492,7 +501,9 @@ def _unpack_signs(packed: torch.Tensor, d: int) -> torch.Tensor:
     """
     batch_shape = packed.shape[:-1]
     n_bytes = packed.shape[-1]
-    powers = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8, device=packed.device)
+    powers = torch.tensor(
+        [1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8, device=packed.device
+    )
     # (..., n_bytes, 8)
     bits = ((packed.unsqueeze(-1) & powers) > 0).reshape(*batch_shape, n_bytes * 8)
     # Trim to original d

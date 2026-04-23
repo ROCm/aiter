@@ -33,13 +33,19 @@ SUPPORTED_BITS = (2, 3, 4)
 def _beta_pdf(x: np.ndarray, alpha: float, beta: float) -> np.ndarray:
     """Beta distribution PDF (unnormalized for sampling purposes)."""
     from scipy.special import betaln
+
     log_norm = betaln(alpha, beta)
-    log_pdf = (alpha - 1) * np.log(np.clip(x, 1e-300, None)) + \
-              (beta - 1) * np.log(np.clip(1 - x, 1e-300, None)) - log_norm
+    log_pdf = (
+        (alpha - 1) * np.log(np.clip(x, 1e-300, None))
+        + (beta - 1) * np.log(np.clip(1 - x, 1e-300, None))
+        - log_norm
+    )
     return np.exp(log_pdf)
 
 
-def _sample_beta_coords(head_dim: int, n_samples: int = 2_000_000, seed: int = 42) -> np.ndarray:
+def _sample_beta_coords(
+    head_dim: int, n_samples: int = 2_000_000, seed: int = 42
+) -> np.ndarray:
     """
     Sample the distribution of a single rotated coordinate.
 
@@ -93,10 +99,12 @@ def _lloyd_max_iteration(
         indices = np.searchsorted(boundaries, samples)
 
         # M-step: recompute centroids as cluster means
-        new_centroids = np.array([
-            samples[indices == k].mean() if np.any(indices == k) else centroids[k]
-            for k in range(n_levels)
-        ])
+        new_centroids = np.array(
+            [
+                samples[indices == k].mean() if np.any(indices == k) else centroids[k]
+                for k in range(n_levels)
+            ]
+        )
 
         # Check convergence
         if np.max(np.abs(new_centroids - centroids)) < tol:
@@ -136,7 +144,7 @@ def generate_lloyd_max_codebook(
             "Install it with: pip install scipy"
         ) from e
 
-    n_levels = 2 ** bits
+    n_levels = 2**bits
     samples = _sample_beta_coords(head_dim, n_samples=n_samples, seed=seed)
     centroids = _lloyd_max_iteration(samples, n_levels)
     centroids_sorted = np.sort(centroids)
@@ -200,11 +208,15 @@ def pregenerate_all_codebooks(verbose: bool = True) -> None:
                     print(f"  [skip] codebook_d{head_dim}_b{bits}.pt already exists")
                 continue
             if verbose:
-                print(f"  [gen]  codebook_d{head_dim}_b{bits}.pt ...", end="", flush=True)
+                print(
+                    f"  [gen]  codebook_d{head_dim}_b{bits}.pt ...", end="", flush=True
+                )
             cb = generate_lloyd_max_codebook(head_dim, bits)
             torch.save(cb, path)
             if verbose:
-                print(f" done  ({cb.shape[0]} levels, range [{cb[0]:.4f}, {cb[-1]:.4f}])")
+                print(
+                    f" done  ({cb.shape[0]} levels, range [{cb[0]:.4f}, {cb[-1]:.4f}])"
+                )
 
 
 if __name__ == "__main__":
