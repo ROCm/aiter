@@ -15,13 +15,10 @@ from flydsl.compiler.protocol import fly_values
 from flydsl.expr import arith, gpu, range_constexpr, const_expr, rocdl, vector
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
 
 from .tensor_shim import GTensor, STensor, _to_raw, get_dtype_in_kernel
 from ..utils import get_shared_memory_per_block
-
-SPLIT_K_COUNTER_MAX_LEN = 128
-SPLIT_K_SIGNAL_STATE_COUNT = 3
 
 
 def swizzle_xor16(row, col_in_bytes, k_blocks16):
@@ -164,6 +161,7 @@ def compile_hgemm_kernel(
     BLOCK_M = BLOCK_M_WARPS * WARP_M
     BLOCK_N = BLOCK_N_WARPS * WARP_N
     assert (n >= BLOCK_N) and (n % BLOCK_N == 0)
+    N_BLOCKS = n // BLOCK_N
     BLOCK_MK_SIZE = BLOCK_M * BLOCK_K
     BLOCK_NK_SIZE = BLOCK_N * BLOCK_K
     BLOCK_MN_SIZE = BLOCK_M * BLOCK_N
@@ -193,15 +191,18 @@ def compile_hgemm_kernel(
 
     allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="smem")
     smem_a_offset = allocator._align(allocator.ptr, 16)
+    C_BYTES = BLOCK_M * BLOCK_N * DTYPE_BYTES
     AS_BYTES = STAGES * BLOCK_M * BLOCK_K * DTYPE_BYTES
-    AS_BYTES = max(AS_BYTES, BLOCK_M * BLOCK_N * DTYPE_BYTES)
-    allocator.ptr = smem_a_offset + AS_BYTES
+    allocator.ptr = smem_a_offset + max(AS_BYTES, C_BYTES)
     SMEM_USE = AS_BYTES
     if B_TO_LDS:
         smem_b_offset = allocator._align(allocator.ptr, 16)
         allocator.ptr = smem_b_offset + STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
         SMEM_USE += STAGES * BLOCK_N * BLOCK_K * DTYPE_BYTES
-    smem_limit = get_shared_memory_per_block(fallback_gfx=GPU_ARCH)
+    SMEM_USE = max(SMEM_USE, C_BYTES)
+    smem_limit = SMEM_CAPACITY_MAP.get(
+        GPU_ARCH, get_shared_memory_per_block(fallback_gfx=GPU_ARCH)
+    )
     if SMEM_USE > smem_limit:
         raise RuntimeError(
             f"{KERNEL_NAME} requires {SMEM_USE} bytes LDS, "
@@ -215,15 +216,15 @@ def compile_hgemm_kernel(
     LDG_B_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
     LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
 
-    @flyc.kernel
+    @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hgemm_kernel(
         C: fx.Tensor,
         A: fx.Tensor,
         B: fx.Tensor,
         BIAS: fx.Tensor,
         m: fx.Int32,
-        COUNTER: fx.Tensor,
-        signal_state: fx.Int32,
+        SEMAPHORE: fx.Tensor,
+        SIGNAL: fx.Tensor,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -234,7 +235,9 @@ def compile_hgemm_kernel(
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
-        BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
+        BIAS_ = None
+        if const_expr(HAS_BIAS):
+            BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
         bs_ = None
         base_ptr = allocator.get_base()
         smem_a_ptr = SmemPtr(
@@ -264,20 +267,23 @@ def compile_hgemm_kernel(
             )
         else:
             SHUFFLED_B_ = GTensor(B, dtype=dtype_, shape=(n, k))
-        COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
+        if const_expr(IS_SPLIT_K):
+            smem_bc_ptr = SmemPtr(base_ptr, smem_a_offset, T.i32, shape=(1,))
+            bc_ = STensor(smem_bc_ptr, T.i32, shape=(1,))
 
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
-        block_m_idx = fx.block_idx.x
-        block_n_idx = fx.block_idx.y
+        block_pid = fx.block_idx.x
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
-        counter_idx = (
-            fx.Int32(signal_state * SPLIT_K_COUNTER_MAX_LEN)
-            + fx.block_idx.x * fx.Int32(n // BLOCK_N)
-            + fx.block_idx.y
-        )
+        if const_expr(IS_SPLIT_K):
+            signal_idx = block_pid
+
+        def swizzle_for_cache_reuse(pid):
+            return pid // N_BLOCKS, pid % N_BLOCKS
+
+        block_m_idx, block_n_idx = swizzle_for_cache_reuse(block_pid)
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -293,8 +299,44 @@ def compile_hgemm_kernel(
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
 
-        def zero_c(bias_g, c_g, counter_tensor, counter_g):
-            cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
+        def get_llvm_ptr(ptr, offset, dtype_bytes):
+            base_ptr = fly.extract_aligned_pointer_as_index(
+                _ptr_type, fly_values(ptr)[0]
+            )
+            base_ptr = llvm.PtrToIntOp(_i64_type, base_ptr).result
+            byte_offset = arith.index_cast(
+                T.i64, fx.Index(offset) * fx.Index(dtype_bytes)
+            )
+            llvm_ptr = llvm.AddOp(
+                base_ptr,
+                byte_offset,
+                llvm.IntegerOverflowFlags(0),
+            ).result
+            llvm_ptr = llvm.IntToPtrOp(_ptr_type, llvm_ptr).result
+            return llvm_ptr._value if hasattr(llvm_ptr, "_value") else llvm_ptr
+
+        def zero_c(bias_g, c_g):
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
+            with ir.InsertionPoint(is_t0_cond_if.then_block):
+                semaphore_ptr = get_llvm_ptr(SEMAPHORE, signal_idx, 4)
+                prev = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    semaphore_ptr,
+                    arith.constant(1, type=T.i32),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                ).result
+                bc_[0] = prev
+                scf.YieldOp([])
+            gpu.barrier()
+
+            arrive_idx = bc_[0]
+            cond_first = arith.cmpi(
+                arith.CmpIPredicate.eq, arrive_idx, arith.constant(0, type=T.i32)
+            )
+            cond_ks0 = cond_first
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
                 zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
@@ -323,6 +365,10 @@ def compile_hgemm_kernel(
             rocdl.sched_barrier(0)
             gpu.barrier()
 
+            llvm.InlineAsmOp(None, [], "buffer_wbl2 sc0 sc1", "", has_side_effects=True)
+            rocdl.s_waitcnt(0)
+            gpu.barrier()
+
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
                 is_t0_cond = arith.cmpi(
@@ -330,32 +376,10 @@ def compile_hgemm_kernel(
                 )
                 is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(is_t0_cond_if.then_block):
-                    counter_base_ptr = fly.extract_aligned_pointer_as_index(
-                        _ptr_type, fly_values(counter_tensor)[0]
-                    )
-                    counter_base_ptr = llvm.PtrToIntOp(
-                        _i64_type, counter_base_ptr
-                    ).result
-                    counter_byte_offset = arith.index_cast(
-                        T.i64, fx.Index(counter_idx) * fx.Index(4)
-                    )
-                    counter_ptr = llvm.AddOp(
-                        counter_base_ptr,
-                        counter_byte_offset,
-                        llvm.IntegerOverflowFlags(0),
-                    ).result
-                    counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
-                    counter_ptr_v = (
-                        counter_ptr._value
-                        if hasattr(counter_ptr, "_value")
-                        else counter_ptr
-                    )
-                    llvm.InlineAsmOp(
-                        None, [], "buffer_wbl2 sc0 sc1", "", has_side_effects=True
-                    )
+                    signal_ptr = get_llvm_ptr(SIGNAL, signal_idx, 4)
                     llvm.InlineAsmOp(
                         None,
-                        [counter_ptr_v, arith.constant(1, type=T.i32)],
+                        [signal_ptr, arith.constant(1, type=T.i32)],
                         "global_store_dword $0, $1, off sc0 sc1",
                         "v,v",
                         has_side_effects=True,
@@ -366,31 +390,7 @@ def compile_hgemm_kernel(
             rocdl.sched_barrier(0)
             gpu.barrier()
 
-            cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ks0_if.then_block):
-                clean_cond = arith.cmpi(
-                    arith.CmpIPredicate.ult,
-                    fx.Index(tid),
-                    fx.Index(SPLIT_K_COUNTER_MAX_LEN),
-                )
-                clean_cond_if = scf.IfOp(clean_cond, results_=[], has_else=False)
-                with ir.InsertionPoint(clean_cond_if.then_block):
-                    clean_counter_idx = fx.Int32(
-                        (
-                            (signal_state + SPLIT_K_SIGNAL_STATE_COUNT - 1)
-                            % SPLIT_K_SIGNAL_STATE_COUNT
-                        )
-                        * SPLIT_K_COUNTER_MAX_LEN
-                    ) + fx.Index(tid)
-                    counter_g[fx.Index(clean_counter_idx)] = arith.constant(
-                        0, type=T.i32
-                    )
-                    scf.YieldOp([])
-                scf.YieldOp([])
-            rocdl.sched_barrier(0)
-            gpu.barrier()
-
-        def split_k_barrier(counter_tensor):
+        def split_k_barrier():
             init_cur = arith.constant(0, type=T.i32)
             w = scf.WhileOp([T.i32], [init_cur])
             before = ir.Block.create_at_start(w.before, [T.i32])
@@ -402,33 +402,61 @@ def compile_hgemm_kernel(
                 ).result
                 scf.ConditionOp(need_wait, [cur])
             with ir.InsertionPoint(after):
-                counter_base_ptr = fly.extract_aligned_pointer_as_index(
-                    _ptr_type, fly_values(counter_tensor)[0]
-                )
-                counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
-                counter_byte_offset = arith.index_cast(
-                    T.i64, fx.Index(counter_idx) * fx.Index(4)
-                )
-                counter_ptr = llvm.AddOp(
-                    counter_base_ptr,
-                    counter_byte_offset,
-                    llvm.IntegerOverflowFlags(0),
-                ).result
-                counter_ptr = llvm.IntToPtrOp(_ptr_type, counter_ptr).result
-                counter_ptr_v = (
-                    counter_ptr._value
-                    if hasattr(counter_ptr, "_value")
-                    else counter_ptr
-                )
+                signal_ptr = get_llvm_ptr(SIGNAL, signal_idx, 4)
                 data = llvm.InlineAsmOp(
                     T.i32,
-                    [counter_ptr_v],
+                    [signal_ptr],
                     "global_load_dword $0, $1, off sc1",
                     "=v,v",
                     has_side_effects=True,
                 ).result
                 rocdl.s_waitcnt(0)
                 scf.YieldOp([data])
+            rocdl.sched_barrier(0)
+            gpu.barrier()
+
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
+            with ir.InsertionPoint(is_t0_cond_if.then_block):
+                semaphore_ptr = get_llvm_ptr(SEMAPHORE, signal_idx, 4)
+                arrive_idx = llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    semaphore_ptr,
+                    arith.constant(1, type=T.i32),
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="agent",
+                    alignment=4,
+                ).result
+                cond_last = arith.cmpi(
+                    arith.CmpIPredicate.eq,
+                    arrive_idx,
+                    arith.constant(2 * SPLIT_K - 1, type=T.i32),
+                )
+                cond_last_if = scf.IfOp(cond_last, results_=[], has_else=False)
+                with ir.InsertionPoint(cond_last_if.then_block):
+                    zero_i32 = arith.constant(0, type=T.i32)
+                    signal_ptr = get_llvm_ptr(SIGNAL, signal_idx, 4)
+                    semaphore_ptr = get_llvm_ptr(SEMAPHORE, signal_idx, 4)
+                    llvm.InlineAsmOp(
+                        None, [], "buffer_wbl2 sc0 sc1", "", has_side_effects=True
+                    )
+                    llvm.InlineAsmOp(
+                        None,
+                        [signal_ptr, zero_i32],
+                        "global_store_dword $0, $1, off sc0 sc1",
+                        "v,v",
+                        has_side_effects=True,
+                    )
+                    llvm.InlineAsmOp(
+                        None,
+                        [semaphore_ptr, zero_i32],
+                        "global_store_dword $0, $1, off sc0 sc1",
+                        "v,v",
+                        has_side_effects=True,
+                    )
+                    rocdl.s_waitcnt(0)
+                    scf.YieldOp([])
+                scf.YieldOp([])
             gpu.barrier()
 
         def ldg_a(k_offset):
@@ -613,7 +641,7 @@ def compile_hgemm_kernel(
             return c_frags_new
 
         if const_expr(IS_SPLIT_K):
-            zero_c(BIAS_, C_, COUNTER, COUNTER_)
+            zero_c(BIAS_, C_)
 
         if const_expr(B_TO_LDS):
 
@@ -828,7 +856,7 @@ def compile_hgemm_kernel(
                     cs_[lds_m_idx, lds_n_idx] = val.truncf(dtype_)
 
         if const_expr(IS_SPLIT_K):
-            split_k_barrier(COUNTER)
+            split_k_barrier()
             out_raw = fly_values(C)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
             out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
@@ -912,8 +940,8 @@ def compile_hgemm_kernel(
         B: fx.Tensor,
         BIAS: fx.Tensor,
         m: fx.Int32,
-        COUNTER: fx.Tensor,
-        signal_state: fx.Int32,
+        SEMAPHORE: fx.Tensor,
+        SIGNAL: fx.Tensor,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -922,10 +950,9 @@ def compile_hgemm_kernel(
             allocator.finalize()
 
         bm = (m + BLOCK_M - 1) // BLOCK_M
-        bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, BIAS, m, COUNTER, signal_state).launch(
-            grid=(bm, bn, SPLIT_K),
+        hgemm_kernel(C, A, B, BIAS, m, SEMAPHORE, SIGNAL).launch(
+            grid=(bm * N_BLOCKS, 1, SPLIT_K),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )

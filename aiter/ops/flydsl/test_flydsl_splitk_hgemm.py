@@ -10,6 +10,8 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -101,6 +103,49 @@ SPLITK_PRECISION_CASES = [
         "b_preshuffle": False,
         "pass_pct": 99.0,
         "max_delta_limit": 8.0,
+    },
+]
+
+# Repeated launches catch inter-kernel split-K synchronization regressions, but
+# stay opt-in because they are slower than the default precision cases.
+SPLITK_STRESS_ENV = "AITER_RUN_FLYDSL_SPLITK_STRESS"
+SPLITK_STRESS_REPEAT = 20
+SPLITK_STRESS_MAX_DELTA_LIMIT = 10.0
+
+SPLITK_STRESS_CASES = [
+    {
+        "name": "gptoss_generic_splitk4_bias_repeated_launch",
+        "m": 32,
+        "n": 2880,
+        "k": 2048,
+        "kernel_family": "hgemm",
+        "tile_m": 32,
+        "tile_n": 64,
+        "tile_k": 256,
+        "split_k": 4,
+        "block_m_warps": 1,
+        "block_n_warps": 4,
+        "b_to_lds": False,
+        "b_preshuffle": False,
+        "has_bias": True,
+    },
+    {
+        "name": "gptoss_small_m_blds_block_k_loops1_splitk8_bias",
+        "m": 8,
+        "n": 2880,
+        "k": 2048,
+        "kernel_family": "small_m",
+        "tile_m": 16,
+        "tile_n": 64,
+        "tile_k": 256,
+        "split_k": 8,
+        "block_m_warps": 1,
+        "block_n_warps": 2,
+        "b_to_lds": True,
+        "b_preshuffle": False,
+        "waves_per_eu": 4,
+        "b_to_lds_unroll": 8,
+        "has_bias": True,
     },
 ]
 
@@ -213,6 +258,54 @@ def run_splitk_precision_case(
 def test_flydsl_splitk_hgemm_precision_regressions(case: dict):
     passed, _, _ = run_splitk_precision_case(case)
     assert passed
+
+
+@pytest.mark.parametrize(
+    "case",
+    [pytest.param(case, id=case["name"]) for case in SPLITK_STRESS_CASES],
+)
+def test_flydsl_splitk_repeated_launch_stress(case: dict):
+    if os.environ.get(SPLITK_STRESS_ENV) != "1":
+        pytest.skip(f"set {SPLITK_STRESS_ENV}=1 to run repeated-launch stress tests")
+
+    torch_dtype = torch.bfloat16
+    a, b = make_inputs(case["m"], case["n"], case["k"], torch_dtype)
+    bias = (
+        torch.rand((case["n"],), device="cuda", dtype=torch_dtype)
+        if case.get("has_bias", False)
+        else None
+    )
+    ref = run_torch_acc(a, b, dtype=torch.float32)
+    if bias is not None:
+        ref = ref + bias.float()
+    ref = ref.to(torch_dtype)
+
+    max_deltas = []
+    for _ in range(SPLITK_STRESS_REPEAT):
+        out = flydsl_hgemm(
+            a,
+            b,
+            bias=bias,
+            kernel_family=case.get("kernel_family"),
+            tile_k=case["tile_k"],
+            tile_m=case["tile_m"],
+            tile_n=case["tile_n"],
+            split_k=case["split_k"],
+            block_m_warps=case.get("block_m_warps", 1),
+            block_n_warps=case.get("block_n_warps", 4),
+            waves_per_eu=case.get("waves_per_eu", 0),
+            b_to_lds_unroll=case.get("b_to_lds_unroll", 0),
+            b_to_lds=case.get("b_to_lds", False),
+            b_preshuffle=case["b_preshuffle"],
+        )
+        torch.cuda.synchronize()
+        max_deltas.append((ref.float() - out.float()).abs().max().item())
+
+    max_delta = max(max_deltas)
+    assert max_delta <= SPLITK_STRESS_MAX_DELTA_LIMIT, (
+        f"{case['name']} max_delta={max_delta:.4f}, "
+        f"all repeated max_delta values={max_deltas}"
+    )
 
 
 def _make_kernel_name_kwargs(**overrides) -> dict:
