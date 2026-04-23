@@ -183,7 +183,40 @@ PREFILL_PARAMS = [
     ),
     # varlen + final_state (default path)
     PrefillArgs(
-        K=128, V=128, Hk=16, Hv=64, tp=8, full_prompt_len=8192, model_name="UT"
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=4,
+        full_prompt_len=1024,
+        model_name="meta-Qwen3.5",
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=4,
+        full_prompt_len=8192,
+        model_name="meta-Qwen3.5",
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=8,
+        full_prompt_len=1024,
+        model_name="meta-Qwen3.5",
+    ),
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=64,
+        tp=8,
+        full_prompt_len=8192,
+        model_name="meta-Qwen3.5",
     ),
 ]
 
@@ -883,6 +916,7 @@ def _prepare_flydsl_kernel_launch(
             stream,
         )
 
+    _launch.best_bv = bv
     return _launch
 
 
@@ -1522,14 +1556,15 @@ class TestPerformance:
                 "V": args.V,
                 "Hg": args.Hg,
                 "H": args.H,
+                "SeqLen": args.full_prompt_len,
                 "T": total_tokens,
                 "varlen": args.is_varlen,
                 "final_st": args.output_final_state,
-                "FlyDSL(us)": us_fly,
+                "FlyDSL_vk(us)": us_fly,
                 "Triton_vk(us)": us_triton_vk,
-                "Triton_opt3(us)": us_triton_opt3,
-                "vs_vk": speedup_vk,
-                "vs_opt3": speedup_opt3,
+                "Triton_kv(us)": us_triton_opt3,
+                "vs_triton_vk": speedup_vk,
+                "vs_triton_kv": speedup_opt3,
             }
         )
 
@@ -1545,14 +1580,15 @@ def _print_perf_table():
         ("V", 5),
         ("Hg", 4),
         ("H", 4),
+        ("SeqLen", 7),
         ("T", 7),
         ("varlen", 7),
         ("final_st", 9),
-        ("FlyDSL(us)", 12),
+        ("FlyDSL_vk(us)", 15),
         ("Triton_vk(us)", 15),
-        ("Triton_opt3(us)", 16),
-        ("vs_vk", 8),
-        ("vs_opt3", 8),
+        ("Triton_kv(us)", 15),
+        ("vs_triton_vk", 13),
+        ("vs_triton_kv", 13),
     ]
 
     header = " | ".join(name.rjust(width) for name, width in cols)
@@ -1574,7 +1610,7 @@ def _print_perf_table():
             if isinstance(val, bool):
                 cells.append(("Y" if val else "N").rjust(width))
             elif isinstance(val, float):
-                if name in ("vs_vk", "vs_opt3"):
+                if name in ("vs_triton_vk", "vs_triton_kv"):
                     cells.append(f"{val:.3f}x".rjust(width))
                 else:
                     cells.append(f"{val:.2f}".rjust(width))
