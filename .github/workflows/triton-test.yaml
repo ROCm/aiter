@@ -59,7 +59,7 @@ jobs:
   build-triton:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     name: Build Triton Wheel
-    runs-on: aiter-1gpu-runner
+    runs-on: linux-aiter-mi300x-1
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -110,11 +110,11 @@ jobs:
           path: triton-wheels/*.whl
           retention-days: 7
 
-  # Step 2: MI325 matrix jobs (always runs)
+  # Step 2: MI300X matrix jobs (always runs)
   triton:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    name: Triton Tests (MI325) / Shard ${{ matrix.shard }}
-    runs-on: aiter-1gpu-runner
+    name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
+    runs-on: linux-aiter-mi300x-1
     needs: [split_triton_tests, build-triton, check-signal]
     strategy:
       fail-fast: false
