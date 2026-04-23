@@ -8,6 +8,13 @@
 #   torchrun --nproc_per_node=8 bench_overlap.py --grid-dims 128,256 --ag-size-mb 128
 #   torchrun --nproc_per_node=2 bench_overlap.py --profile
 
+
+# torchrun --nproc_per_node=2 bench_overlap.py \
+#   --backend triton \
+#   --G 32 --M 267424 --K 1280 --N 2560 \
+#   --ag-size-mb 512 --grid-dims 128,192,208,216,220,224,228,232,240,248,256
+
+
 import argparse
 import os
 import sys
