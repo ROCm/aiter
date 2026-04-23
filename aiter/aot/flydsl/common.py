@@ -114,14 +114,12 @@ def start_aot(cache_dir: str):
     Returns (pool, futures_dict) — caller must call ``wait_aot``
     to collect results and raise on failure.
     """
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ProcessPoolExecutor
 
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    # Run AOT jobs in threads so setup.py can launch them safely without
-    # fork/spawn import hazards from torch/aiter initialization.
-    pool = ThreadPoolExecutor(max_workers=2)
+    pool = ProcessPoolExecutor(max_workers=2)
     futures = {
         pool.submit(run_aot_worker, "moe"): "MoE",
         pool.submit(run_aot_worker, "gemm"): "GEMM",

@@ -331,7 +331,6 @@ if PREBUILD_KERNELS != 0:
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
-
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:
             from aiter.utility.pretune import run_pretune_modules  # noqa: E402
