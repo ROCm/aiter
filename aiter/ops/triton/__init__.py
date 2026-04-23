@@ -96,6 +96,7 @@ _BACKWARD_COMPAT_MAP = {
     "mha_onekernel_bwd": "attention.mha_onekernel_bwd",
     "mha_v3": "attention.mha_v3",
     "mha": "attention.mha",
+    "mla_decode": "attention.mla_decode",
     "mla_decode_rope": "attention.mla_decode_rope",
     "pa_decode": "attention.pa_decode",
     "pa_mqa_logits": "attention.pa_mqa_logits",

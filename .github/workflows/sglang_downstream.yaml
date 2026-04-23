@@ -48,8 +48,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
 
     env:
       SGL_BRANCH: v0.5.10

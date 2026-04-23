@@ -7,6 +7,7 @@ import random
 import os
 import aiter
 from aiter import dtypes
+from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import hipb_mm, hipb_create_extension
@@ -405,9 +406,37 @@ def test_skinny_gemm_a8w8_pertoken_quant():
             for quant_dtype in [dtypes.fp8]:
                 for dtype in [dtypes.fp16, dtypes.bf16]:
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
-                    # test_gemm(dtype, m, n, k, quant_dtype)
 
 
+def _iter_flydsl_csv_cases():
+    """Yield test_gemm kwargs for every flydsl row in the merged bpreshuffle tuned CSV."""
+    gfx, cu = get_gfx(), get_cu_num()
+    merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+    df = pd.read_csv(merged_csv)
+    rows = df[(df["gfx"] == gfx) & (df["cu_num"] == cu) & (df["libtype"] == "flydsl")]
+    aiter.logger.info(
+        "%d flydsl rows for %s cu=%d from %s",
+        len(rows),
+        gfx,
+        cu,
+        os.path.basename(merged_csv),
+    )
+    for _, row in rows.iterrows():
+        q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
+        yield dict(
+            dtype=dtypes.bf16,
+            m=int(row["M"]),
+            n=int(row["N"]),
+            k=int(row["K"]),
+            quantDtype=q_dtype,
+            pad_a=128,
+            skip_ck=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -514,51 +543,79 @@ parser.add_argument(
     help="""Suffix for output CSV filename.
     e.g.: --suffix branch""",
 )
+parser.add_argument(
+    "--no-flydsl-csv",
+    action="store_true",
+    help="Skip validating flydsl shapes from tuned bpreshuffle CSVs.",
+)
+parser.add_argument(
+    "--no-legacy",
+    action="store_true",
+    help="Skip the original hardcoded shape sweep and skinny tests.",
+)
+
 
 args = parser.parse_args()
 
-if args.csv is not None:
-    if not os.path.exists(args.csv):
-        raise FileNotFoundError(f"CSV file not found: {args.csv}")
-    shapes_df = pd.read_csv(args.csv)
-    print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
-    args.mnk = list(
-        zip(shapes_df["M"].tolist(), shapes_df["N"].tolist(), shapes_df["K"].tolist())
-    )
+if not args.no_flydsl_csv:
+    for kwargs in _iter_flydsl_csv_cases():
+        test_gemm(**kwargs)
 
-df = test_normal_gemm_a8w8_pertoken_quant(
-    args.dtype, args.quantDtype, args.mnk, args.pad_a
-)
-test_skinny_gemm_a8w8_pertoken_quant()
-
-if args.output and df is not None:
-    os.makedirs(args.output, exist_ok=True)
-    if args.csv:
-        csv_filename = os.path.basename(args.csv).replace(".csv", f"_{args.suffix}.csv")
-    else:
-        csv_filename = f"gemm_a8w8_{args.suffix}.csv"
-    out_path = os.path.join(args.output, csv_filename)
-    df.to_csv(out_path, index=False)
-    print(f"Saved results to: {out_path}")
-
-if args.bpreshuffle_csv is not None:
-    if not os.path.exists(args.bpreshuffle_csv):
-        raise FileNotFoundError(f"bpreshuffle CSV not found: {args.bpreshuffle_csv}")
-    bpre_df = pd.read_csv(args.bpreshuffle_csv)
-    print(
-        f"Loaded {len(bpre_df)} bpreshuffle shapes from {args.bpreshuffle_csv}",
-        flush=True,
-    )
-    bpre_mnk = list(
-        zip(bpre_df["M"].tolist(), bpre_df["N"].tolist(), bpre_df["K"].tolist())
-    )
-    df_bpre = test_normal_gemm_a8w8_pertoken_quant(
-        args.dtype, args.quantDtype, bpre_mnk, args.pad_a, skip_ck=True
-    )
-    if args.output and df_bpre is not None:
-        bpre_filename = os.path.basename(args.bpreshuffle_csv).replace(
-            ".csv", f"_{args.suffix}.csv"
+if not args.no_legacy:
+    if args.csv is not None:
+        if not os.path.exists(args.csv):
+            raise FileNotFoundError(f"CSV file not found: {args.csv}")
+        shapes_df = pd.read_csv(args.csv)
+        print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
+        args.mnk = list(
+            zip(
+                shapes_df["M"].tolist(),
+                shapes_df["N"].tolist(),
+                shapes_df["K"].tolist(),
+            )
         )
-        bpre_out = os.path.join(args.output, bpre_filename)
-        df_bpre.to_csv(bpre_out, index=False)
-        print(f"Saved bpreshuffle results to: {bpre_out}")
+
+    df = test_normal_gemm_a8w8_pertoken_quant(
+        args.dtype, args.quantDtype, args.mnk, args.pad_a
+    )
+    test_skinny_gemm_a8w8_pertoken_quant()
+
+    if args.output and df is not None:
+        os.makedirs(args.output, exist_ok=True)
+        if args.csv:
+            csv_filename = os.path.basename(args.csv).replace(
+                ".csv", f"_{args.suffix}.csv"
+            )
+        else:
+            csv_filename = f"gemm_a8w8_{args.suffix}.csv"
+        out_path = os.path.join(args.output, csv_filename)
+        df.to_csv(out_path, index=False)
+        print(f"Saved legacy results to: {out_path}")
+
+    if args.bpreshuffle_csv is not None:
+        if not os.path.exists(args.bpreshuffle_csv):
+            raise FileNotFoundError(
+                f"bpreshuffle CSV not found: {args.bpreshuffle_csv}"
+            )
+        bpre_df = pd.read_csv(args.bpreshuffle_csv)
+        print(
+            f"Loaded {len(bpre_df)} bpreshuffle shapes from {args.bpreshuffle_csv}",
+            flush=True,
+        )
+        bpre_mnk = list(
+            zip(
+                bpre_df["M"].tolist(),
+                bpre_df["N"].tolist(),
+                bpre_df["K"].tolist(),
+            )
+        )
+        df_bpre = test_normal_gemm_a8w8_pertoken_quant(
+            args.dtype, args.quantDtype, bpre_mnk, args.pad_a, skip_ck=True
+        )
+        if args.output and df_bpre is not None:
+            bpre_filename = os.path.basename(args.bpreshuffle_csv).replace(
+                ".csv", f"_{args.suffix}.csv"
+            )
+            bpre_out = os.path.join(args.output, bpre_filename)
+            df_bpre.to_csv(bpre_out, index=False)
+            print(f"Saved bpreshuffle results to: {bpre_out}")
