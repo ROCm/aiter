@@ -38,9 +38,6 @@ AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
 
-# Strict accuracy: hard-fail only for flydsl-csv sweeps; legacy sweep only warns.
-_STRICT_ACCURACY = True
-
 
 @benchmark()
 def test_fmoe(
@@ -59,6 +56,7 @@ def test_fmoe(
     hidden_pad=0,
     intermediate_pad=0,
     preshuffle=True,
+    strict_accuracy=True,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -288,7 +286,7 @@ def test_fmoe(
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
-    if _STRICT_ACCURACY:
+    if strict_accuracy:
         assert not (
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
@@ -534,6 +532,7 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        kwargs["strict_accuracy"] = True
         yield kwargs, {
             "kernelName1": kernel_name1,
             "kernelName2": kernel_name2,
@@ -580,6 +579,7 @@ def _iter_legacy_cases():
             WQDType=wq_dtype,
             use_g1u1=True,
             doweight_stage1=doweight_stage1,
+            strict_accuracy=False,
             **over,
         )
 
@@ -644,12 +644,12 @@ def _iter_legacy_cases():
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+_case_iters = []
 if not args.no_flydsl_csv:
-    case_iter = _iter_csv_cases()
-    _STRICT_ACCURACY = True
+    _case_iters.append(_iter_csv_cases())
 if not args.no_legacy:
-    case_iter = _iter_legacy_cases()
-    _STRICT_ACCURACY = False
+    _case_iters.append(_iter_legacy_cases())
+case_iter = itertools.chain(*_case_iters)
 
 df = []
 seen = 0
