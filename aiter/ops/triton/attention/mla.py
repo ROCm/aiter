@@ -278,13 +278,13 @@ def mla_decode_fwd(
         QUERY_DTYPE = "bf16"
 
     if kv_buffer_dtype == torch.uint8:
+        # A8W4 A4W4
+        assert IS_DEVICE_ARCH_GFX12, "FP4 KV cache is only supported on GFX12"
         KV_CACHE_DTYPE = "nvfp4"
     elif kv_buffer_dtype == e4m3_dtype:
         KV_CACHE_DTYPE = "fp8"
     else:
         KV_CACHE_DTYPE = "bf16"
-
-    print(QUERY_DTYPE, KV_CACHE_DTYPE)
 
     if shuffled_kv_cache:
         SCALE_K_WIDTH_LORA = 4

@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import torch
+import triton
 from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 _LOGGER = AiterTritonLogger()
 
@@ -50,33 +55,67 @@ def cat_and_cache_mla(
 
     b, kh, d_nope = k_nope.shape
     bk, kh2, d_rope = k_pe.shape
+    kv_cache_dtype = kv_cache.dtype
+    assert kv_cache_dtype in [
+        torch.bfloat16,
+        e4m3_dtype,
+        torch.uint8,
+    ], "KV cache dtype must be BF16, FP8 or packed FP4"
+
     block_size = 1
-    if shuffled_kv_cache:
+    SCALE_K_WIDTH_NOPE = 4
+    SCALE_K_WIDTH_ROPE = 4
+    if kv_cache_dtype == torch.uint8:
+        assert (
+            shuffled_kv_cache == True
+        ), "shuffle_kv_cache must be True for FP4 KV cache"
         b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        SCALE_K_LORA = d_nope // 16
+        SCALE_K_ROPE = d_rope // 16
+        SCALE_K_WIDTH_NOPE = (
+            min(16, triton.next_power_of_2(SCALE_K_LORA))
+            if SCALE_K_LORA >= 4
+            else SCALE_K_LORA
+        )
+        SCALE_K_WIDTH_ROPE = (
+            min(16, triton.next_power_of_2(SCALE_K_ROPE))
+            if SCALE_K_ROPE >= 4
+            else SCALE_K_ROPE
+        )
     else:
-        b_cache, h_cache, d_cache = kv_cache.shape
+        if shuffled_kv_cache:
+            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        else:
+            b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (
         b == bk and b_slot == b_slot
     ), "K batch dimensions and slot_mapping should be identical (bk == bk == b_slot)"
     assert kh == kh2 == h_cache, "K head should be identical"
-    assert (
-        d_nope + d_rope == d_cache
-    ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
+    if kv_cache.dtype == torch.uint8:
+        assert (
+            (d_nope + d_rope) // 2 + (d_nope + d_rope) // 16
+        ) == d_cache, "The D dimension of kv_cache should be (d_nope + d_rope) // 2 + (d_nope + d_rope) // 16 for FP4 KV cache"
+    else:
+        assert (
+            d_nope + d_rope == d_cache
+        ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
     if isinstance(k_scale, torch.Tensor):
         assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
 
     if shuffled_kv_cache:
         kv_cache_stride_b = kv_cache.stride(0)
         kv_cache_stride_h = kv_cache.stride(1)
-        kv_cache_stride_blk = kv_cache.stride(2)
         kv_cache_stride_d = kv_cache.stride(3)
     else:
         kv_cache_stride_b = kv_cache.stride(0)
         kv_cache_stride_h = kv_cache.stride(1)
-        kv_cache_stride_blk = 0
         kv_cache_stride_d = kv_cache.stride(2)
+
+    assert (
+        kv_cache_stride_d == 1
+    ), "The stride of the last dimension of KV cache must be 1"
 
     _cat_and_cache_mla_kernel[(b * kh,)](
         k_nope,
@@ -87,7 +126,6 @@ def cat_and_cache_mla(
         *k_pe.stride(),
         kv_cache_stride_b,
         kv_cache_stride_h,
-        kv_cache_stride_blk,
         kv_cache_stride_d,
         k_scale_ptr=k_scale,
         KH=kh,
@@ -95,6 +133,8 @@ def cat_and_cache_mla(
         BLOCK_D_pe=d_rope,
         BLOCK_SIZE=block_size,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
+        SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
+        SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         num_warps=1,
     )

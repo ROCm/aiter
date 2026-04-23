@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import torch
 import triton
 from typing import Tuple
@@ -8,6 +11,7 @@ from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 _LOGGER = AiterTritonLogger()
 
@@ -118,11 +122,38 @@ def fused_qk_rope_cat_and_cache_mla(
     b2, qh2, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
+    kv_cache_dtype = kv_cache.dtype
+    assert kv_cache_dtype in [
+        torch.bfloat16,
+        e4m3_dtype,
+        torch.uint8,
+    ], "KV cache dtype must be BF16, FP8 or packed FP4"
+
     block_size = 1
-    if shuffled_kv_cache:
+    SCALE_K_WIDTH_NOPE = 4
+    SCALE_K_WIDTH_ROPE = 4
+    if kv_cache_dtype == torch.uint8:
+        assert (
+            shuffled_kv_cache == True
+        ), "shuffle_kv_cache must be True for FP4 KV cache"
         b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        SCALE_K_LORA = d_nope // 16
+        SCALE_K_ROPE = d_pe // 16
+        SCALE_K_WIDTH_NOPE = (
+            min(16, triton.next_power_of_2(SCALE_K_LORA))
+            if SCALE_K_LORA >= 4
+            else SCALE_K_LORA
+        )
+        SCALE_K_WIDTH_ROPE = (
+            min(16, triton.next_power_of_2(SCALE_K_ROPE))
+            if SCALE_K_ROPE >= 4
+            else SCALE_K_ROPE
+        )
     else:
-        b_cache, h_cache, d_cache = kv_cache.shape
+        if shuffled_kv_cache:
+            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        else:
+            b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     # allow bk >= b to support prefill + decode mixed scenario
@@ -132,9 +163,15 @@ def fused_qk_rope_cat_and_cache_mla(
     assert qh == qh2, "Q head should be identical"
     assert kh == kh2 == h_cache, "K head should be identical"
     assert d_pe == dk2, "D dimension of q_pe and k_pe should be identical"
-    assert (
-        dk_nope + dk2 == d_cache
-    ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
+    assert d_nope == dk_nope, "D dimension of q_nope and k_nope should be identical"
+    if kv_cache.dtype == torch.uint8:
+        assert (
+            (d_nope + d_pe) // 2 + (d_nope + d_pe) // 16
+        ) == d_cache, "The D dimension of kv_cache should be (d_nope + d_rope) // 2 + (d_nope + d_rope) // 16 for FP4 KV cache"
+    else:
+        assert (
+            dk_nope + d_pe == d_cache
+        ), "D dimension of k_nope and k_pe should be summed up to be the D dimension of kv_cache"
     assert qh % kh == 0, "Q heads must be multiple of H heads"
     d_freq = cos.shape[-1]
     assert (d_freq == d_pe // 2) or (
@@ -184,7 +221,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_nope_zeros_out = None
     if num_decode_toks_for_zeros > 0:
         q_nope_zeros_out = torch.empty(
-            (num_decode_toks_for_zeros, qh, dk_nope),
+            (num_decode_toks_for_zeros, qh, d_nope),
             dtype=q_nope.dtype,
             device=q_nope.device,
         )
@@ -192,13 +229,15 @@ def fused_qk_rope_cat_and_cache_mla(
     if shuffled_kv_cache:
         kv_cache_stride_b = kv_cache.stride(0)
         kv_cache_stride_h = kv_cache.stride(1)
-        kv_cache_stride_blk = kv_cache.stride(2)
         kv_cache_stride_d = kv_cache.stride(3)
     else:
         kv_cache_stride_b = kv_cache.stride(0)
         kv_cache_stride_h = kv_cache.stride(1)
-        kv_cache_stride_blk = 0
         kv_cache_stride_d = kv_cache.stride(2)
+
+    assert (
+        kv_cache_stride_d == 1
+    ), "The stride of the last dimension of KV cache must be 1"
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
@@ -234,7 +273,6 @@ def fused_qk_rope_cat_and_cache_mla(
         q_nope_zeros_out.stride(2) if q_nope_zeros_out is not None else 0,
         kv_cache_stride_b,
         kv_cache_stride_h,
-        kv_cache_stride_blk,
         kv_cache_stride_d,
         k_scale_ptr=k_scale,
         QH_PER_KH=qh // kh,
@@ -243,11 +281,12 @@ def fused_qk_rope_cat_and_cache_mla(
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=is_neox,
         BLOCK_D_nope=d_nope,
-        BLOCK_DK_nope=dk_nope,
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
         BLOCK_SIZE=block_size,
         SHUFFLED_KV_CACHE=shuffled_kv_cache,
+        SCALE_K_WIDTH_NOPE=SCALE_K_WIDTH_NOPE,
+        SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
         OUTPUT_Q_NOPE_ZEROS=(q_nope_zeros_out is not None),
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         num_warps=1,

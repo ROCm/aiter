@@ -759,7 +759,7 @@ class MLAProgram:
             self.kv_lora_scales_shared.index(buffer_id)
             .reshape(
                 (
-                    1,
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.BLOCK_SIZE // 128,
                     (self.cfg.KV_LORA_RANK // self.cfg.BLOCK_SCALES_SIZE)
                     // self.cfg.SCALE_K_WIDTH_LORA,
@@ -783,7 +783,7 @@ class MLAProgram:
             self.k_rope_scales_shared.index(buffer_id)
             .reshape(
                 (
-                    1,
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.BLOCK_SIZE // 128,
                     (self.cfg.QK_ROPE_HEAD_DIM // self.cfg.BLOCK_SCALES_SIZE)
                     // self.cfg.SCALE_K_WIDTH_ROPE,
@@ -804,111 +804,88 @@ class MLAProgram:
     @gluon.jit
     def lds_unshuffle_kv_lora(self, buffer_id):
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
-            return (
-                self.kv_lora_shared.index(buffer_id)
-                .reshape(
-                    (
-                        self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // self.cfg.K_WIDTH,
-                        (self.cfg.KV_LORA_RANK // 2) // (2 * 16),
-                        2,
-                        16,
-                        self.cfg.K_WIDTH,
-                    )
-                )
-                .permute((0, 1, 4, 2, 3, 5))
-                .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // 2))
-                .permute((1, 0))
-            )
+            PACK_FACTOR: gl.constexpr = 2
         else:
-            return (
-                self.kv_lora_shared.index(buffer_id)
-                .reshape(
-                    (
-                        self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // 16,
-                        self.cfg.KV_LORA_RANK // (2 * self.cfg.K_WIDTH),
-                        2,
-                        16,
-                        self.cfg.K_WIDTH,
-                    )
+            PACK_FACTOR: gl.constexpr = 1
+        return (
+            self.kv_lora_shared.index(buffer_id)
+            .reshape(
+                (
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+                    self.cfg.BLOCK_SIZE // 16,
+                    (self.cfg.KV_LORA_RANK // PACK_FACTOR) // (2 * self.cfg.K_WIDTH),
+                    2,
+                    16,
+                    self.cfg.K_WIDTH,
                 )
-                .permute((0, 1, 4, 2, 3, 5))
-                .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK))
-                .permute((1, 0))
             )
+            .permute((0, 1, 4, 2, 3, 5))
+            .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // PACK_FACTOR))
+            .permute((1, 0))
+        )
 
     @gluon.jit
     def lds_unshuffle_kv_lora_trans(self, buffer_id):
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
-            return (
-                self.kv_lora_shared.index(buffer_id)
-                .reshape(
-                    (
-                        self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // 16,
-                        (self.cfg.KV_LORA_RANK // 2) // (2 * self.cfg.K_WIDTH),
-                        2,
-                        16,
-                        self.cfg.K_WIDTH,
-                    )
-                )
-                .permute((0, 1, 4, 2, 3, 5))
-                .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // 2))
-            )
+            PACK_FACTOR: gl.constexpr = 2
         else:
-            return (
-                self.kv_lora_shared.index(buffer_id)
-                .reshape(
-                    (
-                        self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // 16,
-                        self.cfg.KV_LORA_RANK // (2 * self.cfg.K_WIDTH),
-                        2,
-                        16,
-                        self.cfg.K_WIDTH,
-                    )
+            PACK_FACTOR: gl.constexpr = 1
+        return (
+            self.kv_lora_shared.index(buffer_id)
+            .reshape(
+                (
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+                    self.cfg.BLOCK_SIZE // 16,
+                    (self.cfg.KV_LORA_RANK // PACK_FACTOR) // (2 * self.cfg.K_WIDTH),
+                    2,
+                    16,
+                    self.cfg.K_WIDTH,
                 )
-                .permute((0, 1, 4, 2, 3, 5))
-                .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK))
             )
+            .permute((0, 1, 4, 2, 3, 5))
+            .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // PACK_FACTOR))
+        )
 
     @gluon.jit
     def lds_unshuffle_k_rope(self, buffer_id):
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
-            return (
-                self.k_rope_shared.index(buffer_id)
-                .reshape(
-                    (
-                        self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // 16,
-                        (self.cfg.QK_ROPE_HEAD_DIM // 2) // (2 * self.cfg.K_WIDTH),
-                        2,
-                        16,
-                        self.cfg.K_WIDTH,
-                    )
-                )
-                .permute((0, 1, 4, 2, 3, 5))
-                .reshape((self.cfg.TILE_SIZE, self.cfg.QK_ROPE_HEAD_DIM // 2))
-                .permute((1, 0))
-            )
+            PACK_FACTOR: gl.constexpr = 2
         else:
-            return (
-                self.k_rope_shared.index(buffer_id)
-                .reshape(
-                    (
-                        self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
-                        self.cfg.BLOCK_SIZE // 16,
-                        self.cfg.QK_ROPE_HEAD_DIM // (2 * self.cfg.K_WIDTH),
-                        2,
-                        16,
-                        self.cfg.K_WIDTH,
-                    )
+            PACK_FACTOR: gl.constexpr = 1
+        return (
+            self.k_rope_shared.index(buffer_id)
+            .reshape(
+                (
+                    self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+                    self.cfg.BLOCK_SIZE // 16,
+                    (self.cfg.QK_ROPE_HEAD_DIM // PACK_FACTOR)
+                    // (2 * self.cfg.K_WIDTH),
+                    2,
+                    16,
+                    self.cfg.K_WIDTH,
                 )
-                .permute((0, 1, 4, 2, 3, 5))
-                .reshape((self.cfg.TILE_SIZE, self.cfg.QK_ROPE_HEAD_DIM))
-                .permute((1, 0))
             )
+            .permute((0, 1, 4, 2, 3, 5))
+            .reshape((self.cfg.TILE_SIZE, self.cfg.QK_ROPE_HEAD_DIM // PACK_FACTOR))
+            .permute((1, 0))
+        )
+        # else:
+        #     return (
+        #         self.k_rope_shared.index(buffer_id)
+        #         .reshape(
+        #             (
+        #                 self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
+        #                 self.cfg.BLOCK_SIZE // 16,
+        #                 self.cfg.QK_ROPE_HEAD_DIM // (2 * self.cfg.K_WIDTH),
+        #                 2,
+        #                 16,
+        #                 self.cfg.K_WIDTH,
+        #             )
+        #         )
+        #         .permute((0, 1, 4, 2, 3, 5))
+        #         .reshape((self.cfg.TILE_SIZE, self.cfg.QK_ROPE_HEAD_DIM))
+        #         .permute((1, 0))
+        #     )
 
     @gluon.jit
     def tdm_shared_load_kv_lora_scales(self, wait_count, buffer_id):
@@ -936,6 +913,17 @@ class MLAProgram:
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         return self.lds_unshuffle_kv_lora_trans(buffer_id).load(
             layout=self.cfg.V_DOT_LAYOUT
+        )
+
+    @gluon.jit
+    def tdm_shared_load_kv_lora_trans_slice(
+        self, wait_count, buffer_id, slice_id: gl.constexpr
+    ):
+        gl.amd.gfx1250.tdm.async_wait(wait_count)
+        return (
+            self.lds_unshuffle_kv_lora_trans(buffer_id)
+            .slice(slice_id * self.cfg.TILE_SIZE // 2, self.cfg.TILE_SIZE // 2, dim=0)
+            .load(layout=self.cfg.V_DOT_LAYOUT)
         )
 
     @gluon.jit
@@ -1033,19 +1021,19 @@ class MLAProgram:
             kv_lora_scales = tl.broadcast_to(
                 kv_lora_scales.reshape(
                     (
-                        self.cfg.TILE_SIZE,
+                        self.cfg.TILE_SIZE // 2,
                         self.cfg.KV_LORA_RANK // self.cfg.BLOCK_SCALES_SIZE,
                         1,
                     )
                 ),
                 (
-                    self.cfg.TILE_SIZE,
+                    self.cfg.TILE_SIZE // 2,
                     self.cfg.KV_LORA_RANK // self.cfg.BLOCK_SCALES_SIZE,
                     self.cfg.BLOCK_SCALES_SIZE,
                 ),
             )
             kv_lora_scales = kv_lora_scales.reshape(
-                (self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK)
+                (self.cfg.TILE_SIZE // 2, self.cfg.KV_LORA_RANK)
             )
             kv_lora_trans = gl.convert_layout(
                 kv_lora_trans, layout=self.cfg.V_DOT_LAYOUT
@@ -1640,10 +1628,21 @@ def _mla_decode_fwd_kernel(
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
         if KV_CACHE_DTYPE == "nvfp4":
-            kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(4, buffer_id)
+            p0, p1 = p.reshape((BLOCK_M, 2, TILE_SIZE // 2)).permute((0, 2, 1)).split()
+            kv_lora_scales0, kv_lora_scales1 = (
+                kv_lora_scales.reshape(
+                    (2, TILE_SIZE // 2, cfg.KV_LORA_RANK // cfg.BLOCK_SCALES_SIZE)
+                )
+                .permute((1, 2, 0))
+                .split()
+            )
+            kv_lora_trans0 = pgm.tdm_shared_load_kv_lora_trans_slice(4, buffer_id, 0)
+            acc = pgm.compute_pkv_lora_trans(p0, kv_lora_trans0, kv_lora_scales0, acc)
+            kv_lora_trans1 = pgm.tdm_shared_load_kv_lora_trans_slice(4, buffer_id, 1)
+            acc = pgm.compute_pkv_lora_trans(p1, kv_lora_trans1, kv_lora_scales1, acc)
         else:
             kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(2, buffer_id)
-        acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
+            acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
         buffer_id = next_buffer_id
 
@@ -1679,10 +1678,21 @@ def _mla_decode_fwd_kernel(
     p, L, acc = pgm.softmax_part1(p, L, acc, alpha)
 
     if KV_CACHE_DTYPE == "nvfp4":
-        kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(0, buffer_id)
+        p0, p1 = p.reshape((BLOCK_M, 2, TILE_SIZE // 2)).permute((0, 2, 1)).split()
+        kv_lora_scales0, kv_lora_scales1 = (
+            kv_lora_scales.reshape(
+                (2, TILE_SIZE // 2, cfg.KV_LORA_RANK // cfg.BLOCK_SCALES_SIZE)
+            )
+            .permute((1, 2, 0))
+            .split()
+        )
+        kv_lora_trans0 = pgm.tdm_shared_load_kv_lora_trans_slice(0, buffer_id, 0)
+        acc = pgm.compute_pkv_lora_trans(p0, kv_lora_trans0, kv_lora_scales0, acc)
+        kv_lora_trans1 = pgm.tdm_shared_load_kv_lora_trans_slice(0, buffer_id, 1)
+        acc = pgm.compute_pkv_lora_trans(p1, kv_lora_trans1, kv_lora_scales1, acc)
     else:
         kv_lora_trans = pgm.tdm_shared_load_kv_lora_trans(0, buffer_id)
-    acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
+        acc = pgm.compute_pkv_lora_trans(p, kv_lora_trans, kv_lora_scales, acc)
 
     if kv_scale_ptr is not None:
         acc = acc * kv_scale

@@ -160,11 +160,6 @@ def dynamic_nvfp4_quant_kv_buffer(
         + scale_width_rope,
     )
 
-    print(quant_head_size_lora, scale_width_lora)
-    print(quant_head_size_rope, scale_width_rope)
-
-    print(kv_buffer_quant_and_shuffled.shape)
-
     return kv_buffer_quant_and_shuffled
 
 
@@ -263,7 +258,7 @@ def torch_mla_extend(
 @pytest.mark.parametrize("ctx_lens", [1328])
 @pytest.mark.parametrize("num_heads", [(16, 1)])
 @pytest.mark.parametrize("kv_lora_rank, qk_rope_head_dim", [(512, 64)])
-@pytest.mark.parametrize("num_blocks", [1])
+@pytest.mark.parametrize("num_blocks", [128])
 @pytest.mark.parametrize("varlen", [False])
 @pytest.mark.parametrize(
     "q_dtype, kv_dtype, out_dtype, block_size, use_out_scale",
@@ -300,14 +295,6 @@ def test_mla_decode_fwd(
     if kv_dtype == torch.uint8:
         if not shuffled_kv_cache:
             pytest.skip("NVFP4 requires shuffled KV cache")
-
-    # kv_buffer1 = torch.randn(
-    #     (16, 64, num_kv_heads, kv_lora_rank + qk_rope_head_dim),
-    #     dtype=torch.bfloat16,
-    #     device="cuda",
-    # )
-    # maybe_shuffled_kv_buffer1 = dynamic_nvfp4_quant_kv_buffer(kv_buffer1, kv_lora_rank)
-    # return
 
     cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
     seq_lens_qo = torch.empty(batch_size, dtype=torch.int, device="cuda")
@@ -353,7 +340,6 @@ def test_mla_decode_fwd(
         )
         query_scales = query_scales.view(-1, num_query_heads, qk_head_dim // 16)
         query = query.to(e4m3_dtype)
-        print(maybe_quant_query.shape, query_scales.shape)
     else:
         query = query.to(q_dtype)
         maybe_quant_query = query
