@@ -172,9 +172,10 @@ def gemm_mxfp4_nopad_gfx1250(
     # subsequent async_loads use [0, 0] and advance only along K.
     a_base = a_fp4_ptr + pid_m * BLOCK_SIZE_M * stride_a_m
     b_base = b_ptr + pid_n * BLOCK_SIZE_N * stride_b_n
-    # Scales are preshuffled (factor 32): one preshuffled row packs 32 logical
-    # rows, so the per-block M (or N) bias is scaled by BLOCK / PF.
-    SCALE_PRESHUFFLE_FACTOR: gl.constexpr = 32
+    # Scales are preshuffled (factor 128, matching pack_scale): one preshuffled
+    # row packs 128 logical rows, so the per-block M (or N) bias is scaled by
+    # BLOCK / PF.
+    SCALE_PRESHUFFLE_FACTOR: gl.constexpr = 128
     SCALE_KWIDTH: gl.constexpr = 4
     as_base = a_scale_ptr + (
         pid_m * BLOCK_SIZE_M // SCALE_PRESHUFFLE_FACTOR

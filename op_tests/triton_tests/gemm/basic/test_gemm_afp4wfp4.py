@@ -126,11 +126,11 @@ def generate_gemm_afp4wfp4_inputs(
     w_scales = w_scales.T
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
-            if M >= 32:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales, preshuffle_factor=32)
+            if M >= 128:
+                x_scales_shuffled = shuffle_scales_gfx1250(x_scales, preshuffle_factor=128)
             else:
                 x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales, preshuffle_factor=32)
+            w_scales_shuffled = shuffle_scales_gfx1250(w_scales, preshuffle_factor=128)
         else:
             if M >= 32:
                 x_scales_shuffled = shuffle_scales(x_scales)
