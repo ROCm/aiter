@@ -9,6 +9,9 @@ Usage:
 
 from __future__ import annotations
 
+import functools as _functools
+from dataclasses import dataclass
+
 import pytest
 import torch
 import triton
@@ -41,8 +44,6 @@ torch.set_default_device("cuda")
 
 
 # -- Global test configuration ------------------------------------------
-
-from dataclasses import dataclass
 
 
 @dataclass
@@ -808,8 +809,6 @@ def _prepare_flydsl_kernel_launch(
 
 
 # -- Triton opt3 KV-layout reference (h: [K, V]) --------------------------
-
-import functools as _functools
 
 
 def _tensor_cache(fn):
