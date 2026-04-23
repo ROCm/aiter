@@ -132,7 +132,7 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((gfx, cu_num, B, M, N, K), kid, splitK, "")
+                    info = ((gfx, cu_num, B, M, N, K), i, splitK, "")
                     task.append(
                         (
                             info,
