@@ -205,6 +205,7 @@ def bench_aiter_vs_flydsl(
 
     def run_flydsl():
         flydsl_rmsnorm(x, gamma, eps)
+
     with torch.inference_mode():
         aiter_us = _bench_gpu_us(run_aiter, warmup=warmup, iters=iters)
         flydsl_us = _bench_gpu_us(run_flydsl, warmup=warmup, iters=iters)
@@ -292,20 +293,18 @@ def main():
         configs = _parse_shape_specs(args.shapes)
     else:
         configs = [
-    # GPT OSS Input Dimensions 
-    (3000, 2880, torch.bfloat16),
-    (4000, 2880, torch.bfloat16),
-    (5000, 2880, torch.bfloat16),
-    (7000, 2880, torch.bfloat16),
-
-    (3072, 2880, torch.bfloat16),   
-    (4096, 2880, torch.bfloat16),   
-    (7168, 2880, torch.bfloat16),   
-    (8192, 2880, torch.bfloat16),   
-
-    # --- Stress / max throughput ---
-    (16384, 2880, torch.bfloat16),
-]
+            # GPT OSS Input Dimensions
+            (3000, 2880, torch.bfloat16),
+            (4000, 2880, torch.bfloat16),
+            (5000, 2880, torch.bfloat16),
+            (7000, 2880, torch.bfloat16),
+            (3072, 2880, torch.bfloat16),
+            (4096, 2880, torch.bfloat16),
+            (7168, 2880, torch.bfloat16),
+            (8192, 2880, torch.bfloat16),
+            # --- Stress / max throughput ---
+            (16384, 2880, torch.bfloat16),
+        ]
 
     results = []
 

@@ -23,7 +23,6 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl._mlir import ir
 from flydsl.expr import buffer_ops
 
-
 KERNEL_NAME = "rmsnorm"
 
 EPS = 1e-5
@@ -47,7 +46,7 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
 
     BLOCK_THREADS = _select_block_threads(N, dtype_str)
     UNROLL = 2 if (dtype_str != "f32" and N <= 4096) else 1
-    USE_GENERIC_X_CACHE = (dtype_str != "f32" and N <= 4096)
+    USE_GENERIC_X_CACHE = dtype_str != "f32" and N <= 4096
 
     tile_cols = BLOCK_THREADS * VEC_WIDTH
     RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
@@ -160,7 +159,9 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
                     upper = u.shrui(c16_v)
                     c1_v = vector.broadcast(vec_i32_ty, arith.constant(1, type=T.i32))
                     lsb = upper & c1_v
-                    c7fff_v = vector.broadcast(vec_i32_ty, arith.constant(0x7FFF, type=T.i32))
+                    c7fff_v = vector.broadcast(
+                        vec_i32_ty, arith.constant(0x7FFF, type=T.i32)
+                    )
                     bias = ArithValue(c7fff_v) + ArithValue(lsb)
                     u_round = ArithValue(u) + bias
                     bf16_bits = u_round.shrui(c16_v)
@@ -190,12 +191,16 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
 
             # Pass 1: sumsq only
             for tile_i in range_constexpr(num_tiles):
-                col_bytes = ArithValue(thr_col_bytes) + (tile_i * tile_cols * elem_bytes)
+                col_bytes = ArithValue(thr_col_bytes) + (
+                    tile_i * tile_cols * elem_bytes
+                )
                 vec_e = _load_vec(in_rsrc, col_bytes, soff=row_soffset)
                 x = vec_e if dtype_str == "f32" else vec_e.extf(vec_type_c)
                 x_av = ArithValue(x)
                 x2 = x_av * x_av
-                red2 = vector.reduction(compute_type, vector.CombiningKind.ADD, x2, fastmath=fm_fast)
+                red2 = vector.reduction(
+                    compute_type, vector.CombiningKind.ADD, x2, fastmath=fm_fast
+                )
                 thread_sumsq = ArithValue(thread_sumsq) + red2
 
             sum_sq = block_reduce_add(thread_sumsq)
@@ -207,7 +212,9 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
 
             # Pass 2: reload x + gamma + store
             for tile_i in range_constexpr(num_tiles):
-                col_bytes = ArithValue(thr_col_bytes) + (tile_i * tile_cols * elem_bytes)
+                col_bytes = ArithValue(thr_col_bytes) + (
+                    tile_i * tile_cols * elem_bytes
+                )
 
                 x_e = _load_vec(in_rsrc, col_bytes, soff=row_soffset)
                 g_e = _load_vec(gamma_rsrc, col_bytes)
@@ -264,7 +271,9 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
                 c_total_vecs_i32 = Int32(total_vecs)
                 for u in range_constexpr(UNROLL):
                     vec_idx = tid + vec_base_int + (u * BLOCK_THREADS)
-                    in_range = arith.cmpi(arith.CmpIPredicate.ult, vec_idx, c_total_vecs_i32)
+                    in_range = arith.cmpi(
+                        arith.CmpIPredicate.ult, vec_idx, c_total_vecs_i32
+                    )
                     safe_vec_idx = in_range.select(vec_idx, Int32(0))
                     col_bytes = ArithValue(safe_vec_idx) * (VEC_WIDTH * elem_bytes)
                     x_e = _load_vec(in_rsrc, col_bytes, soff=row_soffset)
@@ -305,11 +314,15 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
                     if in_range:
                         _store_vec(out_vec, out_rsrc, col_bytes, soff=row_soffset)
             else:
-                for vec_base_int in range_constexpr(0, total_vecs, BLOCK_THREADS * UNROLL):
+                for vec_base_int in range_constexpr(
+                    0, total_vecs, BLOCK_THREADS * UNROLL
+                ):
                     c_total_vecs_i32 = Int32(total_vecs)
                     for u in range_constexpr(UNROLL):
                         vec_idx = tid + vec_base_int + (u * BLOCK_THREADS)
-                        in_range = arith.cmpi(arith.CmpIPredicate.ult, vec_idx, c_total_vecs_i32)
+                        in_range = arith.cmpi(
+                            arith.CmpIPredicate.ult, vec_idx, c_total_vecs_i32
+                        )
                         safe_vec_idx = in_range.select(vec_idx, Int32(0))
                         col_bytes = ArithValue(safe_vec_idx) * (VEC_WIDTH * elem_bytes)
                         x_e = _load_vec(in_rsrc, col_bytes, soff=row_soffset)
@@ -354,10 +367,9 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
         idx_m = arith.index_cast(T.index, m_in)
         launcher = rmsnorm_kernel(Input, Gamma, Gamma, Output)
         launcher.launch(
-            grid=(idx_m, 1, 1), 
+            grid=(idx_m, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
     return launch_rmsnorm
-

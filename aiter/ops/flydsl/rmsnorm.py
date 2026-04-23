@@ -15,6 +15,7 @@ def _to_flydsl_dtype(dtype: torch.dtype) -> str:
 @functools.cache
 def _get_rmsnorm_launch(M: int, N: int, dtype_str: str):
     from .kernels.rmsnorm_kernel import build_rmsnorm_module
+
     return build_rmsnorm_module(M, N, dtype_str)
 
 
@@ -30,11 +31,7 @@ def flydsl_rmsnorm(x, gamma, eps):
 
     # FlyDSL/JIT/DLPack cannot consume tensors that require grad.
     # Also make sure the launch tensor matches x's device/dtype/layout.
-    gamma_launch = (
-        gamma.detach()
-        .to(device=x_2d.device, dtype=x_2d.dtype)
-        .contiguous()
-    )
+    gamma_launch = gamma.detach().to(device=x_2d.device, dtype=x_2d.dtype).contiguous()
 
     if gamma_launch.device != x_2d.device:
         raise RuntimeError("gamma must be on same device as x")
