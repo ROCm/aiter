@@ -319,13 +319,24 @@ if PREBUILD_KERNELS != 0:
         sys.path.insert(0, this_dir)
         from aiter.aot.flydsl.common import start_aot, wait_aot
 
+        core_args = None
+        rest = []
+        for one in all_opts_args_build:
+            if one["md_name"] == "module_aiter_core" and core_args is None:
+                core_args = one
+            else:
+                rest.append(one)
+        
+        if core_args is not None:
+            build_one_module(core_args)
+
         flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
         _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
         wait_aot(_flydsl_pool, _flydsl_futures)
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-            list(executor.map(build_one_module, all_opts_args_build))
+            list(executor.map(build_one_module, rest))
 
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:
