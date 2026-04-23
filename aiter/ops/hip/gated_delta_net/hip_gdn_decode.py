@@ -36,6 +36,7 @@ def _load_extension():
         sources=[
             os.path.join(src_dir, "gdn_decode_ext.cpp"),
             os.path.join(src_dir, "gdn_decode_kernel_hip.hip"),
+            os.path.join(src_dir, "gdn_state_transpose_kernel_hip.hip"),
         ],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "--offload-arch=gfx942", "-std=c++17"],
