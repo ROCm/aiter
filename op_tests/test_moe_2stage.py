@@ -299,6 +299,7 @@ l_quant = [
     (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    # FIXME: a16w4/a8w4 have precision issues now. Temporarily disabled.
     # (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2),  # a16w4
     # (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2),  # a8w4
 ]
