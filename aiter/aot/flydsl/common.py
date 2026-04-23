@@ -44,28 +44,9 @@ def collect_aot_jobs(
 def compile_only_env() -> Iterator[None]:
     prev = os.environ.get("COMPILE_ONLY")
     os.environ["COMPILE_ONLY"] = "1"
-
-    import torch
-
-    _dlpack_patched = False
-    _orig_dlpack = None
-    if not (torch.cuda.is_available() and torch.cuda.device_count() > 0):
-        _orig_dlpack = torch.Tensor.__dlpack__
-
-        def _cpu_safe_dlpack(self, *args, **kwargs):
-            if self.device.type == "cpu":
-                kwargs.pop("stream", None)
-                args = ()
-            return _orig_dlpack(self, *args, **kwargs)
-
-        torch.Tensor.__dlpack__ = _cpu_safe_dlpack
-        _dlpack_patched = True
-
     try:
         yield
     finally:
-        if _dlpack_patched:
-            torch.Tensor.__dlpack__ = _orig_dlpack
         if prev is None:
             os.environ.pop("COMPILE_ONLY", None)
         else:
