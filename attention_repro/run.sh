@@ -17,7 +17,7 @@ remove_indirect_access=1
 shuffled_kv_cache=0
 # export LLIR_REMOVE_DS_WAIT_0="loop"
 # export LLIR_REMOVE_BARRIER=1
-rm -rf ~/.triton/cache/bash
+rm -rf ~/.triton/cache
 export PRINT_IRS=1
 source $TRITON_GFX1250_MODEL_PATH/ffmlite_env.sh
 
