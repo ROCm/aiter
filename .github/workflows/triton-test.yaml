@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    # labeled/unlabeled: re-run when toggling ci:triton-325 to switch MI35X vs MI325
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    # labeled: re-run when adding ci:triton-325 to start extra MI325 jobs
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
     paths:
       - "aiter/ops/triton/**"
@@ -21,15 +21,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Ignore unrelated label/unlabel events (only re-run when ci:triton-325 is toggled).
-# PRs default to MI35X; add label ci:triton-325 to run on MI325. Push / workflow_dispatch use MI35X.
-env:
-  TRITON_GPU_RUNNER: >-
-    ${{ github.event_name != 'pull_request' && 'linux-aiter-mi35x-1' || (contains(github.event.pull_request.labels.*.name, 'ci:triton-325') && 'aiter-1gpu-runner' || 'linux-aiter-mi35x-1') }}
-
 jobs:
   check-signal:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' && github.event.action != 'unlabeled' || github.event.label.name == 'ci:triton-325') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-325') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -43,7 +37,7 @@ jobs:
 
   # Step 1: split triton tests into 8 shards, output triton_shard_0.list ... triton_shard_7.list
   split_triton_tests:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' && github.event.action != 'unlabeled' || github.event.label.name == 'ci:triton-325') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-325') }}
     runs-on: ubuntu-latest
     needs: [check-signal]
     outputs:
@@ -64,7 +58,7 @@ jobs:
 
   # Build Triton wheel once, shared by all shard jobs via artifact
   build-triton:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' && github.event.action != 'unlabeled' || github.event.label.name == 'ci:triton-325') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-325') }}
     name: Build Triton Wheel
     runs-on: linux-aiter-mi300x-1
     needs: [check-signal]
@@ -117,11 +111,11 @@ jobs:
           path: triton-wheels/*.whl
           retention-days: 7
 
-  # Step 2: run Triton shards on the selected GPU runner
+  # Step 2: MI35X matrix jobs (default for PRs and non-PR runs)
   triton:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' && github.event.action != 'unlabeled' || github.event.label.name == 'ci:triton-325') }}
-    name: Triton Tests (${{ github.event_name != 'pull_request' && 'linux-aiter-mi35x-1' || (contains(github.event.pull_request.labels.*.name, 'ci:triton-325') && 'aiter-1gpu-runner' || 'linux-aiter-mi35x-1') }}) / Shard ${{ matrix.shard }}
-    runs-on: ${{ github.event_name != 'pull_request' && 'linux-aiter-mi35x-1' || (contains(github.event.pull_request.labels.*.name, 'ci:triton-325') && 'aiter-1gpu-runner' || 'linux-aiter-mi35x-1') }}
+    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled') }}
+    name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
+    runs-on: linux-aiter-mi35x-1
     needs: [split_triton_tests, build-triton, check-signal]
     strategy:
       fail-fast: false
@@ -235,12 +229,7 @@ jobs:
           set -ex
           echo "Running Triton Tests..."
           docker exec -w /workspace triton_test mkdir -p test-reports
-          if [ "${{ env.TRITON_GPU_RUNNER }}" = "linux-aiter-mi35x-1" ]; then
-            EXTRA_DOCKER_ARGS="-e TRITON_HIP_USE_ASYNC_COPY=0"
-          else
-            EXTRA_DOCKER_ARGS=""
-          fi
-          docker exec ${EXTRA_DOCKER_ARGS} -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+          docker exec -e TRITON_HIP_USE_ASYNC_COPY=0 -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -255,8 +244,150 @@ jobs:
         run: |
           docker rm -f triton_test || true
 
+  # Step 2b: MI325 matrix jobs (opt-in via ci:triton-325 label)
+  triton-mi325:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:triton-325') && (github.event.action != 'labeled' || github.event.label.name == 'ci:triton-325') }}
+    name: Triton Tests (MI325) / Shard ${{ matrix.shard }}
+    runs-on: aiter-1gpu-runner
+    needs: [split_triton_tests, build-triton, check-signal]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      DOCKER_IMAGE: "rocm/pytorch:latest"
+      TRITON_TEST: "op_tests/triton_tests/"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: 'recursive'
+
+      - name: Download test shard lists
+        uses: actions/download-artifact@v4
+        with:
+          name: triton_shards
+
+      - name: Download Triton wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: triton-wheel
+          path: triton-wheels
+
+      - name: List test shard files
+        run: |
+          ls -l triton_shard_*.list
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+
+      - name: Export test file list for this shard as env
+        id: set_shard_files
+        run: |
+          TRITON_TEST=$(cat triton_shard_${{ matrix.shard }}.list)
+          echo "$TRITON_TEST"
+          echo "TRITON_TEST=$TRITON_TEST" >> $GITHUB_ENV
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: triton_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name triton_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root triton_test bash -c "pip config set global.default-timeout 60"
+          docker exec -u root triton_test bash -c "pip config set global.retries 10"
+
+      - name: Setup Aiter and Triton
+        run: |
+          set -ex
+          echo "Setting up Aiter and Triton..."
+          docker exec \
+          -e TRITON_WHEEL_DIR=/workspace/triton-wheels \
+          -w /workspace \
+          triton_test \
+          ./.github/scripts/build_aiter_triton.sh
+
+      - name: Install Pytest
+        run: |
+          set -ex
+          echo "Installing Pytest..."
+          docker exec \
+          -w /workspace \
+          triton_test \
+          pip install pytest
+
+      - name: Triton Tests
+        run: |
+          set -ex
+          echo "Running Triton Tests..."
+          docker exec -w /workspace triton_test mkdir -p test-reports
+          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} --junitxml=test-reports/triton.xml
+
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: triton-test-mi325-shard-${{ matrix.shard }}
+          path: test-reports/triton.xml
+          retention-days: 7
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f triton_test || true
+
+  triton-mi325-test-finish:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:triton-325') && (github.event.action != 'labeled' || github.event.label.name == 'ci:triton-325') }}
+    name: Triton MI325 Test Results
+    runs-on: ubuntu-latest
+    needs: [triton-mi325]
+    steps:
+      - name: Download all MI325 test reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: triton-test-mi325-shard-*
+          path: .
+
+      - name: Check Triton MI325 Test Results
+        run: |
+          set -ex
+          echo "Checking Triton MI325 Test Results..."
+          all_passed=true
+          for shard in {0..7}; do
+            if [ ! -f triton-test-mi325-shard-${shard}/triton.xml ]; then
+              echo "MI325 test report for shard ${shard} not found."
+              all_passed=false
+              break
+            fi
+          done
+          if [ "$all_passed" = true ]; then
+            echo "All MI325 tests passed."
+          else
+            echo "MI325 test failures or errors detected."
+            exit 1
+          fi
+
   triton-test-finish:
-    if: ${{ (!github.event.pull_request || !github.event.pull_request.draft) && (github.event_name != 'pull_request' || github.event.action != 'labeled' && github.event.action != 'unlabeled' || github.event.label.name == 'ci:triton-325') }}
+    if: ${{ (!github.event.pull_request || !github.event.pull_request.draft) && (github.event_name != 'pull_request' || github.event.action != 'labeled') }}
     name: Triton Test Results
     runs-on: ubuntu-latest
     needs: [triton]
