@@ -114,7 +114,7 @@ jobs:
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
     needs: build_vllm_image
-    runs-on: aiter-8gpu-runner
+    runs-on: linux-aiter-mi300x-8
     strategy:
       fail-fast: false
       matrix:
