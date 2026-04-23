@@ -133,9 +133,9 @@ if not _is_metadata_only() and not IS_WINDOWS:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
-    sys.path.insert(0, f"{this_dir}/aiter/")
-    from jit import core
-    from jit.utils.cpp_extension import IS_HIP_EXTENSION
+    sys.path.insert(0, this_dir)
+    from aiter.jit import core
+    from aiter.jit.utils.cpp_extension import IS_HIP_EXTENSION
 
     # Determine build target
     if BUILD_TARGET == "auto":
@@ -217,10 +217,10 @@ if PREBUILD_KERNELS != 0:
             "skip precompilation in this environment"
         )
     else:
-        from jit.utils.mha_recipes import (
+        from aiter.jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
-        from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
+        from aiter.jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
         import glob
 
         exclude_ops = get_exclude_ops()
@@ -315,22 +315,26 @@ if PREBUILD_KERNELS != 0:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        # --- CK kernel builds ---
-        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
-            list(executor.map(build_one_module, all_opts_args_build))
-
         # --- FlyDSL AOT pre-compilation (MOE + GEMM in parallel, before CK) ---
         sys.path.insert(0, this_dir)
+        aiter_jit_dir = os.path.join(this_dir, "aiter", "jit")
+        os.environ.setdefault("AITER_JIT_DIR", aiter_jit_dir)
+        if aiter_jit_dir not in sys.path:
+            sys.path.insert(0, aiter_jit_dir)
         from aiter.aot.flydsl.common import start_aot, wait_aot
 
         flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
         _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
         wait_aot(_flydsl_pool, _flydsl_futures)
 
+        # --- CK kernel builds ---
+        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+            list(executor.map(build_one_module, all_opts_args_build))
+
+
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:
-            sys.path.insert(0, os.path.join(this_dir, "aiter", "utility"))
-            from pretune import run_pretune_modules  # noqa: E402
+            from aiter.utility.pretune import run_pretune_modules  # noqa: E402
 
             cfg_path = OPT_COMPILER_CONFIG
             with open(cfg_path, "r", encoding="utf-8") as _f:

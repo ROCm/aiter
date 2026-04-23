@@ -83,13 +83,13 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
 def run_aot_worker(kind):
     """Worker for ProcessPoolExecutor — runs in a child process."""
     if kind == "moe":
-        from aiter.aot.flydsl.moe import (
+        from .moe import (
             DEFAULT_CSVS,
             compile_one_config,
             parse_csv,
         )
     else:
-        from aiter.aot.flydsl.gemm import (
+        from .gemm import (
             DEFAULT_CSVS,
             compile_one_config,
             parse_csv,
@@ -114,12 +114,14 @@ def start_aot(cache_dir: str):
     Returns (pool, futures_dict) — caller must call ``wait_aot``
     to collect results and raise on failure.
     """
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor
 
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    pool = ProcessPoolExecutor(max_workers=2)
+    # Run AOT jobs in threads so setup.py can launch them safely without
+    # fork/spawn import hazards from torch/aiter initialization.
+    pool = ThreadPoolExecutor(max_workers=2)
     futures = {
         pool.submit(run_aot_worker, "moe"): "MoE",
         pool.submit(run_aot_worker, "gemm"): "GEMM",

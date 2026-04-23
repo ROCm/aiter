@@ -329,7 +329,9 @@ def compile_one_config(
     try:
         with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
             if kind == "hgemm":
-                _compile_hgemm_to_cache(m=m, n=n, k=k, target_gfx=aot_arch, **kwargs)
+                hgemm_kwargs = dict(kwargs)
+                hgemm_kwargs["target_gfx"] = aot_arch
+                _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             else:
