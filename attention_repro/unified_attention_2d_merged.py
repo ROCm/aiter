@@ -1770,7 +1770,7 @@ class AttentionProgram:
         # more numerically stable
         # TODO: investigate why
         if self.cfg.ARCH_NAME == "gfx950" and self.cfg.USE_SINKS:
-            return softmax_part0_cdna4(self, S, M)
+            return self.softmax_part0_cdna4(S, M)
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         # Guard against all-masked rows
