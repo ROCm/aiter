@@ -307,7 +307,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     if constexpr(idx.value == 0)
                     {
                         hk::mma_ABt(p_comp, kv_0, q_0);
-                        __builtin_amdgcn_s_setprio(15);
+                        __builtin_amdgcn_s_setprio(3);
                     }
                     else
                     {
@@ -351,7 +351,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             }
             if constexpr(kSkipCompute == false)
             {
-                __builtin_amdgcn_s_setprio(14);
+                __builtin_amdgcn_s_setprio(2);
             }
 
             // Transpose V (cooperative -- runs even when this warp skips compute)
@@ -438,47 +438,42 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             if constexpr((kSkipCompute == false) && (kIsFirstIter == false))
             {
-                __builtin_amdgcn_s_setprio(8);
+                __builtin_amdgcn_s_setprio(3);
                 hk::mul_vgpr<0, 0>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 1>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 2>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 3>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(7);
                 hk::mul_vgpr<0, 4>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 5>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 6>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 7>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(6);
+                __builtin_amdgcn_s_setprio(2);
                 hk::mul_vgpr<0, 8>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 9>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 10>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 11>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(5);
                 hk::mul_vgpr<0, 12>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 13>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 14>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 15>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(4);
+                __builtin_amdgcn_s_setprio(1);
                 hk::mul_vgpr<0, 16>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 17>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 18>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 19>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(3);
                 hk::mul_vgpr<0, 20>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 21>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 22>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 23>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(2);
+                __builtin_amdgcn_s_setprio(0);
                 hk::mul_vgpr<0, 24>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 25>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 26>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 27>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(1);
                 hk::mul_vgpr<0, 28>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 29>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 30>(oaccu, oaccu, rescale);
                 hk::mul_vgpr<0, 31>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(0);
             }
 
             // Wait for transpose V to complete
