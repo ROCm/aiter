@@ -188,6 +188,18 @@ def test_fmoe(
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and AQDType == dtypes.fp4x2
+        and WQDType == dtypes.fp4x2
+    ):  # a4w4: both stage1 and stage2 use JIT CK (DeviceMoeGemmMXBPreShuffle)
+        # Both use preShuffleBuffer format = shuffle_weight_a16w4(gate_up=False)
+        # / shuffle_scale_a16w4(gate_up=False). Unlike a16w4, the a4w4 kernel
+        # uses gate_up=False for stage1 even though w1 has 2*N rows.
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, False)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, False)
+        w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
+        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif WQDType != dtypes.fp4x2 or preshuffle:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))

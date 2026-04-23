@@ -327,7 +327,7 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
         // }
         if(WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, pk_fp4, float, bf16, 1>(
+            moe_dispatch<fp8, fp4, float, bf16, 1>(
                 M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
                                                                WQ,
                                                                Y,
@@ -350,12 +350,12 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     {
         // if (Y.dtype() == at::ScalarType::Half)
         // {
-        //    moe_dispatch<fp16, pk_fp4, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
+        //    moe_dispatch<fp16, fp4, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
         //    sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 1>(
+            moe_dispatch<bf16, fp4, float, bf16, 1>(
                 M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
                                                                WQ,
                                                                Y,
@@ -371,6 +371,32 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                                                                exp_bias,
                                                                act_op,
                                                                k_batch);
+        }
+    }
+    else if(XQ.dtype() == torch_fp4x2 && WQ.dtype() == torch_fp4x2) // a4w4 (MXFP4 quantized activations)
+    {
+        if(Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<fp4, fp4, float, bf16, 1>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
+        else
+        {
+            TORCH_CHECK(false, "Unsupported output dtype for a4w4 MoE gemm1!");
         }
     }
     else
@@ -455,7 +481,7 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
         // }
         if(WQ.dtype() == torch_fp4x2 && Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, pk_fp4, float, bf16, 2>(
+            moe_dispatch<fp8, fp4, float, bf16, 2>(
                 M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
                                                                WQ,
                                                                Y,
@@ -478,12 +504,12 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     {
         // if (Y.dtype() == at::ScalarType::Half)
         // {
-        //    moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
+        //    moe_dispatch<fp16, fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
         //    sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
         if(Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(
+            moe_dispatch<bf16, fp4, float, bf16, 2>(
                 M, N, K, MPerBlock, act_op, has_bias, k_batch)(XQ,
                                                                WQ,
                                                                Y,
@@ -499,6 +525,32 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                                                                exp_bias,
                                                                act_op,
                                                                k_batch);
+        }
+    }
+    else if(XQ.dtype() == torch_fp4x2 && WQ.dtype() == torch_fp4x2) // a4w4 (MXFP4 quantized activations)
+    {
+        if(Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<fp4, fp4, float, bf16, 2>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
+        else
+        {
+            TORCH_CHECK(false, "Unsupported output dtype for a4w4 MoE gemm2!");
         }
     }
     else
