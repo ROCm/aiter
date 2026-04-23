@@ -45,7 +45,6 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
@@ -186,26 +185,8 @@ def _torch_dtype_for_kernel(dtype_name: str):
 
 
 def _compile_executable_to_cache(exe, *args) -> None:
-    compile_fn = getattr(exe, "compile", None)
-    if compile_fn is None:
-        import flydsl.compiler as flyc
-
-        compile_fn = flyc.compile
-        args = (exe, *args)
-    try:
-        with compile_only_env():
-            compile_fn(*args)
-    except Exception:
-        # FlyDSL compilation can leak ir.Context on failure; clean it up so later
-        # kernels do not inherit a broken compilation state.
-        try:
-            from flydsl._mlir import ir
-
-            while ir.Context.current is not None:
-                ir.Context.current.__exit__(None, None, None)
-        except Exception:
-            pass
-        raise
+    with compile_only_env():
+        exe(*args)
 
 
 def _compile_hgemm_to_cache(
@@ -241,17 +222,6 @@ def _compile_hgemm_to_cache(
     has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
     dev = torch.device("cuda") if has_cuda else torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
-
-    current_gfx = None
-    try:
-        current_gfx = get_gfx()
-    except Exception:
-        pass
-    if current_gfx is not None and target_gfx != current_gfx:
-        print(
-            f"  [WARN] Kernel targets {target_gfx} but current target is {current_gfx}; "
-            "compiling with current target parameters"
-        )
 
     out = torch.empty((m, n), device=dev, dtype=torch_dtype)
     a = torch.empty((m, k), device=dev, dtype=torch_dtype)
