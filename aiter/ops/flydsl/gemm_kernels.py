@@ -35,7 +35,6 @@ def _get_dtypes():
 
 
 SPLIT_K_COUNTER_MAX_LEN = 128
-SPLIT_K_SIGNAL_STATE_COUNT = 3
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
@@ -64,7 +63,6 @@ _HGEMM_KERNEL_RE = re.compile(
 
 SplitKStreamKey = tuple[int, int]
 SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
-SPLIT_K_GLOBAL_SEMAPHORE_STATE: dict[SplitKStreamKey, int] = {}
 
 # Expand the original default HGEMM catalog with the extra cases that proved
 # useful during the wider one-off search, instead of maintaining separate
@@ -671,25 +669,12 @@ def _get_split_k_global_semaphore(stream: torch.cuda.Stream) -> torch.Tensor:
     semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
     if semaphore is None:
         semaphore = torch.zeros(
-            (SPLIT_K_SIGNAL_STATE_COUNT * SPLIT_K_COUNTER_MAX_LEN,),
-            dtype=torch.int32,
+            (SPLIT_K_COUNTER_MAX_LEN,),
+            dtype=torch.int64,
             device=stream.device,
         )
         SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
-        SPLIT_K_GLOBAL_SEMAPHORE_STATE[key] = int(0)
     return semaphore
-
-
-def _get_split_k_signal_state(stream: torch.cuda.Stream) -> int:
-    _get_split_k_global_semaphore(stream)
-    return SPLIT_K_GLOBAL_SEMAPHORE_STATE[_stream_cache_key(stream)]
-
-
-def _advance_split_k_signal_state(stream: torch.cuda.Stream) -> None:
-    key = _stream_cache_key(stream)
-    SPLIT_K_GLOBAL_SEMAPHORE_STATE[key] = (
-        _get_split_k_signal_state(stream) + 1
-    ) % SPLIT_K_SIGNAL_STATE_COUNT
 
 
 def _check_split_k_counter_capacity(
@@ -807,7 +792,6 @@ def _compile_flydsl_hgemm(
         out: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
-        signal_state: int,
         bias: Optional[torch.Tensor] = None,
         stream: Optional[torch.cuda.Stream] = None,
     ):
@@ -833,7 +817,6 @@ def _compile_flydsl_hgemm(
             launch_bias,
             runtime_m,
             semaphore,
-            signal_state,
             launch_stream,
         )
 
@@ -892,7 +875,6 @@ def flydsl_hgemm(
         out = torch.empty((m, n), dtype=a.dtype, device=a.device)
 
     launch_stream = _normalize_launch_stream(a.device, stream)
-    signal_state = _get_split_k_signal_state(launch_stream)
     launcher = _compile_flydsl_hgemm(
         kernel_dtype,
         m,
@@ -918,9 +900,7 @@ def flydsl_hgemm(
         has_bias=bias is not None,
     )
 
-    launcher(out, a, b, signal_state=signal_state, bias=bias, stream=launch_stream)
-    if split_k > 1:
-        _advance_split_k_signal_state(launch_stream)
+    launcher(out, a, b, bias=bias, stream=launch_stream)
     return out
 
 

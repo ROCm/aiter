@@ -21,7 +21,6 @@ from .tensor_shim import GTensor, STensor, _to_raw, get_dtype_in_kernel
 from ..utils import get_shared_memory_per_block
 
 SPLIT_K_COUNTER_MAX_LEN = 128
-SPLIT_K_SIGNAL_STATE_COUNT = 3
 
 
 def swizzle_xor16(row, col_in_bytes, k_blocks16):
@@ -223,7 +222,6 @@ def compile_hgemm_kernel(
         BIAS: fx.Tensor,
         m: fx.Int32,
         COUNTER: fx.Tensor,
-        signal_state: fx.Int32,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         _ptr_type = ir.Type.parse("!llvm.ptr<1>")
@@ -264,8 +262,6 @@ def compile_hgemm_kernel(
             )
         else:
             SHUFFLED_B_ = GTensor(B, dtype=dtype_, shape=(n, k))
-        COUNTER_ = GTensor(COUNTER, dtype=T.i32, shape=(-1,))
-
         tid = fx.Int32(fx.thread_idx.x)
         wid = tid // WARP_SIZE
         w_tid = tid % WARP_SIZE
@@ -273,11 +269,11 @@ def compile_hgemm_kernel(
         block_n_idx = fx.block_idx.y
         ks_idx = fx.Index(fx.block_idx.z)
         ks_begin = arith.index_cast(T.i32, ks_idx * ks)
-        counter_idx = (
-            fx.Int32(signal_state * SPLIT_K_COUNTER_MAX_LEN)
-            + fx.block_idx.x * fx.Int32(n // BLOCK_N)
-            + fx.block_idx.y
+        dispatch_id = llvm.call_intrinsic(
+            _i64_type, "llvm.amdgcn.dispatch.id", [], [], []
         )
+        dispatch_token = arith.addi(dispatch_id, arith.constant(1, type=T.i64))
+        counter_idx = fx.block_idx.x * fx.Int32(n // BLOCK_N) + fx.block_idx.y
 
         m_offset = fx.Index(block_m_idx * BLOCK_M)
         n_offset = fx.Index(block_n_idx * BLOCK_N)
@@ -293,7 +289,7 @@ def compile_hgemm_kernel(
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
 
-        def zero_c(bias_g, c_g, counter_tensor, counter_g):
+        def zero_c(bias_g, c_g, counter_tensor):
             cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
             with ir.InsertionPoint(cond_ks0_if.then_block):
@@ -337,7 +333,7 @@ def compile_hgemm_kernel(
                         _i64_type, counter_base_ptr
                     ).result
                     counter_byte_offset = arith.index_cast(
-                        T.i64, fx.Index(counter_idx) * fx.Index(4)
+                        T.i64, fx.Index(counter_idx) * fx.Index(8)
                     )
                     counter_ptr = llvm.AddOp(
                         counter_base_ptr,
@@ -353,12 +349,12 @@ def compile_hgemm_kernel(
                     llvm.InlineAsmOp(
                         None, [], "buffer_wbl2 sc0 sc1", "", has_side_effects=True
                     )
-                    llvm.InlineAsmOp(
-                        None,
-                        [counter_ptr_v, arith.constant(1, type=T.i32)],
-                        "global_store_dword $0, $1, off sc0 sc1",
-                        "v,v",
-                        has_side_effects=True,
+                    llvm.StoreOp(
+                        dispatch_token,
+                        counter_ptr_v,
+                        alignment=8,
+                        ordering=llvm.AtomicOrdering.release,
+                        syncscope="agent",
                     )
                     rocdl.s_waitcnt(0)
                     scf.YieldOp([])
@@ -366,48 +362,16 @@ def compile_hgemm_kernel(
             rocdl.sched_barrier(0)
             gpu.barrier()
 
-            cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-            with ir.InsertionPoint(cond_ks0_if.then_block):
-                clean_cond = arith.cmpi(
-                    arith.CmpIPredicate.ult,
-                    fx.Index(tid),
-                    fx.Index(SPLIT_K_COUNTER_MAX_LEN),
-                )
-                clean_cond_if = scf.IfOp(clean_cond, results_=[], has_else=False)
-                with ir.InsertionPoint(clean_cond_if.then_block):
-                    clean_counter_idx = fx.Int32(
-                        (
-                            (signal_state + SPLIT_K_SIGNAL_STATE_COUNT - 1)
-                            % SPLIT_K_SIGNAL_STATE_COUNT
-                        )
-                        * SPLIT_K_COUNTER_MAX_LEN
-                    ) + fx.Index(tid)
-                    counter_g[fx.Index(clean_counter_idx)] = arith.constant(
-                        0, type=T.i32
-                    )
-                    scf.YieldOp([])
-                scf.YieldOp([])
-            rocdl.sched_barrier(0)
-            gpu.barrier()
-
         def split_k_barrier(counter_tensor):
-            init_cur = arith.constant(0, type=T.i32)
-            w = scf.WhileOp([T.i32], [init_cur])
-            before = ir.Block.create_at_start(w.before, [T.i32])
-            after = ir.Block.create_at_start(w.after, [T.i32])
-            with ir.InsertionPoint(before):
-                cur = before.arguments[0]
-                need_wait = arith.CmpIOp(
-                    arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
-                ).result
-                scf.ConditionOp(need_wait, [cur])
-            with ir.InsertionPoint(after):
+            is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
+            is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
+            with ir.InsertionPoint(is_t0_cond_if.then_block):
                 counter_base_ptr = fly.extract_aligned_pointer_as_index(
                     _ptr_type, fly_values(counter_tensor)[0]
                 )
                 counter_base_ptr = llvm.PtrToIntOp(_i64_type, counter_base_ptr).result
                 counter_byte_offset = arith.index_cast(
-                    T.i64, fx.Index(counter_idx) * fx.Index(4)
+                    T.i64, fx.Index(counter_idx) * fx.Index(8)
                 )
                 counter_ptr = llvm.AddOp(
                     counter_base_ptr,
@@ -420,15 +384,34 @@ def compile_hgemm_kernel(
                     if hasattr(counter_ptr, "_value")
                     else counter_ptr
                 )
-                data = llvm.InlineAsmOp(
-                    T.i32,
-                    [counter_ptr_v],
-                    "global_load_dword $0, $1, off sc1",
-                    "=v,v",
-                    has_side_effects=True,
-                ).result
-                rocdl.s_waitcnt(0)
-                scf.YieldOp([data])
+                init_cur = arith.constant(0, type=T.i64)
+                w = scf.WhileOp([T.i64], [init_cur])
+                before = ir.Block.create_at_start(w.before, [T.i64])
+                after = ir.Block.create_at_start(w.after, [T.i64])
+                with ir.InsertionPoint(before):
+                    cur = before.arguments[0]
+                    need_wait = arith.CmpIOp(
+                        arith.CmpIPredicate.ne, cur, dispatch_token
+                    ).result
+                    scf.ConditionOp(need_wait, [cur])
+                with ir.InsertionPoint(after):
+                    data = llvm.LoadOp(
+                        T.i64,
+                        counter_ptr_v,
+                        alignment=8,
+                        ordering=llvm.AtomicOrdering.acquire,
+                        syncscope="agent",
+                    ).result
+                    llvm.InlineAsmOp(
+                        res=None,
+                        operands_=[],
+                        asm_string="s_waitcnt vmcnt(0)",
+                        constraints="",
+                        has_side_effects=True,
+                        is_align_stack=False,
+                    )
+                    scf.YieldOp([data])
+                scf.YieldOp([])
             gpu.barrier()
 
         def ldg_a(k_offset):
@@ -613,7 +596,7 @@ def compile_hgemm_kernel(
             return c_frags_new
 
         if const_expr(IS_SPLIT_K):
-            zero_c(BIAS_, C_, COUNTER, COUNTER_)
+            zero_c(BIAS_, C_, COUNTER)
 
         if const_expr(B_TO_LDS):
 
@@ -913,7 +896,6 @@ def compile_hgemm_kernel(
         BIAS: fx.Tensor,
         m: fx.Int32,
         COUNTER: fx.Tensor,
-        signal_state: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -924,7 +906,7 @@ def compile_hgemm_kernel(
         bm = (m + BLOCK_M - 1) // BLOCK_M
         bn = n // BLOCK_N
         hgemm_kernel._func.__name__ = KERNEL_NAME
-        hgemm_kernel(C, A, B, BIAS, m, COUNTER, signal_state).launch(
+        hgemm_kernel(C, A, B, BIAS, m, COUNTER).launch(
             grid=(bm, bn, SPLIT_K),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
