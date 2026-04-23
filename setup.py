@@ -303,7 +303,7 @@ if PREBUILD_KERNELS != 0:
                 verbose=False,
                 is_python_module=True,
                 is_standalone=False,
-                torch_exclude=False,
+                torch_exclude=one_opt_args.get("torch_exclude", False),
                 third_party=one_opt_args["third_party"],
             )
 
