@@ -2957,7 +2957,7 @@ def kernel_unified_attention_2d(
             KVLoader: gl.constexpr = TDMGatherKVLoader
     else:
         if TILE_SIZE == BLOCK_SIZE:
-            KVLoader: gl.constexpr = AsyncGatherKVLoader
+            KVLoader: gl.constexpr = AsyncKVLoader
         else:
             KVLoader: gl.constexpr = AsyncGatherKVLoader
 
@@ -3017,6 +3017,7 @@ def kernel_unified_attention_2d(
         M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc)
 
     elif LOOP_VARIANT == 1:
+        gl.static_assert(cfg.ARCH_NAME == "gfx1250", "For loop variant 2, only gfx1250 is supported")
         gl.static_assert((NUM_BUFFERS == 2) | (NUM_BUFFERS == 3), "For loop variant 1, NUM_BUFFERS should be 2 or 3")
         acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
         M, L, acc = attention_loop_reordered(pgm, kv_loader, q, M, L, acc)
@@ -3118,6 +3119,10 @@ def unified_attention(
     NUM_Q_HEADS = q.shape[1]
     HEAD_SIZE = q.shape[2]
     num_blocks = k.shape[0]
+    Q_FP8 = q.element_size() == 1
+    KV_FP8 = k.element_size() == 1
+    ARCH_NAME = arch_info.get_arch()
+
     assert softcap == 0, "Softcap is not supported"
     assert num_buffers == 2 or num_buffers == 3, "num_buffers should be either 2 or 3"
     if shuffled_kv_cache:
@@ -3134,6 +3139,24 @@ def unified_attention(
             BLOCK_SIZE = k.shape[1]
             NUM_KV_HEADS = k.shape[2]
 
+    # if ARCH_NAME == "gfx950":
+    #     loop_variant = 0
+    #     if Q_FP8 and KV_FP8:
+    #         waves_per_eu = 4 if HEAD_SIZE < 128 else 3
+    #     else:
+    #         waves_per_eu = 4 if HEAD_SIZE < 128 else 2
+    #     num_warps = 4
+    #     block_m = 128
+    #     TILE_SIZE = 64
+    #     USE_TDM = 0
+    # else:
+    #     loop_variant = 3
+    #     num_warps = 4
+    #     block_m = 128
+    #     TILE_SIZE = BLOCK_SIZE
+    #     num_buffers = 3
+    #     use_tdm = 1
+    TILE_SIZE = BLOCK_SIZE * num_kv_blocks
     BLOCK_M = block_m
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
@@ -3146,8 +3169,6 @@ def unified_attention(
     # q_lens_cpu = q_lens.cpu()
     # total_query_blocks = sum((q_lens_cpu[i].item() + BLOCK_Q - 1) // BLOCK_Q for i in range(NUM_SEQS))
     assert num_kv_blocks & (num_kv_blocks - 1) == 0, "num_kv_blocks must be a power of 2"
-    TILE_SIZE = num_kv_blocks * BLOCK_SIZE
-    ARCH_NAME = arch_info.get_arch()
     NUM_WARPS = num_warps
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
