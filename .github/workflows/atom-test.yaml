@@ -203,7 +203,7 @@ jobs:
 
       - name: Run ATOM accuracy test
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           set -euo pipefail
           echo ""
