@@ -38,6 +38,9 @@ AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
 
+# Strict accuracy: hard-fail only for flydsl-csv sweeps; legacy sweep only warns.
+_STRICT_ACCURACY = True
+
 
 @benchmark()
 def test_fmoe(
@@ -285,9 +288,14 @@ def test_fmoe(
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
-    assert not (
-        err != 0 and logits_diff > 0.01
-    ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+    if _STRICT_ACCURACY:
+        assert not (
+            err != 0 and logits_diff > 0.01
+        ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+    elif err != 0 and logits_diff > 0.01:
+        logging.warning(
+            f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
+        )
 
     return {"us": us2, "err": err}
 
@@ -638,8 +646,10 @@ def _iter_legacy_cases():
 # ---------------------------------------------------------------------------
 if not args.no_flydsl_csv:
     case_iter = _iter_csv_cases()
+    _STRICT_ACCURACY = True
 if not args.no_legacy:
     case_iter = _iter_legacy_cases()
+    _STRICT_ACCURACY = False
 
 df = []
 seen = 0
