@@ -33,6 +33,7 @@ def _get_dtypes():
 
     return dtypes
 
+
 SPLIT_K_COUNTER_MAX_LEN = 128
 SPLIT_K_SIGNAL_STATE_COUNT = 3
 FIXED_STAGE = 2
