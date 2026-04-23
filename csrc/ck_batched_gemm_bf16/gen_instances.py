@@ -2,12 +2,28 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
+import sys
 import shutil
 from pathlib import Path
 
 import pandas as pd
-import torch
-from batched_gemm_bf16_common import default_kernels_dict, kernelInstance, kernels_list
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import build_tune_dict_batched, write_lookup_header  # noqa: E402
+
+from batched_gemm_bf16_common import (  # noqa: E402
+    default_kernels_dict,
+    kernelInstance,
+    kernels_list,
+)
 
 
 class batched_gemm_bf16_fwd_codegen:
@@ -161,7 +177,7 @@ torch::Tensor
    {                                                                                                                             \\"""
 
         LOOKUP_template = """
-       {{{mnk},                                                                                                       \\
+       {{{MNK},                                                                                                       \\
         {kernel_name}}},                       \\"""
 
         LOOKUP_end = """
@@ -169,24 +185,14 @@ torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(
-            os.path.join(self.working_path, "batched_gemm_bf16_lookup.h"), "w"
-        ) as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_template.format(
-                            mnk="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(mnk=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
+        write_lookup_header(
+            os.path.join(self.working_path, "batched_gemm_bf16_lookup.h"),
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+        )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -237,22 +243,11 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
-    tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
-        tune_df = pd.read_csv(tune_dict_csv)
-        if torch.cuda.is_available():
-            gpu = torch.cuda.current_device()
-            device_properties = torch.cuda.get_device_properties(gpu)
-            cu_num = device_properties.multi_processor_count
-            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
-        for i in range(len(tune_df)):
-            B = tune_df.loc[i, "B"]
-            M = tune_df.loc[i, "M"]
-            N = tune_df.loc[i, "N"]
-            K = tune_df.loc[i, "K"]
-            kid = tune_df.loc[i, "kernelId"]
-            tune_dict[(B, M, N, K)] = kernels_list[kid]
-    return tune_dict
+        return build_tune_dict_batched(
+            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list
+        )
+    return default_kernels_dict
 
 
 if __name__ == "__main__":
