@@ -1362,10 +1362,11 @@ def compile_mixed_moe_gemm1(
                     _sk = _abs_k // arith.constant(pack_K * 128, index=True)
                     _k_off = _sk * layout_b_scale.stride_k0
 
-                    rocdl.sched_barrier(0)
-                    rocdl.s_waitcnt(3)
+                    # rocdl.sched_barrier(0)
+                    # rocdl.s_waitcnt(3)
                     _barrier()
-                    rocdl.sched_barrier(0)
+                    # gpu.barrier()
+                    # rocdl.sched_barrier(0)
 
                     # DMA A to OTHER buffer (for next half), non-blocking
                     _abs_k_dma = k_base_idx + arith.constant(next_k_dma_py, index=True)
@@ -1451,7 +1452,7 @@ def compile_mixed_moe_gemm1(
                                 )
 
                         # A ds_reads
-                        rocdl.sched_barrier(0)
+                        # rocdl.sched_barrier(0)
                         for _a_j in range_constexpr(len(_pp_a_reads[_p])):
                             _ak, _ami = _pp_a_reads[_p][_a_j]
                             _a_all[(_ak, _ami)] = load_a_subtile(
@@ -1459,10 +1460,10 @@ def compile_mixed_moe_gemm1(
                                 _ami,
                                 lds_read,
                             )
-                        rocdl.sched_barrier(0)
+                        # rocdl.sched_barrier(0)
 
                         # MFMAs on prev data
-                        rocdl.s_setprio(1)
+                        # rocdl.s_setprio(1)
                         for _m_j in range_constexpr(len(_pp_mfma[_p])):
                             _k_idx, _ni_idx, _ikxdl, _inxdl, _ku128 = _pp_mfma[_p][_m_j]
                             _up_b_single = (
@@ -1490,8 +1491,8 @@ def compile_mixed_moe_gemm1(
                                 _ikxdl,
                                 _inxdl,
                             )
-                        rocdl.s_setprio(0)
-                        rocdl.sched_barrier(0)
+                        # rocdl.s_setprio(0)
+                        # rocdl.sched_barrier(0)
 
                     # ---- Assemble loaded data for next half-iteration ----
                     cur_a_tile = []
@@ -1545,7 +1546,7 @@ def compile_mixed_moe_gemm1(
                     )
 
                 # Pipeline (split ping/pong allocators)
-                rocdl.sched_barrier(0)
+                # rocdl.sched_barrier(0)
 
                 k0 = k_base_idx
                 if use_async_copy:
@@ -1553,7 +1554,7 @@ def compile_mixed_moe_gemm1(
                 else:
                     x_regs0 = load_x_tile(k0)
                     store_x_tile_to_lds(x_regs0, lds_x_pong)
-                rocdl.sched_barrier(0)
+                # rocdl.sched_barrier(0)
                 _k0_scale = k_base_idx // arith.constant(pack_K * 128, index=True)
                 a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(
                     _k0_scale
@@ -1574,7 +1575,7 @@ def compile_mixed_moe_gemm1(
                 acc_up = [acc_init] * num_acc_n * m_repeat if _has_up_path else None
 
                 _k1 = k_base_idx + arith.constant(tile_k, index=True)
-                rocdl.sched_barrier(0)
+                # rocdl.sched_barrier(0)
                 if use_async_copy:
                     prefetch_x_to_lds(_k1, lds_x_ping)
                 else:
@@ -1586,11 +1587,11 @@ def compile_mixed_moe_gemm1(
                 # Prime the deep pipeline: DMA K=tile_k -> ping (1 tile ahead)
                 # rocdl.s_waitcnt(8)
                 gpu.barrier()
-                rocdl.sched_barrier(0)
+                # rocdl.sched_barrier(0)
                 a_tile_pong = prefetch_full_a_from_lds(lds_x_pong)
 
-                rocdl.sched_barrier(0)
-                rocdl.s_waitcnt(6)
+                # rocdl.sched_barrier(0)
+                # rocdl.s_waitcnt(6)
 
                 num_k_tiles_py = int(_k_dim) // int(tile_k)
                 odd_k_tiles = (num_k_tiles_py % 2) == 1
@@ -1696,7 +1697,7 @@ def compile_mixed_moe_gemm1(
                 # Keep current g1u1 behavior unchanged. For single-stream stage1
                 # (g1u0 / gate_only), apply scheduler hints on the hot-loop cadence
                 # so they cover real MFMA/VMEM traffic instead of only the prologue.
-                rocdl.sched_barrier(0)
+                # rocdl.sched_barrier(0)
 
                 if k_main2_py > 0:
                     for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
@@ -1802,7 +1803,7 @@ def compile_mixed_moe_gemm1(
                     )
                     if not use_async_copy:
                         store_x_tile_to_lds(x_regs_ping, lds_x_ping)
-                    rocdl.s_waitcnt(0)
+                    # rocdl.s_waitcnt(0)
                     _barrier()
                     a_tile_ping = prefetch_full_a_from_lds(lds_x_ping)
                     acc_gate, acc_up, epilogue_pf = compute_tile(
