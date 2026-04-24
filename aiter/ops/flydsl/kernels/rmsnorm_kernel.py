@@ -14,18 +14,24 @@ Optimised paths:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
+
 from flydsl.expr import arith, vector, gpu, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
 from flydsl._mlir import ir
 from flydsl.expr import buffer_ops
+
+KERNEL_NAME = "rmsnorm"
+
+EPS = 1e-5
+
 import math
 from kernels.kernels_common import dtype_to_elem_type, get_warp_size
 
-KERNEL_NAME = "rmsnorm"
-EPS = 1e-51
 WARP_SIZE = get_warp_size()
+BLOCK_THREADS = 256
 DEFAULT_VEC_WIDTH = 8
 F32_VEC_WIDTH = 4
 
@@ -43,8 +49,6 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
     # f32 vec8 lowers to a 32-byte/v8i32 buffer_load, which may fail AMDGPU
     # instruction selection. Keep f32 on vec4 while preserving vec8 for f16/bf16.
     VEC_WIDTH = F32_VEC_WIDTH if dtype_str == "f32" else DEFAULT_VEC_WIDTH
-
-    BLOCK_THREADS = _select_block_threads(N, dtype_str)
     UNROLL = 2 if (dtype_str != "f32" and N <= 4096) else 1
     USE_GENERIC_X_CACHE = dtype_str != "f32" and N <= 4096
 
