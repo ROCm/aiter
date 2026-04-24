@@ -182,12 +182,18 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                 err_ratio = checkAllclose(
                     out[:M].to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
                 )
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
+            finally:
+                torch.cuda.empty_cache()
         return results
 
     def calculate(self, results, bpes=(1 / 2, 1 / 2, 2)):
@@ -226,14 +232,13 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
         mp_num = args.mp
         shape_grouped = args.shape_grouped
         errRatio = args.errRatio
-        from aiter.jit.utils.chip_info import get_gfx
+        from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
         if get_gfx() not in ["gfx950"]:
             print(f"tuning is not supported in this chip {get_gfx()}")
             return []
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = int(device_properties.multi_processor_count)
+        gfx = self.get_gfx()
+        cu_num = self.get_cu_num()
         task = []
         tasks_in_data = []
 
@@ -265,7 +270,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     else 0
                 )
                 for splitK in range(maxsplitK + 1):
-                    info = ((cu_num, M, N, K), kernel_idx, splitK, "")
+                    info = ((gfx, cu_num, M, N, K), kernel_idx, splitK, "")
                     task.append(
                         (
                             info,
@@ -313,7 +318,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
                     maxsplitK = 0
                 for splitK in range(maxsplitK + 1):
                     kernel_name = kernelName[0]
-                    info = ((cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
+                    info = ((gfx, cu_num, M, N, K), asm_kernels_id, splitK, kernel_name)
                     task.append(
                         (
                             info,

@@ -203,7 +203,6 @@ def input_helper(
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("layout", ["bhsd", "bshd"])
 def test_sage(
     BATCH: int,
@@ -211,10 +210,10 @@ def test_sage(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
     layout: str,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ = 128
     torch.cuda.empty_cache()
 
     softmax_scale = 1.0 / math.sqrt(HEAD_SZ)
@@ -461,24 +460,21 @@ def test_sage_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
 @pytest.mark.parametrize(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
-@pytest.mark.parametrize("layout", ["bhsd"])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("qsmooth", [True, False])
-@pytest.mark.parametrize("hadamard_rotate", [True])  # TODO: hadamard expected to be on
 def test_sage_mxfp4(
     BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    layout: str,
     causal: bool,
     qsmooth: bool,
-    hadamard_rotate: bool,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ = 128
+    layout = "bhsd"
+    hadamard_rotate = True  # hadamard expected to be on
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")

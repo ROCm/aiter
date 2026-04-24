@@ -48,8 +48,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
 
     env:
       SGL_BRANCH: v0.5.10
@@ -180,7 +180,6 @@ jobs:
             git checkout '${GITHUB_COMMIT_SHA}'
             git submodule sync --recursive
             git submodule update --init --recursive
-            PREBUILD_KERNELS=1 GPU_ARCHS='${GPU_ARCH}' python setup.py build_ext --inplace
             pip install -e .
             pip show amd-aiter || pip show aiter
           "

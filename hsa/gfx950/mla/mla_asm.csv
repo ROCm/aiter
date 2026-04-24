@@ -30,3 +30,4 @@ bf16,bf16,64,0,1,0,0,0,_ZN5aiter38mla_a16w16_qh64_qseqlen1_gqaratio64_v3E,mla_a1
 bf16,bf16,64,0,1,0,0,1,_ZN5aiter42mla_a16w16_qh64_qseqlen1_gqaratio64_lse_v3E,mla_a16w16_qh64_qseqlen1_gqaratio64_lse_v3.co
 fp8,fp8,8,1,4,0,0,0,_ZN5aiter35mla_a8w8_qh32_qseqlen4_gqaratio8_psE,mla_a8w8_qh32_qseqlen4_gqaratio8_ps.co
 fp8,fp8,8,1,4,0,0,1,_ZN5aiter39mla_a8w8_qh32_qseqlen4_gqaratio8_lse_psE,mla_a8w8_qh32_qseqlen4_gqaratio8_lse_ps.co
+bf16,bf16,32,1,4,0,0,0,_ZN5aiter38mla_a16w16_qh32_qseqlen4_gqaratio32_psE,mla_a16w16_qh32_qseqlen4_gqaratio32_ps.co

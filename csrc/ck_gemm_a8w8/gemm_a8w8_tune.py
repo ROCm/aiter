@@ -56,7 +56,17 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
+            columns=[
+                "gfx",
+                "cu_num",
+                "M",
+                "N",
+                "K",
+                "kernelId",
+                "splitK",
+                "us",
+                "kernelName",
+            ]
         )
     return tunedf
 
@@ -108,11 +118,11 @@ class GemmA8W8Tuner(GemmCommonTuner):
         return kernels_list[kernelId].name
 
     def _clear_op_caches(self):
-        from aiter.ops.gemm_op_a8w8 import get_GEMM_config_with_quant_type
+        from aiter.ops import gemm_op_a8w8 as _op
 
-        get_GEMM_config_with_quant_type.cache_clear()
-        if hasattr(get_GEMM_config_with_quant_type, "file_cache"):
-            get_GEMM_config_with_quant_type.file_cache.clear()
+        _op.get_GEMM_config_with_quant_type.cache_clear()
+        _op._GEMM_QUANT_TYPE_CACHE.clear()
+        _op._GEMM_QUANT_TYPE_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         pass
@@ -156,12 +166,18 @@ class GemmA8W8Tuner(GemmCommonTuner):
                 err_ratio = checkAllclose(
                     out.to(dtypes.bf16), ref, msg=f"run_config {shape_str}"
                 )
-                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                status = (
+                    "ok"
+                    if err_ratio <= args.errRatio
+                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
+            finally:
+                torch.cuda.empty_cache()
         return results
 
     def tune(
@@ -175,6 +191,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
         shape_grouped = args.shape_grouped
         errRatio = args.errRatio
         cu_num = self.get_cu_num()
+        gfx = self.get_gfx()
 
         task = []
         tasks_data = []
@@ -191,7 +208,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
             kernels_num = len(kernels_list)
             total_kernel_nums = 0
-            info_keys = (cu_num, M, N, K, q_dtype_w)
+            info_keys = (gfx, cu_num, M, N, K, q_dtype_w)
 
             for j in range(kernels_num):
                 kernel = kernels_list[j]
@@ -250,7 +267,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 if __name__ == "__main__":
 
     ## use default key and resultList with q_dtype_w support
-    key = ["cu_num", "M", "N", "K", "q_dtype_w"]
+    key = ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
     resultList = [
         "kernelId",
         "splitK",

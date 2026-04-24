@@ -86,7 +86,7 @@ def dump_mla_metadata_v1_txt(
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    if dtype == dtypes.bf16 and nhead == 32:
+    if dtype == dtypes.bf16 and nhead == 32 and get_gfx() == "gfx942":
         return False
     return True
 
@@ -475,11 +475,24 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q == 4
         )
         or (
+            get_gfx() == "gfx942"
+            and nheads == 8
+            and not is_fp8_q
+            and not is_fp8_kvc
+            and max_seqlen_q == 2
+        )
+        or (
             get_gfx() == "gfx950"
             and nheads == 64
             and is_fp8_q
             and is_fp8_kvc
             and max_seqlen_q == 1
+        )
+        or (
+            get_gfx() == "gfx950"
+            and (nheads * max_seqlen_q) % 128 == 0
+            and not is_fp8_q
+            and not is_fp8_kvc
         )
     ):
         # Natively support cases
@@ -1319,7 +1332,6 @@ def test_mla(
             out_asm,
             msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
-
         if not non_persistent_mode:
             partial_out_ref, partial_lse_ref, split_out_ref, split_lse_ref = (
                 torch_mla_split_kv_and_reduce(
