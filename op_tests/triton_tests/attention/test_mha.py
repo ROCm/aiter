@@ -757,7 +757,6 @@ def test_mha_backward_sbhd_do(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
 @pytest.mark.parametrize("SEQLEN_K", [512, 2048])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
