@@ -1386,7 +1386,9 @@ def apply_act_and_mul(out, act_input, activation=ActivationType.No):
     else:
         inter_dim = act_input.shape[-1] // 2
         torch_act = aiter.get_torch_act(activation)
-        out.copy_(torch_moe_act(act_input, torch_act, inter_dim, activation).to(out.dtype))
+        out.copy_(
+            torch_moe_act(act_input, torch_act, inter_dim, activation).to(out.dtype)
+        )
     return out
 
 
