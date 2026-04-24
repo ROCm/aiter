@@ -5,6 +5,7 @@ import pytest
 import torch
 import aiter
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.jit.core import get_gfx
 from aiter.ops.triton.normalization.rmsnorm import (
     rms_norm,
     rmsnorm2d_fwd_with_add,
@@ -13,6 +14,7 @@ from aiter.ops.triton.normalization.rmsnorm import (
     rmsnorm2d_fwd_with_add_smoothquant,
     rmsnorm2d_fwd_with_add_dynamicquant,
 )
+from aiter.ops.triton.gluon.rmsnorm import gluon_rms_norm_kernel
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
@@ -384,3 +386,29 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
 
     torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
     torch.testing.assert_close(x_normed, ref_x_normed, atol=atol, rtol=rtol)
+
+
+
+_IS_GFX1250 = get_gfx() == "gfx1250"
+@pytest.mark.skipif(not _IS_GFX1250, reason="gluon rmsnorm requires gfx1250 hardware")
+@pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
+@pytest.mark.parametrize(
+    "M, N",
+    [(shape) for shape in get_vals()],
+)
+def test_gluon_rms_norm(M, N, in_dtype_str):
+    in_dtype = str_to_torch_dtype[in_dtype_str]
+    torch.manual_seed(0)
+
+    x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
+
+    out_gluon, _ = gluon_rms_norm_kernel(x, weight, 1e-5)
+    out_ref = torch_rmsnorm(x, weight, in_dtype, 1e-5)
+
+    atol, rtol = 1e-2, 1e-2
+
+    assert (
+        out_gluon.dtype == in_dtype
+    ), f"out_gluon has dtype={out_gluon.dtype}, expected {in_dtype}"
+
+    torch.testing.assert_close(out_gluon, out_ref, atol=atol, rtol=rtol)
