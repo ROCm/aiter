@@ -50,17 +50,6 @@ def dtype_to_elem_type(dtype_str: str):
         f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')"
     )
 
-
-def get_warp_size(arch=None):
-    """Return the wavefront/warp size for the given GPU architecture.
-
-    CDNA (gfx9xx) uses wave64, RDNA (gfx10xx/gfx11xx/gfx12xx) uses wave32.
-    """
-    if arch is None:
-        arch = get_rocm_arch()
-    return 32 if is_rdna_arch(arch) else 64
-
-
 def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
     stream_llvm_ptr = _create_llvm_ptr(stream_ptr_value)
 
