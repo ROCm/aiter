@@ -1514,12 +1514,12 @@ def run_pa_gluon_test(
         if sliding_window > 0
         else context_lengths.max().item()
     )
-    if ps and not (sliding_window > 0):
+    if ps and not (sliding_window > 0 and block_size == 1024):
         split_kv_blocks = triton.cdiv(block_size, context_partition_size)
         max_context_partition_num = get_recommended_splits(
             num_seqs, num_kv_heads, split_kv_blocks
         )
-    elif sliding_window > 0:
+    elif sliding_window > 0 and block_size == 1024:
         max_context_partition_num = (
             triton.cdiv(sliding_window, context_partition_size) + 1
         )
