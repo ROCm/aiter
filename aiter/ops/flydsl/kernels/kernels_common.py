@@ -50,6 +50,7 @@ def dtype_to_elem_type(dtype_str: str):
         f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')"
     )
 
+
 def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
     stream_llvm_ptr = _create_llvm_ptr(stream_ptr_value)
 
