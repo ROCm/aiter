@@ -12,9 +12,9 @@ python3 setup.py develop
 ```bash
 python3 csrc/opus_gemm/opus_gemm_tune.py \
     -i aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv \
-    -o aiter/configs/opus_gemm_a16w16_tuned.csv
+    -o aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv
 ```
-The first run triggers a JIT build of `module_deepgemm_opus_tune` (~30s).
+The first run triggers a JIT build of `module_deepgemm_opus` (~30s).
 
 3. Results are written to the output CSV:
 
@@ -85,7 +85,7 @@ python3 op_tests/test_opus_deepgemm.py --csv_file aiter/configs/model_configs/gp
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-i, --untune_file` | `aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv` | Input shapes CSV |
-| `-o, --tune_file` | `$AITER_CONFIG_OPUS_GEMM_A16W16` | Output tuned CSV |
+| `-o, --tune_file` | `$AITER_OPUS_A16W16_TUNED_CSV` (default `aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv`) | Output tuned CSV (opus-private) |
 | `-o2, --profile_file` | `""` | Save all candidates (not just best) |
 | `--mp` | GPU count | Number of parallel tuning processes |
 | `-k, --splitK` | `False` | Enable split-K sweep (reserved for future) |
