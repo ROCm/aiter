@@ -6,7 +6,7 @@ import argparse
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, run_perftest
-from aiter.ops.deepgemm import deepgemm_opus
+from aiter.ops.opus.deepgemm import deepgemm_opus
 
 
 def run_torch_ref_scale(XQ, WQ, x_scale, w_scale, GROUP_M, GROUP_N, GROUP_K, out_dtype):
