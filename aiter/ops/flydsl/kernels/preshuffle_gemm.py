@@ -11,6 +11,7 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from flydsl._mlir import ir
+from flydsl._mlir.dialects.arith import CmpIPredicate
 
 from flydsl.expr import arith, vector
 from flydsl.expr import gpu
@@ -136,6 +137,7 @@ def compile_preshuffle_gemm_a8(
     use_async_copy: bool = False,
     dsrd_preload: int = -1,
     dvmem_preload: int = -1,
+    xcd_swizzle: int = 0,
 ):
     """Compile the preshuffle GEMM kernel using the @flyc.kernel API.
 
@@ -151,6 +153,10 @@ def compile_preshuffle_gemm_a8(
         use_async_copy: Use async DMA for A tile global-to-LDS transfer.
         dsrd_preload: Initial LDS-read preload count (-1 = auto from _TILE_PRELOAD_TABLE).
         dvmem_preload: Initial global-load preload count (-1 = auto from _TILE_PRELOAD_TABLE).
+        xcd_swizzle: XCD remap group size for workgroup-id swizzling. ``0`` disables
+            the swizzle (default). A positive value ``wgm`` groups ``wgm`` consecutive
+            M-tiles to improve L2 reuse after redistributing workgroups across the
+            8 XCDs on MI300/MI350-class parts.
     """
     if dsrd_preload < 0 or dvmem_preload < 0:
         if in_dtype in ("fp8", "int8") and str(get_hip_arch()) == "gfx950":
@@ -191,6 +197,8 @@ def compile_preshuffle_gemm_a8(
         KERNEL_NAME += "_async"
     if waves_per_eu is not None:
         KERNEL_NAME += f"_wpe{waves_per_eu}"
+    if xcd_swizzle > 0:
+        KERNEL_NAME += f"_xcd{xcd_swizzle}"
 
     tile_k_bytes = int(tile_k) * int(elem_bytes)
 
@@ -352,6 +360,40 @@ def compile_preshuffle_gemm_a8(
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
+
+        # ---- XCD workgroup-id remap ------------------------------------------
+        # Grid layout: bx ↔ M-tile (pid_m), by ↔ N-tile (pid_n). When
+        # ``xcd_swizzle > 0`` we (1) redistribute linear workgroup ids across
+        # ``_NUM_XCDS`` so consecutive workgroups on one XCD cover
+        # non-contiguous linear ids, and (2) regroup them into ``xcd_swizzle``
+        # consecutive M-tiles per group so neighbouring workgroups share B
+        # rows, improving L2 reuse. N is a compile-time constant here, so the
+        # N-axis extent ``_gx`` is a compile-time constant.
+        if const_expr(xcd_swizzle > 0):
+            _NUM_XCDS = 8
+            _c1 = arith.constant(1, index=True)
+            _c_tm = arith.constant(tile_m, index=True)
+            _gx = arith.constant(N // tile_n, index=True)
+            _gy = (c_m + _c_tm - _c1) / _c_tm
+
+            _linear_id = bx * _gx + by
+            _num_wgs = _gx * _gy
+
+            _c_xcds = arith.constant(_NUM_XCDS, index=True)
+            _wgs_per_xcd = _num_wgs / _c_xcds
+            _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
+
+            _c_wgm = arith.constant(xcd_swizzle, index=True)
+            _num_wgid_in_group = _c_wgm * _gx
+            _group_id = _wgid / _num_wgid_in_group
+            _first_pid_m = _group_id * _c_wgm
+            _remaining_m = _gy - _first_pid_m
+            _cmp_m = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
+            _group_size_m = arith.select(_cmp_m, _remaining_m, _c_wgm)
+
+            _wgid_in_group = _wgid % _num_wgid_in_group
+            bx = _first_pid_m + (_wgid_in_group % _group_size_m)
+            by = _wgid_in_group / _group_size_m
 
         # ---- LDS (separate ping/pong buffers for no-alias guarantee) ----
         base_ptr_pong = allocator_pong.get_base()
@@ -1696,6 +1738,7 @@ def compile_preshuffle_gemm_w4(
     use_async_copy: bool = False,
     dsrd_preload: int = 2,
     dvmem_preload: int = 2,
+    xcd_swizzle: int = 0,
 ):
     """MXFP4 preshuffle GEMM — delegates to compile_preshuffle_gemm_a8 with fp4 config."""
     if a_dtype == "fp8":
@@ -1718,6 +1761,7 @@ def compile_preshuffle_gemm_w4(
         use_async_copy=use_async_copy,
         dsrd_preload=dsrd_preload,
         dvmem_preload=dvmem_preload,
+        xcd_swizzle=xcd_swizzle,
     )
     return inner
 

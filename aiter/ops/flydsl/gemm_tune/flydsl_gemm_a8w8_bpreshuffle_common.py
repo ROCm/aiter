@@ -44,12 +44,14 @@ class kernelInstance:
     use_async_copy: int  # 0 or 1
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
     sScheduler: str  # "Default"
+    xcd_swizzle: int = 0  # 0=off, >0=group size for XCD remap
 
     @property
     def name(self) -> str:
         qa = _DTYPE_SHORT.get(self.q_dtype_a, self.q_dtype_a.upper())
         qw = _DTYPE_SHORT.get(self.q_dtype_w, self.q_dtype_w.upper())
         dt = _DTYPE_SHORT.get(self.dtype, self.dtype.upper())
+        xcd_tag = f"_xcd{self.xcd_swizzle}" if self.xcd_swizzle > 0 else ""
         return "_".join(
             [
                 "flydsl",
@@ -71,7 +73,7 @@ class kernelInstance:
                 ),
                 self.sScheduler.lower(),
             ]
-        )
+        ) + xcd_tag
 
 
 def _ki(
@@ -86,6 +88,7 @@ def _ki(
     q_dtype_a="fp8",
     q_dtype_w="fp8",
     dtype="bf16",
+    xcd_swizzle=0,
 ):
     return kernelInstance(
         tile_m,
@@ -99,6 +102,7 @@ def _ki(
         async_copy,
         waves_per_eu,
         scheduler,
+        xcd_swizzle,
     )
 
 
@@ -247,6 +251,7 @@ _LDS_STAGES      = (1, 2)
 _CSHUFFLE_VALS   = (0, 1)
 _ASYNC_COPY_VALS = (0, 1)
 _WAVES_PER_EU    = (0, 1, 2, 3, 4)
+_XCD_SWIZZLE_VALS = (0, 4)
 
 _WAVES_PER_WG = 4  # typical wavefronts per workgroup in FlyDSL preshuffle GEMM
 
@@ -286,12 +291,14 @@ def _build_kernels_list(tiles_lds2, tiles_lds1, total_vgpr=512):
     for wpe in _WAVES_PER_EU:
         for csh in _CSHUFFLE_VALS:
             for acp in _ASYNC_COPY_VALS:
-                for lds in _LDS_STAGES:
-                    for tm, tn, tk in tiles_by_lds[lds]:
-                        if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
-                            continue
-                        kl[idx] = _ki(tm, tn, tk, lds, csh, acp, wpe)
-                        idx += 1
+                for xcd in _XCD_SWIZZLE_VALS:
+                    for lds in _LDS_STAGES:
+                        for tm, tn, tk in tiles_by_lds[lds]:
+                            if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
+                                continue
+                            kl[idx] = _ki(tm, tn, tk, lds, csh, acp, wpe,
+                                          xcd_swizzle=xcd)
+                            idx += 1
     return kl
 
 
