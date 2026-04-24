@@ -491,7 +491,23 @@ class GroupCoordinator:
 
     def _all_gather_out_place(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
         ca_comm = self.device_communicator.ca_comm
-        assert ca_comm is not None
+        if ca_comm is None:
+            # custom all-reduce disabled (e.g. gfx950): fall back to NCCL all-gather
+            world_size = self.world_size
+            input_size = input_.size()
+            output_tensor = torch.empty(
+                (world_size,) + input_size, dtype=input_.dtype, device=input_.device
+            )
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+            output_tensor = output_tensor.movedim(0, dim)
+            output_tensor = output_tensor.reshape(
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
+            return output_tensor
         assert not ca_comm.disabled
         out = ca_comm.custom_all_gather(input_, dim)
         assert out is not None

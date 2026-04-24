@@ -32,7 +32,7 @@ def init_dist_env(
     pipeline_model_parallel_size = 1
     # world_size is TPxPP
     world_size = pipeline_model_parallel_size * tensor_model_parallel_size
-    set_custom_all_reduce(True)
+    set_custom_all_reduce(False)
     init_distributed_environment(
         world_size=world_size,
         rank=rankID,
@@ -50,16 +50,17 @@ def init_dist_env(
     )
 
     if tensor_model_parallel_size > 1:
-        # hack custom_allreduce
+        # hack custom_allreduce (skip when ca_comm is None, e.g. disabled for gfx950)
         tp_grp = get_tp_group()
         ca_comm = tp_grp.device_communicator.ca_comm
-        # signal
-        signal = torch.zeros(
-            tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
-        )
-        ca_comm.signal = signal
-        ca_comm.register_input_buffer(signal)
-        ca_comm.buffer = ca_comm._pool["input"].tensor
+        if ca_comm is not None:
+            # signal
+            signal = torch.zeros(
+                tensor_model_parallel_size * 64, dtype=torch.int64, device=rankID
+            )
+            ca_comm.signal = signal
+            ca_comm.register_input_buffer(signal)
+            ca_comm.buffer = ca_comm._pool["input"].tensor
     logger.debug(f"RANK: {rankID}/{tensor_model_parallel_size} init_dist_env...")
 
 

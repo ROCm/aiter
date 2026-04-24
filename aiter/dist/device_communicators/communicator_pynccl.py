@@ -88,6 +88,16 @@ class PyNcclCommunicator:
             self.available = False
             self.disabled = True
             return
+        # gfx950 tp=8 workaround: ncclCommInitRank hangs inside RCCL when
+        # world_size=8 on MI350X. Fall back to standard PyTorch NCCL allreduce
+        # (torch.distributed.all_reduce via device_group) which works correctly.
+        # Set AITER_PYNCCL_SKIP=1 to activate this workaround.
+        import os as _os
+        if _os.environ.get("AITER_PYNCCL_SKIP", "0") == "1":
+            self.available = False
+            self.disabled = True
+            return
+
         try:
             self.nccl = NCCLLibrary(library_path)
         except Exception as e:
