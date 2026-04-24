@@ -106,11 +106,6 @@ AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
 )
 
-AITER_CONFIG_OPUS_GEMM_A16W16 = os.getenv(
-    "AITER_CONFIG_OPUS_GEMM_A16W16",
-    f"{AITER_ROOT_DIR}/aiter/configs/opus_gemm_a16w16_tuned.csv",
-)
-
 AITER_CONFIG_GEMM_BF16 = os.getenv(
     "AITER_CONFIG_GEMM_BF16",
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
@@ -182,14 +177,6 @@ class AITER_CONFIG(object):
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
-        )
-
-    @property
-    def AITER_CONFIG_OPUS_GEMM_A16W16_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_OPUS_GEMM_A16W16",
-            AITER_CONFIG_OPUS_GEMM_A16W16,
-            "opus_gemm_a16w16_tuned",
         )
 
     def update_config_files(self, file_path: str, merge_name: str):
