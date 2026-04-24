@@ -16,12 +16,20 @@ Per workgroup (grid = num_seqs x num_kv_heads x num_partitions):
   - Each warp handles `HEAD_SIZE/16/NUM_WARPS` N-tiles of PV.
 
 Requirements:
-  HEAD_SIZE         multiple of NUM_WARPS*WAVE_SIZE = 128
-  KV_BLOCK_SIZE     multiple of WMMA_K = 32  (no block gather in this step)
-  QUERY_GROUP_SIZE  exactly 16 (== WMMA_M)
-  HEAD_SIZE         multiple of NUM_WARPS*WMMA_N = 64
+  HEAD_SIZE             multiple of NUM_WARPS*WAVE_SIZE = 128
+  KV_BLOCK_SIZE         multiple of 16
+  KV_COMPUTE_BLOCK_SIZE multiple of WMMA_K = 32, multiple of KV_BLOCK_SIZE
+  PARTITION_SIZE        multiple of KV_COMPUTE_BLOCK_SIZE
+  BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE / KV_BLOCK_SIZE  in {1, 2, 4}
+  QUERY_GROUP_SIZE      exactly 16 (== WMMA_M)
 
 WMMA instruction: wmma_f32_16x16x32_bf16 (or f16), wave32.
+
+Each outer loop iteration processes one "compute tile" of KV_COMPUTE_BLOCK_SIZE
+tokens, built by gathering BLOCKS_PER_COMPUTE physical blocks from the paged KV
+cache. One vectorized block_tables load fetches all phys-block IDs per tile;
+BLOCKS_PER_COMPUTE TDM ops DMA each block into its sub-slice of the K/V LDS
+stage. 2-stage double buffer overlaps the next tile's loads with current compute.
 """
 
 import flydsl.compiler as flyc
@@ -49,15 +57,26 @@ def compile_pa_decode_main(
     KV_BLOCK_SIZE: int = 32,
     QUERY_GROUP_SIZE: int = 16,
     PARTITION_SIZE: int = 256,
+    KV_COMPUTE_BLOCK_SIZE: int = 64,
     dtype: str = "bf16",
 ):
     if HEAD_SIZE % 32 != 0:
         raise ValueError(f"HEAD_SIZE must be multiple of 32, got {HEAD_SIZE}")
-    if KV_BLOCK_SIZE % 32 != 0:
-        raise ValueError(f"KV_BLOCK_SIZE must be multiple of 32, got {KV_BLOCK_SIZE}")
-    if PARTITION_SIZE % KV_BLOCK_SIZE != 0:
+    if KV_BLOCK_SIZE % 16 != 0:
+        raise ValueError(f"KV_BLOCK_SIZE must be multiple of 16, got {KV_BLOCK_SIZE}")
+    if KV_COMPUTE_BLOCK_SIZE % WMMA_K != 0:
         raise ValueError(
-            f"PARTITION_SIZE {PARTITION_SIZE} must be multiple of KV_BLOCK_SIZE {KV_BLOCK_SIZE}"
+            f"KV_COMPUTE_BLOCK_SIZE must be multiple of WMMA_K={WMMA_K}, got {KV_COMPUTE_BLOCK_SIZE}"
+        )
+    if KV_COMPUTE_BLOCK_SIZE % KV_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"KV_COMPUTE_BLOCK_SIZE {KV_COMPUTE_BLOCK_SIZE} must be multiple of "
+            f"KV_BLOCK_SIZE {KV_BLOCK_SIZE}"
+        )
+    if PARTITION_SIZE % KV_COMPUTE_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"PARTITION_SIZE {PARTITION_SIZE} must be multiple of "
+            f"KV_COMPUTE_BLOCK_SIZE {KV_COMPUTE_BLOCK_SIZE}"
         )
     if QUERY_GROUP_SIZE != WMMA_M:
         raise ValueError(f"QUERY_GROUP_SIZE must be exactly {WMMA_M}, got {QUERY_GROUP_SIZE}")
@@ -70,39 +89,48 @@ def compile_pa_decode_main(
             f"{NUM_WARPS * WMMA_N}, got {HEAD_SIZE}"
         )
 
-    block_threads = NUM_WARPS * WAVE_SIZE   # 128
-    K_QK_TILES = HEAD_SIZE // WMMA_K        # HEAD/32 = 4
-    N_QK_TILES = KV_BLOCK_SIZE // WMMA_N    # KVB/16 = 2 (for KVB=32)
-    K_PV_TILES = KV_BLOCK_SIZE // WMMA_K    # KVB/32 = 1 (for KVB=32)
-    HEAD_PER_WARP = HEAD_SIZE // NUM_WARPS  # 32 for HEAD=128
+    BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
+    if BLOCKS_PER_COMPUTE not in (1, 2, 4):
+        # We use a single vectorized buffer_load for the physical block IDs;
+        # vec_width ∈ {1, 2, 4} on AMD.
+        raise ValueError(
+            f"BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE/KV_BLOCK_SIZE must be in "
+            f"{{1, 2, 4}}, got {BLOCKS_PER_COMPUTE}"
+        )
+
+    block_threads = NUM_WARPS * WAVE_SIZE        # 128
+    K_QK_TILES = HEAD_SIZE // WMMA_K             # HEAD/32 = 4
+    N_QK_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_N # compute/16 (e.g. 4 for compute=64)
+    K_PV_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_K # compute/32 (e.g. 2 for compute=64)
+    HEAD_PER_WARP = HEAD_SIZE // NUM_WARPS       # 32 for HEAD=128
     N_PV_TILES_PER_WARP = HEAD_PER_WARP // WMMA_N  # 2 for HEAD=128
-    BLOCKS_PER_PARTITION = PARTITION_SIZE // KV_BLOCK_SIZE
+    COMPUTES_PER_PARTITION = PARTITION_SIZE // KV_COMPUTE_BLOCK_SIZE
 
     elem_bytes = 2  # bf16/f16
 
     gpu_arch = str(get_hip_arch(timeout_s=300))
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
-    # LDS layout (2-stage double-buffer for K and V):
-    #   Q     [QG=16,  HEAD]    dtype       (persistent)
-    #   K[0]  [KVB,    HEAD]    dtype       (stage 0)
-    #   V[0]  [KVB,    HEAD]    dtype       (stage 0)
-    #   K[1]  [KVB,    HEAD]    dtype       (stage 1)
-    #   V[1]  [KVB,    HEAD]    dtype       (stage 1)
-    #   P     [QG=16,  KVB]     dtype
+    # LDS layout (2-stage double-buffer for K and V, sized by KV_COMPUTE_BLOCK_SIZE):
+    #   Q     [QG=16,  HEAD]                dtype       (persistent)
+    #   K[0]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 0, holds BLOCKS_PER_COMPUTE blocks)
+    #   V[0]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 0)
+    #   K[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1)
+    #   V[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1)
+    #   P     [QG=16, KV_COMPUTE_BLOCK_SIZE] dtype
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="pa_decode_main_lds")
     q_lds_offset = 0
     q_lds_bytes = QUERY_GROUP_SIZE * HEAD_SIZE * elem_bytes
-    kv_one_bytes = KV_BLOCK_SIZE * HEAD_SIZE * elem_bytes
+    kv_one_bytes = KV_COMPUTE_BLOCK_SIZE * HEAD_SIZE * elem_bytes
     k_stage_offsets = [q_lds_offset + q_lds_bytes + 2 * i * kv_one_bytes for i in range(2)]
     v_stage_offsets = [k + kv_one_bytes for k in k_stage_offsets]
     p_lds_offset = q_lds_offset + q_lds_bytes + 4 * kv_one_bytes
-    p_lds_bytes = QUERY_GROUP_SIZE * KV_BLOCK_SIZE * elem_bytes
+    p_lds_bytes = QUERY_GROUP_SIZE * KV_COMPUTE_BLOCK_SIZE * elem_bytes
     allocator.ptr = p_lds_offset + p_lds_bytes
 
     q_lds_elems = QUERY_GROUP_SIZE * HEAD_SIZE
-    kv_lds_elems = KV_BLOCK_SIZE * HEAD_SIZE
-    p_lds_elems = QUERY_GROUP_SIZE * KV_BLOCK_SIZE
+    kv_lds_elems = KV_COMPUTE_BLOCK_SIZE * HEAD_SIZE
+    p_lds_elems = QUERY_GROUP_SIZE * KV_COMPUTE_BLOCK_SIZE
 
     # Striped-load counts (Q load stays as buffer_load; K/V go through TDM)
     Q_TOTAL_ELEMS = QUERY_GROUP_SIZE * HEAD_SIZE
@@ -258,18 +286,41 @@ def compile_pa_decode_main(
             q_frags.append(_load_wmma_A_frag(q_lds, lane16, ks * WMMA_K, HEAD_SIZE))
 
         # ---------------- TDM async load helpers ----------------
-        def _phys_blk(logical_blk_idx):
-            bt_off = seq_idx * stride_bt_seq + logical_blk_idx
-            phys_i32 = buffer_ops.buffer_load(bt_rsrc, bt_off, vec_width=1, dtype=T.i32)
-            return arith.index_cast(T.index, phys_i32)
+        # Total logical blocks in a partition (used to index block_tables).
+        BLOCKS_PER_PARTITION = COMPUTES_PER_PARTITION * BLOCKS_PER_COMPUTE
 
-        def _issue_kv_load(kv_tensor, lds_memref, phys_blk):
-            """Issue a TDM async 2D load of [KVB, HEAD] from kv_tensor into lds_memref.
+        def _phys_blks_for_compute(compute_iter_idx):
+            """Load BLOCKS_PER_COMPUTE physical block IDs via one vectorized buffer_load.
 
-            Treat kv_tensor flat-view as a 2D tensor of HEAD-strided rows. The starting
-            row index for block ``phys_blk`` at head ``kv_head`` is
-            ``phys_blk * num_kv_heads * KVB + kv_head * KVB``.
+            For compute iteration `compute_iter_idx`, we need physical block indices at
+            logical positions [base, base + BLOCKS_PER_COMPUTE) where
+            base = part_idx * BLOCKS_PER_PARTITION + compute_iter_idx * BLOCKS_PER_COMPUTE.
+
+            Block-table rows are contiguous in the logical_blk dim, so one vec
+            buffer_load pulls all BLOCKS_PER_COMPUTE entries at once.
+
+            Returns: list of `T.index` values, one per block in the tile.
             """
+            base_logical = (
+                part_idx * arith.index(BLOCKS_PER_PARTITION)
+                + compute_iter_idx * arith.index(BLOCKS_PER_COMPUTE)
+            )
+            bt_off = seq_idx * stride_bt_seq + base_logical
+            if BLOCKS_PER_COMPUTE == 1:
+                phys_i32 = buffer_ops.buffer_load(bt_rsrc, bt_off, vec_width=1, dtype=T.i32)
+                return [arith.index_cast(T.index, phys_i32)]
+            phys_vec = buffer_ops.buffer_load(
+                bt_rsrc, bt_off, vec_width=BLOCKS_PER_COMPUTE, dtype=T.i32
+            )
+            out = []
+            for b in range_constexpr(BLOCKS_PER_COMPUTE):
+                elem = vector.extract(phys_vec, static_position=[b], dynamic_position=[])
+                out.append(arith.index_cast(T.index, elem))
+            return out
+
+        def _issue_kv_load_single_block(kv_tensor, lds_memref, phys_blk, lds_byte_off):
+            """Issue one TDM async 2D load of [KVB, HEAD] into LDS at byte offset
+            `lds_byte_off` relative to the base of `lds_memref`."""
             outer_off = (phys_blk * num_kv_heads + kv_head) * arith.index(KV_BLOCK_SIZE)
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=kv_tensor,
@@ -280,32 +331,48 @@ def compile_pa_decode_main(
                 tile_shape=(KV_BLOCK_SIZE, HEAD_SIZE),
                 elem_bytes=elem_bytes,
                 num_warps=NUM_WARPS,
+                lds_byte_offset=lds_byte_off,
             )
             tdm_ops.tensor_load_2d(desc)
 
-        # ---------------- Prologue: issue loads for iteration 0 ----------------
-        logical_blk0 = part_idx * arith.index(BLOCKS_PER_PARTITION)
-        phys_blk0 = _phys_blk(logical_blk0)
-        _issue_kv_load(arg_key_cache, k_lds_stages[0].get(), phys_blk0)
-        _issue_kv_load(arg_value_cache, v_lds_stages[0].get(), phys_blk0)
+        def _issue_kv_tile_loads(k_lds_mem, v_lds_mem, phys_blks_list):
+            """Issue TDM loads for one compute tile: BLOCKS_PER_COMPUTE K loads + same for V.
 
-        # ---------------- Main loop over KV blocks ----------------
-        for b_in_part in range_constexpr(BLOCKS_PER_PARTITION): # need to fix this it is wasting compute in case actual_num_blocks < blocks_per_partition
-            cur_stage = b_in_part % 2
-            nxt_stage = (b_in_part + 1) % 2
-            logical_blk = part_idx * arith.index(BLOCKS_PER_PARTITION) + arith.index(b_in_part)
-            block_first_tok = logical_blk * arith.index(KV_BLOCK_SIZE)
+            Each block lands in a sub-region of the LDS stage (offset by block-index rows).
+            """
+            one_block_bytes = KV_BLOCK_SIZE * HEAD_SIZE * elem_bytes
+            for b in range_constexpr(BLOCKS_PER_COMPUTE):
+                lds_sub_off = arith.index(b * one_block_bytes)
+                _issue_kv_load_single_block(arg_key_cache,   k_lds_mem, phys_blks_list[b], lds_sub_off)
+                _issue_kv_load_single_block(arg_value_cache, v_lds_mem, phys_blks_list[b], lds_sub_off)
 
-            # Prefetch next block's K, V if it exists
-            if b_in_part < BLOCKS_PER_PARTITION - 1:
-                next_logical_blk = (
-                    part_idx * arith.index(BLOCKS_PER_PARTITION) + arith.index(b_in_part + 1)
+        # Fence counts: each compute tile issues 2*BLOCKS_PER_COMPUTE TDM ops (K+V for each block).
+        FENCE_OUTSTANDING = 2 * BLOCKS_PER_COMPUTE
+
+        # ---------------- Prologue: issue loads for compute tile 0 ----------------
+        phys_blks_tile0 = _phys_blks_for_compute(arith.index(0))
+        _issue_kv_tile_loads(k_lds_stages[0].get(), v_lds_stages[0].get(), phys_blks_tile0)
+
+        # ---------------- Main loop over compute tiles in partition ----------------
+        for compute_iter in range_constexpr(COMPUTES_PER_PARTITION):
+            cur_stage = compute_iter % 2
+            nxt_stage = (compute_iter + 1) % 2
+            tile_first_tok = (
+                part_idx * arith.index(PARTITION_SIZE)
+                + arith.index(compute_iter * KV_COMPUTE_BLOCK_SIZE)
+            )
+
+            # Prefetch next compute tile's BLOCKS_PER_COMPUTE K+V loads if it exists
+            if compute_iter < COMPUTES_PER_PARTITION - 1:
+                next_iter_idx = arith.index(compute_iter + 1)
+                next_phys_blks = _phys_blks_for_compute(next_iter_idx)
+                _issue_kv_tile_loads(
+                    k_lds_stages[nxt_stage].get(),
+                    v_lds_stages[nxt_stage].get(),
+                    next_phys_blks,
                 )
-                next_phys_blk = _phys_blk(next_logical_blk)
-                _issue_kv_load(arg_key_cache, k_lds_stages[nxt_stage].get(), next_phys_blk)
-                _issue_kv_load(arg_value_cache, v_lds_stages[nxt_stage].get(), next_phys_blk)
-                # Wait for current stage loads (let 2 next loads remain outstanding)
-                tdm_ops.tensor_wait(2)
+                # Wait for current tile loads (let next tile's 2*BPC loads remain outstanding)
+                tdm_ops.tensor_wait(FENCE_OUTSTANDING)
             else:
                 tdm_ops.tensor_wait(0)
             gpu.barrier()
@@ -340,10 +407,10 @@ def compile_pa_decode_main(
             for n_tile in range_constexpr(N_QK_TILES):
                 qk_accs[n_tile] = arith.mulf(qk_accs[n_tile], qk_scale_log2_vec)
 
-            # Mask out-of-range tokens (col = block_first_tok + n_tile*16 + lane16)
+            # Mask out-of-range tokens (col = tile_first_tok + n_tile*16 + lane16)
             neg_inf_vec8 = arith.constant_vector(float("-inf"), T.vec(8, T.f32))
             for n_tile in range_constexpr(N_QK_TILES):
-                tok_abs = block_first_tok + arith.index(n_tile * WMMA_N) + lane16
+                tok_abs = tile_first_tok + arith.index(n_tile * WMMA_N) + lane16
                 in_range = arith.cmpi(
                     arith.CmpIPredicate.slt, _raw(tok_abs), _raw(seq_len)
                 )
@@ -440,7 +507,7 @@ def compile_pa_decode_main(
                 for mi in range_constexpr(8):
                     row = lane_kgrp * arith.index(8) + arith.index(mi)
                     col = arith.index(n_tile * WMMA_N) + lane16
-                    off = row * arith.index(KV_BLOCK_SIZE) + col
+                    off = row * arith.index(KV_COMPUTE_BLOCK_SIZE) + col
                     v = vector.extract(
                         p_half, static_position=[mi], dynamic_position=[]
                     )
@@ -457,7 +524,7 @@ def compile_pa_decode_main(
                     # P fragment from P LDS: A operand [M=16, K=32]
                     # row = lane16, K-col = ks*32 + kk
                     p_frag = _load_wmma_A_frag(
-                        p_lds, lane16, ks * WMMA_K, KV_BLOCK_SIZE
+                        p_lds, lane16, ks * WMMA_K, KV_COMPUTE_BLOCK_SIZE
                     )
                     # V fragment from KV LDS: B operand [K=32, N=16]
                     # KV LDS layout [KVB, HEAD]. B operand wants row=K (KVB axis), col=N (HEAD axis).
@@ -524,7 +591,8 @@ def compile_pa_decode_main(
             buffer_ops.buffer_store(m_state[mi], ml_rsrc, off)
             buffer_ops.buffer_store(l_state[mi], es_rsrc, off)
 
-    cache_tag = (HEAD_SIZE, KV_BLOCK_SIZE, QUERY_GROUP_SIZE, PARTITION_SIZE, dtype, NUM_WARPS)
+    cache_tag = (HEAD_SIZE, KV_BLOCK_SIZE, QUERY_GROUP_SIZE, PARTITION_SIZE,
+                 KV_COMPUTE_BLOCK_SIZE, dtype, NUM_WARPS)
 
     @flyc.jit
     def launch_pa_decode_main(
