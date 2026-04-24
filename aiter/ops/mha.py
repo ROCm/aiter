@@ -1293,7 +1293,7 @@ def _flash_attn_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
+        ret = get_gfx() in ("gfx942", "gfx950")
         ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
@@ -2074,7 +2074,7 @@ def _flash_attn_varlen_forward(
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
-        ret = get_gfx() == "gfx942"
+        ret = get_gfx() in ("gfx942", "gfx950")
         ret = ret and (hdim_q == 128)
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
