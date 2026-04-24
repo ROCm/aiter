@@ -183,6 +183,10 @@ std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const s
     {
         tg_div = 1; // do not merge the head and tail in seqlen_q direction
     }
+    if(arch_id == "gfx950")
+    {
+        tg_div = 1; // v2 asm kernel processes one Q tile per workgroup
+    }
     // batch
     int gdx = ((a.seqlen_q + ts_qo - 1) / ts_qo + tg_div - 1) / tg_div;
     int gdy = a.nhead_q;
