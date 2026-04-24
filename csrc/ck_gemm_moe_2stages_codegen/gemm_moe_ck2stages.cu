@@ -13,6 +13,19 @@
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
+static inline int map_activation_to_ck_stage1(int activation)
+{
+    switch(static_cast<ActivationType>(activation))
+    {
+    case ActivationType::Silu: return 1;
+    case ActivationType::Gelu: return 0;
+    case ActivationType::SwigluStep: return 2;
+    default:
+        TORCH_CHECK(false, "Unsupported activation for ck_moe_stage1: ", activation);
+        return -1;
+    }
+}
+
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
@@ -108,7 +121,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
+    activation = map_activation_to_ck_stage1(activation);
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
@@ -172,7 +185,6 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         K *= 2;
     }
 
-    activation = !activation;
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),

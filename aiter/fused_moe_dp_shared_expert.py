@@ -22,7 +22,7 @@ from aiter.jit.core import (
     mp_lock,
 )
 from aiter.jit.utils.chip_info import get_cu_num
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import apply_act_and_mul, moe_sorting, swiglu, swiglustep
 
 BLOCK_SIZE_M = 32
 
@@ -748,11 +748,15 @@ def fused_moe_2stages(
     return moe_out
 
 
-def torch_moe_act(act_input, torch_act, inter_dim):
+def torch_moe_act(act_input, torch_act, inter_dim, activation=ActivationType.No):
     if act_input.shape[-1] == inter_dim:
         return torch_act(act_input)
     else:
         gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+        if activation == ActivationType.Swiglu:
+            return swiglu(gate, up)
+        if activation == ActivationType.SwigluStep:
+            return swiglustep(gate, up)
         return torch_act(gate) * up
 
 
@@ -813,10 +817,7 @@ def asm_stage1(
         sorted_weights=sorted_weights,
     )
     if ksplit > 0:
-        if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
-        else:
-            aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
+        apply_act_and_mul(out, tmp_out.view(dtypes.fp32), activation)
     return out
 
 
@@ -882,7 +883,9 @@ def torch_moe(
 
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
             act_out = (
-                torch_moe_act(act_input, torch_act, inter_dim).to(dtype).to(computeType)
+                torch_moe_act(act_input, torch_act, inter_dim, activation)
+                .to(dtype)
+                .to(computeType)
             )
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])

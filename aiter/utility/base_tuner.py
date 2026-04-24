@@ -552,7 +552,7 @@ class TunerCommon:
         jit_core.AITER_REBUILD = 2
         jit_core.get_module.cache_clear()
         # Reset rebuilded_list so all modules get rebuilt on next call
-        jit_core.rebuilded_list = ["module_aiter_enum"]
+        jit_core.rebuilded_list = ["module_aiter_core"]
         # Clear loaded modules dict (use getattr to avoid Python name mangling of __ prefix in class methods)
         mds = getattr(jit_core, "__mds", None)
         if mds is not None:
