@@ -14,22 +14,17 @@ Optimised paths:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl.expr import arith, vector, gpu, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-
 from flydsl._mlir import ir
 from flydsl.expr import buffer_ops
-
-KERNEL_NAME = "rmsnorm"
-
-EPS = 1e-5
-
 import math
 from kernels.kernels_common import dtype_to_elem_type, get_warp_size
 
+KERNEL_NAME = "rmsnorm"
+EPS = 1e-5
 WARP_SIZE = get_warp_size
 VEC_WIDTH = 8
 
