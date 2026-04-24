@@ -328,6 +328,13 @@ def mla_decode_fwd(
                 and kv_buffer.dtype == dtypes.fp8
             )
             or (
+                get_gfx() == "gfx950"
+                and nhead == 128
+                and q.dtype == dtypes.fp8
+                and kv_buffer.dtype == dtypes.fp8
+                and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
+            )
+            or (
                 get_gfx() == "gfx942"
                 and nhead in (16, 32, 64)
                 and nhead * max_seqlen_q == 128

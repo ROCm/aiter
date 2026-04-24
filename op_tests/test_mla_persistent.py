@@ -459,6 +459,13 @@ def torch_mla_extend_split_kv(
             and is_fp8_kvc
         )
         or (
+            get_gfx() == "gfx950"
+            and nheads == 128
+            and is_fp8_q
+            and is_fp8_kvc
+            and os.getenv("AITER_ENABLE_EXPERIMENTAL", False)
+        )
+        or (
             get_gfx() == "gfx942"
             and nheads in (16, 32, 64)
             and nheads * max_seqlen_q == 128
