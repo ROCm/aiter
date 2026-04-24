@@ -269,15 +269,25 @@ class TunerCommon:
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
                 df = _read_csv(path)
-                base_cols = [c for c in df_list[0].columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                assert (
-                    base_cols == new_cols
-                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
-
                 df_list.append(df)
             else:
                 print(f"path {i+1}: {path} (not exist)")
+
+        if len(df_list) > 1:
+            all_cols = list(df_list[0].columns)
+            for df in df_list[1:]:
+                for c in df.columns:
+                    if c not in all_cols:
+                        insert_before = (
+                            "tflops" if "tflops" in all_cols else all_cols[-1]
+                        )
+                        all_cols.insert(all_cols.index(insert_before), c)
+            _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+            for j in range(len(df_list)):
+                for c in all_cols:
+                    if c not in df_list[j].columns:
+                        df_list[j][c] = _FILL_DEFAULTS.get(c, 0)
+                df_list[j] = df_list[j][all_cols]
         merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
         dedup_keys = self.keys
         if "_tag" in merge_df.columns:
@@ -376,7 +386,18 @@ class TunerCommon:
             return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
-        # print(df_updates)
+        # Widen integer columns to object so that float/string updates don't
+        # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
+        # cannot accept a float like 2.61).
+        import numpy as np
+
+        for col in df_old.columns:
+            if col in df_updates.columns and df_old[col].dtype != df_updates[col].dtype:
+                try:
+                    common = np.result_type(df_old[col].dtype, df_updates[col].dtype)
+                except TypeError:
+                    common = object
+                df_old[col] = df_old[col].astype(common)
         df_old["_tmp_key"] = df_old[key_columns].apply(tuple, axis=1)
         df_updates["_tmp_key"] = df_updates[key_columns].apply(tuple, axis=1)
         matched_keys = df_updates[df_updates["_tmp_key"].isin(df_old["_tmp_key"])][
