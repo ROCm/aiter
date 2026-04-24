@@ -1,5 +1,7 @@
 import torch
 import triton
+from typing import Optional
+
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
     _fused_qkv_split_qk_norm_rope_cache_kernel,
 )
@@ -25,6 +27,8 @@ def fused_qkv_split_qk_norm_rope_cache(
     k_scale: torch.Tensor = None,
     v_scale: torch.Tensor = None,
     eps: float = 1e-5,
+    rotary_dim_half: Optional[int] = None,
+    gated_qkv_layout: str = "interleaved",
 ):
     T = qkv.shape[0]
     q_size = qh * head_dim
@@ -46,14 +50,28 @@ def fused_qkv_split_qk_norm_rope_cache(
 
     if attn_output_gate:
         assert qkv.shape[-1] == 2 * q_size + 2 * kv_size, "Shape error"
+        assert gated_qkv_layout in (
+            "interleaved",
+            "blocked",
+        ), 'gated_qkv_layout must be "interleaved" or "blocked"'
     else:
         assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
+        assert (
+            gated_qkv_layout == "interleaved"
+        ), "non-gated QKV only supports interleaved layout"
     assert head_dim == triton.next_power_of_2(head_dim), "head_dim should be power of 2"
+
+    assert cos.shape[-1] == sin.shape[-1], "cos and sin must match in last dim"
+    inferred_rd_half = cos.shape[-1]
+    if rotary_dim_half is not None:
+        assert (
+            rotary_dim_half == inferred_rd_half
+        ), f"rotary_dim_half={rotary_dim_half} but cos.shape[-1]={inferred_rd_half}"
+    ROTARY_DIM_HALF = inferred_rd_half
 
     # Logic for dimension splitting
     BLOCK_D = head_dim
     BLOCK_D_HALF = head_dim // 2
-    ROTARY_DIM_HALF = cos.shape[-1]
 
     BLOCK_T = 32
     num_warps = 4
@@ -109,6 +127,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCK_D_HALF=BLOCK_D_HALF,
         BLOCK_SIZE=block_size,
         ROTARY_DIM_HALF=ROTARY_DIM_HALF,
+        BLOCKED_GATED_LAYOUT=(attn_output_gate and gated_qkv_layout == "blocked"),
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
         num_warps=num_warps,
