@@ -208,9 +208,7 @@ class AITER_CONFIG(object):
         for _, df in source_pairs[1:]:
             for c in df.columns:
                 if c not in all_cols:
-                    insert_before = (
-                        "tflops" if "tflops" in all_cols else all_cols[-1]
-                    )
+                    insert_before = "tflops" if "tflops" in all_cols else all_cols[-1]
                     all_cols.insert(all_cols.index(insert_before), c)
         for i, (path, df) in enumerate(source_pairs):
             for c in all_cols:
@@ -218,9 +216,7 @@ class AITER_CONFIG(object):
                     df[c] = _FILL_DEFAULTS.get(c, 0)
             source_pairs[i] = (path, df[all_cols])
 
-        merge_df = pd.concat(
-            [df for _, df in source_pairs], ignore_index=True
-        )
+        merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
