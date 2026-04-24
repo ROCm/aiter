@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include "aiter_hip_common.h"
+#include "aiter_tensor.h"
 
 struct __attribute__((packed)) KernelArgs
 {

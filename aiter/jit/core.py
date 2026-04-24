@@ -26,6 +26,7 @@ from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 
 aiter_lib = None
 
@@ -183,29 +184,35 @@ class AITER_CONFIG(object):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
-        df_list = []
+        source_pairs = []
         ## merge config files
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
         import pandas as pd
 
-        df_list.append(pd.read_csv(path_list[0]))
-        for i, path in enumerate(path_list[1:]):
-            if os.path.exists(path):
-                df = pd.read_csv(path)
-                base_cols = [c for c in df_list[0].columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                assert (
-                    base_cols == new_cols
-                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
+        for i, path in enumerate(path_list):
+            if not os.path.exists(path):
+                logger.info(f"path {i + 1}: {path} (not exist)")
+                continue
 
-                df_list.append(df)
-            else:
-                logger.info(f"path {i+1}: {path} (not exist)")
-        merge_df = (
-            pd.concat([df for df in df_list if not df.empty], ignore_index=True)
-            if df_list
-            else pd.DataFrame()
-        )
+            df = pd.read_csv(path)
+            if source_pairs:
+                base_path, base_df = source_pairs[0]
+                base_cols = [c for c in base_df.columns if c != "_tag"]
+                new_cols = [c for c in df.columns if c != "_tag"]
+                if base_cols != new_cols:
+                    raise ValueError(
+                        f"Column mismatch between {base_path} and {path}, "
+                        f"{base_cols}, {new_cols}"
+                    )
+
+            source_pairs.append((path, df))
+
+        if not source_pairs:
+            raise FileNotFoundError(
+                f"No existing config files found in '{file_path}' when merging '{merge_name}'."
+            )
+
+        merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
         has_tag = "_tag" in merge_df.columns
         if has_tag:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
@@ -222,18 +229,52 @@ class AITER_CONFIG(object):
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
                 keys.append("cu_num")
+            if "gfx" in merge_df.columns and "gfx" not in keys:
+                keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
-            sorted_df = merge_df.sort_values("us")
-            duplicated_mask = sorted_df.duplicated(subset=dedup_keys, keep="first")
+            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
-                dup_rows = sorted_df[duplicated_mask]
-                logger.warning(
-                    f"Dropping {len(dup_rows)} duplicate rows during merge of '{merge_name}':\n"
-                    f"{dup_rows.to_string(index=False)}"
+                dup_count = int(duplicated_mask.sum())
+                dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+                if "us" not in merge_df.columns:
+                    raise RuntimeError(
+                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                        f"No 'us' column to determine best performing entry. "
+                        f"Please remove duplicates manually.\n"
+                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+                    )
+
+                # Auto-dedup: globally determine best row (lowest 'us') per shape
+                best_row_index = set(
+                    merge_df.sort_values("us", kind="stable")
+                    .drop_duplicates(subset=dedup_keys, keep="first")
+                    .index
                 )
-            merge_df = sorted_df.drop_duplicates(
-                subset=dedup_keys, keep="first"
-            ).reset_index(drop=True)
+
+                saved_files = []
+                offset = 0
+                for src_path, src_df in source_pairs:
+                    start, end = offset, offset + len(src_df)
+                    offset = end
+                    file_rows = merge_df.iloc[start:end]
+                    new_src_df = file_rows[
+                        file_rows.index.isin(best_row_index)
+                    ].reset_index(drop=True)
+                    if len(new_src_df) < len(src_df):
+                        new_src_df.to_csv(src_path, index=False)
+                        saved_files.append(
+                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
+                        )
+                saved_info = (
+                    "\n".join(saved_files) if saved_files else "  (no files updated)"
+                )
+                raise RuntimeError(
+                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
+                    f"and saved back to source config files. Please re-run.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+                    f"Updated files:\n{saved_info}"
+                )
         else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
@@ -264,8 +305,8 @@ class AITER_CONFIG(object):
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
             op_tuned_file_list = [
                 p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*")
-                if (p.is_file() and "untuned" not in str(p))
+                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+                if (p.is_file() and "untuned" not in p.name)
             ]
 
             if not op_tuned_file_list:
@@ -527,7 +568,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_enum"]
+rebuilded_list = ["module_aiter_core"]
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -740,7 +781,7 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
-        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
         if not torch_exclude:
@@ -752,6 +793,17 @@ def build_module(
         enable_ck = int(os.environ.get("ENABLE_CK", "1"))
         if not any("ENABLE_CK" in f for f in flags_extra_cc):
             flags_cc.append(f"-DENABLE_CK={enable_ck}")
+
+        enable_rope_positions_int32 = int(
+            os.environ.get("ENABLE_ROPE_POSITIONS_INT32", "0")
+        )
+        if not any("ENABLE_ROPE_POSITIONS_INT32" in f for f in flags_extra_cc):
+            flags_cc.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
+            flags_hip.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
@@ -806,7 +858,7 @@ def build_module(
                 f"{AITER_CSRC_DIR}/include",
                 f"{op_dir}/blob",
             ] + _extra_inc
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
         else:
             old_bd_include_dir = f"{op_dir}/build/include"
@@ -818,7 +870,7 @@ def build_module(
                 hipify,
             )
 
-            if not is_standalone:
+            if not is_standalone and not torch_exclude:
                 bd_include_dir = f"{op_dir}/build/include/torch"
                 os.makedirs(bd_include_dir, exist_ok=True)
                 rename_cpp_to_cu(
@@ -867,7 +919,7 @@ def build_module(
 
     def FinalFunc():
         logger.info(
-            f"\033[32mfinish build [{md_name}], cost {time.perf_counter()-startTS:.1f}s \033[0m"
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
@@ -923,9 +975,22 @@ def _get_ck_exclude_modules():
         "module_ps_metadata",
         "module_quant",
         "module_rmsnorm_quant",
-        "module_rope_general_bwd",
-        "module_rope_general_fwd",
-        "module_rope_pos_fwd",
+        "module_rope_1c_uncached_fwd",
+        "module_rope_1c_uncached_bwd",
+        "module_rope_2c_uncached_fwd",
+        "module_rope_2c_uncached_bwd",
+        "module_rope_1c_cached_fwd",
+        "module_rope_1c_cached_bwd",
+        "module_rope_2c_cached_fwd",
+        "module_rope_2c_cached_bwd",
+        "module_rope_1c_thd_fwd",
+        "module_rope_1c_thd_bwd",
+        "module_rope_1c_2d_fwd",
+        "module_rope_1c_2d_bwd",
+        "module_rope_1c_cached_positions_fwd",
+        "module_rope_2c_cached_positions_fwd",
+        "module_rope_1c_cached_positions_offsets_fwd",
+        "module_rope_2c_cached_positions_offsets_fwd",
         "module_sample",
         "module_topk_plain",
     }
@@ -1049,8 +1114,8 @@ def _ctypes_call(func, fc_name, md_name):
     ----------------------|----------------------|---------
     Tensor                | POINTER(aiter_tensor_t) | aiter_tensor_t*
     Optional[Tensor]      | POINTER(aiter_tensor_t) | aiter_tensor_t* (NULL if None)
-    int                   | c_int                | int
-    Optional[int]         | c_int                | int   (-1 if None)
+    int                   | c_int64              | int64_t
+    Optional[int]         | c_int64              | int64_t (-1 if None)
     str                   | c_char_p             | char* (.encode())
     Optional[str]         | c_char_p             | char* (NULL if None)
     bool                  | c_int                | int   (0 / 1)
@@ -1068,6 +1133,8 @@ def _ctypes_call(func, fc_name, md_name):
 
     _cache = {}
     _arg_checked = False
+    _sig = inspect.signature(func)
+    _hints = typing.get_type_hints(func)
 
     def _ensure_loaded():
         if _cache:
@@ -1093,10 +1160,25 @@ def _ctypes_call(func, fc_name, md_name):
         lib = ctypes.CDLL(so_path)
         c_func = getattr(lib, fc_name)
 
-        hints = typing.get_type_hints(func)
+        def _opt_sym(name, argtypes=(), restype=None):
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.argtypes = list(argtypes)
+                fn.restype = restype
+            return fn
 
-        ret_hint = hints.get("return")
-        if ret_hint is int:
+        abi_fn = _opt_sym("aiter_ctypes_abi_version", restype=ctypes.c_int)
+        ctypes_abi_version = abi_fn() if abi_fn else 1
+        ctypes_status_mode = ctypes_abi_version >= 2
+        err_getter = _opt_sym("aiter_get_last_error", restype=ctypes.c_char_p)
+        err_clear = _opt_sym("aiter_clear_last_error")
+
+        ret_hint = _hints.get("return")
+        ctypes_data_return = ctypes_status_mode and ret_hint is int
+
+        if ctypes_status_mode:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is int:
             c_func.restype = ctypes.c_int
         elif ret_hint is float:
             c_func.restype = ctypes.c_float
@@ -1105,8 +1187,8 @@ def _ctypes_call(func, fc_name, md_name):
 
         argtypes = []
         has_tensor = False
-        for pname in inspect.signature(func).parameters:
-            hint = hints.get(pname)
+        for pname in _sig.parameters:
+            hint = _hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
             if hint is torch.Tensor:
@@ -1116,7 +1198,7 @@ def _ctypes_call(func, fc_name, md_name):
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
                 has_tensor = True
             elif _is_union(origin) and int in type_args:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
             elif hint is str:
@@ -1124,7 +1206,7 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
             elif hint is int:
-                argtypes.append(ctypes.c_int)
+                argtypes.append(ctypes.c_int64)
             elif hint is float:
                 argtypes.append(ctypes.c_float)
             else:
@@ -1135,6 +1217,10 @@ def _ctypes_call(func, fc_name, md_name):
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
+        _cache["err_getter"] = err_getter
+        _cache["err_clear"] = err_clear
+        _cache["ctypes_status_mode"] = ctypes_status_mode
+        _cache["ctypes_data_return"] = ctypes_data_return
         _cache["has_tensor"] = has_tensor
 
     def _check_args_before_convert(bound_args, hints):
@@ -1170,20 +1256,17 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is str:
                 if not isinstance(value, str):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects str, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects str, got {type(value).__name__}"
                     )
             elif hint is bool:
                 if not isinstance(value, (bool, int)):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects bool, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects bool, got {type(value).__name__}"
                     )
             elif hint is int:
                 if not isinstance(value, int):
                     raise TypeError(
-                        f"{fc_name}: '{pname}' expects int, "
-                        f"got {type(value).__name__}"
+                        f"{fc_name}: '{pname}' expects int, got {type(value).__name__}"
                     )
             elif hint is float:
                 if not isinstance(value, (float, int)):
@@ -1196,14 +1279,20 @@ def _ctypes_call(func, fc_name, md_name):
         nonlocal _arg_checked
         _ensure_loaded()
         c_func = _cache["c_func"]
+        err_getter = _cache.get("err_getter")
+        err_clear = _cache.get("err_clear")
+        ctypes_status_mode = _cache.get("ctypes_status_mode", False)
+        ctypes_data_return = _cache.get("ctypes_data_return", False)
 
-        sig = inspect.signature(func)
-        bound = sig.bind(*args, **kwargs)
+        if AITER_LOG_MORE == 2:
+            from ..test_common import log_args
+
+            log_args(func, *args, **kwargs)
+        bound = _sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        hints = typing.get_type_hints(func)
 
         if not _arg_checked:
-            _check_args_before_convert(bound.arguments, hints)
+            _check_args_before_convert(bound.arguments, _hints)
             _arg_checked = True
 
         c_args = []
@@ -1211,7 +1300,7 @@ def _ctypes_call(func, fc_name, md_name):
         tensor_device = None
 
         for pname, value in bound.arguments.items():
-            hint = hints.get(pname)
+            hint = _hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
 
@@ -1239,17 +1328,36 @@ def _ctypes_call(func, fc_name, md_name):
             elif hint is bool:
                 c_args.append(1 if value else 0)
             elif hint is int:
-                c_args.append(ctypes.c_int(value))
+                c_args.append(ctypes.c_int64(value))
             elif hint is float:
                 c_args.append(ctypes.c_float(value))
             else:
                 c_args.append(value)
 
-        if _cache.get("has_tensor"):
-            c_args.append(
-                ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
-            )
-        return c_func(*c_args)
+        c_args.append(
+            ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
+        )
+        if err_clear is not None:
+            err_clear()
+        ret = c_func(*c_args)
+
+        err_msg = None
+        if ctypes_status_mode and not ctypes_data_return and ret != 0:
+            err_msg = f"ctypes status={ret}"
+        if err_getter is not None:
+            raw = err_getter()
+            if raw:
+                err_msg = raw.decode(errors="replace")
+        if err_msg is not None:
+            if err_clear is not None:
+                err_clear()
+            raise RuntimeError(f"{fc_name} failed: {err_msg}")
+
+        if ctypes_data_return:
+            return ret
+        if ctypes_status_mode:
+            return None
+        return ret
 
     return caller
 
@@ -1260,6 +1368,7 @@ def compile_ops(
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
     ffi_type: str = "pybind",
+    develop: bool = False,
 ):
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
@@ -1367,17 +1476,30 @@ def compile_ops(
                         doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
                         doc_str = doc_str.replace("typing.SupportsInt", "int")
                         doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                        doc_str = re.sub(r"\s*\|\s*typing\.SupportsIndex", "", doc_str)
                         pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
                         doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
                         for el in enum_types:
                             doc_str = re.sub(
                                 f" (module_)?aiter.*{el} ", f" {el} ", doc_str
                             )
+                        doc_str = re.sub(
+                            r"(?:[\w.]+\.)?aiter_tensor_t",
+                            "aiter_tensor_t",
+                            doc_str,
+                        )
+                        try:
+                            aiter_tensor_t = get_module(
+                                "module_aiter_core"
+                            ).aiter_tensor_t
+                        except Exception:
+                            aiter_tensor_t = object
                         namespace = {
                             "List": List,
                             "Optional": Optional,
                             "torch": torch,
                             "typing": typing,
+                            "aiter_tensor_t": aiter_tensor_t,
                         }
 
                         exec(
@@ -1420,11 +1542,79 @@ def compile_ops(
                         func_hints = typing.get_type_hints(func)
                         if ann["return"] is None:
                             func_hints["return"] = None
-                        if ann != func_hints:
+
+                        tensor_like_types = {torch.Tensor}
+                        if aiter_tensor_t is not object:
+                            tensor_like_types.add(aiter_tensor_t)
+
+                        def canonicalize_hint(hint):
+                            if hint in tensor_like_types:
+                                return ("tensor",)
+
+                            origin = typing.get_origin(hint)
+                            if origin in (list, List):
+                                return (
+                                    "list",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin is tuple:
+                                return (
+                                    "tuple",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin in (typing.Union, types.UnionType):
+                                return (
+                                    "union",
+                                    tuple(
+                                        sorted(
+                                            (
+                                                canonicalize_hint(arg)
+                                                for arg in typing.get_args(hint)
+                                            ),
+                                            key=repr,
+                                        )
+                                    ),
+                                )
+                            return hint
+
+                        canonical_ann = {
+                            key: canonicalize_hint(value) for key, value in ann.items()
+                        }
+                        canonical_func_hints = {
+                            key: canonicalize_hint(value)
+                            for key, value in func_hints.items()
+                        }
+
+                        if canonical_ann != canonical_func_hints:
                             logger.warning(
                                 f"type hints mismatch, override to --> {doc_str}"
                             )
                     return True
+
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
+                if develop:
+                    import torch
+
+                    from ..utility.dtypes import torch_to_aiter_pybind
+
+                    args = tuple(
+                        torch_to_aiter_pybind(a) if isinstance(a, torch.Tensor) else a
+                        for a in args
+                    )
+                    kwargs = {
+                        k: (
+                            torch_to_aiter_pybind(v)
+                            if isinstance(v, torch.Tensor)
+                            else v
+                        )
+                        for k, v in kwargs.items()
+                    }
 
                 if not func.arg_checked:
                     func.arg_checked = check_args()
@@ -1434,6 +1624,10 @@ def compile_ops(
 
                     log_args(func, *args, **kwargs)
 
+                if develop:
+                    module._set_current_hip_stream(
+                        torch.cuda.current_stream().cuda_stream
+                    )
                 return op(*args, **kwargs)
 
             @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)

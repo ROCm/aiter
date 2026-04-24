@@ -135,7 +135,6 @@ def unified_attention(
     sinks=None,
 ):
     assert causal, "Only causal attention is supported"
-    assert q_descale is None, "Q scales not supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -169,7 +168,7 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = cu_count * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = max_seqlen_q == 1
+    ALL_DECODE = int(max_seqlen_q) == 1
     # if batch contains a prefill
     if use_2d_kernel(
         head_size,
@@ -209,9 +208,10 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            out_scale=1 / output_scale if output_scale is not None else 1.0,
+            q_descale_ptr=q_descale,
+            k_descale_ptr=k_descale,
+            v_descale_ptr=v_descale,
+            out_scale_ptr=output_scale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
@@ -239,7 +239,6 @@ def unified_attention(
             stride_v_cache_3=v.stride(3),
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
-            USE_FP8=output_scale is not None,
             ALL_DECODE=ALL_DECODE,
             **config,
         )
@@ -290,8 +289,9 @@ def unified_attention(
             alibi_slopes_ptr=alibi_slopes,
             qq_bias_ptr=qq_bias,
             scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
+            q_descale_ptr=q_descale,
+            k_descale_ptr=k_descale,
+            v_descale_ptr=v_descale,
             softcap=softcap,
             num_query_heads=num_query_heads,
             num_queries_per_kv=num_queries_per_kv,
@@ -330,7 +330,7 @@ def unified_attention(
             seq_lens_ptr=seqused_k,
             num_seqs=num_seqs,
             num_query_heads=num_query_heads,
-            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
+            out_scale_ptr=output_scale,
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
@@ -338,6 +338,5 @@ def unified_attention(
             HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
-            USE_FP8=output_scale is not None,
             **reduce_config,
         )

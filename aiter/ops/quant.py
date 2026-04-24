@@ -72,14 +72,45 @@ def pertoken_quant(
     return y, y_scale
 
 
-def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
+def per_1x32_f4_quant(
+    x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False, pack_dim=-1
+):
+    """Quantize a tensor to MXFP4 (e2m1) format with per-1x32 block scaling.
+
+    By default, packing is along the last dimension (dim=-1), which produces
+    output suitable for ``tl.dot_scaled`` **LHS** operand:
+        A(M, K) -> fp4=(M, K//2), scale=(M, K//32)
+
+    For ``tl.dot_scaled`` **RHS** operand, set ``pack_dim=0`` so the packing
+    is along the first dimension (the K / contraction dimension):
+        B(K, N) -> fp4=(K//2, N), scale=(K//32, N)
+
+    Args:
+        x: Input tensor of shape (..., N) or (M, N).
+        scale: Pre-computed scale tensor (optional, usually None).
+        quant_dtype: Target quantized dtype, must be ``dtypes.fp4x2``.
+        shuffle: Whether to apply e8m0 scale shuffling for hardware.
+        pack_dim: Dimension along which to pack two FP4 values into one byte.
+            -1 (default): pack along the last dimension (for dot_scaled LHS).
+             0: pack along the first dimension (for dot_scaled RHS).
+
+    Returns:
+        Tuple of (quantized_tensor, scale_tensor).
+    """
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
-    F8E8M0_EXP_BIAS = 127
+    F8E8M0_EXP_BIAS = 127  # noqa:F841
     F4E2M1_MAX = 6.0
     MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
     # dtypeMax = F4E2M1_MAX
     dtypeMax = 2.0**MAX_POW2
+
+    # For pack_dim=0, transpose so packing always happens along last dim internally
+    transposed = False
+    if pack_dim == 0:
+        assert x.dim() == 2, "pack_dim=0 requires a 2D input tensor (K, N)"
+        x = x.T.contiguous()
+        transposed = True
 
     shape_original = x.shape
     x = x.view(-1, shape_original[-1])
@@ -102,7 +133,40 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
     if shuffle:
         scale = fp4_utils.e8m0_shuffle(scale)
-    return y, scale.view(dtypes.fp8_e8m0)
+    scale = scale.view(dtypes.fp8_e8m0)
+
+    # For pack_dim=0, transpose results back: (N, K//2) -> (K//2, N)
+    if transposed:
+        y = y.T.contiguous()
+        scale = scale.view(torch.uint8).T.contiguous().view(dtypes.fp8_e8m0)
+
+    return y, scale
+
+
+def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2, shuffle=False):
+    """Convenience function: quantize both LHS and RHS for ``tl.dot_scaled``.
+
+    Handles the packing dimension automatically:
+    - LHS A(M, K): packed along K (dim=-1) -> fp4=(M, K//2), scale=(M, K//32)
+    - RHS B(K, N): packed along K (dim=0)  -> fp4=(K//2, N), scale=(K//32, N)
+
+    Note: Triton 3.6+ expects rhs_scale in transposed form (N, K//32). Users
+    should transpose the returned rhs_scale accordingly if using Triton >= 3.6.
+
+    Args:
+        lhs: LHS tensor of shape (M, K).
+        rhs: RHS tensor of shape (K, N).
+
+    Returns:
+        Tuple of (lhs_fp4, lhs_scale, rhs_fp4, rhs_scale).
+    """
+    lhs_fp4, lhs_scale = per_1x32_f4_quant(
+        lhs, quant_dtype=quant_dtype, shuffle=shuffle, pack_dim=-1
+    )
+    rhs_fp4, rhs_scale = per_1x32_f4_quant(
+        rhs, quant_dtype=quant_dtype, shuffle=shuffle, pack_dim=0
+    )
+    return lhs_fp4, lhs_scale, rhs_fp4, rhs_scale
 
 
 def per_1x32_f8_scale_f8_quant(
@@ -310,7 +374,7 @@ def per_1x32_f4_quant_hip(
                 torch.empty(
                     (
                         (m + 255) // 256 * 256,
-                        (n // 32 + 7) // 8 * 8,
+                        ((n + 31) // 32 + 7) // 8 * 8,
                     ),
                     dtype=torch.uint8,
                     device=device,
@@ -321,7 +385,7 @@ def per_1x32_f4_quant_hip(
         else:
             scale = (
                 torch.empty(
-                    (m, n // 32),
+                    (m, (n + 31) // 32),
                     dtype=torch.uint8,
                     device=device,
                 )
@@ -552,6 +616,102 @@ def moe_smooth_per_token_scaled_quant_v2(
     v2: expert loops along sorted_token_ids. Supports both moe stage1 and stage2.
     """
     ...
+
+
+@compile_ops("module_quant")
+def mxfp4_moe_sort_hip(
+    out_scale: torch.Tensor,
+    scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    cols: int,
+) -> None:
+    """
+    MoE scale sorting with MXFP4 shuffle layout.
+    """
+    ...
+
+
+def mxfp4_moe_sort_fwd(
+    scale: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    cols: int,
+):
+    out_scale = torch.empty(
+        (sorted_ids.shape[0] + 31) // 32 * 32,
+        (cols + 31) // 32,
+        dtype=dtypes.fp8_e8m0,
+        device=scale.device,
+    )
+    mxfp4_moe_sort_hip(out_scale, scale, sorted_ids, num_valid_ids, token_num, cols)
+    return out_scale
+
+
+@compile_ops("module_quant")
+def fused_dynamic_mxfp4_quant_moe_sort_hip(
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_m: int,
+    group_size: int = 32,
+) -> None:
+    """
+    HIP path for fused dynamic MXFP4 quantization and MoE scale sorting.
+    """
+    ...
+
+
+def fused_dynamic_mxfp4_quant_moe_sort(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    topk: int,  # stage1 and stage2: same topk value
+    block_size: int,
+    num_rows: Optional[torch.Tensor] = None,
+    group_size: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    token_num_quant_moe_sort_switch = [
+        8 * 256 / topk,  # stage1
+        8 * 1024 / topk,  # stage2
+    ]
+    M, N = input.view(-1, input.shape[-1]).shape
+    is_stage1 = M == token_num
+    topk = 1 if is_stage1 else topk
+    scale = torch.empty(
+        (sorted_ids.shape[0] + 31) // 32 * 32,
+        (N + 31) // 32,
+        dtype=dtypes.fp8_e8m0,
+        device=input.device,
+    )
+    if (
+        (is_stage1 and M <= token_num_quant_moe_sort_switch[0])
+        or (not is_stage1 and M <= token_num_quant_moe_sort_switch[1] * topk)
+        or group_size != 32
+    ):
+        out = torch.empty(M, N // 2, dtype=dtypes.fp4x2, device=input.device)
+        fused_dynamic_mxfp4_quant_moe_sort_hip(
+            out,
+            scale,
+            input,
+            sorted_ids,
+            num_valid_ids,
+            token_num,
+            block_size,
+            group_size,
+        )
+    else:
+        out, scale_ = per_1x32_f4_quant_hip(
+            input, None, dtypes.fp4x2, num_rows=num_rows, num_rows_factor=topk
+        )
+        mxfp4_moe_sort_hip(scale, scale_, sorted_ids, num_valid_ids, token_num, N)
+    return out, scale
 
 
 @compile_ops("module_quant")

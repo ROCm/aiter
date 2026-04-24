@@ -158,7 +158,7 @@ def run_ck(
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no", "bias", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
@@ -210,14 +210,14 @@ def test_flash_attn_output(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     return_lse = True
@@ -372,6 +372,7 @@ def test_flash_attn_output(
         * nheads
         * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
     )
+    fwd_flop = fwd_flop / 2 if causal else fwd_flop
     dtype_bytes = torch.finfo(dtype).bits // 8
     fwd_num_bytes = (
         batch_size
@@ -384,10 +385,12 @@ def test_flash_attn_output(
         * nheads
         * (seqlen_q * seqlen_k * d * 2 * 3 + seqlen_q * seqlen_k * d_v * 2 * 2)
     )
+    bwd_flop = bwd_flop / 2 if causal else bwd_flop
     bwd_num_bytes = (
         2 * fwd_num_bytes
         + batch_size * nheads * (torch.finfo(torch.float).bits // 8) * seqlen_q
     )
+
     ret = {}
     ret["fwd_us"] = us_fwd
     ret["fwd_tflops"] = (fwd_flop) / 1.0e6 / us_fwd
@@ -411,7 +414,7 @@ def flash_attn_output_benchmark(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
@@ -427,7 +430,7 @@ def flash_attn_output_benchmark(
         local,
         bias_type,
         deterministic,
-        mha_type,
+        gqa_ratio,
         dtype,
         input_layout,
     )
@@ -438,7 +441,7 @@ def flash_attn_output_benchmark(
     ["mixed", "q_only", "k_only", "no_padding", "q_len_1", "k_len_1"],
 )
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no"])
 @pytest.mark.parametrize("local", [False, True])
@@ -491,14 +494,14 @@ def test_flash_attn_seq_padding(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
 ):
 
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     if bias_type == "bias":
@@ -694,7 +697,7 @@ parser.add_argument(
     "-n",
     "--nheads",
     type=int,
-    default=6,
+    default=16,
     help="""Number of heads. Default is 6.
     e.g.: -n 8""",
 )
@@ -777,14 +780,14 @@ parser.add_argument(
          -det false # disable deterministic attention""",
 )
 parser.add_argument(
-    "-m",
-    "--mha_type",
-    type=str,
+    "-gr",
+    "--gqa_ratio",
+    type=int,
     nargs="+",
-    choices=["mha", "mqa", "gqa"],
-    default=["mha", "mqa", "gqa"],
-    help="""Type of multi-head attention.
-    e.g.: -m mha""",
+    choices=[1, 8],
+    default=[1, 8],
+    help="""gqa ratio.
+    e.g.: -gr 8""",
 )
 parser.add_argument(
     "-d",
@@ -812,14 +815,14 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         causal,
         local,
         deterministic,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.causal,
         args.local,
         args.deterministic,
@@ -836,7 +839,7 @@ if __name__ == "__main__":
             local,
             args.bias_type,
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
             args.input_layout,
         )
@@ -854,9 +857,231 @@ if __name__ == "__main__":
             local,
             args.bias_type if args.bias_type != "bias" else "no",
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
         )
 
     df = pd.DataFrame(collected)
     aiter.logger.info(f"mha summary:\n{df}")
+
+
+# ---------------------------------------------------------------------------
+# Sink backward tests (mha_bwd with sink / d_sink)
+#
+# Reference formula (derived from kernel block_fmha_bwd_dot_do_o.hpp):
+#   D[b, h, q]      = sum_j(dout[b, q, h, j] * out[b, q, h, j]) * p_undrop
+#   P_sink[b, h, q] = exp(sink[b, h] - lse_fwd[b, h, q])
+#   d_sink[h]       = sum_{b, q} (-P_sink[b, h, q] * D[b, h, q])
+# ---------------------------------------------------------------------------
+
+
+def _sink_make_qkvo(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
+):
+    """Return (q, k, v, dout) in BSHD layout, requires_grad=True."""
+    q = torch.randn(
+        batch, seqlen_q, nhead, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    k = torch.randn(
+        batch, seqlen_k, nhead_k, hdim, device=device, dtype=dtype
+    ).requires_grad_(True)
+    v = torch.randn(
+        batch, seqlen_k, nhead_k, hdim_v, device=device, dtype=dtype
+    ).requires_grad_(True)
+    dout = torch.randn(batch, seqlen_q, nhead, hdim_v, device=device, dtype=dtype)
+    return q, k, v, dout
+
+
+def _sink_run_fwd(q, k, v, softmax_scale, causal):
+    """Run mha_fwd and return (out, lse)."""
+    out, lse, _, _ = aiter.mha_fwd(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=causal,
+        window_size_left=-1,
+        window_size_right=0 if causal else -1,
+        sink_size=0,
+        return_softmax_lse=True,
+        return_dropout_randval=False,
+    )
+    return out, lse
+
+
+def _sink_reference_d_sink(dout, out, lse, sink, p_undrop=1.0):
+    """
+    Pure-PyTorch reference for d_sink.
+
+    dout : [B, Sq, H, Dv]
+    out  : [B, Sq, H, Dv]
+    lse  : [B, H, Sq]       (forward LSE without sink)
+    sink : [B, H]
+    returns d_sink : [H]
+    """
+    D_bsh = (dout.float() * out.float()).sum(dim=-1) * p_undrop  # [B, Sq, H]
+    D_bhs = D_bsh.permute(0, 2, 1)  # [B, H, Sq]
+    sink_bhs = sink.unsqueeze(-1)  # [B, H, 1]
+    p_sink = torch.exp(sink_bhs.float() - lse.float())  # [B, H, Sq]
+    d_sink = (-p_sink * D_bhs).sum(dim=(0, 2))  # [H]
+    return d_sink.float()
+
+
+_SINK_DTYPES = [dtypes.fp16, dtypes.bf16]
+_SINK_CAUSALS = [False, True]
+_SINK_CONFIGS = [
+    # (batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim)
+    (2, 128, 128, 4, 4, 64),
+    (1, 64, 64, 6, 2, 128),
+]
+
+
+@pytest.mark.parametrize("causal", _SINK_CAUSALS)
+@pytest.mark.parametrize("dtype", _SINK_DTYPES)
+@pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", _SINK_CONFIGS)
+def test_mha_bwd_sink_dsink(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
+    """Verify that mha_bwd correctly accumulates d_sink."""
+    device = torch.device("cuda")
+    hdim_v = hdim
+    softmax_scale = hdim**-0.5
+
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
+    )
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
+
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
+
+    dq, dk, dv, softmax_d = aiter.mha_bwd(
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=causal,
+        window_size_left=-1,
+        window_size_right=0 if causal else -1,
+        deterministic=False,
+        sink=sink,
+        d_sink=d_sink,
+    )
+
+    assert d_sink.abs().max() > 0, "d_sink was not updated by mha_bwd"
+
+    d_sink_ref = _sink_reference_d_sink(dout, out, lse, sink)
+    torch.testing.assert_close(
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg=f"d_sink mismatch for dtype={dtype}, causal={causal}, B={batch}, Sq={seqlen_q}, H={nhead}",
+    )
+
+
+@pytest.mark.parametrize("causal", _SINK_CAUSALS)
+@pytest.mark.parametrize("dtype", _SINK_DTYPES)
+@pytest.mark.parametrize("batch,seqlen_q,seqlen_k,nhead,nhead_k,hdim", _SINK_CONFIGS)
+def test_mha_bwd_with_sink_dq_dk_dv(
+    batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, dtype, causal
+):
+    """Verify that passing sink/d_sink does not corrupt the dQ, dK, dV outputs."""
+    device = torch.device("cuda")
+    hdim_v = hdim
+    softmax_scale = hdim**-0.5
+
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen_q, seqlen_k, nhead, nhead_k, hdim, hdim_v, dtype, device
+    )
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
+
+    common_bwd_args = dict(
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=causal,
+        window_size_left=-1,
+        window_size_right=0 if causal else -1,
+        deterministic=False,
+    )
+
+    dq_base, dk_base, dv_base, _ = aiter.mha_bwd(
+        dout, q.detach(), k.detach(), v.detach(), out, lse, **common_bwd_args
+    )
+
+    sink_small = torch.full((batch, nhead), -1000.0, device=device, dtype=torch.float32)
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
+
+    dq_sink, dk_sink, dv_sink, _ = aiter.mha_bwd(
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        **common_bwd_args,
+        sink=sink_small,
+        d_sink=d_sink,
+    )
+
+    rtol, atol = (0.01, 0.01) if dtype == dtypes.fp16 else (0.02, 0.02)
+    torch.testing.assert_close(
+        dq_sink, dq_base, rtol=rtol, atol=atol, msg="dQ mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dk_sink, dk_base, rtol=rtol, atol=atol, msg="dK mismatch with small sink"
+    )
+    torch.testing.assert_close(
+        dv_sink, dv_base, rtol=rtol, atol=atol, msg="dV mismatch with small sink"
+    )
+
+
+@pytest.mark.parametrize("dtype", _SINK_DTYPES)
+def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
+    """Passing sink=None must give identical output to omitting sink entirely."""
+    device = torch.device("cuda")
+    batch, seqlen, nhead, hdim = 2, 64, 4, 64
+    softmax_scale = hdim**-0.5
+
+    q, k, v, dout = _sink_make_qkvo(
+        batch, seqlen, seqlen, nhead, nhead, hdim, hdim, dtype, device
+    )
+    out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, False)
+
+    common = dict(
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=False,
+        window_size_left=-1,
+        window_size_right=-1,
+        deterministic=False,
+    )
+
+    dq1, dk1, dv1, d1 = aiter.mha_bwd(
+        dout, q.detach(), k.detach(), v.detach(), out, lse, **common
+    )
+    dq2, dk2, dv2, d2 = aiter.mha_bwd(
+        dout,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out,
+        lse,
+        **common,
+        sink=None,
+        d_sink=None,
+    )
+
+    torch.testing.assert_close(dq1, dq2, msg="dQ differs with sink=None vs omitted")
+    torch.testing.assert_close(dk1, dk2, msg="dK differs with sink=None vs omitted")
+    torch.testing.assert_close(dv1, dv2, msg="dV differs with sink=None vs omitted")
+    torch.testing.assert_close(
+        d1, d2, msg="softmax_d differs with sink=None vs omitted"
+    )

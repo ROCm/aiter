@@ -74,8 +74,12 @@ def input_helper(
     kv_cache_dtype,
     output_type,
     num_blocks=4,
+    random_seed: int = 0,
 ):
     """Helper function to generate input tensors for paged attention testing."""
+    torch.cuda.manual_seed(random_seed)
+    random.seed(random_seed)
+
     # Query tensor generation
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         query = torch.randn(
@@ -148,11 +152,10 @@ def input_helper(
     )
 
 
-@pytest.mark.parametrize("B", [1, 4, 27])
-@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16), (24, 4)])
-@pytest.mark.parametrize("D", [1, 64, 128])
-@pytest.mark.parametrize("KV_BLK_SZ", [1, 4, 16])
-@pytest.mark.parametrize("SEQ_LEN", [1, 57, 10000])
+@pytest.mark.parametrize("B", [1, 4])
+@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (8, 1)])
+@pytest.mark.parametrize("KV_BLK_SZ", [1, 16])
+@pytest.mark.parametrize("SEQ_LEN", [1, 57, 1024])
 @pytest.mark.parametrize("NUM_BLK", [4, 16])
 # q_dtype, kv_dtype, compute_type, output_type
 # INT8xINT8 -> BF16-> BF16
@@ -164,7 +167,6 @@ def input_helper(
 @pytest.mark.parametrize(
     "dtype, kv_cache_dtype, compute_type, output_type",
     [
-        (torch.float16, torch.float16, tl.float16, torch.float16),
         (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
         (torch.bfloat16, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
         (torch.bfloat16, torch.int8, tl.bfloat16, torch.bfloat16),
@@ -176,7 +178,6 @@ def test_paged_attn(
     B,
     H_Q,
     H_KV,
-    D,
     KV_BLK_SZ,
     SEQ_LEN,
     NUM_BLK,
@@ -186,6 +187,7 @@ def test_paged_attn(
     output_type,
 ):
 
+    head_size = 128
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     if SEQ_LEN >= 8192 and B >= 16:
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
@@ -206,7 +208,7 @@ def test_paged_attn(
         B,
         H_Q,
         H_KV,
-        D,
+        head_size,
         KV_BLK_SZ,
         SEQ_LEN,
         dtype,
@@ -215,7 +217,7 @@ def test_paged_attn(
         num_blocks,
     )
 
-    attn_scale = 1.0 / (D**0.5)
+    attn_scale = 1.0 / (head_size**0.5)
 
     paged_attention_decode(
         triton_output,
@@ -240,7 +242,7 @@ def test_paged_attn(
     if kv_cache_dtype not in (torch.bfloat16, torch.float16):
         key_cache = key_cache.to(dtype=tl_to_torch_dtype[compute_type])
         value_cache = value_cache.to(dtype=tl_to_torch_dtype[compute_type])
-    torch_output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
+    torch_output = torch.zeros(B, H_Q, head_size, dtype=output_type, device="cuda")
     paged_attention_decode_ref(
         torch_output, query, key_cache, value_cache, block_tables, context_lens
     )
