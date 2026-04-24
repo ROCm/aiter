@@ -92,6 +92,74 @@ def _buffer_load_vec(
 
 
 @dataclass(frozen=True)
+class PreshuffleScaleLayout:
+    """Container returned by `make_preshuffle_scale_layout`.
+
+    The scale layout is ``(c_mn1, c_k1, 4, 16) : (stride_n0, stride_k0, stride_klane, 1)``.
+    Callers compute flat index directly with plain arith::
+
+        idx = mni * stride_n0 + ku * stride_k0 + k_lane * stride_klane + n_lane
+    """
+
+    layout_scale: object  # fly layout value (same as PreshuffleBLayout.layout_b)
+    stride_n0: object  # index-typed MLIR value (dynamic)
+    stride_k0: object  # index-typed MLIR value (= 64)
+    stride_klane: object  # index-typed MLIR value (= 16)
+
+
+def make_preshuffle_scale_layout(
+    arith,
+    *,
+    c_mn: ir.Value,
+    c_k: ir.Value,
+    mn_pack: int = 2,
+    k_pack: int = 2,
+    elem_bytes: int = 4,
+    scale_block_size: int = 32,
+) -> PreshuffleScaleLayout:
+    """Build scale layout matching aiter/CK preshuffle for FP4/FP8 microscale.
+
+    Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
+    ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
+    """
+    from .layout_utils import _div_pow2
+
+    c16 = arith.constant(16, index=True)
+    c4 = arith.constant(4, index=True)
+    c_k_scale = _div_pow2(c_k, scale_block_size)
+
+    c_mn1 = _div_pow2(_div_pow2(c_mn, 16), mn_pack)
+    c_k1 = _div_pow2(_div_pow2(c_k_scale, 4), k_pack)
+    if elem_bytes != mn_pack * k_pack:
+        raise ValueError(
+            f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
+        )
+
+    stride_klane = c16
+    stride_k0 = c4 * stride_klane
+    stride_n0 = c_k1 * stride_k0
+
+    # Build fly layout (i32 strides for fx.make_layout).
+    c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
+    c_k1_i32 = arith.index_cast(T.i32, c_k1)
+    stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
+    stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
+    stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
+
+    layout_scale = fx.make_layout(
+        (c_mn1_i32, c_k1_i32, 4, 16),
+        stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
+    )
+
+    return PreshuffleScaleLayout(
+        layout_scale=layout_scale,
+        stride_n0=stride_n0,
+        stride_k0=stride_k0,
+        stride_klane=stride_klane,
+    )
+
+
+@dataclass(frozen=True)
 class PreshuffleBLayout:
     """Container returned by `make_preshuffle_b_layout`."""
 
@@ -164,74 +232,6 @@ def make_preshuffle_b_layout(
         (n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b
     )
     return PreshuffleBLayout(layout_b=layout_b, kpack_bytes=kpack_bytes)
-
-
-@dataclass(frozen=True)
-class PreshuffleScaleLayout:
-    """Container returned by `make_preshuffle_scale_layout`.
-
-    The scale layout is ``(c_mn1, c_k1, 4, 16) : (stride_n0, stride_k0, stride_klane, 1)``.
-    Callers compute flat index directly with plain arith::
-
-        idx = mni * stride_n0 + ku * stride_k0 + k_lane * stride_klane + n_lane
-    """
-
-    layout_scale: object  # fly layout value (same as PreshuffleBLayout.layout_b)
-    stride_n0: object  # index-typed MLIR value (dynamic)
-    stride_k0: object  # index-typed MLIR value (= 64)
-    stride_klane: object  # index-typed MLIR value (= 16)
-
-
-def make_preshuffle_scale_layout(
-    arith,
-    *,
-    c_mn: ir.Value,
-    c_k: ir.Value,
-    mn_pack: int = 2,
-    k_pack: int = 2,
-    elem_bytes: int = 4,
-    scale_block_size: int = 32,
-) -> PreshuffleScaleLayout:
-    """Build scale layout matching aiter/CK preshuffle for FP4/FP8 microscale.
-
-    Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
-    ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
-    """
-    from .layout_utils import _div_pow2
-
-    c16 = arith.constant(16, index=True)
-    c4 = arith.constant(4, index=True)
-    c_k_scale = _div_pow2(c_k, scale_block_size)
-
-    c_mn1 = _div_pow2(_div_pow2(c_mn, 16), mn_pack)
-    c_k1 = _div_pow2(_div_pow2(c_k_scale, 4), k_pack)
-    if elem_bytes != mn_pack * k_pack:
-        raise ValueError(
-            f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
-        )
-
-    stride_klane = c16
-    stride_k0 = c4 * stride_klane
-    stride_n0 = c_k1 * stride_k0
-
-    # Build fly layout (i32 strides for fx.make_layout).
-    c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
-    c_k1_i32 = arith.index_cast(T.i32, c_k1)
-    stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
-    stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
-    stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
-
-    layout_scale = fx.make_layout(
-        (c_mn1_i32, c_k1_i32, 4, 16),
-        stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
-    )
-
-    return PreshuffleScaleLayout(
-        layout_scale=layout_scale,
-        stride_n0=stride_n0,
-        stride_k0=stride_k0,
-        stride_klane=stride_klane,
-    )
 
 
 def _unpack_int4_to_int8_pair(packed32):
