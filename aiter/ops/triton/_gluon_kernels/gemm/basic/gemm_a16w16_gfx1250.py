@@ -1449,8 +1449,8 @@ def _gemm_a16w16_lds_pipeline_kernel(
     # Final WMMA for the last pre-loaded tile
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
-    if NUM_BUFFERS > 2:
-        gl.amd.sched_barrier(0)
+    # if NUM_BUFFERS > 2:
+    #     gl.amd.sched_barrier(0)
 
     # Bias
     if ADD_BIAS:
