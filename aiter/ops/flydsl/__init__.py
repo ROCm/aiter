@@ -18,6 +18,7 @@ __all__ = [
     "is_flydsl_available",
 ]
 
+
 if is_flydsl_available():
     import flydsl as _flydsl
 
@@ -47,3 +48,10 @@ if is_flydsl_available():
         "flydsl_hgemm",
         # "flydsl_gdr_decode",
     ]
+
+    try:
+        from .rope_kernels import flydsl_fused_qk_rope_reshape_and_cache
+
+        __all__ += ["flydsl_fused_qk_rope_reshape_and_cache"]
+    except ImportError:
+        pass
