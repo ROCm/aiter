@@ -42,6 +42,11 @@ class OpusGemmInstance:
             # Disambiguate by pipeline (flatmm vs split-barrier) and occupancy.
             parts.insert(1, "flatmm")
             parts.append(f"wgpcu{self.WG_PER_CU}")
+        elif self.kernel_tag == "a16w16_flatmm_splitk":
+            # Distinguish from non-splitk flatmm by inserting both tags and
+            # appending the WG_PER_CU suffix (same scheme as flatmm).
+            parts.insert(1, "flatmm_splitk")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
         return "_".join(parts)
 
 
@@ -50,6 +55,26 @@ def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk):
     return OpusGemmInstance(
         bs, bm, bn, bk, 2, tn, wm, wn, wk,
         vec, vec, 4, 0, 0, 0, "a16w16", ["fp32_t", "bf16_t"],
+    )
+
+
+def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu):
+    # Flatmm split-K locked config (per cc -t 0..10 dispatch):
+    # BLOCK_SIZE=256, T_M=2, T_N=1, MFMA=(16,16,32), VEC=(8,8,4), HAS_BIAS=false.
+    # output_dtypes=["fp32_t"]: main kernel writes fp32 workspace; Y is bf16
+    # (reduce kernel does the fp32->bf16 cast). Only the fp32_t template
+    # instantiation is generated; opus_gemm.cu forces the <fp32_t> dispatch
+    # branch for splitk kids regardless of Y.dtype (which must be bf16).
+    vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
+    return OpusGemmInstance(
+        256, bm, bn, bk,
+        2, 1,            # T_M, T_N
+        16, 16, 32,      # MFMA 16x16x32
+        vec, vec, 4,     # VEC
+        0, 0, 0,         # GROUP (unused)
+        "a16w16_flatmm_splitk",
+        ["fp32_t"],
+        wg_per_cu,
     )
 
 
@@ -93,25 +118,47 @@ a16w16_kernels_list = {
     9:  _a16w16(512, 256, 256, 64,  4, 16, 16, 32),  # existing / current default
 }
 
-# 8 tiles validated in gcnasm/opus_fmm/INTEGRATION.md x WG_PER_CU in {1, 2}.
-# Kids start at 100 to reserve room above the split-barrier a16w16 range.
-a16w16_flatmm_kernels_list = {
-    100: _a16w16_flatmm( 32,  32,  64, 2),
-    101: _a16w16_flatmm( 32,  32,  64, 1),
-    102: _a16w16_flatmm( 32,  32, 128, 2),
-    103: _a16w16_flatmm( 32,  32, 128, 1),
-    104: _a16w16_flatmm( 32,  64,  64, 2),
-    105: _a16w16_flatmm( 32,  64,  64, 1),
-    106: _a16w16_flatmm( 32, 128,  64, 2),
-    107: _a16w16_flatmm( 32, 128,  64, 1),
-    108: _a16w16_flatmm( 64,  32,  64, 2),
-    109: _a16w16_flatmm( 64,  32,  64, 1),
-    110: _a16w16_flatmm( 64,  32, 128, 2),  # INTEGRATION.md recommended for M >= 64
-    111: _a16w16_flatmm( 64,  32, 128, 1),
-    112: _a16w16_flatmm( 64,  64,  64, 2),  # INTEGRATION.md best for M >= 128
-    113: _a16w16_flatmm( 64,  64,  64, 1),
-    114: _a16w16_flatmm(128,  32,  64, 2),
-    115: _a16w16_flatmm(128,  32,  64, 1),
+# Removed (kids 100-115, a16w16_flatmm non-splitk):
+#
+# Rationale: the non-splitk a16w16_flatmm pipeline has two latent
+# correctness bugs in its N%16 vector store and K%B_K tail handling
+# (see opus_gemm_tune._kid_rejects_shape rules (b)), so the tunner
+# already rejects these kids for the vast majority of shapes. For
+# the remaining shapes (N%16==0 AND K%B_K==0), the splitk pipeline
+# with splitK=0 (->KBatch=1) produces bit-identical results via the
+# same underlying MMA, at a small cost (one extra reduce kernel
+# launch + one fp32 workspace write pass) that is dwarfed by the
+# ~70% reduction in JIT compile units (from 57 down to ~26).
+#
+# Kept as an empty dict so the three merges in opus_gemm_common.py
+# (kernels_list below) and opus_gemm_tune.py / gen_instances.py
+# stay valid. The `a16w16_flatmm` kernel_tag remains in the schema
+# and validators in case a future kid needs it, but no instances
+# are emitted by default.
+a16w16_flatmm_kernels_list = {}
+
+# 11 splitk tiles mirroring gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp_splitk.cc
+# -t 0..10 dispatch exactly:
+#   * 8 WG_PER_CU=2 tiles (kids 200..207) - occupancy 2, 80 KB LDS/wg budget
+#   * 3 WG_PER_CU=1 tiles (kids 208..210) - hand-picked large/extreme-aspect
+#     tiles that fit only in 160 KB/wg LDS. Larger WG=1 combos (128x128x64,
+#     128x64x128, 64x128x128, 256x64x64, 64x256x64) spill 100+ VGPRs to
+#     scratch and run 1000x slower (cc lines 1143-1150); the validator in
+#     gen_instances.py enforces COM_REP_M*COM_REP_N<=16 for WG=1.
+a16w16_flatmm_splitk_kernels_list = {
+    # WG_PER_CU=2, cc tile 0..7
+    200: _a16w16_flatmm_splitk( 64,  64,  64, 2),   # cc tile 0: M>=128 sweet spot (default)
+    201: _a16w16_flatmm_splitk( 32,  32,  64, 2),   # cc tile 1
+    202: _a16w16_flatmm_splitk( 32,  32, 128, 2),   # cc tile 2
+    203: _a16w16_flatmm_splitk( 32,  64,  64, 2),   # cc tile 3
+    204: _a16w16_flatmm_splitk( 32, 128,  64, 2),   # cc tile 4
+    205: _a16w16_flatmm_splitk( 64,  32,  64, 2),   # cc tile 5
+    206: _a16w16_flatmm_splitk( 64,  32, 128, 2),   # cc tile 6: recommended for medium M
+    207: _a16w16_flatmm_splitk(128,  32,  64, 2),   # cc tile 7
+    # WG_PER_CU=1, cc tile 8..10 (160 KB/wg LDS; zero VGPR spill only)
+    208: _a16w16_flatmm_splitk( 64,  64, 128, 1),   # cc tile 8: deep K, high compute/load ratio
+    209: _a16w16_flatmm_splitk(256,  32,  64, 1),   # cc tile 9: very tall, narrow N
+    210: _a16w16_flatmm_splitk( 32, 256,  64, 1),   # cc tile 10: very wide, narrow M
 }
 
 # combined list (used by production gen_instances / dispatch)
@@ -120,6 +167,7 @@ kernels_list = {
     **a8w8_kernels_list,
     **a16w16_kernels_list,
     **a16w16_flatmm_kernels_list,
+    **a16w16_flatmm_splitk_kernels_list,
 }
 
 default_kernels_dict = {
