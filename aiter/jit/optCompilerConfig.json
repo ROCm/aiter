@@ -345,7 +345,9 @@
             "f'{AITER_CSRC_DIR}/opus_gemm/opus_gemm.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-mllvm --amdgpu-mfma-vgpr-form'"
+        ],
         "md_name": "'module_deepgemm_opus'",
         "extra_ldflags": "None",
         "extra_include": [
