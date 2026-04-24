@@ -105,6 +105,7 @@ jobs:
   wheel-smoke:
     needs: [build, load-configs]
     if: >-
+      always() &&
       (github.event.inputs.skip_build != 'true' || github.event.inputs.aiter_version != '') &&
       (
         (
@@ -147,30 +148,10 @@ jobs:
   load-configs:
     if: >-
       always() && (
-        (
-          github.event.inputs.skip_sglang != 'true' &&
-          github.event.inputs.skip_sglang != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_sglang == 'true'
-          )
-        ) ||
-        (
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
-        ) ||
-        (
-          github.event.inputs.skip_atom != 'true' &&
-          github.event.inputs.skip_atom != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_atom == 'true'
-          )
-        )
+        github.event_name != 'workflow_dispatch' ||
+        github.event.inputs.run_sglang == 'true' ||
+        github.event.inputs.run_vllm == 'true' ||
+        github.event.inputs.run_atom == 'true'
       )
     runs-on: ubuntu-latest
     outputs:
@@ -183,61 +164,24 @@ jobs:
       - name: Load model configs from JSON
         id: load
         run: |
-          python - <<'PY'
-import json
-import os
-from pathlib import Path
-
-config_dir = Path(".github/configs")
-output_path = Path(os.environ["GITHUB_OUTPUT"])
-
-def write_output(name, payload):
-    with output_path.open("a") as fh:
-        fh.write(f"{name}={json.dumps(payload, separators=(',',':'))}\n")
-
-def normalize_runner(entry):
-    runner = entry.get("runner", "")
-    label = (entry.get("test_name") or entry.get("label") or entry.get("model_name") or "").lower()
-    if runner == "aiter-1gpu-runner":
-        entry["runner"] = "linux-aiter-mi300x-1"
-    elif runner == "aiter-8gpu-runner":
-        if any(token in label for token in ["2gpu", "2-gpu", "2_gpu"]):
-            entry["runner"] = "linux-aiter-mi300x-2"
-        elif any(token in label for token in ["4gpu", "4-gpu", "4_gpu"]):
-            entry["runner"] = "linux-aiter-mi300x-4"
-        elif "mi35x" in label:
-            entry["runner"] = "linux-aiter-mi35x-8"
-        else:
-            entry["runner"] = "linux-aiter-mi300x-8"
-    return entry
-
-def normalize_vllm(entry):
-    runner = entry.get("runner", "")
-    if runner == "aiter-1gpu-runner":
-        entry["runner"] = "linux-aiter-mi300x-1"
-    elif runner == "aiter-8gpu-runner":
-        tp = entry.get("tp", 8)
-        if entry.get("label", "").lower().startswith("mi35x"):
-            entry["runner"] = "linux-aiter-mi35x-8"
-        else:
-            entry["runner"] = f"linux-aiter-mi300x-{tp}"
-    return entry
-
-sglang_matrix = [normalize_runner(dict(item)) for item in json.loads((config_dir / "sglang_tests.json").read_text())]
-vllm_matrix = [normalize_vllm(dict(item)) for item in json.loads((config_dir / "vllm_models.json").read_text())]
-vllm_tests_matrix = [normalize_runner(dict(item)) for item in json.loads((config_dir / "vllm_tests.json").read_text())]
-atom_matrix = json.loads((config_dir / "atom_models.json").read_text())
-
-write_output("sglang_matrix", sglang_matrix)
-write_output("vllm_matrix", vllm_matrix)
-write_output("vllm_tests_matrix", vllm_tests_matrix)
-write_output("atom_matrix", atom_matrix)
-PY
+          echo "sglang_matrix=$(cat .github/configs/sglang_tests.json | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "vllm_matrix=$(cat .github/configs/vllm_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "vllm_tests_matrix=$(cat .github/configs/vllm_tests.json | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "atom_matrix=$(cat .github/configs/atom_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
 
   # ── SGLang Integration ───────────────────────────────────────────────
   sglang:
     name: "SGLang (${{ matrix.test_name }})"
     needs: [load-configs, wheel-smoke]
+    if: >-
+      (
+        github.event.inputs.skip_sglang != 'true' &&
+        github.event.inputs.skip_sglang != true
+      ) &&
+      (
+        github.event_name != 'workflow_dispatch' ||
+        github.event.inputs.run_sglang == 'true'
+      )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -245,40 +189,10 @@ PY
       matrix:
         include: ${{ fromJson(needs.load-configs.outputs.sglang_matrix) }}
     steps:
-      - name: Skip SGLang suites
-        if: >-
-          github.event.inputs.skip_sglang == 'true' ||
-          github.event.inputs.skip_sglang == true ||
-          (
-            github.event_name == 'workflow_dispatch' &&
-            github.event.inputs.run_sglang != 'true'
-          )
-        run: echo "SGLang integration suite skipped by workflow inputs."
       - uses: actions/checkout@v4
-        if: >-
-          github.event.inputs.skip_sglang != 'true' &&
-          github.event.inputs.skip_sglang != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_sglang == 'true'
-          )
       - name: Docker login
-        if: >-
-          github.event.inputs.skip_sglang != 'true' &&
-          github.event.inputs.skip_sglang != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_sglang == 'true'
-          )
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       - name: Run SGLang test
-        if: >-
-          github.event.inputs.skip_sglang != 'true' &&
-          github.event.inputs.skip_sglang != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_sglang == 'true'
-          )
         timeout-minutes: ${{ matrix.timeout }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
@@ -293,6 +207,15 @@ PY
   vllm:
     name: "vLLM (${{ matrix.label }}, ${{ matrix.model_name }}, ${{ matrix.kv }})"
     needs: [load-configs, wheel-smoke]
+    if: >-
+      (
+        github.event.inputs.skip_vllm != 'true' &&
+        github.event.inputs.skip_vllm != true
+      ) &&
+      (
+        github.event_name != 'workflow_dispatch' ||
+        github.event.inputs.run_vllm == 'true'
+      )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -300,31 +223,8 @@ PY
       matrix:
         include: ${{ fromJson(needs.load-configs.outputs.vllm_matrix) }}
     steps:
-      - name: Skip vLLM benchmarks
-        if: >-
-          github.event.inputs.skip_vllm == 'true' ||
-          github.event.inputs.skip_vllm == true ||
-          (
-            github.event_name == 'workflow_dispatch' &&
-            github.event.inputs.run_vllm != 'true'
-          )
-        run: echo "vLLM benchmark suite skipped by workflow inputs."
       - uses: actions/checkout@v4
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
       - name: Load vLLM pins
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
         run: |
           python - <<'PY' >> "$GITHUB_ENV"
 import json
@@ -334,22 +234,8 @@ print(f"VLLM_BASE_IMAGE={cfg['base_image']}")
 print(f"VLLM_COMMIT={cfg['vllm_commit']}")
 PY
       - name: Docker login
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       - name: Run vLLM benchmark
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
         timeout-minutes: 45
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
@@ -366,14 +252,6 @@ PY
             "${{ matrix.kv }}" \
             "${{ github.event.inputs.aiter_index_url }}"
       - name: Upload logs
-        if: >-
-          always() &&
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
         uses: actions/upload-artifact@v4
         with:
           name: vllm-${{ matrix.label }}-${{ matrix.model_name }}-${{ matrix.kv }}
@@ -383,6 +261,15 @@ PY
   vllm-tests:
     name: "vLLM Test (${{ matrix.test_name }})"
     needs: [load-configs, wheel-smoke]
+    if: >-
+      (
+        github.event.inputs.skip_vllm != 'true' &&
+        github.event.inputs.skip_vllm != true
+      ) &&
+      (
+        github.event_name != 'workflow_dispatch' ||
+        github.event.inputs.run_vllm == 'true'
+      )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -390,31 +277,8 @@ PY
       matrix:
         include: ${{ fromJson(needs.load-configs.outputs.vllm_tests_matrix) }}
     steps:
-      - name: Skip vLLM kernel tests
-        if: >-
-          github.event.inputs.skip_vllm == 'true' ||
-          github.event.inputs.skip_vllm == true ||
-          (
-            github.event_name == 'workflow_dispatch' &&
-            github.event.inputs.run_vllm != 'true'
-          )
-        run: echo "vLLM kernel test suite skipped by workflow inputs."
       - uses: actions/checkout@v4
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
       - name: Load vLLM pins
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
         run: |
           python - <<'PY' >> "$GITHUB_ENV"
 import json
@@ -424,22 +288,8 @@ print(f"VLLM_BASE_IMAGE={cfg['base_image']}")
 print(f"VLLM_COMMIT={cfg['vllm_commit']}")
 PY
       - name: Docker login
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       - name: Run vLLM AITER test
-        if: >-
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
         timeout-minutes: ${{ matrix.timeout }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
@@ -458,6 +308,15 @@ PY
   atom:
     name: "ATOM (${{ matrix.model_name }})"
     needs: [load-configs, wheel-smoke]
+    if: >-
+      (
+        github.event.inputs.skip_atom != 'true' &&
+        github.event.inputs.skip_atom != true
+      ) &&
+      (
+        github.event_name != 'workflow_dispatch' ||
+        github.event.inputs.run_atom == 'true'
+      )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -465,40 +324,10 @@ PY
       matrix:
         include: ${{ fromJson(needs.load-configs.outputs.atom_matrix) }}
     steps:
-      - name: Skip ATOM tests
-        if: >-
-          github.event.inputs.skip_atom == 'true' ||
-          github.event.inputs.skip_atom == true ||
-          (
-            github.event_name == 'workflow_dispatch' &&
-            github.event.inputs.run_atom != 'true'
-          )
-        run: echo "ATOM accuracy suite skipped by workflow inputs."
       - uses: actions/checkout@v4
-        if: >-
-          github.event.inputs.skip_atom != 'true' &&
-          github.event.inputs.skip_atom != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_atom == 'true'
-          )
       - name: Docker login
-        if: >-
-          github.event.inputs.skip_atom != 'true' &&
-          github.event.inputs.skip_atom != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_atom == 'true'
-          )
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       - name: Run ATOM accuracy test
-        if: >-
-          github.event.inputs.skip_atom != 'true' &&
-          github.event.inputs.skip_atom != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_atom == 'true'
-          )
         timeout-minutes: 90
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
@@ -513,14 +342,6 @@ PY
             "${{ matrix.extra_args }}" \
             "${{ github.event.inputs.aiter_index_url }}"
       - name: Upload logs
-        if: >-
-          always() &&
-          github.event.inputs.skip_atom != 'true' &&
-          github.event.inputs.skip_atom != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_atom == 'true'
-          )
         uses: actions/upload-artifact@v4
         with:
           name: atom-${{ matrix.model_name }}
