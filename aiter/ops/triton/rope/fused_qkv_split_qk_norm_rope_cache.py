@@ -71,7 +71,19 @@ def fused_qkv_split_qk_norm_rope_cache(
 
     # Get Paged Attention block size from cache shape (usually 16 or 32)
     # Cache shape: [num_blocks, num_heads, block_size, head_dim]
+    num_blocks = key_cache.shape[0]
     block_size = key_cache.shape[2]
+
+    # Validate that all valid (non-negative) slot indices are within the
+    # allocated cache; slots < 0 are padding tokens and are intentionally skipped.
+    valid_slots = slot_mapping[slot_mapping >= 0]
+    if valid_slots.numel() > 0:
+        max_slot = int(valid_slots.max().item())
+        assert max_slot < num_blocks * block_size, (
+            f"slot_mapping contains slot {max_slot} which is out of bounds "
+            f"for cache with {num_blocks} blocks of size {block_size} "
+            f"(max valid slot: {num_blocks * block_size - 1})"
+        )
 
     assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
     q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
@@ -158,6 +170,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCKED_GATED_LAYOUT=(attn_output_gate and gated_qkv_layout == "blocked"),
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
+        NUM_BLOCKS=num_blocks,
         num_warps=num_warps,
     )
 
