@@ -75,7 +75,7 @@ def fused_qkv_split_qk_norm_rope_cache(
     # Cache shape: [num_blocks, num_heads, block_size, head_dim]
     block_size = key_cache.shape[2]
 
-    assert qh >= kvh and qh % kvh == 0, "qh must be mutiple of kvh"
+    assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
     q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     k = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
     v = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
