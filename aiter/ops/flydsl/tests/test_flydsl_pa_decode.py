@@ -112,15 +112,26 @@ def _generate_inputs(
 # Small set of cases — FFM is slow, so keep them tiny.
 # WMMA kernel requires:
 #   HEAD_SIZE >= NUM_WARPS*WAVE_SIZE = 128 and HEAD_SIZE % 32 == 0
-#   KV_BLOCK_SIZE % 32 == 0 (WMMA K=32, one block per WMMA K-tile)
+#   KV_BLOCK_SIZE % 16 == 0
+#   KV_COMPUTE_BLOCK_SIZE % WMMA_K (=32) == 0 and % KV_BLOCK_SIZE == 0
+#   BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE/KV_BLOCK_SIZE in {1,2,4}
 #   QUERY_GROUP_SIZE == 16 (WMMA M=16)
 #   (head_size, kv_block_size, query_group_size, num_kv_heads, num_seqs, seq_len)
 CASES = [
-    (128, 32, 16, 1, 1, 128),   # baseline
-    (128, 32, 16, 1, 1, 256),   # longer seq
-    (128, 32, 16, 2, 2, 64),    # multi-seq, multi-kv-head
-    (128, 64, 16, 1, 1, 128),   # larger KV block
+    # Baselines with default KV_COMPUTE_BLOCK_SIZE=64
+    (128, 32, 16, 1, 1, 256),   # KVB=32 → 2 blocks/compute tile, seq 256
+    (128, 32, 16, 1, 1, 512),   # KVB=32, longer seq
+    (128, 16, 16, 1, 1, 256),   # KVB=16 → 4 blocks/compute tile (gather)
+    (128, 16, 16, 1, 1, 512),   # KVB=16, longer seq
+    (128, 64, 16, 1, 1, 256),   # KVB=64 → 1 block/compute tile
+    (128, 32, 16, 2, 2, 256),   # multi-seq, multi-kv-head
 ]
+
+
+def _derive_partition_size(kv_block_size: int, kv_compute_block_size: int) -> int:
+    """Pick a partition size that's a multiple of kv_compute_block_size and gives
+    us at least 2 compute iterations per partition (to exercise the pipeline)."""
+    return kv_compute_block_size * 2
 
 
 @pytest.mark.parametrize(
@@ -152,11 +163,12 @@ def test_flydsl_pa_decode(
     ref = _torch_reference(query, key_cache, value_cache, block_tables, seq_lens, attn_scale)
 
     output = torch.zeros_like(query)
-    # partition_size must be a multiple of kv_block_size; pick 64 or kv_block_size*2
-    partition_size = max(kv_block_size, 32) * 2
+    kv_compute_block_size = 64
+    partition_size = _derive_partition_size(kv_block_size, kv_compute_block_size)
     flydsl_paged_attention_decode(
         output, query, key_cache, value_cache, block_tables, seq_lens, attn_scale,
         partition_size=partition_size,
+        kv_compute_block_size=kv_compute_block_size,
     )
 
     torch.testing.assert_close(output, ref, atol=0.05, rtol=0.05)
