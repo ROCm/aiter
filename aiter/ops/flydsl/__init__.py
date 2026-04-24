@@ -41,8 +41,6 @@ if is_flydsl_available():
     )
     from .rmsnorm import flydsl_rmsnorm
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
-    from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
-
     # from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
