@@ -48,6 +48,18 @@ except ImportError as exc:
     get_flydsl_splitk_hgemm_kernels = None
     FLYDSL_TUNE_ERROR = str(exc)
 
+FLYDSL_SEARCH_LEVELS = ("compact", "full")
+
+
+def normalize_flydsl_search_level(value):
+    level = "compact" if value is None else str(value).strip().lower()
+    if level not in FLYDSL_SEARCH_LEVELS:
+        raise argparse.ArgumentTypeError(
+            f"Invalid flydsl search level: {value}. "
+            f"Expected one of {list(FLYDSL_SEARCH_LEVELS)}"
+        )
+    return level
+
 
 @lru_cache(maxsize=1)
 def init_hipblas():
@@ -173,18 +185,27 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
     return out
 
 
-@lru_cache(maxsize=1)
-def get_flydsl_bf16_catalog(m: int, n: int, k: int):
+@lru_cache(maxsize=8)
+def _get_flydsl_bf16_catalog_cached(m: int, n: int, k: int, search_level: str):
     if get_flydsl_splitk_hgemm_kernels is None:
         return []
-    kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16", m=m, n=n, k=k)
+    kernels = get_flydsl_splitk_hgemm_kernels(
+        "bf16", "bf16", m=m, n=n, k=k, search_level=search_level
+    )
     catalog = [
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
     logger.info(
-        f"FlyDSL bf16 catalog size for M={m}, N={n}, K={k}: {len(catalog)} kernels"
+        "FlyDSL bf16 catalog size for "
+        f"M={m}, N={n}, K={k}, search_level={search_level}: {len(catalog)} kernels"
     )
     return catalog
+
+
+def get_flydsl_bf16_catalog(m: int, n: int, k: int, search_level: str = "full"):
+    return _get_flydsl_bf16_catalog_cached(
+        m, n, k, normalize_flydsl_search_level(search_level)
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -301,6 +322,7 @@ class Gemm:
         profile_file="",
         num_warmup=10,
         libtype=["all"],
+        flydsl_search_level="compact",
         timeout=None,
         verbose=False,
         # splitK=None,
@@ -348,6 +370,7 @@ class Gemm:
         self.verbose = verbose
         self.num_warmup = num_warmup
         self.libtype = libtype
+        self.flydsl_search_level = normalize_flydsl_search_level(flydsl_search_level)
 
     def find_hipblas_sols(self):
         init_hipblas()
@@ -577,7 +600,9 @@ class Gemm:
             return []
 
         task = []
-        flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
+        flydsl_catalog = get_flydsl_bf16_catalog(
+            self.m, self.n, self.k, self.flydsl_search_level
+        )
         weight_idx = 6 if self.is_shuffle else 1
         for solidx, kernel_name, config in flydsl_catalog:
             if config["b_preshuffle"] != self.is_shuffle:
@@ -644,7 +669,8 @@ class Gemm:
         logger.info(
             "FlyDSL candidate count for "
             f"M={self.m}, N={self.n}, K={self.k}, outdtype={self.outdtype}, "
-            f"bpreshuffle={self.is_shuffle}: {len(task)}"
+            f"bpreshuffle={self.is_shuffle}, search_level={self.flydsl_search_level}: "
+            f"{len(task)}"
         )
         return task
 
@@ -1052,6 +1078,15 @@ class GemmTuner(GemmCommonTuner):
             required=False,
             help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl', 'torch', 'skinny']",
         )
+        self.parser.add_argument(
+            "--flydsl_search_level",
+            type=normalize_flydsl_search_level,
+            default=normalize_flydsl_search_level(
+                os.getenv("GTUNE_FLYDSL_SEARCH_LEVEL", "compact")
+            ),
+            required=False,
+            help="FlyDSL search-space level for tuning: compact (default) or full",
+        )
 
     def __init__(
         self,
@@ -1312,6 +1347,7 @@ class GemmTuner(GemmCommonTuner):
                 profile_file=args.profile_file,
                 num_warmup=self.num_warmup,
                 libtype=args.libtype,
+                flydsl_search_level=args.flydsl_search_level,
                 timeout=args.timeout,
                 verbose=args.verbose,
             )

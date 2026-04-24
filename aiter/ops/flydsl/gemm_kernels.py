@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import re
 from itertools import product
 from typing import Dict, Optional
@@ -105,6 +106,17 @@ KERNEL_CONFIG_VARIANTS = (
 )
 
 _SPLITK_HGEMM_KERNELS: Dict[str, Dict] = {}
+FLYDSL_SEARCH_LEVELS = ("compact", "full")
+
+
+def _normalize_flydsl_search_level(search_level: Optional[str]) -> str:
+    level = "full" if search_level is None else str(search_level).strip().lower()
+    if level not in FLYDSL_SEARCH_LEVELS:
+        raise ValueError(
+            f"Unsupported FlyDSL search level {search_level!r}; "
+            f"expected one of {FLYDSL_SEARCH_LEVELS}"
+        )
+    return level
 
 
 def _normalize_supported_kernel_metadata(
@@ -564,7 +576,9 @@ def get_flydsl_splitk_hgemm_kernels(
     m: Optional[int] = None,
     n: Optional[int] = None,
     k: Optional[int] = None,
+    search_level: str = "full",
 ) -> Dict[str, Dict]:
+    search_level = _normalize_flydsl_search_level(search_level)
     kernels = {}
     if any(dim is None for dim in (m, n, k)) and any(
         dim is not None for dim in (m, n, k)
@@ -628,6 +642,7 @@ def get_flydsl_splitk_hgemm_kernels(
                 m=m,
                 n=n,
                 k=k,
+                search_level=search_level,
             )
             or ()
         ):
@@ -652,6 +667,13 @@ def get_flydsl_splitk_hgemm_kernels(
                 b_to_lds_unroll=config["b_to_lds_unroll"],
             )
             kernels[name] = config
+        family_counts = Counter(config["kernel_family"] for config in kernels.values())
+        logger.info(
+            "FlyDSL kernel breakdown for "
+            f"M={m}, N={n}, K={k}, search_level={search_level}: total={len(kernels)}, "
+            f"hgemm={family_counts.get(KERNEL_FAMILY_HGEMM, 0)}, "
+            f"small_m={family_counts.get(KERNEL_FAMILY_SMALL_M, 0)}"
+        )
     return kernels
 
 
@@ -659,7 +681,7 @@ def _register_all_configs():
     for dtype in ("bf16", "f16"):
         for out_dtype in ("f16", "bf16"):
             _SPLITK_HGEMM_KERNELS.update(
-                get_flydsl_splitk_hgemm_kernels(dtype, out_dtype)
+                get_flydsl_splitk_hgemm_kernels(dtype, out_dtype, search_level="full")
             )
 
 

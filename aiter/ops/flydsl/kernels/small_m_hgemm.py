@@ -105,6 +105,7 @@ SMALL_M_BASE_BLOCK_N_WARPS = (1, 2, 3, 4)
 SMALL_M_REPEAT_BLOCK_N_WARPS = (1, 2)
 SMALL_M_B_TO_LDS_BLOCK_N_WARPS = (1, 2, 3, 4)
 SMALL_M_PERSISTENT_BLOCK_N_WARPS = (2, 3, 4)
+SMALL_M_SEARCH_LEVELS = ("compact", "full")
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -299,15 +300,41 @@ def _small_m_registry_variants():
     return tuple(variants)
 
 
+def _normalize_small_m_search_level(search_level: str | None) -> str:
+    level = "full" if search_level is None else str(search_level).strip().lower()
+    if level not in SMALL_M_SEARCH_LEVELS:
+        raise ValueError(
+            f"Unsupported small-M search level {search_level!r}; "
+            f"expected one of {SMALL_M_SEARCH_LEVELS}"
+        )
+    return level
+
+
+def _is_wide_n_b_to_lds_config(config: dict) -> bool:
+    return (
+        config["b_to_lds"]
+        and config["n_tile_repeat"] == 1
+        and config["tile_n"] >= 128
+        and config["block_n_warps"] >= 2
+    )
+
+
+def _keep_small_m_registry_config(config: dict, search_level: str) -> bool:
+    if search_level != "compact":
+        return True
+    if not _is_wide_n_b_to_lds_config(config):
+        return True
+    if config["waves_per_eu"] > 2:
+        return False
+    if config["b_to_lds_unroll"] > 8:
+        return False
+    return True
+
+
 def _canonicalize_small_m_registry_config(config: dict) -> dict:
     """Match registry metadata to the effective compile-time kernel settings."""
     canonical = dict(config)
-    wide_n_b_to_lds = (
-        canonical["b_to_lds"]
-        and canonical["n_tile_repeat"] == 1
-        and canonical["tile_n"] >= 128
-        and canonical["block_n_warps"] >= 2
-    )
+    wide_n_b_to_lds = _is_wide_n_b_to_lds_config(canonical)
     if canonical["b_to_lds"]:
         if canonical["b_to_lds_unroll"] <= 0:
             canonical["b_to_lds_unroll"] = 8
@@ -323,7 +350,9 @@ def iter_small_m_registry_configs(
     m: int,
     n: int,
     k: int,
+    search_level: str = "full",
 ):
+    search_level = _normalize_small_m_search_level(search_level)
     if dtype != "bf16" or out_dtype != "bf16":
         return
 
@@ -378,6 +407,8 @@ def iter_small_m_registry_configs(
                     except ValueError:
                         continue
                     config = _canonicalize_small_m_registry_config(config)
+                    if not _keep_small_m_registry_config(config, search_level):
+                        continue
                     config_key = tuple(sorted(config.items()))
                     if config_key in seen_configs:
                         continue
