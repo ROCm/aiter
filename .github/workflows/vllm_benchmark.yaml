@@ -45,7 +45,7 @@ jobs:
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
     needs: [check-signal]
-    runs-on: linux-aiter-mi300x-1
+    runs-on: build-only-aiter
 
     steps:
       - name: Checkout aiter repo
