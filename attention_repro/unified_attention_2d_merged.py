@@ -2571,7 +2571,6 @@ def attention_loop_tensor_subtile_split(
         # --- S2: QK sub 1 + SM1-B ---
         qk1 = pgm.compute_qk_subtile(k1_s)
         p = pgm.concat_subtile(p0, p1)
-        p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
         l_ij = gl.sum(p, 1)
         L = L * alpha + l_ij
         if q.dtype != gl.bfloat16:
@@ -2586,7 +2585,6 @@ def attention_loop_tensor_subtile_split(
         # --- S3: PV sub 0 + SM0-A ---
         acc0 = pgm.compute_pv(p, v0_s, acc0)
         qk = pgm.concat_subtile(qk0, qk1)
-        qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
         m = reduce_max_prop_nan(qk, -1)
         m_ij = elementwise_max_prop_nan(M, m)
         m_ij_scaled = m_ij * QK_scale
@@ -2637,7 +2635,6 @@ def attention_loop_tensor_subtile_split(
     if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
         qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
     p = pgm.concat_subtile(p0, p1)
-    p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
     if q.dtype != gl.bfloat16:
@@ -2656,7 +2653,6 @@ def attention_loop_tensor_subtile_split(
     # --- S3: PV sub 0 for L + SM0 for L+1 ---
     acc0 = pgm.compute_pv(p, v0_s, acc0)
     qk = pgm.concat_subtile(qk0, qk1)
-    qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
@@ -2691,7 +2687,6 @@ def attention_loop_tensor_subtile_split(
 
     # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
     qk1 = pgm.compute_qk_subtile(k1_s)
-    p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
     if q.dtype != gl.bfloat16:
@@ -2705,7 +2700,6 @@ def attention_loop_tensor_subtile_split(
     # --- S3: PV sub 0 for L+1 + SM0 for L+2 ---
     acc0 = pgm.compute_pv(p, v0_s, acc0)
     qk = pgm.concat_subtile(qk0, qk1)
-    qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
     m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
@@ -2727,7 +2721,6 @@ def attention_loop_tensor_subtile_split(
 
     # ---- Final SM1 + PV for L+2 ----
     acc0 = acc0 * alpha[:, None]
-    p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
     if q.dtype != gl.bfloat16:
@@ -2742,7 +2735,6 @@ def attention_loop_tensor_subtile_split(
 
     acc1 = pgm.compute_pv(p, v1_s, acc1)
     acc = pgm.concat_subtile(acc0, acc1)
-    acc = gl.convert_layout(acc, pgm.cfg.pv_layout, assert_trivial=True)
 
     return M, L, acc
 
