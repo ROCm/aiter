@@ -263,7 +263,7 @@ def create_configs():
     use_tdm = int(IS_DEVICE_ARCH_GFX12)
     for bs in [1,]:
         for head_size in [64, 128]:
-            for use_fp8 in [0, 1]:
+            for use_fp8 in [0,1]:
                 for q_heads in [64,8]:
                     for seq_l in [1024, 2048, 4096, 8192]:
                         x_vals.append(
@@ -340,10 +340,6 @@ def run_benchmark(configs):
         )
         output_scale = None
         soft_cap = None
-        new_kv_layout = num_kv_blocks > 1
-        waves_per_eu = 4 if head_size < 128 else 2
-        num_warps = 4
-        block_m = 128
         if output_scale is not None:
             output_scale = output_scale.cuda()
         if q_descale is not None:
@@ -352,6 +348,7 @@ def run_benchmark(configs):
             k_descale = k_descale.cuda()
         if v_descale is not None:
             v_descale = v_descale.cuda()
+        new_kv_layout = False
         if new_kv_layout:
             maybe_quantized_key_cache = maybe_quantized_key_cache.permute(0, 2, 1, 3)
             maybe_quantized_value_cache = maybe_quantized_value_cache.permute(
@@ -384,13 +381,8 @@ def run_benchmark(configs):
             v_descale=v_descale,
             sinks=sinks,
             output_scale=output_scale,
-            use_tdm=use_tdm,
             num_kv_blocks=num_kv_blocks,
-            new_kv_layout=new_kv_layout,
-            waves_per_eu=waves_per_eu,
             shuffled_kv_cache=shuffled_kv_cache,
-            num_warps=num_warps,
-            block_m=block_m,
         )
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(func, quantiles=quantiles)

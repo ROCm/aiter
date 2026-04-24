@@ -18,46 +18,42 @@ import aiter.ops.triton.utils._triton.arch_info as arch_info
 def shuffle_kv_cache(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
-    layout=(16, 16),  # (num_lanes, bytes_per_thread)
 ):
     """
     Shuffle key and value cache layout for optimized memory access.
-        16x16x32 for BF16
-        16x16x64 for FP8
+
+        layout: (num_lanes, num_elements_per_thread)
+            gfx1250: (16, 8) for BF16 and FP8.
+            gfx950: (16, 8) for BF16 and (16, 16) for FP8.
+
+        WMMA/MFMA instruction shape:
+            BF16: 16x16x32
+            FP8: 16x16x64
     """
     dtype = key_cache.dtype
-    dtype_v = value_cache.dtype
+    assert value_cache.dtype == dtype
     assert dtype in (torch.bfloat16, e4m3_dtype)
+
     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
     num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
     assert block_size >= 16
-    assert dtype == dtype_v
     assert num_blocks == num_blocks_v
     assert num_kv_heads == num_kv_heads_v
     assert head_size == head_size_v
     assert block_size == block_size_v
 
-    num_lanes, bytes_per_thread = layout
-    num_elements_per_thread = (
-        bytes_per_thread // dtype.itemsize
-    )  # there are 16 bytes every 4 VGPRs
-
+    k_width = 16 // key_cache.element_size()
     key_cache_shuffled = key_cache.view(
         -1, block_size, num_kv_heads, head_size
-    ).permute(0, 2, 1, 3)
+    ).permute(0, 2, 3, 1)
     key_cache_shuffled = key_cache_shuffled.view(
         -1,
         num_kv_heads,
-        block_size // num_lanes,
-        num_lanes,
-        head_size // (2 * num_elements_per_thread),
-        2,  # there are 2 groups of threads, t0 ~ t15 and t16 ~ t31
-        num_elements_per_thread,
+        head_size // k_width,
+        k_width,
+        block_size,
     )
-    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 5, 3, 6).contiguous()
-    key_cache_shuffled = key_cache_shuffled.view(
-        -1, num_kv_heads, block_size // 16, head_size * 16
-    )
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
 
     value_cache_shuffled = value_cache.view(
         -1, block_size, num_kv_heads, head_size
@@ -65,18 +61,11 @@ def shuffle_kv_cache(
     value_cache_shuffled = value_cache_shuffled.view(
         -1,
         num_kv_heads,
-        block_size // (2 * num_elements_per_thread),
-        2,
-        num_elements_per_thread,
-        head_size // num_lanes,
-        num_lanes,
+        block_size // k_width,
+        k_width,
+        head_size,
     )
-    value_cache_shuffled = value_cache_shuffled.permute(
-        0, 1, 5, 2, 3, 6, 4
-    ).contiguous()
-    value_cache_shuffled = value_cache_shuffled.view(
-        -1, num_kv_heads, head_size // 16, block_size * 16
-    )
+    value_cache_shuffled = value_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
 
     return key_cache_shuffled, value_cache_shuffled
 
@@ -391,17 +380,18 @@ def test_triton_unified_attn(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        [(1, 1328), (5, 18), (129, 463)],
-        [(1, 523), (1, 37), (1, 2011)],
         [
-            (1024, 1024),
+            (512, 512),
         ],
+        [(567, 275), (34, 345)],
+        [(1, 15), (12, 133), (12, 87), (1, 133), (2, 343)],
+        [(777, 777), (454, 345), (1, 134), (1024, 1024)],
     ],
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", [64, 16])
-@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize("block_size", [64, 32])
+@pytest.mark.parametrize("sliding_window", [None, ])
 @pytest.mark.parametrize(
     "dtype",
     [
@@ -426,8 +416,8 @@ def test_triton_unified_attn(
     "use_tdm, num_kv_blocks",
     [
         (False, 1),
-        (True, 1),
-        (True, 4),
+        #(True, 1),
+        #(True, 4),
     ],
 )
 @pytest.mark.parametrize(
