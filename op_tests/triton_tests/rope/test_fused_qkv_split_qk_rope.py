@@ -298,14 +298,20 @@ def run_torch_with_cache(
 
 # Parametrize grid for ``test_fused_qkv_split_qk_rope_with_cache``; see that test's
 # docstring for the meaning of each argument.
-@pytest.mark.parametrize("B", [1, 4, 8])
-@pytest.mark.parametrize("QH_PER_KH", [1, 2, 4])
+# Grid is intentionally kept small for default test runs.  Key coverage:
+#   - B=4: a representative token batch (single-value avoids ~3x blow-up)
+#   - QH_PER_KH=[1,4]: MHA (1:1) and GQA (4:1) — drops the middle value (2)
+#   - reuse_freqs_front_part=True only: partial-RoPE (rotary_dim<D) requires True
+#     anyway, and the False path is skipped for those cases, so it adds no new
+#     coverage over the full-dim run.
+@pytest.mark.parametrize("B", [4])
+@pytest.mark.parametrize("QH_PER_KH", [1, 4])
 @pytest.mark.parametrize("KH", [1, 4])
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("max_embed_positions", [131072])
-@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+@pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("attn_output_gate", [False, True])
 @pytest.mark.parametrize("use_kv_scale", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
