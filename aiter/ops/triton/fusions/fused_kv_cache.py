@@ -356,24 +356,44 @@ def fused_qk_rope_reshape_and_cache(
     t, qh, d = q.shape
     tk, kh, dk = k.shape
     tv, vh, dv = v.shape
-    if flash_layout:
-        t_cache, block_size, kh_cache, dk_cache = key_cache.shape
-        t_cache_v, block_size_v, vh_cache, dv_cache = value_cache.shape
-        value_shuffle_layout = False
+    kv_cache_dtype = key_cache.dtype
+    assert kv_cache_dtype in [
+        torch.bfloat16,
+        e4m3_dtype,
+        torch.uint8,
+    ], "KV cache dtype must be BF16, FP8 or packed FP4"
+
+    SCALE_K_WIDTH = 4
+    x_cache = 8
+    value_shuffle_layout = False
+    if kv_cache_dtype == torch.uint8:
+        # always shuffled
+        t_cache, kh_cache, block_size, d_cache = key_cache.shape
+        t_cache_v, vh_cache, block_size_v, d_cache_v = value_cache.shape
+        assert block_size == block_size_v
+        SCALE_K = dk // 16
+        SCALE_K_WIDTH = (
+            min(16, triton.next_power_of_2(SCALE_K)) if SCALE_K >= 4 else SCALE_K
+        )
     else:
-        t_cache, kh_cache, dkx_cache, block_size, x_cache = key_cache.shape
-        if value_cache.ndim == 5:
-            # value_cache shuffle: (num_blocks, num_kv_heads, block_size // x, head_size, x)
-            t_cache_v, vh_cache, slot_chunk_v, dv_cache, x_v = value_cache.shape
-            value_shuffle_layout = True
-            block_size_v = slot_chunk_v * x_v
-            assert block_size_v == block_size and x_v == x_cache, (
-                f"value_cache shuffle (T,KH,block_size//x,D,x) must match key: "
-                f"{block_size_v=} {block_size=} {x_v=} {x_cache=}"
-            )
-        else:
-            t_cache_v, vh_cache, dv_cache, block_size_v = value_cache.shape
+        if flash_layout:
+            t_cache, block_size, kh_cache, dk_cache = key_cache.shape
+            t_cache_v, block_size_v, vh_cache, dv_cache = value_cache.shape
             value_shuffle_layout = False
+        else:
+            t_cache, kh_cache, dkx_cache, block_size, x_cache = key_cache.shape
+            if value_cache.ndim == 5:
+                # value_cache shuffle: (num_blocks, num_kv_heads, block_size // x, head_size, x)
+                t_cache_v, vh_cache, slot_chunk_v, dv_cache, x_v = value_cache.shape
+                value_shuffle_layout = True
+                block_size_v = slot_chunk_v * x_v
+                assert block_size_v == block_size and x_v == x_cache, (
+                    f"value_cache shuffle (T,KH,block_size//x,D,x) must match key: "
+                    f"{block_size_v=} {block_size=} {x_v=} {x_cache=}"
+                )
+            else:
+                t_cache_v, vh_cache, dv_cache, block_size_v = value_cache.shape
+                value_shuffle_layout = False
     (t_slot,) = slot_mapping.shape
 
     assert (
@@ -388,15 +408,26 @@ def fused_qk_rope_reshape_and_cache(
     assert (
         t_cache == t_cache_v
     ), "Number of tokens should be identical for key_cache, and value_cache"
-    if flash_layout:
+    if kv_cache_dtype == torch.uint8:
+        assert d == dk == dv, "D dimension should be identical for q, k, and v"
         assert (
-            d == dk == dv == dk_cache == dv_cache
-        ), "D dimension should be identical for q, k, and v"
+            d_cache == d_cache_v
+        ), "D dimension should be identical for key_cache and value_cache"
+        assert (
+            dk // 2 + dk // 16 == d_cache
+        ), "D dimension of key_cache should be (dk // 2 + dk // 16) for FP4 KV cache"
     else:
-        assert (
-            d == dk == dv == dkx_cache * x_cache == dv_cache
-        ), "D dimension should be identical for q, k, and v"
-        assert x_cache == triton.next_power_of_2(x_cache), "x_size should be power of 2"
+        if flash_layout:
+            assert (
+                d == dk == dv == dk_cache == dv_cache
+            ), "D dimension should be identical for q, k, and v"
+        else:
+            assert (
+                d == dk == dv == dkx_cache * x_cache == dv_cache
+            ), "D dimension should be identical for q, k, and v"
+            assert x_cache == triton.next_power_of_2(
+                x_cache
+            ), "x_size should be power of 2"
 
     assert d == triton.next_power_of_2(d), "D dimension should be power of 2"
     assert block_size == triton.next_power_of_2(
@@ -426,6 +457,59 @@ def fused_qk_rope_reshape_and_cache(
     else:
         zeros_out = None
 
+    if kv_cache_dtype == torch.uint8:
+        t_cache, kh_cache, block_size, d_cache = key_cache.shape
+        key_cache_stride_t = key_cache.stride(0)
+        key_cache_stride_h = key_cache.stride(1)
+        key_cache_stride_d = key_cache.stride(3)
+        key_cache_stride_b = key_cache.stride(2)
+        key_cache_stride_x = 0
+        value_cache_stride_t = value_cache.stride(0)
+        value_cache_stride_h = value_cache.stride(1)
+        value_cache_stride_d = value_cache.stride(3)
+        value_cache_stride_b = value_cache.stride(2)
+        value_cache_stride_slot_chunk = 0
+        value_cache_stride_x = 0
+        assert (
+            key_cache_stride_d == value_cache_stride_d == 1
+        ), "The stride of the last dimension of key_cache and value_cache must be 1"
+    elif value_shuffle_layout:
+        key_cache_stride_t = key_cache.stride(0)
+        key_cache_stride_h = key_cache.stride(1)
+        key_cache_stride_d = key_cache.stride(2)
+        key_cache_stride_b = key_cache.stride(3)
+        key_cache_stride_x = key_cache.stride(4)
+        value_cache_stride_t = value_cache.stride(0)
+        value_cache_stride_h = value_cache.stride(1)
+        value_cache_stride_d = value_cache.stride(3)
+        value_cache_stride_b = 0
+        value_cache_stride_slot_chunk = value_cache.stride(2)
+        value_cache_stride_x = value_cache.stride(4)
+    elif not flash_layout:
+        key_cache_stride_t = key_cache.stride(0)
+        key_cache_stride_h = key_cache.stride(1)
+        key_cache_stride_d = key_cache.stride(2)
+        key_cache_stride_b = key_cache.stride(3)
+        key_cache_stride_x = key_cache.stride(4)
+        value_cache_stride_t = value_cache.stride(0)
+        value_cache_stride_h = value_cache.stride(1)
+        value_cache_stride_d = value_cache.stride(2)
+        value_cache_stride_b = value_cache.stride(3)
+        value_cache_stride_slot_chunk = 0
+        value_cache_stride_x = 0
+    else:
+        key_cache_stride_t = key_cache.stride(0)
+        key_cache_stride_h = key_cache.stride(2)
+        key_cache_stride_d = key_cache.stride(3)
+        key_cache_stride_b = key_cache.stride(1)
+        key_cache_stride_x = 0
+        value_cache_stride_t = value_cache.stride(0)
+        value_cache_stride_h = value_cache.stride(2)
+        value_cache_stride_d = value_cache.stride(3)
+        value_cache_stride_b = value_cache.stride(1)
+        value_cache_stride_slot_chunk = 0
+        value_cache_stride_x = 0
+
     n_pid = t * qh + (t_slot - t) * kh
     grid = (n_pid, 1, 1)
     _fused_qk_rope_reshape_and_cache_kernel[grid](
@@ -451,25 +535,36 @@ def fused_qk_rope_reshape_and_cache(
         cos.stride(-1),
         *q_out.stride(),
         *k_out.stride(),
-        key_cache.stride(0) if not flash_layout else key_cache.stride(0),
-        key_cache.stride(1) if not flash_layout else key_cache.stride(2),
-        key_cache.stride(2) if not flash_layout else key_cache.stride(3),
-        key_cache.stride(3) if not flash_layout else key_cache.stride(1),
-        key_cache.stride(4) if not flash_layout else 0,
-        value_cache.stride(0) if not flash_layout else value_cache.stride(0),
-        value_cache.stride(1) if not flash_layout else value_cache.stride(2),
-        (
-            value_cache.stride(3)
-            if (not flash_layout and value_shuffle_layout)
-            else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
-        ),
-        (
-            0
-            if (not flash_layout and value_shuffle_layout)
-            else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
-        ),
-        value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
-        value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
+        key_cache_stride_t,
+        key_cache_stride_h,
+        key_cache_stride_d,
+        key_cache_stride_b,
+        key_cache_stride_x,
+        value_cache_stride_t,
+        value_cache_stride_h,
+        value_cache_stride_d,
+        value_cache_stride_b,
+        value_cache_stride_slot_chunk,
+        value_cache_stride_x,
+        # key_cache.stride(0) if not flash_layout else key_cache.stride(0),
+        # key_cache.stride(1) if not flash_layout else key_cache.stride(2),
+        # key_cache.stride(2) if not flash_layout else key_cache.stride(3),
+        # key_cache.stride(3) if not flash_layout else key_cache.stride(1),
+        # key_cache.stride(4) if not flash_layout else 0,
+        # value_cache.stride(0) if not flash_layout else value_cache.stride(0),
+        # value_cache.stride(1) if not flash_layout else value_cache.stride(2),
+        # (
+        #     value_cache.stride(3)
+        #     if (not flash_layout and value_shuffle_layout)
+        #     else (value_cache.stride(2) if not flash_layout else value_cache.stride(3))
+        # ),
+        # (
+        #     0
+        #     if (not flash_layout and value_shuffle_layout)
+        #     else (value_cache.stride(3) if not flash_layout else value_cache.stride(1))
+        # ),
+        # value_cache.stride(2) if (not flash_layout and value_shuffle_layout) else 0,
+        # value_cache.stride(4) if (not flash_layout and value_shuffle_layout) else 0,
         zeros_out.stride(0) if zeros_out is not None else 0,
         zeros_out.stride(1) if zeros_out is not None else 0,
         zeros_out.stride(2) if zeros_out is not None else 0,
@@ -484,6 +579,7 @@ def fused_qk_rope_reshape_and_cache(
         BLOCK_D_HALF_pe=d // 2,
         BLOCK_SIZE=block_size,
         X_SIZE=x_cache if not flash_layout else 0,
+        SCALE_K_WIDTH=SCALE_K_WIDTH,
         FLASH_LAYOUT=flash_layout,
         VALUE_SHUFFLE_LAYOUT=value_shuffle_layout,
         HAVE_POS=(offs is not None),
