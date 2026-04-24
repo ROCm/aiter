@@ -7,11 +7,17 @@ import functools
 import re
 
 from typing import Dict, Optional
-from aiter.utility import dtypes
 
 import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
+
+
+def _get_dtypes():
+    from aiter.utility import dtypes
+
+    return dtypes
+
 
 _SUFFIX_RE = re.compile(r"(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$")
 
@@ -359,9 +365,12 @@ def _s1_args_fp4(
     size_expert_ids_in,
     dev,
     bias=None,
+    stream=None,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         _view_safe(out),
         _view_safe(a),
@@ -378,7 +387,7 @@ def _s1_args_fp4(
         n_in,
         k_in,
         size_expert_ids_in,
-        torch.cuda.current_stream(),
+        stream,
     )
 
 
@@ -396,7 +405,10 @@ def _s1_args_std(
     n_in,
     k_in,
     size_expert_ids_in,
+    stream=None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         out,
         a,
@@ -411,7 +423,7 @@ def _s1_args_std(
         n_in,
         k_in,
         size_expert_ids_in,
-        torch.cuda.current_stream(),
+        stream,
     )
 
 
@@ -431,12 +443,15 @@ def _s2_args_fp4(
     blocks,
     dev,
     bias=None,
+    stream=None,
 ):
     _bias = (
         bias.view(-1)
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         _view_safe(target),
         _view_safe(a),
@@ -452,7 +467,7 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
-        torch.cuda.current_stream(),
+        stream,
     )
 
 
@@ -470,7 +485,10 @@ def _s2_args_std(
     n_in,
     k_in,
     blocks,
+    stream=None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         target,
         a,
@@ -485,7 +503,7 @@ def _s2_args_std(
         n_in,
         k_in,
         blocks,
-        torch.cuda.current_stream(),
+        stream,
     )
 
 
@@ -589,6 +607,7 @@ def flydsl_moe_stage1(
     _need_fp8 = out_dtype == "fp8"
     _fuse_any_quant = _need_fp4 or _need_fp8
     _base_out_dtype = "bf16" if _fuse_any_quant else out_dtype
+    dtypes = _get_dtypes()
 
     if _need_fp4:
         torch_out_dtype = dtypes.fp4x2

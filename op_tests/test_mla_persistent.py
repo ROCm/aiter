@@ -475,6 +475,13 @@ def torch_mla_extend_split_kv(
             and max_seqlen_q == 4
         )
         or (
+            get_gfx() == "gfx942"
+            and nheads == 8
+            and not is_fp8_q
+            and not is_fp8_kvc
+            and max_seqlen_q == 2
+        )
+        or (
             get_gfx() == "gfx950"
             and nheads == 64
             and is_fp8_q
