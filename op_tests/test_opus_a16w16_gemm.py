@@ -3,12 +3,16 @@
 """
 End-to-end test of the a16w16 user-facing entry gemm_a16w16_opus.
 
-This is the single regression entry point for opus a16w16: it drives
-gemm_a16w16_opus end-to-end (Python CSV lookup → C++ tuned lookup →
-heuristic fallback → launcher → kernel), compares against torch.bmm,
-and prints per-shape TFLOPs. The id-based low-level binding
-(opus_gemm_a16w16_tune) is exercised indirectly when the CSV lookup
-hits, and the heuristic dispatch is exercised on miss.
+Complements the two other a16w16 tests:
+
+  * test_opus_a16w16_tune.py   — iterates every compiled kid via
+    opus_gemm_a16w16_tune (id-based low-level binding).
+  * test_opus_a16w16_lookup.py — iterates every row in the tuned CSV
+    and launches with explicit (solidx, splitK) from CSV.
+
+This file covers the user-facing path: gemm_a16w16_opus goes through
+CSV lookup and on miss delegates to the C++ opus_gemm() two-level
+dispatch. Compares against torch.bmm and prints per-shape TFLOPs.
 
 Usage:
 
@@ -24,70 +28,33 @@ Usage:
 """
 
 import argparse
-import sys
 import torch
 
-# opus a16w16 is gfx950-only. Skip cleanly on any other device so this
-# script can sit in the regression set without failing on non-gfx950 CI
-# slots. Reuse opus's own probe (which honours GPU_ARCHS env first, then
-# rocminfo) so this skip stays in lock-step with what aiter.ops.opus does
-# at import time -- otherwise we'd hit the stub's RuntimeError instead of
-# a clean skip when GPU_ARCHS pins a non-supported arch on a gfx950 box.
-from aiter.ops.opus._arch import _detect_arch  # noqa: E402
-
-_arch_ok, _detected_gfx = _detect_arch({"gfx950"})
-if not _arch_ok:
-    print(f"[skip] test_opus_a16w16_gemm requires gfx950 (detected {_detected_gfx!r})")
-    sys.exit(0)
-
-from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
-from aiter.ops.opus import gemm_a16w16_opus  # noqa: E402
+from aiter.test_common import checkAllclose, run_perftest
+from aiter.ops.opus import gemm_a16w16_opus
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
-    # A: [batch, M, K], B: [N, K] or [batch, N, K] -> bmm.
+    # A: [batch, M, K], B: [N, K] -> bmm with B broadcast as [batch, N, K].
     # run_torch computes in fp32 then casts to match the opus path.
-    if B.dim() == 2:
-        return torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(out_dtype)
-    return torch.bmm(A.float(), B.float().transpose(-1, -2)).to(out_dtype)
-
-
-def _make_b(batch: int, N: int, K: int) -> torch.Tensor:
-    """Build a B that gemm_a16w16_opus accepts for both batch=1 and batch>1.
-
-    The wrapper rejects 2D B + batch>1 because the opus launcher hardcodes
-    stride_b_batch == N*K (a broadcast view would silently fault). For the
-    common "shared weight across batch" case, materialize an explicit
-    `[batch, N, K]` tensor via the contiguous broadcast pattern.
-    """
-    B2D = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
-    if batch == 1:
-        return B2D
-    return B2D.unsqueeze(0).expand(batch, -1, -1).contiguous()
+    return torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(out_dtype)
 
 
 def test_a16w16(batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16):
     # gemm_a16w16_opus accepts either 2D or 3D A; test 3D to exercise the
-    # batched reshape path. B is 2D when batch==1, 3D contiguous otherwise.
+    # batched reshape path. B is always 2D [N, K].
     A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-    B = _make_b(batch, N, K)
+    B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
 
     ref = _torch_ref(A, B, out_dtype)
 
     Y, us = run_perftest(
-        gemm_a16w16_opus,
-        A,
-        B,
-        None,
-        out_dtype,
+        gemm_a16w16_opus, A, B, None, out_dtype,
     )
 
     err = checkAllclose(
-        Y,
-        ref,
-        msg=f"a16w16 b={batch} m={M} n={N} k={K}",
-        rtol=0.1,
-        atol=0.5,
+        Y, ref, msg=f"a16w16 b={batch} m={M} n={N} k={K}",
+        rtol=0.1, atol=0.5,
     )
     flops = 2.0 * batch * M * N * K
     tflops = flops / us / 1e6
@@ -100,39 +67,42 @@ def test_a16w16(batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16):
 
 def load_shapes_from_csv(csv_path):
     import pandas as pd
-
     df = pd.read_csv(csv_path)
-    shapes = list(zip(df["M"].astype(int), df["N"].astype(int), df["K"].astype(int)))
+    shapes = list(
+        zip(df["M"].astype(int), df["N"].astype(int), df["K"].astype(int))
+    )
     return list(dict.fromkeys(shapes))
 
 
 def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
     shapes = load_shapes_from_csv(csv_path)
     print(f"\n{'=' * 80}")
-    print(f"a16w16 sweep from {csv_path}: {len(shapes)} unique shapes, batch={batch}")
+    print(
+        f"a16w16 sweep from {csv_path}: {len(shapes)} unique shapes, batch={batch}"
+    )
     print("=" * 80)
     passed = failed = 0
     for M, N, K in shapes:
         tag = f"a16w16 b={batch} M={M} N={N} K={K}"
         try:
             A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-            B = _make_b(batch, N, K)
+            B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
             ref = _torch_ref(A, B, torch.bfloat16)
             Y, us = run_perftest(
-                gemm_a16w16_opus,
-                A,
-                B,
-                None,
-                torch.bfloat16,
+                gemm_a16w16_opus, A, B, None, torch.bfloat16,
             )
             err = checkAllclose(Y, ref, msg=tag, rtol=0.1, atol=0.5)
             tflops = 2.0 * batch * M * N * K / us / 1e6
-            print(f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
+            print(
+                f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}"
+            )
             passed += 1
         except Exception as e:
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
-    print(f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}")
+    print(
+        f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}"
+    )
     return failed == 0
 
 
@@ -145,8 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("-k", type=int, default=256)
     parser.add_argument("-b", "--batch", type=int, default=8)
     parser.add_argument(
-        "-d",
-        "--dtype",
+        "-d", "--dtype",
         type=str,
         default="bf16",
         choices=["bf16", "fp32"],
