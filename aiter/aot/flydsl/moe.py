@@ -28,7 +28,13 @@ import os
 import sys
 import time
 
-from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, job_identity
+from aiter.aot.flydsl.common import (
+    collect_aot_jobs,
+    compile_only_env,
+    cu_num_to_arch,
+    job_identity,
+    override_env,
+)
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
@@ -45,6 +51,7 @@ from aiter.ops.flydsl.moe_kernels import (
 DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
 ]
+MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 
 def parse_csv(csv_path: str):
@@ -68,6 +75,7 @@ def parse_csv(csv_path: str):
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
+            cu_num = int(row.get("cu_num", "0"))
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -81,6 +89,7 @@ def parse_csv(csv_path: str):
                     "experts": experts,
                     "topk": topk,
                     "doweight_stage1": doweight_stage1,
+                    "cu_num": cu_num,
                 }
                 key = job_identity(job)
                 if key in seen:
@@ -113,11 +122,11 @@ def _precompile_to_cache(
     waves_per_eu: int = 3,
     k_batch: int = 1,
     b_nt: int = 2,
-    gate_only: bool = False,
-    fuse_fp4_quant: bool = False,
+    gate_mode: str = "separated",
     mode: str = "atomic",
     persist: bool = False,
     sort_block_m: int = 0,
+    cu_num: int = 0,
     **kwargs,
 ):
     """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
@@ -129,7 +138,8 @@ def _precompile_to_cache(
     """
     import torch
 
-    dev = torch.device("cuda")
+    dev = torch.device("cpu")
+    _stream = 0
     is_fp4 = b_dtype == "fp4"
     tokens = tile_m
     E = experts
@@ -141,8 +151,15 @@ def _precompile_to_cache(
     num_valid_ids = torch.zeros(1, device=dev, dtype=torch.int32)
     sw = torch.zeros(tokens * topk, device=dev, dtype=torch.float32)
 
-    with compile_only_env():
+    _cu_num_str = str(cu_num) if cu_num > 0 else None
+    with compile_only_env(), override_env("CU_NUM", _cu_num_str):
+        # Clear cached CU count so get_cu_num() re-reads the env var.
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        get_cu_num.cache_clear()
+
         if stage == 1:
+
             _is_splitk = k_batch > 1
             n_in = inter_dim * 2 if is_fp4 else inter_dim
             k_in = model_dim
@@ -174,6 +191,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    stream=_stream,
                 )
             else:
                 out = torch.zeros(
@@ -199,6 +217,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
+                    stream=_stream,
                 )
 
             exe = compile_flydsl_moe_stage1(
@@ -216,13 +235,12 @@ def _precompile_to_cache(
                 waves_per_eu=waves_per_eu,
                 k_batch=k_batch,
                 b_nt=b_nt,
-                gate_only=gate_only,
-                fuse_fp4_quant=fuse_fp4_quant and not _is_splitk,
-                fuse_sort_scale=fuse_fp4_quant and not _is_splitk,
+                gate_mode=gate_mode,
             )
             _run_compiled(exe, args)
 
         elif stage == 2:
+
             accumulate = mode != "reduce"
             _persist_m = -1 if persist else 4
             n_in = model_dim
@@ -253,6 +271,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    stream=_stream,
                 )
             else:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
@@ -274,6 +293,7 @@ def _precompile_to_cache(
                     n_in,
                     k_in,
                     _grid_y,
+                    stream=_stream,
                 )
 
             exe = compile_flydsl_moe_stage2(
@@ -296,7 +316,13 @@ def _precompile_to_cache(
 
 
 def compile_one_config(
-    kernel_name: str, model_dim: int, inter_dim: int, experts: int, topk: int, **kwargs
+    kernel_name: str,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    cu_num: int = 0,
+    **kwargs,
 ) -> dict:
     """Compile one MoE kernel configuration and save to cache.
 
@@ -305,27 +331,35 @@ def compile_one_config(
 
     Returns a dict with timing info.
     """
+    aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
     shape_str = (
         f"{kernel_name}  "
         f"model_dim={model_dim} inter_dim={inter_dim} "
         f"E={experts} topk={topk}"
     )
-    result = {"kernel_name": kernel_name, "shape": shape_str, "compile_time": None}
+    result = {
+        "kernel_name": kernel_name,
+        "shape": shape_str,
+        "compile_time": None,
+        "compile_arch": aot_arch,
+    }
 
     t0 = time.time()
     try:
-        _precompile_to_cache(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            **kwargs,
-        )
+        with override_env("ARCH", aot_arch), override_env("FLYDSL_GPU_ARCH", aot_arch):
+            _precompile_to_cache(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=experts,
+                topk=topk,
+                cu_num=cu_num,
+                **kwargs,
+            )
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
-        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}")
+        print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
     except Exception as e:
-        print(f"  [FAIL] compile  {shape_str}: {e}")
+        print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result
 
@@ -353,13 +387,12 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
-    arch = os.environ.get("ARCH", "(auto-detect)")
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
 
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
-
     print("=" * 72)
     print("FlyDSL MoE AOT Pre-compilation")
     print("=" * 72)
@@ -368,6 +401,7 @@ def main():
     print(f"  Stage1 jobs:  {len(stage1_jobs)}")
     print(f"  Stage2 jobs:  {len(stage2_jobs)}")
     print(f"  Total jobs:   {len(all_jobs)}")
+    print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)
