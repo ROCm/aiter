@@ -75,6 +75,9 @@ else:
     # downstream regressions (e.g. vLLM-ROCm losing rmsnorm2d_fwd_with_add).
     # Any real import failure on Linux must surface as a loud ImportError
     # on `import aiter` -- that is what 0.1.10.post3 and earlier did.
+    # opus is gfx950-only but the package self-guards (warn + stubs on
+    # non-gfx950) inside aiter/ops/opus/__init__.py, so its import line
+    # is safe to put at top-level without try/except.
     from .jit import core as core  # noqa: E402
     from .utility import dtypes as dtypes  # noqa: E402
     from .ops.enum import *  # noqa: F403,E402
@@ -86,6 +89,7 @@ else:
     from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
     from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
     from .ops.deepgemm import *  # noqa: F403,E402
+    from .ops.opus import *  # noqa: F403,E402
     from .ops.aiter_operator import *  # noqa: F403,E402
     from .ops.activation import *  # noqa: F403,E402
     from .ops.attention import *  # noqa: F403,E402
