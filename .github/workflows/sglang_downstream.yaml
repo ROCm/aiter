@@ -52,7 +52,7 @@ jobs:
             label: MI35X
 
     env:
-      SGL_BRANCH: v0.5.10.post1
+      SGL_BRANCH: main
       GPU_ARCH: gfx950
       SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi35x-gpu-8
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
@@ -121,6 +121,7 @@ jobs:
           cd "${SGLANG_WORKSPACE}"
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
       - name: Install aiter under test
         id: install_aiter_under_test
@@ -182,6 +183,35 @@ jobs:
           echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
           exit ${TEST_EXIT_CODE:-0}
 
+      - name: Accuracy Test MI35x (8-GPU Qwen 3.5)
+        id: qwen35_accuracy
+        timeout-minutes: 70
+        continue-on-error: true
+        run: |
+          set -ex
+          cd "${SGLANG_WORKSPACE}"
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Performance Test MI35x (8-GPU Qwen 3.5 FP8)
+        id: qwen35_perf
+        timeout-minutes: 100
+        continue-on-error: true
+        run: |
+          set -ex
+          cd "${SGLANG_WORKSPACE}"
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e SGLANG_USE_AITER=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-qwen35-fp8 --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
       - name: Accuracy Test MI35x (8-GPU DeepSeek-V3.2)
         id: deepseek_v32_accuracy
         timeout-minutes: 70
@@ -227,6 +257,8 @@ jobs:
           check_step "deepseek-r1-mxfp4 accuracy" "${{ steps.deepseek_r1_mxfp4_accuracy.outcome }}"
           check_step "deepseek-r1-mxfp4 perf" "${{ steps.deepseek_r1_mxfp4_perf.outcome }}"
           check_step "qwen3-235b-mxfp4" "${{ steps.qwen3_235b_mxfp4.outcome }}"
+          check_step "qwen35 accuracy" "${{ steps.qwen35_accuracy.outcome }}"
+          check_step "qwen35 perf" "${{ steps.qwen35_perf.outcome }}"
           check_step "deepseek-v32 accuracy" "${{ steps.deepseek_v32_accuracy.outcome }}"
           check_step "deepseek-v32 perf" "${{ steps.deepseek_v32_perf.outcome }}"
 
