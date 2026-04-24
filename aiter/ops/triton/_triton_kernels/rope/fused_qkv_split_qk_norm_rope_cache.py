@@ -418,12 +418,16 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         # KV Caching Logic
         slots = tl.load(slot_mapping_ptr + t_offs, mask=t_mask)
 
-        # Calculate Paged Cache offsets
-        b_idx = slots % BLOCK_SIZE
-        t_slot_idx = slots // BLOCK_SIZE
-
         # We process a block of T. We need to handle mask for slots >= 0
         cache_mask = x_mask & (slots[:, None] >= 0)
+
+        # Clamp slots to 0 before computing indices to avoid negative pointer
+        # arithmetic (the final store is guarded by cache_mask)
+        safe_slots = tl.where(slots >= 0, slots, 0)
+
+        # Calculate Paged Cache offsets
+        b_idx = safe_slots % BLOCK_SIZE
+        t_slot_idx = safe_slots // BLOCK_SIZE
 
         k_scale_rcprl = 1 / k_scale
         k = k * k_scale_rcprl
