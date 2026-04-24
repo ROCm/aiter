@@ -19,6 +19,7 @@ template <typename DTYPE_I,
           int ReduceThreadSize,
           bool ADD_RESIDUAL,
           bool OUTPUT_UNQUANT,
+          bool GEMMA_NORM = false,
           bool interleave = false>
 __global__ void fused_qk_rmsnorm_group_quant_kernel(
     DTYPE_O* __restrict__ q_out_quantized,
@@ -216,6 +217,11 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             vec2_f& thread_data_w2 = rcp;
             thread_data_w2[0] = static_cast<float>(thread_data_w[2 * i]);
             thread_data_w2[1] = static_cast<float>(thread_data_w[2 * i + 1]);
+            if constexpr(GEMMA_NORM)
+            {
+                thread_data_w2[0] += 1.0f;
+                thread_data_w2[1] += 1.0f;
+            }
             asm volatile("v_pk_mul_f32 %0, %1, %2"
                          : "=v"(thread_data_f2[i])
                          : "v"(thread_data_f2[i]), "v"(thread_data_w2));
@@ -396,6 +402,11 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                 vec2_f wv;
                 wv[0] = static_cast<float>(tdw2[2 * i]);
                 wv[1] = static_cast<float>(tdw2[2 * i + 1]);
+                if constexpr(GEMMA_NORM)
+                {
+                    wv[0] += 1.0f;
+                    wv[1] += 1.0f;
+                }
                 asm volatile("v_pk_mul_f32 %0, %1, %2"
                              : "=v"(fp2[i])
                              : "v"(fp2[i]), "v"(wv));
@@ -409,7 +420,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     }
 }
 
-#define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, interleave) \
+#define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, interleave) \
     AITER_DISPATCH_FLOATING16_TYPES(inp1.scalar_type(), "fused_qk_rmsnorm_group_quant_kernel", [&] {                             \
         using DTYPE_I = typename t2opus<scalar_t>::type;                                                                          \
         using DTYPE_OO = DTYPE_O;                                                                                                 \
@@ -422,6 +433,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                          ReduceThreadSize,                                                                        \
                                          ADD_RESIDUAL,                                                                            \
                                          OUTPUT_UNQUANT,                                                                          \
+                                         GEMMA_NORM_V,                                                                            \
                                          interleave><<<grid, block, 0, stream>>>(                                                \
             reinterpret_cast<DTYPE_OO*>(out1_quantized.data_ptr()),                                                              \
             out1_scale.data_ptr(),                                                                                                \
@@ -450,10 +462,10 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             group_size);                                                                                                          \
     });
 
-#define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
-    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, false)
+#define FUSED_RMSNORM_GROUP_QUANT_DISPATCH(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
+    FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, false)
 
-#define FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
+#define FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
     do                                                                                                          \
     {                                                                                                           \
         if(quant_is_fp8)                                                                                        \
@@ -463,7 +475,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                                thread_data_size,                                                \
                                                ReduceThreadSize,                                                \
                                                ADD_RESIDUAL,                                                    \
-                                               OUTPUT_UNQUANT);                                                 \
+                                               OUTPUT_UNQUANT,                                                  \
+                                               GEMMA_NORM_V);                                                   \
         }                                                                                                       \
         else                                                                                                    \
         {                                                                                                       \
@@ -472,29 +485,46 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                                                thread_data_size,                                                \
                                                ReduceThreadSize,                                                \
                                                ADD_RESIDUAL,                                                    \
-                                               OUTPUT_UNQUANT);                                                 \
+                                               OUTPUT_UNQUANT,                                                  \
+                                               GEMMA_NORM_V);                                                   \
         }                                                                                                       \
     } while(0)
 
-#define FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
-    FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT)
+#define FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
+    FUSED_RMSNORM_GROUP_QUANT_DISPATCH(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V)
 
-#define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT) \
-    FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT)
+#define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
+    FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V)
 
-#define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, RTS)                     \
-    do                                                                       \
-    {                                                                        \
-        if(has_residual)                                                      \
-        {                                                                    \
-            if(output_unquantized_inp1) { MACRO(BS, TDS, RTS, true, true); } \
-            else                        { MACRO(BS, TDS, RTS, true, false); }\
-        }                                                                    \
-        else                                                                 \
-        {                                                                    \
-            if(output_unquantized_inp1) { MACRO(BS, TDS, RTS, false, true); }\
-            else                        { MACRO(BS, TDS, RTS, false, false);}\
-        }                                                                    \
+#define DISPATCH_RESIDUAL_UNQUANT_(MACRO, BS, TDS, RTS)                                       \
+    do                                                                                         \
+    {                                                                                          \
+        if(has_residual)                                                                        \
+        {                                                                                      \
+            if(output_unquantized_inp1)                                                         \
+            {                                                                                  \
+                if(gemma_norm) { MACRO(BS, TDS, RTS, true, true, true); }                      \
+                else           { MACRO(BS, TDS, RTS, true, true, false); }                     \
+            }                                                                                  \
+            else                                                                               \
+            {                                                                                  \
+                if(gemma_norm) { MACRO(BS, TDS, RTS, true, false, true); }                     \
+                else           { MACRO(BS, TDS, RTS, true, false, false); }                    \
+            }                                                                                  \
+        }                                                                                      \
+        else                                                                                   \
+        {                                                                                      \
+            if(output_unquantized_inp1)                                                         \
+            {                                                                                  \
+                if(gemma_norm) { MACRO(BS, TDS, RTS, false, true, true); }                     \
+                else           { MACRO(BS, TDS, RTS, false, true, false); }                    \
+            }                                                                                  \
+            else                                                                               \
+            {                                                                                  \
+                if(gemma_norm) { MACRO(BS, TDS, RTS, false, false, true); }                    \
+                else           { MACRO(BS, TDS, RTS, false, false, false); }                   \
+            }                                                                                  \
+        }                                                                                      \
     } while(0)
 
 #define DISPATCH_REDUCE_THREAD_SIZE_(MACRO, BS, TDS)                                              \
@@ -526,7 +556,8 @@ void fused_qk_rmsnorm_group_quant(
     std::optional<double> k_epsilon,
     std::optional<torch::Tensor> q_residual,
     int64_t group_size,
-    bool transpose_scale)
+    bool transpose_scale,
+    bool gemma_norm)
 {
     // Keep internal variable names stable for macro dispatch usage.
     auto& out1_quantized = q_out_quantized;

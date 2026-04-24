@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.3.1"
+FLYDSL_VERSION = "flydsl==0.1.4.2"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -315,18 +315,28 @@ if PREBUILD_KERNELS != 0:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
+        # --- FlyDSL AOT pre-compilation (MOE + GEMM in parallel, before CK) ---
+        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+        os.environ["AITER_AOT_IMPORT"] = "1"
+        try:
+            from aiter.aot.flydsl.common import start_aot, wait_aot
+
+            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+            _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
+            wait_aot(_flydsl_pool, _flydsl_futures)
+        finally:
+            if _prev_aot_import is None:
+                os.environ.pop("AITER_AOT_IMPORT", None)
+            else:
+                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+
+        # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
 
         # Retune GEMM shapes on the live GPU after the main build phase.
-        # Each requested module's tune script benchmarks all CSV shapes and
-        # writes results tagged with the live GPU's (gfx, cu_num) back to
-        # the source CSV, then rebuilds the inference .so.
         if PRETUNE_MODULES:
-            # Import directly from the file to avoid triggering aiter/__init__.py,
-            # which would try to load module_aiter_core before it is registered.
-            sys.path.insert(0, os.path.join(this_dir, "aiter", "utility"))
-            from pretune import run_pretune_modules  # noqa: E402
+            from aiter.utility.pretune import run_pretune_modules  # noqa: E402
 
             cfg_path = OPT_COMPILER_CONFIG
             with open(cfg_path, "r", encoding="utf-8") as _f:
@@ -339,76 +349,6 @@ if PREBUILD_KERNELS != 0:
                 csrc_dir=f"{this_dir}/csrc",
                 repo_dir=this_dir,
             )
-
-        # --- FlyDSL AOT pre-compilation ---
-        try:
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            os.makedirs(flydsl_cache_dir, exist_ok=True)
-            os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = flydsl_cache_dir
-
-            # setup.py loads `jit.core` via sys.path (line 134-135).
-            # Map those modules into the `aiter.*` namespace so that
-            # `import aiter.jit.core` reuses the same instances.
-            for _name in list(sys.modules):
-                if _name == "jit" or _name.startswith("jit."):
-                    _pkg = f"aiter.{_name}"
-                    if _pkg not in sys.modules:
-                        sys.modules[_pkg] = sys.modules[_name]
-
-            from aiter.aot.flydsl.common import collect_aot_jobs
-
-            def _run_flydsl_aot(label, default_csvs, parse_csv, compile_one_config):
-                jobs = collect_aot_jobs(
-                    default_csvs,
-                    parse_csv,
-                    on_missing_csv=lambda csv_path: print(
-                        f"[aiter] {label}: CSV not found: {csv_path}"
-                    ),
-                )
-                if jobs:
-                    print(
-                        f"[aiter] {label}: {len(jobs)} kernels to compile "
-                        f"(cache: {flydsl_cache_dir})"
-                    )
-                    results = []
-                    for job in jobs:
-                        results.append(compile_one_config(**job))
-                    ok = sum(
-                        1 for result in results if result["compile_time"] is not None
-                    )
-                    fail = len(results) - ok
-                    print(f"[aiter] {label}: compiled {ok} ok, {fail} failed")
-
-            from aiter.aot.flydsl.moe import (
-                DEFAULT_CSVS as MOE_DEFAULT_CSVS,
-                compile_one_config as compile_moe_one_config,
-                parse_csv as parse_moe_csv,
-            )
-
-            _run_flydsl_aot(
-                "FlyDSL MoE AOT",
-                MOE_DEFAULT_CSVS,
-                parse_moe_csv,
-                compile_moe_one_config,
-            )
-
-            from aiter.aot.flydsl.gemm import (
-                DEFAULT_CSVS as GEMM_DEFAULT_CSVS,
-                compile_one_config as compile_gemm_one_config,
-                parse_csv as parse_gemm_csv,
-            )
-
-            _run_flydsl_aot(
-                "FlyDSL GEMM AOT",
-                GEMM_DEFAULT_CSVS,
-                parse_gemm_csv,
-                compile_gemm_one_config,
-            )
-        except Exception as e:
-            import traceback
-
-            traceback.print_exc()
-            print(f"[aiter] FlyDSL AOT skipped: {e}")
 
 
 class NinjaBuildExtension(build_ext):
@@ -437,6 +377,7 @@ setup_requires = [
     "psutil",
     "ninja",
     "setuptools_scm",
+    "vcs_versioning",  # transitive dep of setuptools_scm>=10
 ]
 if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")
