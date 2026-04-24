@@ -42,11 +42,132 @@ OpusNoscaleKernel opus_dispatch_a8w8(int M, int N, int K)
   return opus_gemm_512x256x256x128_2x4_16x16x128_0x0x0<CDataType>;
 }
 
-// a16w16 dispatch (split-barrier; default runtime path, not tuned)
+// ── a16w16 runtime dispatch (two-level: tuned lookup → heuristic) ──
+//
+// Mirrors the ck_gemm_a8w8 pattern (see csrc/ck_gemm_a8w8/gemm_a8w8.cu
+// rowwise_dispatch): first consult a compile-time (M,N,K)->kernel table
+// baked in from the opus-private tuned CSV via gen_instances.py
+// --tune_file, then fall through to a hand-written heuristic if-else
+// tree. The heuristic guarantees *some* valid kernel for every shape;
+// its choice is deliberately conservative (favor splitk for small M
+// because its host-side auto-clamp makes it alignment-tolerant, and
+// the traditional a16w16 tile for M>128 where split-barrier pipelines
+// still win throughput).
+//
+// The template parameter CDataType refers to the *accumulator / dispatch*
+// type seen by the id-based tune lookup tables, NOT the user-visible Y
+// dtype. Concretely:
+//   * Traditional a16w16 kid 4..9 has both <bf16_t> and <fp32_t>
+//     instantiations; CDataType == Y dtype.
+//   * Splitk kid 200..210 only exists in <fp32_t> form (traits
+//     static_assert D_C=float) and requires Y to be bf16 (reduce
+//     kernel casts fp32 workspace -> bf16 Y).
+//
+// Therefore:
+//   * Y == bf16: we can invoke any kid; splitk instances must be
+//     specialized on <fp32_t> despite Y being bf16. This is exactly
+//     what opus_gemm_a16w16_tune does too (see bottom half of this
+//     file, OPUS_SPLITK_KID_MIN routing).
+//   * Y == fp32: splitk is off-limits (its launcher TORCH_CHECKs
+//     Y.dtype() == BFloat16). Heuristic stays within split-barrier 4..9.
 template <typename CDataType>
-OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K)
+static OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch(
+    int M, int N, int K, int batch);
+
+template <>
+OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch<bf16_t>(
+    int M, int N, int K, int /*batch*/)
 {
-  return opus_gemm_512x256x256x64_2x4_16x16x32_0x0x0<CDataType>;
+  // Note: splitk template params are <fp32_t> even though Y is bf16;
+  // the reduce kernel handles the fp32->bf16 cast.
+  const bool split_barrier_ok =
+      (N % 16 == 0) && (K % 64 == 0) && ((K / 64) % 2 == 0);
+
+  if (M <= 4)
+  {
+    // Extremely skinny M: cc recommends (64,64,128) WG=1 for deep K.
+    return opus_gemm_flatmm_splitk_256x64x64x128_2x1_16x16x32_0x0x0_wgpcu1<fp32_t>;
+  }
+  if (M <= 64)
+  {
+    // Mid-skinny: cc-recommended medium-M kernel (64,32,128) WG=2.
+    return opus_gemm_flatmm_splitk_256x64x32x128_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
+  }
+  if (M <= 128)
+  {
+    // Sweet spot: (64,64,64) WG=2.
+    return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
+  }
+  // M > 128
+  if (split_barrier_ok)
+  {
+    return opus_gemm_512x256x256x64_2x4_16x16x32_0x0x0<bf16_t>;
+  }
+  // Non-aligned large shape: splitk kid 200 handles any (M, N, K) because
+  // mask_va_tail + reduce-tail cover arbitrary N/K.
+  return opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2<fp32_t>;
+}
+
+template <>
+OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch<fp32_t>(
+    int /*M*/, int /*N*/, int /*K*/, int /*batch*/)
+{
+  // splitk kids force bf16 Y (traits static_assert D_C=float + reduce
+  // writes bf16), so we cannot use them on the fp32 path. Fall back to
+  // the traditional split-barrier tile 9.
+  return opus_gemm_512x256x256x64_2x4_16x16x32_0x0x0<fp32_t>;
+}
+
+// (M, N, K) -> kernel<CDataType>. Populated from opus-private tuned CSV
+// at JIT time by gen_instances.py --tune_file. Mirrors the IntTupleHash
+// + unordered_map layout used by csrc/ck_gemm_a8w8/gemm_a8w8.cu.
+struct IntTupleHash
+{
+  size_t operator()(const std::tuple<int, int, int> &t) const
+  {
+    auto h1 = std::hash<int>{}(std::get<0>(t));
+    auto h2 = std::hash<int>{}(std::get<1>(t));
+    auto h3 = std::hash<int>{}(std::get<2>(t));
+    return h1 ^ h2 ^ h3;
+  }
+};
+
+using OpusA16W16RuntimeMap = std::unordered_map<
+    std::tuple<int, int, int>,
+    OpusA16W16NoscaleKernel,
+    IntTupleHash>;
+
+template <typename CDataType>
+OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch);
+
+template <>
+OpusA16W16NoscaleKernel opus_dispatch_a16w16<bf16_t>(int M, int N, int K, int batch)
+{
+  static const auto lookup = []
+  {
+    return OpusA16W16RuntimeMap{GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)};
+  }();
+  auto it = lookup.find({M, N, K});
+  if (it != lookup.end())
+  {
+    return it->second;
+  }
+  return opus_a16w16_heuristic_dispatch<bf16_t>(M, N, K, batch);
+}
+
+template <>
+OpusA16W16NoscaleKernel opus_dispatch_a16w16<fp32_t>(int M, int N, int K, int batch)
+{
+  static const auto lookup = []
+  {
+    return OpusA16W16RuntimeMap{GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)};
+  }();
+  auto it = lookup.find({M, N, K});
+  if (it != lookup.end())
+  {
+    return it->second;
+  }
+  return opus_a16w16_heuristic_dispatch<fp32_t>(M, N, K, batch);
 }
 
 torch::Tensor opus_gemm(
@@ -84,15 +205,19 @@ torch::Tensor opus_gemm(
   }
   else if (XQ.dtype() == at::ScalarType::BFloat16)
   {
-    // Default runtime path uses the split-barrier a16w16 kernel, which ignores
-    // the splitK argument (pass 0).
+    // Two-level dispatch: tuned CSV lookup (baked in at JIT time) first,
+    // heuristic if-else tree on miss. splitK is passed 0; splitk kids
+    // auto-clamp to pfk anyway so no extra information is needed at this
+    // entry point. Kernels that ignore splitK (a16w16 / flatmm) just
+    // drop it.
+    int batch = XQ.size(0);
     if (Y.dtype() == at::ScalarType::BFloat16)
     {
-      opus_dispatch_a16w16<bf16_t>(M, N, K)(XQ, WQ, Y, 0);
+      opus_dispatch_a16w16<bf16_t>(M, N, K, batch)(XQ, WQ, Y, 0);
     }
     else if (Y.dtype() == at::ScalarType::Float)
     {
-      opus_dispatch_a16w16<fp32_t>(M, N, K)(XQ, WQ, Y, 0);
+      opus_dispatch_a16w16<fp32_t>(M, N, K, batch)(XQ, WQ, Y, 0);
     }
     else
     {
