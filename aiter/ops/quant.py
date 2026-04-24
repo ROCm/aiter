@@ -460,10 +460,16 @@ def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
 
 @functools.lru_cache()
 def get_torch_act(aType):
+    # Best-effort single-input reference. The full SwigluStep behavior is
+    # handled in gated paths where both gate and up tensors are available.
+    def _swiglustep_single(x):
+        return F.silu(x).clamp(max=7.0)
+
     tmp = {
         ActivationType.No: lambda *a, **k: a[0],
         ActivationType.Silu: F.silu,
         ActivationType.Gelu: F.gelu,
+        ActivationType.SwigluStep: _swiglustep_single,
     }
     return tmp.get(aType, NotImplementedError)
 

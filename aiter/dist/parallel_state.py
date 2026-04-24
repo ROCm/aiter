@@ -1076,7 +1076,7 @@ def graph_capture():
         yield context
 
 
-_ENABLE_CUSTOM_ALL_REDUCE = True
+_ENABLE_CUSTOM_ALL_REDUCE = False
 
 
 def set_custom_all_reduce(enable: bool):
