@@ -32,29 +32,39 @@ def fused_qkv_split_qk_norm_rope_cache(
 ):
     """Split packed ``qkv``, RMSNorm Q and K, apply RoPE, write K/V into paged caches.
 
-    Shapes follow ``qh`` / ``kvh`` / ``head_dim``. RoPE uses ``cos`` / ``sin`` last dim
-    as half rotary width (must match ``rotary_dim_half`` when that argument is set).
-    ``reuse_freqs_front_part`` must match how ``cos``/``sin`` were built for partial
-    rotation. When ``attn_output_gate`` is True, ``gated_qkv_layout`` is ``"interleaved"``
-    (Q then gate per head in the flat Q+gate region) or ``"blocked"`` (all Q then all
-    gate). Paged layout is inferred from ``key_cache`` / ``value_cache`` (block size is
-    ``shape[2]``); ``slot_mapping`` maps each token row to a physical slot index.
+    Shapes follow ``qh`` / ``kvh`` / ``head_dim``. For RoPE, ``rotary_dim_half`` refers
+    to the half-width of the rotated subspace. The required ``cos`` / ``sin`` last-dim
+    shape depends on ``reuse_freqs_front_part``: when True, ``cos.shape[-1]`` and
+    ``sin.shape[-1]`` are the half-width (that is, ``rotary_dim_half``); when False,
+    they are the full rotary width (that is, ``2 * rotary_dim_half``). The
+    ``reuse_freqs_front_part`` flag must match how ``cos``/``sin`` were built for
+    partial rotation. When ``attn_output_gate`` is True, ``gated_qkv_layout`` is
+    ``"interleaved"`` (Q then gate per head in the flat Q+gate region) or ``"blocked"``
+    (all Q then all gate). Paged layout is inferred from ``key_cache`` /
+    ``value_cache`` (block size is ``shape[2]``); ``slot_mapping`` maps each token row
+    to a physical slot index.
 
     Args:
         qkv: ``[T, packed_dim]`` flat tensor (Q [+ gate], K, V).
         q_weight, k_weight: RMSNorm gamma ``(head_dim,)``.
-        cos, sin: RoPE tables; last dim is rotary half-width.
+        cos, sin: RoPE tables. If ``reuse_freqs_front_part`` is True, the last dim is
+            the rotary half-width; if False, the last dim is the full rotary width.
         positions: Token positions into the RoPE table.
         key_cache, value_cache: ``[num_blocks, heads, block_size, head_dim]``.
         slot_mapping: ``[T]`` int32 (or index dtype), slot per token for cache write.
         qh: Total query heads; ``kvh`` key/value heads; ``head_dim`` per-head size.
         is_neox: NeoX vs GPT-J rotation style.
         offsets: Optional position offsets (same semantics as other rope ops).
-        reuse_freqs_front_part: Matches frequency table layout for partial RoPE.
+        reuse_freqs_front_part: Frequency-table layout selector for partial RoPE.
+            True means front-part reuse tables with ``cos/sin.shape[-1] ==
+            rotary_dim_half``; False means non-reuse tables with
+            ``cos/sin.shape[-1] == 2 * rotary_dim_half``.
         attn_output_gate: Whether Q+gate is packed in ``qkv``; returns ``(q, gate, k, v)``.
         k_scale, v_scale: Optional per-call scalars applied before cache write.
         eps: RMSNorm epsilon.
-        rotary_dim_half: If set, must equal ``cos.shape[-1]`` (explicit check).
+        rotary_dim_half: Optional half-width of the rotated subspace. When set, it
+            corresponds to ``cos.shape[-1]`` only in reuse mode; in non-reuse mode the
+            table last dim is the full rotary width, ``2 * rotary_dim_half``.
         gated_qkv_layout: ``"interleaved"`` or ``"blocked"`` when ``attn_output_gate``.
     """
     T = qkv.shape[0]
