@@ -65,7 +65,7 @@ def _gluon_rms_norm_kernel(
         
         #Loop through the rows of the input tensor by NUM_PROG blocks
         for row_idx in range(row_start, n_rows, NUM_PROG):
-            input_base = input_ptr + (row_idx * input_row_stride)
+            input_ptr + (row_idx * input_row_stride)
             output_base = output_ptr + (row_idx * output_row_stride)
             #sum_sq store
             sum_sq = 0.0
