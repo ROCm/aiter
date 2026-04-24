@@ -3,18 +3,18 @@
 """
 aiter.ops.opus — opus kernel Python-side bindings.
 
-Public API (PR1: id-based tune + FP8 grouped deepgemm):
-  * opus_gemm_a16w16_tune (from gemm_op_a16w16)
-  * deepgemm_opus         (from deepgemm)
-
-PR2 will add the shape-driven `gemm_a16w16_opus` (CSV lookup + heuristic
-fallback + AITER_OPUS_LOG_UNTUNED auto-log).
+Public API:
+  * gemm_a16w16_opus       — shape-driven wrapper (CSV lookup + C++
+                             heuristic fallback). Typical user entry.
+  * opus_gemm_a16w16_tune  — id-based low-level binding (tuner / override).
+  * deepgemm_opus          — FP8 grouped binding (unchanged legacy API).
 """
 
-from .gemm_op_a16w16 import opus_gemm_a16w16_tune
+from .gemm_op_a16w16 import opus_gemm_a16w16_tune, gemm_a16w16_opus
 from .deepgemm import deepgemm_opus
 
 __all__ = [
     "opus_gemm_a16w16_tune",
+    "gemm_a16w16_opus",
     "deepgemm_opus",
 ]

@@ -1,47 +1,41 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
-Opus a16w16 tuned-CSV lookup against the **global** aiter BF16 GEMM CSVs.
+Opus a16w16 private tuned-CSV lookup + untuned-shape autolog.
 
-Source of truth:
+This module is the Python-side dispatch helper for `gemm_a16w16_opus`.
+It intentionally lives *inside* the opus module tree rather than
+piggybacking on `aiter.jit.core.AITER_CONFIGS` (which is reserved for
+aiter-global configuration shared across backends such as triton / asm /
+flydsl). Opus owns its own env vars and default paths:
 
-  aiter/configs/bf16_tuned_gemm.csv
-  aiter/configs/model_configs/*_bf16_tuned_gemm.csv
+    AITER_OPUS_A16W16_TUNED_CSV
+        Default: aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv
+        Read once per process via lru_cache; ~215 rows typically.
 
-These are the same CSVs that the aiter-global `gemm_a16w16` dispatcher
-reads; opus rows are stamped with `libtype == 'opus'` and coexist with
-`asm` / `triton` / `skinny` / `flydsl` / `torch` / `hipblaslt` rows for
-the same (cu_num, M, N, K, ...) keys. We filter by `libtype == 'opus'`
-here, so the opus runtime dispatch only returns a tuned winner when one
-of those CSVs has an opus row matching the shape.
+    AITER_OPUS_A16W16_UNTUNED_CSV
+        Default: aiter/ops/opus/configs/opus_a16w16_untuned_gemm.csv
+        Target file for AITER_OPUS_LOG_UNTUNED=1 autolog. Missing file
+        is created on first write.
 
-Schema (matches gradlib/GemmTuner.py output):
+    AITER_OPUS_LOG_UNTUNED={0,1}
+        Default: 0. When 1, every (M,N,K,bias,dtype,outdtype,scaleAB,
+        bpreshuffle) tuple that misses the tuned lookup is appended
+        (with de-dup) to the untuned CSV, ready to be fed to
+        `csrc/opus_gemm/opus_gemm_tune.py -i` for offline tuning.
 
-  gfx, cu_num, M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle,
-  libtype, solidx, splitK, us, kernelName, err_ratio, tflops, bw
-
-`gfx` is optional (the legacy opus-private CSV did not have it); when
-absent we tolerate it. Rows missing any of the 9 key columns
-(cu_num/M/N/K/bias/dtype/outdtype/scaleAB/bpreshuffle) are skipped.
-
-Configuration:
-
-  AITER_OPUS_TUNED_CSV_GLOB
-      Colon-separated list of glob patterns for tuned CSVs. Default
-      includes both the global BF16 GEMM CSV and the per-model CSVs
-      under aiter/configs/model_configs/.
-
-  (Removed in this rewrite: AITER_OPUS_A16W16_TUNED_CSV,
-   AITER_OPUS_A16W16_UNTUNED_CSV, AITER_OPUS_LOG_UNTUNED, and the
-   autolog feature. Untuned-shape collection is no longer supported;
-   use gradlib/gemm_tuner.py --libtype opus to tune shapes offline.)
+The lookup uses the 9-column composite key that matches the tuned CSV
+schema from splitk_flatmm plan section 10 (cu_num, M, N, K, bias, dtype,
+outdtype, scaleAB, bpreshuffle). Rows whose libtype != 'opus' are
+filtered out so this file can coexist with a global
+aiter/configs/bf16_tuned_gemm.csv in future integrations.
 """
 
 from __future__ import annotations
 
 import functools
-import glob
 import os
+import threading
 from typing import Optional
 
 import pandas as pd
@@ -49,18 +43,20 @@ import torch
 
 from aiter.jit.core import AITER_ROOT_DIR
 
+
 # ---- Env / default paths --------------------------------------------------
 
-# Colon-separated list of glob patterns; each pattern is expanded with
-# glob.glob() and the results concatenated. Order does not matter -- on
-# duplicate keys we keep the row with the smallest `us` (best winner)
-# across all files.
-_DEFAULT_TUNED_CSV_GLOB = (
-    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv"
-    f":{AITER_ROOT_DIR}/aiter/configs/model_configs/*_bf16_tuned_gemm.csv"
+OPUS_A16W16_TUNED_CSV = os.getenv(
+    "AITER_OPUS_A16W16_TUNED_CSV",
+    f"{AITER_ROOT_DIR}/aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv",
 )
 
-OPUS_TUNED_CSV_GLOB = os.getenv("AITER_OPUS_TUNED_CSV_GLOB", _DEFAULT_TUNED_CSV_GLOB)
+OPUS_A16W16_UNTUNED_CSV = os.getenv(
+    "AITER_OPUS_A16W16_UNTUNED_CSV",
+    f"{AITER_ROOT_DIR}/aiter/ops/opus/configs/opus_a16w16_untuned_gemm.csv",
+)
+
+AITER_OPUS_LOG_UNTUNED = int(os.getenv("AITER_OPUS_LOG_UNTUNED", "0"))
 
 
 # ---- Tuned CSV lookup -----------------------------------------------------
@@ -78,82 +74,33 @@ _KEY_COLUMNS = (
 )
 
 
-def _resolve_csv_paths() -> list[str]:
-    """Expand OPUS_TUNED_CSV_GLOB into a deduplicated list of file paths."""
-    paths: list[str] = []
-    seen: set[str] = set()
-    for pattern in OPUS_TUNED_CSV_GLOB.split(os.pathsep):
-        pattern = pattern.strip()
-        if not pattern:
-            continue
-        for path in sorted(glob.glob(pattern)):
-            if path in seen:
-                continue
-            seen.add(path)
-            paths.append(path)
-    return paths
-
-
 @functools.lru_cache(maxsize=1)
-def _load_tuned_dict() -> dict:
-    """Load opus-flagged rows from all configured tuned CSVs into a dict.
+def _load_tuned_dict():
+    """Load opus tuned CSV into (key_tuple -> dict) for O(1) lookup.
 
-    Returns a mapping `key -> {'solidx', 'splitK', 'kernelName'}` where key
-    is the 9-tuple from `_KEY_COLUMNS`. When multiple CSVs report a winner
-    for the same key, the one with the smallest `us` is retained (best
-    timing wins).
-
-    Cached for the process lifetime. Call `_load_tuned_dict.cache_clear()`
-    if a fresh CSV is dropped in between invocations (rare in production).
+    Cached for the lifetime of the process. Callers can invalidate via
+    `_load_tuned_dict.cache_clear()` if a fresh tune CSV is dropped in
+    between invocations (rare in production hot path).
     """
-    paths = _resolve_csv_paths()
-    if not paths:
+    path = OPUS_A16W16_TUNED_CSV
+    if not os.path.exists(path):
         return {}
-
-    frames: list[pd.DataFrame] = []
-    for path in paths:
-        try:
-            df = pd.read_csv(path)
-        except (pd.errors.EmptyDataError, FileNotFoundError):
-            continue
-        if "libtype" not in df.columns:
-            # CSVs without a `libtype` column predate the multi-backend
-            # schema; they cannot contain opus rows by definition. Skip
-            # rather than misclassify their rows as opus.
-            continue
+    df = pd.read_csv(path).drop_duplicates()
+    if "libtype" in df.columns:
         df = df[df["libtype"] == "opus"]
-        if df.empty:
-            continue
-        missing = [c for c in _KEY_COLUMNS if c not in df.columns]
-        if missing:
-            # Malformed / partial-schema CSV. Skip rather than crash.
-            continue
-        frames.append(df)
-
-    if not frames:
+    missing = [c for c in _KEY_COLUMNS if c not in df.columns]
+    if missing:
+        # CSV is malformed / from a different schema. Fall back to empty
+        # so callers degrade to C++ heuristic instead of raising.
         return {}
-    combined = pd.concat(frames, ignore_index=True).drop_duplicates()
-
-    # Conflict resolution: same 9-tuple key from multiple files -> keep
-    # the row with the smallest `us` (best timing). If `us` is missing,
-    # fall back to first-write-wins.
-    has_us = "us" in combined.columns
-    if has_us:
-        combined = combined.sort_values("us", ascending=True, kind="mergesort")
     out: dict = {}
-    for _, row in combined.iterrows():
+    for _, row in df.iterrows():
         key = tuple(row[c] for c in _KEY_COLUMNS)
-        if key in out:
-            continue  # already kept the better one
-        try:
-            out[key] = {
-                "solidx": int(row["solidx"]),
-                "splitK": int(row["splitK"]),
-                "kernelName": str(row.get("kernelName", "")),
-            }
-        except (KeyError, ValueError, TypeError):
-            # Missing solidx / splitK or non-int values; skip this row.
-            continue
+        out[key] = {
+            "solidx": int(row["solidx"]),
+            "splitK": int(row["splitK"]),
+            "kernelName": str(row.get("kernelName", "")),
+        }
     return out
 
 
@@ -167,7 +114,11 @@ def _key_from_runtime(
     scaleAB: bool = False,
     bpreshuffle: bool = False,
 ) -> tuple:
-    """Build the 9-tuple lookup key using the current device's cu_num."""
+    """Build the 9-tuple lookup key using the current device's cu_num.
+
+    Dtype is serialized as `str(torch.dtype)` (e.g. 'torch.bfloat16'),
+    matching what the tuner's `result_to_df` writes.
+    """
     cu_num = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
@@ -198,11 +149,75 @@ def lookup_tuned(
 
     Dict contains 'solidx' (kernelId), 'splitK', 'kernelName'.
     """
-    key = _key_from_runtime(M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle)
+    key = _key_from_runtime(
+        M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle
+    )
     return _load_tuned_dict().get(key)
 
 
+# ---- Untuned shape autolog ------------------------------------------------
+
+_UNTUNED_LOCK = threading.Lock()
+_UNTUNED_COLUMNS = (
+    "M",
+    "N",
+    "K",
+    "bias",
+    "dtype",
+    "outdtype",
+    "scaleAB",
+    "bpreshuffle",
+)
+
+
+def maybe_log_untuned_shape(
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: torch.dtype,
+    outdtype: torch.dtype,
+    scaleAB: bool = False,
+    bpreshuffle: bool = False,
+) -> None:
+    """Append (M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle) to the
+    untuned CSV for offline tuning. Safe to call unconditionally; this
+    function short-circuits when AITER_OPUS_LOG_UNTUNED != 1.
+
+    Row schema matches aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv
+    so the file can feed directly into `csrc/opus_gemm/opus_gemm_tune.py -i`.
+    """
+    if not AITER_OPUS_LOG_UNTUNED:
+        return
+    path = OPUS_A16W16_UNTUNED_CSV
+    row = {
+        "M": int(M),
+        "N": int(N),
+        "K": int(K),
+        "bias": bool(bias),
+        "dtype": str(dtype),
+        "outdtype": str(outdtype),
+        "scaleAB": bool(scaleAB),
+        "bpreshuffle": bool(bpreshuffle),
+    }
+    with _UNTUNED_LOCK:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path):
+            try:
+                old = pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                old = pd.DataFrame(columns=_UNTUNED_COLUMNS)
+        else:
+            old = pd.DataFrame(columns=_UNTUNED_COLUMNS)
+        new = pd.concat([old, pd.DataFrame([row])], ignore_index=True)
+        new = new.drop_duplicates().reset_index(drop=True)
+        new.to_csv(path, index=False)
+
+
 __all__ = [
-    "OPUS_TUNED_CSV_GLOB",
+    "OPUS_A16W16_TUNED_CSV",
+    "OPUS_A16W16_UNTUNED_CSV",
+    "AITER_OPUS_LOG_UNTUNED",
     "lookup_tuned",
+    "maybe_log_untuned_shape",
 ]
