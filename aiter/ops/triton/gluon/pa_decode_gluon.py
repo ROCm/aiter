@@ -5268,8 +5268,8 @@ def pa_decode_gluon(
     # Calculate elements per 16B load based on data type
     kv_elements_per_16b = 16 // key_cache.dtype.itemsize
 
-    if sliding_window > 0 and kv_block_size != 1024:
-        max_context_partition_num = 1
+    # if sliding_window > 0 and kv_block_size != 1024:
+    #     max_context_partition_num = 1
     grid = (batch_size, num_kv_heads, max_context_partition_num)
 
     assert query_length <= 4, f"query_length == {query_length} exceeds maximum of 4"
@@ -5307,11 +5307,9 @@ def pa_decode_gluon(
         len(key_cache.shape) == 5
     ), f"Expected 5D key_cache tensor, but got shape {key_cache.shape}"
 
-    one_shot = max_context_partition_num <= 1 and not (
-        sliding_window > 0 and kv_block_size == 1024
-    )
+    one_shot = max_context_partition_num <= 1
 
-    if max_context_partition_num > 1:
+    if not one_shot:
         if exp_sums is None:
             exp_sums = torch.empty(
                 batch_size,
