@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -34,8 +35,6 @@ def matmul_launch_metadata(grid, kernel, args):
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
         ret["name"] += "_swiglu"
-    # if args["Quant_static_scale"] is not None:
-    #    ret["name"] += "_quant"
 
     fM = n_tokens
     fK = K if K is not None else n_tokens
@@ -101,96 +100,6 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
-@triton.jit
-def clip(x, limit, clip_lower: tl.constexpr):
-    res = tl.minimum(x, limit)
-    if clip_lower:
-        res = tl.maximum(-limit, res)
-    return res
-
-
-@triton.jit
-def _swiglu(input, alpha, limit):
-    gelu, linear = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
-    gelu = gelu.to(tl.float32)
-    if limit is not None:
-        gelu = clip(gelu, limit, clip_lower=False)
-    linear = linear.to(tl.float32)
-    if limit is not None:
-        linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + tl.exp2(-1.44269504089 * alpha * gelu))
-    return tl.fma(s, linear, s)  # (s * (linear + 1))
-
-
-@triton.jit
-def _reduce_grouped(
-    X,
-    stride_xb: tl.uint64,
-    stride_xm: tl.uint64,
-    stride_xn,  #
-    Out,
-    stride_om: tl.uint64,
-    stride_on,  # output tensor
-    InIndx,
-    B,
-    N,  #
-    # fused activation function
-    APPLY_SWIGLU: tl.constexpr,
-    alpha,
-    limit,
-    ACTIVATION_REDUCTION_N: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    EVEN_N: tl.constexpr,
-):
-    pid_t = tl.program_id(1)
-    pid_n = tl.program_id(0)
-
-    BLOCK_N_OUT: tl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
-    start = pid_t * K
-    # load indices into a tuple
-    if InIndx is None:
-        indxs = (pid_t,)
-    else:
-        indxs = ()
-        for i in tl.static_range(0, K):
-            indxs = indxs + (tl.load(InIndx + start + i),)
-    XPtrs = X + (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) * stride_xn
-    OutPtrs = Out + (pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)) * stride_on
-
-    acc = tl.zeros([BLOCK_N_OUT], dtype=tl.float32)
-    x_n_mask = pid_n * BLOCK_N + tl.arange(0, BLOCK_N) < N
-    # accumulate contributions for this tile
-    for i in tl.static_range(0, K):
-        curr = tl.zeros([BLOCK_N], dtype=tl.float32)
-        # iterate over split_k partial values
-        for b in tl.range(0, B):
-            x_row_ptr = XPtrs + indxs[i] * stride_xm + b * stride_xb
-            if EVEN_N:
-                vals = tl.load(x_row_ptr)
-            else:
-                vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
-            vals = vals.to(tl.float32)
-            curr += vals
-
-        # apply nonlinearity to split-k output
-        if APPLY_SWIGLU:
-            curr = _swiglu(curr[None, :], alpha, limit)
-        curr = tl.reshape(curr, [curr.shape[-1]])
-        # update final accumulator
-        acc += curr
-    # Compute per-32-col MXFP scales for this tile if requested
-    Nrem = N // ACTIVATION_REDUCTION_N
-
-    # write-back for this tile
-    out_ptr = OutPtrs + pid_t * stride_om
-    if EVEN_N:
-        tl.store(out_ptr, acc)
-    else:
-        out_n_mask = pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT) < Nrem
-        tl.store(out_ptr, acc, mask=out_n_mask)
-
-
 @triton.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a16w4(
     Y,
@@ -227,6 +136,7 @@ def _moe_gemm_a16w4(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: tl.constexpr,
+    ADD_RESIDUAL: tl.constexpr,
     # MoE config
     N_EXPTS_ACT: tl.constexpr,
     # optimization config
@@ -264,7 +174,7 @@ def _moe_gemm_a16w4(
 
     MX_PACK_DIVISOR: tl.constexpr = 32
     w_type: tl.constexpr = W.dtype.element_ty
-    tl.static_assert(w_type == tl.uint8, "mx_weight_ptr must be uint8 or fp8")
+    tl.static_assert(w_type == tl.uint8, "mx_weight_ptr must be uint8")
     tl.static_assert(
         WMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
     )
@@ -295,7 +205,6 @@ def _moe_gemm_a16w4(
     pid_emnk = pid
     if XCD_SWIZZLE != 1:
         pid_emnk = xcd_swizzle(pid_emnk, total_actual_tiles, XCD_SWIZZLE)
-    # pid_e = pid_emnk // (unpadded_m * grid_n * SPLIT_K)
     pid_mnk = pid_emnk % (unpadded_m * grid_n * SPLIT_K)
     pid_k = pid_mnk % SPLIT_K
     pid_mn = pid_mnk // SPLIT_K
@@ -438,7 +347,7 @@ def _moe_gemm_a16w4(
             bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         acc = acc + bias[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
-        out = _swiglu(acc, alpha, limit)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
