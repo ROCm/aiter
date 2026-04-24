@@ -23,17 +23,17 @@ def gluon_rms_norm_kernel(
 
     grid = (NUM_PROG,)
     _gluon_rms_norm_kernel[grid](
-        input, 
-        output, 
-        weights, 
+        input,
+        output,
+        weights,
         rsigma,
-        ROW, 
-        COL, 
+        ROW,
+        COL,
         epsilon,
-        input.stride(0), 
+        input.stride(0),
         output.stride(0),
-        BLOCK_SIZE, 
-        USE_BLOCK, 
+        BLOCK_SIZE,
+        USE_BLOCK,
         NUM_PROG,
     )
     return output, rsigma

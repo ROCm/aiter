@@ -388,8 +388,9 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
     torch.testing.assert_close(x_normed, ref_x_normed, atol=atol, rtol=rtol)
 
 
-
 _IS_GFX1250 = get_gfx() == "gfx1250"
+
+
 @pytest.mark.skipif(not _IS_GFX1250, reason="gluon rmsnorm requires gfx1250 hardware")
 @pytest.mark.parametrize("in_dtype_str", ["fp16", "bf16"])
 @pytest.mark.parametrize(
