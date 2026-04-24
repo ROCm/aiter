@@ -23,6 +23,13 @@ def _iris_available() -> bool:
         return False
 
 
+def _is_weak_contiguous(inp: torch.Tensor) -> bool:
+    return inp.is_contiguous() or (
+        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
+        == inp.numel() * inp.element_size()
+    )
+
+
 def _rocm_arch_available() -> bool:
     try:
         props = torch.cuda.get_device_properties(0)
@@ -102,7 +109,7 @@ class AiterCommunicator:
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self.disabled or self._shmem is None:
             return False
-        if not inp.is_contiguous():
+        if not _is_weak_contiguous(inp):
             return False
         inp_size = inp.numel() * inp.element_size()
         if inp_size % 16 != 0:
