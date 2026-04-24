@@ -25,6 +25,10 @@ AITER_INDEX_URL="${5:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
+VLLM_INSTALL_MODE="${VLLM_INSTALL_MODE:-source}"
+VLLM_EXTRA_ARGS="${VLLM_EXTRA_ARGS:-}"
+VLLM_REPOSITORY_URL="${VLLM_REPOSITORY_URL:-https://github.com/vllm-project/vllm}"
+VLLM_GIT_REF="${VLLM_COMMIT:-${VLLM_BRANCH:-main}}"
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
 SHORT_SHA="${AITER_SHA:0:7}"
 IMAGE_TAG="rocm/vllm-aiter-ci:nightly-${SHORT_SHA}"
@@ -36,6 +40,7 @@ echo "Model:       ${MODEL}"
 echo "TP:          ${TP}"
 echo "KV cache:    ${KV_CACHE_DTYPE}"
 echo "Base image:  ${VLLM_BASE_IMAGE}"
+echo "Install mode:${VLLM_INSTALL_MODE}"
 echo ""
 
 # ── Build image ──
@@ -44,16 +49,20 @@ FROM ${VLLM_BASE_IMAGE}
 RUN pip uninstall -y aiter amd-aiter || true
 RUN pip config set global.default-timeout 60 && pip config set global.retries 10
 RUN pip install --upgrade "pybind11>=3.0.1"
-EOF
-
-# Always install aiter from source at the tested SHA.
-# Released wheels may be missing exports (e.g. rms_norm) that newer vLLM expects.
-cat >> /tmp/Dockerfile.vllm-nightly <<EOF
 RUN rm -rf /aiter && git clone https://github.com/ROCm/aiter.git /aiter && \
     cd /aiter && git checkout ${AITER_SHA} && \
-    git submodule sync && git submodule update --init --recursive && \
-    pip install -e .
+    git submodule sync && git submodule update --init --recursive
 EOF
+
+if [[ "${VLLM_INSTALL_MODE}" == "wheel" ]]; then
+  cat >> /tmp/Dockerfile.vllm-nightly <<EOF
+RUN ${AITER_INSTALL_CMD}
+EOF
+else
+  cat >> /tmp/Dockerfile.vllm-nightly <<'EOF'
+RUN cd /aiter && pip install -e .
+EOF
+fi
 
 cat >> /tmp/Dockerfile.vllm-nightly <<'EOF'
 RUN echo "=== AITER version ===" && pip show amd-aiter || true
@@ -71,10 +80,13 @@ else
 fi
 
 # ── Build extra args ──
-EXTRA_ARGS=""
-case "${MODEL}" in *DeepSeek*) EXTRA_ARGS="--block-size 1" ;; esac
+EXTRA_ARGS=()
+if [[ -n "${VLLM_EXTRA_ARGS}" ]]; then
+  read -ra EXTRA_ARGS <<<"${VLLM_EXTRA_ARGS}"
+fi
+case "${MODEL}" in *DeepSeek*) EXTRA_ARGS+=("--block-size" "1") ;; esac
 if [ "${KV_CACHE_DTYPE}" = "fp8" ]; then
-  EXTRA_ARGS="${EXTRA_ARGS} --kv-cache-dtype fp8"
+  EXTRA_ARGS+=("--kv-cache-dtype" "fp8")
 fi
 
 # ── Run benchmark ──
@@ -92,7 +104,7 @@ docker run --rm --device=/dev/kfd ${DEVICE_FLAG} --group-add video \
     --model "${MODEL}" \
     --batch-size 123 --input-len 456 --output-len 78 \
     --num-iters-warmup 3 --num-iters 10 \
-    -tp "${TP}" --load-format dummy ${EXTRA_ARGS} 2>&1 \
+    -tp "${TP}" --load-format dummy "${EXTRA_ARGS[@]}" 2>&1 \
   | tee "${LOG_FILE}"
 
 echo ""
@@ -103,6 +115,7 @@ if ! grep "Avg latency:" "${LOG_FILE}"; then
   tail -50 "${LOG_FILE}"
   exit 1
 fi
+echo "NOTE: PASS indicates the benchmark completed and printed 'Avg latency:' using dummy weights."
 
 # ── Cleanup ──
 docker rmi "${IMAGE_TAG}" || true

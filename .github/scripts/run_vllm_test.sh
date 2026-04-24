@@ -21,13 +21,19 @@ AITER_INDEX_URL="${3:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/resolve_aiter_version.sh"
 
+VLLM_INSTALL_MODE="${VLLM_INSTALL_MODE:-source}"
 VLLM_BASE_IMAGE="${VLLM_BASE_IMAGE:-rocm/vllm-dev:nightly}"
+VLLM_REPOSITORY_URL="${VLLM_REPOSITORY_URL:-https://github.com/vllm-project/vllm}"
+VLLM_GIT_REF="${VLLM_COMMIT:-${VLLM_BRANCH:-main}}"
 SHORT_SHA="${AITER_SHA:0:7}"
 IMAGE_TAG="rocm/vllm-aiter-ci:test-${SHORT_SHA}"
 
 echo "=== vLLM AITER Test ==="
 echo "AITER SHA: ${AITER_SHA}"
 echo "Test cmd:  ${TEST_CMD}"
+echo "Base image: ${VLLM_BASE_IMAGE}"
+echo "Install mode: ${VLLM_INSTALL_MODE}"
+echo "Pinned vLLM ref: ${VLLM_GIT_REF}"
 echo ""
 
 # ── Build image ──
@@ -36,21 +42,32 @@ FROM ${VLLM_BASE_IMAGE}
 RUN pip uninstall -y aiter amd-aiter || true
 RUN pip config set global.default-timeout 60 && pip config set global.retries 10
 RUN pip install --upgrade "pybind11>=3.0.1"
-EOF
-
-# Always install aiter from source at the tested SHA.
-# Released wheels may be missing exports (e.g. rms_norm) that newer vLLM expects.
-cat >> /tmp/Dockerfile.vllm-test <<EOF
 RUN rm -rf /aiter && git clone https://github.com/ROCm/aiter.git /aiter && \
     cd /aiter && git checkout ${AITER_SHA} && \
-    git submodule sync && git submodule update --init --recursive && \
-    pip install -e .
+    git submodule sync && git submodule update --init --recursive
 EOF
+
+if [[ "${VLLM_INSTALL_MODE}" == "wheel" ]]; then
+  cat >> /tmp/Dockerfile.vllm-test <<EOF
+RUN ${AITER_INSTALL_CMD}
+EOF
+else
+  cat >> /tmp/Dockerfile.vllm-test <<'EOF'
+RUN cd /aiter && pip install -e .
+EOF
+fi
 
 cat >> /tmp/Dockerfile.vllm-test <<'EOF'
 RUN echo "=== AITER version ===" && pip show amd-aiter || true
 # Clone vLLM repo for test files (remove existing dir from base image if present)
-RUN rm -rf /app/vllm && git clone --depth 1 https://github.com/vllm-project/vllm.git /app/vllm
+EOF
+
+cat >> /tmp/Dockerfile.vllm-test <<EOF
+RUN rm -rf /app/vllm && git clone ${VLLM_REPOSITORY_URL} /app/vllm && \
+    cd /app/vllm && git fetch --depth 1 origin ${VLLM_GIT_REF} && git checkout FETCH_HEAD
+EOF
+
+cat >> /tmp/Dockerfile.vllm-test <<'EOF'
 # Install vLLM test dependencies
 RUN pip install tblib || true
 EOF

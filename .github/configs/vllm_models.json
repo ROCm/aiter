@@ -42,7 +42,8 @@
     "tp": 8,
     "runner": "aiter-8gpu-runner",
     "label": "MI325-8gpu",
-    "test_type": "bench-latency"
+    "test_type": "bench-latency",
+    "extra_args": "--trust-remote-code"
   },
   {
     "model": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -52,6 +53,66 @@
     "runner": "linux-aiter-mi35x-1",
     "label": "MI35X-1gpu",
     "test_type": "bench-latency"
+  },
+  {
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "model_name": "Mistral-7B",
+    "kv": "default",
+    "tp": 1,
+    "runner": "aiter-1gpu-runner",
+    "label": "MI325-1gpu-wheel",
+    "test_type": "bench-latency",
+    "install_mode": "wheel"
+  },
+  {
+    "model": "moonshotai/Kimi-K2.5",
+    "model_name": "Kimi-K2.5",
+    "kv": "default",
+    "tp": 8,
+    "runner": "aiter-8gpu-runner",
+    "label": "MI325-8gpu-kimi",
+    "test_type": "bench-latency",
+    "extra_args": "--trust-remote-code"
+  },
+  {
+    "model": "moonshotai/Kimi-K2.5",
+    "model_name": "Kimi-K2.5",
+    "kv": "default",
+    "tp": 8,
+    "runner": "linux-aiter-mi35x-8",
+    "label": "MI35X-8gpu-kimi",
+    "test_type": "bench-latency",
+    "extra_args": "--trust-remote-code"
+  },
+  {
+    "model": "MiniMaxAI/MiniMax-M2.5",
+    "model_name": "MiniMax-M2.5",
+    "kv": "default",
+    "tp": 8,
+    "runner": "aiter-8gpu-runner",
+    "label": "MI325-8gpu-minimax",
+    "test_type": "bench-latency",
+    "extra_args": "--trust-remote-code"
+  },
+  {
+    "model": "MiniMaxAI/MiniMax-M2.5",
+    "model_name": "MiniMax-M2.5",
+    "kv": "default",
+    "tp": 8,
+    "runner": "linux-aiter-mi35x-8",
+    "label": "MI35X-8gpu-minimax",
+    "test_type": "bench-latency",
+    "extra_args": "--trust-remote-code"
+  },
+  {
+    "model": "deepseek-ai/DeepSeek-V3",
+    "model_name": "DeepSeek-V3",
+    "kv": "default",
+    "tp": 8,
+    "runner": "linux-aiter-mi35x-8",
+    "label": "MI35X-8gpu-deepseek",
+    "test_type": "bench-latency",
+    "extra_args": "--trust-remote-code"
   },
   {
     "model": "mistralai/Mistral-7B-Instruct-v0.3",

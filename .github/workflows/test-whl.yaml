@@ -10,30 +10,47 @@ on:
       wheel_names:
         description: 'Space-separated list of wheel filenames to test'
         type: string
-        required: true
+        required: false
+        default: ''
+      aiter_index_url:
+        description: 'AITER pip index URL for fallback download'
+        type: string
+        required: false
+        default: ''
+      aiter_version:
+        description: 'Specific AITER version to download when skipping build'
+        type: string
+        required: false
+        default: ''
+      skip_smoke:
+        description: 'Skip executing the wheel smoke test suite'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   test:
+    if: ${{ inputs.skip_smoke != 'true' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           # Python 3.12 tests
-          - runner: aiter-1gpu-runner
-            label: MI300-py312
+          - runner: linux-aiter-mi300x-1
+            label: MI300X-py312
             python_version: "3.12"
             docker_image: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
-          - runner: linux-aiter-mi355-1
-            label: MI355-py312
+          - runner: linux-aiter-mi35x-1
+            label: MI35X-py312
             python_version: "3.12"
             docker_image: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
           # Python 3.10 tests
-          - runner: aiter-1gpu-runner
-            label: MI300-py310
+          - runner: linux-aiter-mi300x-1
+            label: MI300X-py310
             python_version: "3.10"
             docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
-          - runner: linux-aiter-mi355-1
-            label: MI355-py310
+          - runner: linux-aiter-mi35x-1
+            label: MI35X-py310
             python_version: "3.10"
             docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
     runs-on: ${{ matrix.runner }}
@@ -45,14 +62,37 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download wheel artifacts
+        id: download_wheels
+        if: ${{ inputs.wheel_names != '' }}
         uses: actions/download-artifact@v4
         with:
           pattern: aiter-whl-packages-py*
           path: dist
           merge-multiple: true
 
+      - name: Fetch wheel from index when artifacts unavailable
+        if: ${{ steps.download_wheels.outcome == 'skipped' || inputs.wheel_names == '' }}
+        id: fetch_wheel
+        run: |
+          set -eo pipefail
+          if [ -z "${{ inputs.aiter_version }}" ]; then
+            echo "No wheel artifacts and no aiter_version provided."
+            exit 1
+          fi
+          PYTHON_VERSION="${{ matrix.python_version }}"
+          CP_VERSION="cp${PYTHON_VERSION/./}"
+          WHEEL_FILE="amd_aiter-${{ inputs.aiter_version }}-${CP_VERSION}-${CP_VERSION}-linux_x86_64.whl"
+          if [ -z "${{ inputs.aiter_index_url }}" ]; then
+            echo "aiter_index_url is required to download wheel when skipping build."
+            exit 1
+          fi
+          mkdir -p dist
+          curl -fsSL "${{ inputs.aiter_index_url }}${WHEEL_FILE}" -o "dist/${WHEEL_FILE}"
+          echo "WHEEL_NAME=${WHEEL_FILE}" >> "$GITHUB_ENV"
+
       - name: Validate inputs
         run: |
+          set -eo pipefail
           # Validate release_type
           if [[ ! "${{ inputs.release_type }}" =~ ^(nightlies|devreleases)$ ]]; then
             echo "❌ ERROR: Invalid release_type: ${{ inputs.release_type }}"
@@ -60,14 +100,24 @@ jobs:
             exit 1
           fi
 
-          # Validate wheel_names
-          if [ -z "${{ inputs.wheel_names }}" ]; then
-            echo "❌ ERROR: wheel_names is empty"
+          if [ -z "${{ inputs.wheel_names }}" ] && [ -z "${{ inputs.aiter_version }}" ]; then
+            echo "❌ ERROR: Provide wheel_names from build or aiter_version for fallback download"
             exit 1
           fi
 
       - name: Determine wheel to test
         run: |
+          set -eo pipefail
+          if [ -n "${WHEEL_NAME:-}" ]; then
+            echo "Using pre-selected wheel: ${WHEEL_NAME}"
+            exit 0
+          fi
+
+          if [ -z "${{ inputs.wheel_names }}" ]; then
+            echo "❌ ERROR: No wheel names available and fallback download did not populate WHEEL_NAME"
+            exit 1
+          fi
+
           # Convert Python version to wheel format (e.g., 3.12 -> cp312)
           PYTHON_VERSION="${{ matrix.python_version }}"
           CP_VERSION="cp${PYTHON_VERSION/./}"
@@ -208,3 +258,9 @@ jobs:
         run: |
           docker stop aiter_test || true
           docker rm aiter_test || true
+
+  skip:
+    if: ${{ inputs.skip_smoke == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Wheel smoke tests skipped by caller input."
