@@ -2556,9 +2556,10 @@ def attention_loop_tensor_subtile_split(
             wait_count=2, buffer_id=buf_tile_cur,
             target_dtype=q.dtype, skip_wait=MERGE_LOOP_TDM_WAITS,
         )
-        qk1_shifted0, qk1_shifted1 = pgm.split_subtile(qk1_shifted)
-        p10 = gl.exp2(qk1_shifted0)
+        p1 = gl.exp2(qk1_shifted)
         acc0 = acc0 * alpha[:, None]
+        acc1 = acc1 * alpha[:, None]
+
         v0_s, v1_s = pgm.split_subtile(v)
         if not MERGE_LOOP_TDM_WAITS or cfg.NUM_BUFFERS == 2:
             # N=2: K store must land after K ds_load so the prior ds_read has drained
@@ -2569,9 +2570,6 @@ def attention_loop_tensor_subtile_split(
 
         # --- S2: QK sub 1 + SM1-B ---
         qk1 = pgm.compute_qk_subtile(k1_s)
-        p11 = gl.exp2(qk1_shifted1)
-        acc1 = acc1 * alpha[:, None]
-        p1 = pgm.concat_subtile(p10, p11)
         p = pgm.concat_subtile(p0, p1)
         p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
         l_ij = gl.sum(p, 1)
@@ -2624,7 +2622,10 @@ def attention_loop_tensor_subtile_split(
     qk0 = pgm.compute_qk_subtile(k0_s)
     p1 = gl.exp2(qk1_shifted)
     acc0 = acc0 * alpha[:, None]
+    acc1 = acc1 * alpha[:, None]
 
+    if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
+        qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
     v_wait: gl.constexpr = 2
     v = kv_loader.load_v_from_shared(
         wait_count=v_wait, buffer_id=buf_tile_cur,
@@ -2634,9 +2635,7 @@ def attention_loop_tensor_subtile_split(
     # --- S2: QK sub 1 for L+1 + SM1-B for L ---
     qk1 = pgm.compute_qk_subtile(k1_s)
     if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
-        qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_2, 0)
         qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
-    acc1 = acc1 * alpha[:, None]
     p = pgm.concat_subtile(p0, p1)
     p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
     l_ij = gl.sum(p, 1)
@@ -2670,8 +2669,6 @@ def attention_loop_tensor_subtile_split(
     qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
     qk1_shifted = qk1 * QK_scale - m_ij_scaled[:, None]
     p0_next = gl.exp2(qk0_shifted)
-    p1_next = gl.exp2(qk1_shifted)
-    p = pgm.concat_subtile(p0_next, p1_next)
 
     if MERGE_EPI_TDM_WAITS:
         gl.amd.gfx1250.tdm.async_wait(0)
@@ -2686,11 +2683,14 @@ def attention_loop_tensor_subtile_split(
     # --- S1: QK sub 0 for L+2 + SM1-A for L+1 ---
     qk0 = pgm.compute_qk_subtile(k0_s)
     acc0 = acc0 * alpha[:, None]
+    acc1 = acc1 * alpha[:, None]
+    p1_next = gl.exp2(qk1_shifted)
+    p = pgm.concat_subtile(p0_next, p1_next)
+
     qk0 = pgm.apply_mask_qk_subtile(qk0, epilogue_t_3, 0)
 
     # --- S2: QK sub 1 for L+2 + SM1-B for L+1 ---
     qk1 = pgm.compute_qk_subtile(k1_s)
-    acc1 = acc1 * alpha[:, None]
     p = gl.convert_layout(p, pgm.cfg.pv_layout, assert_trivial=True)
     l_ij = gl.sum(p, 1)
     L = L * alpha + l_ij
@@ -2704,10 +2704,6 @@ def attention_loop_tensor_subtile_split(
 
     # --- S3: PV sub 0 for L+1 + SM0 for L+2 ---
     acc0 = pgm.compute_pv(p, v0_s, acc0)
-    v = kv_loader.load_v_from_shared(
-        wait_count=0, buffer_id=buf_tile_next2,
-        target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
-    )
     qk = pgm.concat_subtile(qk0, qk1)
     qk = gl.convert_layout(qk, pgm.cfg.qk_layout, assert_trivial=True)
     m = reduce_max_prop_nan(qk, -1)
@@ -2717,6 +2713,10 @@ def attention_loop_tensor_subtile_split(
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
 
+    v = kv_loader.load_v_from_shared(
+        wait_count=0, buffer_id=buf_tile_next2,
+        target_dtype=q.dtype, skip_wait=MERGE_EPI_TDM_WAITS,
+    )
     # --- S4: PV sub 1 for L+1 + SM0-B for L+2 ---
     acc1 = pgm.compute_pv(p, v1_s, acc1)
     qk0_shifted = qk0 * QK_scale - m_ij_scaled[:, None]
@@ -3084,6 +3084,7 @@ def unified_attention(
     num_kv_blocks=1,
     use_tdm=True,
     shuffled_kv_cache=False,
+    remove_indirect_access=False,
 ):
     """
     Run the unified attention kernel with a paged KV cache.
@@ -3109,7 +3110,7 @@ def unified_attention(
         sinks: Sinks tensor [num_query_heads,]
         loop_variant: 0=double_buf, 1=new_order, 2=subtile_split
     """
-    remove_indirect_access = False
+    remove_indirect_access = remove_indirect_access
     NUM_SEQS = len(seqused_k)
     NUM_Q_HEADS = q.shape[1]
     HEAD_SIZE = q.shape[2]
