@@ -3144,7 +3144,7 @@ def unified_attention(
         TILE_SIZE = 64
         use_tdm = 0
         num_buffers = 2
-    else:
+    elif SLIDING_WINDOW == 0:
         loop_variant = 3
         num_warps = 4
         block_m = 128
@@ -3152,6 +3152,14 @@ def unified_attention(
         num_buffers = 3
         use_tdm = 1
         waves_per_eu = 1
+    else:
+        loop_variant = 0
+        num_warps = 4
+        block_m = 128
+        TILE_SIZE = BLOCK_SIZE
+        num_buffers = 3
+        use_tdm = 1
+        waves_per_eu = 1        
     assert num_buffers == 2 or num_buffers == 3, "num_buffers should be either 2 or 3"
 
     TILE_SIZE = BLOCK_SIZE * num_kv_blocks
