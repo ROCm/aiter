@@ -1497,9 +1497,29 @@ namespace py = pybind11;
           py::arg("x"),                                     \
           py::arg("rotary_dim") = 0);
 
-#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
-    m.def("fused_qk_norm_rope_cache_quant_shuffle",             \
-          &aiter::fused_qk_norm_rope_cache_quant_shuffle);      \
+#define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                                        \
+    m.def("fused_qk_norm_rope_cache_quant_shuffle",                                 \
+          &aiter::fused_qk_norm_rope_cache_quant_shuffle,                           \
+          py::arg("qkv"),                                                          \
+          py::arg("num_heads_q"),                                                  \
+          py::arg("num_heads_k"),                                                  \
+          py::arg("num_heads_v"),                                                  \
+          py::arg("head_dim"),                                                     \
+          py::arg("eps"),                                                          \
+          py::arg("qw"),                                                           \
+          py::arg("kw"),                                                           \
+          py::arg("cos_sin_cache"),                                                \
+          py::arg("is_neox_style"),                                                \
+          py::arg("pos_ids"),                                                      \
+          py::arg("k_cache"),                                                      \
+          py::arg("v_cache"),                                                      \
+          py::arg("slot_mapping"),                                                 \
+          py::arg("kv_cache_dtype"),                                               \
+          py::arg("k_scale"),                                                      \
+          py::arg("v_scale"),                                                      \
+          py::arg("q")        = py::none(),                                        \
+          py::arg("k")        = py::none(),                                        \
+          py::arg("v")        = py::none());                                       \
     m.def("fused_qk_rmsnorm",                                   \
           &aiter::fused_qk_rmsnorm,                             \
           py::arg("q"),                                         \
