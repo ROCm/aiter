@@ -909,34 +909,79 @@ template torch::Tensor
     # ── Lookup / manifest generation ──
 
     def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_HEAD = """#pragma once
+        """Emit opus_gemm_lookup.h with two (M,N,K)->kernel macros.
+
+        Tuned-CSV driven lookup consumed by opus_gemm.cu's runtime
+        `opus_dispatch_a16w16<CDataType>`. Two macros (BF16 / FP32)
+        mirror `gen_a16w16_tune_lookup` and exist because splitk kids
+        (200..210) are only emitted as `<fp32_t>` (their traits
+        static_assert D_C==float, so referencing `splitk<bf16_t>`
+        produces a linker error).
+
+        Per-kid template argument rule (the interesting bit): the map
+        *key* is (M, N, K) regardless of user Y dtype, but the *value*
+        template argument depends on the kid's `output_dtypes`:
+
+          * a16w16 kid 4..9         -> `<CTYPE>` (both bf16/fp32 exist).
+          * a16w16_flatmm 100..115  -> `<CTYPE>` (both exist).
+          * a16w16_flatmm_splitk    -> always `<fp32_t>`. The BF16 map
+            therefore contains splitk entries too, but those entries
+            instantiate `splitk<fp32_t>` -- same trick opus_gemm.cu's
+            heuristic uses. Y is still bf16 because the reduce kernel
+            casts at the end.
+
+          * FP32 map excludes splitk kids entirely (their launcher
+            TORCH_CHECKs Y.dtype()==BFloat16).
+        """
+        HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#define GENERATE_OPUS_LOOKUP_TABLE(CTYPE)                              \\
-   {                                                                   \\"""
+// Per-CTYPE (M,N,K)->kernel tables. splitk kids only live in the FP32
+// specialization of each map (the reduce kernel casts fp32->bf16 Y at
+// runtime); their BF16-map entries still reference splitk<fp32_t>.
+"""
 
-        LOOKUP_TEMPLATE = """
+        # ENTRY_MATCH_CTYPE uses the CTYPE macro parameter so it expands
+        # to `kernel<bf16_t>` inside the BF16 macro and `kernel<fp32_t>`
+        # inside the FP32 macro. ENTRY_FORCE_FP32 hardcodes the template
+        # parameter for splitk kids that only have the fp32 instance.
+        ENTRY_MATCH_CTYPE = """
        {{{MNK},                                                        \\
         {kernel_name}<CTYPE>}},                                        \\"""
+        ENTRY_FORCE_FP32 = """
+       {{{MNK},                                                        \\
+        {kernel_name}<fp32_t>}},                                       \\"""
 
-        LOOKUP_END = """
-   }
-"""
-        with open(os.path.join(self.working_path, "opus_gemm_lookup.h"), "w") as f:
-            f.write(LOOKUP_HEAD)
+        def _emit_map(f, macro_name: str, ctype: str):
+            f.write(f"#define {macro_name}(CTYPE)                         \\\n")
+            f.write("   {                                                                   \\")
             for mnk, k in kernels_dict.items():
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(
-                        LOOKUP_TEMPLATE.format(
-                            MNK="{"
-                            + ", ".join(map(str, list(mnk)))
-                            + "}",
-                            kernel_name=k.name,
-                        )
-                    )
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_TEMPLATE.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_END)
+                if self.istune and isinstance(mnk, int):
+                    mnk_lit = str(mnk)
+                elif (not self.istune) and isinstance(mnk, tuple) and mnk[0] > 0:
+                    mnk_lit = "{" + ", ".join(map(str, list(mnk))) + "}"
+                else:
+                    continue
+
+                is_splitk = k.kernel_tag == "a16w16_flatmm_splitk"
+                if is_splitk:
+                    # splitk only emits <fp32_t>; skip from FP32-output map
+                    # (launcher requires bf16 Y), include in BF16-output
+                    # map with forced <fp32_t> template argument.
+                    if ctype == "fp32_t":
+                        continue
+                    entry = ENTRY_FORCE_FP32
+                else:
+                    if ctype not in k.output_dtypes:
+                        continue
+                    entry = ENTRY_MATCH_CTYPE
+                f.write(entry.format(MNK=mnk_lit, kernel_name=k.name))
+            f.write("\n   }\n\n")
+
+        with open(os.path.join(self.working_path, "opus_gemm_lookup.h"), "w") as f:
+            f.write(HEADER)
+            _emit_map(f, "GENERATE_OPUS_LOOKUP_TABLE_BF16", "bf16_t")
+            _emit_map(f, "GENERATE_OPUS_LOOKUP_TABLE_FP32", "fp32_t")
 
     def gen_a16w16_tune_lookup(self, kernels_dict):
         """Emit opus_gemm_a16w16_tune_lookup.h with int-ID-to-kernel maps for tuning.
@@ -1101,6 +1146,22 @@ if __name__ == "__main__":
         help="filter kernels by tag (e.g. a16w16, a16w16_flatmm, a16w16_flatmm_splitk, a8w8, a8w8_scale)",
     )
 
+    parser.add_argument(
+        "--tune_file",
+        default=None,
+        required=False,
+        help=(
+            "Optional path to the opus-private tuned CSV "
+            "(e.g. aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv). "
+            "When given and the file exists, winners matching the current "
+            "device's cu_num are baked into opus_gemm_lookup.h via "
+            "GENERATE_OPUS_LOOKUP_TABLE so opus_gemm()'s bf16 dispatch can "
+            "hit them at runtime without the Python wrapper being in the "
+            "loop. Without this flag the lookup table stays empty and the "
+            "C++ dispatch falls straight through to the heuristic."
+        ),
+    )
+
     args = parser.parse_args()
     TAG_TO_LIST = {
         "a8w8_scale":           a8w8_scale_kernels_list,
@@ -1112,3 +1173,21 @@ if __name__ == "__main__":
     kdict = TAG_TO_LIST.get(args.kernel_tag, kernels_list) if args.kernel_tag else kernels_list
     codegen = opus_gemm_codegen(args.working_path, args.tune)
     codegen.gen_instances(kdict)
+
+    # If a tuned CSV is provided and present on disk, rewrite
+    # opus_gemm_lookup.h so the C++ side can resolve tuned winners by
+    # (M, N, K). gen_instances() has already emitted an empty version;
+    # overwrite it with the CSV-driven entries. The kernel impls /
+    # instance .cpp files were already produced above so every kernel
+    # referenced by get_tune_dict is guaranteed to be buildable.
+    if args.tune_file and os.path.exists(args.tune_file):
+        tune_dict = get_tune_dict(args.tune_file)
+        # get_tune_dict seeds with default_kernels_dict (negative int keys
+        # used only in --tune runtime lookup); gen_lookup_dict already
+        # skips those via the `isinstance(mnk, tuple) and mnk[0] > 0`
+        # guard, so passing the full dict straight through is safe.
+        codegen.gen_lookup_dict(tune_dict)
+        print(f"[opus gen_instances] baked {sum(1 for k in tune_dict if isinstance(k, tuple) and k[0] > 0)} tuned entries from {args.tune_file} into opus_gemm_lookup.h")
+    else:
+        if args.tune_file:
+            print(f"[opus gen_instances] --tune_file {args.tune_file} not found, using empty lookup")
