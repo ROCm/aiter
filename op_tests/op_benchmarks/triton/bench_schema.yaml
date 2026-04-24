@@ -89,3 +89,6 @@ benchmarks:
   bench_pa_decode_gluon_normal_fp8_blk64_ql4:
     input_columns: [batch_size, context_length]
     output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
+  bench_pa_decode_gluon_normal_bf16_blk64_ql4:
+    input_columns: [batch_size, context_length]
+    output_columns: [Time_(ms) (ms / TB/s), Bandwidth_(TB/s) (ms / TB/s)]
