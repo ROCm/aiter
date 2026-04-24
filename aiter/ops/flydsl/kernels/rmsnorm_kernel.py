@@ -14,19 +14,25 @@ Optimised paths:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
+
 from flydsl.expr import arith, vector, gpu, range_constexpr
 from flydsl.expr.typing import T, Int32
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
 from flydsl._mlir import ir
 from flydsl.expr import buffer_ops
+
+KERNEL_NAME = "rmsnorm"
+
+EPS = 1e-5
+
 import math
 from kernels.kernels_common import dtype_to_elem_type, get_warp_size
 
-KERNEL_NAME = "rmsnorm"
-EPS = 1e-5
-WARP_SIZE = get_warp_size
-VEC_WIDTH = 8
+WARP_SIZE = 64
+DEFAULT_VEC_WIDTH = 8
+F32_VEC_WIDTH = 4
 
 
 def _select_block_threads(N: int, dtype_str: str) -> int:
@@ -38,6 +44,10 @@ def _select_block_threads(N: int, dtype_str: str) -> int:
 def build_rmsnorm_module(M: int, N: int, dtype_str: str):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
+
+    # f32 vec8 lowers to a 32-byte/v8i32 buffer_load, which may fail AMDGPU
+    # instruction selection. Keep f32 on vec4 while preserving vec8 for f16/bf16.
+    VEC_WIDTH = F32_VEC_WIDTH if dtype_str == "f32" else DEFAULT_VEC_WIDTH
 
     BLOCK_THREADS = _select_block_threads(N, dtype_str)
     UNROLL = 2 if (dtype_str != "f32" and N <= 4096) else 1
@@ -132,8 +142,9 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
             raw = buffer_ops.buffer_load(
                 rsrc, dw, vec_width=vec_dwords, dtype=T.i32, soffset_bytes=soff
             )
-            if vec_dwords == VEC_WIDTH:
-                return raw.bitcast(vec_type_e)
+            # Always use vector.bitcast when the destination is a vector type.
+            # raw.bitcast(vec_type_e) fails for f32 because vec_type_e is an MLIR
+            # VectorType and does not expose dtype.width.
             return vector.bitcast(vec_type_e, raw)
 
         def _store_vec(data, rsrc, col_byte_off, soff=None):
@@ -170,9 +181,8 @@ def build_rmsnorm_module(M: int, N: int, dtype_str: str):
                 out_e = y_val.truncf(vec_type_e)
 
             i32_vec_ty = T.vec(vec_dwords, T.i32)
-            if vec_dwords != VEC_WIDTH:
-                return vector.bitcast(i32_vec_ty, out_e)
-            return out_e.bitcast(i32_vec_ty)
+            # Always use vector.bitcast when the destination is a vector type.
+            return vector.bitcast(i32_vec_ty, out_e)
 
         # ==================================================================
         # Tile-fast path: full tiles only. No x caching to reduce register use.
