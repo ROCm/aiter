@@ -1488,14 +1488,19 @@ def paged_attention_decode_sliding_window_head_1(
         )
     if QUERY_SEQ_LEN_POW2 == 1:
         max_logits_group_idx_in_len = max_logits_base_offsets
+        query_token_idx = mtp_idx
         max_logits_base_offsets = mtp_idx * query_group_size + max_logits_base_offsets
     else:
         max_logits_query_len_idx = max_logits_base_offsets // ONE_QUERY_GROUP_SIZE_POW2
         max_logits_group_idx_in_len = (
             max_logits_base_offsets % ONE_QUERY_GROUP_SIZE_POW2
         )
+        # Keep the per-row query token index in the original query sequence space.
+        # `max_logits_base_offsets` below already includes the mtp split offset, so
+        # recomputing from it later would double-count `mtp_idx` for the second split.
+        query_token_idx = mtp_idx * QUERY_SEQ_LEN_POW2 + max_logits_query_len_idx
         max_logits_base_offsets = (
-            mtp_idx * QUERY_SEQ_LEN_POW2 + max_logits_query_len_idx
+            query_token_idx
         ) * query_group_size + max_logits_group_idx_in_len
     if ONE_SHOT:
         if QUERY_SEQ_LEN_POW2 == 1:
@@ -1670,11 +1675,6 @@ def paged_attention_decode_sliding_window_head_1(
         )
 
     key_tensor = gl.load(key_cache_ptr + key_block_offsets)
-    query_token_idx = (
-        mtp_idx * QUERY_SEQ_LEN_POW2
-        + max_logits_base_offsets // ONE_QUERY_GROUP_SIZE_POW2
-    )
-
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
         sequence_partition_start_idx,
@@ -1706,8 +1706,15 @@ def paged_attention_decode_sliding_window_head_1(
                 )
             # Optimize: Load both scales with VMEM scheduling, overlap with key reshape
             key_scale_value_blocked = gl.load(key_scale + key_scale_offsets)
+            # Shared memory is used as a 1D staging buffer for layout conversion.
+            key_scale_value_blocked = gl.reshape(
+                key_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
+            )
             key_scale_shared.store(key_scale_value_blocked)
             value_scale_value_blocked = gl.load(value_scale + key_scale_offsets)
+            value_scale_value_blocked = gl.reshape(
+                value_scale_value_blocked, [CONTEXT_PARTITION_SIZE]
+            )
             value_scale_shared.store(value_scale_value_blocked)
 
         # Reshape key tensor for matrix multiplication
