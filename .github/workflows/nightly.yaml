@@ -147,8 +147,8 @@ jobs:
   # ── Load model configs ──────────────────────────────────────────────
   load-configs:
     if: >-
-      always() && (
-        github.event_name != 'workflow_dispatch' ||
+      always() &&
+      (
         github.event.inputs.run_sglang == 'true' ||
         github.event.inputs.run_vllm == 'true' ||
         github.event.inputs.run_atom == 'true'
@@ -277,13 +277,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Load vLLM pins
         run: |
-          python - <<'PY' >> "$GITHUB_ENV"
-import json
-with open(".github/configs/vllm_pins.json") as f:
-    cfg = json.load(f)
-print(f"VLLM_BASE_IMAGE={cfg['base_image']}")
-print(f"VLLM_COMMIT={cfg['vllm_commit']}")
-PY
+          {
+            printf 'VLLM_BASE_IMAGE=%s\n' "$(jq -r '.base_image' .github/configs/vllm_pins.json)"
+            printf 'VLLM_COMMIT=%s\n' "$(jq -r '.vllm_commit' .github/configs/vllm_pins.json)"
+          } >> "$GITHUB_ENV"
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
       - name: Run vLLM AITER test
