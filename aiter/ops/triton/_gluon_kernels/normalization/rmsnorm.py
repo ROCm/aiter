@@ -32,7 +32,7 @@ def _gluon_rms_norm_kernel(
     sharedLayoutWeights: gl.constexpr = gl.SwizzledSharedLayout(1,1,1,order=[0])
 
     #create a swizzled shared layout for the output
-    sharedLayoutOutput: gl.constexpr = gl.SwizzledSharedLayout(1,1,1,order=[1,0])
+    gl.SwizzledSharedLayout(1,1,1,order=[1,0])
 
     
     #tensor descriptor for input
