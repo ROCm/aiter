@@ -34,8 +34,6 @@ def generate_qkv_inputs(
         qkv_layout: When ``attn_output_gate`` is True, how Q and gate are packed:
             ``"interleaved"`` — ``[q_h0||g_h0||q_h1||g_h1||...]`` then K then V;
             ``"blocked"`` — ``[all Q flat][all gate flat]`` then K then V.
-            Non-gated QKV is always logically interleaved; only gated uses
-            ``blocked``.
     """
     QH = QH_PER_KH * KH
     kv_size = KH * D
@@ -352,8 +350,6 @@ def test_fused_qkv_split_qk_rope_with_cache(
         rotary_dim: RoPE span in features along the head dim; ``None`` means full ``D``,
             ``32`` exercises partial RoPE when ``D`` is 64 or 128.
     """
-    if not attn_output_gate and qkv_layout == "blocked":
-        pytest.skip("blocked QKV layout applies only when attn_output_gate=True")
 
     rd = D if rotary_dim is None else rotary_dim
     if rd > D:

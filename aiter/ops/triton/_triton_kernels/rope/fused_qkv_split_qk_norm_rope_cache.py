@@ -174,7 +174,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # PagedAttention block size
-    ROTARY_DIM_HALF: tl.constexpr = 0,
+    ROTARY_DIM_EFFECTIVE: tl.constexpr = 0,
     BLOCKED_GATED_LAYOUT: tl.constexpr = False,
     HAVE_K_SCALE: tl.constexpr = False,
     HAVE_V_SCALE: tl.constexpr = False,
@@ -191,17 +191,17 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     tl.assume(stride_kv_h > 0)
     tl.assume(stride_kv_d > 0)
 
-    # Half-width of cos/sin table for Neox folding; 0 means full-head (legacy).
-    EFFECTIVE_RDH: tl.constexpr = (
-        ROTARY_DIM_HALF if ROTARY_DIM_HALF > 0 else BLOCK_D_HALF
-    )
-    # ref_rope_sbhd_fwd rotate_dim = cos.shape[-1] * (2 if reuse else 1)
+    # # Half-width of cos/sin table for Neox folding; 0 means full-head (legacy).
+    # EFFECTIVE_RDH: tl.constexpr = (
+    #     ROTARY_DIM_HALF if ROTARY_DIM_HALF > 0 else BLOCK_D_HALF
+    # )
+    # # ref_rope_sbhd_fwd rotate_dim = cos.shape[-1] * (2 if reuse else 1)
     ROTARY_SPAN: tl.constexpr = (
-        EFFECTIVE_RDH * 2 if REUSE_FREQS_FRONT_PART else EFFECTIVE_RDH
+        ROTARY_DIM_EFFECTIVE * 2 if REUSE_FREQS_FRONT_PART else ROTARY_DIM_EFFECTIVE
     )
     PARTIAL_ROTATION: tl.constexpr = ROTARY_SPAN < BLOCK_D
     # NeoX swap operates on first ROTARY_SPAN dims; pair-half width is ROTARY_SPAN // 2.
-    PARTIAL_PAIR_HALF: tl.constexpr = ROTARY_SPAN // 2
+    EFFECTIVE_RDH: tl.constexpr = ROTARY_SPAN // 2
 
     pid_t = tl.program_id(0)
     hq = tl.program_id(1)
@@ -307,7 +307,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
                 stride_qkv_d,
                 q_lane_base,
                 x_mask,
-                PARTIAL_PAIR_HALF,
+                EFFECTIVE_RDH,
             )
         else:
             q_rotated = _partial_gptj_rotated(
@@ -378,7 +378,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
                     stride_qkv_d,
                     K_HEAD_D_OFFSET,
                     x_mask,
-                    PARTIAL_PAIR_HALF,
+                    EFFECTIVE_RDH,
                 )
             else:
                 k_rotated = _partial_gptj_rotated(

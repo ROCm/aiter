@@ -1,6 +1,5 @@
 import torch
 import triton
-from typing import Optional
 
 from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache import (
     _fused_qkv_split_qk_norm_rope_cache_kernel,
@@ -27,13 +26,11 @@ def fused_qkv_split_qk_norm_rope_cache(
     k_scale: torch.Tensor = None,
     v_scale: torch.Tensor = None,
     eps: float = 1e-5,
-    rotary_dim_half: Optional[int] = None,
     gated_qkv_layout: str = "interleaved",
 ):
     """Split packed ``qkv``, RMSNorm Q and K, apply RoPE, write K/V into paged caches.
 
-    Shapes follow ``qh`` / ``kvh`` / ``head_dim``. RoPE uses ``cos`` / ``sin`` last dim
-    as half rotary width (must match ``rotary_dim_half`` when that argument is set).
+    Shapes follow ``qh`` / ``kvh`` / ``head_dim``. RoPE uses ``cos`` / ``sin`` last dim.
     ``reuse_freqs_front_part`` must match how ``cos``/``sin`` were built for partial
     rotation. When ``attn_output_gate`` is True, ``gated_qkv_layout`` is ``"interleaved"``
     (Q then gate per head in the flat Q+gate region) or ``"blocked"`` (all Q then all
@@ -54,7 +51,6 @@ def fused_qkv_split_qk_norm_rope_cache(
         attn_output_gate: Whether Q+gate is packed in ``qkv``; returns ``(q, gate, k, v)``.
         k_scale, v_scale: Optional per-call scalars applied before cache write.
         eps: RMSNorm epsilon.
-        rotary_dim_half: If set, must equal ``cos.shape[-1]`` (explicit check).
         gated_qkv_layout: ``"interleaved"`` or ``"blocked"`` when ``attn_output_gate``.
     """
     T = qkv.shape[0]
@@ -83,18 +79,11 @@ def fused_qkv_split_qk_norm_rope_cache(
         ), 'gated_qkv_layout must be "interleaved" or "blocked"'
     else:
         assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
-        assert (
-            gated_qkv_layout == "interleaved"
-        ), "non-gated QKV only supports interleaved layout"
     assert head_dim == triton.next_power_of_2(head_dim), "head_dim should be power of 2"
 
     assert cos.shape[-1] == sin.shape[-1], "cos and sin must match in last dim"
-    inferred_rd_half = cos.shape[-1]
-    if rotary_dim_half is not None:
-        assert (
-            rotary_dim_half == inferred_rd_half
-        ), f"rotary_dim_half={rotary_dim_half} but cos.shape[-1]={inferred_rd_half}"
-    ROTARY_DIM_HALF = inferred_rd_half
+    # the effective rotary dim, half or full of the rotary dim depending on reuse_freqs_front_part
+    ROTARY_DIM_EFFECTIVE = cos.shape[-1]
 
     # Logic for dimension splitting
     BLOCK_D = head_dim
@@ -153,7 +142,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCK_D=BLOCK_D,
         BLOCK_D_HALF=BLOCK_D_HALF,
         BLOCK_SIZE=block_size,
-        ROTARY_DIM_HALF=ROTARY_DIM_HALF,
+        ROTARY_DIM_EFFECTIVE=ROTARY_DIM_EFFECTIVE,
         BLOCKED_GATED_LAYOUT=(attn_output_gate and gated_qkv_layout == "blocked"),
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
