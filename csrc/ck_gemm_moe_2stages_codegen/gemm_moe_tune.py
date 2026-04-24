@@ -1978,7 +1978,7 @@ class FmoeTuner(TunerCommon):
                     )
         return tasks
 
-    def gen_2stages_task(self, key, blockMs):
+    def gen_2stages_task(self, key, blockMs, use_splitk=False):
         info = key
         tasks_ck = []
         (
@@ -2024,7 +2024,10 @@ class FmoeTuner(TunerCommon):
         )
         ck_stage1_splitk_kernels = {}
         splitk_list = []
-        if is_fp8_blockscale:
+        enable_stage1_splitk = (
+            use_splitk and is_fp8_blockscale and (token * topk <= expert)
+        )
+        if enable_stage1_splitk:
             tilek = 128
             for _sk in range(2, 9):
                 if (model_dim % _sk == 0) and ((model_dim // _sk) % tilek == 0):
@@ -2104,6 +2107,61 @@ class FmoeTuner(TunerCommon):
                             None,
                         )
                     )
+
+                for splitk in splitk_list:
+                    for kernel in ck_stage1_splitk_kernels.values():
+                        if kernel.MPerBlock != blockM:
+                            continue
+                        tagged_kernel_name = f"{kernel.name}_sk{splitk}"
+                        tasks_ck.append(
+                            (
+                                (info, "stage1", tagged_kernel_name, blockM),  # tag
+                                FmoeTuner.generate_data_2stages,
+                                (
+                                    token,
+                                    model_dim,
+                                    inter_dim,
+                                    expert,
+                                    topk,
+                                    act_type,
+                                    dtype,
+                                    q_dtype_a,
+                                    q_dtype_w,
+                                    q_type,
+                                    use_g1u1,
+                                    doweight_stage1,
+                                    blockM,
+                                    1,
+                                ),
+                                FmoeTuner.ck_moe_stage1_fwd_out,  # func
+                                (
+                                    [0, 1, 2, 5, 6, 7, 8, 15, 14],
+                                    dtype,
+                                    topk,
+                                    kernel.name,
+                                    blockM,
+                                    q_type,
+                                    act_type,
+                                    splitk,
+                                ),
+                                {},
+                                FmoeTuner.run_torch_moe_stage1,
+                                (
+                                    [0, 10, 11, 12, 13, 3, 4, 5, 8, 22],
+                                    dtype,
+                                    act_type,
+                                    q_type,
+                                    doweight_stage1,
+                                    topk,
+                                    blockM,
+                                ),
+                                {},
+                                (None),
+                                0.01,
+                                0.01,
+                                None,
+                            )
+                        )
 
                 for kernel in ck_stage2_kernels.values():
                     if kernel.MPerBlock != blockM:
@@ -2760,7 +2818,7 @@ class FmoeTuner(TunerCommon):
                 doweight_stage1,
             )
             tasks.extend(self.gen_2stages_asm1_task(info, blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, blockMs))
+            tasks_ck.extend(self.gen_2stages_task(info, blockMs, args.splitK))
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
             task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
