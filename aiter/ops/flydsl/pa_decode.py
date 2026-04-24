@@ -34,6 +34,7 @@ from .kernels.pa_decode_gfx1250 import (
 
 
 _DEFAULT_PARTITION_SIZE = 256
+_DEFAULT_KV_COMPUTE_BLOCK_SIZE = 64
 
 
 def _dtype_to_str(dt: torch.dtype) -> str:
@@ -54,6 +55,7 @@ def flydsl_paged_attention_decode(
     attn_scale: float,
     *,
     partition_size: int = _DEFAULT_PARTITION_SIZE,
+    kv_compute_block_size: int = _DEFAULT_KV_COMPUTE_BLOCK_SIZE,
 ) -> torch.Tensor:
     """Paged-attention decode for gfx1250.
 
@@ -130,6 +132,7 @@ def flydsl_paged_attention_decode(
         KV_BLOCK_SIZE=kv_block_size,
         QUERY_GROUP_SIZE=query_group_size,
         PARTITION_SIZE=partition_size,
+        KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
         dtype=dtype_str,
     )
     reduce_launch = compile_pa_decode_reduce(
