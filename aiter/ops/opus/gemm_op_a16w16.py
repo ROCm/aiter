@@ -3,7 +3,23 @@
 """
 Opus a16w16 Python user-facing API.
 
-Two entry points:
+Public entry points:
+
+* `gemm_a16w16_opus(A, B, bias=None, dtype=bf16, *, kernelId=None, splitK=None, out=None)`
+  Shape-driven wrapper. The typical user writes `gemm_a16w16_opus(A, B)`
+  and never sees a kid number. Internal path:
+
+    1. Reshape A/B to 3D, allocate Y, validate (bias unsupported;
+       bpreshuffle and non-bf16 A/B also unsupported).
+    2. If `kernelId` is given explicitly -> opus_gemm_a16w16_tune.
+    3. Otherwise query opus-private tuned CSV via aiter.ops.opus.common;
+       on hit -> opus_gemm_a16w16_tune with the tuned (solidx, splitK).
+    4. On miss -> optionally autolog the shape
+       (AITER_OPUS_LOG_UNTUNED=1) and fall through to the private
+       bf16 no-scale fallback binding `_opus_gemm_bf16_dispatch`,
+       which forwards to the C++ entry `opus_gemm` whose bf16 branch
+       does its own lookup + heuristic dispatch (see
+       csrc/opus_gemm/opus_gemm.cu).
 
 * `opus_gemm_a16w16_tune(XQ, WQ, Y, kernelId, splitK)`
   Low-level pybind binding to the id-based tune dispatcher. Exposes a
@@ -11,22 +27,10 @@ Two entry points:
   via `splitK`. Intended for the tuner, for debugging a specific kid,
   and for aiter-global integrations (e.g. future tuned_gemm.solMap).
 
-* `gemm_a16w16_opus(A, B, bias=None, dtype=bf16, *, kernelId=None, splitK=None, out=None)`
-  High-level shape-driven API. The typical user writes
-  `gemm_a16w16_opus(A, B)` and never sees a kid number. Internally:
-
-    1. Reshape A/B to 3D, allocate Y, validate (bias is currently
-       unsupported by opus; bpreshuffle and non-bf16 A/B likewise).
-    2. If `kernelId` is given explicitly -> opus_gemm_a16w16_tune.
-    3. Otherwise query opus-private tuned CSV via aiter.ops.opus.common;
-       on hit -> opus_gemm_a16w16_tune with the tuned (solidx, splitK).
-    4. On miss -> optionally autolog the shape
-       (AITER_OPUS_LOG_UNTUNED=1) and fall through to
-       `deepgemm_opus(XQ, WQ, Y, ...)`, i.e. the C++ entry `opus_gemm`,
-       whose bf16 branch does its own lookup + heuristic dispatch (see
-       csrc/opus_gemm/opus_gemm.cu).
-
-Both entries share the JIT module `module_deepgemm_opus`.
+All entry points share the JIT module `module_deepgemm_opus`, which
+still hosts bindings for other opus kernel families (a8w8 etc.). The
+Python surface is deliberately per-dtype: a16w16 here, a8w8 in its own
+module when that lands.
 """
 
 from typing import Optional
@@ -36,10 +40,9 @@ from torch import Tensor
 
 from ...jit.core import compile_ops
 from . import common as _opus_common
-from .deepgemm import deepgemm_opus as _opus_gemm_cpp_entry
 
 
-# ---- Low-level pybind binding --------------------------------------------
+# ---- Low-level pybind bindings --------------------------------------------
 
 
 def _gen_opus_gemm_a16w16_tune_fake_tensors(
@@ -63,6 +66,42 @@ def opus_gemm_a16w16_tune(
     Y: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
+) -> torch.Tensor: ...
+
+
+# Private bf16 no-scale dispatch binding, used only by gemm_a16w16_opus
+# as the CSV-miss fallback path. Wraps the same C++ function (opus_gemm)
+# that used to be exposed via the legacy aiter.ops.deepgemm.deepgemm_opus
+# entry, but deliberately hides its scale / group_layout arguments so
+# callers of the a16w16 module do not see FP8-grouped concepts. The C++
+# side's bf16 branch handles lookup + heuristic dispatch internally.
+#
+# Parameter annotations match the C++ signature exactly; torch_library's
+# infer_schema requires every parameter be typed even though we always
+# pass None for the last three.
+def _gen_opus_gemm_bf16_dispatch_fake_tensors(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    group_layout: Optional[torch.Tensor] = None,
+    x_scale: Optional[torch.Tensor] = None,
+    w_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return Y
+
+
+@compile_ops(
+    "module_deepgemm_opus",
+    fc_name="opus_gemm",
+    gen_fake=_gen_opus_gemm_bf16_dispatch_fake_tensors,
+)
+def _opus_gemm_bf16_dispatch(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    group_layout: Optional[torch.Tensor] = None,
+    x_scale: Optional[torch.Tensor] = None,
+    w_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor: ...
 
 
@@ -201,7 +240,7 @@ def gemm_a16w16_opus(
         scaleAB=False,
         bpreshuffle=False,
     )
-    _opus_gemm_cpp_entry(XQ, WQ, Y, None, None, None)
+    _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None)
     return _finalize_output(Y, reshape_out_to_2d)
 
 
