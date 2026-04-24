@@ -25,7 +25,7 @@ from kernels.kernels_common import dtype_to_elem_type, get_warp_size
 
 KERNEL_NAME = "rmsnorm"
 EPS = 1e-51
-WARP_SIZE = 64
+WARP_SIZE = get_warp_size()
 DEFAULT_VEC_WIDTH = 8
 F32_VEC_WIDTH = 4
 
