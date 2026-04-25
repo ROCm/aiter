@@ -205,10 +205,16 @@ def flydsl_moe_stage2(
         sorted_weights = torch.empty(0, device=out.device, dtype=torch.float32)
 
     if mode == "reduce":
-        if valid_mask is None and topk_ids is not None and expert_mask is not None:
-            valid_mask = expert_mask[topk_ids]
-        if valid_mask is not None:
-            valid_mask = valid_mask.contiguous().to(torch.uint8)
+        if use_valid_mask:
+            if topk_ids is None or expert_mask is None:
+                raise ValueError(
+                    "reduce mode with valid_mask requires topk_ids and expert_mask"
+                )
+            topk_ids_arg = topk_ids.contiguous().to(torch.int32)
+            expert_mask_arg = expert_mask.contiguous().to(torch.int32)
+        else:
+            topk_ids_arg = None
+            expert_mask_arg = None
         exe(
             out,
             inter_states,
@@ -225,8 +231,9 @@ def flydsl_moe_stage2(
             model_dim,
             inter_dim,
             int(num_expert_blocks),
-            valid_mask=valid_mask,
-            stream=stream,
+            topk_ids=topk_ids_arg,
+            expert_mask=expert_mask_arg,
+            stream_ptr=stream,
         )
     else:
         exe(

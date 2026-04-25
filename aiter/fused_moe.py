@@ -1546,11 +1546,11 @@ def fused_moe_2stages(
                 dtype_str="bf16",
                 use_mask=True,
             )
-            valid_mask = expert_mask[topk_ids].contiguous().to(torch.uint8)
             reduce_exe(
                 moe_intermediate,
                 moe_out,
-                valid_mask,
+                topk_ids.to(torch.int32),
+                expert_mask.to(torch.int32),
                 token_num,
                 torch.cuda.current_stream(),
             )
