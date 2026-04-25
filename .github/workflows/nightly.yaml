@@ -92,30 +92,9 @@ jobs:
       always() &&
       (github.event.inputs.skip_build != 'true' || github.event.inputs.aiter_version != '') &&
       (
-        (
-          github.event.inputs.skip_sglang != 'true' &&
-          github.event.inputs.skip_sglang != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_sglang == 'true'
-          )
-        ) ||
-        (
-          github.event.inputs.skip_vllm != 'true' &&
-          github.event.inputs.skip_vllm != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_vllm == 'true'
-          )
-        ) ||
-        (
-          github.event.inputs.skip_atom != 'true' &&
-          github.event.inputs.skip_atom != true &&
-          (
-            github.event_name != 'workflow_dispatch' ||
-            github.event.inputs.run_atom == 'true'
-          )
-        )
+        github.event.inputs.skip_sglang != 'true' ||
+        github.event.inputs.skip_vllm != 'true' ||
+        github.event.inputs.skip_atom != 'true'
       )
     uses: ./.github/workflows/test-whl.yaml
     with:

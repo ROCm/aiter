@@ -35,7 +35,7 @@ on:
 
 jobs:
   test:
-    if: ${{ inputs.skip_smoke != 'true' && contains(format(',{0},', replace(inputs.python_versions != '' && inputs.python_versions || '3.10,3.12', ' ', '')), format(',{0},', matrix.python_version)) }}
+    if: ${{ inputs.skip_smoke != 'true' && contains(format(',{0},', inputs.python_versions != '' && inputs.python_versions || '3.10,3.12'), format(',{0},', matrix.python_version)) }}
     strategy:
       fail-fast: false
       matrix:
