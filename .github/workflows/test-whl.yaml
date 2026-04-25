@@ -35,7 +35,9 @@ on:
 
 jobs:
   test:
-    if: ${{ inputs.skip_smoke != 'true' && contains(format(',{0},', inputs.python_versions != '' && inputs.python_versions || '3.10,3.12'), format(',{0},', matrix.python_version)) }}
+    if: ${{ inputs.skip_smoke != 'true' }}
+    env:
+      PYTHON_FILTER: ${{ inputs.python_versions != '' && replace(inputs.python_versions, ' ', '') || '3.10,3.12' }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,12 +65,32 @@ jobs:
       contents: read
       actions: read
     steps:
+      - name: Determine if this matrix entry is selected
+        id: filter
+        shell: bash
+        env:
+          FILTER: ${{ env.PYTHON_FILTER }}
+          PY_VER: ${{ matrix.python_version }}
+        run: |
+          filter=",${FILTER},"
+          py=",${PY_VER},"
+          if [[ "$filter" == *"$py"* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip unselected python version
+        if: ${{ steps.filter.outputs.run != 'true' }}
+        run: echo "Skipping matrix for python ${{ matrix.python_version }} (filter: ${{ env.PYTHON_FILTER }})"
+
       - name: Checkout code
+        if: ${{ steps.filter.outputs.run == 'true' }}
         uses: actions/checkout@v4
 
       - name: Download wheel artifacts
         id: download_wheels
-        if: ${{ inputs.wheel_names != '' }}
+        if: ${{ steps.filter.outputs.run == 'true' && inputs.wheel_names != '' }}
         uses: actions/download-artifact@v4
         with:
           pattern: aiter-whl-packages-py*
@@ -76,7 +98,7 @@ jobs:
           merge-multiple: true
 
       - name: Fetch wheel from index when artifacts unavailable
-        if: ${{ steps.download_wheels.outcome == 'skipped' || inputs.wheel_names == '' }}
+        if: ${{ steps.filter.outputs.run == 'true' && (steps.download_wheels.outcome == 'skipped' || inputs.wheel_names == '') }}
         id: fetch_wheel
         run: |
           set -eo pipefail
@@ -96,6 +118,7 @@ jobs:
           echo "WHEEL_NAME=${WHEEL_FILE}" >> "$GITHUB_ENV"
 
       - name: Validate inputs
+        if: ${{ steps.filter.outputs.run == 'true' }}
         run: |
           set -eo pipefail
           # Validate release_type
@@ -111,6 +134,7 @@ jobs:
           fi
 
       - name: Determine wheel to test
+        if: ${{ steps.filter.outputs.run == 'true' }}
         run: |
           set -eo pipefail
           if [ -n "${WHEEL_NAME:-}" ]; then
@@ -148,6 +172,7 @@ jobs:
           fi
 
       - name: Start GPU test container
+        if: ${{ steps.filter.outputs.run == 'true' }}
         run: |
           docker ps -aq -f name=aiter_test | xargs -r docker stop | xargs -r docker rm || true
 
@@ -168,6 +193,7 @@ jobs:
             ${{ matrix.docker_image }}
 
       - name: Verify GPU accessibility
+        if: ${{ steps.filter.outputs.run == 'true' }}
         run: |
           echo "============================================"
           echo "Verifying GPU accessibility"
@@ -182,6 +208,7 @@ jobs:
 
       - name: Install wheels
         id: install
+        if: ${{ steps.filter.outputs.run == 'true' }}
         run: |
           echo "============================================"
           echo "Installing wheel"
