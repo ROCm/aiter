@@ -65,6 +65,7 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
+    weight = weight.to(input.dtype)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         out = rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm)
     else:
@@ -82,6 +83,7 @@ def rmsnorm2d_fwd_with_add(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    weight = weight.to(input.dtype)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         rmsnorm2d_fwd_with_add_ck(
             out,
@@ -133,6 +135,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
+    weight = weight.to(input.dtype)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         assert group_size == 0, "group_size is not supported for ck rmsnorm"
         assert not shuffle_scale, "shuffle_scale is not supported for ck rmsnorm"
@@ -155,6 +158,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
+    weight = weight.to(input.dtype)
     if use_model_sensitive_rmsnorm > 0 or input.shape[-1] > 8192:
         assert group_size == 0, "group_size is not supported for ck rmsnorm"
         assert not shuffle_scale, "shuffle_scale is not supported for ck rmsnorm"
