@@ -1,5 +1,5 @@
 
-export FLIR_PATH=/workspace/FlyDSL
+export FLIR_PATH=/workspace/FLIR
 export AITER_USE_FLYDSL=1
 # Env vars used by FLIR/kernels/moe_gemm_2stage.py (a8w4smooth path)
 export FLIR_A8W4SMOOTH_QPARAM_FORMAT=packed4

@@ -37,7 +37,7 @@ if is_flydsl_available() and FLIR_PATH:
     if FLIR_PATH not in sys.path:
         sys.path.insert(0, FLIR_PATH)
     try:
-        from kernels.moe_gemm_2stage import (
+        from kernels.a8w4_moe_gemm_2stage import (
             compile_moe_reduction,
         )
     except ImportError as e:
@@ -1546,13 +1546,13 @@ def fused_moe_2stages(
                 dtype_str="bf16",
                 use_mask=True,
             )
+            valid_mask = expert_mask[topk_ids].contiguous().to(torch.uint8)
             reduce_exe(
                 moe_intermediate,
                 moe_out,
-                topk_ids,
-                expert_mask,
+                valid_mask,
                 token_num,
-                torch.cuda.current_stream().cuda_stream,
+                torch.cuda.current_stream(),
             )
         else:
             moe_out = moe_intermediate.sum(dim=1)

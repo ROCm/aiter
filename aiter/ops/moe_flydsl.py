@@ -23,7 +23,7 @@ def _ensure_flir():
     if FLIR_PATH not in sys.path:
         sys.path.insert(0, FLIR_PATH)
     try:
-        from kernels.moe_gemm_2stage import (
+        from kernels.a8w4_moe_gemm_2stage import (
             compile_moe_gemm1,
             compile_moe_gemm2,
             compile_moe_gemm2_ex,
@@ -110,7 +110,7 @@ def flydsl_moe_stage1(
     qs = w1_lqq_scale.view(torch.int32)
     qz = w1_lqq_zero.view(torch.int32)
 
-    stream_ptr = torch.cuda.current_stream().cuda_stream
+    stream = torch.cuda.current_stream()
     num_expert_blocks = sorted_expert_ids.shape[0]
 
     if sorted_weights is None:
@@ -132,7 +132,7 @@ def flydsl_moe_stage1(
         inter_dim,
         model_dim,
         int(num_expert_blocks),
-        stream_ptr,
+        stream,
     )
 
     return out
@@ -191,37 +191,24 @@ def flydsl_moe_stage2(
         in_dtype="a8w4smooth",
         out_dtype="bf16",
         mode=mode,
-        expert_mask=True if use_valid_mask else None,
+        valid_mask=True if use_valid_mask else None,
         zero_intermediate=False,
     )
 
     qs = w2_lqq_scale.view(torch.int32)
     qz = w2_lqq_zero.view(torch.int32)
 
-    stream_ptr = torch.cuda.current_stream().cuda_stream
+    stream = torch.cuda.current_stream()
     num_expert_blocks = sorted_expert_ids.shape[0]
 
     if sorted_weights is None:
         sorted_weights = torch.empty(0, device=out.device, dtype=torch.float32)
-    if topk_ids is not None:
-        topk_ids = topk_ids.contiguous()
-    if expert_mask is not None:
-        expert_mask = expert_mask.contiguous()
-    if valid_mask is not None:
-        valid_mask = valid_mask.contiguous()
 
     if mode == "reduce":
-        expected_intermediate_shape = (token_num * topk, model_dim)
-        if intermediate is not None:
-            if (
-                intermediate.device != out.device
-                or intermediate.dtype != out.dtype
-                or intermediate.numel()
-                != expected_intermediate_shape[0] * expected_intermediate_shape[1]
-            ):
-                intermediate = None
-            else:
-                intermediate = intermediate.view(expected_intermediate_shape)
+        if valid_mask is None and topk_ids is not None and expert_mask is not None:
+            valid_mask = expert_mask[topk_ids]
+        if valid_mask is not None:
+            valid_mask = valid_mask.contiguous().to(torch.uint8)
         exe(
             out,
             inter_states,
@@ -238,11 +225,8 @@ def flydsl_moe_stage2(
             model_dim,
             inter_dim,
             int(num_expert_blocks),
-            intermediate=intermediate,
-            topk_ids=topk_ids,
-            expert_mask=expert_mask,
             valid_mask=valid_mask,
-            stream_ptr=stream_ptr,
+            stream=stream,
         )
     else:
         exe(
@@ -261,7 +245,7 @@ def flydsl_moe_stage2(
             model_dim,
             inter_dim,
             int(num_expert_blocks),
-            stream_ptr,
+            stream,
         )
 
     return out
