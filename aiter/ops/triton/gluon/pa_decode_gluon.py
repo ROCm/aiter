@@ -1447,12 +1447,32 @@ def paged_attention_decode_sliding_window_head_1(
             ptr=query_ptr, offsets=mtp_query_offsets, mask=mtp_query_mask
         )
     if SLIDING_WINDOW > 0:
-        sequence_start_idx = context_length - SLIDING_WINDOW
         sequence_end_idx = context_length
-        sequence_partition_start_idx = gl.maximum(
-            0, sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
+        sequence_start_idx = context_length - SLIDING_WINDOW
+        window_partition_start_idx = gl.maximum(
+            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
         )
-        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+        window_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+        window_partition_count = gl.maximum(
+            0, window_partition_end_idx - window_partition_start_idx
+        )
+        sequence_split_count = gl.maximum(
+            1, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
+        partitions_per_sequence_split = gl.cdiv(
+            window_partition_count, sequence_split_count
+        )
+        local_partition_start_idx = (
+            window_partition_start_idx
+            + partitions_per_sequence_split * sequence_split_idx
+        )
+        local_partition_end_idx = gl.minimum(
+            window_partition_end_idx,
+            window_partition_start_idx
+            + partitions_per_sequence_split * (sequence_split_idx + 1),
+        )
+        sequence_partition_start_idx = local_partition_start_idx + block_split_idx
+        sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
@@ -2519,12 +2539,32 @@ def paged_attention_decode_sliding_window(
         ptr=query_ptr, offsets=mtp_query_offsets, mask=mtp_query_mask
     )
     if SLIDING_WINDOW > 0:
-        sequence_start_idx = context_length - SLIDING_WINDOW
         sequence_end_idx = context_length
-        sequence_partition_start_idx = gl.maximum(
-            0, sequence_start_idx // CONTEXT_PARTITION_SIZE + block_split_idx
+        sequence_start_idx = context_length - SLIDING_WINDOW
+        window_partition_start_idx = gl.maximum(
+            0, sequence_start_idx // CONTEXT_PARTITION_SIZE
         )
-        sequence_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+        window_partition_end_idx = gl.cdiv(sequence_end_idx, CONTEXT_PARTITION_SIZE)
+        window_partition_count = gl.maximum(
+            0, window_partition_end_idx - window_partition_start_idx
+        )
+        sequence_split_count = gl.maximum(
+            1, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
+        partitions_per_sequence_split = gl.cdiv(
+            window_partition_count, sequence_split_count
+        )
+        local_partition_start_idx = (
+            window_partition_start_idx
+            + partitions_per_sequence_split * sequence_split_idx
+        )
+        local_partition_end_idx = gl.minimum(
+            window_partition_end_idx,
+            window_partition_start_idx
+            + partitions_per_sequence_split * (sequence_split_idx + 1),
+        )
+        sequence_partition_start_idx = local_partition_start_idx + block_split_idx
+        sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
