@@ -2542,7 +2542,7 @@ def paged_attention_decode_sliding_window(
         + kv_block_start_idx // CONTEXT_PARTITION_SIZE_PER_BLOCK,
         offsets=block_indices,
         mask=block_indices < (max_num_kv_blocks - kv_block_start_idx),
-        cache=".cg"
+        cache=".cg",
     )
     max_logits_base_offsets_mtp = gl.arange(
         0, QUERY_GROUP_SIZE_POW2, layout=gl.SliceLayout(1, qk_linear_layout)
@@ -2719,7 +2719,7 @@ def paged_attention_decode_sliding_window(
             + kv_block_start_idx2 // CONTEXT_PARTITION_SIZE_PER_BLOCK,
             offsets=block_indices,
             mask=block_indices < (max_num_kv_blocks - kv_block_start_idx2),
-            cache=".cg"
+            cache=".cg",
         )
 
         page_offset2 = (
@@ -2831,7 +2831,9 @@ def paged_attention_decode_sliding_window(
                 )
                 value_tensor = gl.where(value_in_window_mask, value_tensor, 0.0)
             else:
-                value_tensor = gl.load(value_cache_ptr + value_block_offsets, cache_modifier=".cg")
+                value_tensor = gl.load(
+                    value_cache_ptr + value_block_offsets, cache_modifier=".cg"
+                )
 
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
@@ -2862,7 +2864,9 @@ def paged_attention_decode_sliding_window(
                     value_in_window_mask[None, None, :], value_tensor, 0.0
                 )
             else:
-                value_tensor = gl.load(value_cache_ptr + value_block_offsets, cache_modifier=".cg")
+                value_tensor = gl.load(
+                    value_cache_ptr + value_block_offsets, cache_modifier=".cg"
+                )
 
             # Permute and resape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
@@ -3002,10 +3006,12 @@ def paged_attention_decode_sliding_window(
                 key_cache_ptr + key_block_offsets2,
                 mask=kv_in_window_mask2[None, None, :, None],
                 other=0.0,
-                cache_modifier=".cg"
+                cache_modifier=".cg",
             )
         else:
-            key_tensor2 = gl.load(key_cache_ptr + key_block_offsets2, cache_modifier=".cg")
+            key_tensor2 = gl.load(
+                key_cache_ptr + key_block_offsets2, cache_modifier=".cg"
+            )
 
         attention_output = gl.amd.cdna3.mfma(
             probs_converted, values_converted, pv_accumulator
