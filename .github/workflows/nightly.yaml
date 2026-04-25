@@ -18,11 +18,7 @@ on:
         type: string
         required: false
       skip_build:
-        description: 'Skip build + wheel tests (go straight to integration tests)'
-        type: boolean
-        default: false
-      skip_wheel_smoke:
-        description: 'Skip wheel smoke sanity gate'
+        description: 'Skip build (use aiter_version + aiter_index_url instead)'
         type: boolean
         default: false
       skip_promote:
@@ -85,25 +81,6 @@ jobs:
       contents: read
       actions: read
 
-  # ── Wheel smoke tests ───────────────────────────────────────────────
-  wheel-smoke:
-    needs: [build, load-configs]
-    if: >-
-      always() &&
-      github.event.inputs.skip_wheel_smoke != 'true' &&
-      (github.event.inputs.skip_build != 'true' || github.event.inputs.aiter_version != '')
-    uses: ./.github/workflows/test-whl.yaml
-    with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
-      wheel_names: ${{ needs.build.outputs.wheel_names || '' }}
-      aiter_index_url: ${{ github.event.inputs.aiter_index_url }}
-      aiter_version: ${{ github.event.inputs.aiter_version }}
-      skip_smoke: ${{ github.event.inputs.skip_wheel_smoke == 'true' }}
-      python_versions: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.python_version != '' && github.event.inputs.python_version || '3.10,3.12' }}
-    permissions:
-      contents: read
-      actions: read
-
   # ── Load model configs ──────────────────────────────────────────────
   load-configs:
     if: >-
@@ -132,12 +109,11 @@ jobs:
   # ── SGLang Integration ───────────────────────────────────────────────
   sglang:
     name: "SGLang (${{ matrix.test_name }})"
-    needs: [load-configs, wheel-smoke]
+    needs: [build, load-configs]
     if: >-
-      (
-        github.event.inputs.skip_sglang != 'true' &&
-        github.event.inputs.skip_sglang != true
-      )
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_sglang != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -162,12 +138,11 @@ jobs:
   # ── vLLM Benchmarks ────────────────────────────────────────────────
   vllm:
     name: "vLLM (${{ matrix.label }}, ${{ matrix.model_name }}, ${{ matrix.kv }})"
-    needs: [load-configs, wheel-smoke]
+    needs: [build, load-configs]
     if: >-
-      (
-        github.event.inputs.skip_vllm != 'true' &&
-        github.event.inputs.skip_vllm != true
-      )
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_vllm != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -209,12 +184,11 @@ jobs:
   # ── vLLM AITER Kernel Tests ─────────────────────────────────────────
   vllm-tests:
     name: "vLLM Test (${{ matrix.test_name }})"
-    needs: [load-configs, wheel-smoke]
+    needs: [build, load-configs]
     if: >-
-      (
-        github.event.inputs.skip_vllm != 'true' &&
-        github.event.inputs.skip_vllm != true
-      )
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_vllm != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
@@ -249,12 +223,11 @@ jobs:
   # ── ATOM Accuracy ──────────────────────────────────────────────────
   atom:
     name: "ATOM (${{ matrix.model_name }})"
-    needs: [load-configs, wheel-smoke]
+    needs: [build, load-configs]
     if: >-
-      (
-        github.event.inputs.skip_atom != 'true' &&
-        github.event.inputs.skip_atom != true
-      )
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_atom != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -287,14 +260,13 @@ jobs:
 
   # ── Promote ────────────────────────────────────────────────────────
   promote:
-    needs: [build, wheel-smoke, sglang, vllm, vllm-tests, atom]
+    needs: [build, sglang, vllm, vllm-tests, atom]
     if: >-
       always() &&
       github.repository_owner == 'ROCm' &&
       github.event.inputs.skip_promote != 'true' &&
       github.event.inputs.skip_build != 'true' &&
       needs.build.result == 'success' &&
-      (needs.wheel-smoke.result == 'success' || needs.wheel-smoke.result == 'skipped') &&
       (needs.sglang.result == 'success' || needs.sglang.result == 'skipped') &&
       (needs.vllm.result == 'success' || needs.vllm.result == 'skipped') &&
       (needs.vllm-tests.result == 'success' || needs.vllm-tests.result == 'skipped') &&
