@@ -680,6 +680,8 @@ def compile_hgemm_kernel(
             out_raw = fly_values(C)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
             out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
+            if const_expr(HAS_BIAS):
+                cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
@@ -693,9 +695,6 @@ def compile_hgemm_kernel(
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     pk_val = cs_.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
-                        cond_ks0 = arith.cmpi(
-                            arith.CmpIPredicate.eq, ks_idx, fx.Index(0)
-                        )
                         bias_if = scf.IfOp(
                             cond_ks0,
                             results_=[T.vec(LDG_VEC_SIZE, dtype_)],

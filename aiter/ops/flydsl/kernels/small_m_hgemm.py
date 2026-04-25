@@ -794,6 +794,8 @@ def compile_small_m_hgemm_kernel(
             out_raw = fly_values(c_tensor)[0]
             out_base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, out_raw)
             out_base_int = llvm.PtrToIntOp(_i64_type, out_base_ptr).result
+            if const_expr(HAS_BIAS):
+                cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
             for i in range_constexpr(LDG_REG_C_COUNT):
                 global_tid = BLOCK_THREADS * i + tid
                 m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
@@ -807,9 +809,6 @@ def compile_small_m_hgemm_kernel(
                 with ir.InsertionPoint(cond_boundary_if.then_block):
                     pk_val = c_s.vec_load((m_local_idx, n_local_idx), LDG_VEC_SIZE)
                     if const_expr(HAS_BIAS):
-                        cond_ks0 = arith.cmpi(
-                            arith.CmpIPredicate.eq, ks_idx, fx.Index(0)
-                        )
                         bias_if = scf.IfOp(
                             cond_ks0,
                             results_=[T.vec(LDG_VEC_SIZE, dtype_)],
@@ -973,7 +972,7 @@ def compile_small_m_hgemm_kernel(
                         b_frags[kk * WARP_N_STEPS + ii] = vec
                 return b_frags
 
-            def run_b_to_lds_tile(tile_n_offset):
+            def run_b_to_lds_tile(tile_n_offset, needs_store_barrier: bool):
                 c_frags_local = [acc_init] * C_FRAGS_LEN
                 ldg_sts_a_async(ks_begin, 0)
                 ldg_sts_b_async(bs_, ks_begin, 0, tile_n_offset)
@@ -1069,14 +1068,18 @@ def compile_small_m_hgemm_kernel(
                     store_split_k_tile(C, C_, cs_, tile_n_offset)
                 else:
                     store_c_tile(BIAS_, C_, cs_, tile_n_offset)
-                gpu.barrier()
+                if const_expr(needs_store_barrier):
+                    gpu.barrier()
 
             for tile_i in range_constexpr(tile_group):
                 tile_exec_if = scf.IfOp(
                     tile_actives[tile_i], results_=[], has_else=False
                 )
                 with ir.InsertionPoint(tile_exec_if.then_block):
-                    run_b_to_lds_tile(tile_n_offsets[tile_i])
+                    run_b_to_lds_tile(
+                        tile_n_offsets[tile_i],
+                        needs_store_barrier=tile_i + 1 < tile_group,
+                    )
                     scf.YieldOp([])
         else:
             sts_a(ldg_a(ks_begin), 0)
@@ -1203,7 +1206,8 @@ def compile_small_m_hgemm_kernel(
                         store_split_k_tile(C, C_, cs_, tile_n_offsets[tile_i])
                     else:
                         store_c_tile(BIAS_, C_, cs_, tile_n_offsets[tile_i])
-                    gpu.barrier()
+                    if const_expr(tile_i + 1 < N_TILE_REPEAT):
+                        gpu.barrier()
                     scf.YieldOp([])
 
     @flyc.jit
