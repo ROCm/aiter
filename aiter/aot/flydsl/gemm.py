@@ -230,11 +230,6 @@ def _compile_hgemm_to_cache(
     a = torch.empty((m, k), device=dev, dtype=torch_dtype)
     b = torch.empty((n, k), device=dev, dtype=torch_dtype)
     bias = torch.empty((n,), device=dev, dtype=torch_dtype)
-    counter = torch.zeros(
-        (128 * 3,),
-        device=dev,
-        dtype=torch.int32,
-    )
     stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
 
     exe = compile_flydsl_hgemm_kernel(
@@ -260,7 +255,7 @@ def _compile_hgemm_to_cache(
     )
     # FlyDSL JIT does not accept None for tensor slots; pass a real buffer when
     # bias fusion is disabled (matches runtime launcher dummy tensor behavior).
-    _compile_executable_to_cache(exe, out, a, b, bias, m, counter, 0, stream)
+    _compile_executable_to_cache(exe, out, a, b, bias, m, stream)
 
 
 def _compile_preshuffle_to_cache(

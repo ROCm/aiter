@@ -34,7 +34,6 @@ def _get_dtypes():
     return dtypes
 
 
-SPLIT_K_COUNTER_MAX_LEN = 128
 FIXED_STAGE = 2
 FIXED_C_TO_LDS = False
 KERNEL_ASYNC_COPY = get_rocm_arch() != "gfx942"
@@ -60,9 +59,6 @@ _HGEMM_KERNEL_RE = re.compile(
     r")?"
     r"_(?P<target_gfx>gfx[0-9a-z]+)$"
 )
-
-SplitKStreamKey = tuple[int, int]
-SPLIT_K_GLOBAL_SEMAPHORE: dict[SplitKStreamKey, torch.Tensor] = {}
 
 # Expand the original default HGEMM catalog with the extra cases that proved
 # useful during the wider one-off search, instead of maintaining separate
@@ -184,13 +180,6 @@ def flydsl_kernel_name(
         )
     name += f"_{get_gfx()}"
     return name
-
-
-def _stream_cache_key(stream: torch.cuda.Stream) -> SplitKStreamKey:
-    device_index = stream.device.index
-    if device_index is None:
-        raise ValueError(f"Unable to determine device index for stream {stream!r}")
-    return (device_index, int(stream.cuda_stream))
 
 
 def _normalize_launch_stream(
@@ -664,34 +653,6 @@ def _register_all_configs():
 _register_all_configs()
 
 
-def _get_split_k_global_semaphore(stream: torch.cuda.Stream) -> torch.Tensor:
-    key = _stream_cache_key(stream)
-    semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
-    if semaphore is None:
-        semaphore = torch.zeros(
-            (SPLIT_K_COUNTER_MAX_LEN,),
-            dtype=torch.int64,
-            device=stream.device,
-        )
-        SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
-    return semaphore
-
-
-def _check_split_k_counter_capacity(
-    m: int, n: int, tile_m: int, tile_n: int, split_k: int
-) -> None:
-    if split_k <= 1:
-        return
-    bm = (m + tile_m - 1) // tile_m
-    bn = n // tile_n
-    required = bm * bn
-    if required > SPLIT_K_COUNTER_MAX_LEN:
-        raise ValueError(
-            "Split-K counter capacity exceeded: "
-            f"requires {required} counters, max supported is {SPLIT_K_COUNTER_MAX_LEN}"
-        )
-
-
 def _compile_flydsl_hgemm(
     dtype: str,
     m: int,
@@ -806,9 +767,7 @@ def _compile_flydsl_hgemm(
             )
         launch_bias = b if bias is None else bias
         runtime_m = int(a.shape[0])
-        _check_split_k_counter_capacity(runtime_m, n, tile_m, tile_n, split_k)
         launch_stream = _normalize_launch_stream(a.device, stream)
-        semaphore = _get_split_k_global_semaphore(launch_stream)
         return _run_compiled(
             kernel,
             out,
@@ -816,7 +775,6 @@ def _compile_flydsl_hgemm(
             b,
             launch_bias,
             runtime_m,
-            semaphore,
             launch_stream,
         )
 
@@ -871,10 +829,16 @@ def flydsl_hgemm(
                 "first or pass `auto_shuffle_b=True`."
             )
 
-    if out is None:
-        out = torch.empty((m, n), dtype=a.dtype, device=a.device)
-
     launch_stream = _normalize_launch_stream(a.device, stream)
+    split_k_out_initialized = False
+    if out is None:
+        if split_k > 1:
+            with torch.cuda.stream(launch_stream):
+                out = torch.zeros((m, n), dtype=a.dtype, device=a.device)
+            split_k_out_initialized = True
+        else:
+            out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+
     launcher = _compile_flydsl_hgemm(
         kernel_dtype,
         m,
@@ -900,6 +864,10 @@ def flydsl_hgemm(
         has_bias=bias is not None,
     )
 
+    if split_k > 1:
+        with torch.cuda.stream(launch_stream):
+            if not split_k_out_initialized:
+                out.zero_()
     launcher(out, a, b, bias=bias, stream=launch_stream)
     return out
 
