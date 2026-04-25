@@ -27,10 +27,15 @@ on:
         type: boolean
         required: false
         default: false
+      python_versions:
+        description: 'Comma-separated Python versions to smoke test (e.g. 3.12 or 3.10,3.12)'
+        type: string
+        required: false
+        default: '3.10,3.12'
 
 jobs:
   test:
-    if: ${{ inputs.skip_smoke != 'true' }}
+    if: ${{ inputs.skip_smoke != 'true' && contains(format(',{0},', replace(inputs.python_versions != '' && inputs.python_versions || '3.10,3.12', ' ', '')), format(',{0},', matrix.python_version)) }}
     strategy:
       fail-fast: false
       matrix:
@@ -49,8 +54,8 @@ jobs:
             label: MI300X-py310
             python_version: "3.10"
             docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
-          - runner: linux-aiter-mi355-1
-            label: MI355-py310
+          - runner: linux-aiter-mi35x-1
+            label: MI35X-py310
             python_version: "3.10"
             docker_image: rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1
     runs-on: ${{ matrix.runner }}

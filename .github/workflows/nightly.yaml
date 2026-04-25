@@ -25,22 +25,6 @@ on:
         description: 'Skip wheel smoke sanity gate'
         type: boolean
         default: false
-      skip_tests:
-        description: '[Deprecated] alias for skip_wheel_smoke'
-        type: boolean
-        default: false
-      skip_sglang:
-        description: 'Skip SGLang integration tests'
-        type: boolean
-        default: false
-      skip_vllm:
-        description: 'Skip vLLM integration tests'
-        type: boolean
-        default: false
-      skip_atom:
-        description: 'Skip ATOM integration tests'
-        type: boolean
-        default: false
       skip_promote:
         description: 'Skip promote job'
         type: boolean
@@ -55,16 +39,16 @@ on:
         type: string
         required: false
         default: ''
-      run_sglang:
-        description: 'Run SGLang integration tests'
+      skip_sglang:
+        description: 'Skip SGLang integration tests'
         type: boolean
         default: false
-      run_vllm:
-        description: 'Run vLLM integration tests'
+      skip_vllm:
+        description: 'Skip vLLM integration tests'
         type: boolean
         default: false
-      run_atom:
-        description: 'Run ATOM integration tests'
+      skip_atom:
+        description: 'Skip ATOM integration tests'
         type: boolean
         default: false
       sglang_job_filter:
@@ -139,7 +123,8 @@ jobs:
       wheel_names: ${{ needs.build.outputs.wheel_names || '' }}
       aiter_index_url: ${{ github.event.inputs.aiter_index_url }}
       aiter_version: ${{ github.event.inputs.aiter_version }}
-      skip_smoke: ${{ github.event.inputs.skip_wheel_smoke == 'true' || github.event.inputs.skip_tests == 'true' }}
+      skip_smoke: ${{ github.event.inputs.skip_wheel_smoke == 'true' }}
+      python_versions: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.python_version != '' && github.event.inputs.python_version || '3.10,3.12' }}
     permissions:
       contents: read
       actions: read
@@ -149,9 +134,9 @@ jobs:
     if: >-
       always() &&
       (
-        github.event.inputs.run_sglang == 'true' ||
-        github.event.inputs.run_vllm == 'true' ||
-        github.event.inputs.run_atom == 'true'
+        github.event.inputs.skip_sglang != 'true' ||
+        github.event.inputs.skip_vllm != 'true' ||
+        github.event.inputs.skip_atom != 'true'
       )
     runs-on: ubuntu-latest
     outputs:
@@ -177,10 +162,6 @@ jobs:
       (
         github.event.inputs.skip_sglang != 'true' &&
         github.event.inputs.skip_sglang != true
-      ) &&
-      (
-        github.event_name != 'workflow_dispatch' ||
-        github.event.inputs.run_sglang == 'true'
       )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -211,10 +192,6 @@ jobs:
       (
         github.event.inputs.skip_vllm != 'true' &&
         github.event.inputs.skip_vllm != true
-      ) &&
-      (
-        github.event_name != 'workflow_dispatch' ||
-        github.event.inputs.run_vllm == 'true'
       )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -262,10 +239,6 @@ jobs:
       (
         github.event.inputs.skip_vllm != 'true' &&
         github.event.inputs.skip_vllm != true
-      ) &&
-      (
-        github.event_name != 'workflow_dispatch' ||
-        github.event.inputs.run_vllm == 'true'
       )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -306,10 +279,6 @@ jobs:
       (
         github.event.inputs.skip_atom != 'true' &&
         github.event.inputs.skip_atom != true
-      ) &&
-      (
-        github.event_name != 'workflow_dispatch' ||
-        github.event.inputs.run_atom == 'true'
       )
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
