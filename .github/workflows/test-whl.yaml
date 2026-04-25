@@ -82,7 +82,8 @@ jobs:
 
       - name: Skip unselected python version
         if: ${{ steps.filter.outputs.run != 'true' }}
-        run: echo "Skipping matrix for python ${{ matrix.python_version }} (filter: ${{ env.PYTHON_FILTER }})"
+        run: |
+          echo "Skipping matrix for python ${{ matrix.python_version }} (filter: ${{ env.PYTHON_FILTER }})"
 
       - name: Checkout code
         if: ${{ steps.filter.outputs.run == 'true' }}
@@ -106,15 +107,35 @@ jobs:
             echo "No wheel artifacts and no aiter_version provided."
             exit 1
           fi
-          PYTHON_VERSION="${{ matrix.python_version }}"
-          CP_VERSION="cp${PYTHON_VERSION/./}"
-          WHEEL_FILE="amd_aiter-${{ inputs.aiter_version }}-${CP_VERSION}-${CP_VERSION}-linux_x86_64.whl"
           if [ -z "${{ inputs.aiter_index_url }}" ]; then
             echo "aiter_index_url is required to download wheel when skipping build."
             exit 1
           fi
+          PYTHON_VERSION="${{ matrix.python_version }}"
+          CP_VERSION="cp${PYTHON_VERSION/./}"
+          VERSION="${{ inputs.aiter_version }}"
+          INDEX_URL="${{ inputs.aiter_index_url }}"
+
+          INDEX_HTML=$(curl -fsSL "${INDEX_URL}")
+          VERSION_PATTERN="${VERSION//+/%2B}"
+          WHEEL_FILE=$(echo "${INDEX_HTML}" | grep -oP "amd_aiter-${VERSION_PATTERN}-${CP_VERSION}-${CP_VERSION}-[^\"><]+\.whl" | head -1)
+          if [ -z "${WHEEL_FILE}" ]; then
+            WHEEL_FILE=$(echo "${INDEX_HTML}" | grep -oP "amd_aiter-${VERSION}-${CP_VERSION}-${CP_VERSION}-[^\"><]+\.whl" | head -1)
+          fi
+          if [ -z "${WHEEL_FILE}" ]; then
+            echo "ERROR: No wheel found for amd_aiter==${VERSION} (${CP_VERSION}) at ${INDEX_URL}"
+            echo "Available wheels:"
+            echo "${INDEX_HTML}" | grep -oP "amd_aiter-[^\"><]+\.whl" | sort -u
+            exit 1
+          fi
+          echo "Found wheel: ${WHEEL_FILE}"
           mkdir -p dist
-          curl -fsSL "${{ inputs.aiter_index_url }}${WHEEL_FILE}" -o "dist/${WHEEL_FILE}"
+          curl -fsSL "${INDEX_URL}${WHEEL_FILE}" -o "dist/${WHEEL_FILE}"
+          WHEEL_FILE_DECODED="${WHEEL_FILE//%2B/+}"
+          if [ "${WHEEL_FILE}" != "${WHEEL_FILE_DECODED}" ]; then
+            mv "dist/${WHEEL_FILE}" "dist/${WHEEL_FILE_DECODED}"
+            WHEEL_FILE="${WHEEL_FILE_DECODED}"
+          fi
           echo "WHEEL_NAME=${WHEEL_FILE}" >> "$GITHUB_ENV"
 
       - name: Validate inputs

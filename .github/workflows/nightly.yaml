@@ -90,12 +90,8 @@ jobs:
     needs: [build, load-configs]
     if: >-
       always() &&
-      (github.event.inputs.skip_build != 'true' || github.event.inputs.aiter_version != '') &&
-      (
-        github.event.inputs.skip_sglang != 'true' ||
-        github.event.inputs.skip_vllm != 'true' ||
-        github.event.inputs.skip_atom != 'true'
-      )
+      github.event.inputs.skip_wheel_smoke != 'true' &&
+      (github.event.inputs.skip_build != 'true' || github.event.inputs.aiter_version != '')
     uses: ./.github/workflows/test-whl.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
