@@ -72,8 +72,7 @@ jobs:
           FILTER: ${{ env.PYTHON_FILTER }}
           PY_VER: ${{ matrix.python_version }}
         run: |
-          filter_raw="${FILTER:-}"
-          filter=",${filter_raw//[[:space:]]/},"
+          filter=",$(echo "${FILTER:-}" | tr -d '[:space:]'),"
           py=",${PY_VER},"
           if [[ "$filter" == *"$py"* ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
