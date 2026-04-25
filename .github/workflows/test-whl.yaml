@@ -37,7 +37,7 @@ jobs:
   test:
     if: ${{ inputs.skip_smoke != 'true' }}
     env:
-      PYTHON_FILTER: ${{ inputs.python_versions != '' && replace(inputs.python_versions, ' ', '') || '3.10,3.12' }}
+      PYTHON_FILTER: ${{ inputs.python_versions != '' && inputs.python_versions || '3.10,3.12' }}
     strategy:
       fail-fast: false
       matrix:
@@ -72,7 +72,8 @@ jobs:
           FILTER: ${{ env.PYTHON_FILTER }}
           PY_VER: ${{ matrix.python_version }}
         run: |
-          filter=",${FILTER},"
+          filter_raw="${FILTER:-}"
+          filter=",${filter_raw//[[:space:]]/},"
           py=",${PY_VER},"
           if [[ "$filter" == *"$py"* ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -240,6 +241,7 @@ jobs:
 
       - name: Run single-GPU tests
         id: tests
+        if: ${{ steps.filter.outputs.run == 'true' }}
         run: |
           echo "============================================================"
           echo "Running SINGLE-GPU tests on ${{ matrix.label }}"
@@ -269,7 +271,7 @@ jobs:
           "
 
       - name: Test summary
-        if: always()
+        if: ${{ always() && steps.filter.outputs.run == 'true' }}
         run: |
           echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Runner**: ${{ matrix.runner }}" >> $GITHUB_STEP_SUMMARY
@@ -286,7 +288,7 @@ jobs:
           fi
 
       - name: Clean up
-        if: always()
+        if: ${{ always() && steps.filter.outputs.run == 'true' }}
         run: |
           docker stop aiter_test || true
           docker rm aiter_test || true
