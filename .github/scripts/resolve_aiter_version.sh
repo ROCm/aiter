@@ -11,18 +11,26 @@ AITER_PYTHON_TAG="${AITER_PYTHON_TAG:-cp312}"
 if [ -n "${AITER_INDEX_URL:-}" ]; then
   # Find the direct wheel URL from the index
   WHEEL_URL=$(python3 -c "
-import re, urllib.request
+import re, urllib.parse, urllib.request
 index = '${AITER_INDEX_URL}'.rstrip('/')
 version_filter = '${AITER_VERSION:-}'
 pytag = '${AITER_PYTHON_TAG}'
-url = index + '/amd-aiter/'
+# If the URL already ends with a package path, use it directly; otherwise append /amd-aiter/
+if index.rstrip('/').endswith('amd-aiter'):
+    url = index + '/'
+else:
+    url = index + '/amd-aiter/'
 with urllib.request.urlopen(url, timeout=30) as resp:
-    html = resp.read().decode()
-# Find all wheels matching the requested Python tag
-pattern = r'href=\"([^\"]*amd_aiter-[^\"]*' + pytag + r'-' + pytag + r'-linux_x86_64\.whl)\"'
+    html = urllib.parse.unquote(resp.read().decode())
+# Find all wheels matching the requested Python tag (any platform tag)
+pattern = r'href=\"([^\"]*amd_aiter-[^\"]*' + pytag + r'-' + pytag + r'-[^\"]+\.whl)\"'
 wheels = re.findall(pattern, html)
 if not wheels:
-    raise SystemExit(f'No {pytag} wheels found')
+    # Try without href quotes (some indices use different formatting)
+    pattern2 = r'(amd_aiter-[^\s\"<>]*' + pytag + r'-' + pytag + r'-[^\s\"<>]+\.whl)'
+    wheels = re.findall(pattern2, html)
+if not wheels:
+    raise SystemExit(f'No {pytag} wheels found at {url}')
 # Resolve relative URLs
 resolved = []
 for w in wheels:
@@ -31,7 +39,7 @@ for w in wheels:
     elif w.startswith('../'):
         resolved.append(index + '/' + w.lstrip('./'))
     else:
-        resolved.append(index + '/' + w)
+        resolved.append(url + w)
 # Filter by version if specified
 if version_filter:
     encoded = version_filter.replace('+', '%2B')
