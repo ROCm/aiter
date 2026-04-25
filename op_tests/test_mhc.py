@@ -627,7 +627,7 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    default=[512, 1024, 2048, 8192, 65536],
+    default=[1, 32, 64, 128, 256, 512, 1024, 2048, 8192, 65536],
     help="""M.
     e.g.: -m 32""",
 )
