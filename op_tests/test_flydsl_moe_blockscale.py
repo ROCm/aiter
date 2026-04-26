@@ -601,3 +601,102 @@ def test_moe_blockscale_dsv4_no_tp_shape(B, model_dim, inter_dim, E, topk):
     _run_stage2_and_compare(
         data, stage1_out, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 6.5 — Full-CSV coverage: every kernelName1/2 row in the DSV4 tuned
+# config must (a) resolve through `get_flydsl_blockscale_kernel_params`
+# (NOT fall through to FP4 or CK), and (b) compute correctly vs torch ref
+# for the row's token count. Failure here BLOCKS silicon validation.
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+_DSV4_CSV_PATH = _os.path.abspath(
+    _os.path.join(
+        _os.path.dirname(__file__),
+        "..",
+        "aiter",
+        "configs",
+        "model_configs",
+        "dsv4_fp8_blockscale_tuned_fmoe.csv",
+    )
+)
+
+
+def _load_dsv4_csv():
+    import pandas as pd
+    return pd.read_csv(_DSV4_CSV_PATH)
+
+
+def test_dsv4_csv_kernel_names_resolve():
+    """Every kernelName1/2 in the DSV4 CSV must contain `_blockscale_` AND
+    resolve through `get_flydsl_blockscale_kernel_params` (not fall through
+    to the FP4 wrapper or CK MoE).
+    """
+    from aiter.ops.flydsl.moe_blockscale_kernels import (
+        get_flydsl_blockscale_kernel_params,
+    )
+    df = _load_dsv4_csv()
+    assert len(df) > 0, "DSV4 CSV is empty"
+    for col in ("kernelName1", "kernelName2"):
+        assert col in df.columns, f"missing column: {col}"
+        for kn in df[col]:
+            kn = str(kn)
+            assert (
+                "_blockscale_" in kn
+            ), f"row {kn}: missing `_blockscale_` substring (would route to FP4 wrapper)"
+            params = get_flydsl_blockscale_kernel_params(kn)
+            assert params is not None, f"unregistered kernel: {kn}"
+
+
+@pytest.mark.parametrize("token_count", [1, 12, 128, 512, 1024])
+def test_dsv4_csv_pair_correctness(token_count: int):
+    """For each token count covered by the DSV4 CSV, run the assigned
+    (kernelName1, kernelName2) pair end-to-end and assert numerical
+    correctness against the torch reference.
+
+    Uses the TP=8 per-rank shape (inter_dim_per_rank=384 = 3072/8) that
+    matches what runs on production silicon.
+    """
+    from aiter.ops.flydsl.moe_blockscale_kernels import (
+        get_flydsl_blockscale_kernel_params,
+    )
+    df = _load_dsv4_csv()
+    rows = df[df["token"] == token_count]
+    if len(rows) == 0:
+        pytest.skip(f"no CSV row for token={token_count}")
+    row = rows.iloc[0]
+    kn1 = str(row["kernelName1"])
+    kn2 = str(row["kernelName2"])
+    params1 = get_flydsl_blockscale_kernel_params(kn1)
+    params2 = get_flydsl_blockscale_kernel_params(kn2)
+    assert params1 is not None and params2 is not None
+
+    B = token_count
+    model_dim = 7168
+    inter_dim_per_rank = 384
+    E = 384
+    topk = 6
+
+    data = _build_blockscale_inputs(
+        B=B,
+        model_dim=model_dim,
+        inter_dim=inter_dim_per_rank,
+        E=E,
+        topk=topk,
+        block_m=int(params1["tile_m"]),
+    )
+    stage1_out = _run_stage1_and_compare(
+        data,
+        tile_m=int(params1["tile_m"]),
+        tile_n=int(params1["tile_n"]),
+        tile_k=int(params1["tile_k"]),
+    )
+    _run_stage2_and_compare(
+        data,
+        stage1_out,
+        tile_m=int(params2["tile_m"]),
+        tile_n=int(params2["tile_n"]),
+        tile_k=int(params2["tile_k"]),
+    )
