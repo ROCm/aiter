@@ -93,3 +93,30 @@ class TestHappyPathVariousShapes:
             dict(B=1, M=64, K=8, N=64, D=64, num_tokens=64, head=8),
         ]:
             dsv4_validate_sparse_attn_metadata(**_ok_meta(**kw))
+
+
+class TestDeviceContiguity:
+    def test_kv_device_must_match_q(self):
+        if not torch.cuda.is_available():
+            pytest.skip("needs cuda for cross-device test")
+        m = _ok_meta()
+        m["q"] = m["q"].to("cuda")
+        # kv stays on CPU
+        with pytest.raises(ValueError, match=r"kv\.device=.*q\.device="):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_topk_must_be_contiguous(self):
+        # Use transpose to construct non-contiguous topk_idxs
+        # Shape [2,4,4] transposed to [4,4,2] is non-contiguous
+        non_contig = torch.zeros(2, 4, 4, dtype=torch.int32).transpose(0, 1)
+        assert not non_contig.is_contiguous(), "test setup must produce non-contig"
+        # non_contig.shape == [4, 2, 4]; matching q [4, 2, 2, 64], kv [4, 12, 64]
+        m = _ok_meta(B=4, M=2, K=4, N=12, num_tokens=8)
+        m["q"] = torch.zeros(4, 2, 2, 64)
+        m["kv"] = torch.zeros(4, 12, 64)
+        m["topk_idxs"] = non_contig
+        m["positions"] = torch.zeros(8, dtype=torch.long)
+        m["slot_mapping"] = torch.zeros(8, dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0, 8], dtype=torch.int32)
+        with pytest.raises(ValueError, match="topk_idxs must be contiguous"):
+            dsv4_validate_sparse_attn_metadata(**m)

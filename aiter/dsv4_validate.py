@@ -57,3 +57,17 @@ def dsv4_validate_sparse_attn_metadata(
         raise ValueError(
             f"cu_seqlens_q.dtype must be int32/int64, got {cu_seqlens_q.dtype}"
         )
+
+    # ---- 3. Device & contiguity ----------------------------------------
+    dev = q.device
+    for name, t in (
+        ("kv", kv),
+        ("topk_idxs", topk_idxs),
+        ("slot_mapping", slot_mapping),
+        ("positions", positions),
+        ("cu_seqlens_q", cu_seqlens_q),
+    ):
+        if t.device != dev:
+            raise ValueError(f"{name}.device={t.device} != q.device={dev}")
+        if not t.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
