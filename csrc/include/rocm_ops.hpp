@@ -181,6 +181,18 @@ namespace py = pybind11;
           "                int max_context_len,"                  \
           "                Tensor? alibi_slopes,"                 \
           "                str kv_cache_dtype,"                   \
+          "                float k_scale, float v_scale) -> ()"); \
+    m.def("paged_attention_ragged_nhd",                           \
+          &paged_attention_ragged_nhd,                            \
+          "paged_attention_ragged_nhd(Tensor! out, Tensor exp_sums,"  \
+          "                Tensor max_logits, Tensor tmp_out,"        \
+          "                Tensor query, Tensor key_cache,"           \
+          "                Tensor value_cache, int num_kv_heads,"     \
+          "                float scale, Tensor block_tables,"         \
+          "                Tensor context_lens, int block_size,"      \
+          "                int max_context_len,"                      \
+          "                Tensor? alibi_slopes,"                     \
+          "                str kv_cache_dtype,"                       \
           "                float k_scale, float v_scale) -> ()");
 
 #define ATTENTION_V1_PYBIND                                       \
