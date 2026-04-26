@@ -42,6 +42,7 @@ void paged_attention_ragged(std::optional<std::string> folder,
     const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warpSize);
     const std::string alibi_enabled = alibi_slopes_ptr ? "true" : "false";
     std::list<std::string> args{std::to_string(gqa_ratio),
+                                std::to_string(num_kv_heads),
                                 std::to_string(head_size),
                                 std::to_string(npar_loops),
                                 dtype,
@@ -155,6 +156,7 @@ void paged_attention_ragged_nhd(std::optional<std::string> folder,
         args.push_back(func_name);
         execute_cmd(R"(python3 -m csrc.cpp_itfs.pa.pa_ragged_nhd \
                                     --gqa_ratio={} \
+                                    --num_kv_heads={} \
                                     --head_size={} \
                                     --npar_loops={} \
                                     --dtype={} \

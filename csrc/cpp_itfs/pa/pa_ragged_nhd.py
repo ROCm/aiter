@@ -11,6 +11,7 @@ with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged_nhd.cpp.jinja", "r") as 
 
 def compile(
     gqa_ratio: int,
+    num_kv_heads: int,
     head_size: int,
     npar_loops: int,
     dtype: str,
@@ -41,10 +42,12 @@ def compile(
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged.cuh",
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_kernels.cuh",
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_common.cuh",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged_nhd_impl.cpp",
             f"{AITER_CORE_DIR}/csrc/include",
             f"{AITER_CORE_DIR}/csrc/include/ck_tile/",
         ],
         gqa_ratio=gqa_ratio,
+        num_kv_heads=num_kv_heads,
         head_size=head_size,
         npar_loops=npar_loops,
         dtype=dtype,
@@ -89,33 +92,23 @@ def paged_attention_ragged_nhd(
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size
-    if kv_cache_dtype == "auto":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "__hip_bfloat16"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "_Float16"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
-        if query.dtype == torch.bfloat16:
-            dtype = "__hip_bfloat16"
-            kv_dtype = "uint8_t"
-        elif query.dtype == torch.float16:
-            dtype = "_Float16"
-            kv_dtype = "uint8_t"
-        else:
-            raise ValueError(f"Unsupported data type: {query.dtype}")
-    else:
-        raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype}")
-
-    if out.dtype == torch.bfloat16:
-        out_dtype = "__hip_bfloat16"
-    elif out.dtype == torch.float16:
-        out_dtype = "_Float16"
-    else:
-        raise ValueError(f"Unsupported data type: {out.dtype}")
+    if query.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise ValueError("paged_attention_ragged_nhd(pa-256) only supports bf16")
+    if kv_cache_dtype != "auto":
+        raise ValueError(
+            "paged_attention_ragged_nhd(pa-256) only supports kv_cache_dtype='auto'"
+        )
+    if kv_cache_layout != "NHD":
+        raise ValueError(
+            "paged_attention_ragged_nhd(pa-256) only supports kv_cache_layout='NHD'"
+        )
+    if block_size != 1:
+        raise ValueError("paged_attention_ragged_nhd(pa-256) only supports block_size=1")
+    if query.size(2) != 256:
+        raise ValueError("paged_attention_ragged_nhd(pa-256) only supports head_size=256")
+    dtype = "__hip_bfloat16"
+    kv_dtype = "__hip_bfloat16"
+    out_dtype = "__hip_bfloat16"
 
     num_kv_heads = key_cache.size(1) if kv_cache_layout == "HND" else key_cache.size(2)
     num_seqs = query.size(0)
@@ -133,6 +126,7 @@ def paged_attention_ragged_nhd(
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
     func = compile(
         gqa_ratio,
+        num_kv_heads,
         head_size,
         npar_loops,
         dtype,
@@ -242,6 +236,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--gqa_ratio", type=int, required=True)
+    parser.add_argument("--num_kv_heads", type=int, required=True)
     parser.add_argument("--head_size", type=int, required=True)
     parser.add_argument("--npar_loops", type=int, required=True)
     parser.add_argument("--dtype", type=str, required=True)
