@@ -526,23 +526,65 @@ def test_moe_blockscale_stage2_sweep(B, model_dim, inter_dim, E, topk):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "B, model_dim, inter_dim_per_rank, E, topk",
+    # ATOM silicon runs DSV4 with TP=8 + column-parallel sharding on w1's
+    # inter_dim. Per-rank w1 shape: [E=384, 2*768=1536, 7168] = 2.1 GB FP8,
+    # which fits comfortably in i32 strides (E*2*inter_per_rank*K = 4.22 G
+    # elements, just under 2**32). This is the actual shape the kernel sees
+    # on production silicon — NOT the 16.9 GB no-TP shape that triggered the
+    # i32 overflow in earlier exploration.
+    [(12, 7168, 384, 384, 6)],  # inter_dim_per_rank = 3072 / TP=8 = 384
+)
+def test_moe_blockscale_dsv4_shape(B, model_dim, inter_dim_per_rank, E, topk):
+    """DSV4 prefill 12-token shape per-TP-rank — gating case for #37 W4.5.
+
+    Validates both stage1 and stage2 of the AITER FlyDSL blockscale port at
+    the DSV4 PER-RANK shape (model=7168, inter_per_rank=384, E=384, topk=6)
+    that runs on silicon under TP=8 column-parallel sharding. This is the
+    realistic kernel input — `aiter.fused_moe.fused_moe` is invoked once
+    per TP rank with already-sharded weights, so the kernel never sees the
+    full 16.9 GB tensor.
+
+    Tile (32, 128, 128) matches the blockscale registry's smallest covered
+    tile, sufficient for the 12-token prefill case.
+    """
+    tile_m, tile_n, tile_k = 32, 128, 128
+    data = _build_blockscale_inputs(
+        B=B,
+        model_dim=model_dim,
+        inter_dim=inter_dim_per_rank,
+        E=E,
+        topk=topk,
+        block_m=tile_m,
+    )
+    stage1_out = _run_stage1_and_compare(
+        data, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k
+    )
+    _run_stage2_and_compare(
+        data, stage1_out, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k
+    )
+
+
 @pytest.mark.xfail(
-    reason="FlyDSL preshuffle B-stride i32 overflow at DSV4 weight scale "
-    "(E*2*inter*K > 2**32 elements); fix requires kernel-side i64 strides "
-    "or per-expert buffer descriptors -- tracked in sunway513/atom#37.",
+    reason="FlyDSL preshuffle B-stride i32 overflow when E*2*inter*K > 2**32 "
+    "elements (>4.3 G); see Task 5 subagent report for empirical bisect data. "
+    "ATOM silicon uses TP=8 + column-parallel sharding so per-rank stays "
+    "well below this — the no-TP test below is xfail'd as a regression "
+    "monitor for the day FlyDSL gains i64 stride support.",
     strict=False,
 )
 @pytest.mark.parametrize(
     "B, model_dim, inter_dim, E, topk",
     [(12, 7168, 3072, 384, 6)],
 )
-def test_moe_blockscale_dsv4_shape(B, model_dim, inter_dim, E, topk):
-    """DSV4 prefill 12-token shape -- gating case for sunway513/atom#37 W4.5.
+def test_moe_blockscale_dsv4_no_tp_shape(B, model_dim, inter_dim, E, topk):
+    """DSV4 full no-TP shape — XFAIL until FlyDSL i64 strides land.
 
-    Validates both stage1 and stage2 of the AITER FlyDSL blockscale port at
-    the DSV4 shape (model=7168, inter=3072, E=384, topk=6) that triggers
-    the W4.5 accuracy regression. Tile (32, 128, 128) matches the
-    blockscale registry's smallest covered tile to minimise compile time.
+    This is the FULL DSV4 MoE shape (16.9 GB FP8 weights) which exceeds
+    i32 stride limits in `make_preshuffle_b_layout`. Kept as a regression
+    monitor — when FlyDSL upstream lands i64-aware preshuffle helpers,
+    remove the xfail to confirm the fix.
     """
     tile_m, tile_n, tile_k = 32, 128, 128
     data = _build_blockscale_inputs(
