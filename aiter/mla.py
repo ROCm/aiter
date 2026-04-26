@@ -226,10 +226,6 @@ def mla_decode_fwd(
         if nhead in [8, 16] and max_seqlen_q == 1:
             MAYBE_FINAL_OUT = False
 
-        # ASM kernels use MFMA_Q=16 tile size and write all 16 rows to R/LSE,
-        # so allocate for the full tile even when nhead < 16.
-        mfma_q = 16 if nhead in [8, 16] and max_seqlen_q == 1 else nhead
-
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if (
@@ -240,14 +236,14 @@ def mla_decode_fwd(
                 )
             )
             else torch.empty(
-                (total_s, num_kv_splits, mfma_q, v_head_dim),
+                (total_s, num_kv_splits, nhead, v_head_dim),
                 dtype=dtypes.fp32,
                 device=device,
             )
         )
 
         attn_lse = torch.empty(
-            (total_s, num_kv_splits, mfma_q, 1), dtype=dtypes.fp32, device=device
+            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
         )
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
