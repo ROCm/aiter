@@ -42,7 +42,6 @@ void paged_attention_ragged(std::optional<std::string> folder,
     const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warpSize);
     const std::string alibi_enabled = alibi_slopes_ptr ? "true" : "false";
     std::list<std::string> args{std::to_string(gqa_ratio),
-                                std::to_string(num_kv_heads),
                                 std::to_string(head_size),
                                 std::to_string(npar_loops),
                                 dtype,
@@ -135,7 +134,9 @@ void paged_attention_ragged_nhd(std::optional<std::string> folder,
     const int gqa_ratio = num_heads / num_kv_heads;
     const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warpSize);
     const std::string alibi_enabled = alibi_slopes_ptr ? "true" : "false";
+    // Must match execute_cmd placeholder order: gqa, num_kv_heads, head, npar, ...
     std::list<std::string> args{std::to_string(gqa_ratio),
+                                std::to_string(num_kv_heads),
                                 std::to_string(head_size),
                                 std::to_string(npar_loops),
                                 dtype,
