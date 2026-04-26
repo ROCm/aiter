@@ -149,3 +149,75 @@ class TestTopkDomain:
         m["slot_mapping"] = torch.zeros(0, dtype=torch.long)
         m["cu_seqlens_q"] = torch.tensor([0], dtype=torch.int32)
         dsv4_validate_sparse_attn_metadata(**m)
+
+
+class TestSlotDomain:
+    def test_slot_negative_rejected(self):
+        m = _ok_meta(num_tokens=2)
+        m["slot_mapping"] = torch.tensor([0, -1], dtype=torch.long)
+        m["positions"] = torch.tensor([0, 1], dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0, 2], dtype=torch.int32)
+        m["q"] = torch.zeros(1, 2, 2, 64)
+        m["topk_idxs"] = torch.zeros(1, 2, 4, dtype=torch.int32)
+        with pytest.raises(ValueError, match="slot_mapping contains negative"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_slot_max_must_be_lt_pool(self):
+        m = _ok_meta(num_tokens=2, pool=4)
+        m["slot_mapping"] = torch.tensor([0, 4], dtype=torch.long)
+        m["positions"] = torch.tensor([0, 1], dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0, 2], dtype=torch.int32)
+        m["q"] = torch.zeros(1, 2, 2, 64)
+        m["topk_idxs"] = torch.zeros(1, 2, 4, dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"slot_mapping max=4 >= pool_capacity=4"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+
+class TestPositionsDomain:
+    def test_positions_negative_rejected(self):
+        m = _ok_meta(num_tokens=2)
+        m["positions"] = torch.tensor([0, -1], dtype=torch.long)
+        m["slot_mapping"] = torch.tensor([0, 1], dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0, 2], dtype=torch.int32)
+        m["q"] = torch.zeros(1, 2, 2, 64)
+        m["topk_idxs"] = torch.zeros(1, 2, 4, dtype=torch.int32)
+        with pytest.raises(ValueError, match="positions contains negative"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+
+class TestCuMonotonicity:
+    def test_cu_must_start_at_zero(self):
+        m = _ok_meta()
+        m["cu_seqlens_q"] = torch.tensor([1, 2], dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"cu_seqlens_q\[0\] must be 0"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_cu_must_be_monotonic(self):
+        m = _ok_meta(num_tokens=2)
+        m["q"] = torch.zeros(1, 2, 2, 64)
+        m["topk_idxs"] = torch.zeros(1, 2, 4, dtype=torch.int32)
+        m["positions"] = torch.tensor([0, 1], dtype=torch.long)
+        m["slot_mapping"] = torch.tensor([0, 1], dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0, 2, 1, 2], dtype=torch.int32)
+        with pytest.raises(ValueError, match="non-decreasing"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_cu_tail_must_match_positions_count(self):
+        m = _ok_meta(num_tokens=2)
+        m["q"] = torch.zeros(1, 2, 2, 64)
+        m["topk_idxs"] = torch.zeros(1, 2, 4, dtype=torch.int32)
+        m["positions"] = torch.tensor([0, 1], dtype=torch.long)
+        m["slot_mapping"] = torch.tensor([0, 1], dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0, 5], dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"cu_seqlens_q\[-1\]=5 != positions"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_positions_count_must_match_slot_mapping(self):
+        m = _ok_meta(num_tokens=2)
+        m["q"] = torch.zeros(1, 2, 2, 64)
+        m["topk_idxs"] = torch.zeros(1, 2, 4, dtype=torch.int32)
+        m["positions"] = torch.tensor([0, 1], dtype=torch.long)
+        m["slot_mapping"] = torch.tensor([0, 1, 2], dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0, 2], dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"positions\.numel\(\)=2 != slot"):
+            dsv4_validate_sparse_attn_metadata(**m)

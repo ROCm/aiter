@@ -86,3 +86,38 @@ def dsv4_validate_sparse_attn_metadata(
                     f"topk_idxs max={max_idx} >= kv.size(N)={kv.shape[1]} "
                     f"-- would cause GPU OOB in sparse_attn"
                 )
+
+    # ---- 5. Slot mapping domain ----------------------------------------
+    if slot_mapping.numel() > 0:
+        if (slot_mapping < 0).any().item():
+            raise ValueError("slot_mapping contains negative ids")
+        max_slot = slot_mapping.max().item()
+        if max_slot >= pool_capacity:
+            raise ValueError(
+                f"slot_mapping max={max_slot} >= pool_capacity={pool_capacity}"
+            )
+
+    # ---- 6. Positions domain -------------------------------------------
+    if positions.numel() > 0:
+        if (positions < 0).any().item():
+            raise ValueError("positions contains negative values")
+
+    # ---- 7. cu_seqlens_q monotonicity & token ownership ---------------
+    if cu_seqlens_q.numel() < 1:
+        raise ValueError("cu_seqlens_q must have at least 1 element ([0])")
+    if cu_seqlens_q[0].item() != 0:
+        raise ValueError(f"cu_seqlens_q[0] must be 0, got {cu_seqlens_q[0].item()}")
+    if cu_seqlens_q.numel() >= 2:
+        diffs = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+        if (diffs < 0).any().item():
+            raise ValueError("cu_seqlens_q must be non-decreasing (monotonic)")
+    if cu_seqlens_q[-1].item() != positions.numel():
+        raise ValueError(
+            f"cu_seqlens_q[-1]={cu_seqlens_q[-1].item()} != "
+            f"positions.numel()={positions.numel()}"
+        )
+    if positions.numel() != slot_mapping.numel():
+        raise ValueError(
+            f"positions.numel()={positions.numel()} != "
+            f"slot_mapping.numel()={slot_mapping.numel()}"
+        )
