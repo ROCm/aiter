@@ -434,7 +434,7 @@ def make_kernel_runner(
 
         r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (block_r**0.5)
 
-        if args.include_quant_overhead:
+        if args.e2e:
             return lambda: fav3_sage_mxfp4_wrapper(
                 q,
                 k,
@@ -629,7 +629,11 @@ def benchmark_single_case(
         current_primary = to_bshd_output_if_needed(current_primary, args.layout)
         ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
         compare_accuracy(current_primary, ref_primary)
-        check_attention_outputs(current_primary, ref_primary, fp8=False)
+        if args.kernel == "sage_mxfp4":
+            # MXFP4 is numerically noisier than BF16/FP32 and needs looser checks.
+            check_attention_outputs(current_primary, ref_primary, fp8=True, atol=3.0e-1, rtol=2.0e-1)
+        else:
+            check_attention_outputs(current_primary, ref_primary, fp8=False)
 
     total_flops = (
         2.0
@@ -825,7 +829,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
     if args.kernel != "sage_mxfp4" and (
-        args.include_quant_overhead or args.qsmooth or args.hadamard_rotate is False
+        args.e2e or args.qsmooth or args.hadamard_rotate is False
     ):
         logger.warning(
             "MXFP4-specific flags are ignored unless --kernel=sage_mxfp4"
@@ -1183,9 +1187,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--include-quant-overhead",
+        "--e2e",
         action="store_true",
-        help="(MXFP4 only) Include quantization overhead in benchmark",
+        help="(MXFP4 only) Include end-to-end quantization overhead in benchmark",
     )
     parser.add_argument(
         "--hadamard-rotate",
