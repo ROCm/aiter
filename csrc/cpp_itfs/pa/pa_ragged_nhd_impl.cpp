@@ -12,9 +12,9 @@
 #include <cstdio>
 #include <cstdlib>
 
-using float16x4 = __fp16 __attribute__ ((ext_vector_type(2)));
-using float16x8 = __fp16 __attribute__ ((ext_vector_type(8)));
-using float16x32 = __fp16 __attribute__ ((ext_vector_type(32)));
+// using float16x4 = __fp16 __attribute__ ((ext_vector_type(2)));
+// using float16x8 = __fp16 __attribute__ ((ext_vector_type(8)));
+// using float16x32 = __fp16 __attribute__ ((ext_vector_type(32)));
 using bfloat16x2 = __bf16  __attribute__ ((ext_vector_type(2)));
 using bfloat16x4 = __bf16  __attribute__ ((ext_vector_type(4)));
 using bfloat16x8 = __bf16  __attribute__ ((ext_vector_type(8)));
@@ -192,8 +192,8 @@ __device__ void s_waitcnt_lgkmcnt() {
 #endif
 #define KV_MIN_PART_SIZE 256
 
-// 本文件当前按 S=256 的 K/V 分段与写回调试；与 PyTorch 参考对齐时请勿混用 S=128。
-static_assert(S == 256, "pa.cpp: K/V LDS 与合并写回仅实现 S=256");
+// This file is tuned for S=256 K/V tiling and write-back; do not mix S=128 when matching PyTorch reference.
+static_assert(S == 256, "pa.cpp: K/V LDS and fused write-back are only implemented for S=256");
 
 template<typename TS, typename TD>
 TD& cast(TS& t) {
@@ -311,9 +311,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint* idx_lds = share_buf.get_idx_buf(warp_id);
     uint idx_global = lane_id + cur_kv_len_start;
     idx_lds[lane_id] = (idx_global < kv_len_end) ? kv_page_indices[idx_global] : 0;
-    // 这条是原始用法先保留 
-    // 似乎该api在rocm7.2 不生效 hipcc -O2 -c -std=c++20 --offload-arch=gfx942 -S -emit-llvm pa.cpp -o k72.ll 
-    // 检查到 llvm ir中无法生成 @llvm.amdgcn.raw.buffer.load.lds
+    // Keep commented: original raw buffer load to LDS path.
+    // On ROCm 7.2 this path appears ineffective (e.g. hipcc -O2 -c -std=c++20 --offload-arch=gfx942 -S -emit-llvm pa.cpp -o k72.ll):
+    // LLVM IR does not emit @llvm.amdgcn.raw.buffer.load.lds.
     //llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + cur_kv_len_start) * sizeof(uint), 0, 0, 0);
     __builtin_amdgcn_sched_barrier(0);
 
@@ -322,14 +322,14 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         if (part_idx == 0)
         if (BLOCK_SIZE == 1) {
             for (uint n = 0; n < KV_PART_SIZE_WARP / 4; n++) {
-    #if FAKE_K_IDX // 这个不用的
-                uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
-                global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
-                k_idxs[n] = global_row_id + 1 + kv_indptr[b];
-    #else
+    // #if FAKE_K_IDX // unused debug path
+    //             uint global_row_id = n * 4 + key_load_row_id + cur_kv_len_start;
+    //             global_row_id = global_row_id < kv_len_end ? global_row_id : 0;
+    //             k_idxs[n] = global_row_id + 1 + kv_indptr[b];
+    // #else
                 //k_idxs[n] = buffer_load_dword<uint>(idx_buf, 0, (key_load_row_id + cur_kv_len_start) * sizeof(uint), n * 4 * sizeof(uint));
-                k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
-    #endif
+            k_idxs[n] = idx_lds[n * 4 + key_load_row_id];
+    // #endif
             }
         }
         // key -> reg
@@ -509,10 +509,10 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         *share_buf.get_sum_buf(fma_row_id, warp_id) = cur_sum;
     }
     __syncthreads();
-    // 开始写回
+    // Begin write-back
     // each wave processes up to ceil(HQ/HK, 4) query tokens (TOKENS_PER_WARP); must match the write-back loop below
     constexpr uint M = HQ / HK; // gqa ratio
-    constexpr uint TOKENS_PER_WARP = (M + 3) / 4; // ceil_div(M, 4) warp 负责的 query token 数目
+    constexpr uint TOKENS_PER_WARP = (M + 3) / 4; // ceil_div(M, 4): query tokens per warp
 
     float maxs[4 * TOKENS_PER_WARP], sums[4 * TOKENS_PER_WARP];
     float real_max[TOKENS_PER_WARP], real_sum[TOKENS_PER_WARP];

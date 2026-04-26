@@ -28,23 +28,16 @@ def compile(
     import os
 
     version = os.getenv("QKV_VERSION", "GOLDEN")
-    if version == "EXPERIMENTAL":
-        if head_size != 128 or kv_dtype != "__hip_bfloat16":
-            print(
-                "EXPERIMENTAL pa_ragged kernel requires head_size=128 and kv_dtype=bf16. Fallback to original kernel"
-            )
 
+    if head_size != 256 or kv_dtype != "__hip_bfloat16" or gqa_ratio >16:
+        print(
+                "[ERROR] pa_ragged_nhd requires head_size=256 and kv_dtype=bf16! and gqa_ratio <= 16!"
+            )
     return compile_template_op(
         src_template,
         MD_NAME,
         [
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h",
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged.cuh",
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_kernels.cuh",
-            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_common.cuh",
             f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged_nhd_impl.cpp",
-            f"{AITER_CORE_DIR}/csrc/include",
-            f"{AITER_CORE_DIR}/csrc/include/ck_tile/",
         ],
         gqa_ratio=gqa_ratio,
         num_kv_heads=num_kv_heads,
