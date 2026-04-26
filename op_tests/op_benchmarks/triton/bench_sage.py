@@ -14,7 +14,6 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.triton.mha import flash_attn_func
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
@@ -55,7 +54,7 @@ arg_to_torch_dtype = {
 
 
 KernelName = Literal[
-    "sage",
+    "sage_fp8",
     "sage_mxfp4",
     "fav3_fp8",
     "aiter_fp8",
@@ -398,24 +397,6 @@ def make_fav3_fp8_runner(
     )
 
 
-def make_fav2_runner(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: Optional[float],
-    causal: bool,
-) -> Any:
-    return lambda: flash_attn_func(
-        q,
-        k,
-        v,
-        dropout_p=0.0,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        return_lse=False,
-        return_attn_probs=False,
-    )
-
 
 def make_torch_ref_runner(
     q: torch.Tensor,
@@ -437,7 +418,7 @@ def make_kernel_runner(
     head_dim = q_bshd.shape[-1]
     softmax_scale = head_dim**-0.5
 
-    if args.kernel == "sage":
+    if args.kernel == "sage_fp8":
         return lambda: fav3_sage_wrapper_func(
             q,
             k,
@@ -591,20 +572,15 @@ def make_reference_output(
         )
         return primary_output(ref_out)
 
-    if ref == "fav2":
-        return primary_output(make_fav2_runner(q_bshd, k_bshd, v_bshd, softmax_scale, args.causal)())
-
-    if ref == "sage":
+    if ref == "aiter_bf16":
         return primary_output(
-            fav3_sage_wrapper_func(
+            aiter.ops.mha.flash_attn_func(
                 q_bshd,
                 k_bshd,
                 v_bshd,
-                softmax_scale,
+                dropout_p=0.0,
                 causal=args.causal,
-                return_lse=False,
-                layout="bshd",
-                block_lut=None,
+                return_attn_probs=False,
             )
         )
 
@@ -667,7 +643,7 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in ("fav3_fp8", "aiter_fp8", "sage", "sage_mxfp4"):
+    if args.kernel in ("fav3_fp8", "aiter_fp8", "sage_fp8", "sage_mxfp4"):
         q_elem_size = 1
         k_elem_size = 1
     else:
@@ -683,7 +659,7 @@ def benchmark_single_case(
 
     if "time(ms)" in provider:
         return ms
-    if "throughput_sparse(TFLOPS)" in provider:
+    if "sparse_throughput(TFLOPS)" in provider:
         flops = sparse_flops if sparse_flops is not None else total_flops
         return flops / ms * 1e-9
     if "throughput(TFLOPS)" in provider:
@@ -696,31 +672,29 @@ def benchmark_single_case(
 
 
 def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[str]:
-    all_metrics = [
-        "time(ms)",
-        "throughput(TFLOPS)",
-        "bandwidth(GB/s)",
-        "arithmetic_intensity(FLOP/byte)",
-    ]
-    if include_sparse_metric:
-        all_metrics.append("throughput_sparse(TFLOPS)")
+    metric_map = {
+        "time": "time(ms)",
+        "throughput": "throughput(TFLOPS)",
+        "bandwidth": "bandwidth(GB/s)",
+        "arithint": "arithmetic_intensity(FLOP/byte)",
+        "sparseput": "sparse_throughput(TFLOPS)",
+    }
 
     if args.compare_to_ref:
         return ["time(ms)"]
 
     if args.metric == "all":
-        return all_metrics
+        # By default (when --metric not specified), show only throughput (matching bench_fav3_sage.py)
+        result = [metric_map["throughput"]]
+        if include_sparse_metric:
+            result.append(metric_map["sparseput"])
+        return result
 
-    metric_map = {
-        "time": "time(ms)",
-        "throughput": "throughput(TFLOPS)",
-        "bandwidth": "bandwidth(GB/s)",
-        "arithmetic_intensity": "arithmetic_intensity(FLOP/byte)",
-        "throughput_sparse": "throughput_sparse(TFLOPS)",
-    }
+    if args.metric == "sparseput" and not include_sparse_metric:
+        raise ValueError("sparse_throughput requires --block-sparsity or --block-mask-file")
 
-    if args.metric == "throughput_sparse" and not include_sparse_metric:
-        raise ValueError("throughput_sparse requires --block-sparsity or --block-mask-file")
+    if args.metric not in metric_map:
+        raise ValueError(f"Unknown metric: {args.metric}")
 
     return [metric_map[args.metric]]
 
@@ -850,8 +824,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.block_sparsity is not None and args.block_mask_file:
         logger.info("Using --block-mask-file; ignoring --block-sparsity")
 
-    if args.compare_to_ref and args.ref not in ("torch", "fav2", "sage"):
-        raise ValueError("--ref must be one of: torch, fav2, sage")
+    if args.compare_to_ref and args.ref not in ("torch", "aiter_bf16"):
+        raise ValueError("--ref must be one of: torch, aiter_bf16")
 
     if args.kernel != "sage_mxfp4" and (
         args.include_quant_overhead or args.qsmooth or args.hadamard_rotate is False
@@ -1136,8 +1110,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kernel",
         type=str,
-        default="sage",
-        choices=["sage", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_bf16"],
+        default="sage_fp8",
+        choices=["sage_fp8", "sage_mxfp4", "fav3_fp8", "aiter_fp8", "aiter_bf16"],
         help="Kernel implementation to benchmark.",
     )
 
@@ -1162,10 +1136,10 @@ def parse_args() -> argparse.Namespace:
             "time",
             "throughput",
             "bandwidth",
-            "arithmetic_intensity",
-            "throughput_sparse",
+            "arithint",
+            "sparseput",
         ],
-        help="Metric(s) to report",
+        help="Metric(s) to report (default: time+throughput only; 'all' does not include bandwidth/arithint)",
     )
 
     parser.add_argument("-o", action="store_true", help="Write Triton output CSV")
@@ -1176,7 +1150,7 @@ def parse_args() -> argparse.Namespace:
         "--ref",
         type=str,
         default="torch",
-        choices=["torch", "fav2", "sage"],
+        choices=["torch", "aiter_bf16"],
         help="Reference kernel for --compare-to-ref",
     )
 
@@ -1292,11 +1266,10 @@ def main() -> int:
             lambda: run_block_sparse_repetitions(args, loaded_single_mask),
         )
 
-    default_runner = (
-        lambda: run_benchmark_captured(args, loaded_single_mask)
-        if args.load_captured
-        else lambda: run_benchmark_generated(args, loaded_single_mask)
-    )
+    if args.load_captured:
+        default_runner = lambda: run_benchmark_captured(args, loaded_single_mask)
+    else:
+        default_runner = lambda: run_benchmark_generated(args, loaded_single_mask)
     return run_with_optional_vgpr(args, default_runner)
 
 
