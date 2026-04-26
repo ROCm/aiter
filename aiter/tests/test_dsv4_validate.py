@@ -57,3 +57,39 @@ class TestShapeRank:
     def test_happy_path_passes(self):
         # Should not raise on valid input
         dsv4_validate_sparse_attn_metadata(**_ok_meta())
+
+
+class TestDtype:
+    def test_topk_must_be_int32(self):
+        m = _ok_meta()
+        m["topk_idxs"] = torch.zeros(1, 1, 4, dtype=torch.int64)
+        with pytest.raises(ValueError, match="topk_idxs.dtype must be int32"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_slot_mapping_must_be_int(self):
+        m = _ok_meta()
+        m["slot_mapping"] = torch.zeros(1, dtype=torch.float32)
+        with pytest.raises(ValueError, match="slot_mapping.dtype must be int"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_positions_must_be_int(self):
+        m = _ok_meta()
+        m["positions"] = torch.zeros(1, dtype=torch.float32)
+        with pytest.raises(ValueError, match="positions.dtype must be int"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_cu_must_be_int(self):
+        m = _ok_meta()
+        m["cu_seqlens_q"] = torch.tensor([0.0, 1.0])
+        with pytest.raises(ValueError, match="cu_seqlens_q.dtype must be int"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+
+class TestHappyPathVariousShapes:
+    def test_passes_for_diverse_shapes(self):
+        for kw in [
+            dict(B=2, M=8, K=16, N=24, D=64, num_tokens=16, head=4),
+            dict(B=4, M=1, K=4, N=8, D=128, num_tokens=4, head=1),
+            dict(B=1, M=64, K=8, N=64, D=64, num_tokens=64, head=8),
+        ]:
+            dsv4_validate_sparse_attn_metadata(**_ok_meta(**kw))

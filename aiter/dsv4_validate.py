@@ -23,6 +23,9 @@ def dsv4_validate_sparse_attn_metadata(
 
     See sunway513/ATOM docs/superpowers/specs/2026-04-26-dsv4-w43-redo-aiter-track-design.md
     §5 for the full ABI contract.
+
+    Note: spec §5.1 mixes shape+dtype; impl splits into §1 (shape/rank) +
+    §2 (dtype) for append-friendly extension.
     """
     # ---- 1. Tensor shape & rank --------------------------------------
     if q.dim() != 4:
@@ -39,4 +42,18 @@ def dsv4_validate_sparse_attn_metadata(
         raise ValueError(
             f"topk_idxs.shape[:2]={tuple(topk_idxs.shape[:2])} != "
             f"q.shape[:2]={tuple(q.shape[:2])}"
+        )
+
+    # ---- 2. Dtype --------------------------------------------------
+    if topk_idxs.dtype != torch.int32:
+        raise ValueError(f"topk_idxs.dtype must be int32, got {topk_idxs.dtype}")
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"slot_mapping.dtype must be int32/int64, got {slot_mapping.dtype}"
+        )
+    if positions.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"positions.dtype must be int32/int64, got {positions.dtype}")
+    if cu_seqlens_q.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"cu_seqlens_q.dtype must be int32/int64, got {cu_seqlens_q.dtype}"
         )
