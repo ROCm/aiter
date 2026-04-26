@@ -731,6 +731,107 @@ def _flydsl_stage2_wrapper(
     )
 
 
+# ---- Sprint 4 (sunway513/atom#37 W4.5 accuracy): blockscale MoE wrappers ----
+# Routes per_1x128 FP8/FP8 (DSV4) MoE through FlyDSL's blockscale kernels.
+# Selection: kernelName1/2 contains the substring `_blockscale_`.
+
+
+def _flydsl_blockscale_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    activation=ActivationType.Silu,
+    w1_scale=None,
+    a1_scale=None,
+    sorted_weights=None,
+    out_scale=None,
+    out_scale_sorted=None,
+    bias1=None,
+    **_kwargs,
+):
+    parsed = aiter.ops.flydsl.moe_blockscale_kernels.get_flydsl_blockscale_kernel_params(
+        kernelName
+    )
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL blockscale kernel name: {kernelName}")
+    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    return aiter.ops.flydsl.flydsl_moe_blockscale_stage1(
+        a=hidden_states,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        act=act,
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+        scale_block_k=parsed.get("scale_block_k", 128),
+        waves_per_eu=parsed.get("waves_per_eu", 3),
+        b_nt=parsed.get("b_nt", 2),
+        bias=bias1,
+    )
+
+
+def _flydsl_blockscale_stage2_wrapper(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    w2_scale=None,
+    a2_scale=None,
+    sorted_weights=None,
+    bias2=None,
+    **_kwargs,
+):
+    parsed = aiter.ops.flydsl.moe_blockscale_kernels.get_flydsl_blockscale_kernel_params(
+        kernelName
+    )
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL blockscale kernel name: {kernelName}")
+    return aiter.ops.flydsl.flydsl_moe_blockscale_stage2(
+        inter_states=inter_states,
+        w2=w2,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        mode=parsed.get("mode", "atomic"),
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        sorted_weights=sorted_weights,
+        scale_block_k=parsed.get("scale_block_k", 128),
+        waves_per_eu=parsed.get("waves_per_eu", 3),
+        b_nt=parsed.get("b_nt", 0),
+        bias=bias2,
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -973,7 +1074,20 @@ def get_2stage_cfgs(
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         _s1_fq = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
-        if is_flydsl1:
+        # Sprint 4 (sunway513/atom#37 W4.5): blockscale variant gets its own
+        # wrapper. Selection rule: substring `_blockscale_` in kernelName.
+        # NOT prefix-match — kernel names look like
+        # `flydsl_moe1_afp8_wfp8_bf16_blockscale_t...`, sharing the
+        # `flydsl_moe1_` prefix with the FP4 path.
+        is_blockscale1 = is_flydsl1 and "_blockscale_" in kernelName1
+        is_blockscale2 = is_flydsl2 and "_blockscale_" in kernelName2
+        if is_blockscale1:
+            stage1_func = functools.partial(
+                _flydsl_blockscale_stage1_wrapper,
+                kernelName=kernelName1,
+                activation=activation,
+            )
+        elif is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
@@ -990,7 +1104,12 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
-        if is_flydsl2:
+        if is_blockscale2:
+            stage2_func = functools.partial(
+                _flydsl_blockscale_stage2_wrapper,
+                kernelName=kernelName2,
+            )
+        elif is_flydsl2:
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
