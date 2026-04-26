@@ -71,3 +71,18 @@ def dsv4_validate_sparse_attn_metadata(
             raise ValueError(f"{name}.device={t.device} != q.device={dev}")
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+
+    # ---- 4. Topk index domain (most likely #42 culprit) ----------------
+    if topk_idxs.numel() > 0:
+        if (topk_idxs < -1).any().item():
+            raise ValueError(
+                "topk_idxs contains values < -1 (only -1 is the skip sentinel)"
+            )
+        valid_topk = topk_idxs[topk_idxs >= 0]
+        if valid_topk.numel() > 0:
+            max_idx = valid_topk.max().item()
+            if max_idx >= kv.shape[1]:
+                raise ValueError(
+                    f"topk_idxs max={max_idx} >= kv.size(N)={kv.shape[1]} "
+                    f"-- would cause GPU OOB in sparse_attn"
+                )

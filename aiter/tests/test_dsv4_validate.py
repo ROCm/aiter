@@ -120,3 +120,32 @@ class TestDeviceContiguity:
         m["cu_seqlens_q"] = torch.tensor([0, 8], dtype=torch.int32)
         with pytest.raises(ValueError, match="topk_idxs must be contiguous"):
             dsv4_validate_sparse_attn_metadata(**m)
+
+
+class TestTopkDomain:
+    def test_topk_below_sentinel_rejected(self):
+        m = _ok_meta(B=1, M=1, K=4)
+        m["topk_idxs"] = torch.tensor([[[-2, 0, 1, 2]]], dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"topk_idxs contains values < -1"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_topk_max_must_be_lt_kv_n(self):
+        m = _ok_meta(B=1, M=1, K=4, N=12)
+        m["topk_idxs"] = torch.tensor([[[0, 1, 2, 128]]], dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"topk_idxs max=128 >= kv\.size\(N\)=12"):
+            dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_all_negative_one_sentinels_pass(self):
+        m = _ok_meta(B=1, M=1, K=4)
+        m["topk_idxs"] = torch.full((1, 1, 4), -1, dtype=torch.int32)
+        # Should not raise — -1 is the skip sentinel
+        dsv4_validate_sparse_attn_metadata(**m)
+
+    def test_empty_topk_passes(self):
+        m = _ok_meta(B=1, M=0, K=4)
+        m["q"] = torch.zeros(1, 0, 2, 64)
+        m["topk_idxs"] = torch.zeros(1, 0, 4, dtype=torch.int32)
+        m["positions"] = torch.zeros(0, dtype=torch.long)
+        m["slot_mapping"] = torch.zeros(0, dtype=torch.long)
+        m["cu_seqlens_q"] = torch.tensor([0], dtype=torch.int32)
+        dsv4_validate_sparse_attn_metadata(**m)
