@@ -405,7 +405,7 @@ def compile_mixed_moe_gemm1(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(known_block_size=[total_threads, 1, 1])
         def moe_gemm1(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
@@ -2522,6 +2522,8 @@ def compile_mixed_moe_gemm2(
     def _scale_elem_type():
         return T.i32
 
+    num_waves = 4 #tile_n // 32
+    #total_threads = num_waves * 64
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
     if bytes_x_per_tile % total_threads != 0:
@@ -2603,7 +2605,7 @@ def compile_mixed_moe_gemm2(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(known_block_size=[total_threads, 1, 1])
         def moe_gemm2(
             arg_out: fx.Tensor,
             arg_x: fx.Tensor,
@@ -2729,7 +2731,7 @@ def compile_mixed_moe_gemm2(
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.constant(tile_k_bytes // 16, index=True)
-            layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+            layout_tx_wave_lane = fx.make_layout((num_waves, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
 
             base_ptr = allocator.get_base()
@@ -3372,6 +3374,7 @@ def compile_mixed_moe_gemm2(
                                             a128 = pack_i64x4_to_i32x8(
                                                 a0, a1, c0_i64, c0_i64
                                             )
+                                        #rocdl.sched_barrier(0)
 
                                         for inxdl in range_constexpr(pack_N):
                                             ni_idx = ni * pack_N + inxdl
@@ -3383,7 +3386,7 @@ def compile_mixed_moe_gemm2(
                                             )
 
                                             acc_idx = mi_idx * num_acc_n + ni_idx
-                                            rocdl.sched_barrier(0)
+                                            #rocdl.sched_barrier(0) #TODO
                                             acc_list[acc_idx] = (
                                                 rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                                                     mfma_res_ty,
@@ -3410,49 +3413,60 @@ def compile_mixed_moe_gemm2(
 
                 rocdl.sched_barrier(0)
 
-                def hot_loop_scheduler():
-                    # - MFMA group size per "slot": num_acc_n
-                    # - Total MFMA per tile: (2*K32 per K64) * k_unroll * m_repeat * num_acc_n
-                    # - We emit (mfma_group + dsrd + mfma_group) per scheduler iteration.
-                    mfma_group = num_acc_n
-                    mfma_total = (k_unroll * 2) * m_repeat * mfma_group
-                    mfma_per_iter = 2 * mfma_group
-                    sche_iters = (
-                        0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
+                def hot_loop_scheduler(part=False):
+                    """Stage2 hot-loop scheduler.
+
+                    part=False : full iteration (x/B/scale VMEMs + dsrd + mfma + dswr)
+                    part=True  : a0_prefetch + compute_tile(prefetch_epilogue) only
+                    """
+                    n_mfma = k_unroll * m_repeat * num_acc_n
+                    n_dsrd = k_unroll * m_repeat * (2 if is_f8_a else 1)
+
+                    if not part:
+                        n_b_vmem = k_unroll * num_acc_n
+                        n_scale_vmem = k_unroll_packed * (
+                            m_repeat_packed + num_acc_n_packed
+                        )
+                        n_vmem = num_x_loads + n_b_vmem + n_scale_vmem
+                        n_dswr = num_x_loads
+                    else:
+                        n_vmem = (m_repeat * 4 if doweight_stage2 else 0) + (
+                            num_acc_n if enable_bias else 0
+                        )
+                        n_dswr = 0
+
+                    if n_vmem > 0:
+                        rocdl.sched_vmem(n_vmem)
+
+                    max_temp = 3
+                    _n_chunks = max(
+                        (n_dsrd + max_temp - 1) // max_temp,
+                        (n_mfma + max_temp - 1) // max_temp,
+                        1,
                     )
+                    _dswr_per_chunk = max(1, n_dswr // _n_chunks) if n_dswr > 0 else 0
+                    _dsrd_left = n_dsrd
+                    _mfma_left = n_mfma
+                    _dswr_left = n_dswr
 
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(1)
-                    if tile_m == 16:
-                        rocdl.sched_vmem(1)
-                    rocdl.sched_mfma(1)
-                    if tile_m == 16:
-                        rocdl.sched_vmem(1)
-                    if num_acc_n < 4:
-                        rocdl.sched_dsrd(1)
-                        rocdl.sched_mfma(1)
-                        if tile_m == 16:
-                            rocdl.sched_vmem(1)
-                        rocdl.sched_dsrd(1)
-                        rocdl.sched_mfma(1)
-                        if tile_m == 16:
-                            rocdl.sched_vmem(1)
-                        rocdl.sched_mfma(1)
+                    for _ci in range_constexpr(_n_chunks):
+                        _rd = min(max_temp, _dsrd_left)
+                        if _rd > 0:
+                            rocdl.sched_dsrd(_rd)
+                            _dsrd_left -= _rd
+                        _mm = min(_rd if _rd > 0 else max_temp, _mfma_left)
+                        if _mm > 0:
+                            rocdl.sched_mfma(_mm)
+                            _mfma_left -= _mm
+                        _dw = min(_dswr_per_chunk, _dswr_left)
+                        if _dw > 0:
+                            rocdl.sched_dswr(_dw)
+                            _dswr_left -= _dw
 
-                    # DS-write hints: match A LDS-store micro-ops; stagger vs MFMA tail (preshuffle_gemm).
-                    dswr_tail = num_x_loads
-                    dstr_advance = 2
-                    if dswr_tail > sche_iters:
-                        dswr_tail = sche_iters
-                    dswr_start = max(sche_iters - dswr_tail - dstr_advance, 0)
-
-                    for sche_i in range_constexpr(sche_iters):
-                        rocdl.sched_vmem(1)
-                        rocdl.sched_mfma(mfma_group)
-                        rocdl.sched_dsrd(1)
-                        rocdl.sched_mfma(mfma_group)
-                        if sche_i >= dswr_start - 1:
-                            rocdl.sched_dswr(1)
+                    if _mfma_left > 0:
+                        rocdl.sched_mfma(_mfma_left)
+                    if _dswr_left > 0:
+                        rocdl.sched_dswr(_dswr_left)
 
                     rocdl.sched_barrier(0)
 
@@ -3526,6 +3540,7 @@ def compile_mixed_moe_gemm2(
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                         hot_loop_scheduler()
                         gpu.barrier()
+                        #_barrier()
 
                         # Cross-tile prefetch for the ping tile we are about to compute.
                         a0_prefetch_ping = lds_load_packs_k64(
@@ -3550,6 +3565,7 @@ def compile_mixed_moe_gemm2(
                         store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                         hot_loop_scheduler()
                         gpu.barrier()
+                        #_barrier()
 
                         # Cross-tile prefetch for the next pong tile.
                         a0_prefetch_pong = lds_load_packs_k64(
@@ -3567,6 +3583,9 @@ def compile_mixed_moe_gemm2(
                         a0_prefetch=a0_prefetch_pong,
                         prefetch_epilogue=True,
                     )
+                    hot_loop_scheduler(part=True)
+                    gpu.barrier()
+                    #_barrier()
 
                 else:
                     # Tail: 2 remaining tiles.
@@ -3589,6 +3608,7 @@ def compile_mixed_moe_gemm2(
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
                     gpu.barrier()
+                    #_barrier()
 
                     # Epilogue tile with sw prefetch.
                     a0_prefetch_ping = lds_load_packs_k64(
@@ -3603,6 +3623,9 @@ def compile_mixed_moe_gemm2(
                         a0_prefetch=a0_prefetch_ping,
                         prefetch_epilogue=True,
                     )
+                    hot_loop_scheduler(part=True)
+                    gpu.barrier()
+                    #_barrier()
 
                 # ---------------- Epilogue: LDS CShuffle + atomic half2 (x2) ----------------
                 # Reuse the shared helper so GEMM / MoE kernels share the exact same CShuffle skeleton.
@@ -3656,6 +3679,7 @@ def compile_mixed_moe_gemm2(
                     col_base_local,
                     num_acc_n: int,
                     lds_out,
+                    lds_col_remap=None,
                 ):
                     # Match origin/dev_a16w4: rely on sentinel padded rows + hardware OOB behavior.
                     fused2 = buffer_ops.buffer_load(
@@ -3695,7 +3719,12 @@ def compile_mixed_moe_gemm2(
                             v = v * tw
                         v_out = arith.trunc_f(out_elem(), v)
 
-                        lds_idx = row_base_lds + col_local
+                        lds_col = (
+                            lds_col_remap(col_local)
+                            if lds_col_remap is not None
+                            else col_local
+                        )
+                        lds_idx = row_base_lds + lds_col
                         vec1_out = T.vec(1, out_elem())
                         v1 = vector.from_elements(vec1_out, [v_out])
 
@@ -3792,6 +3821,10 @@ def compile_mixed_moe_gemm2(
                     write_row_to_lds=write_row_to_lds,
                     precompute_row=precompute_row,
                     store_pair=store_pair,
+                    skip_initial_barrier=True,
+                    interleave_n_reps=True,
+                    use_vskip=bool(accumulate),
+                    llvm=llvm,
                 )
 
             _if_blk = scf.IfOp(blk_valid)
@@ -3874,7 +3907,7 @@ def compile_mixed_moe_gemm2(
             i32_size_expert_ids_in,
         ).launch(
             grid=(gx, gy, 1),
-            block=(256, 1, 1),
+            block=(total_threads, 1, 1),
             stream=stream,
         )
 

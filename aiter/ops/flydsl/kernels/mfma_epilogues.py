@@ -111,6 +111,17 @@ def c_shuffle_epilog(
     write_row_to_lds: Callable,
     precompute_row: Callable | None = None,
     store_pair: Callable,
+    # When True, skip the initial gpu.barrier() before write_row_to_lds.
+    # Useful when the caller already issued a barrier right before this call.
+    skip_initial_barrier: bool = False,
+    # When True and n_reps_shuffle > 1, interleave the LDS column layout so that
+    # each CShuffle reader thread's multiple nr fragments are adjacent. This lets
+    # the read side use a single wider ds_read instead of multiple narrow reads.
+    interleave_n_reps: bool = False,
+    # When True, replace per-row branching in Phase 3 with exec masking plus
+    # s_setvskip inline asm. Requires the caller to pass the llvm dialect module.
+    use_vskip: bool = False,
+    llvm=None,
 ):
     """LDS CShuffle epilogue skeleton.
 
@@ -137,14 +148,38 @@ def c_shuffle_epilog(
             f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane*e_vec}, got tile_n={tile_n}"
         )
 
-    # ---------------- Step 1: write C tile to LDS (row-major, fp16) ----------------
+    # ---------------- Step 1: write C tile to LDS ----------------
+    CShuffleNLane = int(cshuffle_nlane)
+    CShuffleMLane = int(cshuffle_mlane)
+    EVec = int(e_vec)
+    n_reps_shuffle = int(tile_n) // (CShuffleNLane * EVec)
+
+    _do_interleave = interleave_n_reps and n_reps_shuffle > 1
+
     tile_n_idx = arith.constant(int(tile_n), index=True)
     n_tile_base_v = n_tile_base
     col_base_local = n_tile_base_v + lane_mod_16  # index within [0,tile_n)
 
+    _col_remap = None
+    if _do_interleave:
+        _nr_step = CShuffleNLane * EVec
+        _wide_evec = n_reps_shuffle * EVec
+        _c_nr_step = arith.constant(_nr_step, index=True)
+        _c_evec_remap = arith.constant(EVec, index=True)
+        _c_wide_evec = arith.constant(_wide_evec, index=True)
+
+        def _col_remap(col):
+            nr = col // _c_nr_step
+            local_c = col % _c_nr_step
+            n_lane_col = local_c // _c_evec_remap
+            evec_v = local_c % _c_evec_remap
+            return n_lane_col * _c_wide_evec + nr * _c_evec_remap + evec_v
+
     def _write_row(mi: int, ii: int, row_in_tile, row):
-        # row_base_lds = row_in_tile * tile_n
         row_base_lds = row_in_tile * tile_n_idx
+        _extra = {}
+        if _col_remap is not None:
+            _extra["lds_col_remap"] = _col_remap
         write_row_to_lds(
             mi=mi,
             ii=ii,
@@ -154,10 +189,11 @@ def c_shuffle_epilog(
             col_base_local=col_base_local,
             num_acc_n=num_acc_n,
             lds_out=lds_out,
+            **_extra,
         )
 
-    # Ensure all LDS reads finished before the lds write.
-    gpu.barrier()
+    if not skip_initial_barrier:
+        gpu.barrier()
     default_epilog(
         arith=arith,
         range_constexpr=range_constexpr,
@@ -171,12 +207,7 @@ def c_shuffle_epilog(
     gpu.barrier()
 
     # ---------------- Step 2: shuffle mapping + half2 store/atomic ----------------
-    CShuffleNLane = int(cshuffle_nlane)
-    CShuffleMLane = int(cshuffle_mlane)
-    EVec = int(e_vec)
-
     m_reps_shuffle = int(tile_m) // CShuffleMLane
-    n_reps_shuffle = int(tile_n) // (CShuffleNLane * EVec)
 
     c_nlane = fx.Index(CShuffleNLane)
     m_lane = tx // c_nlane
@@ -189,6 +220,13 @@ def c_shuffle_epilog(
     bx_m_v = bx_m
     by_n_v = by_n
 
+    if _do_interleave:
+        _wide_evec = n_reps_shuffle * EVec
+        vec_frag_wide = T.vec(_wide_evec, frag_elem_type)
+        c_wide_evec = fx.Index(_wide_evec)
+
+    # Phase 1: collect row metadata up-front.
+    _pc_results = []
     for mr in range_constexpr(m_reps_shuffle):
         row_base_m = arith.constant(mr * CShuffleMLane, index=True)
         row_local = row_base_m + m_lane
@@ -211,26 +249,140 @@ def c_shuffle_epilog(
             and len(row_ctx_raw) == 2
         ):
             row_ctx, row_pred = row_ctx_raw
+        _pc_results.append((row_local, row, row_ctx, row_pred))
 
-        def _do_store_row():
-            row_base_lds = row_local * tile_n_idx
+    # Pack per-row validity into a single i32 SGPR bitmap for s_setvskip.
+    _vskip_bitmap_raw = None
+    if use_vskip and llvm is not None:
+        _c0_vskip = arith.constant(0, index=True)
+        _c1_vskip = arith.constant(1, index=True)
+        bitmap_idx = _c0_vskip
+        for _bmr in range_constexpr(m_reps_shuffle):
+            _, _, _, _rp = _pc_results[_bmr]
+            if _rp is not None:
+                _not_pred = arith.select(_rp, _c0_vskip, _c1_vskip)
+                _bit_weight = arith.constant(1 << _bmr, index=True)
+                bitmap_idx = bitmap_idx + _not_pred * _bit_weight
+        _vskip_bitmap_i32 = arith.index_cast(T.i32, bitmap_idx)
+        _vskip_bitmap_raw = (
+            _vskip_bitmap_i32._value
+            if hasattr(_vskip_bitmap_i32, "_value")
+            else _vskip_bitmap_i32
+        )
+
+    # Phase 2: issue all LDS reads back-to-back.
+    _all_frags = []
+    for mr in range_constexpr(m_reps_shuffle):
+        row_local = _pc_results[mr][0]
+        row_base_lds = row_local * tile_n_idx
+        if _do_interleave:
+            lds_idx_base = row_base_lds + (n_lane * c_wide_evec)
+            wide_frag = vector.load_op(vec_frag_wide, lds_out, [lds_idx_base])
+            _all_frags.append(wide_frag)
+        else:
+            row_frags = []
             for nr in range_constexpr(n_reps_shuffle):
                 col_base_nr = arith.constant(nr * (CShuffleNLane * EVec), index=True)
-                col_pair0 = col_base_nr + (n_lane * c_evec)  # even col within tile
-
+                col_pair0 = col_base_nr + (n_lane * c_evec)
                 lds_idx_pair = row_base_lds + col_pair0
                 frag = vector.load_op(vec_frag, lds_out, [lds_idx_pair])
+                row_frags.append(frag)
+            _all_frags.append(row_frags)
 
-                store_pair(
-                    row_local=row_local,
-                    row=row,
-                    row_ctx=row_ctx,
-                    col_pair0=col_pair0,
-                    col_g0=by_n_v + col_pair0,
-                    frag=frag,
-                )
+    # Phase 3: address computation plus final store/atomic.
+    for mr in range_constexpr(m_reps_shuffle):
+        row_local, row, row_ctx, row_pred = _pc_results[mr]
 
-        if row_pred is not None:
+        def _do_store_row():
+            if _do_interleave:
+                wide_frag = _all_frags[mr]
+                for nr in range_constexpr(n_reps_shuffle):
+                    elems = []
+                    for e in range_constexpr(EVec):
+                        elems.append(
+                            vector.extract(
+                                wide_frag,
+                                static_position=[nr * EVec + e],
+                                dynamic_position=[],
+                            )
+                        )
+                    frag = vector.from_elements(vec_frag, elems)
+                    col_base_nr = arith.constant(nr * (CShuffleNLane * EVec), index=True)
+                    col_pair0 = col_base_nr + (n_lane * c_evec)
+                    store_pair(
+                        row_local=row_local,
+                        row=row,
+                        row_ctx=row_ctx,
+                        col_pair0=col_pair0,
+                        col_g0=by_n_v + col_pair0,
+                        frag=frag,
+                    )
+            else:
+                for nr in range_constexpr(n_reps_shuffle):
+                    frag = _all_frags[mr][nr]
+                    col_base_nr = arith.constant(nr * (CShuffleNLane * EVec), index=True)
+                    col_pair0 = col_base_nr + (n_lane * c_evec)
+                    store_pair(
+                        row_local=row_local,
+                        row=row,
+                        row_ctx=row_ctx,
+                        col_pair0=col_pair0,
+                        col_g0=by_n_v + col_pair0,
+                        frag=frag,
+                    )
+
+        if (
+            row_pred is not None
+            and use_vskip
+            and llvm is not None
+            and _vskip_bitmap_raw is not None
+        ):
+            pred_i32 = arith.index_cast(
+                T.i32,
+                arith.select(
+                    row_pred,
+                    arith.constant(1, index=True),
+                    arith.constant(0, index=True),
+                ),
+            )
+            pred_raw = (
+                pred_i32._value if hasattr(pred_i32, "_value") else pred_i32
+            )
+            i64_ty = ir.IntegerType.get_signless(64)
+            i32_ty = ir.IntegerType.get_signless(32)
+            saved_exec_op = llvm.InlineAsmOp(
+                res=i64_ty,
+                operands_=[pred_raw],
+                asm_string=(
+                    "s_mov_b64 $0, exec\n"
+                    "v_cmp_ne_u32_e64 vcc, $1, 0\n"
+                    "s_and_b64 exec, exec, vcc"
+                ),
+                constraints="=&s,v,~{vcc}",
+                has_side_effects=True,
+                is_align_stack=False,
+            )
+            llvm.InlineAsmOp(
+                res=i32_ty,
+                operands_=[_vskip_bitmap_raw],
+                asm_string=(
+                    f"v_readfirstlane_b32 $0, $1\n"
+                    f"s_setvskip $0, {mr}"
+                ),
+                constraints="=s,v",
+                has_side_effects=True,
+                is_align_stack=False,
+            )
+            _do_store_row()
+            llvm.InlineAsmOp(
+                res=None,
+                operands_=[saved_exec_op.result],
+                asm_string="s_setvskip 0, 0\ns_mov_b64 exec, $0",
+                constraints="s",
+                has_side_effects=True,
+                is_align_stack=False,
+            )
+        elif row_pred is not None:
             _if_row = scf.IfOp(row_pred)
             with _if_then(_if_row, scf):
                 _do_store_row()
@@ -265,9 +417,12 @@ def mfma_epilog(
     n_tile_base=None,
     lds_out=None,
     write_row_to_lds: Callable | None = None,
-    precompute_row: Callable | None = None,
+    precompute_row: Callable | None = None,  
     store_pair: Callable | None = None,
     frag_elem_type: ir.Type | None = None,
+    skip_initial_barrier: bool = False,
+    use_vskip: bool = False,
+    llvm=None,
 ):
     if not use_cshuffle:
         if body_row is None:
@@ -305,4 +460,7 @@ def mfma_epilog(
         write_row_to_lds=write_row_to_lds,
         precompute_row=precompute_row,
         store_pair=store_pair,
+        skip_initial_barrier=skip_initial_barrier,
+        use_vskip=use_vskip,
+        llvm=llvm,
     )

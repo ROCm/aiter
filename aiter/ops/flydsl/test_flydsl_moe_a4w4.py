@@ -15,6 +15,7 @@ Usage:
     python op_tests/test_flydsl_moe_a4w4.py --stage e2e             # end-to-end only
     python op_tests/test_flydsl_moe_a4w4.py -t 16 -t 128            # specific token counts
     python op_tests/test_flydsl_moe_a4w4.py --block-m 16 32 64      # specific block sizes
+    python op_tests/test_flydsl_moe_a4w4.py --use-g1u1 0            # g1u0 mode
 """
 
 import argparse
@@ -56,6 +57,7 @@ def _generate_a4w4_data(
     block_m: int,
     dtype=torch.bfloat16,
     doweight_stage1: bool = False,
+    use_g1u1: bool = True,
 ):
     """Generate quantised a4w4 data with torch reference outputs for stage1 and stage2."""
     torch_quant = aiter.get_torch_quant(Q_TYPE)
@@ -64,7 +66,8 @@ def _generate_a4w4_data(
     torch.cuda.manual_seed(0)
 
     inp = torch.randn((token, model_dim), dtype=dtype) / 10
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w1_cols = inter_dim * 2 if use_g1u1 else inter_dim
+    w1 = torch.randn((E, w1_cols, model_dim), dtype=dtype) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
@@ -211,6 +214,7 @@ def test_flydsl_stage1_a4w4(
     E: int = 256,
     topk: int = 8,
     block_m: int = 32,
+    use_g1u1: bool = True,
     atol: float = 1.0,
     rtol: float = 0.05,
 ):
@@ -219,7 +223,7 @@ def test_flydsl_stage1_a4w4(
     print(f"\n{'='*70}")
     print(
         f"[TEST] FlyDSL stage1 A4W4: token={token}, dim=({model_dim},{inter_dim}), "
-        f"E={E}, topk={topk}, block_m={block_m}"
+        f"E={E}, topk={topk}, block_m={block_m}, use_g1u1={use_g1u1}"
     )
     print(f"{'='*70}")
 
@@ -230,6 +234,7 @@ def test_flydsl_stage1_a4w4(
         E=E,
         topk=topk,
         block_m=block_m,
+        use_g1u1=use_g1u1,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -242,7 +247,7 @@ def test_flydsl_stage1_a4w4(
         num_valid_ids=data["num_valid_ids"],
         topk=topk,
         tile_m=block_m,
-        tile_n=256,
+        tile_n=128,
         tile_k=256,
         a_dtype="fp4",
         b_dtype="fp4",
@@ -250,6 +255,7 @@ def test_flydsl_stage1_a4w4(
         w1_scale=data["w1_scale_shuf"],
         a1_scale=data["a1_scale_sort"],
         sorted_weights=data["sorted_weights_s1"],
+        use_g1u1=use_g1u1,
     )
     torch.cuda.synchronize()
 
@@ -269,6 +275,7 @@ def test_flydsl_stage2_a4w4(
     E: int = 256,
     topk: int = 8,
     block_m: int = 32,
+    use_g1u1: bool = True,
     mode: str = "atomic",
     atol: float = 1.0,
     rtol: float = 0.05,
@@ -278,7 +285,7 @@ def test_flydsl_stage2_a4w4(
     print(f"\n{'='*70}")
     print(
         f"[TEST] FlyDSL stage2 A4W4: token={token}, dim=({model_dim},{inter_dim}), "
-        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}"
+        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}, use_g1u1={use_g1u1}"
     )
     print(f"{'='*70}")
 
@@ -289,6 +296,7 @@ def test_flydsl_stage2_a4w4(
         E=E,
         topk=topk,
         block_m=block_m,
+        use_g1u1=use_g1u1,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -329,6 +337,7 @@ def test_flydsl_e2e_a4w4(
     E: int = 256,
     topk: int = 8,
     block_m: int = 32,
+    use_g1u1: bool = True,
     mode: str = "atomic",
     atol: float = 1.0,
     rtol: float = 0.05,
@@ -339,7 +348,7 @@ def test_flydsl_e2e_a4w4(
     print(f"\n{'='*70}")
     print(
         f"[TEST] FlyDSL E2E A4W4: token={token}, dim=({model_dim},{inter_dim}), "
-        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}"
+        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}, use_g1u1={use_g1u1}"
     )
     print(f"{'='*70}")
 
@@ -352,6 +361,7 @@ def test_flydsl_e2e_a4w4(
         E=E,
         topk=topk,
         block_m=block_m,
+        use_g1u1=use_g1u1,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -373,6 +383,7 @@ def test_flydsl_e2e_a4w4(
         w1_scale=data["w1_scale_shuf"],
         a1_scale=data["a1_scale_sort"],
         sorted_weights=data["sorted_weights_s1"],
+        use_g1u1=use_g1u1,
     )
     torch.cuda.synchronize()
 
@@ -450,9 +461,17 @@ def main():
         choices=["stage1", "stage2", "e2e"],
         help="Which tests to run (default: all)",
     )
+    parser.add_argument(
+        "--use-g1u1",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="1: g1u1 (gate+up), 0: g1u0",
+    )
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.05)
     args = parser.parse_args()
+    use_g1u1 = bool(args.use_g1u1)
 
     from aiter.ops.flydsl.utils import is_flydsl_available
 
@@ -474,6 +493,7 @@ def main():
                         E=args.experts,
                         topk=args.topk,
                         block_m=bm,
+                        use_g1u1=use_g1u1,
                         atol=args.atol,
                         rtol=args.rtol,
                     )
@@ -502,6 +522,7 @@ def main():
                             E=args.experts,
                             topk=args.topk,
                             block_m=bm,
+                            use_g1u1=use_g1u1,
                             mode=mode,
                             atol=args.atol,
                             rtol=args.rtol,
@@ -533,6 +554,7 @@ def main():
                             E=args.experts,
                             topk=args.topk,
                             block_m=bm,
+                            use_g1u1=use_g1u1,
                             mode=mode,
                             atol=args.atol,
                             rtol=args.rtol,

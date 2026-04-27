@@ -2632,10 +2632,10 @@ class FmoeTuner(TunerCommon):
                 if q_type == QuantType.per_1x32 or q_type2 == QuantType.per_1x32
                 else blockMs
             )
-            #tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
-            #tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
+            tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
+            tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, shape_blockMs))
-            #task_1stage.extend(self.gen_1stage_asm_task(info))
+            task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue
