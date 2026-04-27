@@ -31,8 +31,8 @@ def get_mhc_config(
     - This allows MHC operations to work on GPUs without tuned configs (may be suboptimal).
 
     Config file naming convention:
-    - For MHC_FUSED: mode is required ("lite" or "sinkhorn")
-      - e.g., gfx942-MHC_FUSED_LITE.json, gfx942-MHC_FUSED_SINKHORN-C=128.json
+    - For MHC_FUSED: mode is required ("sinkhorn")
+      - e.g., gfx942-MHC_FUSED_SINKHORN-C=128.json
     - For other configs (e.g., MHC_SINKHORN): mode is not used
       - e.g., gfx942-MHC_SINKHORN.json
 
@@ -41,7 +41,7 @@ def get_mhc_config(
         M: M dimension (batch/sequence size)
         C: C dimension (hidden dim per stream). Uses threshold matching
             to find the largest available C config <= input C.
-        mode: H_res mode for MHC_FUSED - "lite" or "sinkhorn" (required for MHC_FUSED)
+        mode: H_res mode for MHC_FUSED - "sinkhorn" (required for MHC_FUSED)
 
     Returns:
         Tuple of (config dict, bool indicating if C-specialized config was used)
@@ -58,8 +58,8 @@ def get_mhc_config(
 
     # Determine the actual config name based on mode
     if mode is not None:
-        if mode not in ("lite", "sinkhorn"):
-            raise ValueError(f"mode must be 'lite' or 'sinkhorn', got '{mode}'")
+        if mode != "sinkhorn":
+            raise ValueError(f"mode must be 'sinkhorn', got '{mode}'")
         actual_config_name = f"{config_name}_{mode.upper()}"
     else:
         # No mode suffix - for standalone configs like MHC_SINKHORN

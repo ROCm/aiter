@@ -7,22 +7,17 @@ Benchmark for mHC (manifold-constrained Hyper Connection) fused kernel.
 Measures performance of the Triton implementation across various input shapes
 and configurations, reporting time, throughput (TFLOPS), and bandwidth.
 
-Supports three benchmark modes:
-- "mhc_lite": mHC-lite using convex combination of permutations (exact doubly stochastic, faster)
-- "mhc": Full mHC with Sinkhorn-Knopp iterations (approximate doubly stochastic)
-- "sinkhorn_knopp_only": Benchmark only the Sinkhorn-Knopp kernel in isolation
-- `--with-hip`: adds the HIP kernel aiter.mhc_pre alongside the Triton "mhc" mode.
+- `--with-hip`: adds the HIP kernel aiter.mhc_pre alongside the Triton kernel.
 """
 
 import sys
 import argparse
 import logging
 from itertools import product
-from math import factorial
 import torch
 import triton
 
-from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
+from aiter.ops.triton.fusions.mhc import mhc, fused_mhc
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
@@ -86,7 +81,6 @@ def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 def run_benchmark(args):
     """Run mHC benchmark with specified configuration."""
     dtype = arg_to_torch_dtype[args.dtype]
-    mode = args.mode
     sinkhorn_iters = args.sinkhorn_iters
 
     configs = get_benchmark_configs(args)
@@ -117,12 +111,7 @@ def run_benchmark(args):
         line_vals = list(metrics)
 
     benchmark_name = get_caller_name_no_ext()
-    if mode == "mhc_lite":
-        benchmark_name += "_lite"
-    elif mode == "mhc":
-        benchmark_name += f"_sinkhorn-{sinkhorn_iters}iters"
-    elif mode == "sinkhorn_knopp_only":
-        benchmark_name += f"_sinkhorn_only-{sinkhorn_iters}iters"
+    benchmark_name += f"_sinkhorn-{sinkhorn_iters}iters"
     if args.with_hip:
         benchmark_name += "_triton+hip"
 
@@ -151,7 +140,6 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_mhc_kernel(M, n, C, provider):
         """Benchmark mHC kernel for given configuration."""
-        # Generate inputs based on mode
         (
             x,
             phi,
@@ -160,23 +148,19 @@ def run_benchmark(args):
             alpha_res,
             bias,
             n_streams,
-        ) = generate_mhc_inputs(M, n, C, dtype, mode=mode)
+        ) = generate_mhc_inputs(M, n, C, dtype)
 
-        # Compute FLOPs for mHC or mHC-Lite operation
+        # Compute FLOPs for mHC operation
         nC = n * C
-        n_factorial = factorial(n)
         n_squared = n * n
-
-        # Determine phi_res output dimension based on mode
-        n_res = n_factorial if mode == "mhc_lite" else n_squared
-        N = n_res + 2 * n
+        N = n_squared + 2 * n
 
         # Standard GEMM FLOPs (2*M*N*K for matrix multiply)
         # Eq 14: x @ phi for 3 streams
         # - x @ phi_pre: (M, nC) @ (nC, n) = 2*M*nC*n
         # - x @ phi_post: (M, nC) @ (nC, n) = 2*M*nC*n
-        # - x @ phi_res: (M, nC) @ (nC, n_res) = 2*M*nC*n_res
-        flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * n_res
+        # - x @ phi_res: (M, nC) @ (nC, n²) = 2*M*nC*n²
+        flops_matmul = 2.0 * M * nC * n + 2.0 * M * nC * n + 2.0 * M * nC * n_squared
 
         # Eq 15: RMS normalization - M rows, each with nC elements
         # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
@@ -190,7 +174,7 @@ def run_benchmark(args):
         # Eq 17 & 18: Activation functions (fused in kernel, but count FLOPs)
         # - sigmoid(H_pre): ~10 ops per element for M*n elements
         # - 2*sigmoid(H_post): ~11 ops per element for M*n elements
-        # - H_res activation: softmax (lite) or none (sinkhorn)
+        # - H_res activation: none (raw logits for Sinkhorn-Knopp)
         # flops_activations = 10.0 * M * n + 11.0 * M * n
 
         # Eq 19: Sinkhorn-Knopp (separate kernel, log-domain implementation)
@@ -203,21 +187,9 @@ def run_benchmark(args):
         # Simplified: ~10*n² per iteration (accounting for expensive exp/log ops)
         flops_sinkhorn = 10.0 * M * n_squared * sinkhorn_iters
 
-        # Calculate mode-specific FLOPs
-        if mode == "mhc_lite":
-            # Matrix multiply: (M, n_factorial) @ (n_factorial, n_squared) = 2*M*n_factorial*n_squared
-            flops_softmax = 10.0 * M * n_factorial
-            flops_matmul_lite = 2.0 * M * n_factorial * n_squared
-            flops_lite = flops_softmax + flops_matmul_lite
-            total_flops = (
-                flops_matmul + flops_rms + flops_lite
-            )  # + flops_scale_bias + flops_activations
-        elif mode == "mhc":
-            total_flops = (
-                flops_matmul + flops_rms + flops_sinkhorn
-            )  # + flops_scale_bias + flops_activations
-        elif mode == "sinkhorn_knopp_only":
-            total_flops = flops_sinkhorn
+        total_flops = (
+            flops_matmul + flops_rms + flops_sinkhorn
+        )  # + flops_scale_bias + flops_activations
 
         # Compute memory traffic
         elem_size = 2  # bf16/fp16 = 2 bytes
@@ -227,16 +199,13 @@ def run_benchmark(args):
         # - x: (M, nC)
         # - phi_pre, phi_post, phi_res: (nC, n), (nC, n), (nC, n_res)
         # - bias: (N,) in fp32
-        # - For lite mode: perm_matrices (n_factorial, n_squared)
         mem_read = (
             M * nC * elem_size  # x
             + nC * n * elem_size  # phi_pre
             + nC * n * elem_size  # phi_post
-            + nC * n_res * elem_size  # phi_res
+            + nC * n_squared * elem_size  # phi_res
             + N * bias_size  # bias
         )
-        if mode == "mhc_lite":
-            mem_read += n_factorial * n_squared * elem_size  # perm_matrices
 
         # Memory writes:
         # - out_pre: (M, n)
@@ -248,22 +217,15 @@ def run_benchmark(args):
             + M * n_squared * elem_size  # out_res
         )
 
-        # Sinkhorn-Knopp memory traffic (in-place operations)
-        if mode == "mhc":
-            mem_sinkhorn = 2 * M * n_squared * elem_size * sinkhorn_iters
-            mem_read += mem_sinkhorn / 2
-            mem_write += mem_sinkhorn / 2
-            total_mem = mem_read + mem_write
-        elif mode == "mhc_lite":
-            total_mem = mem_read + mem_write
-        elif mode == "sinkhorn_knopp_only":
-            # Sinkhorn-only: read/write H_res matrix
-            total_mem = 2 * M * n_squared * elem_size * sinkhorn_iters
+        mem_sinkhorn = 2 * M * n_squared * elem_size * sinkhorn_iters
+        mem_read += mem_sinkhorn / 2
+        mem_write += mem_sinkhorn / 2
+        total_mem = mem_read + mem_write
 
         backend = "hip" if provider.startswith("hip_") else "triton"
 
         # Create benchmark function
-        if mode == "mhc" and backend == "hip":
+        if backend == "hip":
             # Note: HIP additionally fuses the "apply pre" step
             # (layer_input = sum_i residual[:, i] * H_pre[:, i]) which the
             # shared total_flops/total_mem model does not account for, so
@@ -290,7 +252,7 @@ def run_benchmark(args):
                         sinkhorn_repeat=sinkhorn_iters,
                     )
 
-        elif mode == "mhc":
+        else:
 
             def fn():
                 return mhc(
@@ -301,45 +263,7 @@ def run_benchmark(args):
                     alpha_res,
                     bias,
                     n_streams,
-                    hres_mode="sinkhorn",
                     sinkhorn_iters=sinkhorn_iters,
-                )
-
-        elif mode == "mhc_lite":
-
-            def fn():
-                return mhc(
-                    x,
-                    phi,
-                    alpha_pre,
-                    alpha_post,
-                    alpha_res,
-                    bias,
-                    n_streams,
-                    hres_mode="lite",
-                )
-
-        elif mode == "sinkhorn_knopp_only":
-            # Sinkhorn-only: benchmark just the Sinkhorn-Knopp kernel
-            # Pre-generate H_res for fair comparison (use sinkhorn mode for raw logits)
-            x_sk, phi_sk, _, _, _, bias_sk, _ = generate_mhc_inputs(
-                M, n, C, dtype, mode="mhc"
-            )
-            out = fused_mhc(
-                x_sk,
-                phi_sk,
-                alpha_pre,
-                alpha_post,
-                alpha_res,
-                bias_sk,
-                n_streams,
-                hres_mode="sinkhorn",
-            )
-            H_res_3d = out[:, 2 * n_streams :].reshape(M, n, n)
-
-            def fn():
-                return sinkhorn_knopp(
-                    H_res_3d, C=C, num_iters=sinkhorn_iters, out=H_res_3d
                 )
 
         # Benchmark
@@ -396,17 +320,10 @@ def parse_args():
         help="Data type for computation",
     )
     parser.add_argument(
-        "--mode",
-        type=str,
-        default="mhc_lite",
-        choices=["mhc", "mhc_lite", "sinkhorn_knopp_only"],
-        help="Benchmark mode: 'mhc' (fused + sinkhorn_knopp), 'mhc_lite', 'sinkhorn_knopp_only'. Default: 'mhc_lite'",
-    )
-    parser.add_argument(
         "-sinkhorn_iters",
         type=int,
         default=20,
-        help="Number of Sinkhorn-Knopp iterations for sinkhorn mode (default: 20)",
+        help="Number of Sinkhorn-Knopp iterations (default: 20)",
     )
     parser.add_argument(
         "--with-hip",
@@ -416,7 +333,7 @@ def parse_args():
         help=(
             "Also benchmark the HIP aiter.mhc_pre kernel "
             "(mhc_pre_gemm_sqrsum + mhc_pre_big_fuse) alongside Triton. "
-            "Requires --mode mhc and --dtype bf16."
+            "Requires --dtype bf16."
         ),
     )
 
@@ -452,17 +369,6 @@ def _validate_with_hip(args):
     """
     if not args.with_hip:
         return 0
-
-    if args.mode != "mhc":
-        logging.error(
-            "--with-hip only supports --mode mhc (got %r). "
-            "The HIP kernel aiter.mhc_pre has no analogue for 'mhc_lite' "
-            "(no permutation-combination residual stream) or for "
-            "'sinkhorn_knopp_only' (Sinkhorn-Knopp is fused inside "
-            "aiter.mhc_pre_big_fuse, not exposed as a standalone HIP kernel).",
-            args.mode,
-        )
-        return 1
 
     if args.dtype != "bf16":
         logging.error(

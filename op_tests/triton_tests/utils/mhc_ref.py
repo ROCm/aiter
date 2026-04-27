@@ -6,13 +6,12 @@ PyTorch reference implementations for mHC (manifold-constrained Hyper Connection
 
 This module provides reference implementations for validating Triton kernels:
 - mhc_torch: Reference for mHC projection mapping (Eq 14-19, Sinkhorn mode)
-- mhc_lite_torch: Reference for mHC-lite (exact doubly stochastic via permutations)
 - sinkhorn_knopp_exp_domain_torch: Sinkhorn-Knopp in exponential domain
 - sinkhorn_knopp_log_domain_torch: Sinkhorn-Knopp in log domain
 - is_doubly_stochastic: Helper to validate doubly stochastic matrices
 
 Also provides test input generation utilities:
-- generate_mhc_inputs: Generate test inputs for mHC mapping (supports both sinkhorn and lite modes via hres_mode parameter)
+- generate_mhc_inputs: Generate test inputs for mHC mapping
 - get_test_shapes: Test shape configurations for mHC
 - get_sk_test_shapes: Test shape configurations for Sinkhorn-Knopp
 
@@ -21,16 +20,13 @@ Notation (from mHC paper arXiv:2512.24880v2):
     - n: Stream parameter controlling manifold dimension
     - C: Hidden dimension per stream
     - nC: Total flattened input dimension (K in kernel, K = n × C)
-    - N: Total output dimension (n² + 2n for sinkhorn, n! + 2n for lite)
+    - N: Total output dimension (n² + 2n)
 """
 
-from itertools import permutations as itertools_permutations
-from math import factorial
 import torch
 
 __all__ = [
     "mhc_torch",
-    "mhc_lite_torch",
     "sinkhorn_knopp_exp_domain_torch",
     "sinkhorn_knopp_log_domain_torch",
     "is_doubly_stochastic",
@@ -141,107 +137,6 @@ def mhc_torch(
         H_res = H_res.to(torch.float32)
 
     # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
-    out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
-
-    return out
-
-
-def mhc_lite_torch(
-    x: torch.Tensor,
-    phi: torch.Tensor,  # Unified phi: (K, n + n + n_res)
-    alpha_pre: float,
-    alpha_post: float,
-    alpha_res: float,
-    bias: torch.Tensor,
-    n: int,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """
-    PyTorch reference implementation of mHC-lite (exact doubly stochastic).
-
-    This serves as ground truth for validating the Triton kernel implementation
-    with hres_mode="lite". Uses exact doubly stochastic matrices via convex
-    combination of all n! permutation matrices, avoiding iterative Sinkhorn.
-
-    Args:
-        x: (M, K) input tensor where K = n × C (flattened n-stream residual)
-        phi: (K, N) unified projection matrix where N = n + n + n!
-            Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n!-1]
-        alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
-        alpha_post: α^post scaling factor for post-stream (Eq 12)
-        alpha_res: α^res scaling factor for residual stream (Eq 12)
-        bias: (N,) bias vector where N = n + n + n!
-        n: stream parameter (manifold dimension controller)
-        eps: epsilon for RMS normalization stability
-
-    Returns:
-        (M, N) unified output tensor where N = n + n + n²
-        Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
-
-        To extract components:
-        - H_pre = out[:, :n]
-        - H_post = out[:, n:2n]
-        - H_res = out[:, 2n:]
-
-        Note: H_res is reshaped from (M, n, n) to (M, n²) for consistency with sinkhorn mode.
-    """
-    # Extract individual phi components from unified tensor
-    phi_pre = phi[:, :n]
-    phi_post = phi[:, n : 2 * n]
-    phi_res = phi[:, 2 * n :]
-    x_f32 = x.to(torch.float32)
-    M = x.shape[0]
-    n_factorial = factorial(n)
-    n_squared = n * n
-
-    # Eq 15: r = ||x̃||₂ / √(nC)
-    mean_sq = torch.mean(x_f32**2, dim=-1, keepdim=True)
-    rms = torch.sqrt(mean_sq + eps)
-    x_norm = x_f32 / rms
-
-    # Eq 14: H̃ = x̃φ - compute each stream separately
-    phi_pre_f32 = phi_pre.to(torch.float32)
-    phi_post_f32 = phi_post.to(torch.float32)
-    phi_res_f32 = phi_res.to(torch.float32)
-
-    H_tilde_pre = x_norm @ phi_pre_f32  # (M, n)
-    H_tilde_post = x_norm @ phi_post_f32  # (M, n)
-    H_tilde_res = x_norm @ phi_res_f32  # (M, n!)
-
-    # Split bias - for lite mode, bias_res has n! elements
-    bias_f32 = bias.to(torch.float32)
-    bias_pre = bias_f32[:n]
-    bias_post = bias_f32[n : 2 * n]
-    bias_res = bias_f32[2 * n : 2 * n + n_factorial]
-
-    # Eq 16: Apply stream-specific scaling and bias
-    H_pre = alpha_pre * H_tilde_pre + bias_pre
-    H_post = alpha_post * H_tilde_post + bias_post
-    H_res_weights = alpha_res * H_tilde_res + bias_res  # (M, n!)
-
-    # Eq 17: Apply sigmoid activation to pre-stream
-    H_pre = torch.sigmoid(H_pre)
-
-    # Eq 18: Apply scaled sigmoid activation to post-stream
-    H_post = 2.0 * torch.sigmoid(H_post)
-
-    # mHC-lite: softmax + permutation combination
-    # Apply softmax to get convex coefficients
-    alpha_coeffs = torch.softmax(H_res_weights, dim=-1)  # (M, n!)
-
-    # Generate all n! permutation matrices
-    all_perms = list(itertools_permutations(range(n)))
-    P = torch.zeros(n_factorial, n, n, device=x.device, dtype=torch.float32)
-    for k, perm in enumerate(all_perms):
-        for i, j in enumerate(perm):
-            P[k, i, j] = 1.0
-
-    # Weighted sum: H_res[m] = Σ_k α[m,k] * P[k]
-    # Using einsum: (M, n!) x (n!, n, n) -> (M, n, n)
-    H_res = torch.einsum("mk,kij->mij", alpha_coeffs, P)  # (M, n, n)
-    H_res = H_res.view(M, n_squared)  # Flatten to (M, n²)
-
-    # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
     out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
 
     return out
@@ -358,30 +253,26 @@ def generate_mhc_inputs(
     Generate test inputs for mHC mapping.
 
     Args:
-        mode: Benchmark mode - "mhc", "mhc_lite", or "sinkhorn_knopp_only". Default: "mhc"
+        mode: Benchmark mode - "mhc" or "sinkhorn_knopp_only". Default: "mhc"
 
     Returns:
         Tuple of (x, phi, alpha_pre, alpha_post, alpha_res, bias, n) where:
         - x: (M, nC) flattened n-stream residual input
-        - phi: (nC, n + n + n_res) unified projection matrix [pre | post | res]
+        - phi: (nC, n + n + n²) unified projection matrix [pre | post | res]
         - alpha_pre: α^pre scaling factor for pre-stream (Eq 12)
         - alpha_post: α^post scaling factor for post-stream (Eq 12)
         - alpha_res: α^res scaling factor for residual stream (Eq 12)
-        - bias: (n² + 2n,) for mhc/sinkhorn_knopp_only modes, (n! + 2n,) for mhc_lite mode
+        - bias: (n² + 2n,) bias vector
         - n: stream parameter (returned for convenience)
     """
-    if mode not in ("mhc", "mhc_lite", "sinkhorn_knopp_only"):
+    if mode not in ("mhc", "sinkhorn_knopp_only"):
         raise ValueError(
-            f"Invalid mode: {mode}. Must be 'mhc', 'mhc_lite', or 'sinkhorn_knopp_only'"
+            f"Invalid mode: {mode}. Must be 'mhc' or 'sinkhorn_knopp_only'"
         )
 
     nC = n * C  # Total flattened dimension
 
-    # Determine phi_res and bias dimensions based on mode
-    if mode == "mhc_lite":
-        n_res = factorial(n)  # n! columns for lite mode
-    else:
-        n_res = n * n  # n² columns for sinkhorn mode
+    n_res = n * n  # n² columns
 
     N_total = n_res + 2 * n
 
