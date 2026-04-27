@@ -22,6 +22,14 @@ def _rmsnorm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     return F.rms_norm(x.float(), (x.shape[-1],), w.float(), eps).to(x.dtype)
 
 
+def _gemma_rmsnorm_ref(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    """Gemma-style RMSNorm: x * rsqrt(mean(x^2) + eps) * (1 + w)."""
+    xf = x.float()
+    variance = xf.pow(2).mean(dim=-1, keepdim=True)
+    normed = xf * torch.rsqrt(variance + eps)
+    return (normed * (1.0 + w.float())).to(x.dtype)
+
+
 def _fp4x2_hip_supported_gfx() -> set[str]:
     # Opus fp4 cast path is only implemented for architectures with fp4 builtins.
     return {"gfx950", "gfx1250"}
@@ -114,9 +122,11 @@ def run_torch_ref(
     res1: torch.Tensor | None,
     transpose_scale: bool,
     quant_out_dtype: torch.dtype = dtypes.fp8,
+    gemma_norm: bool = False,
 ):
     x1_in = x1 if res1 is None else x1 + res1
-    x1_norm = _rmsnorm_ref(x1_in, x1_weight, x1_epsilon)
+    norm_fn = _gemma_rmsnorm_ref if gemma_norm else _rmsnorm_ref
+    x1_norm = norm_fn(x1_in, x1_weight, x1_epsilon)
     if quant_out_dtype == dtypes.fp8:
         x1_q, x1_s = _per_token_group_fp8_quant_ref(x1_norm, group_size, dtypes.fp8)
     elif quant_out_dtype == dtypes.fp4x2:
@@ -134,7 +144,7 @@ def run_torch_ref(
     x2_norm = None
     if x2 is not None:
         assert x2_weight is not None
-        x2_norm = _rmsnorm_ref(
+        x2_norm = norm_fn(
             x2, x2_weight, x2_epsilon if x2_epsilon is not None else x1_epsilon
         )
     return (x1_q, x1_s), x1_norm, x2_norm, x1_in
@@ -262,6 +272,7 @@ def run_hip(
     output_unquantized_inp1: bool,
     transpose_scale: bool,
     quant_out_dtype: torch.dtype,
+    gemma_norm: bool = False,
 ):
     m, n1 = x1.shape
     num_scale_cols = n1 // group_size
@@ -300,6 +311,7 @@ def run_hip(
         res1,
         group_size,
         transpose_scale,
+        gemma_norm,
     )
     return (x1_q, x1_s), x1_u, x2_out, res_out
 
@@ -316,6 +328,7 @@ def test_fused_qk_rmsnorm_group_quant(
     output_unquantized_inp1: bool = False,
     transpose_scale: bool = True,
     quant_out_dtype: torch.dtype = dtypes.fp8,
+    gemma_norm: bool = False,
 ):
     assert token > 0
     assert num_head1 > 0
@@ -458,10 +471,14 @@ def test_fused_qk_rmsnorm_group_quant(
         res1,
         transpose_scale,
         quant_out_dtype,
+        gemma_norm=gemma_norm,
     )
-    has_triton_fp8 = quant_out_dtype == dtypes.fp8
+    has_triton_fp8 = quant_out_dtype == dtypes.fp8 and not gemma_norm
     has_triton_fp4 = (
-        quant_out_dtype == dtypes.fp4x2 and group_size == 32 and not transpose_scale
+        quant_out_dtype == dtypes.fp4x2
+        and group_size == 32
+        and not transpose_scale
+        and not gemma_norm
     )
     has_triton = has_triton_fp8 or has_triton_fp4
     if has_triton_fp8:
@@ -506,6 +523,7 @@ def test_fused_qk_rmsnorm_group_quant(
         output_unquantized_inp1,
         transpose_scale,
         quant_out_dtype,
+        gemma_norm=gemma_norm,
     )
 
     (x1_q_torch, x1_s_torch), x1_torch, x2_torch, res_torch = torch_out
@@ -530,10 +548,14 @@ def test_fused_qk_rmsnorm_group_quant(
         x1_deq_hip = _upcast_group_fp8(
             x1_q_hip, _recover_row_major_scale(x1_s_hip, transpose_scale), group_size
         )
-        x1_deq_triton = _upcast_group_fp8(
-            x1_q_triton,
-            _recover_row_major_scale(x1_s_triton, transpose_scale),
-            group_size,
+        x1_deq_triton = (
+            _upcast_group_fp8(
+                x1_q_triton,
+                _recover_row_major_scale(x1_s_triton, transpose_scale),
+                group_size,
+            )
+            if has_triton
+            else None
         )
     elif quant_out_dtype == dtypes.fp4x2:
         q_atol = 0.5
@@ -845,6 +867,11 @@ if __name__ == "__main__":
     parser.add_argument("--group_size", type=int, default=128)
     parser.add_argument("--output_unquantized_inp1", action="store_true")
     parser.add_argument("--transpose_scale", action="store_true")
+    parser.add_argument(
+        "--gemma_norm",
+        action="store_true",
+        help="Test gemma-style RMSNorm: x * rsqrt(mean(x^2)+eps) * (1+w) instead of standard * w.",
+    )
     args = parser.parse_args()
 
     if args.dtype is not None:
@@ -932,6 +959,7 @@ if __name__ == "__main__":
                                     output_unquantized_inp1=args.output_unquantized_inp1,
                                     transpose_scale=args.transpose_scale,
                                     quant_out_dtype=quant_out_dtype,
+                                    gemma_norm=args.gemma_norm,
                                 )
                                 df.append(row)
 

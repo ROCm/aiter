@@ -606,6 +606,7 @@ def lds_load_pack_k32(
 
 __all__ = [
     "PreshuffleBLayout",
+    "PreshuffleScaleLayout",
     "buffer_copy_gmem16_dwordx4",
     "lds_load_pack_k32",
     "lds_store_4b_xor16",

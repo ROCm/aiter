@@ -13,10 +13,9 @@ from torch.library import Library
 from ..jit.core import (
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
-    AITER_ROOT_DIR,
     compile_ops,
 )
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -346,29 +345,42 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     return splitK
 
 
-_CKGEMM_CONFIG_CACHE = None
+_CKGEMM_CONFIG_CACHE: dict = {}
+_CKGEMM_HAS_GFX: dict = {}
 
 
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
+def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
     if tuned_file is None:
-        tuned_file = "a8w8_tuned_gemm.csv"
-    global _CKGEMM_CONFIG_CACHE
-
-    if _CKGEMM_CONFIG_CACHE is None:
-        _CKGEMM_CONFIG_CACHE = {}
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
     if tuned_file not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
-            ["cu_num", "M", "N", "K"]
-        ).to_dict("index")
+        # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
+        # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
+        if "gfx" in ckgemm_dict.columns:
+            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+                ["gfx", "cu_num", "M", "N", "K"]
+            ).to_dict("index")
+            _CKGEMM_HAS_GFX[tuned_file] = True
+        else:
+            logger.warning(
+                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
+                "Re-run the tuner or migrate the CSV to add a gfx column."
+            )
+            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+                ["cu_num", "M", "N", "K"]
+            ).to_dict("index")
+            _CKGEMM_HAS_GFX[tuned_file] = False
 
+    gfx = get_gfx()
     cu_num = get_cu_num()
+    has_gfx = _CKGEMM_HAS_GFX[tuned_file]
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = _CKGEMM_CONFIG_CACHE[tuned_file].get((cu_num, padded_M, N, K), None)
+        key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
+        config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
@@ -382,35 +394,53 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     return config
 
 
+_GEMM_QUANT_TYPE_CACHE: dict = {}
+_GEMM_QUANT_TYPE_HAS_GFX: dict = {}
+
+
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config_with_quant_type(
     M: int,
     N: int,
     K: int,
     q_dtype_w: torch.dtype,
-    tuned_file=f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+    tuned_file=None,
 ):
-    # Use dict to cache configs for different files
-    if not hasattr(get_GEMM_config_with_quant_type, "file_cache"):
-        get_GEMM_config_with_quant_type.file_cache = {}
-
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     # Load file if not cached
-    if tuned_file not in get_GEMM_config_with_quant_type.file_cache:
+    if tuned_file not in _GEMM_QUANT_TYPE_CACHE:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
-            asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
-                "index"
+        # Use (gfx, cu_num, M, N, K, q_dtype_w) key when the CSV has a gfx column (new schema).
+        # Fall back to (cu_num, M, N, K, q_dtype_w) for old CSVs that pre-date the gfx column.
+        if "gfx" in asmGemmDictDf.columns:
+            _GEMM_QUANT_TYPE_CACHE[tuned_file] = asmGemmDictDf.set_index(
+                ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
+            ).to_dict("index")
+            _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = True
+        else:
+            logger.warning(
+                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
+                "Re-run the tuner or migrate the CSV to add a gfx column."
             )
-        )
+            _GEMM_QUANT_TYPE_CACHE[tuned_file] = asmGemmDictDf.set_index(
+                ["cu_num", "M", "N", "K", "q_dtype_w"]
+            ).to_dict("index")
+            _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = False
 
+    gfx = get_gfx()
     cu_num = get_cu_num()
+    has_gfx = _GEMM_QUANT_TYPE_HAS_GFX[tuned_file]
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = get_GEMM_config_with_quant_type.file_cache[tuned_file].get(
-            (cu_num, padded_M, N, K, str(q_dtype_w)), None
+        key = (
+            (gfx, cu_num, padded_M, N, K, str(q_dtype_w))
+            if has_gfx
+            else (cu_num, padded_M, N, K, str(q_dtype_w))
         )
+        config = _GEMM_QUANT_TYPE_CACHE[tuned_file].get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 msg = f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
@@ -633,8 +663,6 @@ def gemm_a8w8_blockscale(
     n = WQ.shape[0]
     k = XQ.shape[1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    from aiter.jit.utils.chip_info import get_gfx
-
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)

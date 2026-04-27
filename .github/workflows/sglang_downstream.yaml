@@ -48,14 +48,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
 
     env:
-      SGL_BRANCH: v0.5.8
+      SGL_BRANCH: v0.5.10
       GPU_ARCH: gfx942
-      GPU_ARCH_CI: mi300 # used in sglang ci scripts
-      SGL_IMAGE: rocm/sgl-dev:v0.5.8-rocm700-mi30x-20260127
+      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi325-gpu-1
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -63,103 +62,140 @@ jobs:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
 
-      - name: Clone sglang repo
+      - name: Prepare sglang workspace
         run: |
-          git clone -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git
+          set -ex
+          SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-downstream"
+          rm -rf "${SGLANG_WORKSPACE}"
+          git clone --depth 1 -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git "${SGLANG_WORKSPACE}"
+          test -d "${SGLANG_WORKSPACE}/sgl-kernel"
+          test -d "${SGLANG_WORKSPACE}/python"
+          echo "SGLANG_WORKSPACE=${SGLANG_WORKSPACE}" >> "${GITHUB_ENV}"
 
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
-      - name: Pull SGlang base image
+      - name: Patch sglang CI scripts for aiter runners
         run: |
-          docker pull ${{ env.SGL_IMAGE }}
+          cd "${SGLANG_WORKSPACE}"
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Generate Dockerfile
+          def replace_once(path_str: str, old: str, new: str) -> None:
+              path = Path(path_str)
+              text = path.read_text()
+              if old not in text:
+                  raise SystemExit(f"Expected snippet not found in {path}: {old!r}")
+              path.write_text(text.replace(old, new, 1))
+
+          hostname_override = 'HOSTNAME_VALUE="${SGLANG_CI_HOSTNAME_OVERRIDE:-$(hostname)}"'
+          for rel in (
+              "scripts/ci/amd/amd_ci_start_container.sh",
+              "scripts/ci/amd/amd_ci_install_dependency.sh",
+              "scripts/ci/amd/amd_ci_exec.sh",
+          ):
+              replace_once(rel, "HOSTNAME_VALUE=$(hostname)", hostname_override)
+
+          replace_once(
+              "scripts/ci/amd/amd_ci_install_dependency.sh",
+              "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .",
+              "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .",
+          )
+          PY
+
+      - name: Resolve SGLang base image
         run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.SGL_IMAGE }}
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
 
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
-          RUN pip uninstall -y aiter
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
+          prefixes = [
+              "v0.5.10-rocm700-mi30x-",
+              "v0.5.10rc0-rocm700-mi30x-",
+          ]
+          matches = {prefix: [] for prefix in prefixes}
+          patterns = {
+              prefix: re.compile(rf"^{re.escape(prefix)}\d{{8}}(?:-preview)?$")
+              for prefix in prefixes
+          }
+          next_url = "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100"
 
-          RUN rm -rf aiter \
-           && git clone ${{ env.GITHUB_REPO_URL }} aiter \
-           && cd aiter \
-           && git checkout ${{ env.GITHUB_COMMIT_SHA }} \
-           && git submodule update --init --recursive \
-           && PREBUILD_KERNELS=1 GPU_ARCHS=${{ env.GPU_ARCH }} python setup.py build_ext --inplace \
-           && pip install -e .
+          while next_url:
+              with urllib.request.urlopen(next_url, timeout=30) as resp:
+                  data = json.load(resp)
+              for item in data.get("results", []):
+                  name = item["name"]
+                  for prefix in prefixes:
+                      if patterns[prefix].match(name):
+                          matches[prefix].append(name)
+              next_url = data.get("next")
 
-          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
-          EOF
+          chosen_tag = None
+          for prefix in prefixes:
+              if matches[prefix]:
+                  chosen_tag = sorted(matches[prefix], reverse=True)[0]
+                  break
 
-      - name: Show Dockerfile
-        run: cat Dockerfile.mod
+          if not chosen_tag:
+              raise SystemExit("No public MI30X SGLang image found for v0.5.10.")
 
-      - name: Build Docker image
-        run: |
-          docker build -t sglang_aiter_test:ci -f Dockerfile.mod .
+          image = f"rocm/sgl-dev:{chosen_tag}"
+          print(f"Resolved SGLang base image: {image}")
+          if chosen_tag.startswith("v0.5.10rc0-"):
+              print("Using v0.5.10rc0 image because no public v0.5.10 MI30X tag was found.")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write(f"SGL_IMAGE={image}\n")
+          PY
 
       - name: Start CI container
         run: |
-          echo "Clean up containers..."
-          docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm
-
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
-            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-          else
-            DEVICE_FLAG="--device /dev/dri"
-          fi
-
-          echo "Starting container: sglang_aiter_test:ci"
-          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
-          -v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout" \
-          --ipc=host --group-add video \
-          --network=host \
-          --shm-size 32g \
-          --cap-add=SYS_PTRACE \
-          -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
-          --security-opt seccomp=unconfined \
-          -w /sglang-checkout \
-          --name sglang_aiter_test \
-          sglang_aiter_test:ci
-
-          # The checkout is owned by the runner (non-root) but the container runs as
-          # root. Git >= 2.35.2 rejects cross-user repos, so mark the mount as safe.
-          docker exec -u root sglang_aiter_test git config --global --add safe.directory /sglang-checkout
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
+          set -ex
+          docker rm -f ci_sglang || true
+          cd "${SGLANG_WORKSPACE}"
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${SGL_IMAGE}"
+          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python'
 
       - name: Setup pip config
         run: |
-          docker exec -u root sglang_aiter_test bash -c "pip config set global.default-timeout 60"
-          docker exec -u root sglang_aiter_test bash -c "pip config set global.retries 10"
+          docker exec -u root ci_sglang bash -c "pip config set global.default-timeout 60"
+          docker exec -u root ci_sglang bash -c "pip config set global.retries 10"
 
       - name: Install dependencies
         run: |
-          cd sglang
-          git config user.name "aiter-ci" && git config user.email "aiter-ci@amd.com"
-          git fetch origin 2c9b43b5135846f40f66c4e543589bf303c1c07c && git cherry-pick FETCH_HEAD # https://github.com/charlesHsuGG/sglang/commit/2c9b43b5135846f40f66c4e543589bf303c1c07c
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
-          sed -i 's|^\(install_with_retry docker exec -w /human-eval sglang_aiter_test pip install --cache-dir=/sgl-data/pip-cache\) -e \.$|\1 --no-build-isolation -e .|' scripts/ci/amd_ci_install_dependency.sh
-          sed -i "4s/^GPU_ARCH=.*/GPU_ARCH=\"${GPU_ARCH_CI}\"/" scripts/ci/amd_ci_install_dependency.sh
-          bash scripts/ci/amd_ci_install_dependency.sh
+          cd "${SGLANG_WORKSPACE}"
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
+
+      - name: Install aiter under test
+        run: |
+          set -ex
+          docker exec ci_sglang bash -lc "
+            set -ex
+            pip uninstall -y amd-aiter aiter || true
+            rm -rf /tmp/aiter-under-test
+            git clone '${GITHUB_REPO_URL}' /tmp/aiter-under-test
+            cd /tmp/aiter-under-test
+            git checkout '${GITHUB_COMMIT_SHA}'
+            git submodule sync --recursive
+            git submodule update --init --recursive
+            pip install -e .
+            pip show amd-aiter || pip show aiter
+          "
 
       - name: Evaluate Accuracy
         timeout-minutes: 120
         run: |
           set -ex
-          cd sglang
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
-          bash scripts/ci/amd_ci_exec.sh printenv | grep GPU_ARCH || true
-          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 ../registered/eval/test_eval_accuracy_large.py
-          bash scripts/ci/amd_ci_exec.sh python3 ../registered/quant/test_eval_fp8_accuracy.py
-          bash scripts/ci/amd_ci_exec.sh python3 ../registered/models/test_qwen_models.py
+          cd "${SGLANG_WORKSPACE}"
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" python3 -c 'import os; print({k: os.environ.get(k) for k in ("GPU_ARCHS", "SGLANG_USE_AITER")})'
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER=0 python3 registered/eval/test_eval_accuracy_large.py
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/quant/test_eval_fp8_accuracy.py
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/models/test_qwen_models.py
 
-      # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
       - name: Clean Up
         if: always()
-        run:
-          docker exec -u root sglang_aiter_test bash -c "rm -rf /sglang-checkout/sgl-kernel; rm -rf /sglang-checkout/python"
+        run: |
+          docker rm -f ci_sglang || true
+          rm -rf "${SGLANG_WORKSPACE}" || true

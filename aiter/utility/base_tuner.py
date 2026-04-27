@@ -14,6 +14,7 @@ from aiter import logger
 from operator import itemgetter
 import time
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
 
 INVALID_TIME = -1
 
@@ -268,15 +269,25 @@ class TunerCommon:
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
                 df = _read_csv(path)
-                base_cols = [c for c in df_list[0].columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                assert (
-                    base_cols == new_cols
-                ), f"Column mismatch between {path_list[0]} and {path}, {base_cols}, {new_cols}"
-
                 df_list.append(df)
             else:
                 print(f"path {i+1}: {path} (not exist)")
+
+        if len(df_list) > 1:
+            all_cols = list(df_list[0].columns)
+            for df in df_list[1:]:
+                for c in df.columns:
+                    if c not in all_cols:
+                        insert_before = (
+                            "tflops" if "tflops" in all_cols else all_cols[-1]
+                        )
+                        all_cols.insert(all_cols.index(insert_before), c)
+            _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+            for j in range(len(df_list)):
+                for c in all_cols:
+                    if c not in df_list[j].columns:
+                        df_list[j][c] = _FILL_DEFAULTS.get(c, 0)
+                df_list[j] = df_list[j][all_cols]
         merge_df = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
         dedup_keys = self.keys
         if "_tag" in merge_df.columns:
@@ -329,16 +340,31 @@ class TunerCommon:
         if self.get_out_file(args.tune_file) == args.untune_file:
             # retune all shapes in tune_file
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
-            self.tunedf = self.untunedf[self.untunedf["cu_num"] != self.get_cu_num()]
-            self.untunedf = self.untunedf[self.untunedf["cu_num"] == self.get_cu_num()]
+            gfx = self.get_gfx()
+            cu_num = self.get_cu_num()
+            if "gfx" not in self.untunedf.columns:
+                self.untunedf["gfx"] = gfx
+            target_mask = (self.untunedf["gfx"] == gfx) & (
+                self.untunedf["cu_num"] == cu_num
+            )
+            self.tunedf = self.untunedf[~target_mask]
+            self.untunedf = self.untunedf[target_mask]
             self.untunedf = self.untunedf[self.keys]
         else:
             # retune shapes that are in both untune_file and tune_file
             untunedf = self.get_untuned_gemm_list(args.untune_file)
+            gfx = self.get_gfx()
+            cu_num = self.get_cu_num()
             if "cu_num" not in untunedf.columns:
-                untunedf["cu_num"] = self.get_cu_num()
+                untunedf["gfx"] = gfx
+                untunedf["cu_num"] = cu_num
             else:
-                untunedf = untunedf[untunedf["cu_num"] == self.get_cu_num()]
+                target_mask = untunedf["cu_num"] == cu_num
+                if "gfx" in untunedf.columns:
+                    target_mask = target_mask & (untunedf["gfx"] == gfx)
+                else:
+                    untunedf["gfx"] = gfx
+                untunedf = untunedf[target_mask]
             self.untunedf = untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
 
@@ -360,7 +386,18 @@ class TunerCommon:
             return df_old
         key_columns = self.keys
         df_updates = df_updates.loc[:, self.columns]
-        # print(df_updates)
+        # Widen integer columns to object so that float/string updates don't
+        # trigger a Pandas dtype-coercion error (e.g. tflops=0 stored as int64
+        # cannot accept a float like 2.61).
+        import numpy as np
+
+        for col in df_old.columns:
+            if col in df_updates.columns and df_old[col].dtype != df_updates[col].dtype:
+                try:
+                    common = np.result_type(df_old[col].dtype, df_updates[col].dtype)
+                except TypeError:
+                    common = object
+                df_old[col] = df_old[col].astype(common)
         df_old["_tmp_key"] = df_old[key_columns].apply(tuple, axis=1)
         df_updates["_tmp_key"] = df_updates[key_columns].apply(tuple, axis=1)
         matched_keys = df_updates[df_updates["_tmp_key"].isin(df_old["_tmp_key"])][
@@ -401,6 +438,9 @@ class TunerCommon:
         device_properties = torch.cuda.get_device_properties(gpu)
         cu_num = device_properties.multi_processor_count
         return cu_num
+
+    def get_gfx(self):
+        return _chip_get_gfx()
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
@@ -571,8 +611,9 @@ class TunerCommon:
             return "OK", ""
         if status.startswith("error:"):
             return "ERROR", status[len("error:") :].strip()
-        if status == "mismatch":
-            return "MISMATCH", "output mismatch vs reference"
+        if status.startswith("mismatch"):
+            detail = status[len("mismatch") :].lstrip(":").strip()
+            return "MISMATCH", detail or "output mismatch vs reference"
         if not status:
             return "UNKNOWN", ""
         return status.upper(), ""
@@ -583,6 +624,22 @@ class TunerCommon:
             value = row.get(key, "")
             parts.append(f"{key}={value}")
         return "keys: " + ", ".join(parts)
+
+    def _emit_repro_csv(self, failed_repros, report_file=None):
+        """Emit a copy-pasteable CSV block for reproducing failed shapes."""
+        if not failed_repros:
+            return
+        untuned_keys = [k for k in self.keys if k != "cu_num"]
+        csv_header = ",".join(untuned_keys)
+        lines = [
+            "",
+            f"============= Repro CSV ({len(failed_repros)} failed shapes) =============",
+            "Copy the lines below into a CSV file to reproduce:",
+            csv_header,
+        ]
+        for kd in failed_repros:
+            lines.append(",".join(str(kd.get(k, "")) for k in untuned_keys))
+        self._emit_report_lines(lines, report_file)
 
     def _get_benchmark_e2e_us(self, row, suffix=""):
         return getattr(row, f"benchmark_e2e_us{suffix}", -1)
@@ -612,8 +669,9 @@ class TunerCommon:
             header = f"{'Shape':<40} | {'E2E(us)':>10} | {'Status':>8}"
         lines.append(header)
         lines.append("-" * len(header))
+        failed_repros = []
         if results_df.empty:
-            for r in results:
+            for idx, r in enumerate(results):
                 shape_str = r.get("shape", "unknown")
                 e2e_us = r.get("e2e_us", -1)
                 status = r.get("status", "unknown")
@@ -621,8 +679,22 @@ class TunerCommon:
                 e2e_str = f"{e2e_us:.2f}" if e2e_us > 0 else "N/A"
                 lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
                 if status_detail:
-                    lines.append(f"{'':<40} | {'':>10} | {'reason: ' + status_detail}")
+                    lines.append(f"reason: {status_detail}")
+                if status_summary in ("ERROR", "MISMATCH"):
+                    if shapes_df is not None and idx < len(shapes_df):
+                        key_dict = {
+                            k: shapes_df.iloc[idx].get(k, "") for k in self.keys
+                        }
+                    elif self.untunedf is not None and idx < len(self.untunedf):
+                        key_dict = {
+                            k: self.untunedf.iloc[idx].get(k, "") for k in self.keys
+                        }
+                    else:
+                        key_dict = {}
+                    if key_dict:
+                        failed_repros.append(key_dict)
             self._emit_report_lines(lines, report_file)
+            self._emit_repro_csv(failed_repros, report_file)
             return
         for row in results_df.itertuples(index=False):
             shape_str = getattr(row, "shape", "unknown")
@@ -642,14 +714,14 @@ class TunerCommon:
                 )
             else:
                 lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
-            lines.append(
-                self._format_benchmark_keys(
-                    {key: getattr(row, key, "") for key in self.keys}
-                )
-            )
+            key_dict = {key: getattr(row, key, "") for key in self.keys}
+            lines.append(self._format_benchmark_keys(key_dict))
             if status_detail:
                 lines.append(f"reason: {status_detail}")
+            if status_summary in ("ERROR", "MISMATCH"):
+                failed_repros.append(key_dict)
         self._emit_report_lines(lines, report_file)
+        self._emit_repro_csv(failed_repros, report_file)
 
     def _print_comparison(self, pre_results, post_results, report_file=None):
         """Print comparison to stdout or append it to a report file."""
@@ -684,6 +756,7 @@ class TunerCommon:
         header = f"{'Shape':<40} | {'Pre-E2E(us)':>13} | {'Post-E2E(us)':>14} | {'Speedup':>8} | {'Status':>8}"
         lines.append(header)
         lines.append("-" * len(header))
+        compare_failed_repros = []
         for row in comparison_df.itertuples(index=False):
             shape = getattr(row, "shape", "unknown")
             pre_us = self._get_benchmark_e2e_us(row, "_pre")
@@ -711,14 +784,14 @@ class TunerCommon:
             lines.append(
                 f"{shape:<40} | {pre_str:>13} | {post_str:>14} | {speedup_str:>8} | {status_summary:>8}"
             )
-            lines.append(
-                self._format_benchmark_keys(
-                    {key: getattr(row, key, "") for key in self.keys}
-                )
-            )
+            key_dict = {key: getattr(row, key, "") for key in self.keys}
+            lines.append(self._format_benchmark_keys(key_dict))
             if status_detail:
                 lines.append(f"reason: {status_detail}")
+            if status_summary in ("ERROR", "MISMATCH"):
+                compare_failed_repros.append(key_dict)
         self._emit_report_lines(lines, report_file)
+        self._emit_repro_csv(compare_failed_repros, report_file)
 
     def _benchmark_results_to_df(self, results, shapes_df=None):
         columns = self.keys + [
@@ -826,67 +899,100 @@ class TunerCommon:
             )
             return
 
-        lines = [
-            (
-                "============= Compare-Gated CSV Updates ============="
-                if apply_updates
-                else "============= Compare-Gated CSV Update Preview ============="
-            )
-        ]
+        # Count actions
+        update_count = len(comparison[comparison["update_reason"] == "threshold_met"])
+        no_baseline_count = len(
+            comparison[comparison["update_reason"] == "no_baseline"]
+        )
+        skip_count = len(comparison[comparison["update_reason"] == "skip"])
+        total = len(comparison)
+
         target_desc = tuned_file if tuned_file else "tuned csv"
-        lines.append(
-            (
-                f"Threshold: improve >= {threshold_percent:.2f}% to update {target_desc}"
-                if apply_updates
-                else f"Threshold: improve >= {threshold_percent:.2f}% would update {target_desc} with --update_improved"
-            )
-        )
-        lines.append(
-            (
-                "Rows with no valid pre-run baseline but passing post-run will also update."
-                if apply_updates
-                else "Rows with no valid pre-run baseline but passing post-run would also update."
-            )
-        )
-        header = f"{'Shape':<40} | {'Pre-E2E':>10} | {'Post-E2E':>10} | {'Improve':>9} | {'Action':>18}"
-        lines.append(header)
-        lines.append("-" * len(header))
-        for row in comparison.itertuples(index=False):
-            pre_str = (
-                f"{row.pre_us:.2f}"
-                if pd.notna(row.pre_us) and row.pre_us > 0
-                else "N/A"
-            )
-            post_str = (
-                f"{row.post_us:.2f}"
-                if pd.notna(row.post_us) and row.post_us > 0
-                else "N/A"
-            )
-            improve_str = (
-                f"{row.improvement_pct:.2f}%"
-                if pd.notna(row.improvement_pct)
-                else "N/A"
-            )
-            if row.update_reason == "threshold_met":
-                action = "UPDATE"
-            elif row.update_reason == "no_baseline":
-                action = "UPDATE_NO_BASELINE"
-            else:
-                action = "SKIP"
-            lines.append(
-                f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
-            )
-            lines.append(
-                self._format_benchmark_keys(
-                    {key: getattr(row, key, "") for key in self.keys}
+        verb = "Updated" if apply_updates else "Would update"
+
+        lines = [
+            "============= Compare Report =============",
+            f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
+            f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}",
+            f"Threshold: >= {threshold_percent:.1f}% improvement to update {target_desc}",
+            "",
+        ]
+
+        # Updated shapes first
+        if update_count + no_baseline_count > 0:
+            lines.append(f"--- {verb} ({update_count + no_baseline_count} shapes) ---")
+            header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>18}"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for row in comparison.itertuples(index=False):
+                if row.update_reason == "skip":
+                    continue
+                pre_str = (
+                    f"{row.pre_us:.2f}"
+                    if pd.notna(row.pre_us) and row.pre_us > 0
+                    else "N/A"
                 )
-            )
-            pre_summary, pre_detail = self._split_benchmark_status(row.pre_status)
-            post_summary, post_detail = self._split_benchmark_status(row.post_status)
-            if pre_detail:
-                lines.append(f"pre-{pre_summary.lower()}: {pre_detail}")
-            if post_detail:
-                lines.append(f"post-{post_summary.lower()}: {post_detail}")
+                post_str = (
+                    f"{row.post_us:.2f}"
+                    if pd.notna(row.post_us) and row.post_us > 0
+                    else "N/A"
+                )
+                improve_str = (
+                    f"{row.improvement_pct:.2f}%"
+                    if pd.notna(row.improvement_pct)
+                    else "N/A"
+                )
+                action = "UPDATE" if row.update_reason == "threshold_met" else "NEW"
+                lines.append(
+                    f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
+                )
+            lines.append("")
+
+        # Skipped shapes
+        if skip_count > 0:
+            lines.append(f"--- Skipped ({skip_count} shapes) ---")
+            header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Reason':>18}"
+            lines.append(header)
+            lines.append("-" * len(header))
+            for row in comparison.itertuples(index=False):
+                if row.update_reason != "skip":
+                    continue
+                pre_str = (
+                    f"{row.pre_us:.2f}"
+                    if pd.notna(row.pre_us) and row.pre_us > 0
+                    else "N/A"
+                )
+                post_str = (
+                    f"{row.post_us:.2f}"
+                    if pd.notna(row.post_us) and row.post_us > 0
+                    else "N/A"
+                )
+                improve_str = (
+                    f"{row.improvement_pct:.2f}%"
+                    if pd.notna(row.improvement_pct)
+                    else "N/A"
+                )
+                pre_summary, _ = self._split_benchmark_status(row.pre_status)
+                post_summary, post_detail = self._split_benchmark_status(
+                    row.post_status
+                )
+                if post_summary in ("ERROR", "MISMATCH"):
+                    reason = f"post-{post_summary.lower()}"
+                elif (
+                    pd.notna(row.improvement_pct)
+                    and row.improvement_pct < threshold_percent
+                ):
+                    reason = f"< {threshold_percent:.1f}% improve"
+                else:
+                    reason = "no improvement"
+                lines.append(
+                    f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {reason:>18}"
+                )
+
+        if not apply_updates:
+            lines.append("")
+            lines.append("Re-run with --update_improved to apply.")
+
         self._emit_report_lines(lines, report_file)
 
     def _merge_compare_filtered_results(self, base_file, candidate_file, comparison):
@@ -947,9 +1053,17 @@ class TunerCommon:
         if not args.compare or (total_batches <= 1 and len(self.untunedf) <= 30):
             return None
 
-        report_root, _ = os.path.splitext(output_file)
-        compare_report_file = f"{report_root}.compare.txt"
-        with open(compare_report_file, "w") as f:
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(output_file))[0]
+        fd, compare_report_file = tempfile.mkstemp(
+            prefix=f"{base_name}.",
+            suffix=".compare.txt",
+            dir=compare_dir,
+            text=True,
+        )
+        os.chmod(compare_report_file, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.write(
                 f"Compare report for {self.name}\n"
                 f"Shapes: {len(self.untunedf)}\n"
@@ -963,8 +1077,13 @@ class TunerCommon:
         if not args.compare:
             return None
 
-        candidate_root, candidate_ext = os.path.splitext(output_file)
-        compare_candidate_file = f"{candidate_root}.candidate{candidate_ext or '.csv'}"
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        base_name, candidate_ext = os.path.splitext(os.path.basename(output_file))
+        pid = os.getpid()
+        compare_candidate_file = os.path.join(
+            compare_dir, f"{base_name}.{pid}.candidate{candidate_ext or '.csv'}"
+        )
         if os.path.exists(output_file):
             shutil.copyfile(output_file, compare_candidate_file)
         elif os.path.exists(compare_candidate_file):
@@ -1331,7 +1450,7 @@ class GemmCommonTuner(TunerCommon):
     def __init__(
         self,
         name,
-        key=["cu_num", "M", "N", "K"],
+        key=["gfx", "cu_num", "M", "N", "K"],
         resultList=[
             "kernelId",
             "splitK",
@@ -1358,6 +1477,7 @@ class GemmCommonTuner(TunerCommon):
             self.get_retune_gemm_list(args)
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
+            self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
@@ -1379,7 +1499,10 @@ class GemmCommonTuner(TunerCommon):
         info, time, err_ratio = results
         if time == -1:
             return 0, 0
-        cu_num, m, n, k, *rest = info[0]
+        if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
+            _gfx, cu_num, m, n, k, *rest = info[0]
+        else:  # legacy subclass key: (cu_num, m, n, k, ...)
+            cu_num, m, n, k, *rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -1486,7 +1609,10 @@ class GemmCommonTuner(TunerCommon):
         resultdf.to_csv(file, index=False, na_rep="Null")
 
     def set_run_iters(self, input, inputdtype):
-        cu_num, m, n, k, *rest = input
+        if len(input) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
+            _gfx, cu_num, m, n, k, *rest = input
+        else:  # legacy subclass key: (cu_num, m, n, k, ...)
+            cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
         if flops < 256 * 5120 * 256 * 2:
             self.num_warmup = 50

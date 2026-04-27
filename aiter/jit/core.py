@@ -26,6 +26,7 @@ from file_baton import FileBaton  # noqa: E402
 from torch_guard import torch_compile_guard  # noqa: E402
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
 
 aiter_lib = None
 
@@ -194,22 +195,26 @@ class AITER_CONFIG(object):
                 continue
 
             df = pd.read_csv(path)
-            if source_pairs:
-                base_path, base_df = source_pairs[0]
-                base_cols = [c for c in base_df.columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                if base_cols != new_cols:
-                    raise ValueError(
-                        f"Column mismatch between {base_path} and {path}, "
-                        f"{base_cols}, {new_cols}"
-                    )
-
             source_pairs.append((path, df))
 
         if not source_pairs:
             raise FileNotFoundError(
-                f"No existing config files found in '{file_path}' when merging '{merge_name}'."
+                f"No existing config files found in '{file_path}' "
+                f"when merging '{merge_name}'."
             )
+
+        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+        all_cols = list(source_pairs[0][1].columns)
+        for _, df in source_pairs[1:]:
+            for c in df.columns:
+                if c not in all_cols:
+                    insert_before = "tflops" if "tflops" in all_cols else all_cols[-1]
+                    all_cols.insert(all_cols.index(insert_before), c)
+        for i, (path, df) in enumerate(source_pairs):
+            for c in all_cols:
+                if c not in df.columns:
+                    df[c] = _FILL_DEFAULTS.get(c, 0)
+            source_pairs[i] = (path, df[all_cols])
 
         merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
         has_tag = "_tag" in merge_df.columns
@@ -228,6 +233,8 @@ class AITER_CONFIG(object):
             keys = untunedf.columns.to_list()
             if "cu_num" not in keys:
                 keys.append("cu_num")
+            if "gfx" in merge_df.columns and "gfx" not in keys:
+                keys.append("gfx")
             dedup_keys = keys + ["_tag"] if has_tag else keys
             duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
             if duplicated_mask.any():
@@ -302,8 +309,8 @@ class AITER_CONFIG(object):
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
             op_tuned_file_list = [
                 p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*")
-                if (p.is_file() and "untuned" not in str(p))
+                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+                if (p.is_file() and "untuned" not in p.name)
             ]
 
             if not op_tuned_file_list:
@@ -778,7 +785,7 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
-        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
 
         if not torch_exclude:
@@ -1594,7 +1601,7 @@ def compile_ops(
                             )
                     return True
 
-                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, …).
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
                 if develop:
                     import torch
 

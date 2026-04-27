@@ -420,7 +420,7 @@ class CustomAllreduce:
         """Batch-register graph-captured buffer addresses."""
         self._pool.flush_graph_buffers(self._ptr)
 
-    def should_custom_ar(self, inp: torch.Tensor):
+    def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
@@ -433,7 +433,12 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         # In allreduce 2stage writemode, use 2x tmp buffer
         if self.world_size == 2 or self.fully_connected:
-            return inp_size <= (self.max_size / 2)
+            # decode
+            if not prefill_support:
+                return inp_size <= 8192 * 8192
+            # prefill
+            else:
+                return inp_size <= (self.max_size / 2)
         return False
 
     def should_custom_ag(self, inp: torch.Tensor):

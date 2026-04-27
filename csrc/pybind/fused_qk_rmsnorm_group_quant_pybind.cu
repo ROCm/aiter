@@ -21,5 +21,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("k_epsilon")                = std::nullopt,
           py::arg("q_residual")               = std::nullopt,
           py::arg("group_size")               = 128,
-          py::arg("transpose_scale")          = false);
+          py::arg("transpose_scale")          = false,
+          py::arg("gemma_norm")              = false);
 }

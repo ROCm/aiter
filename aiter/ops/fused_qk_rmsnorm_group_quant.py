@@ -27,6 +27,7 @@ def _fused_qk_rmsnorm_group_quant_kernel(
     q_residual: Optional[Tensor] = None,
     group_size: int = 128,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None: ...
 
 
@@ -45,6 +46,7 @@ def fused_qk_rmsnorm_group_quant(
     q_residual: Optional[Tensor] = None,
     group_size: int = 128,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> None:
     if q_out_quantized.dtype not in (dtypes.fp8, dtypes.fp4x2):
         raise ValueError(
@@ -83,4 +85,5 @@ def fused_qk_rmsnorm_group_quant(
         q_residual,
         group_size,
         transpose_scale,
+        gemma_norm,
     )

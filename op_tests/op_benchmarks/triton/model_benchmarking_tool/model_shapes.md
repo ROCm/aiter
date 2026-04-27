@@ -30,7 +30,7 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `K`      | int    | Inner dimension K. |
 | `TP_dim` | string \| null | `"N"`, `"K"`, or `null`. |
 
-### Batched GEMM kernels (`batched_gemm_a8w8`, `batched_gemm_afp4wfp4`)
+### Batched GEMM kernels (`batched_gemm_a8w8`, `batched_gemm_afp4wfp4`, `batched_gemm_a16wfp4`)
 
 | Field     | Type   | Description |
 |----------|--------|-------------|
@@ -74,6 +74,8 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `dqk`    | int    | Query/key head dimension. |
 | `dv`     | int    | Value head dimension. |
 | `comment`| string | Optional label (e.g. `"Prefill"`, `"Text"`, `"Vision"`). |
+| `sink`   | bool   | Optional. When true, enables attention sink in the MHA benchmark. |
+| `sliding_window_left` | int | Optional. Left sliding-window size (`--window-size-left`); omit for no window. |
 
 ### MLA — Multi-head Latent Attention (`mla`)
 
@@ -84,6 +86,17 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `dqk`    | int    | Query/key head dimension. |
 | `dv`     | int    | Value head dimension. |
 | `comment`| string | Optional label (e.g. `"Decode"`). |
+
+### Unified Attention (`unified_attention`)
+
+| Field        | Type   | Description |
+|-------------|--------|-------------|
+| `hq`        | int    | Number of query heads. |
+| `hkv`       | int    | Number of key/value heads. |
+| `dqk`       | int    | Query/key head dimension. |
+| `dv`        | int    | Value head dimension. |
+| `block_size`| int    | Optional. KV cache block size. |
+| `sliding_window` | int \| null | Optional. Sliding-window size for unified attention; omit when not used. |
 
 ## Example
 
@@ -108,6 +121,9 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
       }
     ],
     "mha": [
+      { "hq": 128, "hkv": 8, "dqk": 128, "dv": 128 }
+    ],
+    "unified_attention": [
       { "hq": 128, "hkv": 8, "dqk": 128, "dv": 128 }
     ]
   }

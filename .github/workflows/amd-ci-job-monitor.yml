@@ -150,6 +150,7 @@ jobs:
         with:
           name: actions-job-snapshot
           path: actions-snapshot.json
+          retention-days: 7
 
   matrix-reports:
     name: ${{ matrix.workflow }} - ${{ matrix.job_name }}
