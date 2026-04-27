@@ -50,23 +50,15 @@ jobs:
       id-token: write
       contents: read
     steps:
+      # ---- Common steps (fork and non-fork) ----
       - name: Checkout code
-        if: ${{ !github.event.pull_request.head.repo.fork }}
         uses: actions/checkout@v4
 
       - name: Docker login
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
-      # - name: Prepare docker config
-      #   run: |
-      #     export DOCKER_CONFIG="$HOME/.docker"
-      #     mkdir -p "$DOCKER_CONFIG" || true
-      #     cp /docker-config/config.json "$DOCKER_CONFIG/config.json"
-      #     echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
-      
       - name: Generate Dockerfile
-        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           cat <<EOF > Dockerfile.mod
           FROM ${{ env.DOCKER_IMAGE }}
@@ -106,17 +98,14 @@ jobs:
           EOF
 
       - name: Show Dockerfile
-        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: cat Dockerfile.mod
 
       - name: Build Docker image
-        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
 
       - name: Verify prebuilt kernels
-        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
           echo "=== Prebuilt kernel validation ==="
@@ -129,6 +118,7 @@ jobs:
             echo "Prebuild validation passed: $KERNEL_COUNT kernels compiled"
           fi
 
+      # ---- Non-fork only: push image to Docker Hub ----
       - name: Push Docker image
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
@@ -136,12 +126,12 @@ jobs:
           docker push $IMAGE_TAG
 
       - name: Success message
-        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           echo "Successfully prepared image: rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}"
 
+      # ---- Extract and upload wheel (fork PRs + main branch) ----
       - name: Extract wheel from image
-        if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
+        if: ${{ github.event.pull_request.head.repo.fork || (github.ref == 'refs/heads/main' && github.event_name != 'schedule') }}
         run: |
           set -ex
           IMAGE_TAG=rocm/aiter-ci:pre-build-${{ env.GITHUB_COMMIT_SHA }}
@@ -152,6 +142,14 @@ jobs:
             bash -c "cp /aiter/dist/*.whl /dist/"
           echo "Extracted wheels:"
           ls -lh dist/*.whl
+
+      - name: Upload wheel artifact (fork)
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-whl-fork-${{ github.run_id }}
+          path: dist/*.whl
+          retention-days: 1
 
       - name: Upload wheel as artifact
         if: ${{ github.ref == 'refs/heads/main' && github.event_name != 'schedule' }}
@@ -232,7 +230,7 @@ jobs:
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_image, split_aiter_tests] 
+    needs: [build_aiter_image, split_aiter_tests]
     strategy:
       fail-fast: false
       matrix:
@@ -284,10 +282,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      
+
       - name: Docker login
+        if: ${{ !github.event.pull_request.head.repo.fork }}
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
-      
+
       - name: Download test shard lists
         uses: actions/download-artifact@v4
         with:
@@ -332,16 +331,27 @@ jobs:
           --name aiter_test \
           $IMAGE_TAG
 
-      - name: Setup Aiter for fork PR
+      - name: Download wheel artifact (fork)
+        if: ${{ github.event.pull_request.head.repo.fork }}
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter-whl-fork-${{ github.run_id }}
+          path: dist/
+
+      - name: Install prebuilt wheel (fork)
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           set -ex
+          echo "Installing prebuilt wheel for fork PR..."
+          # CK submodule source needed by some tests
           git submodule sync && git submodule update --init --recursive --depth 1 --jobs 4
-          echo "Setting up Aiter for fork PR..."
-          docker exec \
-          -w /workspace \
-          aiter_test \
-          bash -c "BUILD_TRITON=0 ./.github/scripts/build_aiter_triton.sh"
+          # Copy wheel into container and install
+          docker cp dist/ aiter_test:/tmp/wheel/
+          docker exec aiter_test bash -c "
+            pip uninstall -y aiter || true
+            pip install /tmp/wheel/*.whl
+            pip install -r /workspace/requirements.txt
+          "
 
       - name: Restore CK from prebuilt image
         if: ${{ !github.event.pull_request.head.repo.fork }}
@@ -380,17 +390,10 @@ jobs:
         timeout-minutes: 90
         run: |
           set -ex
-          if [ "${{ github.event.pull_request.head.repo.fork }}" = "true" ]; then
-            docker exec \
-            -w /workspace \
-            aiter_test \
-            bash -c "MAX_JOBS=64 SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
-          else
-            docker exec \
-            -w /workspace \
-            aiter_test \
-            bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
-          fi
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
 
       - name: Collect test logs
         if: always()
@@ -425,7 +428,7 @@ jobs:
         with:
           pattern: standard-test-log-*-shard-*
           path: .
-      
+
       - name: List test logs
         run: |
           ls -l standard-test-log-*
@@ -499,7 +502,7 @@ jobs:
           -w /workspace \
           --name aiter_test \
           $IMAGE_TAG
-      
+
       - name: Setup Aiter for fork PR
         if: ${{ github.event.pull_request.head.repo.fork }}
         run: |
