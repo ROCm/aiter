@@ -40,7 +40,7 @@ class QManagerV1
     }
 };
 
-// Lanes loads Q from VRAM by row so as to fullfill cache line. Then, lanes exchange data via
+// Lanes load Q from VRAM by row so as to fulfill cache line. Then, lanes exchange data via
 // ds_bpermute_b32.
 template <typename T>
 class QManagerV2
@@ -192,7 +192,7 @@ class QManagerV2
     }
 };
 
-// Lanes loads Q from VRAM by row so as to fullfill cache line. Then, lanes exchange data via LDS.
+// Lanes load Q from VRAM by row so as to fulfill cache line. Then, lanes exchange data via LDS.
 template <typename T>
 class QManagerV3
 {
@@ -325,7 +325,7 @@ class QManagerV4
     using q_t = typename T::q_t;
 
     // Stores 16x64 elements per warp in LDS.
-    // Pad 2DW per 2 rows.
+    // Pad 4DW per 4 rows.
     static constexpr uint32_t kNumElemPerRow           = 64;
     static constexpr uint32_t kNumElemPerCol           = 16;
     static constexpr uint32_t kNumPaddingBytesPer4Rows = 4 * sizeof(uint32_t); // 4*4=16
@@ -613,7 +613,9 @@ class KvManagerV1
         4; // use buffer_load_dword which loads 4B each time.
 
     public:
-    // Calculate the size of LDS in bytes for a 32x64 block.
+    // LDS size in bytes for the whole 32 x kQkHeadDim KV block (one tile).
+    // Layout is sliced into kQkHeadDim/kNumColsPerWarp = 72 (576/8) per-warp 32x8 strips,
+    // each strip occupying kWarpOffset(=272) bytes including 2 DW padding.
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
         return kWarpOffset * (T::kQkHeadDim / kNumColsPerWarp);
@@ -1053,11 +1055,12 @@ class KvManagerV3
         return kNumBytesPerBlock * kNumBlocks; // 2112*9=19008
     }
 
-    // Each warp takes two 4x32 blocks, each row is handled by 8 contiguous threads.
-    // warp[0, 4]: row[ 0- 4], row[16-20]
-    // warp[1, 5]: row[ 8-12], row[24-28]
-    // warp[2, 6]: row[16-20], row[32-36]
-    // warp[3, 7]: row[24-28], row[40-44]
+    // Each warp takes two 4x32 blocks (rows r..r+3 and r+16..r+19); each row is handled by 8
+    // contiguous threads. warps {0,4}/{1,5}/{2,6}/{3,7} differ only in column block; the row sets:
+    // warp[0, 4]: row[ 0- 3], row[16-19]
+    // warp[1, 5]: row[ 4- 7], row[20-23]
+    // warp[2, 6]: row[ 8-11], row[24-27]
+    // warp[3, 7]: row[12-15], row[28-31]
     __device__ __forceinline__ static uint32_t get_kv_ld_row_base_idx(const int32_t warp_idx)
     {
         constexpr uint32_t kNumThrPerSubBlock =
@@ -1341,7 +1344,7 @@ class VtManagerV1
         hkm::ds_write_b128(v_transposed.hi, p_lds_vt_lane, sizeof(v4ui));
     }
 
-    // load 32x32 block for each warp. Each threads takes 4x4 elements.
+    // load 32x16 block for each warp. Each thread takes 2x4 elements.
     template <uint32_t kColOffset, uint32_t GPR>
     __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_vt)
     {
@@ -1471,14 +1474,14 @@ __device__ __forceinline__ uint32_t float_2_bf16_pair(uint32_t src_0, uint32_t s
     return result;
 }
 
-// Convert float32 data in pinned GPR to a 16 bits data and store in VRAM.
+// Convert float32 data in pinned GPR to 16-bit data and store to VRAM.
 template <typename T, typename out_t>
 class OManager16bitsV1
 {
     private:
     static_assert(sizeof(out_t) == 2, "Output type must be 16 bits");
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaCols = 16;
 
     public:
@@ -1487,9 +1490,9 @@ class OManager16bitsV1
         return 0; // Not used
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
@@ -1540,8 +1543,8 @@ class OManager16bitsV1
     }
 };
 
-// Compare with OManager32bitsV1, this version changes the layout of data in GPR via LDS on storing
-// buffer to make sure that the data in adjacent lanes are stored in the same cache line.
+// Compared with OManager16bitsV1, this version changes the layout of data in GPR via LDS before
+// storing to VRAM so that adjacent lanes write into the same cache line.
 template <typename T, typename out_t>
 class OManager16bitsV2
 {
@@ -1556,7 +1559,7 @@ class OManager16bitsV2
         4 * sizeof(uint32_t) / sizeof(out_t); // use buffer_store_dwordx4
     static constexpr uint32_t kVramStLanePerRow = kNumCols / kVramStElemPerLane; // 32/8=4
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaRows = 16;
     static constexpr uint32_t kMfmaCols = 16;
     static constexpr uint32_t kMfmaElemPerLane =
@@ -1574,9 +1577,9 @@ class OManager16bitsV2
         return T::kNumWarps * get_lds_size_per_warp_in_byte(); // 8*1056=8448
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
@@ -1639,14 +1642,14 @@ class OManager16bitsV2
     }
 };
 
-// Convert float32 data in pinned GPR to a 32 bits data and store in VRAM.
+// Store float32 data from pinned GPR to VRAM (no conversion; out_t must be float).
 template <typename T, typename out_t>
 class OManager32bitsV1
 {
     private:
     static_assert(sizeof(out_t) == 4, "Output type must be 32 bits");
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaCols = 16;
 
     public:
@@ -1655,9 +1658,9 @@ class OManager32bitsV1
         return 0; // Not used
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
@@ -1705,8 +1708,8 @@ class OManager32bitsV1
     }
 };
 
-// Compare with OManager32bitsV1, this version changes the layout of data in GPR via LDS on storing
-// buffer to make sure that the data in adjacent lanes are stored in the same cache line.
+// Compared with OManager32bitsV1, this version changes the layout of data in GPR via LDS before
+// storing to VRAM so that adjacent lanes write into the same cache line.
 template <typename T, typename out_t>
 class OManager32bitsV2
 {
@@ -1727,7 +1730,7 @@ class OManager32bitsV2
     static constexpr uint32_t kVramStOffsetDeltaInBytes =
         kVramStRowsPerRnd * T::kVoHeadDim * sizeof(out_t); // 8*512*4=16384
 
-    // All comes from result of mfma_f32_16x16x32_fp8_fp8
+    // All come from the result of mfma_f32_16x16x32_fp8_fp8.
     static constexpr uint32_t kMfmaRows = 16;
     static constexpr uint32_t kMfmaCols = 16;
     static constexpr uint32_t kMfmaElemPerLane =
@@ -1744,9 +1747,9 @@ class OManager32bitsV2
         return T::kNumWarps * get_lds_size_per_warp_in_byte(); // 8*2304=18432
     }
 
-    // Convert 16x32 blocks of 8 float32 data and store them in VRAM.
-    // GPR_START: Starting GPR index for current 16x32 block
-    // kColOffset: Element-wise column offset in output buffer.
+    // Convert one 16x32 MFMA-result tile (8 float32 elements per lane) and store to VRAM.
+    // GPR_START: starting GPR index of the 16x32 tile.
+    // kColOffset: element-wise column offset in the output buffer.
     template <uint32_t GPR_START, uint32_t kColOffset>
     __device__ __forceinline__ void output_to_vram(const out_t* p_output,
                                                    const uint32_t warp_idx,
