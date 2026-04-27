@@ -28,7 +28,13 @@ from unittest.mock import patch
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_ASM_SPLITK_MAX_GRID = 16 * 64  # mirrors aiter.ops.gemm_op_a16w16.ASM_SPLITK_MAX_GRID
+# Mirrors aiter.ops.gemm_op_a16w16.ASM_SPLITK_MAX_GRID (_SEMA_SHAPE[0] * _SEMA_SHAPE[1]).
+# We cannot import it directly: gemm_op_a16w16.py imports torch at module level,
+# which fails on machines without a GPU before any stub can intercept it.
+# If _SEMA_SHAPE changes in production, this constant and the boundary-test
+# shapes below (m=2048, n=2048 => gdx*gdy == 1024) must be updated together —
+# a mismatch causes a silent false pass, not a visible test failure.
+_ASM_SPLITK_MAX_GRID = 16 * 64
 
 
 def _make_stub(name, **attrs):
