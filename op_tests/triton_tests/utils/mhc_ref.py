@@ -247,13 +247,9 @@ def generate_mhc_inputs(
     C: int,
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
-    mode: str = "mhc",
 ):
     """
     Generate test inputs for mHC mapping.
-
-    Args:
-        mode: Benchmark mode - "mhc" or "sinkhorn_knopp_only". Default: "mhc"
 
     Returns:
         Tuple of (x, phi, alpha_pre, alpha_post, alpha_res, bias, n) where:
@@ -265,10 +261,6 @@ def generate_mhc_inputs(
         - bias: (n² + 2n,) bias vector
         - n: stream parameter (returned for convenience)
     """
-    if mode not in ("mhc", "sinkhorn_knopp_only"):
-        raise ValueError(
-            f"Invalid mode: {mode}. Must be 'mhc' or 'sinkhorn_knopp_only'"
-        )
 
     nC = n * C  # Total flattened dimension
 

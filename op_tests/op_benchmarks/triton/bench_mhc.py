@@ -17,7 +17,7 @@ from itertools import product
 import torch
 import triton
 
-from aiter.ops.triton.fusions.mhc import mhc, fused_mhc
+from aiter.ops.triton.fusions.mhc import mhc
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,

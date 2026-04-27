@@ -85,11 +85,9 @@ def fused_mhc(
     BLOCK_M = config.pop("BLOCK_M", 64 if M >= 64 else 32)
     BLOCK_N = triton.next_power_of_2(config.pop("BLOCK_N", n_squared))
 
-    n_res = n_squared
     n_blocks_res = triton.cdiv(n_squared, BLOCK_N)
 
-    N_total_input = n_res + 2 * n  # For phi and bias validation
-    N_total_output = n_res + 2 * n  # For output allocation
+    N_total = n_squared + 2 * n
 
     BLOCK_K = config.pop("BLOCK_K", 64)
     # Ensure BLOCK_K doesn't exceed K dimension
@@ -102,12 +100,12 @@ def fused_mhc(
     )
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
-    assert total_phi_cols == N_total_input, (
-        f"phi shape mismatch: expected (K, {N_total_input}), got ({K_phi}, {total_phi_cols})"
+    assert total_phi_cols == N_total, (
+        f"phi shape mismatch: expected (K, {N_total}), got ({K_phi}, {total_phi_cols})"
     )
 
-    assert bias.shape[0] == N_total_input, (
-        f"Bias shape mismatch: expected ({N_total_input},), got {bias.shape}"
+    assert bias.shape[0] == N_total, (
+        f"Bias shape mismatch: expected ({N_total},), got {bias.shape}"
     )
     assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
 
@@ -116,19 +114,18 @@ def fused_mhc(
     ), "All tensors must be on the same device"
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
 
-    N = N_total_input  # Kernel input size
+    N = N_total
 
     # Allocate unified output if not provided
     # Single contiguous tensor: (M, n + n + n_squared)
     # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_squared-1}]
-    total_out_cols = N_total_output
     if out is None:
-        out = torch.empty(M, total_out_cols, dtype=x.dtype, device=x.device)
+        out = torch.empty(M, N_total, dtype=x.dtype, device=x.device)
     else:
         assert out.shape == (
             M,
-            total_out_cols,
-        ), f"out shape mismatch: expected ({M}, {total_out_cols}), got {out.shape}"
+            N_total,
+        ), f"out shape mismatch: expected ({M}, {N_total}), got {out.shape}"
         assert out.dtype == x.dtype and out.device == x.device
 
     # Stream-aware grid: Each program processes exactly one stream
@@ -142,11 +139,10 @@ def fused_mhc(
         actual_ksplit = triton.cdiv(K, splitk_block_size)
 
         # Allocate unified intermediate buffer (float32 for precision)
-        # Single contiguous tensor: (num_ksplit, M, n + n + n_res)
-        # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_res-1}]
-        total_cols = N_total_input
+        # Single contiguous tensor: (num_ksplit, M, n + n + n_squared)
+        # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_squared-1}]
         acc_partial = torch.empty(
-            (num_ksplit, M, total_cols), dtype=torch.float32, device=x.device
+            (num_ksplit, M, N_total), dtype=torch.float32, device=x.device
         )
         acc_sq_partial = torch.empty(
             (num_ksplit, M), dtype=torch.float32, device=x.device
