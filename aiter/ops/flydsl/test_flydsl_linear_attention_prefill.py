@@ -436,8 +436,44 @@ def _bench_fn(fn, *args, **kwargs):
 PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
 
+def _assert_k5_outputs_match_ref(
+    h_out, vn_out, fs_out, h_ref, vn_ref, fs_ref, *, output_final_state, label
+):
+    """Compare a K5 backend's outputs against the PyTorch FP32 reference.
+
+    All backends in this file return VK-ordered ``h`` / ``final_state`` and
+    ``v_new`` in head-major ``[B, H, T, V]`` layout (which we permute back to
+    ``[B, T, H, V]`` for comparison via ``_normalize_opt_v_new``).
+    """
+    torch.testing.assert_close(
+        h_out.float(),
+        h_ref.float(),
+        atol=1e-1,
+        rtol=1e-1,
+        msg=f"{label}: h mismatch",
+    )
+    torch.testing.assert_close(
+        _normalize_opt_v_new(vn_out).float(),
+        vn_ref.float(),
+        atol=1e-1,
+        rtol=1e-1,
+        msg=f"{label}: v_new mismatch",
+    )
+    if output_final_state:
+        torch.testing.assert_close(
+            fs_out.float(),
+            fs_ref.float(),
+            atol=1e-1,
+            rtol=1e-1,
+            msg=f"{label}: final_state mismatch",
+        )
+    else:
+        assert fs_out is None, f"{label}: expected None final_state"
+        assert fs_ref is None
+
+
 class TestCorrectness:
-    """Correctness against PyTorch reference."""
+    """Correctness against PyTorch FP32 reference for all three K5 backends."""
 
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_flydsl(self, args: PrefillArgs):
@@ -467,17 +503,108 @@ class TestCorrectness:
             cu_seqlens=cu,
         )
 
-        torch.testing.assert_close(h_fly.float(), h_ref.float(), atol=1e-1, rtol=1e-1)
-        torch.testing.assert_close(
-            _normalize_opt_v_new(vn_fly).float(), vn_ref.float(), atol=1e-1, rtol=1e-1
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl",
         )
-        if args.output_final_state:
-            torch.testing.assert_close(
-                fs_fly.float(), fs_ref.float(), atol=1e-1, rtol=1e-1
-            )
-        else:
-            assert fs_fly is None
-            assert fs_ref is None
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_triton_vk(self, args: PrefillArgs):
+        """Triton VK K5 (h: [V, K]) -- same input/output layout as FlyDSL."""
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_vk, vn_vk, fs_vk = chunk_gated_delta_rule_fwd_h_opt_vk(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_vk,
+            vn_vk,
+            fs_vk,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="triton_vk",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_triton_kv(self, args: PrefillArgs):
+        """Triton KV K5 (h: [K, V]) -- h0/h/final_state are transposed.
+
+        We feed the wrapper a KV-layout ``initial_state`` (transposed from the
+        VK-layout ``h0`` produced by ``_make_inputs``), and transpose the
+        returned ``h`` / ``final_state`` back to VK so they compare to the
+        common FP32 reference.
+        """
+        context_lens = _build_context_lens(
+            args.full_prompt_len, args.max_num_batched_tokens
+        )
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h0_kv = h0.transpose(-2, -1).contiguous() if h0 is not None else None
+
+        h_kv, vn_kv, fs_kv = chunk_gated_delta_rule_fwd_h_opt(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0_kv,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        # KV-layout outputs need to be transposed back to VK for comparison.
+        h_kv_vk = h_kv.transpose(-2, -1).contiguous()
+        fs_kv_vk = fs_kv.transpose(-2, -1).contiguous() if fs_kv is not None else None
+
+        _assert_k5_outputs_match_ref(
+            h_kv_vk,
+            vn_kv,
+            fs_kv_vk,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="triton_kv",
+        )
 
 
 _perf_results: list[dict] = []
@@ -498,33 +625,38 @@ class TestPerformance:
         h0_kv = h0.transpose(-2, -1).contiguous() if h0 is not None else None
 
         # K5 launch closures: each invokes the K5 host wrapper of its backend.
-        flydsl_launch = lambda: chunk_gated_delta_rule_fwd_h_flydsl(
-            k=k,
-            w=w_c,
-            u=u_c,
-            g=g,
-            initial_state=h0,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-        triton_vk_launch = lambda: chunk_gated_delta_rule_fwd_h_opt_vk(
-            k=k,
-            w=w_c,
-            u=u_c,
-            g=g,
-            initial_state=h0,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
-        triton_opt3_launch = lambda: chunk_gated_delta_rule_fwd_h_opt(
-            k=k,
-            w=w_c,
-            u=u_c,
-            g=g,
-            initial_state=h0_kv,
-            output_final_state=args.output_final_state,
-            cu_seqlens=cu,
-        )
+        def flydsl_launch():
+            chunk_gated_delta_rule_fwd_h_flydsl(
+                k=k,
+                w=w_c,
+                u=u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
+        def triton_vk_launch():
+            chunk_gated_delta_rule_fwd_h_opt_vk(
+                k=k,
+                w=w_c,
+                u=u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
+        def triton_opt3_launch():
+            chunk_gated_delta_rule_fwd_h_opt(
+                k=k,
+                w=w_c,
+                u=u_c,
+                g=g,
+                initial_state=h0_kv,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
 
         # Warmup FlyDSL once so its internal BV-autotune sweep does not
         # leak into the timed window. Triton's own ``triton.autotune`` is
