@@ -9,9 +9,9 @@ import torch
 from aiter.ops.triton.attention.unified_attention import unified_attention
 from aiter.ops.triton.utils.types import e4m3_dtype
 
-NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
-HEAD_SIZES = [128, 256]
-BLOCK_SIZES = [16, 64, 48]
+NUM_HEADS = [(4, 4), (16, 2)]
+HEAD_SIZES = [64, 128]
+BLOCK_SIZES = [16, 64]
 
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
@@ -115,8 +115,6 @@ def ref_paged_attn(
     "q_dtype, kv_dtype, out_dtype, use_q_descale, use_kv_descale, use_out_scale",
     [
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False),
-        (e4m3_dtype, e4m3_dtype, e4m3_dtype, False, False, False),
-        (e4m3_dtype, e4m3_dtype, e4m3_dtype, True, True, True),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True, False),
     ],

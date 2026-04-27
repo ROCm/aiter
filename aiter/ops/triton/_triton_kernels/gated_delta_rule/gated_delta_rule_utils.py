@@ -42,6 +42,33 @@ autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
+FLA_USE_AUTOTUNE = False
+
+
+def maybe_autotune(configs, default_config=None, **kwargs):
+    """
+    Conditional autotune decorator.
+
+    When FLA_USE_AUTOTUNE is True, behaves identically to @triton.autotune.
+    When FLA_USE_AUTOTUNE is False (default), uses only the single default_config
+    (first config in the list if not specified), skipping all benchmark overhead.
+
+    Usage::
+
+        @maybe_autotune(
+            configs=[triton.Config(...), triton.Config(...), ...],
+            default_config=triton.Config({"BV": 64}, num_warps=4, num_stages=2),
+            key=[...],
+        )
+        @triton.jit
+        def my_kernel(...):
+            ...
+    """
+    if FLA_USE_AUTOTUNE:
+        return triton.autotune(configs=configs, **kwargs)
+    cfg = default_config if default_config is not None else configs[0]
+    return triton.autotune(configs=[cfg], **kwargs)
+
 
 @lru_cache(maxsize=1)
 def check_environments():
