@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GDN prefill kernel benchmark: original (FLA) vs opt vs opt_vk.
+"""GDN prefill kernel benchmark: original (FLA) vs opt vs opt_vk vs flydsl_vk.
 
 Measures pure chunk-kernel CUDA time via torch.profiler, with per-kernel
 breakdown.  L2-norm is applied once before the timed region so the profiler
@@ -9,6 +9,7 @@ Backends (all from aiter):
   - chunk_gated_delta_rule        (original, mirrors FLA implementation)
   - chunk_gated_delta_rule_opt    (fused K12/K34, transposed intermediate)
   - chunk_gated_delta_rule_opt_vk (same fused K12/K34, h in [V,K] layout)
+  - flydsl_gdr_prefill            (same pipeline as opt_vk, but K5 runs FlyDSL)
 
 Usage:
     python gdr_prefill_kernel_bench.py
@@ -22,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import profile, ProfilerActivity
 
+from aiter.ops.flydsl.linear_attention_prefill_kernels import flydsl_gdr_prefill
 from aiter.ops.triton.gated_delta_net import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
@@ -49,10 +51,17 @@ BACKENDS = {
     "opt": chunk_gated_delta_rule_opt,
     "original": chunk_gated_delta_rule,
     "opt_vk": chunk_gated_delta_rule_opt_vk,
+    "flydsl_vk": flydsl_gdr_prefill,
 }
 
+# Backends whose K5 hidden state expects the transposed VK layout
+# ([N, H, K, V] for ``initial_state``).
+_VK_BACKENDS = {"opt_vk", "flydsl_vk"}
+
 # Kernel names that belong to the chunk algorithm itself (exclude l2norm,
-# memcpy, fill, dtype-cast elementwise, etc.)
+# memcpy, fill, dtype-cast elementwise, etc.).
+# ``chunk_gdn_fwd_h_opt3`` is the FlyDSL K5 kernel registered via
+# ``@flyc.kernel(name=...)`` in aiter/ops/flydsl/kernels/chunk_gated_delta_h.py.
 CHUNK_KERNEL_PREFIXES = [
     "chunk_gated_delta_rule_fwd_kernel_h",
     "chunk_fwd_kernel_o",
@@ -62,6 +71,7 @@ CHUNK_KERNEL_PREFIXES = [
     "recompute_w_u_fwd_kernel",
     "fused_solve_tril_recompute_w_u_kernel",
     "fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel",
+    "chunk_gdn_fwd_h_opt3",
 ]
 
 
@@ -88,7 +98,7 @@ def make_inputs(B, T, H, K, V, dtype):
 
 
 def run_fn(backend_name, fn, q, k, v, g, beta, h0, scale):
-    if backend_name == "opt_vk":
+    if backend_name in _VK_BACKENDS:
         state = h0.transpose(-1, -2).contiguous()
     else:
         state = h0.clone()
@@ -137,10 +147,12 @@ def validate(q, k, v, g, beta, h0, scale):
     o_orig = run_fn("original", BACKENDS["original"], q, k, v, g, beta, h0, scale)
     o_opt = run_fn("opt", BACKENDS["opt"], q, k, v, g, beta, h0, scale)
     o_vk = run_fn("opt_vk", BACKENDS["opt_vk"], q, k, v, g, beta, h0, scale)
+    o_fly = run_fn("flydsl_vk", BACKENDS["flydsl_vk"], q, k, v, g, beta, h0, scale)
     torch.cuda.synchronize()
     diff_opt = (o_orig.float() - o_opt.float()).abs().max().item()
     diff_vk = (o_orig.float() - o_vk.float()).abs().max().item()
-    return diff_opt, diff_vk
+    diff_fly = (o_orig.float() - o_fly.float()).abs().max().item()
+    return diff_opt, diff_vk, diff_fly
 
 
 # -- Main ---------------------------------------------------------------------
@@ -179,7 +191,7 @@ def main():
 
     print(f"GPU: {gpu}")
     print(f"Batch: {B}  |  Warmup: {cli.warmup}  |  Measure iters: {cli.niters}")
-    print("Backends: opt, original (FLA), opt_vk")
+    print("Backends: opt, original (FLA), opt_vk, flydsl_vk")
     print("L2-norm applied BEFORE profiling (use_qk_l2norm_in_kernel=False)")
     print()
 
@@ -208,9 +220,12 @@ def main():
                 torch.manual_seed(42)
                 q, k_, v_, g, beta, h0, scale = make_inputs(B, T, H, K, V, dtype)
                 try:
-                    diff_opt, diff_vk = validate(q, k_, v_, g, beta, h0, scale)
+                    diff_opt, diff_vk, diff_fly = validate(
+                        q, k_, v_, g, beta, h0, scale
+                    )
                     print(
-                        f"Validation vs original:  opt={diff_opt:.2e}  opt_vk={diff_vk:.2e}"
+                        f"Validation vs original:  opt={diff_opt:.2e}  "
+                        f"opt_vk={diff_vk:.2e}  flydsl_vk={diff_fly:.2e}"
                     )
                 except Exception as e:
                     print(f"Validation FAILED: {e}")
@@ -279,7 +294,7 @@ def main():
                 # Summary
                 orig = row.get("original")
                 print("\n  --- Chunk kernel time (us/iter) ---")
-                for bname in ["opt", "original", "opt_vk"]:
+                for bname in ["opt", "original", "opt_vk", "flydsl_vk"]:
                     t = row.get(bname)
                     if t is None:
                         print(f"  {bname:<12s}  ERROR")
@@ -299,13 +314,14 @@ def main():
     print("=" * 100)
     print(
         "| Model | TP | H | T | opt (us) | original (us) | opt_vk (us) "
-        "| opt spdup | opt_vk spdup |"
+        "| flydsl_vk (us) | opt spdup | opt_vk spdup | flydsl_vk spdup |"
     )
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for r in all_summary:
         orig = r.get("original")
         opt = r.get("opt")
         vk = r.get("opt_vk")
+        fly = r.get("flydsl_vk")
 
         def fmt(v):
             return f"{v:.1f}" if v is not None else "ERR"
@@ -317,8 +333,8 @@ def main():
 
         print(
             f"| {r['model']} | {r['tp']} | {r['H']} | {r['T']} "
-            f"| {fmt(opt)} | {fmt(orig)} | {fmt(vk)} "
-            f"| {spd(orig, opt)} | {spd(orig, vk)} |"
+            f"| {fmt(opt)} | {fmt(orig)} | {fmt(vk)} | {fmt(fly)} "
+            f"| {spd(orig, opt)} | {spd(orig, vk)} | {spd(orig, fly)} |"
         )
     print()
 
