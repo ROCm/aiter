@@ -79,39 +79,32 @@ def allocate_output(
     return matmul_output, final_output
 
 
-def get_kernel_config(m, n, k, routing_data, use_gluon=False):
+def get_kernel_config_triton(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 1 if use_gluon else 8
+    num_xcds = 1
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     num_stages = 2
 
     split_k = 1
-    if use_gluon:
-        # TODO: need to tune
+    if block_m == 16:
         block_n = 128
-        block_k = 512
+        block_k = 256
         num_warps = 4
-    else:
-        if block_m == 16:
-            block_n = 128
-            block_k = 256
-            num_warps = 4
-
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n >= 64 and grid < 256:
+            block_n = block_n // 2
             grid_m = routing_data.n_blocks(m, block_m)
             grid_n = triton.cdiv(n, block_n)
             grid = grid_m * grid_n * split_k
-            while block_n >= 64 and grid < 256:
-                block_n = block_n // 2
-                grid_m = routing_data.n_blocks(m, block_m)
-                grid_n = triton.cdiv(n, block_n)
-                grid = grid_m * grid_n * split_k
-        else:
-            # for scale preshuffling
-            block_n = 512
-            block_k = 256
-            num_warps = 8
+    else:
+        # for scale preshuffling
+        block_n = 512
+        block_k = 256
+        num_warps = 8
 
     ret = {
         "block_m": block_m,
@@ -130,7 +123,30 @@ def get_kernel_config(m, n, k, routing_data, use_gluon=False):
     return ret
 
 
-def swizzle_scales(data):
+def get_kernel_config_gluon(m, n, k, routing_data):
+    block_m = routing_data.block_m
+    num_xcds = 1
+    num_buffers = 3
+
+    block_m = 32
+    block_n = 128
+    block_k = 512
+    num_warps = 4
+
+    ret = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "xcd_swizzle": num_xcds,
+        "num_buffers": num_buffers,
+        "split_k": 1,
+        "waves_per_eu": 0,
+    }
+    return ret
+
+
+def swizzle_scales_gfx950(data):
     NON_K_PRESHUFFLE_BLOCK_SIZE = 32
     block_shape = data.shape
     SCALE_K = block_shape[-2]
@@ -304,7 +320,10 @@ def moe_gemm_a4w4(
         K = unpadded_K
     # compute optimization flags
     if config is None:
-        config = get_kernel_config(M, N, K, routing_data, use_gluon=use_gluon)
+        if use_gluon:
+            config = get_kernel_config_gluon(M, N, K, routing_data)
+        else:
+            config = get_kernel_config_triton(M, N, K, routing_data)
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -345,7 +364,7 @@ def moe_gemm_a4w4(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    if backend == "gluon" and get_arch() == "gfx1250":
+    if use_gluon and get_arch() == "gfx1250":
         # layouts
         WMMA_LAYOUT = get_wmma_layout(
             config["num_warps"], False, swizzle_mx_scale == "GFX1250_SCALE"
@@ -353,7 +372,7 @@ def moe_gemm_a4w4(
         WMMA_LAYOUT_PACKED = get_wmma_layout(
             config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE"
         )
-        assert config["split_k"] == 1, "split_k is not currently supported for gfx1250"
+        assert config["split_k"] == 1, "Split-k is not supported for Gluon backend on gfx1250"
         _moe_gemm_a4w4_gfx1250[(grid,)](
             y,
             y.stride(0),
@@ -395,22 +414,16 @@ def moe_gemm_a4w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            config["group_m"],
+            SPLIT_K=config["split_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            SPLIT_K=config["split_k"],
-            EVEN_K=K % config["block_k"] == 0,
-            MASK_K_LIMIT=K % config["block_k"],
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            NUM_BUFFERS=config["num_buffers"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             WMMA_LAYOUT=WMMA_LAYOUT,
             WMMA_LAYOUT_PACKED=WMMA_LAYOUT_PACKED,
             NUM_WARPS=config["num_warps"],
             num_warps=config["num_warps"],
-            num_stages=config["num_stages"],
             waves_per_eu=config["waves_per_eu"],
-            matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-            kpack=config["kpack"],
         )
     else:
         _moe_gemm_a4w4[(grid,)](
