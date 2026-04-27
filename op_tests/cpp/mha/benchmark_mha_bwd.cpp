@@ -351,9 +351,27 @@ bool run(const ck_tile::ArgParser& arg_parser)
         (mode == mode_enum::batch ? seqlen_q : seqstart_q_host.back());
     const ck_tile::index_t shape_seqlen_k =
         (mode == mode_enum::batch ? seqlen_k : seqstart_k_host.back());
-    const ck_tile::index_t kN0 = (hdim_q <= 128) ? 128 : 64;
-    const ck_tile::index_t nsplits =
-        deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
+    const fmha_bwd_traits traits{
+        shape_seqlen_q,
+        shape_seqlen_k,
+        batch,
+        max_seqlen_q,
+        max_seqlen_k,
+        hdim_q,
+        hdim_v,
+        nhead,
+        nhead_k,
+        data_type,
+        mode == mode_enum::group,
+        mask.type,
+        bias.type,
+        use_dbias,
+        p_drop > 0.0f,
+        s_randval,
+        deterministic,
+    };
+    const fmha_bwd_launcher launcher(traits);
+    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
     const ck_tile::index_t a16_dq_acc_seq =
         v3_atomic_fp32 ? shape_seqlen_q
                        : (mode == mode_enum::batch ? (seqlen_q + 15) / 16 * 16

@@ -150,19 +150,37 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
     bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
     auto opts = q.options();
-    // nsplits: deterministic mode splits dK into ceil(max_seqlen_k/16) pieces for atomic-free accumulation.
-    constexpr ck_tile::index_t kN0 = 16;
-    const ck_tile::index_t nsplits = deterministic
-        ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0)
-        : 1;
+    const fmha_bwd_traits traits{
+        total_q,
+        total_k,
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        head_size_q,
+        head_size_v,
+        num_heads,
+        num_heads_k,
+        q_dtype_str,
+        true, // is_group_mode
+        mask.type,
+        bias_type,
+        false, // has_dbias
+        p_dropout > 0,
+        false, // is_store_randval
+        deterministic,
+    };
+    const fmha_bwd_launcher launcher(traits);
+    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
     auto stream = at::hip::getCurrentHIPStream();
 
     auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
-    // Always zero dq_accum: the dq_dk_dv kernel writes via atomicAdd regardless of
-    // deterministic mode, so an uninitialized accumulator would corrupt dQ.
-    at::Tensor dq_accum = torch::zeros({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
+    at::Tensor dq_accum;
+    if (launcher.needs_zero_dq_acc)
+        dq_accum = torch::zeros({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
+    else
+        dq_accum = torch::empty({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA

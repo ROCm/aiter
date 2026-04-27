@@ -241,7 +241,8 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     if(asm_ret == -1)
     {
-        return fmha_bwd(traits, ck_args, s);
+        const fmha_bwd_launcher launcher(traits);
+        return launcher.run(ck_args, s);
     }
     return asm_ret;
 #endif
