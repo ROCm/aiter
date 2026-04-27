@@ -507,13 +507,19 @@ def triton_gemm(
     scale_c: Optional[Tensor] = None,
     bpreshuffle: Optional[bool] = False,
 ):
-    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-
+    # Assertions
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "Triton gemm_a16w16 does not support scaling yet"
     assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
-    return gemm_a16w16(inp, weights, bias=bias, dtype=otype)
+    # Check architecture
+    gfx = get_gfx()
+    if (gfx.startswith("gfx12")):
+        from aiter.ops.triton._gluon_kernels.gemm.basic.gemm_a16w16 import gemm_a16w16
+        return gemm_a16w16(inp, weights, bias=bias, dtype=otype, kernel_type="lds_pipeline")
+    else:
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+        return gemm_a16w16(inp, weights, bias=bias, dtype=otype)
 
 
 solMap = {
