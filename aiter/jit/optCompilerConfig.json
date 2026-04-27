@@ -415,19 +415,29 @@
     },
     "module_moe_asm": {
         "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/aiter_ctypes_error_tls.cu'",
             "f'{AITER_CSRC_DIR}/pybind/moe_op_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'"
         ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_cc": [
+            "'-DAITER_FMOE_WITH_TORCH=1'"
+        ],
+        "flags_extra_hip": [
+            "'-DAITER_FMOE_WITH_TORCH=1'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
-        "verbose": "False"
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe_2stages --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmoe --output_dir {{}}'"
+        ]
     },
     "module_moe_topksoftmax_asm": {
         "srcs": [
