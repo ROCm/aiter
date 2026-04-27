@@ -19,7 +19,12 @@ from unittest.mock import patch
 
 # ---------------------------------------------------------------------------
 # Minimal stubs so GemmTuner can be imported without a real ROCm stack.
-# Uses setdefault so installed packages, if present, take precedence.
+#
+# GemmTuner.py executes nine "from aiter..." imports at module level, before
+# any test code runs.  On a machine without ROCm every one fails, so we must
+# pre-populate sys.modules with objects that satisfy those imports before the
+# "from gradlib.GemmTuner import Gemm" line below.  That is why _install_stubs()
+# is called unconditionally at module level rather than inside setUp().
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +32,8 @@ _ASM_SPLITK_MAX_GRID = 16 * 64  # mirrors aiter.ops.gemm_op_a16w16.ASM_SPLITK_MA
 
 
 def _make_stub(name, **attrs):
+    # types.ModuleType produces a bare module object — the same class "import"
+    # normally creates — so "from stub_name import attr" works without real code.
     mod = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(mod, k, v)
@@ -114,6 +121,10 @@ def _install_stubs():
         if name in sys.modules:
             continue
         try:
+            # Prefer the real module when it is importable (e.g. on a GPU CI
+            # machine where aiter is installed).  Only fall back to the stub on
+            # ImportError, so we don't corrupt other tests in the same session
+            # that depend on the real implementation.
             importlib.import_module(name)
         except Exception:
             sys.modules[name] = mod
@@ -131,6 +142,9 @@ from gradlib.GemmTuner import Gemm  # noqa: E402
 
 def _make_gemm(m, n, k):
     import aiter.dtypes as dtypes
+    # __new__ allocates the instance without calling __init__, which would
+    # trigger GPU data generation.  We set the attributes that
+    # asm_gemm_all_solutions() actually reads, and nothing more.
     gemm = Gemm.__new__(Gemm)
     gemm.m = m
     gemm.n = n
@@ -160,6 +174,10 @@ def _fake_kernels(tile_m, tile_n, splitK_flag, subK):
 
 class TestSplitKSemaphoreGuard(unittest.TestCase):
 
+    # @patch target must name the lookup site, not the definition site.
+    # GemmTuner does "from aiter.jit.utils.chip_info import get_gfx", so get_gfx
+    # lives in the gradlib.GemmTuner namespace — patching the original module
+    # would have no effect on the already-bound local reference.
     @patch("gradlib.GemmTuner.get_gfx", return_value="gfx942")
     @patch("gradlib.GemmTuner.generate_data", return_value=None)
     def test_large_grid_candidates_are_skipped(self, _gen, _gfx):
