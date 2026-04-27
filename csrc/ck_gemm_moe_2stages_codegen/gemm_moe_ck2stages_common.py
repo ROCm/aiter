@@ -195,9 +195,11 @@ a8w8_gemm1_blockscale_kernels_list= {
      3: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
      # NPerBlock=64 kernels for inter_dim divisible by 64 but not 128 (e.g. tp=4 inter_dim=320)
+     # Stage2 KPerBlock=64 is NOT added: gfx950 FP8 mfma KPack=32 requires KPerBlock>=128
+     # Stage1 M=64 uses V1+MWaves=1+NWaves=4 (V3 requires MRepeat>=4, V3+MWaves=2 gives MRepeat=2)
      4: kernelInstanceGEMM1(       256,       16,         64,       256,     1,       4,        1,),
      5: kernelInstanceGEMM1(       256,       32,         64,       128,     1,       4,        1,),
-     6: kernelInstanceGEMM1(       256,       64,         64,       128,     2,       2,        3,),
+     6: kernelInstanceGEMM1(       256,       64,         64,       128,     1,       4,        1,),
 }
 
 # gemm1 out:bf16/fp16 A:fp8 B:win4
@@ -321,10 +323,9 @@ a8w8_gemm2_blockscale_kernels_list= {
      2: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
      3: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
      #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
-     # KPerBlock=64 kernels for inter_dim divisible by 64 but not 128 (e.g. tp=4 inter_dim=320)
-     4: kernelInstanceGEMM2(       256,       16,        128,        64,     1,       4,        1,),
-     5: kernelInstanceGEMM2(       256,       32,        128,        64,     1,       4,        1,),
-     6: kernelInstanceGEMM2(       256,       64,        128,        64,     1,       4,        3,),
+     # NOTE: KPerBlock=64 for FP8 blockscale is NOT supported on gfx950:
+     # static_assert(KPerThread % KPack == 0) fails (KPack=32 for FP8 mfma).
+     # Stage2 K=inter_dim requires padding to next multiple of 128.
 }
 
 # gemm2 out:bf16/fp16 A:fp8 B:in4
