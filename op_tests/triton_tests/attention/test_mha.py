@@ -685,6 +685,78 @@ def test_mha_backward(
             assert_cosine_similarity(tri, ref)
 
 
+@pytest.mark.parametrize("BATCH", [2, 4])
+@pytest.mark.parametrize("SEQLEN_Q", [256, 512])
+@pytest.mark.parametrize("SEQLEN_K", [256, 512])
+@pytest.mark.parametrize("NUM_Q_HEADS", [32])
+@pytest.mark.parametrize("NUM_K_HEADS", [8])
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("CAUSAL", [False])
+@pytest.mark.parametrize("FUSED", [False, True])
+def test_mha_backward_sbhd_do(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    FUSED: bool,
+    dtype=torch.float16,
+):
+    """Verify backward correctness when dO has SBHD memory layout (strides differ from O).
+
+    Creates dO as a (seqlen, batch, nheads, headdim) tensor transposed to
+    (batch, seqlen, nheads, headdim), so its strides are different from the
+    contiguous BSHD output tensor. This exercises the independent stride
+    handling for dO in _bwd_preprocess.
+    """
+    torch.cuda.empty_cache()
+    torch.manual_seed(42)
+    if FUSED and CAUSAL:
+        pytest.skip("FUSED+CAUSAL results in NaNs")
+
+    mha_set_use_fused_bwd_kernel(FUSED)
+
+    q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    v = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+
+    # dO in SBHD memory layout: (seqlen, batch, nheads, headdim) viewed as BSHD
+    do_sbhd = torch.randn(
+        SEQLEN_Q, BATCH, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype
+    )
+    do = do_sbhd.transpose(0, 1)  # shape is BSHD but strides are SBHD
+    assert not do.is_contiguous(), "dO should be non-contiguous (SBHD strides)"
+
+    # Reference: use contiguous dO for the reference computation
+    do_contig = do.contiguous()
+
+    # Triton forward + backward with SBHD-strided dO
+    with torch.enable_grad():
+        triton_out = flash_attn_func(q, k, v, causal=CAUSAL)
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
+
+    # Reference forward + backward (with contiguous dO)
+    torch_out, torch_grads, fwd_tol, bwd_tols = _attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do_contig,
+        causal=CAUSAL,
+    )
+    torch_dq, torch_dk, torch_dv = torch_grads
+
+    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
+    ref_vals = [torch_out, torch_dq, torch_dk, torch_dv]
+    tols = [fwd_tol] + bwd_tols
+    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
 @pytest.mark.parametrize("SEQLEN_K", [512, 2048])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
