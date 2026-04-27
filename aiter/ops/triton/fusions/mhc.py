@@ -100,13 +100,13 @@ def fused_mhc(
     )
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
-    assert total_phi_cols == N_total, (
-        f"phi shape mismatch: expected (K, {N_total}), got ({K_phi}, {total_phi_cols})"
-    )
+    assert (
+        total_phi_cols == N_total
+    ), f"phi shape mismatch: expected (K, {N_total}), got ({K_phi}, {total_phi_cols})"
 
-    assert bias.shape[0] == N_total, (
-        f"Bias shape mismatch: expected ({N_total},), got {bias.shape}"
-    )
+    assert (
+        bias.shape[0] == N_total
+    ), f"Bias shape mismatch: expected ({N_total},), got {bias.shape}"
     assert num_ksplit >= 1, f"num_ksplit must be >= 1, got {num_ksplit}"
 
     assert (

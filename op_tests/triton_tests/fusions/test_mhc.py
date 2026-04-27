@@ -1046,5 +1046,3 @@ def test_sk_output_range():
 
     assert torch.all(out >= 0.0), "Output has negative values"
     assert torch.all(out <= 1.0), "Output has values > 1"
-
-
