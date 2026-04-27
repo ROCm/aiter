@@ -97,10 +97,8 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
         maxtol = 2e-2
     if rmstol is None:
         rmstol = 4e-3
-    """
-    Compare reference values against obtained values.
-    """
 
+    # Compare reference values against obtained values.
     # cast to float32:
     ref = ref.to(torch.float32).detach()
     tri = tri.to(torch.float32).detach()

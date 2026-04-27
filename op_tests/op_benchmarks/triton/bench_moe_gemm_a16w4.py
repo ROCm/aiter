@@ -193,10 +193,10 @@ def bench_mlp_single_weight_init(
     )
 
     # -- benchmark --
-    x_dtype = torch.bfloat16
+    x_dtype_torch = torch.bfloat16 if x_dtype == "bf16" else torch.float16
 
     reps = 100
-    x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
+    x = torch.randn((batch, dim1), dtype=x_dtype_torch, device=dev)
     xg = x
 
     # run layer
@@ -216,7 +216,7 @@ def bench_mlp_single_weight_init(
             rdata,
             gather_indx=gather_indx,
             swizzle_mx_scale=swizzle_mx_scale1,
-            out_dtype=x_dtype,
+            out_dtype=x_dtype_torch,
             apply_swiglu=True,
         )
         x = moe_gemm_a16w4(
@@ -230,7 +230,7 @@ def bench_mlp_single_weight_init(
             rdata,
             gather_indx=gather_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
-            out_dtype=x_dtype,
+            out_dtype=x_dtype_torch,
             apply_swiglu=True,
         )
 

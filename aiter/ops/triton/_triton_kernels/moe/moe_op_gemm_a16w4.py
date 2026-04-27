@@ -224,7 +224,7 @@ def _moe_gemm_a16w4(
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
 
-    # A pointers
+    # X pointers
     offs_x_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_x_m = tl.max_contiguous(tl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
     if GatherIndx is None:
@@ -268,7 +268,7 @@ def _moe_gemm_a16w4(
         + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
     )
 
-    # B pointers
+    # W pointers
     offs_w_n = pid_n * PACKED_BLOCK_N_W + tl.arange(0, PACKED_BLOCK_N_W)
     offs_w_n = tl.max_contiguous(
         tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
