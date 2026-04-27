@@ -6,6 +6,31 @@ from aiter.ops.triton._triton_kernels.rope.fused_qkv_split_qk_norm_rope_cache im
 )
 
 
+def infer_rope_cache_triton_block_t(T: int, device: torch.device) -> int:
+    """Pick Triton token tile ``BLOCK_T`` for :func:`fused_qkv_split_qk_norm_rope_cache`.
+
+    Same heuristic as vLLM ``input_quant_fp8.calc_rows_per_block``: scale tile size with
+    sequence length and SM/CU count so the launch grid stays in a sensible range — use
+    ``ceil(T / (2 * sm_count))`` rounded up to the next power of two, then cap (the
+    vLLM quant path caps at 4 rows; this kernel keeps a larger upper bound due to
+    per-token work and ``tl.arange(0, BLOCK_T)`` register pressure).
+    """
+    if device.type != "cuda":
+        raise ValueError(
+            "fused_qkv_split_qk_norm_rope_cache expects a CUDA/HIP device "
+            f"(got {device!r})."
+        )
+    device_id = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    sm_count = max(
+        int(torch.cuda.get_device_properties(device_id).multi_processor_count),
+        1,
+    )
+    block_t = triton.next_power_of_2(triton.cdiv(T, 2 * sm_count))
+    return max(1, min(int(block_t), 32))
+
+
 def fused_qkv_split_qk_norm_rope_cache(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,  # RMS norm weight for Q
@@ -73,17 +98,7 @@ def fused_qkv_split_qk_norm_rope_cache(
     # Cache shape: [num_blocks, num_heads, block_size, head_dim]
     num_blocks = key_cache.shape[0]
     block_size = key_cache.shape[2]
-
-    # Validate that all valid (non-negative) slot indices are within the
-    # allocated cache; slots < 0 are padding tokens and are intentionally skipped.
-    valid_slots = slot_mapping[slot_mapping >= 0]
-    if valid_slots.numel() > 0:
-        max_slot = int(valid_slots.max().item())
-        assert max_slot < num_blocks * block_size, (
-            f"slot_mapping contains slot {max_slot} which is out of bounds "
-            f"for cache with {num_blocks} blocks of size {block_size} "
-            f"(max valid slot: {num_blocks * block_size - 1})"
-        )
+    total_num_kv_cache_tokens = num_blocks * block_size
 
     assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
     q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
@@ -113,7 +128,7 @@ def fused_qkv_split_qk_norm_rope_cache(
     BLOCK_D = head_dim
     BLOCK_D_HALF = head_dim // 2
 
-    BLOCK_T = 32
+    BLOCK_T = infer_rope_cache_triton_block_t(T, qkv.device)
     num_warps = 4
     grid = (triton.cdiv(T, BLOCK_T), qh)
 
@@ -170,7 +185,7 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCKED_GATED_LAYOUT=(attn_output_gate and gated_qkv_layout == "blocked"),
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
-        NUM_BLOCKS=num_blocks,
+        total_num_kv_cache_tokens=total_num_kv_cache_tokens,
         num_warps=num_warps,
     )
 

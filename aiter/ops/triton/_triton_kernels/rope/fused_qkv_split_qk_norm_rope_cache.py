@@ -163,7 +163,7 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
     value_cache_stride_b,
     k_scale_ptr,
     v_scale_ptr,
-    NUM_BLOCKS,  # Total number of paged-cache blocks (key_cache.shape[0])
+    total_num_kv_cache_tokens: tl.int64,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
     HAVE_POS: tl.constexpr,
@@ -416,20 +416,17 @@ def _fused_qkv_split_qk_norm_rope_cache_kernel(
         tl.store(k_ptr + kv_out_offs, k.to(k_ptr.dtype.element_ty), mask=x_mask)
         tl.store(v_ptr + kv_out_offs, v.to(v_ptr.dtype.element_ty), mask=x_mask)
 
-        # KV Caching Logic
+        # KV Caching Logic: skip cache writes for padding (slot < 0) or out-of-range
+        # slots. Bounds use total_num_kv_cache_tokens (= num_blocks * block_size)
+        # so we avoid Python-side GPU sync (max/assert on slot_mapping).
         slots = tl.load(slot_mapping_ptr + t_offs, mask=t_mask)
+        valid_slot = (slots >= 0) & (slots < total_num_kv_cache_tokens)
+        safe_slots = tl.where(valid_slot, slots, 0)
 
-        # Clamp slots to 0 before computing indices to avoid negative pointer
-        # arithmetic (the final store is guarded by cache_mask).
-        safe_slots = tl.where(slots >= 0, slots, 0)
-
-        # Calculate Paged Cache offsets
         b_idx = safe_slots % BLOCK_SIZE
         t_slot_idx = safe_slots // BLOCK_SIZE
 
-        # Guard writes: slot must be valid (>= 0) and within the allocated
-        # cache range (t_slot_idx < NUM_BLOCKS) to prevent out-of-bounds stores.
-        cache_mask = x_mask & (slots[:, None] >= 0) & (t_slot_idx[:, None] < NUM_BLOCKS)
+        cache_mask = x_mask & valid_slot[:, None]
 
         k_scale_rcprl = 1 / k_scale
         k = k * k_scale_rcprl
