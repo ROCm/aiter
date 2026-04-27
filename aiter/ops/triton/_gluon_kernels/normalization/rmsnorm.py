@@ -234,7 +234,7 @@ def _gluon_rms_norm_kernel(
             rms_norm = a * norm_factor * weights
             # store rms norm and the norm factor
             gl.store(
-                rsigma_ptr + row_start, norm_factor.to(rsigma_ptr.dtype.element_ty)
+                rsigma_ptr + row_idx, norm_factor.to(rsigma_ptr.dtype.element_ty)
             )
             smemOutput1d = smemOutput.index(current_stage).reshape([BLOCK_SIZE])
             smemOutput1d.store(rms_norm.to(output_ptr.dtype.element_ty))
