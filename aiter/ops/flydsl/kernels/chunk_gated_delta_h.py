@@ -835,24 +835,41 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     chunk_size: int = 64,
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
-    wu_contiguous: bool = True,
-    BV: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """FlyDSL K5 wrapper with wrapper-level autotune over BV.
+    """FlyDSL K5 host wrapper.
 
-    ``h`` / ``initial_state`` / ``final_state`` are VK-ordered on the last two dims: ``[..., V, K]``.
+    Signature is API-compatible with
+    ``aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h.chunk_gated_delta_rule_fwd_h_opt_vk``:
+
+    Args:
+        k: [B, T, Hg, K] bf16.
+        w: [B, H, T_flat, K] bf16, head-major contiguous layout.
+        u: [B, H, T_flat, V] bf16, head-major contiguous layout.
+        g: [T_total, H] f32 cumulative gate, or None.
+        gk: per-K gate (currently ignored by the FlyDSL kernel).
+        initial_state: [N, H, V, K] f32, or None.
+        output_final_state: whether to return the final hidden state.
+        chunk_size: chunk size BT (default 64).
+        save_new_value: whether to materialize ``v_new``.
+        cu_seqlens: [N+1] LongTensor for variable-length batching, or None.
+
+    Returns:
+        (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
+        last two dims).
+
+    BV-tile selection is internal; results of the very first call for a given
+    shape are cached in module-level ``_autotune_cache``.
     """
+    # Layout is fixed to head-major contiguous (matches Triton VK wrapper).
+    wu_contiguous = True
+    BV = 0  # 0 => autotune (cache hit on subsequent calls)
+
     B, T, Hg, K = k.shape
     BT = chunk_size
 
-    if wu_contiguous:
-        H = w.shape[1]
-        V = u.shape[-1]
-        T_flat = w.shape[2]
-    else:
-        H = u.shape[-2]
-        V = u.shape[-1]
-        T_flat = w.shape[1]
+    H = w.shape[1]
+    V = u.shape[-1]
+    T_flat = w.shape[2]
 
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None

@@ -27,18 +27,12 @@ if not is_flydsl_available():
     )
 
 try:
-    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-        flydsl_gdr_prefill,
-    )
-    from aiter.ops.flydsl.kernels import (
-        chunk_gated_delta_h as flydsl_chunk_gated_delta_h_mod,
+    from aiter.ops.flydsl.kernels.chunk_gated_delta_h import (
+        chunk_gated_delta_rule_fwd_h_flydsl,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
-        chunk_gated_delta_rule_fwd_kernel_h_opt,
-        chunk_gated_delta_rule_fwd_kernel_h_opt_vk,
-    )
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
-        prepare_chunk_offsets as _prepare_chunk_offsets,
+        chunk_gated_delta_rule_fwd_h_opt,
+        chunk_gated_delta_rule_fwd_h_opt_vk,
     )
 except ImportError as exc:
     pytest.skip(
@@ -250,16 +244,6 @@ def _build_cu_seqlens(context_lens, device="cuda"):
     return scheduled_q_lens, cu_seqlens
 
 
-def _build_chunk_offsets(cu_seqlens, chunk_size):
-    lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    return torch.cat(
-        [
-            cu_seqlens.new_tensor([0]),
-            triton.cdiv(lens, chunk_size),
-        ]
-    ).cumsum(-1)
-
-
 def _make_inputs(
     context_lens,
     args: PrefillArgs = None,
@@ -414,9 +398,7 @@ def _normalize_opt_v_new(vn_opt):
     return vn_opt.permute(0, 2, 1, 3).contiguous()
 
 
-# -- Triton opt_vk reference ---------------------------------------------
-
-_FLA_CHUNK_SIZE_OPT_VK = 64
+# -- Performance benchmark ----------------------------------------------
 
 
 def _bench_fn(fn, *args, **kwargs):
@@ -449,276 +431,6 @@ def _bench_fn(fn, *args, **kwargs):
     return total_us
 
 
-def _prepare_flydsl_kernel_launch(
-    k,
-    w,
-    u,
-    g=None,
-    initial_state=None,
-    output_final_state=False,
-    chunk_size=64,
-    save_new_value=True,
-    cu_seqlens=None,
-    wu_contiguous=True,
-    bv=0,
-):
-    mod = flydsl_chunk_gated_delta_h_mod
-    batch_size, total_tokens, hg, head_k_dim = k.shape
-    bt = chunk_size
-
-    if wu_contiguous:
-        num_heads = w.shape[1]
-        head_v_dim = u.shape[-1]
-        t_flat = w.shape[2]
-    else:
-        num_heads = u.shape[-2]
-        head_v_dim = u.shape[-1]
-        t_flat = w.shape[1]
-
-    if cu_seqlens is None:
-        num_seqs, num_chunks, chunk_offsets = (
-            batch_size,
-            triton.cdiv(total_tokens, bt),
-            None,
-        )
-    else:
-        num_seqs = len(cu_seqlens) - 1
-        lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        num_chunks = sum(triton.cdiv(int(seq_len), bt) for seq_len in lens.tolist())
-        chunk_offsets = _build_chunk_offsets(cu_seqlens, bt).to(torch.int32)
-
-    use_g = g is not None
-    use_h0 = initial_state is not None
-    is_varlen = cu_seqlens is not None
-
-    if bv <= 0:
-        shape_key = (
-            head_k_dim,
-            head_v_dim,
-            bt,
-            num_heads,
-            hg,
-            t_flat,
-            num_seqs,
-            use_g,
-            use_h0,
-            output_final_state,
-            save_new_value,
-            is_varlen,
-            wu_contiguous,
-        )
-        if shape_key not in mod._autotune_cache:
-            mod.chunk_gated_delta_rule_fwd_h_flydsl(
-                k,
-                w,
-                u,
-                g=g,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                chunk_size=chunk_size,
-                save_new_value=save_new_value,
-                cu_seqlens=cu_seqlens,
-                wu_contiguous=wu_contiguous,
-            )
-            torch.cuda.synchronize()
-        bv = mod._autotune_cache[shape_key]
-
-    launch_fn = mod._get_or_compile(
-        head_k_dim,
-        head_v_dim,
-        bt,
-        bv,
-        num_heads,
-        hg,
-        use_g,
-        use_h0,
-        output_final_state,
-        save_new_value,
-        is_varlen,
-        wu_contiguous,
-    )
-
-    h = k.new_empty(batch_size, num_chunks, num_heads, head_v_dim, head_k_dim)
-    final_state = (
-        k.new_empty(num_seqs, num_heads, head_v_dim, head_k_dim, dtype=torch.float32)
-        if output_final_state
-        else None
-    )
-    v_new_buf = k.new_empty(batch_size, num_heads, t_flat, head_v_dim, dtype=u.dtype)
-
-    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
-    g_arg = g if g is not None else dummy
-    h0_arg = initial_state if initial_state is not None else dummy
-    ht_arg = final_state if final_state is not None else dummy
-    vn_arg = v_new_buf
-    cu_arg = (
-        cu_seqlens.to(torch.int32) if cu_seqlens is not None else dummy.to(torch.int32)
-    )
-    co_arg = chunk_offsets if chunk_offsets is not None else dummy.to(torch.int32)
-    stream = torch.cuda.current_stream()
-
-    def _launch():
-        mod._launch_kernel(
-            launch_fn,
-            bv,
-            head_v_dim,
-            num_seqs,
-            num_heads,
-            k,
-            u,
-            w,
-            vn_arg,
-            g_arg,
-            h,
-            h0_arg,
-            ht_arg,
-            cu_arg,
-            co_arg,
-            total_tokens,
-            t_flat,
-            stream,
-        )
-
-    _launch.best_bv = bv
-    return _launch
-
-
-# -- Triton K5 launch closures (host prep done once, only device kernel timed) --
-# These mirror the host wrappers in
-# ``aiter/ops/triton/_triton_kernels/gated_delta_rule/prefill/chunk_delta_h.py``
-# (`chunk_gated_delta_rule_fwd_h_opt` / `_opt_vk`), but lift all per-call host
-# work (allocations + chunk_offsets + grid lambda + initial_state transpose) out
-# of the closure so ``_bench_fn`` only times the underlying ``triton.jit``
-# device kernel launch -- the same convention FlyDSL's autotune harness uses.
-
-
-def _prepare_triton_opt3_kv_kernel_launch(
-    k,
-    w,
-    u,
-    g=None,
-    initial_state=None,
-    output_final_state=False,
-    chunk_size=64,
-    save_new_value=True,
-    cu_seqlens=None,
-):
-    """Triton K5 (KV layout) launch closure: device-only launch in the body."""
-    B, T, Hg, K = k.shape
-    H = w.shape[1]
-    V = u.shape[-1]
-    T_flat = w.shape[2]
-    BT = chunk_size
-
-    if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
-    else:
-        N = len(cu_seqlens) - 1
-        chunk_offsets = _prepare_chunk_offsets(cu_seqlens, BT)
-        NT = int(chunk_offsets[-1].item())
-
-    # The KV wrapper expects initial_state in [N, H, K, V]; tests carry VK.
-    h0_kv = (
-        initial_state.transpose(-2, -1).contiguous()
-        if initial_state is not None
-        else None
-    )
-    # h is in KV layout: [B, NT, H, K, V].
-    h = k.new_empty(B, NT, H, K, V)
-    final_state = (
-        k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
-    )
-    v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
-
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), N * H)
-
-    def _launch():
-        chunk_gated_delta_rule_fwd_kernel_h_opt[grid](
-            k=k,
-            v=u,
-            w=w,
-            v_new=v_new,
-            g=g,
-            gk=None,
-            h=h,
-            h0=h0_kv,
-            ht=final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_offsets=chunk_offsets,
-            T=T,
-            T_flat=T_flat,
-            H=H,
-            Hg=Hg,
-            K=K,
-            V=V,
-            BT=BT,
-        )
-
-    return _launch
-
-
-def _prepare_triton_opt_vk_kernel_launch(
-    k,
-    w,
-    u,
-    g=None,
-    gk=None,
-    initial_state=None,
-    output_final_state=False,
-    chunk_size=_FLA_CHUNK_SIZE_OPT_VK,
-    save_new_value=True,
-    cu_seqlens=None,
-):
-    """Triton K5 (VK layout) launch closure: device-only launch in the body."""
-    B, T, Hg, K = k.shape
-    H = w.shape[1]
-    V = u.shape[-1]
-    T_flat = w.shape[2]
-    BT = chunk_size
-
-    if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
-    else:
-        N = len(cu_seqlens) - 1
-        chunk_offsets = _prepare_chunk_offsets(cu_seqlens, BT)
-        NT = int(chunk_offsets[-1].item())
-
-    # h is in VK layout: [B, NT, H, V, K].
-    h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
-    )
-    v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
-
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), N * H)
-
-    def _launch():
-        chunk_gated_delta_rule_fwd_kernel_h_opt_vk[grid](
-            k=k,
-            v=u,
-            w=w,
-            v_new=v_new,
-            g=g,
-            gk=gk,
-            h=h,
-            h0=initial_state,
-            ht=final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_offsets=chunk_offsets,
-            T=T,
-            T_flat=T_flat,
-            H=H,
-            Hg=Hg,
-            K=K,
-            V=V,
-            BT=BT,
-        )
-
-    return _launch
-
-
 # -- Correctness tests ---------------------------------------------------
 
 PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
@@ -736,7 +448,7 @@ class TestCorrectness:
             context_lens, args=args
         )
 
-        h_fly, vn_fly, fs_fly = flydsl_gdr_prefill(
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
             k,
             w_c,
             u_c,
@@ -782,33 +494,43 @@ class TestPerformance:
         k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
         total_tokens = sum(context_lens)
 
-        flydsl_launch = _prepare_flydsl_kernel_launch(
-            k,
-            w_c,
-            u_c,
+        # Triton KV wrapper expects initial_state in [N, H, K, V]; tests carry VK.
+        h0_kv = h0.transpose(-2, -1).contiguous() if h0 is not None else None
+
+        # K5 launch closures: each invokes the K5 host wrapper of its backend.
+        flydsl_launch = lambda: chunk_gated_delta_rule_fwd_h_flydsl(
+            k=k,
+            w=w_c,
+            u=u_c,
             g=g,
             initial_state=h0,
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
         )
-        triton_vk_launch = _prepare_triton_opt_vk_kernel_launch(
-            k,
-            w_c,
-            u_c,
+        triton_vk_launch = lambda: chunk_gated_delta_rule_fwd_h_opt_vk(
+            k=k,
+            w=w_c,
+            u=u_c,
             g=g,
             initial_state=h0,
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
         )
-        triton_opt3_launch = _prepare_triton_opt3_kv_kernel_launch(
-            k,
-            w_c,
-            u_c,
+        triton_opt3_launch = lambda: chunk_gated_delta_rule_fwd_h_opt(
+            k=k,
+            w=w_c,
+            u=u_c,
             g=g,
-            initial_state=h0,
+            initial_state=h0_kv,
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
         )
+
+        # Warmup FlyDSL once so its internal BV-autotune sweep does not
+        # leak into the timed window. Triton's own ``triton.autotune`` is
+        # already absorbed by ``_bench_fn``'s NUM_WARMUP=5 prelude.
+        flydsl_launch()
+        torch.cuda.synchronize()
 
         us_triton_opt3 = _bench_fn(triton_opt3_launch)
         us_fly = _bench_fn(flydsl_launch)
