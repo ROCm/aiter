@@ -10,6 +10,7 @@ must be filtered out by asm_gemm_all_solutions() to avoid out-of-bounds writes.
 No GPU required.  Run:
     python3 -m unittest op_tests.tuning_tests.test_asm_splitk_guard -v
 """
+
 import importlib
 import sys
 import types
@@ -66,59 +67,69 @@ def _install_stubs():
             return hash(self._name)
 
     dtypes_mod = _make_stub("aiter.dtypes", bf16=_DType("bf16"), fp32=_DType("fp32"))
-    aiter_mod = _make_stub("aiter", dtypes=dtypes_mod, logger=logging.getLogger("aiter"))
+    aiter_mod = _make_stub(
+        "aiter", dtypes=dtypes_mod, logger=logging.getLogger("aiter")
+    )
 
     stubs = {
-        "aiter":                            aiter_mod,
-        "aiter.dtypes":                     dtypes_mod,
-        "aiter.jit":                        _make_stub("aiter.jit"),
-        "aiter.jit.core":                   _make_stub(
+        "aiter": aiter_mod,
+        "aiter.dtypes": dtypes_mod,
+        "aiter.jit": _make_stub("aiter.jit"),
+        "aiter.jit.core": _make_stub(
             "aiter.jit.core",
             AITER_CONFIG_GEMM_BF16="",
             get_asm_dir=lambda: "/nonexistent",
         ),
-        "aiter.jit.utils":                  _make_stub("aiter.jit.utils"),
-        "aiter.jit.utils.chip_info":        _make_stub(
+        "aiter.jit.utils": _make_stub("aiter.jit.utils"),
+        "aiter.jit.utils.chip_info": _make_stub(
             "aiter.jit.utils.chip_info",
             get_cu_num=lambda: 128,
             get_gfx=lambda: "gfx942",
         ),
-        "aiter.ops":                        _make_stub("aiter.ops"),
-        "aiter.ops.flydsl":                 _make_stub("aiter.ops.flydsl"),
-        "aiter.ops.flydsl.utils":           _make_stub(
+        "aiter.ops": _make_stub("aiter.ops"),
+        "aiter.ops.flydsl": _make_stub("aiter.ops.flydsl"),
+        "aiter.ops.flydsl.utils": _make_stub(
             "aiter.ops.flydsl.utils",
             is_flydsl_available=lambda: False,
         ),
-        "aiter.ops.gemm_op_a16w16":         _make_stub(
+        "aiter.ops.gemm_op_a16w16": _make_stub(
             "aiter.ops.gemm_op_a16w16",
             ASM_SPLITK_MAX_GRID=_ASM_SPLITK_MAX_GRID,
         ),
-        "aiter.ops.shuffle":                _make_stub(
+        "aiter.ops.shuffle": _make_stub(
             "aiter.ops.shuffle",
             shuffle_weight=lambda *a, **kw: None,
         ),
-        "aiter.ops.triton":                 _make_stub("aiter.ops.triton"),
-        "aiter.ops.triton.gemm":            _make_stub("aiter.ops.triton.gemm"),
-        "aiter.ops.triton.gemm.basic":      _make_stub("aiter.ops.triton.gemm.basic"),
+        "aiter.ops.triton": _make_stub("aiter.ops.triton"),
+        "aiter.ops.triton.gemm": _make_stub("aiter.ops.triton.gemm"),
+        "aiter.ops.triton.gemm.basic": _make_stub("aiter.ops.triton.gemm.basic"),
         "aiter.ops.triton.gemm.basic.gemm_a16w16": _make_stub(
             "aiter.ops.triton.gemm.basic.gemm_a16w16",
             gemm_a16w16=lambda *a, **kw: None,
         ),
-        "aiter.utility":                    _make_stub("aiter.utility"),
-        "aiter.utility.base_tuner":         _make_stub(
+        "aiter.utility": _make_stub("aiter.utility"),
+        "aiter.utility.base_tuner": _make_stub(
             "aiter.utility.base_tuner",
             GemmCommonTuner=type(
                 "GemmCommonTuner",
                 (),
-                {"ARG_DEFAULTS": {
-                    "verbose": False, "tune_file": "", "untune_file": "",
-                    "errRatio": 0.05, "batch": 100, "profile_file": "",
-                    "timeout": None, "warmup": 5, "iters": 101,
-                    "min_improvement_pct": 3.0,
-                }},
+                {
+                    "ARG_DEFAULTS": {
+                        "verbose": False,
+                        "tune_file": "",
+                        "untune_file": "",
+                        "errRatio": 0.05,
+                        "batch": 100,
+                        "profile_file": "",
+                        "timeout": None,
+                        "warmup": 5,
+                        "iters": 101,
+                        "min_improvement_pct": 3.0,
+                    }
+                },
             ),
         ),
-        "aiter.utility.mp_tuner":           _make_stub(
+        "aiter.utility.mp_tuner": _make_stub(
             "aiter.utility.mp_tuner",
             mp_tuner=lambda *a, **kw: [],
         ),
@@ -141,13 +152,14 @@ _install_stubs()
 sys.path.insert(0, str(_REPO_ROOT / "gradlib"))
 from gradlib.GemmTuner import Gemm  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_gemm(m, n, k):
     import aiter.dtypes as dtypes
+
     # __new__ allocates the instance without calling __init__, which would
     # trigger GPU data generation.  We set the attributes that
     # asm_gemm_all_solutions() actually reads, and nothing more.
@@ -178,6 +190,7 @@ def _fake_kernels(tile_m, tile_n, splitK_flag, subK):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 class TestSplitKSemaphoreGuard(unittest.TestCase):
 
     # @patch target must name the lookup site, not the definition site.
@@ -191,8 +204,9 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
         # tile 64x64 on a 4096x4096 grid => gdx=64, gdy=64 => 4096 > 1024
         gemm = _make_gemm(m=4096, n=4096, k=256)
 
-        with patch.object(Gemm, "get_asm_kernels",
-                          return_value=_fake_kernels(64, 64, 1, 64)):
+        with patch.object(
+            Gemm, "get_asm_kernels", return_value=_fake_kernels(64, 64, 1, 64)
+        ):
             tasks = gemm.asm_gemm_all_solutions()
 
         for task in tasks:
@@ -202,7 +216,8 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
             gdx = (n + 64 - 1) // 64
             gdy = (m + 64 - 1) // 64
             self.assertLessEqual(
-                gdx * gdy, _ASM_SPLITK_MAX_GRID,
+                gdx * gdy,
+                _ASM_SPLITK_MAX_GRID,
                 f"Task with splitK={splitK} has grid {gdx}x{gdy}={gdx*gdy} > {_ASM_SPLITK_MAX_GRID}",
             )
 
@@ -213,13 +228,15 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
         # tile 128x128 on 128x128 => gdx=1, gdy=1 => 1 <= 1024
         gemm = _make_gemm(m=128, n=128, k=256)
 
-        with patch.object(Gemm, "get_asm_kernels",
-                          return_value=_fake_kernels(128, 128, 1, 64)):
+        with patch.object(
+            Gemm, "get_asm_kernels", return_value=_fake_kernels(128, 128, 1, 64)
+        ):
             tasks = gemm.asm_gemm_all_solutions()
 
         splitk_tasks = [t for t in tasks if t[0][2] > 1]
-        self.assertGreater(len(splitk_tasks), 0,
-                           "Expected SplitK tasks for a small grid, got none")
+        self.assertGreater(
+            len(splitk_tasks), 0, "Expected SplitK tasks for a small grid, got none"
+        )
 
     @patch("gradlib.GemmTuner.get_gfx", return_value="gfx942")
     @patch("gradlib.GemmTuner.generate_data", return_value=None)
@@ -228,13 +245,17 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
         # tile=64, m=2048, n=2048 => gdx=32, gdy=32 => exactly 1024
         gemm = _make_gemm(m=2048, n=2048, k=256)
 
-        with patch.object(Gemm, "get_asm_kernels",
-                          return_value=_fake_kernels(64, 64, 1, 64)):
+        with patch.object(
+            Gemm, "get_asm_kernels", return_value=_fake_kernels(64, 64, 1, 64)
+        ):
             tasks = gemm.asm_gemm_all_solutions()
 
         splitk_tasks = [t for t in tasks if t[0][2] > 1]
-        self.assertGreater(len(splitk_tasks), 0,
-                           f"Grid of exactly {_ASM_SPLITK_MAX_GRID} should not be filtered")
+        self.assertGreater(
+            len(splitk_tasks),
+            0,
+            f"Grid of exactly {_ASM_SPLITK_MAX_GRID} should not be filtered",
+        )
 
 
 if __name__ == "__main__":
