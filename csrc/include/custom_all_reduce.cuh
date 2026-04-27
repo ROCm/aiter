@@ -217,35 +217,13 @@ DINLINE void end_sync(const RankSignals& sg,
                                 flag,
                                 final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
                                 __MEMORY_SCOPE_SYSTEM);
-        // wait until we got true from all ranks.
-        //
-        // When final_sync=false this barrier also needs to synchronize
-        // peer-GPU writes that preceded the release store (e.g. stage-1
-        // `reduce_scatter_cross_device_store` writes IPC `tmps` on every
-        // rank before signalling end). For release/acquire to actually
-        // propagate those cross-device writes, the acquire must match
-        // the release's `__MEMORY_SCOPE_SYSTEM` — using
-        // `__MEMORY_SCOPE_DEVICE` here leaves a residual race that shows
-        // up as progressively corrupted 2-stage fused AR+RMSNorm output
-        // at large per-rank volumes.
+        // wait until we got true from all ranks
         while(__scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                      final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                                     final_sync ? __MEMORY_SCOPE_DEVICE
-                                                : __MEMORY_SCOPE_SYSTEM) < flag)
+                                     __MEMORY_SCOPE_DEVICE) < flag)
             ;
     }
     __syncthreads();
-    if(!final_sync)
-    {
-        // The acquire semantics on the load above only order subsequent
-        // memory accesses for the `ngpus` threads that actually polled.
-        // `__syncthreads()` then pulls the remaining threads past the
-        // barrier, but does NOT carry the system-scope acquire with it.
-        // Subsequent reads from peer-written memory on those other threads
-        // can still see stale values. A block-wide system-scope acquire
-        // fence after the syncthreads upgrades the ordering to all threads.
-        __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM);
-    }
     // use one thread to update flag
     if(threadIdx.x == 0)
         self_sg->_flag[blockIdx.x] = flag;
