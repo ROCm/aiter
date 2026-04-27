@@ -1,19 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
-Tests for GemmTuner.asm_gemm_all_solutions SplitK semaphore guard.
+Level 1: Unit tests for the ASM SplitK semaphore grid guard in GemmTuner.
 
-The ASM SplitK kernels use a semaphore array of size gdx*gdy.  Candidates
-where gdx*gdy > 1024 must be filtered out to avoid out-of-bounds writes.
+The ASM SplitK kernels index into a semaphore workspace of size ASM_SPLITK_MAX_GRID
+(defined in aiter.ops.gemm_op_a16w16).  Candidates where gdx*gdy exceeds that limit
+must be filtered out by asm_gemm_all_solutions() to avoid out-of-bounds writes.
+
+No GPU required.  Run:
+    python3 -m unittest op_tests.tuning_tests.test_asm_splitk_guard -v
 """
+import importlib
 import sys
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# ---------------------------------------------------------------------------
+# Minimal stubs so GemmTuner can be imported without a real ROCm stack.
+# Uses setdefault so installed packages, if present, take precedence.
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Minimal stubs so GemmTuner can be imported without a real ROCm stack
-# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_ASM_SPLITK_MAX_GRID = 16 * 64  # mirrors aiter.ops.gemm_op_a16w16.ASM_SPLITK_MAX_GRID
+
 
 def _make_stub(name, **attrs):
     mod = types.ModuleType(name)
@@ -28,17 +39,20 @@ def _install_stubs():
     class _DType:
         def __init__(self, name):
             self._name = name
+
         def __str__(self):
             return self._name
+
         def __repr__(self):
             return self._name
+
         def __eq__(self, other):
             return isinstance(other, _DType) and self._name == other._name
+
         def __hash__(self):
             return hash(self._name)
 
     dtypes_mod = _make_stub("aiter.dtypes", bf16=_DType("bf16"), fp32=_DType("fp32"))
-
     aiter_mod = _make_stub("aiter", dtypes=dtypes_mod, logger=logging.getLogger("aiter"))
 
     stubs = {
@@ -61,6 +75,10 @@ def _install_stubs():
         "aiter.ops.flydsl.utils":           _make_stub(
             "aiter.ops.flydsl.utils",
             is_flydsl_available=lambda: False,
+        ),
+        "aiter.ops.gemm_op_a16w16":         _make_stub(
+            "aiter.ops.gemm_op_a16w16",
+            ASM_SPLITK_MAX_GRID=_ASM_SPLITK_MAX_GRID,
         ),
         "aiter.ops.shuffle":                _make_stub(
             "aiter.ops.shuffle",
@@ -93,13 +111,17 @@ def _install_stubs():
         ),
     }
     for name, mod in stubs.items():
-        sys.modules.setdefault(name, mod)
+        if name in sys.modules:
+            continue
+        try:
+            importlib.import_module(name)
+        except Exception:
+            sys.modules[name] = mod
 
 
 _install_stubs()
 
-# Now import the module under test from the local gradlib tree
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(_REPO_ROOT / "gradlib"))
 from gradlib.GemmTuner import Gemm  # noqa: E402
 
 
@@ -108,7 +130,6 @@ from gradlib.GemmTuner import Gemm  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _make_gemm(m, n, k):
-    """Return a Gemm instance configured for the given shape, bypassing GPU calls."""
     import aiter.dtypes as dtypes
     gemm = Gemm.__new__(Gemm)
     gemm.m = m
@@ -142,7 +163,7 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
     @patch("gradlib.GemmTuner.get_gfx", return_value="gfx942")
     @patch("gradlib.GemmTuner.generate_data", return_value=None)
     def test_large_grid_candidates_are_skipped(self, _gen, _gfx):
-        """Candidates where gdx*gdy > 1024 must not appear in the task list."""
+        """Candidates where gdx*gdy > ASM_SPLITK_MAX_GRID must not appear in the task list."""
         # tile 64x64 on a 4096x4096 grid => gdx=64, gdy=64 => 4096 > 1024
         gemm = _make_gemm(m=4096, n=4096, k=256)
 
@@ -151,21 +172,20 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
             tasks = gemm.asm_gemm_all_solutions()
 
         for task in tasks:
-            # info structure: ((m,n,k,...), solidx, splitK, libtype, kname)
             info = task[0]
             shape, splitK = info[0], info[2]
             m, n = shape[0], shape[1]
             gdx = (n + 64 - 1) // 64
             gdy = (m + 64 - 1) // 64
             self.assertLessEqual(
-                gdx * gdy, 1024,
-                f"Task with splitK={splitK} has grid {gdx}x{gdy}={gdx*gdy} > 1024",
+                gdx * gdy, _ASM_SPLITK_MAX_GRID,
+                f"Task with splitK={splitK} has grid {gdx}x{gdy}={gdx*gdy} > {_ASM_SPLITK_MAX_GRID}",
             )
 
     @patch("gradlib.GemmTuner.get_gfx", return_value="gfx942")
     @patch("gradlib.GemmTuner.generate_data", return_value=None)
     def test_small_grid_candidates_are_kept(self, _gen, _gfx):
-        """Candidates where gdx*gdy <= 1024 must still be generated."""
+        """Candidates where gdx*gdy <= ASM_SPLITK_MAX_GRID must still be generated."""
         # tile 128x128 on 128x128 => gdx=1, gdy=1 => 1 <= 1024
         gemm = _make_gemm(m=128, n=128, k=256)
 
@@ -179,9 +199,9 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
 
     @patch("gradlib.GemmTuner.get_gfx", return_value="gfx942")
     @patch("gradlib.GemmTuner.generate_data", return_value=None)
-    def test_boundary_grid_exactly_1024_is_kept(self, _gen, _gfx):
-        """A grid of exactly gdx*gdy == 1024 should not be filtered."""
-        # tile=64, m=64*32=2048, n=64*32=2048 => gdx=32, gdy=32 => exactly 1024
+    def test_boundary_grid_exactly_max_is_kept(self, _gen, _gfx):
+        """A grid of exactly gdx*gdy == ASM_SPLITK_MAX_GRID must not be filtered."""
+        # tile=64, m=2048, n=2048 => gdx=32, gdy=32 => exactly 1024
         gemm = _make_gemm(m=2048, n=2048, k=256)
 
         with patch.object(Gemm, "get_asm_kernels",
@@ -190,7 +210,7 @@ class TestSplitKSemaphoreGuard(unittest.TestCase):
 
         splitk_tasks = [t for t in tasks if t[0][2] > 1]
         self.assertGreater(len(splitk_tasks), 0,
-                           "Grid of exactly 1024 should not be filtered")
+                           f"Grid of exactly {_ASM_SPLITK_MAX_GRID} should not be filtered")
 
 
 if __name__ == "__main__":
