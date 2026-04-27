@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 import triton
 import torch
 from aiter.ops.triton.utils.device_info import get_num_sms
@@ -113,6 +114,15 @@ def select_2d_config(
         waves_per_eu = 2
     elif mla_like:
         waves_per_eu = 1
+
+    if mla_like and is_quantized:
+        if not mla_like_many_ctas:
+            waves_per_eu = 2
+            num_stages_2d = 3
+            preload_v = False
+        elif max_seqlen_k > 128:
+            num_stages_2d = 3
+            preload_v = False
 
     return {
         "BLOCK_M": BLOCK_M,
