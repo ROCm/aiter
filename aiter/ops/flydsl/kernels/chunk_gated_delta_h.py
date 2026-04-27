@@ -84,6 +84,7 @@ def compile_chunk_gated_delta_h(
     H: int,
     Hg: int,
     USE_G: bool = True,
+    USE_GK: bool = False,
     USE_INITIAL_STATE: bool = True,
     STORE_FINAL_STATE: bool = True,
     SAVE_NEW_VALUE: bool = True,
@@ -93,7 +94,7 @@ def compile_chunk_gated_delta_h(
     """Compile the GDN K5 kernel.
 
     Returns a @flyc.jit function:
-        launch_fn(k, v, w, v_new, g, h, h0, ht,
+        launch_fn(k, v, w, v_new, g, gk, h, h0, ht,
                   cu_seqlens, chunk_offsets,
                   T_val, T_flat, N_val, stream)
     """
@@ -153,6 +154,7 @@ def compile_chunk_gated_delta_h(
         w_tensor: fx.Tensor,
         v_new_tensor: fx.Tensor,
         g_tensor: fx.Tensor,
+        gk_tensor: fx.Tensor,
         h_tensor: fx.Tensor,
         h0_tensor: fx.Tensor,
         ht_tensor: fx.Tensor,
@@ -176,6 +178,8 @@ def compile_chunk_gated_delta_h(
         w_ = GTensor(w_tensor, dtype=T.bf16, shape=(-1,))
         h_ = GTensor(h_tensor, dtype=T.bf16, shape=(-1,))
         g_ = GTensor(g_tensor, dtype=T.f32, shape=(-1,))
+        if const_expr(USE_GK):
+            gk_ = GTensor(gk_tensor, dtype=T.f32, shape=(-1,))
 
         vn_ = GTensor(v_new_tensor, dtype=T.bf16, shape=(-1,))
         if const_expr(USE_INITIAL_STATE):
@@ -423,14 +427,17 @@ def compile_chunk_gated_delta_h(
                         row * fx.Int32(LDS_K_STRIDE) + fx.Int32(kb * 64) + load_col_base
                     )
 
-            # Prefetch g values (overlap with MFMA below)
-            if const_expr(USE_G):
+            # Compute last_idx for the current chunk (shared by USE_G / USE_GK)
+            if const_expr(USE_G or USE_GK):
                 next_chunk_end = (i_t_i32 + fx.Int32(1)) * fx.Int32(BT)
                 last_idx_raw = arith.select(
                     arith.cmpi(arith.CmpIPredicate.slt, next_chunk_end, T_local),
                     next_chunk_end,
                     T_local,
                 ) - fx.Int32(1)
+
+            # Prefetch g values (overlap with MFMA below)
+            if const_expr(USE_G):
                 g_last_off = (bos + last_idx_raw) * fx.Int32(H) + i_h
                 g_last_prefetch = g_[fx.Index(g_last_off)]
 
@@ -446,6 +453,28 @@ def compile_chunk_gated_delta_h(
                     safe_row = arith.select(in_bounds, abs_row, fx.Int32(0))
                     g_row_off = (bos + safe_row) * fx.Int32(H) + i_h
                     g_row_prefetch.append((g_[fx.Index(g_row_off)], in_bounds))
+
+            # Prefetch gk values for per-K h decay at chunk end.
+            # h_accs[kb, nr] holds v4f32 with elements at K = kb*64 + wid*16
+            #   + lane_m_base*4 + elem_i  (elem_i in 0..3).
+            # gk[(bos + last_idx) * H * K + i_h * K + global_k] is one f32 per K.
+            if const_expr(USE_GK):
+                gk_chunk_base = (bos + last_idx_raw) * fx.Int32(H * K) + i_h * fx.Int32(
+                    K
+                )
+                gk_last_prefetch = []  # [kb][elem_i] -> exp(gk_last)
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    kb_elems = []
+                    for elem_i in range_constexpr(4):
+                        global_k = (
+                            fx.Int32(kb * 64)
+                            + wid * fx.Int32(16)
+                            + lane_m_base * fx.Int32(4)
+                            + fx.Int32(elem_i)
+                        )
+                        gk_off = gk_chunk_base + global_k
+                        kb_elems.append(_fast_exp(gk_[fx.Index(gk_off)]))
+                    gk_last_prefetch.append(kb_elems)
 
             # Prefetch u values (overlap with MFMA below)
             u_prefetch = []
@@ -577,6 +606,23 @@ def compile_chunk_gated_delta_h(
                             h_accs_in[acc_idx], exp_g_last_vec
                         )
 
+            # Per-K decay: h[v, k] *= exp(gk_last[k]) at chunk end.
+            # Each lane's v4f32 spans 4 different K positions (one per elem_i),
+            # so we build a per-kb gate vector and multiply h_accs accordingly.
+            if const_expr(USE_GK):
+                for kb in range_constexpr(NUM_K_BLOCKS):
+                    gk_vec = arith.constant_vector(0.0, T.f32x4)
+                    for elem_i in range_constexpr(4):
+                        gk_vec = vector.insert(
+                            gk_last_prefetch[kb][elem_i],
+                            gk_vec,
+                            static_position=[elem_i],
+                            dynamic_position=[],
+                        )
+                    for nr in range_constexpr(N_REPEAT):
+                        acc_idx = kb * N_REPEAT + nr
+                        h_accs_in[acc_idx] = arith.mulf(h_accs_in[acc_idx], gk_vec)
+
             # -- 4. State update: h += k^T @ v_new_gated --
             BT_STEPS = BT // WMMA_K
 
@@ -697,6 +743,7 @@ def compile_chunk_gated_delta_h(
         w_tensor: fx.Tensor,
         v_new_tensor: fx.Tensor,
         g_tensor: fx.Tensor,
+        gk_tensor: fx.Tensor,
         h_tensor: fx.Tensor,
         h0_tensor: fx.Tensor,
         ht_tensor: fx.Tensor,
@@ -720,6 +767,7 @@ def compile_chunk_gated_delta_h(
             w_tensor,
             v_new_tensor,
             g_tensor,
+            gk_tensor,
             h_tensor,
             h0_tensor,
             ht_tensor,
@@ -748,7 +796,19 @@ _AUTOTUNE_ITERS = 25
 
 
 def _get_or_compile(
-    K, V, BT, BV, H, Hg, use_g, use_h0, store_fs, save_vn, is_varlen, wu_contig
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
 ):
     cache_key = (
         K,
@@ -758,6 +818,7 @@ def _get_or_compile(
         H,
         Hg,
         use_g,
+        use_gk,
         use_h0,
         store_fs,
         save_vn,
@@ -773,6 +834,7 @@ def _get_or_compile(
             H=H,
             Hg=Hg,
             USE_G=use_g,
+            USE_GK=use_gk,
             USE_INITIAL_STATE=use_h0,
             STORE_FINAL_STATE=store_fs,
             SAVE_NEW_VALUE=save_vn,
@@ -793,6 +855,7 @@ def _launch_kernel(
     w,
     vn_arg,
     g_arg,
+    gk_arg,
     h,
     h0_arg,
     ht_arg,
@@ -810,6 +873,7 @@ def _launch_kernel(
         w,
         vn_arg,
         g_arg,
+        gk_arg,
         h,
         h0_arg,
         ht_arg,
@@ -846,7 +910,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         w: [B, H, T_flat, K] bf16, head-major contiguous layout.
         u: [B, H, T_flat, V] bf16, head-major contiguous layout.
         g: [T_total, H] f32 cumulative gate, or None.
-        gk: per-K gate (currently ignored by the FlyDSL kernel).
+        gk: [T_total, H, K] f32 per-K cumulative gate, or None.
         initial_state: [N, H, V, K] f32, or None.
         output_final_state: whether to return the final hidden state.
         chunk_size: chunk size BT (default 64).
@@ -899,6 +963,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 
     dummy = torch.empty(1, device=k.device, dtype=torch.float32)
     g_arg = g if g is not None else dummy
+    gk_arg = gk if gk is not None else dummy
     h0_arg = initial_state if initial_state is not None else dummy
     ht_arg = final_state if final_state is not None else dummy
     vn_arg = v_new_buf
@@ -909,6 +974,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     stream = torch.cuda.current_stream()
 
     use_g = g is not None
+    use_gk = gk is not None
     use_h0 = initial_state is not None
     is_varlen = cu_seqlens is not None
 
@@ -923,6 +989,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
             T_flat,
             N,
             use_g,
+            use_gk,
             use_h0,
             output_final_state,
             save_new_value,
@@ -948,6 +1015,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
                         H,
                         Hg,
                         use_g,
+                        use_gk,
                         use_h0,
                         output_final_state,
                         save_new_value,
@@ -966,6 +1034,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
                             w,
                             vn_arg,
                             g_arg,
+                            gk_arg,
                             h,
                             h0_arg,
                             ht_arg,
@@ -991,6 +1060,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
                             w,
                             vn_arg,
                             g_arg,
+                            gk_arg,
                             h,
                             h0_arg,
                             ht_arg,
@@ -1019,6 +1089,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         H,
         Hg,
         use_g,
+        use_gk,
         use_h0,
         output_final_state,
         save_new_value,
@@ -1036,6 +1107,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         w,
         vn_arg,
         g_arg,
+        gk_arg,
         h,
         h0_arg,
         ht_arg,
