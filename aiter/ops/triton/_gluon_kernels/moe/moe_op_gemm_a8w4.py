@@ -238,6 +238,7 @@ def _moe_gemm_a8w4(
 
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
+    NUM_TDM_OPS: gl.constexpr = 4 if is_x_microscaled else 3
     w_type: gl.constexpr = W.dtype.element_ty
     gl.static_assert(w_type == gl.uint8, "mx_weight_ptr must be uint8 or fp8")
     gl.static_assert(
@@ -336,6 +337,10 @@ def _moe_gemm_a8w4(
     SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
     )
+    if is_x_microscaled:
+        SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
+        )
 
     if GatherIndx is None:
         x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -374,6 +379,25 @@ def _moe_gemm_a8w4(
         layout=SHARED_LAYOUT_W_SCALES,
     )
 
+    if is_x_microscaled:
+        if GatherIndx is None:
+            XMxScale += start_m * stride_x_mx_m
+            x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=XMxScale,
+                shape=(M, tl.cdiv(K, MX_PACK_DIVISOR)),
+                strides=(stride_x_mx_m, stride_x_mx_k),
+                block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
+                layout=SHARED_LAYOUT_X_SCALES,
+            )
+        else:
+            x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=XMxScale,
+                shape=(num_tokens, tl.cdiv(K, MX_PACK_DIVISOR)),
+                strides=(stride_x_mx_m, stride_x_mx_k),
+                block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
+                layout=SHARED_LAYOUT_X_SCALES,
+            )
+
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         WMMA_LAYOUT: gl.constexpr = gl.amd.AMDWMMALayout(
             3,
@@ -409,6 +433,10 @@ def _moe_gemm_a8w4(
     DOT_LAYOUT_W_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
         DOT_LAYOUT_W, [BLOCK_N, MX_SCALE_BLOCK_K]
     )
+    if is_x_microscaled:
+        DOT_LAYOUT_X_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
+            DOT_LAYOUT_X, [BLOCK_M, MX_SCALE_BLOCK_K]
+        )
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
@@ -421,6 +449,12 @@ def _moe_gemm_a8w4(
         shape=[NUM_BUFFERS] + w_scales_desc.block_shape,
         layout=w_scales_desc.layout,
     )
+    if is_x_microscaled:
+        x_scales_buffer = gl.allocate_shared_memory(
+            x_scales_desc.dtype,
+            shape=[NUM_BUFFERS] + x_scales_desc.block_shape,
+            layout=x_scales_desc.layout,
+        )
 
     read_idx = 0
     write_idx = 0
@@ -448,13 +482,27 @@ def _moe_gemm_a8w4(
             [off_w_n_scale, write_idx * PACKED_MX_BLOCK],
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
+        if is_x_microscaled:
+            if GatherIndx is None:
+                gl.amd.gfx1250.tdm.async_load(
+                    x_scales_desc,
+                    [off_x_m, write_idx * MX_SCALE_BLOCK_K],
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                )
+            else:
+                gl.amd.gfx1250.tdm.async_gather(
+                    x_scales_desc,
+                    offs_x_m,
+                    write_idx * MX_SCALE_BLOCK_K,
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                )
         write_idx += 1
 
     num_k_iter = tl.cdiv(K, BLOCK_K)
 
     # After TDM prologue there are (NUM_BUFFERS-1)*3 ops in-flight; waiting for
     # (NUM_BUFFERS-2)*3 lets exactly one tile (tile 0) complete.
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 3)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_TDM_OPS)
 
     # Register pre-load prologue: wait for tile 0 then read it into cur_x/cur_w/cur_w_scales.
     cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
@@ -473,11 +521,16 @@ def _moe_gemm_a8w4(
             SCALE_KWIDTH,
         )
     cur_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
+    if is_x_microscaled:
+        cur_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X_SCALES)
     read_idx += 1
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for k in range(num_k_iter - (NUM_BUFFERS - 1)):
-        acc = gl.amd.gfx1250.wmma_scaled(cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
+        if is_x_microscaled:
+            acc = gl.amd.gfx1250.wmma_scaled(cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
+        else:
+            acc = gl.amd.gfx1250.wmma_scaled(cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
 
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
@@ -502,9 +555,23 @@ def _moe_gemm_a8w4(
             [off_w_n_scale, write_idx * PACKED_MX_BLOCK],
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
+        if is_x_microscaled:
+            if GatherIndx is None:
+                gl.amd.gfx1250.tdm.async_load(
+                    x_scales_desc,
+                    [off_x_m, write_idx * MX_SCALE_BLOCK_K],
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                )
+            else:
+                gl.amd.gfx1250.tdm.async_gather(
+                    x_scales_desc,
+                    offs_x_m,
+                    write_idx * MX_SCALE_BLOCK_K,
+                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                )
         write_idx += 1
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 3)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_TDM_OPS)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         next_w = (
@@ -522,16 +589,20 @@ def _moe_gemm_a8w4(
                 SCALE_KWIDTH,
             )
         next_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
+        if is_x_microscaled:
+            next_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X_SCALES)
 
         cur_x = next_x
         cur_w = next_w
         cur_w_scales = next_w_scales
+        if is_x_microscaled:
+            cur_x_scales = next_x_scales
         read_idx += 1
 
     # Epilogue: drain remaining pipeline stages (no new TDM loads).
     # The first NUM_BUFFERS-2 iterations still use the pre-load / WMMA pattern.
     for k_ep in gl.static_range(NUM_BUFFERS - 2):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - k_ep) * 3)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - k_ep) * NUM_TDM_OPS)
 
         next_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         next_w = (
@@ -549,14 +620,24 @@ def _moe_gemm_a8w4(
                 SCALE_KWIDTH,
             )
         next_w_scales = w_scales_buffer_slice.load(layout=DOT_LAYOUT_W_SCALES)
+        if is_x_microscaled:
+            next_x_scales = x_scales_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X_SCALES)
 
-        acc = gl.amd.gfx1250.wmma_scaled(cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
+        if is_x_microscaled:
+            acc = gl.amd.gfx1250.wmma_scaled(cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
+        else:
+            acc = gl.amd.gfx1250.wmma_scaled(cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
         cur_x = next_x
         cur_w = next_w
         cur_w_scales = next_w_scales
+        if is_x_microscaled:
+            cur_x_scales = next_x_scales
         read_idx += 1
 
-    acc = gl.amd.gfx1250.wmma_scaled(cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
+    if is_x_microscaled:
+        acc = gl.amd.gfx1250.wmma_scaled(cur_x, cur_x_scales, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
+    else:
+        acc = gl.amd.gfx1250.wmma_scaled(cur_x, 0, "e4m3", cur_w, cur_w_scales, "e2m1", acc)
 
     # scalar fp8 scale
     if X_static_scale is not None:
@@ -573,7 +654,6 @@ def _moe_gemm_a8w4(
     if B is not None:
         BPtrs = B + expt_id * stride_b_e
         bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
-        # Reg bank conflict here
         acc = acc + bias[None, :]
     if APPLY_SWIGLU:
         out = _swiglu(acc, alpha, limit)

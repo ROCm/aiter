@@ -512,11 +512,15 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="Run MoE GEMM A8W4 test")
-    parser.add_argument("--M", type=int, default=32)
-    # parser.add_argument("--N", type=int, default=512)
-    # parser.add_argument("--K", type=int, default=512)
-    parser.add_argument("--N", type=int, default=5760)
+    parser.add_argument("--M", type=int, default=1024)
+    parser.add_argument("--N", type=int, default=1024)
     parser.add_argument("--K", type=int, default=2880)
+    # parser.add_argument("--M", type=int, default=32)
+    # parser.add_argument("--N", type=int, default=5760)
+    # parser.add_argument("--K", type=int, default=2880)
+    # parser.add_argument("--K", type=int, default=512)
+    # parser.add_argument("--N", type=int, default=5760)
+    # parser.add_argument("--K", type=int, default=2880)
     # parser.add_argument("--N", type=int, default=6144)
     # parser.add_argument("--K", type=int, default=3072)
     parser.add_argument("--E", type=int, default=1, help="Total experts")
@@ -539,6 +543,10 @@ def main():
     parser.add_argument(
         "--hbm_swizzling", action=argparse.BooleanOptionalAction, default=False,
         help="Enable HBM scale swizzling (default: False).",
+    )
+    parser.add_argument(
+        "--mxfp8_act", action=argparse.BooleanOptionalAction, default=True,
+        help="Use mxfp8 microscaled activation instead of static fp8 (default: False).",
     )
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
@@ -570,7 +578,8 @@ def main():
     print(
         f"  Flags: gather={args.do_gather}, scatter={args.do_scatter}, "
         f"swiglu={args.apply_swiglu}, fused_quant={args.fused_quant}, "
-        f"gammas={args.has_y_gammas}, hbm_swizzling={args.hbm_swizzling}"
+        f"gammas={args.has_y_gammas}, hbm_swizzling={args.hbm_swizzling}, "
+        f"mxfp8_act={args.mxfp8_act}"
     )
     print(f"  Device: {device}, Architecture: {arch}")
 
@@ -612,10 +621,15 @@ def main():
             swizzle_mx_scale = "CDNA4_SCALE"
             w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
 
-    x_mx_scales = None
-    x_static_scale = x_bf16.abs().max().float() / 448.0
-    x_tri = downcast_to_static_fp8(x_bf16, x_static_scale)
-    x_ref = x_bf16.clone()
+    if args.mxfp8_act:
+        x_tri, x_mx_scales = downcast_to_mxfp(x_bf16, torch.float8_e4m3fn, axis=1)
+        x_ref = upcast_from_mxfp(x_tri, x_mx_scales, torch.bfloat16, axis=1)
+        x_static_scale = None
+    else:
+        x_mx_scales = None
+        x_static_scale = x_bf16.abs().max().float() / 448.0
+        x_tri = downcast_to_static_fp8(x_bf16, x_static_scale)
+        x_ref = x_bf16.clone()
 
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias.clone(), routing_data, gather_idx, scatter_idx,
@@ -624,35 +638,37 @@ def main():
 
     block_k = config['block_k']
     block_n = config['block_n']
-    K_padded = 3072
-    N_padded = 6144
+    K_padded = None
+    N_padded = None
+    # K_padded = 3072
+    # N_padded = args.N
 
-    xK = x_tri.shape[1]
-    x_pad = torch.zeros((in_m, K_padded), dtype=x_tri.dtype, device=device)
-    x_pad[:, :xK] = x_tri
-    x_tri = x_pad[:, :xK]
+    # xK = x_tri.shape[1]
+    # x_pad = torch.zeros((in_m, K_padded), dtype=x_tri.dtype, device=device)
+    # x_pad[:, :xK] = x_tri
+    # x_tri = x_pad[:, :xK]
 
-    wK, wN = w_tri.shape[1], w_tri.shape[2]
-    w_pad = torch.zeros((args.E, N_padded, K_padded // 2), dtype=w_tri.dtype, device=device)
-    w_pad = w_pad.transpose(1, 2)
-    w_pad[:, :wK, :wN] = w_tri
-    w_tri = w_pad[:, :wK, :wN]
+    # wK, wN = w_tri.shape[1], w_tri.shape[2]
+    # w_pad = torch.zeros((args.E, N_padded, K_padded // 2), dtype=w_tri.dtype, device=device)
+    # w_pad = w_pad.transpose(1, 2)
+    # w_pad[:, :wK, :wN] = w_tri
+    # w_tri = w_pad[:, :wK, :wN]
 
-    sK, sN = w_scale_tri.shape[1], w_scale_tri.shape[2]
-    ws_pad = torch.zeros((args.E, N_padded, sK), dtype=w_scale_tri.dtype, device=device)
-    ws_pad = ws_pad.transpose(1, 2)
-    ws_pad[:, :sK, :sN] = w_scale_tri
-    w_scale_tri = ws_pad[:, :sK, :sN]
+    # sK, sN = w_scale_tri.shape[1], w_scale_tri.shape[2]
+    # ws_pad = torch.zeros((args.E, N_padded, sK), dtype=w_scale_tri.dtype, device=device)
+    # ws_pad = ws_pad.transpose(1, 2)
+    # ws_pad[:, :sK, :sN] = w_scale_tri
+    # w_scale_tri = ws_pad[:, :sK, :sN]
 
-    bias_pad = torch.zeros((args.E, N_padded), dtype=bias.dtype, device=device)
-    bias_pad[:, :args.N] = bias
-    bias = bias_pad[:, :args.N]
+    # bias_pad = torch.zeros((args.E, N_padded), dtype=bias.dtype, device=device)
+    # bias_pad[:, :args.N] = bias
+    # bias = bias_pad[:, :args.N]
 
-    print(f"  Stride padding: K {args.K}->{K_padded}, N {args.N}->{N_padded}")
-    print(f"  x_tri       shape={tuple(x_tri.shape)}  stride={x_tri.stride()}")
-    print(f"  w_tri       shape={tuple(w_tri.shape)}  stride={w_tri.stride()}")
-    print(f"  w_scale_tri shape={tuple(w_scale_tri.shape)}  stride={w_scale_tri.stride()}")
-    print(f"  bias        shape={tuple(bias.shape)}  stride={bias.stride()}")
+    # print(f"  Stride padding: K {args.K}->{K_padded}, N {args.N}->{N_padded}")
+    # print(f"  x_tri       shape={tuple(x_tri.shape)}  stride={x_tri.stride()}")
+    # print(f"  w_tri       shape={tuple(w_tri.shape)}  stride={w_tri.stride()}")
+    # print(f"  w_scale_tri shape={tuple(w_scale_tri.shape)}  stride={w_scale_tri.stride()}")
+    # print(f"  bias        shape={tuple(bias.shape)}  stride={bias.stride()}")
 
     quant_static_scale = None
     out_dtype = torch.bfloat16
@@ -675,11 +691,16 @@ def main():
         swizzle_mx_scale,
         out_dtype,
         args.apply_swiglu,
-        unpadded_N=args.N,
-        unpadded_K=args.K,
+        unpadded_N=N_padded,
+        unpadded_K=K_padded,
     )
     if args.fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
+
+    print(f"  ref_y shape={tuple(ref_y.shape)} dtype={ref_y.dtype} min={ref_y.float().min().item():.4f} max={ref_y.float().max().item():.4f} nan={ref_y.isnan().sum().item()} inf={ref_y.isinf().sum().item()}")
+    print(f"  tri_y shape={tuple(tri_y.shape)} dtype={tri_y.dtype} min={tri_y.float().min().item():.4f} max={tri_y.float().max().item():.4f} nan={tri_y.isnan().sum().item()} inf={tri_y.isinf().sum().item()}")
+    print(f"  ref_y[:4,:4]=\n{ref_y[:4,:4]}")
+    print(f"  tri_y[:4,:4]=\n{tri_y[:4,:4]}")
 
     ref_f = ref_y.to(torch.float32).detach()
     tri_f = tri_y.to(torch.float32).detach()
