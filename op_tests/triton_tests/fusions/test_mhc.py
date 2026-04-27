@@ -4,8 +4,8 @@
 """
 Pytest tests for mHC (manifold-constrained Hyper Connection) fused kernel.
 
-Tests correctness of the Triton implementation (equations 14-18) against
-PyTorch reference for various input shapes and configurations.
+Tests correctness of the Triton implementation (equations 14-19 + apply-pre)
+against PyTorch references for various input shapes and configurations.
 
 Notation (from mHC paper arXiv:2512.24880v2):
     - M: Batch/sequence dimension
@@ -19,6 +19,7 @@ Notation (from mHC paper arXiv:2512.24880v2):
       - H^pre: [0:n] manifold projection with sigmoid activation (n elements, H^{pre} ∈ ℝ^{1×n})
       - H^post: [n:2n] post-processing with 2*sigmoid activation (n elements, H^{post} ∈ ℝ^{1×n})
       - H^res: [2n:2n+n²] residual connection (identity activation) (n² elements, H^{res} ∈ ℝ^{n×n})
+    - layer_input: (M, C)    - Σᵢ (σ(H^pre_i) + hc_pre_eps) · x_i
 """
 
 import torch
@@ -34,18 +35,58 @@ from op_tests.triton_tests.utils.mhc_ref import (
     get_sk_test_shapes,
 )
 
+try:
+    import aiter as _aiter
+
+    _HAS_AITER_MHC_PRE = hasattr(_aiter, "mhc_pre")
+except ImportError:
+    _aiter = None
+    _HAS_AITER_MHC_PRE = False
+
+
 # =============================================================================
 # Tests
 # =============================================================================
+
+
+def _assert_mhc_close(
+    triton_tuple,
+    ref_tuple,
+    *,
+    post_atol=1e-2,
+    post_rtol=1e-2,
+    comb_atol=1e-2,
+    comb_rtol=1e-2,
+    layer_atol=1e-2,
+    layer_rtol=1e-2,
+):
+    """Compare Triton's ``(post_mix, comb_mix, layer_input)`` 3-tuple against
+    the merged ``mhc_torch`` 4-tuple ``(hpost, hres, hpre, layer_input)``.
+
+    ``hpre`` is ignored here — Triton consumes H^pre inline and only exposes
+    its downstream effect via ``layer_input``. All comparisons run in fp32;
+    both sides are cast via ``.float()``.
+    """
+    post_t, comb_t, layer_t = triton_tuple
+    post_ref, comb_ref, _hpre_ref, layer_ref = ref_tuple
+
+    torch.testing.assert_close(
+        post_t.float(), post_ref.float(), atol=post_atol, rtol=post_rtol
+    )
+    torch.testing.assert_close(
+        comb_t.float(), comb_ref.float(), atol=comb_atol, rtol=comb_rtol
+    )
+    torch.testing.assert_close(
+        layer_t.float(), layer_ref.float(), atol=layer_atol, rtol=layer_rtol
+    )
 
 
 @pytest.mark.parametrize("M, n, C", get_test_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_correctness(M, n, C, dtype):
     """
-    Test that Triton mhc() matches PyTorch reference for equations 14-19.
-
-    Validates correctness across various shapes and data types.
+    Test that Triton mhc() matches the PyTorch reference for equations 14-19
+    plus the apply-pre step.
     """
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -55,105 +96,23 @@ def test_mhc_correctness(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    H_pre_torch = out_torch[:, :n_streams]
-    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-    H_res_torch = out_torch[:, 2 * n_streams :]
+    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
-    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    H_pre_triton = out_triton[:, :n_streams]
-    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-    H_res_triton = out_triton[:, 2 * n_streams :]
-
-    torch.testing.assert_close(
-        H_pre_triton.to(torch.float32),
-        H_pre_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_post_triton.to(torch.float32),
-        H_post_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_res_triton.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=1e-2 if C < 1024 else 5e-2,
-        rtol=1e-2 if C < 1024 else 5e-2,
-    )
-
-
-@pytest.mark.parametrize("M, n, C", get_test_shapes())
-def test_mhc_preallocated_output(M, n, C):
-    """
-    Test mhc() with pre-allocated output tensors.
-
-    Verifies that the kernel correctly writes to user-provided output buffers.
-    """
-    torch.cuda.empty_cache()
-
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
-        M, n, C
-    )
-    n_squared = n * n
-    # Allocate unified output buffer: (M, n + n + n_squared)
-    out = torch.empty(M, n + n + n_squared, dtype=x.dtype, device=x.device)
-
-    out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    H_pre_torch = out_torch[:, :n_streams]
-    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-    H_res_torch = out_torch[:, 2 * n_streams :]
-
-    # Call mhc with unified output buffer
-    result = mhc(
-        x,
-        phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
-        bias,
-        n_streams,
-        out=out,
-    )
-
-    # Verify result is the same object as out (in-place modification)
-    assert result is out
-
-    # Extract streams from unified output
-    result_pre = result[:, :n]
-    result_post = result[:, n : 2 * n]
-    result_res = result[:, 2 * n :]
-
-    torch.testing.assert_close(
-        result_pre.to(torch.float32),
-        H_pre_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        result_post.to(torch.float32),
-        H_post_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    # H_res uses relaxed tolerance because Sinkhorn-Knopp is an iterative algorithm
-    torch.testing.assert_close(
-        result_res.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=1e-2 if C < 1024 else 5e-2,
-        rtol=1e-2 if C < 1024 else 5e-2,
+    relaxed = C >= 1024
+    _assert_mhc_close(
+        triton_tuple,
+        out_torch,
+        comb_atol=5e-2 if relaxed else 1e-2,
+        comb_rtol=5e-2 if relaxed else 1e-2,
+        layer_atol=5e-2 if relaxed else 1e-2,
+        layer_rtol=5e-2 if relaxed else 1e-2,
     )
 
 
 @pytest.mark.parametrize("eps", [1e-6, 1e-5, 1e-8])
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024)])
 def test_mhc_different_epsilon(eps, M, n, C):
-    """
-    Test mhc() with different epsilon values for RMSNorm (Eq 15).
-
-    Validates numerical stability parameter handling.
-    """
+    """Test mhc() with different epsilon values for RMSNorm (Eq 15)."""
     torch.cuda.empty_cache()
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
@@ -161,102 +120,40 @@ def test_mhc_different_epsilon(eps, M, n, C):
     )
 
     out_torch = mhc_torch(
-        x,
-        phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
-        bias,
-        n_streams,
-        eps=eps,
+        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps
     )
-    H_pre_torch = out_torch[:, :n_streams]
-    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-    H_res_torch = out_torch[:, 2 * n_streams :]
+    triton_tuple = mhc(
+        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams, eps=eps
+    )
 
-    out_triton = mhc(
-        x,
-        phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
-        bias,
-        n_streams,
-        eps=eps,
-    )
-    H_pre_triton = out_triton[:, :n_streams]
-    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-    H_res_triton = out_triton[:, 2 * n_streams :]
-
-    for torch_out, triton_out in [
-        (H_pre_torch, H_pre_triton),
-        (H_post_torch, H_post_triton),
-    ]:
-        torch.testing.assert_close(
-            triton_out.to(torch.float32),
-            torch_out.to(torch.float32),
-            atol=1e-2,
-            rtol=1e-2,
-        )
-    torch.testing.assert_close(
-        H_res_triton.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    _assert_mhc_close(triton_tuple, out_torch)
 
 
 @pytest.mark.parametrize("alpha_scale", [0.1, 0.5, 1.0, 2.0, 10.0])
 def test_mhc_different_alpha(alpha_scale):
-    """
-    Test mhc() with different scaling factors α (Eq 16).
-
-    Validates stream-specific scaling behavior across range of α values.
-    """
+    """Test mhc() with different scaling factors α (Eq 16)."""
     torch.cuda.empty_cache()
 
     M, n, C = 32, 4, 1024
     x, phi, _, _, _, bias, n_streams = generate_mhc_inputs(M, n, C)
 
-    # Use same alpha for all streams, scaled by alpha_scale
-    alpha_pre = alpha_scale
-    alpha_post = alpha_scale
-    alpha_res = alpha_scale
+    alpha_pre = alpha_post = alpha_res = alpha_scale
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    H_pre_torch = out_torch[:, :n_streams]
-    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-    H_res_torch = out_torch[:, 2 * n_streams :]
+    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
-    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    H_pre_triton = out_triton[:, :n_streams]
-    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-    H_res_triton = out_triton[:, 2 * n_streams :]
-
-    for torch_out, triton_out in [
-        (H_pre_torch, H_pre_triton),
-        (H_post_torch, H_post_triton),
-    ]:
-        torch.testing.assert_close(
-            triton_out.to(torch.float32),
-            torch_out.to(torch.float32),
-            atol=1e-2,
-            rtol=1e-2,
-        )
-    torch.testing.assert_close(
-        H_res_triton.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+    _assert_mhc_close(
+        triton_tuple,
+        out_torch,
+        comb_atol=5e-2,
+        comb_rtol=5e-2,
+        layer_atol=5e-2,
+        layer_rtol=5e-2,
     )
 
 
 def test_mhc_zero_input():
-    """
-    Test mhc() with zero input (edge case for RMSNorm).
-
-    When x = 0, RMS norm → ε, testing numerical stability of Eq 15.
-    """
+    """Test mhc() with zero input (edge case for RMSNorm)."""
     torch.cuda.empty_cache()
 
     M, n, C = 16, 4, 512
@@ -264,50 +161,19 @@ def test_mhc_zero_input():
     N_total = n * n + 2 * n
 
     x = torch.zeros(M, nC, dtype=torch.bfloat16, device="cuda")
-
-    # Create unified phi tensor: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
     n_squared = n * n
     phi = torch.randn(nC, n + n + n_squared, dtype=torch.bfloat16, device="cuda") * 0.1
-
     alpha_pre = alpha_post = alpha_res = 1.0
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda") * 0.1
 
-    # Reference implementation
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    H_pre_torch = out_torch[:, :n]
-    H_post_torch = out_torch[:, n : 2 * n]
-    H_res_torch = out_torch[:, 2 * n :]
+    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
-    # Triton implementation
-    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    H_pre_triton = out_triton[:, :n]
-    H_post_triton = out_triton[:, n : 2 * n]
-    H_res_triton = out_triton[:, 2 * n :]
-
-    for torch_out, triton_out in [
-        (H_pre_torch, H_pre_triton),
-        (H_post_torch, H_post_triton),
-    ]:
-        torch.testing.assert_close(
-            triton_out.to(torch.float32),
-            torch_out.to(torch.float32),
-            atol=1e-2,
-            rtol=1e-2,
-        )
-    torch.testing.assert_close(
-        H_res_triton.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    _assert_mhc_close(triton_tuple, out_torch)
 
 
 def test_mhc_large_values():
-    """
-    Test mhc() numerical stability with large input values.
-
-    Validates that float32 accumulation prevents overflow/underflow.
-    """
+    """Test mhc() numerical stability with large input values."""
     torch.cuda.empty_cache()
 
     M, n, C = 32, 4, 1024
@@ -315,52 +181,25 @@ def test_mhc_large_values():
     N_total = n * n + 2 * n
 
     x = torch.randn(M, nC, dtype=torch.bfloat16, device="cuda") * 100
-
-    # Create unified phi tensor: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
     n_squared = n * n
     phi = torch.randn(nC, n + n + n_squared, dtype=torch.bfloat16, device="cuda") * 0.01
-
     alpha_pre = alpha_post = alpha_res = 1.0
     bias = torch.randn(N_total, dtype=torch.float32, device="cuda")
 
-    # Reference implementation
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    H_pre_torch = out_torch[:, :n]
-    H_post_torch = out_torch[:, n : 2 * n]
-    H_res_torch = out_torch[:, 2 * n :]
+    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
 
-    # Triton implementation
-    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n)
-    H_pre_triton = out_triton[:, :n]
-    H_post_triton = out_triton[:, n : 2 * n]
-    H_res_triton = out_triton[:, 2 * n :]
-
-    for torch_out, triton_out in [
-        (H_pre_torch, H_pre_triton),
-        (H_post_torch, H_post_triton),
-    ]:
-        torch.testing.assert_close(
-            triton_out.to(torch.float32),
-            torch_out.to(torch.float32),
-            atol=1e-2,
-            rtol=1e-2,
-        )
-    torch.testing.assert_close(
-        H_res_triton.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
+    # Layer_input scales linearly with x, so loosen its absolute tolerance for
+    # x ~ N(0, 100²).
+    _assert_mhc_close(
+        triton_tuple, out_torch, layer_atol=2.0, layer_rtol=1e-2
     )
 
 
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_mhc_small_shapes(M, n, C, dtype):
-    """
-    Quick smoke test for mhc() with representative shapes.
-
-    Subset of test_mhc_correctness for faster validation during development.
-    """
+    """Quick smoke test for mhc() with representative shapes."""
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
@@ -369,42 +208,20 @@ def test_mhc_small_shapes(M, n, C, dtype):
     )
 
     out_torch = mhc_torch(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    H_pre_torch = out_torch[:, :n_streams]
-    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-    H_res_torch = out_torch[:, 2 * n_streams :]
+    triton_tuple = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
 
-    out_triton = mhc(x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams)
-    H_pre_triton = out_triton[:, :n_streams]
-    H_post_triton = out_triton[:, n_streams : 2 * n_streams]
-    H_res_triton = out_triton[:, 2 * n_streams :]
-
-    for torch_out, triton_out in [
-        (H_pre_torch, H_pre_triton),
-        (H_post_torch, H_post_triton),
-    ]:
-        torch.testing.assert_close(
-            triton_out.to(torch.float32),
-            torch_out.to(torch.float32),
-            atol=1e-2,
-            rtol=1e-2,
-        )
-    torch.testing.assert_close(
-        H_res_triton.to(torch.float32),
-        H_res_torch.to(torch.float32),
-        atol=2e-2,
-        rtol=5e-2,
+    _assert_mhc_close(
+        triton_tuple,
+        out_torch,
+        comb_atol=2e-2,
+        comb_rtol=5e-2,
+        layer_atol=5e-2,
+        layer_rtol=5e-2,
     )
 
 
 def test_mhc_output_range():
-    """
-    Validate output value ranges for mhc().
-
-    Verifies activation functions produce expected bounds:
-    - Pre-stream (Eq 17): σ(·) ∈ [0, 1]
-    - Post-stream (Eq 18): 2σ(·) ∈ [0, 2]
-    - Res-stream (Eq 19): Doubly stochastic - values in [0, 1], rows/cols sum to 1
-    """
+    """Validate output value ranges for mhc()."""
     torch.cuda.empty_cache()
 
     M, n, C = 64, 4, 1024
@@ -412,7 +229,7 @@ def test_mhc_output_range():
         M, n, C
     )
 
-    out = mhc(
+    post_mix, comb_mix, _ = mhc(
         x,
         phi,
         alpha_pre,
@@ -422,27 +239,17 @@ def test_mhc_output_range():
         n_streams,
         sinkhorn_iters=50,
     )
-    H_pre = out[:, :n_streams]
-    H_post = out[:, n_streams : 2 * n_streams]
-    H_res = out[:, 2 * n_streams :]
-
-    # Pre-stream (Eq 17): sigmoid output should be in [0, 1]
-    assert torch.all(H_pre >= 0.0), "Pre-stream has values < 0"
-    assert torch.all(H_pre <= 1.0), "Pre-stream has values > 1"
 
     # Post-stream (Eq 18): 2*sigmoid output should be in [0, 2]
-    assert torch.all(H_post >= 0.0), "Post-stream has values < 0"
-    assert torch.all(H_post <= 2.0), "Post-stream has values > 2"
+    assert torch.all(post_mix >= 0.0), "Post-stream has values < 0"
+    assert torch.all(post_mix <= 2.0), "Post-stream has values > 2"
 
     # Res-stream (Eq 19): doubly stochastic
-    n_squared = n * n
-    assert H_res.shape == (M, n_squared), "Res-stream shape mismatch"
-
-    # Verify doubly stochastic numerical accuracy against the reference implementation.
-    H_res_3d = H_res.view(M, n_streams, n_streams).to(torch.float32)
-    assert is_doubly_stochastic(H_res_3d, tol=5e-2), (
-        "Res-stream is not doubly stochastic. "
-        f"Row sums: {H_res_3d.sum(dim=-1)}, Col sums: {H_res_3d.sum(dim=-2)}"
+    assert comb_mix.shape == (M, n_streams, n_streams), "comb_mix shape mismatch"
+    assert is_doubly_stochastic(comb_mix.to(torch.float32), tol=5e-2), (
+        "comb_mix is not doubly stochastic. "
+        f"Row sums: {comb_mix.float().sum(dim=-1)}, "
+        f"Col sums: {comb_mix.float().sum(dim=-2)}"
     )
 
 
@@ -465,12 +272,7 @@ def _make_split_k_config(num_ksplit):
 @pytest.mark.parametrize("num_ksplit", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_split_k_correctness(M, n, C, num_ksplit, dtype):
-    """
-    Test that split-K implementation matches the original fused kernel.
-
-    Validates that splitting the K dimension across multiple programs produces
-    the same results as processing K in a single program.
-    """
+    """Test that split-K matches the PyTorch reference (no Sinkhorn)."""
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
@@ -478,7 +280,6 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         M, n, C, dtype
     )
 
-    # Reference: PyTorch implementation
     out_ref = mhc_torch(
         x,
         phi,
@@ -489,12 +290,8 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         n_streams,
         return_with_sinkhorn=False,
     )
-    H_pre_ref = out_ref[:, :n_streams]
-    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
-    H_res_ref = out_ref[:, 2 * n_streams :]
 
-    # Test: split-K kernel with config passed directly
-    out_split = fused_mhc(
+    triton_tuple = fused_mhc(
         x,
         phi,
         alpha_pre,
@@ -504,39 +301,22 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         n_streams,
         config=_make_split_k_config(num_ksplit),
     )
-    H_pre_split = out_split[:, :n_streams]
-    H_post_split = out_split[:, n_streams : 2 * n_streams]
-    H_res_split = out_split[:, 2 * n_streams :]
 
-    torch.testing.assert_close(
-        H_pre_split.to(torch.float32),
-        H_pre_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_post_split.to(torch.float32),
-        H_post_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_res_split.to(torch.float32),
-        H_res_ref.to(torch.float32),
-        atol=1e-2 if C < 1024 else 5e-2,
-        rtol=1e-2 if C < 1024 else 5e-2,
+    relaxed = C >= 1024
+    _assert_mhc_close(
+        triton_tuple,
+        out_ref,
+        comb_atol=5e-2 if relaxed else 1e-2,
+        comb_rtol=5e-2 if relaxed else 1e-2,
+        layer_atol=5e-2 if relaxed else 1e-2,
+        layer_rtol=5e-2 if relaxed else 1e-2,
     )
 
 
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048)])
 @pytest.mark.parametrize("num_ksplit", [2, 4])
 def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
-    """
-    Test split-K with the full mhc() pipeline including Sinkhorn-Knopp.
-
-    Validates that split-K works correctly when combined with the
-    Sinkhorn-Knopp post-processing step.
-    """
+    """Test split-K with the full mhc() pipeline including Sinkhorn-Knopp."""
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
@@ -544,7 +324,6 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         M, n, C
     )
 
-    # Reference: PyTorch implementation
     out_ref = mhc_torch(
         x,
         phi,
@@ -555,12 +334,8 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         n_streams,
         return_with_sinkhorn=True,
     )
-    H_pre_ref = out_ref[:, :n_streams]
-    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
-    H_res_ref = out_ref[:, 2 * n_streams :]
 
-    # Test: split-K kernel with full mhc pipeline (config passed directly)
-    out_split = mhc(
+    triton_tuple = mhc(
         x,
         phi,
         alpha_pre,
@@ -570,38 +345,20 @@ def test_split_k_mhc_full_pipeline(M, n, C, num_ksplit):
         n_streams,
         config=_make_split_k_config(num_ksplit),
     )
-    H_pre_split = out_split[:, :n_streams]
-    H_post_split = out_split[:, n_streams : 2 * n_streams]
-    H_res_split = out_split[:, 2 * n_streams :]
 
-    torch.testing.assert_close(
-        H_pre_split.to(torch.float32),
-        H_pre_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_post_split.to(torch.float32),
-        H_post_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_res_split.to(torch.float32),
-        H_res_ref.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+    _assert_mhc_close(
+        triton_tuple,
+        out_ref,
+        comb_atol=5e-2,
+        comb_rtol=5e-2,
+        layer_atol=5e-2,
+        layer_rtol=5e-2,
     )
 
 
 @pytest.mark.parametrize("num_ksplit", [1, 2, 4, 8])
 def test_split_k_various_splits(num_ksplit):
-    """
-    Test split-K with various split counts.
-
-    Validates that the kernel handles different numbers of K-splits correctly,
-    including edge cases where num_ksplit may not evenly divide K.
-    """
+    """Test split-K with various split counts (skip Sinkhorn)."""
     torch.cuda.empty_cache()
 
     M, n, C = 32, 4, 1024
@@ -609,8 +366,7 @@ def test_split_k_various_splits(num_ksplit):
         M, n, C
     )
 
-    # Reference: PyTorch implementation
-    out_torch = mhc_torch(
+    out_ref = mhc_torch(
         x,
         phi,
         alpha_pre,
@@ -620,12 +376,8 @@ def test_split_k_various_splits(num_ksplit):
         n_streams,
         return_with_sinkhorn=False,
     )
-    H_pre_torch = out_torch[:, :n_streams]
-    H_post_torch = out_torch[:, n_streams : 2 * n_streams]
-    # H_res_torch = out_torch[:, 2 * n_streams :]
 
-    # Test: split-K kernel (config passed directly)
-    out_split = fused_mhc(
+    triton_tuple = fused_mhc(
         x,
         phi,
         alpha_pre,
@@ -635,104 +387,21 @@ def test_split_k_various_splits(num_ksplit):
         n_streams,
         config=_make_split_k_config(num_ksplit),
     )
-    H_pre_split = out_split[:, :n_streams]
-    H_post_split = out_split[:, n_streams : 2 * n_streams]
-    # H_res_split = out_split[:, 2 * n_streams :]
 
+    # post and layer_input only; skip comb_mix (not Sinkhorn-projected here)
+    # and hpre (raw logits, no Triton-side counterpart).
+    post_t, _, layer_t = triton_tuple
+    post_ref, _, _hpre_ref, layer_ref = out_ref
     torch.testing.assert_close(
-        H_pre_split.to(torch.float32),
-        H_pre_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
+        post_t.float(), post_ref.float(), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(
-        H_post_split.to(torch.float32),
-        H_post_torch.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-
-
-@pytest.mark.parametrize("M, n, C", [(16, 4, 512), (32, 4, 1024)])
-def test_split_k_preallocated_output(M, n, C):
-    """
-    Test split-K with pre-allocated output tensors.
-
-    Verifies that split-K correctly writes to user-provided output buffers.
-    """
-    torch.cuda.empty_cache()
-
-    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
-        M, n, C
-    )
-    n_squared = n * n
-
-    # Create single unified pre-allocated output buffer
-    total_out_cols = n + n + n_squared
-    out = torch.empty(M, total_out_cols, dtype=x.dtype, device=x.device)
-
-    # Reference without split-K (returns unified tensor)
-    out_ref = mhc_torch(
-        x,
-        phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
-        bias,
-        n_streams,
-        return_with_sinkhorn=False,
-    )
-    H_pre_ref = out_ref[:, :n_streams]
-    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
-    H_res_ref = out_ref[:, 2 * n_streams :]
-
-    # Test with split-K and pre-allocated unified output (config passed directly)
-    result = fused_mhc(
-        x,
-        phi,
-        alpha_pre,
-        alpha_post,
-        alpha_res,
-        bias,
-        n_streams,
-        out=out,
-        config=_make_split_k_config(2),
-    )
-
-    # Verify that the returned tensor is the same object (in-place operation)
-    assert result is out
-
-    # Extract streams from unified output
-    out_pre = out[:, :n_streams]
-    out_post = out[:, n_streams : 2 * n_streams]
-    out_res = out[:, 2 * n_streams :]
-
-    torch.testing.assert_close(
-        out_pre.to(torch.float32),
-        H_pre_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        out_post.to(torch.float32),
-        H_post_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        out_res.to(torch.float32),
-        H_res_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
+        layer_t.float(), layer_ref.float(), atol=5e-2, rtol=5e-2
     )
 
 
 def test_split_k_large_k():
-    """
-    Test split-K with large K dimension where split-K should be beneficial.
-
-    Validates correctness for typical mHC usage with large input features.
-    """
+    """Test split-K with large K dimension where split-K should be beneficial."""
     torch.cuda.empty_cache()
 
     M, n, C = 64, 4, 2048  # K = n * C = 8192
@@ -740,7 +409,6 @@ def test_split_k_large_k():
         M, n, C
     )
 
-    # Reference
     out_ref = mhc_torch(
         x,
         phi,
@@ -751,12 +419,8 @@ def test_split_k_large_k():
         n_streams,
         return_with_sinkhorn=False,
     )
-    H_pre_ref = out_ref[:, :n_streams]
-    H_post_ref = out_ref[:, n_streams : 2 * n_streams]
-    H_res_ref = out_ref[:, 2 * n_streams :]
 
-    # Test with 4-way split (config passed directly)
-    out_split = fused_mhc(
+    triton_tuple = fused_mhc(
         x,
         phi,
         alpha_pre,
@@ -766,28 +430,14 @@ def test_split_k_large_k():
         n_streams,
         config=_make_split_k_config(4),
     )
-    H_pre_split = out_split[:, :n_streams]
-    H_post_split = out_split[:, n_streams : 2 * n_streams]
-    H_res_split = out_split[:, 2 * n_streams :]
 
-    # Use slightly relaxed tolerance for larger K due to more accumulation steps
-    torch.testing.assert_close(
-        H_pre_split.to(torch.float32),
-        H_pre_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_post_split.to(torch.float32),
-        H_post_ref.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        H_res_split.to(torch.float32),
-        H_res_ref.to(torch.float32),
-        atol=5e-2,
-        rtol=5e-2,
+    _assert_mhc_close(
+        triton_tuple,
+        out_ref,
+        comb_atol=5e-2,
+        comb_rtol=5e-2,
+        layer_atol=5e-2,
+        layer_rtol=5e-2,
     )
 
 
@@ -1046,3 +696,126 @@ def test_sk_output_range():
 
     assert torch.all(out >= 0.0), "Output has negative values"
     assert torch.all(out <= 1.0), "Output has values > 1"
+
+
+# =============================================================================
+# Triton-vs-HIP parity anchor
+# =============================================================================
+
+def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n):
+    """Convert Triton-convention mhc inputs to HIP `aiter.mhc_pre` conventions.
+
+    Mapping:
+      M <-> m                 n <-> hc_mult              C <-> hidden_size
+      x (M, n*C)              <-> residual (m, hc_mult, hidden_size) bf16
+      phi (n*C, 2n+n²)        <-> fn.T (hc_mult3, hc_hidden_size)    fp32
+      (alpha_pre/post/res)    <-> hc_scale (3,)                      fp32
+      bias                    <-> hc_base (hc_mult3,)                fp32
+    """
+    M, K = x.shape
+    C = K // n
+    residual = x.view(M, n, C).contiguous().to(torch.bfloat16)
+    fn_hip = phi.T.contiguous().float()
+    hc_scale = torch.tensor(
+        [alpha_pre, alpha_post, alpha_res], dtype=torch.float32, device=x.device
+    )
+    hc_base = bias.to(torch.float32).contiguous()
+    return residual, fn_hip, hc_scale, hc_base
+
+
+@pytest.mark.parametrize(
+    "M, n, C",
+    [
+        (64, 4, 1024),
+        (1024, 4, 1024),
+        (2048, 4, 2048),
+    ],
+)
+def test_triton_mhc_matches_hip(M, n, C):
+    """Triton ``mhc()`` matches the real HIP kernel ``aiter.mhc_pre()``.
+
+    Skips when:
+      - CUDA is unavailable
+      - ``aiter.mhc_pre`` is not built in this environment
+      - ``n != 4`` (``mhc_pre_big_fuse`` hardcodes ``hc_mult == 4``)
+      - ``C < 512`` (``mhc_pre_big_fuse`` dispatch lower bound)
+      - ``n*C`` is not divisible by 64 (``mhc_pre_gemm_sqrsum`` ``tile_k`` requirement)
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required for mHC kernels")
+    if not _HAS_AITER_MHC_PRE:
+        pytest.skip("aiter.mhc_pre is not available in this environment")
+    if n != 4:
+        pytest.skip("aiter.mhc_pre_big_fuse hardcodes hc_mult == 4")
+    if C < 512:
+        pytest.skip("aiter.mhc_pre_big_fuse dispatch requires C >= 512")
+    if (n * C) % 64 != 0:
+        pytest.skip("aiter.mhc_pre_gemm_sqrsum needs n*C divisible by tile_k")
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
+
+    rms_eps = 1e-6
+    hc_pre_eps = 0.0
+    hc_sinkhorn_eps = 0.0
+    hc_post_mult_value = 2.0
+    sinkhorn_repeat = 20
+
+    x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
+        M, n, C, dtype=torch.bfloat16
+    )
+
+    post_t, comb_t, li_t = mhc(
+        x,
+        phi,
+        alpha_pre,
+        alpha_post,
+        alpha_res,
+        bias,
+        n_streams,
+        eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        sinkhorn_iters=sinkhorn_repeat,
+    )
+
+    residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
+        x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams
+    )
+    # aiter.mhc_pre allocates outputs via torch.empty without a device kwarg,
+    # so it needs an active torch.device context to land on the GPU.
+    with torch.device(x.device):
+        post_h, comb_h, li_h = _aiter.mhc_pre(
+            residual,
+            fn_hip,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+
+    cfg = f"(M={M}, n={n}, C={C})"
+    torch.testing.assert_close(
+        post_t.float(),
+        post_h.float(),
+        atol=4e-2,
+        rtol=1e-2,
+        msg=f"post_mix Triton vs aiter.mhc_pre mismatch at {cfg}",
+    )
+    torch.testing.assert_close(
+        comb_t.float(),
+        comb_h.float(),
+        atol=4e-2,
+        rtol=1e-2,
+        msg=f"comb_mix Triton vs aiter.mhc_pre mismatch at {cfg}",
+    )
+    torch.testing.assert_close(
+        li_t.float(),
+        li_h.float(),
+        atol=8e-2,
+        rtol=2e-2,
+        msg=f"layer_input Triton vs aiter.mhc_pre mismatch at {cfg}",
+    )

@@ -10,36 +10,48 @@ import triton.language as tl
 @triton.jit
 def _mhc_fused_kernel(
     x_ptr,
-    phi_ptr,  # Unified phi: (K, n + n + n_res)
+    phi_ptr,  # Unified phi: (K, n + n + n_res), layout [pre | post | res]
     alpha_pre,
     alpha_post,
     alpha_res,
     bias_ptr,
-    out_ptr,  # Unified output: (M, n + n + n_squared)
+    out_ptr,  # Shrunk output: (M, n + n_squared), layout [post | res]
+    layer_input_ptr,  # (M, C); the apply-pre output
     M: tl.constexpr,
     K: tl.constexpr,
     N: tl.constexpr,
     n: tl.constexpr,
     n_squared: tl.constexpr,
+    C: tl.constexpr,
     eps: tl.constexpr,
+    hc_pre_eps,
     stride_xm,
     stride_xk,
     stride_phi_k,  # Stride for K dimension
     stride_phi_n,  # Stride for N dimension (total_cols)
     stride_out_m,  # Stride for M dimension
-    stride_out_n,  # Stride for N dimension (total_cols)
+    stride_out_n,  # Stride for N dimension (post + res)
+    stride_li_m,
+    stride_li_c,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    BLOCK_C: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
 ):
     """
-    Fused kernel for equations 14-18 with stream-aware grid.
+    Fused kernel for mHC equations 14-18 plus the layer_input apply step.
 
     Computes three separate outputs:
     - H^pre: (M, n) with sigmoid activation (Eq 17)
     - H^post: (M, n) with 2*sigmoid activation (Eq 18)
     - H^res: (M, n²) raw logits (identity activation, for Sinkhorn-Knopp post-processing)
+
+    Pre-stream programs compute `pre_mix = sigmoid(H_pre) + hc_pre_eps` and apply
+    it to `x` to produce `layer_input[m, c] = sum_i pre_mix[m, i] * x[m, i*C + c]`.
+
+    Post and res streams write to a unified `(M, n + n_squared)` tensor following 
+    `[post | res]`. phi/bias indexing follows `[pre | post | res]` layout
 
     Grid structure:
     - The grid is organized per-stream so each program processes exactly one stream
@@ -57,7 +69,6 @@ def _mhc_fused_kernel(
     is_pre_program = pid_n < n_blocks_pre
     is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
     is_res_program = ~is_pre_program & ~is_post_program
-    is_post_f32 = is_post_program.to(tl.float32)
     is_post_i32 = is_post_program.to(tl.int32)
     is_res_i32 = is_res_program.to(tl.int32)
 
@@ -70,14 +81,13 @@ def _mhc_fused_kernel(
 
     n_out = n + (n_squared - n) * is_res_i32
 
-    col_offset = n * (is_post_i32 + 2 * is_res_i32)
-    rn_global = rn_local + col_offset
-
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-
+    
     # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    # phi/bias indexing keeps the original [pre | post | res] layout
     phi_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
+    rn_global = rn_local + phi_col_start
 
     # Unified phi tensor - strides are the same for all streams
     for k in range(0, K, BLOCK_K):
@@ -112,23 +122,50 @@ def _mhc_fused_kernel(
 
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
 
-    out_res = out
+    if is_pre_program:
+        # Pre stream: compute pre_mix and apply to x to produce layer_input.
+        pre_mix = tl.sigmoid(out) + hc_pre_eps  # (BLOCK_M, BLOCK_N)
 
-    # Pre: sigmoid(out), Post: 2*sigmoid(out), Res: out_res (identity)
-    out_activated = tl.where(
-        is_pre_program | is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out_res
-    )
+        for c0 in range(0, C, BLOCK_C):
+            rc = c0 + tl.arange(0, BLOCK_C)
+            li_acc = tl.zeros([BLOCK_M, BLOCK_C], dtype=tl.float32)
 
-    # Compute output column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
-    out_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
+            for i in tl.static_range(n):
+                # Extract column i of pre_mix into a (BLOCK_M,) vector
+                pre_mix_i = tl.sum(
+                    tl.where(rn_local[None, :] == i, pre_mix, 0.0),
+                    axis=1,
+                )
+                # Re-read x[rm, i*C + rc] (same to HIP version)
+                x_tile = tl.load(
+                    x_ptr
+                    + rm[:, None] * stride_xm
+                    + (i * C + rc[None, :]) * stride_xk,
+                    mask=(rm[:, None] < M) & (rc[None, :] < C),
+                    other=0.0,
+                ).to(tl.float32)
+                li_acc += pre_mix_i[:, None] * x_tile
 
-    # Unified output tensor - strides are the same for all streams
-    out_col_offset = out_col_start + rn_local
-    tl.store(
-        out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
-        out_activated,
-        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
-    )
+            tl.store(
+                layer_input_ptr
+                + rm[:, None] * stride_li_m
+                + rc[None, :] * stride_li_c,
+                li_acc.to(layer_input_ptr.dtype.element_ty),
+                mask=(rm[:, None] < M) & (rc[None, :] < C),
+            )
+    else:
+        # Post / Res: activate and write output (layout [post | res]).
+        is_post_f32 = is_post_program.to(tl.float32)
+        out_activated = tl.where(
+            is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out
+        )
+        out_col_start = tl.where(is_post_program, 0, n)
+        out_col_offset = out_col_start + rn_local
+        tl.store(
+            out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
+            out_activated,
+            mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+        )
 
 
 @triton.jit
@@ -265,43 +302,55 @@ def _mhc_fused_split_kernel(
 
 @triton.jit
 def _mhc_fused_reduce_kernel(
-    acc_ptr,  # Unified input: (NUM_KSPLIT, M, n + n + n_res)
+    acc_ptr,  # Unified input: (NUM_KSPLIT, M, n + n + n_res), layout [pre | post | res]
     acc_sq_ptr,
     alpha_pre,
     alpha_post,
     alpha_res,
     bias_ptr,
-    out_ptr,  # Unified output: (M, n + n + n_squared)
+    out_ptr,  # Unified output: (M, n + n_squared), layout [post | res]
+    x_ptr,  # needed for the apply-pre step in the pre branch
+    layer_input_ptr,  # (M, C); the apply-pre output
     M: tl.constexpr,
     K: tl.constexpr,
     N: tl.constexpr,
     n: tl.constexpr,
     n_squared: tl.constexpr,
+    C: tl.constexpr,
     eps: tl.constexpr,
+    hc_pre_eps,
     stride_acc_k,  # Stride for NUM_KSPLIT dimension
     stride_acc_m,  # Stride for M dimension
     stride_acc_n,  # Stride for N dimension (total_cols)
     stride_acc_sq_k,
     stride_acc_sq_m,
     stride_out_m,  # Stride for M dimension
-    stride_out_n,  # Stride for N dimension (total_cols)
+    stride_out_n,  # Stride for N dimension (post + res)
+    stride_xm,
+    stride_xk,
+    stride_li_m,
+    stride_li_c,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_C: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     ACTUAL_KSPLIT: tl.constexpr,
 ):
     """
-    Reduce kernel for mHC - combines partial results and applies post-processing.
+    Reduce kernel for mHC - combines split-K partials and applies the post-block.
 
-    Reads from unified contiguous tensor (NUM_KSPLIT, M, total_cols) where
-    total_cols = n + n + n_res, laid out as: [pre, post, res].
-
-    Sums partial dot products and sum-of-squares across K-splits, then applies:
+    Reads from unified `(NUM_KSPLIT, M, n + n + n_squared)` partials laid out as
+    `[pre | post | res]`. Sums partial dot products and sum-of-squares across
+    K-splits, then applies:
     - RMS normalization (Eq 15)
     - Bias + alpha scaling (Eq 16)
     - Stream-specific activations (Eq 17-18)
+    - For pre: the layer_input apply step (sum_i pre_mix_i * x), matching HIP's
+      `mhc_pre_big_fuse`. H^pre is consumed in registers and is never written
+      to global. The final `out` tensor is shrunk to `(M, n + n_squared)` with
+      layout `[post | res]`.
 
-    Grid structure: (M_blocks, N_blocks_total)
+    Grid structure: (M_blocks, N_blocks_total).
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -314,7 +363,6 @@ def _mhc_fused_reduce_kernel(
     is_pre_program = pid_n < n_blocks_pre
     is_post_program = (pid_n >= n_blocks_pre) & (pid_n < n_blocks_pre + n_blocks_post)
     is_res_program = ~is_pre_program & ~is_post_program
-    is_post_f32 = is_post_program.to(tl.float32)
     is_post_i32 = is_post_program.to(tl.int32)
     is_res_i32 = is_res_program.to(tl.int32)
 
@@ -327,11 +375,9 @@ def _mhc_fused_reduce_kernel(
 
     n_out = tl.where(is_pre_program, n, tl.where(is_post_program, n, n_squared))
 
-    # Global column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
+    # Partials buffer keeps the original [pre | post | res] layout
     stream_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
     col_offset = stream_start + rn_local
-
-    # For bias: use global column index
     rn_bias_global = stream_start + rn_local
 
     # Sum partial results across K-splits
@@ -367,23 +413,47 @@ def _mhc_fused_reduce_kernel(
 
     out = rsigma[:, None] * alpha_val * acc + bias[None, :]
 
-    out_res = out
+    if is_pre_program:
+        pre_mix = tl.sigmoid(out) + hc_pre_eps  # (BLOCK_M, BLOCK_N)
 
-    # Pre: sigmoid(out), Post: 2*sigmoid(out), Res: out_res (identity)
-    out_activated = tl.where(
-        is_pre_program | is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out_res
-    )
+        for c0 in range(0, C, BLOCK_C):
+            rc = c0 + tl.arange(0, BLOCK_C)
+            li_acc = tl.zeros([BLOCK_M, BLOCK_C], dtype=tl.float32)
 
-    # Compute output column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_squared-1]
-    out_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
+            for i in tl.static_range(n):
+                pre_mix_i = tl.sum(
+                    tl.where(rn_local[None, :] == i, pre_mix, 0.0),
+                    axis=1,
+                )
+                x_tile = tl.load(
+                    x_ptr
+                    + rm[:, None] * stride_xm
+                    + (i * C + rc[None, :]) * stride_xk,
+                    mask=(rm[:, None] < M) & (rc[None, :] < C),
+                    other=0.0,
+                ).to(tl.float32)
+                li_acc += pre_mix_i[:, None] * x_tile
 
-    # Unified output tensor - strides are the same for all streams
-    out_col_offset = out_col_start + rn_local
-    tl.store(
-        out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
-        out_activated,
-        mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
-    )
+            tl.store(
+                layer_input_ptr
+                + rm[:, None] * stride_li_m
+                + rc[None, :] * stride_li_c,
+                li_acc.to(layer_input_ptr.dtype.element_ty),
+                mask=(rm[:, None] < M) & (rc[None, :] < C),
+            )
+    else:
+        # Post / Res: activate and write to the shrunk out (layout [post | res]).
+        is_post_f32 = is_post_program.to(tl.float32)
+        out_activated = tl.where(
+            is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out
+        )
+        out_col_start = tl.where(is_post_program, 0, n)
+        out_col_offset = out_col_start + rn_local
+        tl.store(
+            out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
+            out_activated,
+            mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+        )
 
 
 @triton.jit

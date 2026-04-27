@@ -49,18 +49,26 @@ def mhc_torch(
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
+    hc_pre_eps: float = 0.0,
+    sinkhorn_iters: int = 20,
     return_with_sinkhorn: bool = True,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    PyTorch reference implementation of mHC projection mapping (Eq 14-19).
+    Single PyTorch reference for mHC (Eq 14-19) plus the apply-pre fusion step,
+    exposing every meaningful intermediate so each test picks what it needs.
 
-    This serves as ground truth for validating the Triton kernel implementation.
+    The Triton ``mhc()`` wrapper (and HIP ``aiter.mhc_pre``) only return three
+    of the four outputs (``hpost``, ``hres``, ``layer_input``); ``H^pre`` is
+    consumed in-kernel. This ref additionally returns the raw pre-sigmoid
+    ``hpre`` so tests that want to assert on it (or re-derive ``pre_mix``
+    via ``σ(hpre) + hc_pre_eps``) can do so
 
     Implements:
     - Eq 14: H̃ = x̃φ (matrix multiplication)
     - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b (scaling)
-    - Eq 17: H^pre = σ(H^pre) (sigmoid activation for pre-stream)
+    - Eq 17: H^pre = σ(H^pre) + hc_pre_eps; folded into
+      ``layer_input[m, c] = Σᵢ pre_mix[m, i] · x[m, i*C + c]`` (apply-pre).
     - Eq 18: H^post = 2σ(H^post) (scaled sigmoid activation for post-stream)
     - Eq 19: H^res = Sinkhorn(H^res) (project residual stream onto doubly stochastic manifold)
 
@@ -74,16 +82,22 @@ def mhc_torch(
         bias: (N,) bias vector where N = n + n + n²
         n: stream parameter (manifold dimension controller)
         eps: epsilon for RMS normalization stability
-        return_with_sinkhorn: if True, apply Sinkhorn-Knopp to H_res; else return raw logits
+        hc_pre_eps: additive epsilon on σ(H^pre) before the apply-pre fold.
+            Note: ``hpre`` is returned **before** sigmoid and **before** this
+            additive eps; the eps only affects ``layer_input``.
+        sinkhorn_iters: number of Sinkhorn-Knopp iterations for H^res (Eq 19)
+        return_with_sinkhorn: if True, apply Sinkhorn-Knopp to H_res; else
+            return raw H^res logits as ``hres`` (matches ``fused_mhc()`` which
+            omits Eq 19).
 
     Returns:
-        (M, N) unified output tensor where N = n + n + n²
-        Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n²-1]
-
-        To extract components:
-        - H_pre = out[:, :n]
-        - H_post = out[:, n:2n]
-        - H_res = out[:, 2n:]
+        Tuple ``(hpost, hres, hpre, layer_input)`` all in fp32:
+        - ``hpost``: (M, n, 1) — ``2σ(H^post)`` (Eq 18, unsqueezed to match ``mhc()``).
+        - ``hres``: (M, n, n) — Sinkhorn-projected H^res (or raw logits when
+          ``return_with_sinkhorn=False``).
+        - ``hpre``: (M, n) — **raw H^pre logits**, post-Eq-16, pre-Eq-17. Apply
+          ``σ`` and ``+hc_pre_eps`` to recover ``pre_mix`` if needed.
+        - ``layer_input``: (M, C) — apply-pre fused output, Σᵢ pre_mix[i] · x_i.
     """
     # Extract individual phi components from unified tensor
     phi_pre = phi[:, :n]
@@ -112,34 +126,31 @@ def mhc_torch(
     bias_res = bias_f32[2 * n :]
 
     # Eq 16: Apply stream-specific scaling and bias
-    # Note: normalization already applied in x_norm above
     H_pre = alpha_pre * H_tilde_pre + bias_pre
     H_post = alpha_post * H_tilde_post + bias_post
     H_res = alpha_res * H_tilde_res + bias_res
 
-    # Eq 17: Apply sigmoid activation to pre-stream
-    # H^pre = σ(H^pre)
-    H_pre = torch.sigmoid(H_pre)
+    # Eq 17 + apply-pre fold: pre_mix = σ(H_pre) + hc_pre_eps, then
+    # layer_input[m, c] = Σᵢ pre_mix[m, i] * x[m, i*C + c].
+    pre_mix = torch.sigmoid(H_pre) + hc_pre_eps  # (M, n)
+    M, K = x.shape
+    C = K // n
+    x_3d = x_f32.view(M, n, C)  # (M, n, C)
+    layer_input = torch.einsum("mn,mnc->mc", pre_mix, x_3d)  # (M, C)
 
-    # Eq 18: Apply scaled sigmoid activation to post-stream
-    # H^post = 2σ(H^post)
-    H_post = 2.0 * torch.sigmoid(H_post)
+    # Eq 18: hpost = 2σ(H^post), reshaped to (M, n, 1) to match mhc()'s output.
+    hpost = (2.0 * torch.sigmoid(H_post)).unsqueeze(-1)  # (M, n, 1) fp32
 
-    # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint
-    # Reshape H_res from (M, n²) to (M, n, n) for Sinkhorn algorithm
-    # Note: Use 20 iterations to match the default in the Triton mhc() implementation
+    # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint.
+    H_res_3d = H_res.view(M, n, n)
     if return_with_sinkhorn:
-        M = H_res.shape[0]
-        H_res_3d = H_res.view(M, n, n)
-        H_res_ds = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=20)
-        H_res = H_res_ds.view(M, -1)  # Reshape back to (M, n²)
+        hres = sinkhorn_knopp_log_domain_torch(
+            H_res_3d, num_iters=sinkhorn_iters
+        )
     else:
-        H_res = H_res.to(torch.float32)
+        hres = H_res_3d  # already fp32
 
-    # Layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
-    out = torch.cat([H_pre.to(x.dtype), H_post.to(x.dtype), H_res.to(x.dtype)], dim=1)
-
-    return out
+    return hpost, hres, H_pre, layer_input
 
 
 def sinkhorn_knopp_exp_domain_torch(

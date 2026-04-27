@@ -5,11 +5,12 @@
 High-level Python wrapper for mHC (manifold-constrained Hyper Connection).
 
 Provides two main functions:
-- fused_mhc(): Low-level interface for equations 14-18 (fused kernel only)
-- mhc(): Complete pipeline implementing equations 14-19 (kernel + Sinkhorn-Knopp)
+- fused_mhc(): Low-level interface for equations 14-18 plus the layer_input
+  apply step (raw H_res, Sinkhorn-Knopp NOT applied).
+- mhc(): Complete pipeline implementing equations 14-19 (kernel + Sinkhorn-Knopp).
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 import triton
 
@@ -34,21 +35,20 @@ def fused_mhc(
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
-    out: Optional[torch.Tensor] = None,  # Unified output: (M, n + n + n_squared)
+    hc_pre_eps: float = 0.0,
     config: Optional[dict] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Fused Triton kernel interface for mHC projection mapping (equations 14-18).
+    Fused Triton kernel interface for mHC projection mapping (equations 14-18)
+    plus the layer_input apply step.
 
     This function implements:
     - Eq 14: H̃ = x̃φ (matrix multiplication)
     - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
     - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
-    - Eq 17: H^pre = σ(H^pre) - sigmoid activation for pre-stream
+    - Eq 17: H^pre = σ(H^pre) - sigmoid activation
     - Eq 18: H^post = 2σ(H^post) - scaled sigmoid activation for post-stream
-    - H^res: identity (raw logits for Sinkhorn-Knopp post-processing)
-
-    All operations are fused in an optimized Triton kernel for maximum performance.
+    - layer_input[m, c] = Σᵢ (σ(H^pre[m, i]) + hc_pre_eps) · x[m, i, c]
 
     Args:
         x: (M, K) input tensor where K = n*C
@@ -59,17 +59,16 @@ def fused_mhc(
         alpha_res: Scaling factor for residual stream
         bias: (N,) bias vector (fp32)
         n: Stream parameter (manifold dimension)
-        eps: Epsilon for numerical stability
-        out: Optional (M, N) pre-allocated unified output buffer
+        eps: Epsilon for RMS-norm numerical stability
+        hc_pre_eps: Additive epsilon on σ(H^pre) before the apply step
+            (default 0.0 for Eq-17 parity).
         config: Optional kernel configuration dict
 
     Returns:
-        Tuple of three tensor views (H_pre, H_post, H_res):
-        - H_pre: (M, n) - manifold projection with sigmoid activation
-        - H_post: (M, n) - post-processing with scaled sigmoid
-        - H_res: (M, n²) - raw logits (NOT doubly stochastic)
-
-        Note: All three tensors are views into a single contiguous output buffer.
+        Tuple `(h_post, h_res, layer_input)`:
+        - h_post:         (M, n, 1)  in x.dtype  - 2σ(H^post)
+        - h_res:          (M, n, n)  in x.dtype  - raw H^res before Sinkhorn
+        - layer_input:      (M, C)     in x.dtype  - Σᵢ pre_mix_i · x_i
     """
     M, K = x.shape
     C = K // n  # Derive C from K and n
@@ -93,10 +92,15 @@ def fused_mhc(
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
 
+    # TODO: have BLOCK_C in json config file and load it here later
+    BLOCK_C = config.pop("BLOCK_C", BLOCK_K)
+    BLOCK_C = min(BLOCK_C, triton.next_power_of_2(C))
+
     _LOGGER.info(
         f"FUSED_MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} "
         f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
-        f"num_ksplit={num_ksplit}"
+        f"hc_pre_eps={hc_pre_eps} num_ksplit={num_ksplit} "
+        f"BLOCK_N={BLOCK_N} BLOCK_C={BLOCK_C}"
     )
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
@@ -113,20 +117,18 @@ def fused_mhc(
         x.device == phi.device == bias.device
     ), "All tensors must be on the same device"
     assert x.device.type == "cuda", "mHC kernel requires CUDA device"
+    # Pre-stream programs assume one program owns all H^pre cols for its row block.
+    assert (
+        BLOCK_N >= n
+    ), f"BLOCK_N ({BLOCK_N}) must be >= n ({n}) for the apply-pre fusion"
 
     N = N_total
 
-    # Allocate unified output if not provided
-    # Single contiguous tensor: (M, n + n + n_squared)
-    # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_squared-1}]
-    if out is None:
-        out = torch.empty(M, N_total, dtype=x.dtype, device=x.device)
-    else:
-        assert out.shape == (
-            M,
-            N_total,
-        ), f"out shape mismatch: expected ({M}, {N_total}), got {out.shape}"
-        assert out.dtype == x.dtype and out.device == x.device
+    # Output `out` shrinks to (M, n + n_squared) with layout [post | res] —
+    # H^pre is consumed inside the kernel, so its slice is no longer materialized.
+    N_out_post_res = n + n_squared
+    out = torch.empty(M, N_out_post_res, dtype=x.dtype, device=x.device)
+    layer_input = torch.empty(M, C, dtype=x.dtype, device=x.device)
 
     # Stream-aware grid: Each program processes exactly one stream
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
@@ -134,13 +136,10 @@ def fused_mhc(
     total_n_blocks = n_blocks_pre + n_blocks_post + n_blocks_res
 
     if num_ksplit > 1:
-        # Split-K path: use split and reduce kernels
+        # Split-K path: use split and reduce kernels.
         splitk_block_size = triton.cdiv(K, num_ksplit)
         actual_ksplit = triton.cdiv(K, splitk_block_size)
 
-        # Allocate unified intermediate buffer (float32 for precision)
-        # Single contiguous tensor: (num_ksplit, M, n + n + n_squared)
-        # Layout: [pre_0...pre_{n-1}, post_0...post_{n-1}, res_0...res_{n_squared-1}]
         acc_partial = torch.empty(
             (num_ksplit, M, N_total), dtype=torch.float32, device=x.device
         )
@@ -148,7 +147,6 @@ def fused_mhc(
             (num_ksplit, M), dtype=torch.float32, device=x.device
         )
 
-        # Launch split kernel with 3D grid: (M_blocks, N_blocks_total, NUM_KSPLIT)
         grid_split = (triton.cdiv(M, BLOCK_M), total_n_blocks, num_ksplit)
         _mhc_fused_split_kernel[grid_split](
             x,
@@ -176,7 +174,6 @@ def fused_mhc(
             **config,
         )
 
-        # Launch reduce kernel with 2D grid: (M_blocks, N_blocks_total)
         grid_reduce = (triton.cdiv(M, BLOCK_M), total_n_blocks)
         _mhc_fused_reduce_kernel[grid_reduce](
             acc_partial,
@@ -186,12 +183,16 @@ def fused_mhc(
             alpha_res,
             bias,
             out,
+            x,
+            layer_input,
             M=M,
             K=K,
             N=N,
             n=n,
             n_squared=n_squared,
+            C=C,
             eps=eps,
+            hc_pre_eps=hc_pre_eps,
             stride_acc_k=acc_partial.stride(0),
             stride_acc_m=acc_partial.stride(1),
             stride_acc_n=acc_partial.stride(2),
@@ -199,15 +200,18 @@ def fused_mhc(
             stride_acc_sq_m=acc_sq_partial.stride(1),
             stride_out_m=out.stride(0),
             stride_out_n=out.stride(1),
+            stride_xm=x.stride(0),
+            stride_xk=x.stride(1),
+            stride_li_m=layer_input.stride(0),
+            stride_li_c=layer_input.stride(1),
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            BLOCK_C=BLOCK_C,
             ACTUAL_KSPLIT=actual_ksplit,
             **config,
         )
     else:
-        # Launch 2D grid: (row blocks, stream-aware column blocks)
         grid = (triton.cdiv(M, BLOCK_M), total_n_blocks)
-        # Invoke the fused Triton kernel for equations 14-18
         _mhc_fused_kernel[grid](
             x,
             phi,
@@ -216,26 +220,34 @@ def fused_mhc(
             alpha_res,
             bias,
             out,
+            layer_input,
             M=M,
             K=K,
             N=N,
             n=n,
             n_squared=n_squared,
+            C=C,
             eps=eps,
+            hc_pre_eps=hc_pre_eps,
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
             stride_phi_k=phi.stride(0),
             stride_phi_n=phi.stride(1),
             stride_out_m=out.stride(0),
             stride_out_n=out.stride(1),
+            stride_li_m=layer_input.stride(0),
+            stride_li_c=layer_input.stride(1),
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
+            BLOCK_C=BLOCK_C,
             **config,
         )
 
-    # Return unified output tensor
-    return out
+    # `out` layout is [post | res]: out[:, :n] is H^post, out[:, n:] is H^res
+    h_post = out[:, :n].unsqueeze(-1)  # (M, n, 1)
+    h_res = out[:, n:].view(M, n, n)  # (M, n, n)
+    return h_post, h_res, layer_input
 
 
 def mhc(
@@ -247,15 +259,15 @@ def mhc(
     bias: torch.Tensor,
     n: int,
     eps: float = 1e-6,
+    hc_pre_eps: float = 0.0,
     sinkhorn_iters: int = 20,
-    out: Optional[torch.Tensor] = None,  # Unified output: (M, n + n + n_squared)
     config: Optional[dict] = None,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute mHC projection mapping (equations 14-19).
 
-    Complete mHC pipeline with Sinkhorn-Knopp normalization.
-    All operations are fused in optimized Triton kernels for maximum performance.
+    Runs `fused_mhc()` then applies log-domain Sinkhorn-Knopp in-place to the
+    `h_res` view to project H^res onto the doubly-stochastic manifold (Eq 19).
 
     Args:
         x: (M, K) input tensor where K = n*C
@@ -266,23 +278,21 @@ def mhc(
         alpha_res: Scaling factor for residual stream
         bias: (N,) bias vector (fp32)
         n: Stream parameter (manifold dimension)
-        eps: Epsilon for numerical stability
+        eps: Epsilon for RMS-norm numerical stability
+        hc_pre_eps: Additive epsilon on σ(H^pre) before the apply step
         sinkhorn_iters: Number of Sinkhorn-Knopp iterations
-        out: Optional (M, N) pre-allocated unified output buffer
         config: Optional kernel configuration dict
 
     Returns:
-        Tuple of three tensor views (H_pre, H_post, H_res):
-        - H_pre: (M, n) - manifold projection with sigmoid activation
-        - H_post: (M, n) - post-processing with scaled sigmoid
-        - H_res: (M, n²) - doubly stochastic residual connection
-
-        Note: All three tensors are views into a single contiguous output buffer.
+        Tuple `(h_post, h_res, layer_input)`:
+        - h_post:    (M, n, 1)  in x.dtype  - 2σ(H^post)
+        - h_res:    (M, n, n)  in x.dtype  - doubly-stochastic Sinkhorn output
+        - layer_input: (M, C)     in x.dtype  - Σᵢ σ(H^pre[m, i]) + hc_pre_eps · x_i
     """
     _LOGGER.info(
         f"MHC: calling fused_mhc() then sinkhorn_knopp() with {sinkhorn_iters} iterations"
     )
-    res = fused_mhc(
+    h_post, h_res, layer_input = fused_mhc(
         x,
         phi,
         alpha_pre,
@@ -290,19 +300,16 @@ def mhc(
         alpha_res,
         bias,
         n,
-        eps,
-        out=out,
+        eps=eps,
+        hc_pre_eps=hc_pre_eps,
         config=config,
     )
 
-    M = res.shape[0]
     C = x.shape[1] // n
-    out_res_3d = res[:, 2 * n :].view(M, n, n)
+    # In-place on the comb_mix view (no copy-back path needed)
+    sinkhorn_knopp(h_res, C=C, num_iters=sinkhorn_iters, out=h_res)
 
-    # In-place on the residual view (no copy-back path needed)
-    sinkhorn_knopp(out_res_3d, C=C, num_iters=sinkhorn_iters, out=out_res_3d)
-
-    return res
+    return h_post, h_res, layer_input
 
 
 def sinkhorn_knopp(

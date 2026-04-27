@@ -4,10 +4,14 @@
 """
 Benchmark for mHC (manifold-constrained Hyper Connection) fused kernel.
 
-Measures performance of the Triton implementation across various input shapes
-and configurations, reporting time, throughput (TFLOPS), and bandwidth.
+Measures performance of the Triton `mhc()` implementation across various
+input shapes and configurations, reporting time, throughput (TFLOPS), and
+bandwidth.
 
 - `--with-hip`: adds the HIP kernel aiter.mhc_pre alongside the Triton kernel.
+  When passed, a silent Triton-vs-HIP correctness check runs as the first
+  step of each `(M, n, C)` row, once per config.
+  AssertionError on mismatch aborts the benchmark.
 """
 
 import sys
@@ -137,6 +141,12 @@ def run_benchmark(args):
         args={},
     )
 
+    # Tracks (configs that have already passed the silent Triton-vs-HIP 
+    # parity check within this benchmark run, so each
+    # config is checked at most once even when multiple providers/metrics
+    # are reported per row.
+    _checked_configs: set = set()
+
     @triton.testing.perf_report([benchmark])
     def bench_mhc_kernel(M, n, C, provider):
         """Benchmark mHC kernel for given configuration."""
@@ -166,41 +176,30 @@ def run_benchmark(args):
         # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
         flops_rms = 4.0 * M * nC
 
-        # Eq 16: Scale and bias addition for 3 streams
-        # - Multiply by (alpha/r): M*n + M*n + M*n_res FLOPs
-        # - Add bias: M*n + M*n + M*n_res FLOPs
-        # flops_scale_bias = 2.0 * M * (2*n + n_res)
-
-        # Eq 17 & 18: Activation functions (fused in kernel, but count FLOPs)
-        # - sigmoid(H_pre): ~10 ops per element for M*n elements
-        # - 2*sigmoid(H_post): ~11 ops per element for M*n elements
-        # - H_res activation: none (raw logits for Sinkhorn-Knopp)
-        # flops_activations = 10.0 * M * n + 11.0 * M * n
+        # Apply-pre step (fused in both Triton and HIP):
+        # layer_input[m, c] = Σᵢ pre_mix[m, i] * x[m, i*C + c]
+        # = 2*M*n*C FLOPs (multiply-add for each (m, i, c))
+        flops_apply_pre = 2.0 * M * n * C
 
         # Eq 19: Sinkhorn-Knopp (separate kernel, log-domain implementation)
         # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
-        # Per normalization (log-domain): add, max, subtract, exp, sum, log operations
-        # Operations per iteration per matrix:
-        #   - Element-wise: add(n²) + subtract(n²) + exp(n²) ≈ 3n² (×2 for row+col)
-        #   - Reductions: max(n) + sum(n) + log(n) ≈ 3n (×2 for row+col)
-        # Total: ~(6n² + 6n) ≈ 6n² + 6n per iteration (for n=4: ~108 FLOPs)
         # Simplified: ~10*n² per iteration (accounting for expensive exp/log ops)
         flops_sinkhorn = 10.0 * M * n_squared * sinkhorn_iters
 
-        total_flops = (
-            flops_matmul + flops_rms + flops_sinkhorn
-        )  # + flops_scale_bias + flops_activations
+        total_flops = flops_matmul + flops_rms + flops_apply_pre + flops_sinkhorn
 
         # Compute memory traffic
         elem_size = 2  # bf16/fp16 = 2 bytes
         bias_size = 4  # bias is fp32 = 4 bytes
 
         # Memory reads:
-        # - x: (M, nC)
+        # - x: (M, nC) - read once for the GEMM
+        # - x re-read by the apply-pre step: (M, n*C) = (M, nC) again
         # - phi_pre, phi_post, phi_res: (nC, n), (nC, n), (nC, n_res)
         # - bias: (N,) in fp32
         mem_read = (
-            M * nC * elem_size  # x
+            M * nC * elem_size  # x (GEMM)
+            + M * nC * elem_size  # x (apply-pre re-read)
             + nC * n * elem_size  # phi_pre
             + nC * n * elem_size  # phi_post
             + nC * n_squared * elem_size  # phi_res
@@ -208,13 +207,13 @@ def run_benchmark(args):
         )
 
         # Memory writes:
-        # - out_pre: (M, n)
-        # - out_post: (M, n)
-        # - out_res: (M, n_squared) - always n_squared for output
+        # - post_mix: (M, n)
+        # - comb_mix logits / Sinkhorn output: (M, n_squared)
+        # - layer_input: (M, C) - replaces the old H^pre write
         mem_write = (
-            M * n * elem_size  # out_pre
-            + M * n * elem_size  # out_post
-            + M * n_squared * elem_size  # out_res
+            M * n * elem_size  # post_mix
+            + M * n_squared * elem_size  # comb_mix
+            + M * C * elem_size  # layer_input
         )
 
         mem_sinkhorn = 2 * M * n_squared * elem_size * sinkhorn_iters
@@ -222,15 +221,20 @@ def run_benchmark(args):
         mem_write += mem_sinkhorn / 2
         total_mem = mem_read + mem_write
 
-        backend = "hip" if provider.startswith("hip_") else "triton"
+        def triton_fn():
+            return mhc(
+                x,
+                phi,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias,
+                n_streams,
+                sinkhorn_iters=sinkhorn_iters,
+            )
 
-        # Create benchmark function
-        if backend == "hip":
-            # Note: HIP additionally fuses the "apply pre" step
-            # (layer_input = sum_i residual[:, i] * H_pre[:, i]) which the
-            # shared total_flops/total_mem model does not account for, so
-            # hip_throughput(TFLOPS) / hip_bandwidth(GB/s) slightly
-            # underreport. hip_time(ms) is unambiguous.
+        hip_fn = None
+        if args.with_hip:
             import aiter  # noqa: F401  (side-effect: register module_mhc ops)
 
             residual, fn_hip, hc_scale, hc_base = _triton_to_hip_pre_inputs(
@@ -238,7 +242,7 @@ def run_benchmark(args):
             )
             hip_device_ctx = torch.device(residual.device)
 
-            def fn():
+            def hip_fn():
                 with hip_device_ctx:
                     return aiter.mhc_pre(
                         residual,
@@ -247,24 +251,17 @@ def run_benchmark(args):
                         hc_base,
                         rms_eps=1e-6,
                         hc_pre_eps=0.0,
-                        hc_sinkhorn_eps=1e-6,
+                        hc_sinkhorn_eps=0.0,
                         hc_post_mult_value=2.0,  # parity with Triton's 2*sigmoid(H_post)
                         sinkhorn_repeat=sinkhorn_iters,
                     )
 
-        else:
+        if args.with_hip and (M, n, C) not in _checked_configs:
+            _assert_triton_matches_hip(triton_fn(), hip_fn(), M=M, n=n, C=C)
+            _checked_configs.add((M, n, C))
 
-            def fn():
-                return mhc(
-                    x,
-                    phi,
-                    alpha_pre,
-                    alpha_post,
-                    alpha_res,
-                    bias,
-                    n_streams,
-                    sinkhorn_iters=sinkhorn_iters,
-                )
+        backend = "hip" if provider.startswith("hip_") else "triton"
+        fn = hip_fn if backend == "hip" else triton_fn
 
         # Benchmark
         ms = triton.testing.do_bench(fn)
@@ -333,7 +330,9 @@ def parse_args():
         help=(
             "Also benchmark the HIP aiter.mhc_pre kernel "
             "(mhc_pre_gemm_sqrsum + mhc_pre_big_fuse) alongside Triton. "
-            "Requires --dtype bf16."
+            "Requires --dtype bf16. Also runs a silent Triton-vs-HIP "
+            "correctness check once per (M, n, C) before timing that row; "
+            "aborts on mismatch."
         ),
     )
 
@@ -432,6 +431,51 @@ def _validate_with_hip(args):
             return 1
 
     return 0
+
+
+def _assert_triton_matches_hip(triton_out, hip_out, *, M, n, C):
+    """Silent Triton-vs-HIP parity assertions on already-computed output tuples.
+
+    Runs only the three `torch.testing.assert_close` calls; callers are
+    responsible for invoking `mhc()` and `aiter.mhc_pre()` with parity-aligned
+    parameters and passing the resulting 3-tuples here. Silent on success;
+    raises AssertionError on mismatch with a descriptive `(M, n, C)` tag.
+
+    Tolerances are reused verbatim from the parity test
+    `test_triton_mhc_matches_hip` in
+    `op_tests/triton_tests/fusions/test_mhc.py`, where they were
+    empirically calibrated to be robust across 10 seeds:
+        post_mix:    atol=4e-2, rtol=1e-2
+        comb_mix:    atol=4e-2, rtol=1e-2
+        layer_input: atol=8e-2, rtol=2e-2  (widest because pre_mix is
+                                            bf16-quantized in HIP before
+                                            the apply-pre step).
+    """
+    post_t, comb_t, li_t = triton_out
+    post_h, comb_h, li_h = hip_out
+
+    cfg = f"(M={M}, n={n}, C={C})"
+    torch.testing.assert_close(
+        post_t.float(),
+        post_h.float(),
+        atol=4e-2,
+        rtol=1e-2,
+        msg=f"post_mix mismatch between Triton and HIP at {cfg}",
+    )
+    torch.testing.assert_close(
+        comb_t.float(),
+        comb_h.float(),
+        atol=4e-2,
+        rtol=1e-2,
+        msg=f"comb_mix mismatch between Triton and HIP at {cfg}",
+    )
+    torch.testing.assert_close(
+        li_t.float(),
+        li_h.float(),
+        atol=8e-2,
+        rtol=2e-2,
+        msg=f"layer_input mismatch between Triton and HIP at {cfg}",
+    )
 
 
 def main():
