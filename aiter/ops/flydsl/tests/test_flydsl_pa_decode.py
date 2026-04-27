@@ -113,29 +113,36 @@ def _generate_inputs(
 # WMMA kernel requires:
 #   HEAD_SIZE >= NUM_WARPS*WAVE_SIZE = 128 and HEAD_SIZE % 32 == 0
 #   KV_BLOCK_SIZE % 16 == 0
-#   KV_COMPUTE_BLOCK_SIZE % WMMA_K (=32) == 0 and % KV_BLOCK_SIZE == 0
+#   KV_COMPUTE_BLOCK_SIZE % 64 == 0 (NUM_WARPS * WMMA_N) and % KV_BLOCK_SIZE == 0
 #   BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE/KV_BLOCK_SIZE in {1,2,4}
 #   QUERY_GROUP_SIZE == 16 (WMMA M=16)
-#   (head_size, kv_block_size, query_group_size, num_kv_heads, num_seqs, seq_len)
+#   (head, kvb, qg, nkv, nseqs, seq_len, kv_compute)
 CASES = [
-    # Baselines with default KV_COMPUTE_BLOCK_SIZE=64
-    (128, 32, 16, 1, 1, 256),   # KVB=32 → 2 blocks/compute tile, seq 256
-    (128, 32, 16, 1, 1, 512),   # KVB=32, longer seq
-    (128, 16, 16, 1, 1, 256),   # KVB=16 → 4 blocks/compute tile (gather)
-    (128, 16, 16, 1, 1, 512),   # KVB=16, longer seq
-    (128, 64, 16, 1, 1, 256),   # KVB=64 → 1 block/compute tile
-    (128, 32, 16, 2, 2, 256),   # multi-seq, multi-kv-head
+    # Baselines with KV_COMPUTE_BLOCK_SIZE = 64 (1 N-tile per warp for QK)
+    (128, 32, 16, 1, 1, 256, 64),    # KVB=32, BPC=2, seq=256
+    (128, 32, 16, 1, 1, 512, 64),    # KVB=32, seq=512
+    (128, 16, 16, 1, 1, 256, 64),    # KVB=16, BPC=4 (gather)
+    (128, 16, 16, 1, 1, 512, 64),    # KVB=16, seq=512
+    (128, 64, 16, 1, 1, 256, 64),    # KVB=64, BPC=1
+    (128, 32, 16, 2, 2, 256, 64),    # multi-seq, multi-kv-head
+
+    # KV_COMPUTE_BLOCK_SIZE = 128 (2 N-tiles per warp for QK)
+    (128, 32, 16, 1, 1, 512, 128),   # KVB=32, BPC=4
+    (128, 64, 16, 1, 1, 512, 128),   # KVB=64, BPC=2
+
+    # KV_COMPUTE_BLOCK_SIZE = 256 (4 N-tiles per warp for QK)
+    (128, 64, 16, 1, 1, 512, 256),   # KVB=64, BPC=4
 ]
 
 
-def _derive_partition_size(kv_block_size: int, kv_compute_block_size: int) -> int:
+def _derive_partition_size(kv_compute_block_size: int) -> int:
     """Pick a partition size that's a multiple of kv_compute_block_size and gives
     us at least 2 compute iterations per partition (to exercise the pipeline)."""
     return kv_compute_block_size * 2
 
 
 @pytest.mark.parametrize(
-    "head_size,kv_block_size,query_group_size,num_kv_heads,num_seqs,seq_len",
+    "head_size,kv_block_size,query_group_size,num_kv_heads,num_seqs,seq_len,kv_compute_block_size",
     CASES,
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -146,6 +153,7 @@ def test_flydsl_pa_decode(
     num_kv_heads,
     num_seqs,
     seq_len,
+    kv_compute_block_size,
     dtype,
 ):
     query, key_cache, value_cache, block_tables, seq_lens = _generate_inputs(
@@ -163,8 +171,7 @@ def test_flydsl_pa_decode(
     ref = _torch_reference(query, key_cache, value_cache, block_tables, seq_lens, attn_scale)
 
     output = torch.zeros_like(query)
-    kv_compute_block_size = 64
-    partition_size = _derive_partition_size(kv_block_size, kv_compute_block_size)
+    partition_size = _derive_partition_size(kv_compute_block_size)
     flydsl_paged_attention_decode(
         output, query, key_cache, value_cache, block_tables, seq_lens, attn_scale,
         partition_size=partition_size,
