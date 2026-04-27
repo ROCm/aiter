@@ -300,6 +300,24 @@ def create_shuffle_gdr_decode_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * scale_vec
 
+                dot_kq_vec = vector.from_elements(
+                    acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
+                )
+                for ki in range_constexpr(WARP_TILE_K_ITERS):
+                    dot_kq_vec = vector.FMAOp(
+                        sk_vecs[ki], sq_vecs[ki], dot_kq_vec
+                    ).result
+                dot_kq = mlir_vector.ReductionOp(
+                    T.f32, vector.CombiningKind.ADD, dot_kq_vec
+                ).dest
+                for offset in WARP_THREADS_K_SHFL_OFFSETS:
+                    dot_kq = (
+                        dot_kq
+                        + mlir_gpu.ShuffleOp(
+                            dot_kq, _to_raw(fx.Int32(offset)), width_i32, mode="xor"
+                        ).shuffleResult
+                    )
+
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
 
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
@@ -308,15 +326,21 @@ def create_shuffle_gdr_decode_kernel(
                     sum_hk = vector.from_elements(
                         acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
                     )
+                    sum_hq_old = vector.from_elements(
+                        acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
+                    )
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] *= r_g_vec
-                        sum_hk = vector.FMAOp(
-                            state_vecs[vi * WARP_TILE_K_ITERS + ki], sk_vecs[ki], sum_hk
-                        ).result
+                        h_cur = state_vecs[vi * WARP_TILE_K_ITERS + ki]
+                        sum_hk = vector.FMAOp(h_cur, sk_vecs[ki], sum_hk).result
+                        sum_hq_old = vector.FMAOp(h_cur, sq_vecs[ki], sum_hq_old).result
 
                     sum_hk = mlir_vector.ReductionOp(
                         T.f32, vector.CombiningKind.ADD, sum_hk
+                    ).dest
+                    sum_hq_old = mlir_vector.ReductionOp(
+                        T.f32, vector.CombiningKind.ADD, sum_hq_old
                     ).dest
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
@@ -324,6 +348,15 @@ def create_shuffle_gdr_decode_kernel(
                             sum_hk
                             + mlir_gpu.ShuffleOp(
                                 sum_hk, _to_raw(fx.Int32(offset)), width_i32, mode="xor"
+                            ).shuffleResult
+                        )
+                        sum_hq_old = (
+                            sum_hq_old
+                            + mlir_gpu.ShuffleOp(
+                                sum_hq_old,
+                                _to_raw(fx.Int32(offset)),
+                                width_i32,
+                                mode="xor",
                             ).shuffleResult
                         )
 
@@ -334,34 +367,16 @@ def create_shuffle_gdr_decode_kernel(
                         width_i32,
                         mode="idx",
                     ).shuffleResult
-                    v_new = vector.BroadcastOp(acc_vec_t, v_new)
-
-                    sum_hq = vector.from_elements(
-                        acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
-                    )
+                    sum_hq = sum_hq_old + v_new * dot_kq
+                    v_new_bcast = vector.BroadcastOp(acc_vec_t, v_new)
 
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
-                        h_old = state_vecs[vi * WARP_TILE_K_ITERS + ki]
-                        r_q_val = sq_vecs[ki]
-                        r_k_val = sk_vecs[ki]
-                        h_new = vector.FMAOp(r_k_val, v_new, h_old).result
+                        h_new = vector.FMAOp(
+                            sk_vecs[ki],
+                            v_new_bcast,
+                            state_vecs[vi * WARP_TILE_K_ITERS + ki],
+                        ).result
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
-                        sum_hq = vector.FMAOp(h_new, r_q_val, sum_hq).result
-
-                    sum_hq = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hq
-                    ).dest
-
-                    for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_hq = (
-                            sum_hq
-                            + mlir_gpu.ShuffleOp(
-                                sum_hq,
-                                _to_raw(arith.constant(offset, type=T.i32)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
-                        )
 
                     sum_hq = sum_hq.truncf(dtype_)
                     write_cond = arith.cmpi(
