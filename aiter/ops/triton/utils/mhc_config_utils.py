@@ -33,11 +33,9 @@ def get_mhc_config(
     Config file naming convention:
     - For MHC_FUSED: mode is required ("sinkhorn")
       - e.g., gfx942-MHC_FUSED_SINKHORN-C=128.json
-    - For other configs (e.g., MHC_SINKHORN): mode is not used
-      - e.g., gfx942-MHC_SINKHORN.json
 
     Args:
-        config_name: Base name of the config (e.g., "MHC_FUSED", "MHC_SINKHORN")
+        config_name: Base name of the config (e.g., "MHC_FUSED")
         M: M dimension (batch/sequence size)
         C: C dimension (hidden dim per stream). Uses threshold matching
             to find the largest available C config <= input C.
@@ -56,14 +54,9 @@ def get_mhc_config(
     dev = arch_info.get_arch()
     fallback_dev = "gfx942"
 
-    # Determine the actual config name based on mode
-    if mode is not None:
-        if mode != "sinkhorn":
-            raise ValueError(f"mode must be 'sinkhorn', got '{mode}'")
-        actual_config_name = f"{config_name}_{mode.upper()}"
-    else:
-        # No mode suffix - for standalone configs like MHC_SINKHORN
-        actual_config_name = config_name
+    if mode is None or mode != "sinkhorn":
+        raise ValueError(f"mode must be 'sinkhorn', got '{mode}'")
+    actual_config_name = f"{config_name}_{mode.upper()}"
 
     cache_key = f"{dev}_{actual_config_name}"
 

@@ -24,15 +24,12 @@ Notation (from mHC paper arXiv:2512.24880v2):
 
 import torch
 import pytest
-from aiter.ops.triton.fusions.mhc import mhc, fused_mhc, sinkhorn_knopp
+from aiter.ops.triton.fusions.mhc import mhc
 from op_tests.triton_tests.utils.mhc_ref import (
     mhc_torch,
-    sinkhorn_knopp_exp_domain_torch,
-    sinkhorn_knopp_log_domain_torch,
     is_doubly_stochastic,
     generate_mhc_inputs,
     get_test_shapes,
-    get_sk_test_shapes,
 )
 
 try:
@@ -291,7 +288,7 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         return_with_sinkhorn=False,
     )
 
-    triton_tuple = fused_mhc(
+    triton_tuple = mhc(
         x,
         phi,
         alpha_pre,
@@ -299,6 +296,7 @@ def test_split_k_correctness(M, n, C, num_ksplit, dtype):
         alpha_res,
         bias,
         n_streams,
+        sinkhorn_iters=0,
         config=_make_split_k_config(num_ksplit),
     )
 
@@ -377,7 +375,7 @@ def test_split_k_various_splits(num_ksplit):
         return_with_sinkhorn=False,
     )
 
-    triton_tuple = fused_mhc(
+    triton_tuple = mhc(
         x,
         phi,
         alpha_pre,
@@ -385,6 +383,7 @@ def test_split_k_various_splits(num_ksplit):
         alpha_res,
         bias,
         n_streams,
+        sinkhorn_iters=0,
         config=_make_split_k_config(num_ksplit),
     )
 
@@ -420,7 +419,7 @@ def test_split_k_large_k():
         return_with_sinkhorn=False,
     )
 
-    triton_tuple = fused_mhc(
+    triton_tuple = mhc(
         x,
         phi,
         alpha_pre,
@@ -428,6 +427,7 @@ def test_split_k_large_k():
         alpha_res,
         bias,
         n_streams,
+        sinkhorn_iters=0,
         config=_make_split_k_config(4),
     )
 
@@ -440,262 +440,6 @@ def test_split_k_large_k():
         layer_rtol=5e-2,
     )
 
-
-# =============================================================================
-# Sinkhorn-Knopp Tests
-# =============================================================================
-
-
-@pytest.mark.parametrize("M, N", get_sk_test_shapes())
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_sk_correctness(M, N, dtype):
-    """Test that Triton Sinkhorn-Knopp matches PyTorch reference."""
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-
-    logits = torch.randn(M, N, N, dtype=dtype, device="cuda")
-
-    out_torch_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=20)
-    out_torch_log = sinkhorn_knopp_log_domain_torch(logits, num_iters=20)
-    out_triton = sinkhorn_knopp(logits, C=128, num_iters=20)
-
-    torch.testing.assert_close(
-        out_triton.to(torch.float32),
-        out_torch_log.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        out_triton.to(torch.float32),
-        out_torch_exp.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-
-
-@pytest.mark.parametrize("M, N", get_sk_test_shapes())
-def test_sk_doubly_stochastic(M, N):
-    """Test that output matrices are doubly stochastic."""
-    torch.cuda.empty_cache()
-
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
-
-    out = sinkhorn_knopp(logits, C=128, num_iters=20)
-
-    # Convert to float32 for accurate sum checking
-    out_f32 = out.to(torch.float32)
-
-    assert is_doubly_stochastic(out_f32, tol=1e-2), (
-        f"Output is not doubly stochastic. "
-        f"Row sums: {out_f32.sum(dim=-1)}, Col sums: {out_f32.sum(dim=-2)}"
-    )
-
-
-@pytest.mark.parametrize("num_iters", [5, 10, 20, 50])
-def test_sk_different_iters(num_iters):
-    """Test with different numbers of Sinkhorn iterations."""
-    torch.cuda.empty_cache()
-
-    M, N = 16, 4
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
-
-    out_torch_exp = sinkhorn_knopp_exp_domain_torch(logits, num_iters=num_iters)
-    out_torch_log = sinkhorn_knopp_log_domain_torch(logits, num_iters=num_iters)
-    out_triton = sinkhorn_knopp(logits, C=128, num_iters=num_iters)
-
-    torch.testing.assert_close(
-        out_triton.to(torch.float32),
-        out_torch_log.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        out_triton.to(torch.float32),
-        out_torch_exp.to(torch.float32),
-        atol=1e-2,
-        rtol=1e-2,
-    )
-
-
-@pytest.mark.parametrize("M", [1, 4, 16, 64, 256, 1024])
-def test_sk_batch_sizes(M):
-    """Test with various batch sizes."""
-    torch.cuda.empty_cache()
-
-    N = 4  # Typical mHC stream count
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
-
-    out = sinkhorn_knopp(logits, C=128, num_iters=20)
-
-    assert out.shape == (M, N, N)
-    # Use relaxed tolerance for large batch sizes due to bfloat16 precision
-    tol = 2e-2 if M >= 1024 else 1e-2
-    assert is_doubly_stochastic(out.to(torch.float32), tol=tol)
-
-
-@pytest.mark.parametrize("N", [2, 4, 8, 16, 32, 64])
-def test_sk_matrix_sizes(N):
-    """Test with various matrix sizes (must be power of 2)."""
-    torch.cuda.empty_cache()
-
-    M = 16
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
-
-    out = sinkhorn_knopp(logits, C=128, num_iters=10)
-
-    assert out.shape == (M, N, N)
-    # N=2 requires slightly higher tolerance due to bfloat16 precision with less averaging
-    tol = 2e-2 if N == 2 else 1e-2
-    assert is_doubly_stochastic(out.to(torch.float32), tol=tol)
-
-
-def test_sk_numerical_stability_small_values():
-    """Test numerical stability with small input values."""
-    torch.cuda.empty_cache()
-
-    M, N = 16, 4
-    # Small values (close to zero)
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * 0.01
-
-    out = sinkhorn_knopp(logits, C=128, num_iters=20)
-
-    # Primary check: log domain should handle this gracefully - no numerical issues
-    assert not torch.isnan(out).any(), "Triton output contains NaN"
-    assert not torch.isinf(out).any(), "Triton output contains Inf"
-    # All values should be valid probabilities
-    assert torch.all(out >= 0.0), "Output has negative values"
-    assert torch.all(out <= 1.0), "Output has values > 1"
-    assert is_doubly_stochastic(
-        out.to(torch.float32), tol=0.2
-    ), "Triton output is not doubly stochastic for large inputs"
-
-
-@pytest.mark.parametrize("value_scale", [10.0, 20.0])
-def test_sk_log_domain_stability_large_values(value_scale):
-    """
-    Demonstrate that log domain (Triton) handles large values without overflow/underflow.
-
-    With very large input values (* 20), the matrices become extremely peaked
-    (close to permutation matrices with values like 1e-16). The key advantage
-    of log domain is numerical stability - no NaN/Inf even with extreme inputs.
-
-    Note: bf16 precision limits mean row/col sums may not be exactly 1 for
-    extremely peaked matrices, so we use a relaxed tolerance.
-    """
-    torch.cuda.empty_cache()
-
-    M, N = 16, 4
-
-    # Large values that stress exponential domain
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda") * value_scale
-
-    out_triton = sinkhorn_knopp(logits, C=128, num_iters=50)
-
-    # Primary check: log domain should handle this gracefully - no numerical issues
-    assert not torch.isnan(out_triton).any(), "Triton output contains NaN"
-    assert not torch.isinf(out_triton).any(), "Triton output contains Inf"
-    # All values should be valid probabilities
-    assert torch.all(out_triton >= 0.0), "Output has negative values"
-    assert torch.all(out_triton <= 1.0), "Output has values > 1"
-    assert is_doubly_stochastic(
-        out_triton.to(torch.float32), tol=0.2
-    ), "Triton output is not doubly stochastic for large inputs"
-
-
-def test_sk_preallocated_output():
-    """Test with pre-allocated output tensor."""
-    torch.cuda.empty_cache()
-
-    M, N = 16, 4
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
-    out = torch.empty(M, N, N, dtype=logits.dtype, device=logits.device)
-
-    result = sinkhorn_knopp(logits, C=128, num_iters=10, out=out)
-
-    assert result is out
-    assert is_doubly_stochastic(out.to(torch.float32), tol=1e-2)
-
-
-def test_sk_identity_initialization():
-    """Test that identity-like input produces identity-like output."""
-    torch.cuda.empty_cache()
-
-    M, N = 8, 4
-    # Create logits that favor diagonal (identity-like)
-    logits = torch.zeros(M, N, N, dtype=torch.bfloat16, device="cuda")
-    logits[:, range(N), range(N)] = 10.0  # Large diagonal values
-
-    out = sinkhorn_knopp(logits, C=128, num_iters=20)
-
-    # Output should be close to identity
-    identity = (
-        torch.eye(N, device="cuda", dtype=torch.float32).unsqueeze(0).expand(M, -1, -1)
-    )
-    torch.testing.assert_close(
-        out.to(torch.float32),
-        identity,
-        atol=0.1,
-        rtol=0.1,
-    )
-
-
-def test_sk_uniform_input():
-    """Test that uniform input produces uniform output (1/N everywhere)."""
-    torch.cuda.empty_cache()
-
-    M, N = 8, 4
-    # Uniform logits (all same value)
-    logits = torch.ones(M, N, N, dtype=torch.bfloat16, device="cuda")
-
-    out = sinkhorn_knopp(logits, C=128, num_iters=20)
-
-    # Output should be uniform: 1/N everywhere
-    expected = torch.full((M, N, N), 1.0 / N, device="cuda", dtype=torch.float32)
-    torch.testing.assert_close(
-        out.to(torch.float32),
-        expected,
-        atol=1e-2,
-        rtol=1e-2,
-    )
-
-
-def test_sk_convergence():
-    """Test that more iterations lead to better convergence."""
-    torch.cuda.empty_cache()
-
-    M, N = 16, 4
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
-
-    # Compute with different iteration counts
-    out_5 = sinkhorn_knopp(logits, C=128, num_iters=5).to(torch.float32)
-    out_20 = sinkhorn_knopp(logits, C=128, num_iters=20).to(torch.float32)
-
-    # Measure how close row/col sums are to 1
-    def sum_error(P):
-        row_err = (P.sum(dim=-1) - 1).abs().max()
-        col_err = (P.sum(dim=-2) - 1).abs().max()
-        return max(row_err.item(), col_err.item())
-
-    err_5 = sum_error(out_5)
-    err_20 = sum_error(out_20)
-
-    # More iterations should give better convergence
-    assert (
-        err_20 <= err_5
-    ), f"More iterations should improve convergence: {err_20} > {err_5}"
-
-
-def test_sk_output_range():
-    """Test that all output values are in valid range [0, 1]."""
-    torch.cuda.empty_cache()
-
-    M, N = 64, 4
-    logits = torch.randn(M, N, N, dtype=torch.bfloat16, device="cuda")
-
-    out = sinkhorn_knopp(logits, C=128, num_iters=10)
-
-    assert torch.all(out >= 0.0), "Output has negative values"
-    assert torch.all(out <= 1.0), "Output has values > 1"
 
 
 # =============================================================================

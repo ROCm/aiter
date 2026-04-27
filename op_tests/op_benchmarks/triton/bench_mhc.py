@@ -181,7 +181,7 @@ def run_benchmark(args):
         # = 2*M*n*C FLOPs (multiply-add for each (m, i, c))
         flops_apply_pre = 2.0 * M * n * C
 
-        # Eq 19: Sinkhorn-Knopp (separate kernel, log-domain implementation)
+        # Eq 19: Sinkhorn-Knopp
         # Each iteration: 2 normalizations (row + col) on M matrices of size (n, n)
         # Simplified: ~10*n² per iteration (accounting for expensive exp/log ops)
         flops_sinkhorn = 10.0 * M * n_squared * sinkhorn_iters
@@ -208,7 +208,7 @@ def run_benchmark(args):
 
         # Memory writes:
         # - post_mix: (M, n)
-        # - comb_mix logits / Sinkhorn output: (M, n_squared)
+        # - comb_mix doubly-stochastic Sinkhorn output: (M, n_squared)
         # - layer_input: (M, C) - replaces the old H^pre write
         mem_write = (
             M * n * elem_size  # post_mix
@@ -216,9 +216,6 @@ def run_benchmark(args):
             + M * C * elem_size  # layer_input
         )
 
-        mem_sinkhorn = 2 * M * n_squared * elem_size * sinkhorn_iters
-        mem_read += mem_sinkhorn / 2
-        mem_write += mem_sinkhorn / 2
         total_mem = mem_read + mem_write
 
         def triton_fn():

@@ -13,7 +13,6 @@ This module provides reference implementations for validating Triton kernels:
 Also provides test input generation utilities:
 - generate_mhc_inputs: Generate test inputs for mHC mapping
 - get_test_shapes: Test shape configurations for mHC
-- get_sk_test_shapes: Test shape configurations for Sinkhorn-Knopp
 
 Notation (from mHC paper arXiv:2512.24880v2):
     - M: Batch/sequence dimension
@@ -32,7 +31,6 @@ __all__ = [
     "is_doubly_stochastic",
     "generate_mhc_inputs",
     "get_test_shapes",
-    "get_sk_test_shapes",
 ]
 
 # =============================================================================
@@ -87,8 +85,8 @@ def mhc_torch(
             additive eps; the eps only affects ``layer_input``.
         sinkhorn_iters: number of Sinkhorn-Knopp iterations for H^res (Eq 19)
         return_with_sinkhorn: if True, apply Sinkhorn-Knopp to H_res; else
-            return raw H^res logits as ``hres`` (matches ``fused_mhc()`` which
-            omits Eq 19).
+            return raw H^res logits as ``hres`` (matches ``mhc(..., sinkhorn_iters=0)``
+            which skips Eq 19).
 
     Returns:
         Tuple ``(hpost, hres, hpre, layer_input)`` all in fp32:
@@ -329,19 +327,3 @@ def get_test_shapes():
     return shapes
 
 
-def get_sk_test_shapes():
-    """
-    Generate test shape configurations for Sinkhorn-Knopp.
-
-    Returns list of (M, N) tuples where:
-        M: batch size (number of matrices)
-        N: matrix size (must be power of 2, max 64)
-    """
-    shapes = []
-
-    # Various batch sizes with typical matrix sizes
-    for M in [1, 4, 16, 64, 256]:
-        for N in [2, 4, 8, 16, 32]:
-            shapes.append((M, N))
-
-    return shapes

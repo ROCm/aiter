@@ -25,6 +25,7 @@ def _mhc_fused_kernel(
     C: tl.constexpr,
     eps: tl.constexpr,
     hc_pre_eps,
+    hc_post_mult_value,
     stride_xm,
     stride_xk,
     stride_phi_k,  # Stride for K dimension
@@ -38,20 +39,25 @@ def _mhc_fused_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_C: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
+    NUM_SINKHORN_ITERS: tl.constexpr,
 ):
     """
-    Fused kernel for mHC equations 14-18 plus the layer_input apply step.
+    Fused kernel for mHC equations 14-19 plus the layer_input apply step.
 
     Computes three separate outputs:
-    - H^pre: (M, n) with sigmoid activation (Eq 17)
-    - H^post: (M, n) with 2*sigmoid activation (Eq 18)
-    - H^res: (M, n²) raw logits (identity activation, for Sinkhorn-Knopp post-processing)
+    - H^pre: (M, n) with sigmoid activation (Eq 17), consumed in registers
+    - H^post: (M, n) with hc_post_mult_value * sigmoid activation (Eq 18)
+    - H^res: (M, n, n) doubly-stochastic Sinkhorn-Knopp output when
+      NUM_SINKHORN_ITERS > 0 (Eq 19), or raw logits when 0.
 
     Pre-stream programs compute `pre_mix = sigmoid(H_pre) + hc_pre_eps` and apply
     it to `x` to produce `layer_input[m, c] = sum_i pre_mix[m, i] * x[m, i*C + c]`.
 
     Post and res streams write to a unified `(M, n + n_squared)` tensor following 
-    `[post | res]`. phi/bias indexing follows `[pre | post | res]` layout
+    `[post | res]`. phi/bias indexing follows `[pre | post | res]` layout. When
+    NUM_SINKHORN_ITERS > 0, the res branch reshapes its `(BLOCK_M, BLOCK_N)`
+    tile to `(BLOCK_M, n, n)` and runs log-domain Sinkhorn-Knopp inline before
+    the store; this requires `BLOCK_N == n_squared` (enforced by the wrapper).
 
     Grid structure:
     - The grid is organized per-stream so each program processes exactly one stream
@@ -154,12 +160,47 @@ def _mhc_fused_kernel(
                 mask=(rm[:, None] < M) & (rc[None, :] < C),
             )
     else:
-        # Post / Res: activate and write output (layout [post | res]).
-        is_post_f32 = is_post_program.to(tl.float32)
-        out_activated = tl.where(
-            is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out
-        )
-        out_col_start = tl.where(is_post_program, 0, n)
+        # Post or Res branch.
+        if is_post_program:
+            out_activated = tl.sigmoid(out) * hc_post_mult_value
+            out_col_start = 0
+        else:
+            # Res branch: log-domain Sinkhorn-Knopp on (BLOCK_M, n, n) sub-tile,
+            # or raw logits when NUM_SINKHORN_ITERS == 0. Requires BLOCK_N == n_squared.
+            if NUM_SINKHORN_ITERS > 0:
+                LOG2_E: tl.constexpr = 1.4426950408889634
+                LN_2: tl.constexpr = 0.6931471805599453
+
+                log_A = tl.reshape(out, (BLOCK_M, n, n))
+
+                log_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+                log_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+
+                for _ in range(NUM_SINKHORN_ITERS):
+                    scaled_row = log_A + log_v[:, None, :]
+                    row_max = tl.max(scaled_row, axis=2)
+                    exp_shifted = tl.exp2(
+                        (scaled_row - row_max[:, :, None]) * LOG2_E
+                    )
+                    row_sum_exp = tl.sum(exp_shifted, axis=2)
+                    log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
+                    log_u = -log_row_sums
+
+                    scaled_col = log_A + log_u[:, :, None]
+                    col_max = tl.max(scaled_col, axis=1)
+                    exp_shifted = tl.exp2(
+                        (scaled_col - col_max[:, None, :]) * LOG2_E
+                    )
+                    col_sum_exp = tl.sum(exp_shifted, axis=1)
+                    log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
+                    log_v = -log_col_sums
+
+                log_P = log_A + log_u[:, :, None] + log_v[:, None, :]
+                P = tl.exp2(log_P * LOG2_E)
+                out_activated = tl.reshape(P, (BLOCK_M, n_squared))
+            else:
+                out_activated = out
+            out_col_start = n
         out_col_offset = out_col_start + rn_local
         tl.store(
             out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
@@ -319,6 +360,7 @@ def _mhc_fused_reduce_kernel(
     C: tl.constexpr,
     eps: tl.constexpr,
     hc_pre_eps,
+    hc_post_mult_value,
     stride_acc_k,  # Stride for NUM_KSPLIT dimension
     stride_acc_m,  # Stride for M dimension
     stride_acc_n,  # Stride for N dimension (total_cols)
@@ -335,6 +377,7 @@ def _mhc_fused_reduce_kernel(
     BLOCK_C: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     ACTUAL_KSPLIT: tl.constexpr,
+    NUM_SINKHORN_ITERS: tl.constexpr,
 ):
     """
     Reduce kernel for mHC - combines split-K partials and applies the post-block.
@@ -344,11 +387,15 @@ def _mhc_fused_reduce_kernel(
     K-splits, then applies:
     - RMS normalization (Eq 15)
     - Bias + alpha scaling (Eq 16)
-    - Stream-specific activations (Eq 17-18)
+    - Stream-specific activations (Eq 17-18) using hc_post_mult_value for post
     - For pre: the layer_input apply step (sum_i pre_mix_i * x), matching HIP's
       `mhc_pre_big_fuse`. H^pre is consumed in registers and is never written
-      to global. The final `out` tensor is shrunk to `(M, n + n_squared)` with
-      layout `[post | res]`.
+      to global.
+    - For res: optional inline log-domain Sinkhorn-Knopp (Eq 19) when
+      NUM_SINKHORN_ITERS > 0. Requires `BLOCK_N == n_squared`.
+
+    The final `out` tensor is shrunk to `(M, n + n_squared)` with layout
+    `[post | res]`.
 
     Grid structure: (M_blocks, N_blocks_total).
     """
@@ -442,88 +489,50 @@ def _mhc_fused_reduce_kernel(
                 mask=(rm[:, None] < M) & (rc[None, :] < C),
             )
     else:
-        # Post / Res: activate and write to the shrunk out (layout [post | res]).
-        is_post_f32 = is_post_program.to(tl.float32)
-        out_activated = tl.where(
-            is_post_program, tl.sigmoid(out) * (1.0 + is_post_f32), out
-        )
-        out_col_start = tl.where(is_post_program, 0, n)
+        # Post or Res branch.
+        if is_post_program:
+            out_activated = tl.sigmoid(out) * hc_post_mult_value
+            out_col_start = 0
+        else:
+            # Res branch: log-domain Sinkhorn-Knopp on (BLOCK_M, n, n) sub-tile,
+            # or raw logits when NUM_SINKHORN_ITERS == 0. Requires BLOCK_N == n_squared.
+            if NUM_SINKHORN_ITERS > 0:
+                LOG2_E: tl.constexpr = 1.4426950408889634
+                LN_2: tl.constexpr = 0.6931471805599453
+
+                log_A = tl.reshape(out, (BLOCK_M, n, n))
+
+                log_u = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+                log_v = tl.zeros((BLOCK_M, n), dtype=tl.float32)
+
+                for _ in range(NUM_SINKHORN_ITERS):
+                    scaled_row = log_A + log_v[:, None, :]
+                    row_max = tl.max(scaled_row, axis=2)
+                    exp_shifted = tl.exp2(
+                        (scaled_row - row_max[:, :, None]) * LOG2_E
+                    )
+                    row_sum_exp = tl.sum(exp_shifted, axis=2)
+                    log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
+                    log_u = -log_row_sums
+
+                    scaled_col = log_A + log_u[:, :, None]
+                    col_max = tl.max(scaled_col, axis=1)
+                    exp_shifted = tl.exp2(
+                        (scaled_col - col_max[:, None, :]) * LOG2_E
+                    )
+                    col_sum_exp = tl.sum(exp_shifted, axis=1)
+                    log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
+                    log_v = -log_col_sums
+
+                log_P = log_A + log_u[:, :, None] + log_v[:, None, :]
+                P = tl.exp2(log_P * LOG2_E)
+                out_activated = tl.reshape(P, (BLOCK_M, n_squared))
+            else:
+                out_activated = out
+            out_col_start = n
         out_col_offset = out_col_start + rn_local
         tl.store(
             out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
             out_activated,
             mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
         )
-
-
-@triton.jit
-def _sinkhorn_knopp_log_domain_kernel(
-    logits_ptr,
-    out_ptr,
-    M,
-    stride_batch,
-    stride_row,
-    stride_col,
-    N: tl.constexpr,
-    NUM_ITERS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-):
-    """Log-domain Sinkhorn-Knopp kernel for projecting raw logits onto doubly stochastic matrices."""
-    pid_m = tl.program_id(axis=0)
-    batch_start = pid_m * BLOCK_M
-
-    LOG2_E: tl.constexpr = 1.4426950408889634
-    LN_2: tl.constexpr = 0.6931471805599453
-
-    row_idx = tl.arange(0, N)[:, None]
-    col_idx = tl.arange(0, N)[None, :]
-    flat_idx = row_idx * stride_row + col_idx * stride_col
-
-    # Loop over batch elements in this block
-    for batch_local in range(BLOCK_M):
-        batch_idx = batch_start + batch_local
-        if batch_idx < M:
-            # Base offset for this batch
-            batch_offset = batch_idx * stride_batch
-
-            # Load the NxN matrix (raw logits) in log domain
-            log_A = tl.load(logits_ptr + batch_offset + flat_idx).to(tl.float32)
-
-            # Initialize log scaling factors
-            # Initially u = v = 1 (no scaling), so log(1) = 0,
-            log_u = tl.zeros((N,), dtype=tl.float32)  # Row scalings
-            log_v = tl.zeros((N,), dtype=tl.float32)  # Column scalings
-
-            # Iterate and alternate between row and column normalization.
-            for _ in range(NUM_ITERS):
-                # Add column scaling: scaled[i,j] = log_A[i,j] + log_v[j]
-                scaled_row = log_A + log_v[None, :]  # (N, N)
-
-                row_max = tl.max(scaled_row, axis=1)  # (N,)
-
-                # Compute logsumexp per row
-                exp_shifted = tl.exp2((scaled_row - row_max[:, None]) * LOG2_E)
-                row_sum_exp = tl.sum(exp_shifted, axis=1)  # (N,)
-                log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2  # (N,)
-
-                # Update row scaling: log_u = -log(row_sum) to normalize rows to 1
-                log_u = -log_row_sums
-
-                # Add row scaling: scaled[i,j] = log_A[i,j] + log_u[i]
-                scaled_col = log_A + log_u[:, None]  # (N, N)
-
-                col_max = tl.max(scaled_col, axis=0)  # (N,)
-
-                # Compute logsumexp per column
-                exp_shifted = tl.exp2((scaled_col - col_max[None, :]) * LOG2_E)
-                col_sum_exp = tl.sum(exp_shifted, axis=0)  # (N,)
-                log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2  # (N,)
-
-                # Update column scaling: log_v = -log(col_sum) to normalize cols to 1
-                log_v = -log_col_sums
-
-            # Combine base logits with accumulated scaling factors:
-            log_P = log_A + log_u[:, None] + log_v[None, :]
-            P = tl.exp2(log_P * LOG2_E)
-
-            tl.store(out_ptr + batch_offset + flat_idx, P.to(out_ptr.dtype.element_ty))
