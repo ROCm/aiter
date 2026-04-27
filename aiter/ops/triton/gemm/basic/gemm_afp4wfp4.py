@@ -406,17 +406,6 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     return y
 
-
-def _unshuffle_scale(s, pf=32):
-    r, c = s.shape
-    rows = r * pf
-    cols = c // pf
-    kw = 4 if cols >= 4 else cols
-    return (s.reshape(r, cols // kw, pf // 4, 4, kw)
-             .permute(0, 3, 2, 1, 4).contiguous()
-             .reshape(rows, cols))
-
-
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
