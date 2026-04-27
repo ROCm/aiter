@@ -8,7 +8,10 @@ import glob
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
+import time
 
 import torch
 import triton
@@ -34,7 +37,6 @@ from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
 
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
-    print_vgpr,
 )
 from op_tests.triton_tests.attention.test_fav3_sage import (
     check_attention_outputs,
@@ -1225,9 +1227,68 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def print_vgpr_from_bench(runner: Any) -> None:
+    """Run benchmark with Triton dumps enabled and print kernel VGPR metadata.
+
+    This avoids relying on benchmark_utils table parsing, which can fail when
+    Triton does not emit the expected result table format.
+    """
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False) as temp_file:
+        output_file = temp_file.name
+
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    env_keys = ["AMDGCN_ENABLE_DUMP", "TRITON_ALWAYS_COMPILE", "TRITON_PRINT_AUTOTUNING"]
+    old_env = {k: os.environ.get(k) for k in env_keys}
+
+    try:
+        with open(output_file, "w+") as temp_file:
+            sys.stdout = temp_file
+            sys.stderr = temp_file
+
+            os.environ["AMDGCN_ENABLE_DUMP"] = "1"
+            os.environ["TRITON_ALWAYS_COMPILE"] = "1"
+            os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+            runner()
+
+            sys.stdout.flush()
+            sys.stderr.flush()
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        for k in env_keys:
+            if old_env[k] is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old_env[k]
+
+    time.sleep(0.2)
+
+    try:
+        with open(output_file, "r") as f:
+            lines = f.readlines()
+    finally:
+        os.unlink(output_file)
+
+    vgpr_info: List[str] = []
+    for line in lines:
+        if re.search(r"Autotuning kernel", line):
+            vgpr_info.append(line.strip())
+        if re.search(r"Triton autotuning for function", line):
+            vgpr_info.append(line.strip())
+        if re.search(r"\.name:", line):
+            vgpr_info.append(line.strip())
+        if re.search(r"\.vgpr_count:", line) or re.search(r"\.vgpr_spill_count:", line):
+            vgpr_info.append(line.strip())
+
+    if vgpr_info:
+        print("\n".join(vgpr_info))
+    else:
+        print("No VGPR metadata found in Triton dump output.")
+
+
 def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:
     if args.print_vgpr:
-        print_vgpr(runner, get_caller_name_no_ext())
+        print_vgpr_from_bench(runner)
     else:
         runner()
     return 0
