@@ -29,11 +29,11 @@ def _gluon_rms_norm_kernel(
         [0],  # order
     )
 
-    # block size for columns
-    col_offsets = gl.arange(0, BLOCK_SIZE, layout=col_layout)
-
     # create a swizzled shared layout for the input
     sharedLayoutInput: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+
+    # create a swizzled shared layout for the output
+    sharedLayoutOutput: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
 
     # create a swizzled shared layout for the weights
     sharedLayoutWeights: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
@@ -59,9 +59,21 @@ def _gluon_rms_norm_kernel(
         sharedLayoutWeights,  # layout of tensor
     )
 
+    # tensor descriptor for output
+    output_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        output_ptr,  # base pointer of tensor
+        [n_rows, n_cols],  # shape of tensor
+        [output_row_stride, 1],  # strides of tensor
+        [1, BLOCK_SIZE],  # block shape of tensor
+        sharedLayoutOutput,  # layout of tensor
+    )
+
     nStages: gl.constexpr = 2
     smemInput = gl.allocate_shared_memory(
         input_ptr.dtype.element_ty, [nStages, 1, BLOCK_SIZE], sharedLayoutInput
+    )
+    smemOutput = gl.allocate_shared_memory(
+        output_ptr.dtype.element_ty, [nStages, 1, BLOCK_SIZE], sharedLayoutOutput
     )
 
     if USE_BLOCK:
@@ -69,18 +81,15 @@ def _gluon_rms_norm_kernel(
         smemWeights = gl.allocate_shared_memory(
             weights_ptr.dtype.element_ty, [nStages, BLOCK_SIZE], sharedLayoutWeights
         )
+
         # one time creation for handling the last block if n_cols is not a multiple of BLOCK_SIZE
         n_col_blk = gl.cdiv(n_cols, BLOCK_SIZE) - 1
         last_col_idx = n_col_blk * BLOCK_SIZE
-        mask = col_offsets < (n_cols - last_col_idx)
 
         # Loop through the rows of the input tensor by NUM_PROG blocks
         for row_idx in range(row_start, n_rows, NUM_PROG):
-            input_ptr + (row_idx * input_row_stride)
-            output_base = output_ptr + (row_idx * output_row_stride)
             # sum_sq store
             sum_sq = 0.0
-
             # preload the inputs and weights
             gl.amd.gfx1250.tdm.async_load(input_desc, [row_idx, 0], smemInput.index(0))
             gl.amd.gfx1250.tdm.async_load(weights_desc, [0], smemWeights.index(0))
@@ -130,7 +139,6 @@ def _gluon_rms_norm_kernel(
             for blk_idx in range(0, n_col_blk - 1):
                 preload_idx = blk_idx % 2
                 load_idx = 1 - preload_idx
-                cols = blk_idx * BLOCK_SIZE + col_offsets
                 # load input_ptr, compute square of input, store in sum_sq
                 gl.amd.gfx1250.tdm.async_load(
                     input_desc,
@@ -147,7 +155,14 @@ def _gluon_rms_norm_kernel(
                 a = smemInput_1d.load(col_layout).to(gl.float32)
                 weights = smemWeights.index(preload_idx).load(col_layout).to(gl.float32)
                 rms_norm = a * weights * norm_factor
-                gl.store(output_base + cols, rms_norm.to(output_ptr.dtype.element_ty))
+                # store rms_norm than use async_store
+                smemOutput1d = smemOutput.index(preload_idx).reshape([BLOCK_SIZE])
+                smemOutput1d.store(rms_norm.to(output_ptr.dtype.element_ty))
+                gl.amd.gfx1250.tdm.async_store(
+                    output_desc,
+                    [row_idx, blk_idx * BLOCK_SIZE],
+                    smemOutput.index(preload_idx),
+                )
 
             # handle the last block if n_cols is not a multiple of BLOCK_SIZE
             last_block_idx = (n_col_blk - 1) % 2
@@ -156,9 +171,13 @@ def _gluon_rms_norm_kernel(
             a = smemInput_1d.load(col_layout).to(gl.float32)
             weights = smemWeights.index(last_block_idx).load(col_layout).to(gl.float32)
             rms_norm = a * weights * norm_factor
-            cols_last_block = (n_col_blk - 1) * BLOCK_SIZE + col_offsets
-            gl.store(
-                output_base + cols_last_block, rms_norm.to(output_ptr.dtype.element_ty)
+            # store rms_norm then use async_store
+            smemOutput1d = smemOutput.index(last_block_idx).reshape([BLOCK_SIZE])
+            smemOutput1d.store(rms_norm.to(output_ptr.dtype.element_ty))
+            gl.amd.gfx1250.tdm.async_store(
+                output_desc,
+                [row_idx, (n_col_blk - 1) * BLOCK_SIZE],
+                smemOutput.index(last_block_idx),
             )
 
             # handle the last condition of the second stage software pipeline
@@ -174,11 +193,12 @@ def _gluon_rms_norm_kernel(
             a = smemInput_1d.load(col_layout).to(gl.float32)
             weights = smemWeights.index(last_idx).load(col_layout).to(gl.float32)
             rms_norm = a * weights * norm_factor
-            gl.store(
-                output_base + last_col_idx + col_offsets,
-                rms_norm.to(output_ptr.dtype.element_ty),
-                mask=mask,
+            smemOutput1d = smemOutput.index(last_idx).reshape([BLOCK_SIZE])
+            smemOutput1d.store(rms_norm.to(output_ptr.dtype.element_ty))
+            gl.amd.gfx1250.tdm.async_store(
+                output_desc, [row_idx, last_col_idx], smemOutput.index(last_idx)
             )
+            gl.amd.gfx1250.tdm.async_wait(0)
             gl.store(rsigma_ptr + row_idx, norm_factor.to(rsigma_ptr.dtype.element_ty))
 
     else:  # no blocking
@@ -190,12 +210,10 @@ def _gluon_rms_norm_kernel(
         gl.amd.gfx1250.tdm.async_wait(0)
         gl.amd.gfx1250.tdm.async_load(input_desc, [row_start, 0], smemInput.index(0))
 
-        mask = col_offsets < n_cols
         for row_idx in range(row_start, n_rows, NUM_PROG):
             # determine the current and next stage
             current_stage = ((row_idx - row_start) // NUM_PROG) % 2
             next_stage = 1 - current_stage
-            output_base = output_ptr + (row_idx * output_row_stride)
             ##acquire next incoming row
             gl.amd.gfx1250.tdm.async_load(
                 input_desc, [row_idx + NUM_PROG, 0], smemInput.index(next_stage)
@@ -218,8 +236,9 @@ def _gluon_rms_norm_kernel(
             gl.store(
                 rsigma_ptr + row_start, norm_factor.to(rsigma_ptr.dtype.element_ty)
             )
-            gl.store(
-                output_base + col_offsets,
-                rms_norm.to(output_ptr.dtype.element_ty),
-                mask=mask,
+            smemOutput1d = smemOutput.index(current_stage).reshape([BLOCK_SIZE])
+            smemOutput1d.store(rms_norm.to(output_ptr.dtype.element_ty))
+            gl.amd.gfx1250.tdm.async_store(
+                output_desc, [row_idx, 0], smemOutput.index(current_stage)
             )
+            gl.amd.gfx1250.tdm.async_wait(0)

@@ -13,8 +13,8 @@ from aiter.ops.triton.normalization.rmsnorm import (
     rmsnorm2d_fwd_with_dynamicquant,
     rmsnorm2d_fwd_with_add_smoothquant,
     rmsnorm2d_fwd_with_add_dynamicquant,
+    gluon_rms_norm_kernel,
 )
-from aiter.ops.triton.gluon.rmsnorm import gluon_rms_norm_kernel
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
