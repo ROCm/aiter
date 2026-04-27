@@ -345,24 +345,51 @@ A8W8_blockscale_gemm1_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        if (block_m == 16)
+        if (inter_dim % 128 != 0 && inter_dim % 64 == 0)
         {{
-            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-        }}
-        else if (block_m == 32)
-        {{
-            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-        }}
-        else if (block_m == 64)
-        {{
-            return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            // NPerBlock=64: inter_dim is 64-aligned but not 128-aligned (e.g. tp=4 inter_dim=320)
+            // scale index block_n_id*64/128 (integer div) maps pairs of tiles to one per_1x128 scale
+            if (block_m == 16)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 64, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 32)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 64)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 64, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else
+            {{
+                TORCH_CHECK(
+                    false,
+                    "Unsupported block_m value for NPerBlock=64 blockscale dispatch: ",
+                    block_m);
+            }}
         }}
         else
         {{
-            TORCH_CHECK(
-                false,
-                "Unsupported block_m value for moe heuristic dispatch: ",
-                block_m);
+            if (block_m == 16)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 32)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 64)
+            {{
+                return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else
+            {{
+                TORCH_CHECK(
+                    false,
+                    "Unsupported block_m value for moe heuristic dispatch: ",
+                    block_m);
+            }}
         }}
     }}
 """
@@ -744,27 +771,57 @@ A8W8_blockscale_gemm2_heuristic_dispatch = """
         && {MulRoutedWeight} == mul_routed_weight_stage
         && {Quant} == quant)
     {{
-        if (block_m == 16)
+        if (inter_dim % 128 != 0 && inter_dim % 64 == 0)
         {{
-            if (inter_dim % 256 == 0)
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            // KPerBlock=64: inter_dim is 64-aligned but not 128-aligned (e.g. tp=4 inter_dim=320)
+            // K=inter_dim, uses same per_1x128 scale via k_block_id*64/128 integer division
+            if (block_m == 16)
+            {{
+                if (inter_dim % 256 == 0)
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                else
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 32)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 64)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 64, 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
             else
-                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 128, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-        }}
-        else if (block_m == 32)
-        {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
-        }}
-        else if (block_m == 64)
-        {{
-            return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            {{
+                TORCH_CHECK(
+                    false,
+                    "Unsupported block_m value for KPerBlock=64 blockscale dispatch: ",
+                    block_m);
+            }}
         }}
         else
         {{
-            TORCH_CHECK(
-                false,
-                "Unsupported block_m value for moe heuristic dispatch: ",
-                block_m);
+            if (block_m == 16)
+            {{
+                if (inter_dim % 256 == 0)
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 16, 128, 256/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+                else
+                    return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 128, 16, 128, 128/sizeof({A0DataType}), 1, 2, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 32)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else if (block_m == 64)
+            {{
+                return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}>;
+            }}
+            else
+            {{
+                TORCH_CHECK(
+                    false,
+                    "Unsupported block_m value for moe heuristic dispatch: ",
+                    block_m);
+            }}
         }}
     }}
 """
