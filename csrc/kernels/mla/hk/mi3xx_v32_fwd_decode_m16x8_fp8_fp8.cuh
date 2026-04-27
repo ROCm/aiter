@@ -512,13 +512,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     constexpr uint32_t kColOffset2     = kColOffset0 + kColOffsetDelta * 2;
                     constexpr uint32_t kColOffset3     = kColOffset0 + kColOffsetDelta * 3;
 
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset0, k_kv_0_begin>(
+                    vt_manager.template load_transposed_v_to_gpr<0, kColOffset0, k_kv_0_begin>(
                         p_lds_vt);
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset1, k_kv_0_begin + 2>(
+                    vt_manager.template load_transposed_v_to_gpr<0, kColOffset1, k_kv_0_begin + 2>(
                         p_lds_vt);
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset2, k_kv_1_begin>(
+                    vt_manager.template load_transposed_v_to_gpr<0, kColOffset2, k_kv_1_begin>(
                         p_lds_vt);
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset3, k_kv_1_begin + 2>(
+                    vt_manager.template load_transposed_v_to_gpr<0, kColOffset3, k_kv_1_begin + 2>(
                         p_lds_vt);
 
                     asm volatile("s_waitcnt lgkmcnt(4)");

@@ -963,28 +963,33 @@ class KvManagerV2
         static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
                       "load_k_to_gpr(): Unsupported column offset!");
 
-        // const uint32_t lane_idx = opus::lane_id();
-        // const uint32_t row = kRowOffset + lane_idx % kMfmaRows;
-        // const uint32_t row_phy = ((row % 16) / 2) * 4 + 2 * (row / 16) + (row % 2);
-        // const uint32_t col = kColOffset + lane_idx / kMfmaRows * kMfmaElemPerThr;
-        // const uintptr_t p_lds_kv_lane =
-        //     p_lds_kv +
-        //     (row_phy / 4) * kNumBytesPerSubBlock +
-        //     row_phy * kNumBytesPerRow +
-        //     col / kNumCols * kNumBytesPerBlock +
-        //     (col % kNumCols) * sizeof(kv_t);
-        // constexpr uint32_t kFixedOffset = 0;
-
-        const uint32_t lane_idx       = opus::lane_id();
-        const uint32_t row            = lane_idx % kMfmaRows;      // row < 16
-        const uint32_t row_phy        = (row / 2) * 4 + (row % 2); // row_phy < 32
-        const uint32_t col            = lane_idx / kMfmaRows * kMfmaElemPerThr;
-        const uintptr_t p_lds_kv_lane = p_lds_kv + (row_phy / 4) * kNumBytesPerSubBlock +
-                                        (row_phy % 4) * kNumBytesPerRow +
-                                        (col % kNumCols) * sizeof(kv_t);
-        constexpr uint32_t kFixedOffset = (kRowOffset / 16) * 2 * kNumBytesPerRow +
-                                          (kColOffset % kNumCols) * sizeof(kv_t) +
-                                          (kColOffset / kNumCols) * kNumBytesPerBlock;
+        // Canonical address (matches load_v_to_gpr() / store layout):
+        //   row     = kRowOffset + lane_idx % kMfmaRows;             // ? [kRowOffset, kRowOffset+16)
+        //   row_phy = ((row % 16) / 2) * 4 + 2 * (row / 16) + (row % 2);
+        //   col     = kColOffset + (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        //   p_lds_kv_lane = p_lds_kv +
+        //       (row_phy / 4)         * kNumBytesPerSubBlock +
+        //       (row_phy % 4)         * kNumBytesPerRow +
+        //        col / kNumCols       * kNumBytesPerBlock +
+        //       (col % kNumCols)      * sizeof(kv_t);
+        //
+        // Per-lane simplifications (lane row ? [0,16), lane col ? {0,8,16,24}):
+        //   row/16 == 0          => row_phy = (row/2)*4 + (row%2)
+        //                        => row_phy/4 == row/2, row_phy%4 == row%2
+        //   col < 32 < kNumCols  => col/kNumCols == 0, col%kNumCols == col
+        // kRowOffset/kColOffset terms are constexpr-folded into kFixedOffset.
+        // kRowOffset==16 shifts row_phy by +2 (always lands in row_phy%4),
+        // contributing +(kRowOffset/16) * 2 * kNumBytesPerRow.
+        const uint32_t lane_idx = opus::lane_id();
+        const uint32_t row      = lane_idx % kMfmaRows;
+        const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uintptr_t p_lds_kv_lane = p_lds_kv + (row / 2) * kNumBytesPerSubBlock +
+                                        (row % 2) * kNumBytesPerRow +
+                                        col * sizeof(kv_t);
+        constexpr uint32_t kFixedOffset =
+            (kRowOffset / 16) * 2 * kNumBytesPerRow +
+            (kColOffset / kNumCols) * kNumBytesPerBlock +
+            (kColOffset % kNumCols) * sizeof(kv_t);
 
         using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
         static_assert(range_type::lo + 1 == range_type::hi,
@@ -1033,11 +1038,12 @@ class KvManagerV3
     static constexpr uint32_t kNumBlocks       = T::kQkHeadDim / kNumCols; // 576/64=9
     static constexpr uint32_t kNumPaddingDw    = 2;
     static constexpr uint32_t kNumBytesPerSubBlock =
-        opus::get_warp_size() * 4 * sizeof(kv_t) +
-        kNumPaddingDw * sizeof(uint32_t);                   // 64*4*1+2*4=256+8=264
-    static constexpr uint32_t kNumSubBlocks = T::kNumWarps; // 8
+        kNumSubBlockRows * kNumSubBlockCols * sizeof(kv_t); // 4*32*1=128
+    static constexpr uint32_t kNumBytesPer2SubBlocksWithPadding =
+        kNumBytesPerSubBlock * 2 + kNumPaddingDw * sizeof(uint32_t); // 128*2+2*4=256+8=264
+    static constexpr uint32_t kNum2SubBlocks = T::kNumWarps; // 8
     static constexpr uint32_t kNumBytesPerBlock =
-        kNumBytesPerSubBlock * kNumSubBlocks;                               // 264*8=2112
+        kNumBytesPer2SubBlocksWithPadding * kNum2SubBlocks;                 // 264*8=2112
     static constexpr uint32_t kNumRowsPerWarp = kNumSubBlockRows * 2;       // 8
     static constexpr uint32_t kNumWarpsPerCol = kNumRows / kNumRowsPerWarp; // 32 / 8 = 4
     static constexpr uint32_t kNumBytesPerThrPerRnd =
@@ -1046,6 +1052,38 @@ class KvManagerV3
         kNumSubBlockCols / kNumBytesPerThrPerRnd; // 32 / 4 = 8
 
     static_assert(T::kQkHeadDim % kNumCols == 0, "kQkHeadDim must be divisible by kNumCols!");
+
+    // Per-lane LDS byte offset within a 32-row x 32-col sub-tile of one warp's V/K block.
+    // Shared by load_k_to_gpr() and load_transposed_v_to_gpr(): both walk a 16x32 tile,
+    // and per-lane (row, col) lands in the same place -- only the rule that maps lane_idx
+    // to (row, col) differs (mfma A-tile layout vs ds_read_b64_tr_b8 input footprint).
+    //
+    // Preconditions (caller must guarantee):
+    //   row ? [0, 16)         -- local row inside the 16-row tile.
+    //   col ? {0, 8, 16, 24}  -- local col inside the 32-col sub-block.
+    // With those, the canonical formula
+    //   (row_phy/8)*264 + (row_phy%8)*32 + col/64*2112 + (col%64)/32*1056 + (col%64)%32
+    // collapses to the two terms below (see load_*_to_gpr() comments for the derivation).
+    __device__ __forceinline__ static uint32_t get_block_lane_offset(const uint32_t row,
+                                                                     const uint32_t col)
+    {
+        return (row / 4) * kNumBytesPer2SubBlocksWithPadding +
+               ((row % 4) * kNumSubBlockCols + col) * sizeof(kv_t);
+    }
+
+    // Constexpr ds_read immediate-offset that selects the (kRowOffset, kColOffset)
+    // sub-tile within the warp's V/K block.
+    //   kRowOffset ? {0, 16}                          -- top or bottom 16 rows of the 32-row block.
+    //   kColOffset is a multiple of 32, < kQkHeadDim -- picks the 32-col strip.
+    // Note: kColOffset is a multiple of 32 (asserted by callers), so the canonical
+    // (kColOffset/64)*2112 + ((kColOffset%64)/32)*1056 collapses to (kColOffset/32)*1056
+    // because 2 * 1056 == 2112.
+    template <uint32_t kRowOffset, uint32_t kColOffset>
+    static constexpr uint32_t get_block_fixed_offset()
+    {
+        return (kRowOffset / 16) * kNumBytesPerSubBlock +
+               (kColOffset / 32) * 4 * kNumBytesPer2SubBlocksWithPadding;
+    }
 
     public:
     // There are 576 / 64 = 9 blocks. Each block contains 32x64 elements.
@@ -1083,7 +1121,7 @@ class KvManagerV3
     __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
                                                                        const uintptr_t p_lds_kv)
     {
-        return p_lds_kv + warp_idx * kNumBytesPerSubBlock;
+        return p_lds_kv + warp_idx * kNumBytesPer2SubBlocksWithPadding;
     }
 
     // Load 32x64 elements from VRAM to LDS
@@ -1202,33 +1240,15 @@ class KvManagerV3
         static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
                       "load_k_to_gpr(): Unsupported column offset!");
 
-        // const uint32_t lane_idx = opus::get_lane_id();
-        // const uint32_t row = kRowOffset + lane_idx % kMfmaRows;
-        // const uint32_t row_phy = (row % 4) + (row / 16) * 4 + (row % 16 / 4) * 8;
-        // const uint32_t col = kColOffset + (lane_idx / kMfmaRows) * kMfmaElemPerThr;
-        // const uintptr_t p_lds_kv_lane = p_lds_kv +
-        //     (row_phy / 8) * kNumBytesPerSubBlock +
-        //     (row_phy % 8) * kNumSubBlockCols * sizeof(kv_t) +
-        //     col / kNumCols * kNumBytesPerBlock +
-        //     (col % kNumCols) / 32 * (4 * kNumBytesPerSubBlock) +
-        //     ((col % kNumCols) % 32) * sizeof(kv_t);
-        // constexpr uint32_t kFixedOffset = 0;
-
-        const uint32_t lane_idx       = opus::lane_id();
-        const uint32_t row            = lane_idx % kMfmaRows;
-        const uint32_t row_phy        = (row % 4) + (row / 16) * 4 + (row % 16 / 4) * 8;
-        const uint32_t col            = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
-        const uintptr_t p_lds_kv_lane = p_lds_kv + (row_phy / 8) * kNumBytesPerSubBlock +
-                                        (row_phy % 8) * kNumSubBlockCols * sizeof(kv_t) +
-                                        col / kNumCols * kNumBytesPerBlock +
-                                        (col % kNumCols) / 32 * (4 * kNumBytesPerSubBlock) +
-                                        ((col % kNumCols) % 32) * sizeof(kv_t);
-        constexpr uint32_t kFixedOffset =
-            (kRowOffset / 16) * 4 / 8 * kNumBytesPerSubBlock +
-            (kRowOffset / 16) * 4 % 8 * kNumSubBlockCols * sizeof(kv_t) +
-            kColOffset / kNumCols * kNumBytesPerBlock +
-            (kColOffset % kNumCols) / 32 * (4 * kNumBytesPerSubBlock) +
-            ((kColOffset % kNumCols) % 32) * sizeof(kv_t);
+        // Per-lane (row, col): mfma_f32_16x16x32 A-tile layout.
+        //   row = lane_idx % 16    ? [0, 16)
+        //   col = (lane_idx / 16) * 8 ? {0, 8, 16, 24}
+        // See get_block_lane_offset() / get_block_fixed_offset() for the address math.
+        const uint32_t lane_idx = opus::lane_id();
+        const uint32_t row      = lane_idx % kMfmaRows;
+        const uint32_t col      = (lane_idx / kMfmaRows) * kMfmaElemPerThr;
+        const uintptr_t p_lds_kv_lane = p_lds_kv + get_block_lane_offset(row, col);
+        constexpr uint32_t kFixedOffset = get_block_fixed_offset<kRowOffset, kColOffset>();
 
         using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
         static_assert(range_type::lo + 1 == range_type::hi,
@@ -1247,10 +1267,10 @@ class KvManagerV3
         const uint32_t row           = (warp_idx % 2) * 16 + lane_idx / 16 * 4;
         const uint32_t row_phy       = (row % 4) + (row / 16) * 4 + (row % 16 / 4) * 8;
         const uint32_t col           = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
-        const uintptr_t p_lds_v_lane = p_lds_v + (row_phy / 8) * kNumBytesPerSubBlock +
+        const uintptr_t p_lds_v_lane = p_lds_v + (row_phy / 8) * kNumBytesPer2SubBlocksWithPadding +
                                        (row_phy % 8) * kNumSubBlockCols * sizeof(kv_t) +
                                        col / kNumCols * kNumBytesPerBlock +
-                                       (col % kNumCols) / 32 * (4 * kNumBytesPerSubBlock) +
+                                       (col % kNumCols) / 32 * (4 * kNumBytesPer2SubBlocksWithPadding) +
                                        ((col % kNumCols) % 32) * sizeof(kv_t);
 
         const v2ui pass_0 = hkm::ds_read_b64(p_lds_v_lane, 0);
@@ -1262,11 +1282,83 @@ class KvManagerV3
             pass_0.x, pass_0.y, pass_1.x, pass_1.y, pass_2.x, pass_2.y, pass_3.x, pass_3.y};
     }
 
-    template <uint32_t kColOffset, uint32_t GPR>
-    __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_vt)
+    // Load a 16x32 (rows x cols) tile of V from LDS into 2 consecutive GPRs per lane,
+    // transposed for use as the B operand of mfma_f32_16x16x32_fp8_fp8.
+    //
+    // The 64-lane wave is split into 4 lane groups of 16 lanes. Each group handles a
+    // 4x32 sub-tile (rows r..r+3, cols 0..31 in tile-local coords). Within a group,
+    // `ds_read_b64_tr_b8` requires this input footprint (each lane reads 8 fp8 bytes):
+    //   * L00: [0, 00~07], L01: [0, 08~15], L08: [0, 16~23], L09: [0, 24~31]
+    //   * L02: [1, 00~07], L03: [1, 08~15], L10: [1, 16~23], L11: [1, 24~31]
+    //   * L04: [2, 00~07], L05: [2, 08~15], L12: [2, 16~23], L13: [2, 24~31]
+    //   * L06: [3, 00~07], L07: [3, 08~15], L14: [3, 16~23], L15: [3, 24~31]
+    // After the hardware transpose, each lane holds 4 rows x 2 cols of V across the
+    // 2 destination GPRs (GPR -> cols c, c+16; GPR+1 -> see finalize_load_transposed_v_to_gpr):
+    //   L00: rows[0~3] of cols {00, 16}, L01: rows[0~3] of cols {01, 17}, ...,
+    //   L15: rows[0~3] of cols {15, 31}.
+    // The 4 lane groups together cover the full 16x32 tile (4 rows each).
+    //
+    // Template params:
+    //   kRowOffset : row offset of the tile within the 32-row LDS V block (0 or 16).
+    //   kColOffset : col offset of the tile within the 512-col head_dim (multiple of 32, < 512).
+    //   GPR        : index of the first of the 2 destination VGPRs.
+    // Runtime param:
+    //   p_lds_v    : LDS base address of the current V block (KvManagerV3 layout).
+    template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t GPR>
+    __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_v)
     {
+#if defined(__gfx950__)
+        static_assert(((kRowOffset % 16) == 0) && (kRowOffset < 32),
+                      "load_transpose_v_to_gpr(): Unsupported row offset!");
+        static_assert(((kColOffset % 32) == 0) && (kColOffset < 512),
+                      "load_transpose_v_to_gpr(): Unsupported column offset!");
+
+        // Per-lane (row, col): ds_read_b64_tr_b8 input footprint (see header above).
+        //   row = (lane_idx / 16) * 4 + ((lane_idx % 16) / 2) % 4    ? [0, 16)
+        //   col = ((lane_idx % 2) + ((lane_idx % 16) / 8) * 2) * 8   ? {0, 8, 16, 24}
+        // See get_block_lane_offset() / get_block_fixed_offset() for the address math.
+        const uint32_t lane_idx        = opus::lane_id();
+        const uint32_t lane_idx_in_grp = lane_idx % 16;
+        const uint32_t row             = (lane_idx / 16) * 4 + (lane_idx_in_grp / 2) % 4;
+        const uint32_t col             = ((lane_idx % 2) + (lane_idx_in_grp / 8) * 2) * 8;
+        const uintptr_t p_lds_v_lane   = p_lds_v + get_block_lane_offset(row, col);
+        constexpr uint32_t kFixedOffset = get_block_fixed_offset<kRowOffset, kColOffset>();
+
+        hkm::ds_read_b64_tr_b8<GPR>(p_lds_v_lane, kFixedOffset);
+#else
         static_assert(false,
                       "KVManagerV3::load_transposed_v_to_gpr() is not expected to be called.");
+#endif
+    }
+
+    // Repack the output of two adjacent load_transposed_v_to_gpr() calls into the layout
+    // that mfma_f32_16x16x32_fp8_fp8 expects for its B operand.
+    //
+    // After load_transposed_v_to_gpr(), each lane's 2 GPRs are laid out row-major across
+    // the local 2-row x 2-col mini-tile (in dword units):
+    //   GPR_0   = block[r,   c | r,   c+1]   // row r,   2 cols
+    //   GPR_0+1 = block[r+1, c | r+1, c+1]   // row r+1, 2 cols  (this is "GPR_1" of the same call)
+    // Calling finalize on the (GPR_0, GPR_1) pair from two adjacent loads rearranges them
+    // to column-major (each GPR pair holds one N column with its K rows contiguous):
+    //   GPR_0 = block[r, c   | r+1, c  ]   // col c,   2 rows
+    //   GPR_1 = block[r, c+1 | r+1, c+1]   // col c+1, 2 rows
+    // This is achieved by a single intra-lane `v_swap_b32` between GPR_0+1 and GPR_1
+    // (no cross-lane traffic).
+    //
+    // Template params:
+    //   GPR_0, GPR_1 : indices of the first VGPR of two 2-register pairs returned by
+    //                  load_transposed_v_to_gpr(). The pairs must not overlap.
+    template <uint32_t GPR_0, uint32_t GPR_1>
+    __device__ __forceinline__ void static finalize_load_transposed_v_to_gpr()
+    {
+#if defined(__gfx950__)
+        asm volatile("v_swap_b32 v[%0], v[%1]"
+                     :
+                     : "i"(GPR_0+1), "i"(GPR_1));
+#else
+        static_assert(false,
+                      "KVManagerV3::finalize_load_transposed_v_to_gpr() is not expected to be called.");
+#endif
     }
 };
 
@@ -1345,7 +1437,7 @@ class VtManagerV1
     }
 
     // load 32x16 block for each warp. Each thread takes 2x4 elements.
-    template <uint32_t kColOffset, uint32_t GPR>
+    template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t GPR>
     __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_vt)
     {
         constexpr uint32_t kNumDwPerBlock =
@@ -1356,6 +1448,8 @@ class VtManagerV1
         constexpr uint32_t kFixedColBlk      = kColOffset / kNumColsPerThr;
         constexpr uint32_t kFixedBlockOffset = kFixedColBlk * kNumElemsPerBlock * sizeof(kv_t);
 
+        static_assert(kRowOffset == 0,
+                      "load_transpose_v_to_gpr(): Unsupported row offset!");
         static_assert(((kColOffset % 16) == 0) && (kColOffset < 512),
                       "load_transpose_v_to_gpr(): Unsupported column offset!");
 

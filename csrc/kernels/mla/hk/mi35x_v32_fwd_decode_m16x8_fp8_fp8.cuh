@@ -89,7 +89,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
     QManagerV3<T> q_manager;
     KvManagerV3<T> kv_manager;
-    VtManagerV1<T> vt_manager;
     OManager16bitsV2<T, out_t> o_manager;
     OManager32bitsV2<T, split_t> split_o_manager;
 
@@ -128,7 +127,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
     constexpr uint32_t kSzLdsQ  = q_manager.get_lds_size_in_byte();
     constexpr uint32_t kSzLdsKv = kv_manager.get_lds_size_in_byte();
-    constexpr uint32_t kSzLdsTv = vt_manager.get_lds_size_in_byte();
     constexpr uint32_t kSzLdsO =
         (o_manager.get_lds_size_in_byte() > split_o_manager.get_lds_size_in_byte())
             ? o_manager.get_lds_size_in_byte()
@@ -138,10 +136,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                   "kSzLdsO must be less than or equal to kSzLdsKv because we want to reuse p_lds_o "
                   "and p_lds_kv_next.");
 
-    const uintptr_t p_lds_vt = reinterpret_cast<uintptr_t>(p_lds);
-    const uintptr_t p_lds_q  = p_lds_vt + kSzLdsTv;
-    uintptr_t p_lds_kv_curr  = p_lds_q + kSzLdsQ;
-    uintptr_t p_lds_kv_next  = p_lds_kv_curr + kSzLdsKv;
+    const uintptr_t p_lds_q = reinterpret_cast<uintptr_t>(p_lds);
+    uintptr_t p_lds_kv_curr = p_lds_q + kSzLdsQ;
+    uintptr_t p_lds_kv_next = p_lds_kv_curr + kSzLdsKv;
 
     for(int32_t work_idx = work_start_idx; work_idx < work_end_idx; ++work_idx)
     {
@@ -354,10 +351,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 __builtin_amdgcn_s_setprio(2);
             }
 
-            // Transpose V (cooperative -- runs even when this warp skips compute)
-            v8ui v;
-            kv_manager.load_v_to_gpr(&v, warp_idx, p_lds_kv_curr);
-
             if constexpr((kIsGlobalLast == false) && (kCheckBoundaryNext == false))
             {
                 if((kv_tile_start + 2 * T::kBlockN) < kv_end)
@@ -397,16 +390,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 }
             }
 
-            // Get max of row interleaveing with transposing V
+            // Get max of row
             comp_t local_max{};
             if constexpr(kSkipCompute == false)
             {
                 local_max = max_8<k_p_comp_begin, comp_t>();
             }
-
-            asm volatile("s_waitcnt lgkmcnt(0)"); // Wait for un-transposed V to be loaded
-            __builtin_amdgcn_sched_barrier(
-                0); // For avoiding conflict between ds_bpermute and ds_read.
 
             comp_t rescale = 1.0f;
             if constexpr(kSkipCompute == false)
@@ -417,7 +406,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     warpReduce<aiter::MaxFunctor, decltype(local_max), reduce_range, stop_stride>(
                         local_max);
             }
-            vt_manager.transpose_v(&v); // cooperative -- always runs
 
             if constexpr(kSkipCompute == false)
             {
@@ -430,11 +418,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 softmax_p1<kIsFirstIter, k_p_comp_begin>(&row_sum_e, row_max, rescale);
             }
 
-            // Prepare for output
-            const uintptr_t p_lds_o    = kDoEpilogue ? p_lds_kv_curr : 0;
+            // Prepare for output. V is read directly from p_lds_kv_curr in the PV
+            // loop below, so the output bounce buffer overlays p_lds_kv_next instead.
+            // On the epilogue iteration kIsGlobalLast == true, so no async K load
+            // targets p_lds_kv_next and the swap at the end is also skipped.
+            const uintptr_t p_lds_o    = kDoEpilogue ? p_lds_kv_next : 0;
             const float reci_row_sum_e = kDoEpilogue ? (1.0f / row_sum_e) : .0f;
-
-            vt_manager.store_transposed_v_to_lds(p_lds_vt, warp_idx, v);
 
             if constexpr((kSkipCompute == false) && (kIsFirstIter == false))
             {
@@ -477,9 +466,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             }
 
             // Wait for transpose V to complete
-            asm volatile("s_waitcnt lgkmcnt(0)");
-            __builtin_amdgcn_s_barrier();
-            __builtin_amdgcn_sched_barrier(0);
+            // asm volatile("s_waitcnt lgkmcnt(0)");
+            // __builtin_amdgcn_s_barrier();
+            // __builtin_amdgcn_sched_barrier(0);
 
             if constexpr(kSkipCompute == false)
             {
@@ -506,22 +495,25 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
                 if constexpr(kSkipCompute == false)
                 {
-                    constexpr uint32_t kColOffsetDelta = T::kBlockK / 2;
-                    constexpr uint32_t kColOffset0     = idx.value * T::kBlockK * 2;
-                    constexpr uint32_t kColOffset1     = kColOffset0 + kColOffsetDelta * 1;
-                    constexpr uint32_t kColOffset2     = kColOffset0 + kColOffsetDelta * 2;
-                    constexpr uint32_t kColOffset3     = kColOffset0 + kColOffsetDelta * 3;
+                    constexpr uint32_t kColOffset0 = idx.value * T::kBlockK * 2;
+                    constexpr uint32_t kColOffset1 = kColOffset0 + T::kBlockK;
 
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset0, k_kv_0_begin>(
-                        p_lds_vt);
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset1, k_kv_0_begin + 2>(
-                        p_lds_vt);
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset2, k_kv_1_begin>(
-                        p_lds_vt);
-                    vt_manager.template load_transposed_v_to_gpr<kColOffset3, k_kv_1_begin + 2>(
-                        p_lds_vt);
+                    // Each call issues a single ds_read_b64_tr_b8 (1 lgkm op). The
+                    // 2 calls per kv_* fill 4 VGPRs; finalize_load_transposed_v_to_gpr
+                    // then does a v_swap_b32 to re-pack into mfma B-operand layout
+                    // (must run after the matching s_waitcnt).
+                    kv_manager.template load_transposed_v_to_gpr<0, kColOffset0, k_kv_0_begin>(
+                        p_lds_kv_curr);
+                    kv_manager.template load_transposed_v_to_gpr<16, kColOffset0, k_kv_0_begin + 2>(
+                        p_lds_kv_curr);
+                    kv_manager.template load_transposed_v_to_gpr<0, kColOffset1, k_kv_1_begin>(
+                        p_lds_kv_curr);
+                    kv_manager.template load_transposed_v_to_gpr<16, kColOffset1, k_kv_1_begin + 2>(
+                        p_lds_kv_curr);
 
-                    asm volatile("s_waitcnt lgkmcnt(4)");
+                    asm volatile("s_waitcnt lgkmcnt(2)");
+                    kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_begin,
+                                                                          k_kv_0_begin + 2>();
                     if constexpr(kIsFirstIter)
                     {
                         hk::mma_ABt(oaccu_0, kv_0, p_mfma);
@@ -532,6 +524,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     }
 
                     asm volatile("s_waitcnt lgkmcnt(0)");
+                    kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_1_begin,
+                                                                          k_kv_1_begin + 2>();
                     if constexpr(kIsFirstIter)
                     {
                         hk::mma_ABt(oaccu_1, kv_1, p_mfma);
