@@ -519,13 +519,10 @@ def gemm_afp4wfp4_preshuffle(
 
         config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
 
-        # Unshuffle scales on host: convert preshuffled layout to row-major
-        # for direct buffer_load into WMMA scale registers
-        if M >= 32:
-            x_scales = _unshuffle_scale(x_scales)
-        else:
-            x_scales = x_scales.contiguous()
-        w_scales = _unshuffle_scale(w_scales)
+        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
+        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
+        x_scales = x_scales.contiguous()
+        w_scales = w_scales.contiguous()
 
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
         x_fp4,
