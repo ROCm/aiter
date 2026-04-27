@@ -197,6 +197,9 @@ class Case:
             Case(16, 512, 512, "float8_e4m3fn", 32, 2),
             Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),
             Case(300, 400, 800, "float8_e4m3fn", 8, 4),
+            Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2),
+            Case(16, 512, 512, "mxfloat8_e4m3fn", 32, 2, hbm_swizzling=True),
+            Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
         ]
     ],
 )
@@ -232,8 +235,8 @@ def test_op(
         pytest.skip("Kernel not supported on this GPU.")
 
     if get_arch() == "gfx1250":
-        if act_dtype_str == "mxfloat8_e4m3fn":
-            pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
+        # if act_dtype_str == "mxfloat8_e4m3fn":
+        #     pytest.skip("Mxfloat activations are not supported yet on gfx1250.")
         if apply_swiglu and has_y_gammas:
             pytest.skip("Swiglu and gammas are not supported together on gfx1250.")
         # temporary
