@@ -368,6 +368,7 @@ def varlen_fwd(
     softcap: float,
     return_softmax: bool,
     gen_: Optional[torch.Tensor] = None,
+    num_splits: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
 
     if str(q.dtype).startswith("torch.float8"):
