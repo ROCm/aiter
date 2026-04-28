@@ -312,7 +312,7 @@ def test_fmoe(
         num_iters=5,
         num_warmup=2,
     )
-    checkAllclose(
+    err = checkAllclose(
         out2_ref,
         out2_ck,
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
