@@ -1,5 +1,4 @@
 import torch
-import triton
 import triton.language as tl
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
