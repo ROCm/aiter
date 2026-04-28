@@ -6,7 +6,7 @@ import torch
 
 
 def _get_compiled(fn):
-    return torch.compile(fn, backend="inductor", options={"max_autotune": True})
+    return torch.compile(fn, backend="inductor", fullgraph=True, options={"max_autotune": True})
 
 
 def torch_rmsnorm(x, weight, eps):

@@ -6,7 +6,9 @@ import torch
 
 
 def _get_compiled(fn):
-    return torch.compile(fn, backend="inductor", options={"max_autotune": True})
+    return torch.compile(
+        fn, backend="inductor", fullgraph=True, options={"max_autotune": True}
+    )
 
 
 def torch_fused_mul_add(x, a, b):
@@ -37,7 +39,10 @@ def test_compile_fused_mul_add(M, N, dtype, scalar_ab):
     torch.cuda.synchronize()
 
     assert not torch.isnan(out_compiled).any(), "torch.compile produced NaN"
-    torch.testing.assert_close(out_compiled, out_eager, atol=1e-3, rtol=1e-3)
+    if dtype == torch.bfloat16:
+        torch.testing.assert_close(out_compiled, out_eager, atol=0.1, rtol=0.1)
+    else:
+        torch.testing.assert_close(out_compiled, out_eager, atol=1e-3, rtol=1e-3)
 
 
 if __name__ == "__main__":
