@@ -70,6 +70,10 @@ jobs:
           fi
           echo "CK commit: $(git -C 3rdparty/composable_kernel rev-parse HEAD)"
 
+      - name: Docker login
+        if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Build Aiter wheel in base container
         run: |
           set -euo pipefail
@@ -277,6 +281,10 @@ jobs:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
 
+      - name: Docker login
+        if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Run the container
         run: |
           set -ex
@@ -443,6 +451,10 @@ jobs:
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
           path: aiter_wheels
+
+      - name: Docker login
+        if: ${{ !github.event.pull_request || !github.event.pull_request.head.repo.fork }}
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Run the container
         run: |
