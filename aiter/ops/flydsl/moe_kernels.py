@@ -222,6 +222,7 @@ def compile_flydsl_moe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -251,6 +252,7 @@ def compile_flydsl_moe_stage1(
             enable_bias=enable_bias,
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
+            swiglu_limit=swiglu_limit,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -574,6 +576,7 @@ def flydsl_moe_stage1(
     bias: Optional[torch.Tensor] = None,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -752,6 +755,7 @@ def flydsl_moe_stage1(
         enable_bias=(bias is not None),
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
+        swiglu_limit=swiglu_limit,
     )
     _run_compiled(exe, args)
 

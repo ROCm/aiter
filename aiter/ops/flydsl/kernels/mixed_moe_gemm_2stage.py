@@ -130,6 +130,7 @@ def compile_mixed_moe_gemm1(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    swiglu_limit: float = 0.0,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -273,6 +274,10 @@ def compile_mixed_moe_gemm1(
     _gui_tag = "_gui" if gate_up_interleave else ""
     _as1_tag = "_as1" if a_scale_one else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    _act_tag = "" if act == "silu" else f"_{act}"
+    _slim_tag = (
+        f"_slim{str(swiglu_limit).replace('.', 'p')}" if swiglu_limit != 0 else ""
+    )
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
         f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
@@ -1928,8 +1933,14 @@ def compile_mixed_moe_gemm1(
                     return g * sig
 
                 def _silu_mul_vec4(gate_v4, up_v4):
-                    """Element-wise silu(gate) * up on vec4_f32."""
+                    """Element-wise silu(gate) * up on vec4_f32.
+                    When swiglu_limit != 0, clamp gate <= limit and
+                    -limit <= up <= limit before applying silu(gate) * up.
+                    """
                     result_elems = []
+                    if const_expr(swiglu_limit != 0):
+                        _limit = arith.constant(float(swiglu_limit), type=f32)
+                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     for ei in range_constexpr(4):
                         g = vector.extract(
                             gate_v4, static_position=[ei], dynamic_position=[]
@@ -1937,20 +1948,30 @@ def compile_mixed_moe_gemm1(
                         u = vector.extract(
                             up_v4, static_position=[ei], dynamic_position=[]
                         )
+                        if const_expr(swiglu_limit != 0):
+                            g = arith.minimumf(g, _limit)
+                            u = arith.minimumf(u, _limit)
+                            u = arith.maximumf(u, _neg_limit)
                         result_elems.append(_silu_elem(g) * u)
                     return vector.from_elements(vec4_f32, result_elems)
 
                 def _swiglu_mul_vec4(gate_v4, up_v4):
                     """Element-wise swiglu(gate, up) on vec4_f32.
                     swiglu(g, u) = g * sigmoid(alpha * g) * (u + 1)
-                    with clamping: gate <= limit, -limit <= up <= limit.
+                    When swiglu_limit != 0, clamp gate <= limit and
+                    -limit <= up <= limit before the activation.
                     """
                     result_elems = []
                     _alpha = arith.constant(1.702, type=f32)
-                    _limit = arith.constant(7.0, type=f32)
-                    _neg_limit = arith.constant(-7.0, type=f32)
                     _one = arith.constant(1.0, type=f32)
                     _neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+                    if const_expr(swiglu_limit != 0):
+                        _limit = arith.constant(float(swiglu_limit), type=f32)
+                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
+                    else:
+                        _limit = arith.constant(float(7.0), type=f32)
+                        _neg_limit = arith.constant(-float(7.0), type=f32)
+
                     for ei in range_constexpr(4):
                         g = vector.extract(
                             gate_v4, static_position=[ei], dynamic_position=[]

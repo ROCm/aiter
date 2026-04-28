@@ -649,6 +649,7 @@ def _flydsl_stage1_wrapper(
     out_scale=None,
     out_scale_sorted=None,
     bias1=None,
+    swiglu_limit: float = 0.0,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
@@ -682,6 +683,7 @@ def _flydsl_stage1_wrapper(
         bias=bias1,
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -1166,6 +1168,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    swiglu_limit=0.0,
 ):
     quant_func = get_quant(quant_type)
     token_num, _ = hidden_states.shape
@@ -1292,6 +1295,7 @@ def fused_moe_2stages(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
+        swiglu_limit=swiglu_limit,
         **extra_stage1_args,
     )
     if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
