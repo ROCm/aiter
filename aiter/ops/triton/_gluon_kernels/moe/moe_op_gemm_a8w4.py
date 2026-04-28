@@ -229,7 +229,6 @@ def _moe_gemm_a8w4(
     NUM_BUFFERS: gl.constexpr,
     # One of ["GFX1250", None]
     SWIZZLE_MX_SCALE: gl.constexpr,
-    EVEN_K: gl.constexpr,
     MASK_K_LIMIT: gl.constexpr,
     W_CACHE_MODIFIER: gl.constexpr,
     num_warps: gl.constexpr,
@@ -317,9 +316,9 @@ def _moe_gemm_a8w4(
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
-    off_w_n_scale = pid_n * SCALE_BLOCK_N
 
     # B pointers
+    off_w_n_scale = pid_n * SCALE_BLOCK_N
     off_w_n = pid_n * PACKED_BLOCK_N_W
     W += expt_id * stride_w_e
 
@@ -677,7 +676,6 @@ def _moe_gemm_a8w4(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
         )
-        # STORE_LAYOUT: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 16], threads_per_warp=[4, 8], warps_per_cta=[4, 1], order=[1, 0])
         offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(0, OUT_BLOCK_N)
         mask_m = offs_m < M
@@ -697,11 +695,6 @@ def _moe_gemm_a8w4(
     # write-back
     Y += start_m * stride_y_m
     offs_y_m = offs_m
-    # YPtrs = (
-    #    Y
-    #    + offs_y_m.to(index_type)[:, None] * stride_y_m
-    #    + offs_y_n.to(index_type)[None, :] * stride_y_n
-    # )
     offs_y = (
         offs_y_m.to(index_type)[:, None] * stride_y_m
         + offs_y_n.to(index_type)[None, :] * stride_y_n
@@ -709,7 +702,4 @@ def _moe_gemm_a8w4(
     mask = mask_m[:, None] & mask_n[None, :]
     if Quant_static_scale is None:
         out = out.to(tl.bfloat16)
-    # if APPLY_SWIGLU:
-    #    out = gl.convert_layout(out, layout=STORE_LAYOUT)
-    # gl.store(YPtrs, out, mask=mask)
     gl.amd.gfx1250.buffer_store(out, Y, offs_y, mask=mask)
