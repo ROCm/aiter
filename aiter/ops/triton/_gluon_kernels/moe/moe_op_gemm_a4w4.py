@@ -371,7 +371,6 @@ def _moe_gemm_a4w4_gfx1250(
 
     load_idx = 0
     wmma_idx = 0
-    scale_idx = 0
 
     # prologue: fill NUM_BUFFERS-1 LDS slots via TDM
     for _ in gl.static_range(NUM_BUFFERS - 1):
@@ -406,7 +405,8 @@ def _moe_gemm_a4w4_gfx1250(
     wmma_idx += 1
     cur_x_scales = gl.amd.gfx1250.buffer_load(XMxScale, offs_x_scale)
     cur_w_scales = gl.amd.gfx1250.buffer_load(WMxScale, offs_w_scale)
-    scale_idx += 1
+    XMxScale += MX_SCALE_BLOCK_K * stride_x_mx_k
+    WMxScale += PACKED_MX_BLOCK * stride_w_mx_k
 
     # main loop: perform wmma and fill LDS with next tile
     num_k_iter = gl.cdiv(K, BLOCK_K)
@@ -447,9 +447,10 @@ def _moe_gemm_a4w4_gfx1250(
             .load(layout=DOT_LAYOUT_W)
         )
         wmma_idx += 1
-        next_x_scales = gl.amd.gfx1250.buffer_load(XMxScale, offs_x_scale + scale_idx * MX_SCALE_BLOCK_K * stride_x_mx_k)
-        next_w_scales = gl.amd.gfx1250.buffer_load(WMxScale, offs_w_scale + scale_idx * PACKED_MX_BLOCK * stride_w_mx_k)
-        scale_idx += 1
+        next_x_scales = gl.amd.gfx1250.buffer_load(XMxScale, offs_x_scale)
+        next_w_scales = gl.amd.gfx1250.buffer_load(WMxScale, offs_w_scale)
+        XMxScale += MX_SCALE_BLOCK_K * stride_x_mx_k
+        WMxScale += PACKED_MX_BLOCK * stride_w_mx_k
 
         # prepare next iteration
         cur_x = next_x
@@ -473,9 +474,10 @@ def _moe_gemm_a4w4_gfx1250(
             .load(layout=DOT_LAYOUT_W)
         )
         wmma_idx += 1
-        next_x_scales = gl.amd.gfx1250.buffer_load(XMxScale, offs_x_scale + scale_idx * MX_SCALE_BLOCK_K * stride_x_mx_k)
-        next_w_scales = gl.amd.gfx1250.buffer_load(WMxScale, offs_w_scale + scale_idx * PACKED_MX_BLOCK * stride_w_mx_k)
-        scale_idx += 1
+        next_x_scales = gl.amd.gfx1250.buffer_load(XMxScale, offs_x_scale)
+        next_w_scales = gl.amd.gfx1250.buffer_load(WMxScale, offs_w_scale)
+        XMxScale += MX_SCALE_BLOCK_K * stride_x_mx_k
+        WMxScale += PACKED_MX_BLOCK * stride_w_mx_k
 
         # prepare next iteration
         cur_x = next_x
