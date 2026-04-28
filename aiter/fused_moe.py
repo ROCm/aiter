@@ -381,6 +381,7 @@ def fused_moe_1stage(
     block_size_M=32,
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
+    xbf16=False,
     kernelName: str = "",
     # following for quant
     q_dtype_a=None,
@@ -433,25 +434,32 @@ def fused_moe_1stage(
             activation,
         )
     else:
-        quant_func = get_quant(quant_type)
-        if hidden_states.dtype != q_dtype_a:
-            if quant_type == QuantType.per_1x128:
-                quant_func = functools.partial(quant_func, transpose_scale=True)
-            a1, a1_scale = quant_func(
-                hidden_states,
-                scale=a1_scale,
-                quant_dtype=q_dtype_a,
-                num_rows=num_local_tokens,
-            )
-        else:
-            assert (
-                a1_scale is not None or quant_type == QuantType.No
-            ), "a1_scale must be provided for quantized input for fused_moe"
+        if xbf16:
+            # xquant happens inside the asm kernel for per_1x128
             a1 = hidden_states
-            if quant_type == QuantType.per_1x128:
-                scale_t = torch.empty_like(a1_scale)
-                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
-                a1_scale = scale_t
+            a1_scale = torch.empty(0, device="cuda")
+        else:
+            quant_func = get_quant(quant_type)
+            if hidden_states.dtype != q_dtype_a:
+                if quant_type == QuantType.per_1x128:
+                    quant_func = functools.partial(quant_func, transpose_scale=True)
+                a1, a1_scale = quant_func(
+                    hidden_states,
+                    scale=a1_scale,
+                    quant_dtype=q_dtype_a,
+                    num_rows=num_local_tokens,
+                )
+            else:
+                assert (
+                    a1_scale is not None or quant_type == QuantType.No
+                ), "a1_scale must be provided for quantized input for fused_moe"
+                a1 = hidden_states
+                if quant_type == QuantType.per_1x128:
+                    scale_t = torch.empty_like(a1_scale)
+                    aiter.partial_transpose(
+                        scale_t, a1_scale, num_rows=num_local_tokens
+                    )
+                    a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -869,6 +877,7 @@ def get_2stage_cfgs(
         kernelName1 = ""
         kernelName2 = ""
         run_1stage = False
+        run_1stage_xbf16 = False
         if (
             activation,
             q_type,
@@ -880,13 +889,16 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 256 == 0)
+                run_1stage = token > 32 and (inter_dim % 128 == 0)
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+
+            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
+                run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
 
         block_m = (
             BLOCK_SIZE_M
@@ -908,7 +920,7 @@ def get_2stage_cfgs(
         )
         use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
-            f"run_1stage = {run_1stage}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
+            f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
         block_m = cfg["block_m"]
@@ -925,10 +937,14 @@ def get_2stage_cfgs(
                 "Tuned kernels are optimized for preshuffled weights (preshuffle_on). "
                 "Running with preshuffle_off may produce incorrect results."
             )
+        if "xbf16" in cfg:
+            run_1stage_xbf16 = run_1stage and bool(int(cfg["xbf16"]))
+        else:
+            run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
+        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
     )
 
     def get_block_m() -> int:
@@ -949,6 +965,7 @@ def get_2stage_cfgs(
                 kernelName=kernelName1,
                 activation=activation,
                 quant_type=q_type,
+                xbf16=run_1stage_xbf16,
             ),
             None,
             block_m,

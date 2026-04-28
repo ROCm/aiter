@@ -132,7 +132,7 @@ def _moe_gemm_int8_smoothquant(
     Int8 MoE GEMM with SmoothQuant support and per-token per-channel scaling.
 
     SmoothQuant formula:
-        Y = (X diag(s)^-1) · (diag(s) W)
+        Y = (X * diag(s)^-1) @ (diag(s) * W)
 
     Where s is the smoothing factor
 
@@ -140,10 +140,10 @@ def _moe_gemm_int8_smoothquant(
         Y = (X @ W) * x_scale * w_scale
 
     Key parameters:
-    - X is int8 activations [M, K] (quantized X diag(s)^-1)
-    - W is int8 weights [E, K, N] (quantized diag(s)W)
-    - x_scale is fp32 per-token scale [M] (dequant scale for X̂)
-    - w_scale is fp32 per-output-channel scale [E, N] (dequant scale for Ŵ)
+    - X is int8 activations [M, K] (quantized X * diag(s)^-1)
+    - W is int8 weights [E, K, N] (quantized diag(s) * W)
+    - x_scale is fp32 per-token scale [M] (dequant scale for X)
+    - w_scale is fp32 per-output-channel scale [E, N] (dequant scale for W)
 
     Activation functions:
     - alpha=0: No activation
