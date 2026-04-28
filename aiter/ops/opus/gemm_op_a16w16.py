@@ -107,10 +107,12 @@ def _opus_gemm_bf16_dispatch(
 
 # ---- High-level shape-driven API -----------------------------------------
 
-# splitk kids (200..299) require bf16 output; their C++ traits static_assert
-# D_C==float and the reduce kernel casts fp32 workspace down to bf16 Y. The
-# wrapper surfaces this as a clear Python exception before launch when we
-# know the tuned CSV picked a splitk kid but user requested fp32 Y.
+# splitk kids (200..299) main kernel only has the <fp32_t> instantiation
+# (traits static_assert D_C==float, fp32 workspace). The reduce kernel
+# (splitk_reduce_kernel) is templated on D_OUT and dispatches to either
+# __bf16 or float at launch time based on Y.dtype(), so both bf16 and fp32
+# outputs are valid. Kept here only as a documentation anchor; the dispatch
+# code below no longer needs to special-case Y.dtype against splitk kids.
 _SPLITK_KID_MIN = 200
 _SPLITK_KID_MAX = 299
 
@@ -184,7 +186,7 @@ def gemm_a16w16_opus(
     A : [M, K] or [batch, M, K], bf16
     B : [N, K], bf16 (plain layout; not pre-shuffled)
     bias : must be None (opus kernels have HAS_BIAS=false)
-    dtype : output dtype, bf16 or fp32; splitk kids force bf16
+    dtype : output dtype, bf16 or fp32 (any kernel family supports either)
     kernelId : optional explicit override. When given, bypass CSV / C++
         dispatch and launch this specific tuned instance via
         opus_gemm_a16w16_tune.
@@ -218,14 +220,11 @@ def gemm_a16w16_opus(
     )
     if cfg is not None:
         kid = cfg["solidx"]
-        if _SPLITK_KID_MIN <= kid <= _SPLITK_KID_MAX and dtype is not torch.bfloat16:
-            # Tuned winner is a splitk kid but user asked for fp32 Y --
-            # splitk's fp32 workspace + bf16 Y cast hard-codes bf16. Fall
-            # through to C++ dispatch rather than picking a bad kid.
-            pass
-        else:
-            opus_gemm_a16w16_tune(XQ, WQ, Y, kid, int(cfg["splitK"]))
-            return _finalize_output(Y, reshape_out_to_2d)
+        # Both bf16 and fp32 Y are now valid for splitk kids (the reduce
+        # kernel handles the cast / passthrough), so no Y.dtype gating is
+        # needed here -- always honor the tuned winner.
+        opus_gemm_a16w16_tune(XQ, WQ, Y, kid, int(cfg["splitK"]))
+        return _finalize_output(Y, reshape_out_to_2d)
 
     # 3) CSV miss (or incompatible tuned winner): optionally record the
     #    shape and delegate to the C++ bf16 dispatcher, which is (or

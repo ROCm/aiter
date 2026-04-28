@@ -12,7 +12,6 @@ cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,ke
 256,8192,100,5120,False,torch.bfloat16,torch.bfloat16,False,False,opus,200,0,31.0555,opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,270.12,2786.9
 256,16384,100,5120,False,torch.bfloat16,torch.bfloat16,False,False,opus,204,0,87.1896,opus_gemm_flatmm_splitk_256x32x128x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,192.42,1973.55
 256,32768,100,5120,False,torch.bfloat16,torch.bfloat16,False,False,opus,204,0,164.9335,opus_gemm_flatmm_splitk_256x32x128x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,203.44,2080.37
-256,1,128,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,103,0,7.8592,opus_gemm_flatmm_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu1,0.0,0.09,94.58
 256,2,128,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,205,4,8.4181,opus_gemm_flatmm_splitk_256x64x32x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,0.18,89.01
 256,4,128,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,201,4,8.5886,opus_gemm_flatmm_splitk_256x32x32x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,0.34,88.65
 256,8,128,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,201,4,8.3841,opus_gemm_flatmm_splitk_256x32x32x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,0.7,93.68
@@ -38,7 +37,8 @@ cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,ke
 256,8192,200,5120,False,torch.bfloat16,torch.bfloat16,False,False,opus,200,0,63.4321,opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,264.49,1406.4
 256,16384,200,5120,False,torch.bfloat16,torch.bfloat16,False,False,opus,200,0,135.0647,opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,248.43,1305.85
 256,32768,200,5120,False,torch.bfloat16,torch.bfloat16,False,False,opus,210,0,260.4792,opus_gemm_flatmm_splitk_256x32x256x64_2x1_16x16x32_0x0x0_wgpcu1,0.0,257.64,1346.36
-256,6,384,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,202,4,8.4045,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,3.93,665.79
+256,6,384,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,202,4,8.4936,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,3.89,658.81
+256,6,384,7168,False,torch.bfloat16,torch.float32,False,False,opus,202,4,8.2967,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,3.98,675.0
 256,8,384,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,202,4,8.5284,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,5.16,659.66
 256,16,384,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,202,4,8.5383,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,10.32,673.05
 256,24,384,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,202,4,8.5629,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,15.43,685.23
@@ -170,7 +170,6 @@ cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,ke
 256,56,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,200,4,13.3538,opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,126.97,2345.17
 256,72,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,204,8,15.8169,opus_gemm_flatmm_splitk_256x32x128x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,137.83,1998.75
 256,88,2112,7168,False,torch.bfloat16,torch.bfloat16,False,False,opus,203,4,16.0778,opus_gemm_flatmm_splitk_256x32x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,165.72,1984.78
-256,1,2560,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,111,0,15.3908,opus_gemm_flatmm_256x64x32x128_2x1_16x16x32_0x0x0_wgpcu1,0.0,0.96,958.79
 256,2,2560,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,202,4,10.2087,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,2.89,1446.55
 256,4,2560,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,209,0,0.2489,opus_gemm_flatmm_splitk_256x256x32x64_2x1_16x16x32_0x0x0_wgpcu1,0.0,236.97,59417.92
 256,8,2560,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,203,4,10.4836,opus_gemm_flatmm_splitk_256x32x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,11.25,1414.84
@@ -180,7 +179,6 @@ cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,ke
 256,64,2560,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,210,4,18.9183,opus_gemm_flatmm_splitk_256x32x256x64_2x1_16x16x32_0x0x0_wgpcu1,0.0,49.88,816.24
 256,128,2560,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,200,8,14.6334,opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,128.98,1102.84
 256,256,2560,2880,False,torch.bfloat16,torch.bfloat16,False,False,opus,200,0,20.838,opus_gemm_flatmm_splitk_256x64x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,181.15,841.29
-256,1,2880,2048,False,torch.bfloat16,torch.bfloat16,False,False,opus,103,0,13.3432,opus_gemm_flatmm_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu1,0.0,0.88,884.82
 256,1,2880,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,203,8,11.2954,opus_gemm_flatmm_splitk_256x32x64x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,2.09,2089.96
 256,2,2880,2048,False,torch.bfloat16,torch.bfloat16,False,False,opus,202,4,9.5551,opus_gemm_flatmm_splitk_256x32x32x128_2x1_16x16x32_0x0x0_wgpcu2,0.0,2.47,1236.64
 256,2,2880,4096,False,torch.bfloat16,torch.bfloat16,False,False,opus,207,4,0.1531,opus_gemm_flatmm_splitk_256x128x32x64_2x1_16x16x32_0x0x0_wgpcu2,0.0,308.2,154283.89

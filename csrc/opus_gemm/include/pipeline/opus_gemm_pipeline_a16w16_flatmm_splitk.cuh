@@ -2,8 +2,10 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // BF16 a16w16 flatmm split-K pipeline: 4-wave warp-spec main kernel that
-// writes fp32 partial sums into a workspace tensor, plus a tile-agnostic
-// reduce kernel that sums across splits and casts to bf16 C.
+// writes fp32 partial sums into a workspace tensor. The companion reduce
+// kernel that sums across splits and casts to D_OUT (bf16 or fp32) C lives
+// in the shared header splitk_reduce.cuh (re-included below so launchers
+// that pull this pipeline header keep getting both kernels).
 //
 // Ported from gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp_splitk.cc.
 //
@@ -11,12 +13,12 @@
 //   * gemm_a16w16_flatmm_splitk_kernel<Traits>(kargs)
 //       grid.x = split_k * num_tiles_m * num_tiles_n
 //       writes fp32 [split_k, B, padded_M, padded_N]
-//   * gemm_a16w16_flatmm_splitk_reduce_kernel<VEC=16, BLOCK=64>(ws, c, ...)
-//       grid = (ceil(N, VEC*BLOCK), batch * M, 1)
-//       sums workspace across split_k, casts fp32 -> bf16, writes C.
+//   * splitk_reduce_kernel<VEC=16, BLOCK=64, D_OUT>(ws, c, ...)
+//       defined in splitk_reduce.cuh; D_OUT picks the output cast.
 #pragma once
 
 #include "opus_gemm_traits_a16w16.cuh"
+#include "splitk_reduce.cuh"
 
 // ============================================================================
 // Layout functions -- device-only. Suffixed with _splitk to avoid symbol
@@ -535,90 +537,4 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs kargs) {
         store<T::VEC_C>(g_c, v_c, u_gc, 0);
     }
 #endif // __HIP_DEVICE_COMPILE__
-}
-
-// ============================================================================
-// Reduce kernel: tile-agnostic; sums workspace across split_k, casts fp32 ->
-// bf16, writes to C. Template-parametrized but all splitk launchers invoke
-// it with <VEC_=16, BLOCK_=64>.
-//
-// Grid: (ceil(N, VEC * BLOCK), batch * M, 1).
-// Each thread handles VEC = 16 fp32 along N; loads via buffer_load_dwordx4 x4.
-//
-// Store path (3-way split on the N tail):
-//   * (n_base + VEC <= N): fast path, 2x buffer_store_dwordx4 (16 bf16 = 32 B).
-//   * (n_base < N):        tail path, VEC_valid scalar buffer_store_b16 -- one
-//                          store per in-range element. Prevents a 128-bit
-//                          vector store from straddling the row-N boundary
-//                          and silently landing in the next row of the
-//                          row-major C tensor (the buffer rsrc only checks
-//                          linear byte offset, not per-row column bounds).
-//   * (n_base >= N):       skip entirely.
-// ============================================================================
-
-template<int VEC_ = 16, int BLOCK_ = 64>
-__global__ void gemm_a16w16_flatmm_splitk_reduce_kernel(
-    const float* __restrict__ workspace,
-    __bf16*      __restrict__ c_out,
-    int split_k, int M, int N, int batch,
-    int padded_M, int padded_N)
-{
-#ifdef __HIP_DEVICE_COMPILE__
-    constexpr int VEC   = VEC_;
-    constexpr int BLOCK = BLOCK_;
-
-    const int bm_id  = int(opus::block_id_y());            // 0..batch*M-1
-    const int nblk   = int(opus::block_id_x());
-    const int tid    = int(opus::thread_id_x());
-    const int n_base = (nblk * BLOCK + tid) * VEC;
-
-    const int b = bm_id / M;
-    const int m = bm_id - b * M;
-
-    const int  ws_row_base  = b * padded_M * padded_N + m * padded_N + n_base;
-    const long split_stride = (long)batch * padded_M * padded_N;
-
-    auto g_ws = opus::make_gmem(workspace,
-                                (unsigned int)(split_stride * split_k * sizeof(float)));
-
-    opus::vector_t<float, VEC> acc;
-    #pragma unroll
-    for (int t = 0; t < VEC; ++t) acc[t] = 0.0f;
-
-    for (int s = 0; s < split_k; ++s) {
-        int ws_idx = ws_row_base + (int)(s * split_stride);
-        #pragma unroll
-        for (int g = 0; g < VEC / 4; ++g) {
-            auto v4 = g_ws.template load<4>(ws_idx + g * 4);
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) acc[g * 4 + j] += v4[j];
-        }
-    }
-
-    opus::vector_t<__bf16, VEC> out;
-    #pragma unroll
-    for (int t = 0; t < VEC; ++t) out[t] = static_cast<__bf16>(acc[t]);
-
-    auto g_c = opus::make_gmem(c_out,
-                               (unsigned int)((size_t)batch * M * N * sizeof(__bf16)));
-    const int c_idx = b * M * N + m * N + n_base;  // in bf16 elements
-
-    if (n_base + VEC <= N) {
-        // Fast path: entire VEC chunk is in-row -> 2x buffer_store_dwordx4.
-        g_c.template store<8>(opus::slice(out, opus::number<0>{}, opus::number<8>{}), c_idx);
-        g_c.template store<8>(opus::slice(out, opus::number<8>{}, opus::number<16>{}), c_idx + 8);
-    } else if (n_base < N) {
-        // Tail path: only the first `valid` elements of the VEC chunk are in
-        // row m. Scalar-store them one by one; the remaining (VEC - valid)
-        // elements would otherwise spill into row m+1 via a 128-bit vector
-        // store (buffer rsrc cannot catch this because the target byte offset
-        // is still < rsrc.size in a row-major tensor).
-        const int valid = N - n_base;
-        #pragma unroll
-        for (int j = 0; j < VEC; ++j) {
-            if (j < valid) g_c.template store<1>(out[j], c_idx + j);
-        }
-    }
-    // else: whole VEC chunk is past N -> write nothing.
-#endif  // __HIP_DEVICE_COMPILE__
 }
