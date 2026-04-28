@@ -26,6 +26,7 @@ def generate_batched_gemm_a8w8_inputs(
         - x_scale: shape (B, M, 1)
         - w_scale: shape (B, 1, N)
     """
+    torch.manual_seed(0)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
     if layout[0] == "T":

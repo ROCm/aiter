@@ -12,7 +12,7 @@ from flydsl._mlir.dialects import (
     math as mlir_math,
     vector as mlir_vector,
 )
-from flydsl.expr import range_constexpr, arith, vector, rocdl
+from flydsl.expr import range_constexpr, const_expr, arith, vector, rocdl
 from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator
@@ -167,7 +167,7 @@ def create_shuffle_gdr_decode_kernel(
         # sr_tensor = STensor(smem_sr_ptr, dtype=T.f32, shape=(-1,))
 
         def fast_exp(x, use_exp2=True):
-            if use_exp2:
+            if const_expr(use_exp2):
                 log2e = 1.4426950408889634
                 out = rocdl.exp2(T.f32, x * log2e)
                 return out
@@ -180,7 +180,7 @@ def create_shuffle_gdr_decode_kernel(
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
 
-            if "f32" in A_log_dtype:
+            if const_expr("f32" in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
             else:
                 r_A_log = A_log_tensor[hv_i].extf(T.f32)
@@ -238,7 +238,7 @@ def create_shuffle_gdr_decode_kernel(
                     sq_vecs[ki] = q_vec.extf(acc_vec_t)
                     sk_vecs[ki] = k_vec.extf(acc_vec_t)
 
-                if use_qk_l2norm:
+                if const_expr(use_qk_l2norm):
                     sum_q_partial_vec = vector.from_elements(
                         acc_vec_t, [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)]
                     )

@@ -41,20 +41,20 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    name: Sglang Integration Test (1 GPU, ${{ matrix.label }})
+    name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-1
-            label: MI35X
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
 
     env:
       SGL_BRANCH: v0.5.10
-      GPU_ARCH: gfx950
-      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi35x-gpu-1
+      GPU_ARCH: gfx942
+      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi325-gpu-1
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
       GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
 
@@ -112,8 +112,8 @@ jobs:
           import urllib.request
 
           prefixes = [
-              "v0.5.10-rocm700-mi35x-",
-              "v0.5.10rc0-rocm700-mi35x-",
+              "v0.5.10-rocm700-mi30x-",
+              "v0.5.10rc0-rocm700-mi30x-",
           ]
           matches = {prefix: [] for prefix in prefixes}
           patterns = {
@@ -139,12 +139,12 @@ jobs:
                   break
 
           if not chosen_tag:
-              raise SystemExit("No public MI35X SGLang image found for v0.5.10.")
+              raise SystemExit("No public MI30X SGLang image found for v0.5.10.")
 
           image = f"rocm/sgl-dev:{chosen_tag}"
           print(f"Resolved SGLang base image: {image}")
           if chosen_tag.startswith("v0.5.10rc0-"):
-              print("Using v0.5.10rc0 image because no public v0.5.10 MI35X tag was found.")
+              print("Using v0.5.10rc0 image because no public v0.5.10 MI30X tag was found.")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               fh.write(f"SGL_IMAGE={image}\n")
@@ -180,7 +180,6 @@ jobs:
             git checkout '${GITHUB_COMMIT_SHA}'
             git submodule sync --recursive
             git submodule update --init --recursive
-            PREBUILD_KERNELS=1 GPU_ARCHS='${GPU_ARCH}' python setup.py build_ext --inplace
             pip install -e .
             pip show amd-aiter || pip show aiter
           "
