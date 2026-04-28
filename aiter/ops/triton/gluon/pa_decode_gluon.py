@@ -18,7 +18,7 @@ try:
         launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_cxx,
     )
 except Exception:
-    FLYDSL_PS_REDUCE_AVAILABLE = False
+    CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 
 FLYDSL_PS_REDUCE_AVAILABLE = True
