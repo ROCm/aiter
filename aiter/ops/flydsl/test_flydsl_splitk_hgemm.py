@@ -248,6 +248,11 @@ def test_flydsl_kernel_name_rejects_legacy_metadata():
     with pytest.raises(ValueError, match="b_to_lds=False"):
         flydsl_kernel_name(**_make_kernel_name_kwargs(b_to_lds=True, b_preshuffle=True))
 
+    with pytest.raises(ValueError, match="b_preshuffle=False"):
+        flydsl_kernel_name(
+            **_make_kernel_name_kwargs(b_to_lds=False, b_preshuffle=True)
+        )
+
 
 def print_summary(results: list[tuple[str, str, float, float]]) -> None:
     print(f"\n{'='*70}")

@@ -161,7 +161,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         stages=stages,
         async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
-        b_preshuffle=config["b_preshuffle"],
+        b_preshuffle=config.get("b_preshuffle", False),
         auto_shuffle_b=False,
         c_to_lds=config.get("c_to_lds", False),
     )
@@ -171,7 +171,6 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
-
 
 @lru_cache(maxsize=1)
 def get_flydsl_bf16_catalog(m: int, n: int, k: int):
@@ -580,7 +579,7 @@ class Gemm:
         flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
         weight_idx = 6 if self.is_shuffle else 1
         for solidx, kernel_name, config in flydsl_catalog:
-            if config["b_preshuffle"] != self.is_shuffle:
+            if config.get("b_preshuffle", False) != self.is_shuffle:
                 continue
             if self.n < config["tile_n"] or self.n % config["tile_n"] != 0:
                 continue
