@@ -798,15 +798,17 @@ torch::Tensor
 {{{{
     static_assert(std::is_same<D_C, fp32_t>::value,
         "splitk main kernel uses fp32 workspace; D_C template param must be fp32_t "
-        "(Y is still bf16; reduce kernel does the fp32->bf16 cast)");
+        "(Y can be bf16 or fp32; reduce kernel handles the cast / passthrough)");
 
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
 
-    TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16,
-        "flatmm_splitk requires Y dtype bf16 (reduce kernel casts fp32 workspace to bf16)");
+    TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16
+                || Y.dtype() == at::ScalarType::Float,
+        "flatmm_splitk requires Y dtype bf16 or fp32 "
+        "(reduce kernel casts fp32 workspace to D_OUT)");
     TORCH_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
         "M, N, K, batch must be >= 1");
 
@@ -869,21 +871,30 @@ torch::Tensor
 
     constexpr int REDUCE_VEC = 16;
     constexpr int REDUCE_BS  = 64;
-    // Note: no padded_N % REDUCE_VEC check. The reduce kernel has a tail
-    // path (see opus_gemm_pipeline_a16w16_flatmm_splitk.cuh) that handles
-    // the (n_base + VEC > N) case with per-element scalar stores, so any
-    // N (including odd / non-power-of-16) is safe.
+    // Note: no padded_N % REDUCE_VEC check. splitk_reduce_kernel has a tail
+    // path (see splitk_reduce.cuh) that handles the (n_base + VEC > N) case
+    // with per-element scalar stores, so any N (including odd /
+    // non-power-of-16) is safe.
     dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS),
                       batch * M, 1);
     dim3 block_reduce(REDUCE_BS);
 
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
-    gemm_a16w16_flatmm_splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS>
-        <<<grid_reduce, block_reduce, 0, stream>>>(
-            reinterpret_cast<const float*>(workspace.data_ptr()),
-            reinterpret_cast<__bf16*>(Y.data_ptr()),
-            split_k, M, N, batch, padded_M, padded_N);
+    if (Y.dtype() == at::ScalarType::BFloat16) {{{{
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16>
+            <<<grid_reduce, block_reduce, 0, stream>>>(
+                reinterpret_cast<const float*>(workspace.data_ptr()),
+                reinterpret_cast<__bf16*>(Y.data_ptr()),
+                split_k, M, N, batch, padded_M, padded_N);
+    }}}} else {{{{
+        // Y.dtype() == Float per the TORCH_CHECK above.
+        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float>
+            <<<grid_reduce, block_reduce, 0, stream>>>(
+                reinterpret_cast<const float*>(workspace.data_ptr()),
+                reinterpret_cast<float*>(Y.data_ptr()),
+                split_k, M, N, batch, padded_M, padded_N);
+    }}}}
 
     return Y;
 }}}}
@@ -918,27 +929,38 @@ template torch::Tensor
         static_assert D_C==float, so referencing `splitk<bf16_t>`
         produces a linker error).
 
-        Per-kid template argument rule (the interesting bit): the map
-        *key* is (M, N, K) regardless of user Y dtype, but the *value*
-        template argument depends on the kid's `output_dtypes`:
+        Outdtype-aware bucketing
+        ------------------------
+        kernels_dict tuple keys carry the outdtype string in slot 3
+        ((M, N, K, outdtype_str), produced by get_tune_dict). The BF16
+        macro picks up rows whose outdtype is "torch.bfloat16" and the
+        FP32 macro picks up rows whose outdtype is "torch.float32";
+        same-(M,N,K) rows with different outdtypes therefore land in
+        different macros and the two C++ maps can resolve to different
+        kernels for the same shape. Legacy CSVs without an outdtype
+        column are normalized to bf16 by get_tune_dict, so they only
+        populate the BF16 map -- matching pre-outdtype-split behavior.
+
+        Per-kid template argument rule:
 
           * a16w16 kid 4..9         -> `<CTYPE>` (both bf16/fp32 exist).
           * a16w16_flatmm 100..115  -> `<CTYPE>` (both exist).
-          * a16w16_flatmm_splitk    -> always `<fp32_t>`. The BF16 map
-            therefore contains splitk entries too, but those entries
-            instantiate `splitk<fp32_t>` -- same trick opus_gemm.cu's
-            heuristic uses. Y is still bf16 because the reduce kernel
-            casts at the end.
-
-          * FP32 map excludes splitk kids entirely (their launcher
-            TORCH_CHECKs Y.dtype()==BFloat16).
+          * a16w16_flatmm_splitk    -> always `<fp32_t>`. Splitk rows
+            with outdtype=bf16 land in the BF16 map (with forced
+            <fp32_t> template arg) and rows with outdtype=fp32 land in
+            the FP32 map (also with <fp32_t>). Both work because the
+            splitk reduce kernel handles the cast / passthrough at
+            launch time based on the actual Y dtype.
         """
         HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-// Per-CTYPE (M,N,K)->kernel tables. splitk kids only live in the FP32
-// specialization of each map (the reduce kernel casts fp32->bf16 Y at
-// runtime); their BF16-map entries still reference splitk<fp32_t>.
+// Per-CTYPE (M,N,K)->kernel tables. Same (M,N,K) can resolve to
+// different kernels in the BF16 vs FP32 maps because get_tune_dict
+// keys winners on (M, N, K, outdtype_str) and gen_lookup_dict buckets
+// the rows into per-CTYPE macros below. splitk kids appear in either
+// map with their main-kernel template forced to <fp32_t> (the reduce
+// kernel handles the final Y cast at launch time).
 """
 
         # ENTRY_MATCH_CTYPE uses the CTYPE macro parameter so it expands
@@ -952,24 +974,44 @@ template torch::Tensor
        {{{MNK},                                                        \\
         {kernel_name}<fp32_t>}},                                       \\"""
 
+        # Map ctype short name -> CSV outdtype string emitted by the
+        # tuner's result_to_df.
+        ctype_to_outdtype = {
+            "bf16_t": "torch.bfloat16",
+            "fp32_t": "torch.float32",
+        }
+
         def _emit_map(f, macro_name: str, ctype: str):
             f.write(f"#define {macro_name}(CTYPE)                         \\\n")
             f.write("   {                                                                   \\")
+            target_outdtype = ctype_to_outdtype.get(ctype)
             for mnk, k in kernels_dict.items():
                 if self.istune and isinstance(mnk, int):
+                    # tune mode: id-based map, no shape / outdtype filter.
                     mnk_lit = str(mnk)
                 elif (not self.istune) and isinstance(mnk, tuple) and mnk[0] > 0:
-                    mnk_lit = "{" + ", ".join(map(str, list(mnk))) + "}"
+                    # Tuple key shape: (M, N, K, outdtype_str). Skip rows
+                    # whose outdtype doesn't match the macro we're emitting
+                    # (e.g. an fp32 row from the CSV must not pollute the
+                    # bf16 map -- C++ would resolve the same (M,N,K) to
+                    # the wrong kid for bf16 callers).
+                    if len(mnk) >= 4:
+                        row_outdtype = str(mnk[3])
+                        if (
+                            target_outdtype is not None
+                            and row_outdtype != target_outdtype
+                        ):
+                            continue
+                    # The C++ map key is still 3-wide: (M, N, K).
+                    mnk_lit = "{" + ", ".join(map(str, mnk[:3])) + "}"
                 else:
                     continue
 
                 is_splitk = k.kernel_tag == "a16w16_flatmm_splitk"
                 if is_splitk:
-                    # splitk only emits <fp32_t>; skip from FP32-output map
-                    # (launcher requires bf16 Y), include in BF16-output
-                    # map with forced <fp32_t> template argument.
-                    if ctype == "fp32_t":
-                        continue
+                    # splitk only emits <fp32_t>; the per-row outdtype
+                    # filter above already ensures we end up in the right
+                    # CTYPE bucket.
                     entry = ENTRY_FORCE_FP32
                 else:
                     if ctype not in k.output_dtypes:
@@ -1096,6 +1138,25 @@ torch::Tensor
 
 
 def get_tune_dict(tune_dict_csv):
+    """Load a tuned CSV into the lookup-dict shape consumed by gen_lookup_dict.
+
+    Key layout
+    ----------
+    Tuple keys: (M, N, K, outdtype_str). Promoting outdtype into the key
+    is what lets a single (M, N, K) shape carry distinct winners for bf16
+    vs fp32 output (the underlying main kernel hardware rules differ
+    enough that the best kid is not always the same; e.g. fp32 output
+    biases reduce-bound shapes toward larger split-K). gen_lookup_dict
+    then writes outdtype="torch.bfloat16" rows only into the BF16 (M,N,K)
+    map and outdtype="torch.float32" rows only into the FP32 (M,N,K) map.
+
+    Backwards compat
+    ----------------
+    Legacy CSVs without an `outdtype` column are interpreted as
+    bf16-output (matches what the tuner used to write). int keys from
+    default_kernels_dict are passed through untouched -- gen_lookup_dict
+    skips them via the `isinstance(mnk, tuple) and mnk[0] > 0` guard.
+    """
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
@@ -1108,13 +1169,17 @@ def get_tune_dict(tune_dict_csv):
         # column (matches aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv
         # schema; see opus_gemm_tune.py result_to_df override).
         kid_col = "solidx" if "solidx" in tune_df.columns else "kernelId"
+        has_outdtype = "outdtype" in tune_df.columns
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
+            outdtype = (
+                str(tune_df.loc[i, "outdtype"]) if has_outdtype else "torch.bfloat16"
+            )
             kid = int(tune_df.loc[i, kid_col])
             if kid in kernels_list:
-                tune_dict[(M, N, K)] = kernels_list[kid]
+                tune_dict[(M, N, K, outdtype)] = kernels_list[kid]
     return tune_dict
 
 
