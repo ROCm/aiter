@@ -49,8 +49,8 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-1
             label: MI35X
-          - runner: aiter-1gpu-runner
-            label: MI325
+          - runner: linux-aiter-mi300x-1
+            label: MI300X
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -108,6 +108,7 @@ jobs:
           name: opus-test-log-${{ matrix.runner }}
           path: latest_test.log
           if-no-files-found: warn
+          retention-days: 7
 
       - name: Cleanup container
         if: always()
