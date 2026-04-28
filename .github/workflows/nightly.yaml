@@ -133,7 +133,7 @@ jobs:
             esac
           fi
           filter="$(echo "$filter" | tr -d '[:space:]')"
-          jq_filter='
+          jq_filter="$(cat <<'JQ'
             def allowed($filter):
               if $filter == "" then true
               else
@@ -141,7 +141,8 @@ jobs:
                 | any($allowed[]; . == .runner)
               end;
             [ .[] | select(allowed($filter)) ]
-          '
+          JQ
+          )"
           echo "sglang_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/sglang_tests.json)" >> "$GITHUB_OUTPUT"
           echo "vllm_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/vllm_models.json)" >> "$GITHUB_OUTPUT"
           echo "vllm_tests_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/vllm_tests.json)" >> "$GITHUB_OUTPUT"
