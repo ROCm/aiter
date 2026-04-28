@@ -87,7 +87,7 @@ def flydsl_gdr_decode(
 ):
     device = query.device
     dtype = query.dtype
-    for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
+    for input in [key, value, a, b, dt_bias, A_log, indices, out]:
         assert input.is_contiguous()
         assert input.data_ptr() % 16 == 0
         assert input.device == device
