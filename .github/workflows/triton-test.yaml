@@ -60,7 +60,7 @@ jobs:
   build-triton:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     name: Build Triton Wheel
-    runs-on: linux-aiter-mi35x-1
+    runs-on: build-only-aiter
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
