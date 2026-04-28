@@ -153,7 +153,6 @@ def bench_mlp_single_weight_init(
 
     # -- benchmark --
     x_dtype_str = x_dtype
-    x_dtype = torch.float8_e4m3fn
 
     reps = 100
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
