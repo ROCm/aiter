@@ -18,6 +18,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import get_x_vals
 def test_ff_a16w16_ungated(
     batch: int, hidden_dim: int, intermediate_dim: int, dtype, output, activation
 ):
+    torch.manual_seed(0)
     ff_ungated_test(
         ff_a16w16_nogate,
         batch=batch,
@@ -37,6 +38,7 @@ def test_ff_a16w16_ungated(
 def test_ff_a16w16_gated(
     batch: int, hidden_dim: int, intermediate_dim: int, dtype, output, activation
 ):
+    torch.manual_seed(0)
     ff_gated_test(
         ff_a16w16_gated,
         batch=batch,

@@ -10,6 +10,7 @@ from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 def generate_qkv_inputs(
     B: int, QH_PER_KH: int, KH: int, D: int, nope: bool, nope_first: bool, dtype
 ):
+    torch.manual_seed(0)
     qkv = torch.randn(
         (B, (QH_PER_KH * KH + 2 * KH) * (D * (2 if nope else 1))),
         dtype=dtype,
