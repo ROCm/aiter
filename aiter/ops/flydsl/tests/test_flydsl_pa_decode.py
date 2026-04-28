@@ -7,6 +7,7 @@ Reference: a simple torch SDPA-style implementation over the paged KV cache.
 """
 
 import math
+import random
 
 import pytest
 import torch
@@ -72,11 +73,13 @@ def _generate_inputs(
     query_group_size: int,
     head_size: int,
     kv_block_size: int,
-    seq_len: int,
+    seq_len: int,           # interpreted as MAX seq_len when num_seqs > 1
     dtype: torch.dtype,
     seed: int = 42,
+    random_seq_lens: bool = True,
 ):
     torch.manual_seed(seed)
+    random.seed(seed)
     device = "cuda"
 
     num_q_heads = num_kv_heads * query_group_size
@@ -102,9 +105,17 @@ def _generate_inputs(
         block_tables[s] = all_blocks[idx : idx + num_blocks_per_seq]
         idx += num_blocks_per_seq
 
-    # seq_lens: use slightly varying but bounded by seq_len.
-    # For simplicity use the same value for all sequences.
-    seq_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32, device=device)
+    # seq_lens: by default randomize per-seq in [1, seq_len] when num_seqs > 1
+    # (matches gluon's `kv_varlen=True` mode). Seq 0 is pinned to the max so
+    # the launcher's `num_partitions = ceil(max_seq_len / partition_size)`
+    # is exercised at the parametrized seq_len. Tests can opt out via
+    # `random_seq_lens=False` to get a uniform batch.
+    if random_seq_lens and num_seqs > 1:
+        seq_lens_list = [random.randint(1, seq_len) for _ in range(num_seqs)]
+        seq_lens_list[0] = seq_len
+        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
+    else:
+        seq_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32, device=device)
 
     return query, key_cache, value_cache, block_tables, seq_lens
 
@@ -172,4 +183,5 @@ def test_flydsl_pa_decode(
         kv_compute_block_size=kv_compute_block_size,
     )
 
+    assert not torch.isnan(output).any(), "output contains NaN"
     torch.testing.assert_close(output, ref, atol=0.05, rtol=0.05)
