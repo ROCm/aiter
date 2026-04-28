@@ -25,8 +25,19 @@ GDR_GLOBAL_CONFIG_MAP = None
 GDR_GPU_ARCH = get_rocm_arch()
 
 
+GDR_GLOBAL_CONFIG_MAP = None
+GDR_GPU_ARCH = get_rocm_arch()
+
+
 def get_default_kwargs(
-    batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim
+    dtype_str,
+    state_dtype_str,
+    batch_size,
+    seq_length,
+    num_k_heads,
+    num_v_heads,
+    head_k_dim,
+    head_v_dim,
 ):
     d = {}
     d["NUM_BLOCKS_PER_V_DIM"] = 1
@@ -51,10 +62,15 @@ def get_default_kwargs(
                         obj["head_k_dim"],
                         obj["head_v_dim"],
                     )
-                    _dict[(arch, b, sq, nkh, nvh, khd, vhd)] = obj["config"]
+                    d_str, sd_str = obj["dtype"], obj["state_dtype"]
+                    _dict[(d_str, sd_str, arch, b, sq, nkh, nvh, khd, vhd)] = obj[
+                        "config"
+                    ]
         GDR_GLOBAL_CONFIG_MAP = _dict
     config = GDR_GLOBAL_CONFIG_MAP.get(
         (
+            dtype_str,
+            state_dtype_str,
             GDR_GPU_ARCH,
             batch_size,
             seq_length,
@@ -106,7 +122,14 @@ def flydsl_gdr_decode(
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
     kwargs_ = get_default_kwargs(
-        batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim
+        str(dtype),
+        str(state.dtype),
+        batch_size,
+        seq_length,
+        num_k_heads,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
     )
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
