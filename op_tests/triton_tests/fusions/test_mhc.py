@@ -22,8 +22,6 @@ Notation (from mHC paper arXiv:2512.24880v2):
     - layer_input: (M, C)    - Σᵢ (σ(H^pre_i) + hc_pre_eps) · x_i
 """
 
-import time
-
 import pytest
 import torch
 
