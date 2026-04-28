@@ -227,16 +227,19 @@ def _moe_gemm_a4w4_gfx1250(
     start_m = start_m.to(index_type)
     pid_n = pid_n.to(index_type)
 
-    # constants
+    # get the packed block sizes
+    # both A and B tensors are mxfp4
+    #   2 MXFP4 elements are packed into 1 int8
+    #   in the K dimension
     X_M_DIVISOR: gl.constexpr = 1
-    X_K_DIVISOR: gl.constexpr = 2
-    W_K_DIVISOR: gl.constexpr = 2
+    X_K_DIVISOR: gl.constexpr = 2 # 2 MXFP4 elements packed into 1 byte
+    W_K_DIVISOR: gl.constexpr = 2 # 2 MXFP4 elements packed into 1 byte
     W_N_DIVISOR: gl.constexpr = 1
     PACKED_BLOCK_M_X: gl.constexpr = BLOCK_M // X_M_DIVISOR
     PACKED_BLOCK_K_X: gl.constexpr = BLOCK_K // X_K_DIVISOR
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
     PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N // W_N_DIVISOR
-    MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR
+    MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR # 32 elements share 1 scale element
 
     # wmma layouts
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
