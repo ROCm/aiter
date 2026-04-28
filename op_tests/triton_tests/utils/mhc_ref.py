@@ -193,6 +193,7 @@ def sinkhorn_knopp_log_domain_torch(
     Returns:
         Doubly stochastic matrices with shape (M, N, N)
     """
+    num_iters = int(num_iters)  # Ensure int for range()
     M, N, _ = logits.shape
 
     log_A = logits.to(torch.float32)

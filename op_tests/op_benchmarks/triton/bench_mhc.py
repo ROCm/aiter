@@ -11,6 +11,7 @@ and bandwidth.
 Usage:
   python bench_mhc.py              # Benchmark mhc (pre-transformer)
   python bench_mhc.py --op post    # Benchmark mhc_post (post-transformer)
+  python bench_mhc.py --op e2e     # Benchmark full pipeline (mhc → mhc_post)
 
 - `--with-hip`: adds the HIP kernel alongside the Triton kernel.
   When passed, a silent Triton-vs-HIP correctness check runs as the first
@@ -18,18 +19,22 @@ Usage:
   AssertionError on mismatch aborts the benchmark.
 """
 
-import sys
 import argparse
 import logging
+import sys
 from itertools import product
+
 import torch
 import triton
 
-from aiter.ops.triton.fusions.mhc import mhc
-from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
+from aiter.ops.triton.fusions.mhc import mhc, mhc_post
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
+)
+from op_tests.triton_tests.utils.mhc_ref import (
+    generate_mhc_inputs,
+    generate_mhc_post_inputs,
 )
 
 arg_to_torch_dtype = {
@@ -294,8 +299,8 @@ def parse_args():
         "--op",
         type=str,
         default="pre",
-        choices=["pre", "post"],
-        help="Which operation to benchmark: 'pre' (mhc) or 'post' (mhc_post)",
+        choices=["pre", "post", "e2e"],
+        help="Which operation to benchmark: 'pre' (mhc), 'post' (mhc_post), or 'e2e' (full pipeline)",
     )
 
     # Shape parameters
@@ -494,9 +499,6 @@ def _assert_triton_matches_hip(triton_out, hip_out, *, M, n, C):
 
 def run_post_benchmark(args):
     """Run mhc_post benchmark with specified configuration."""
-    from aiter.ops.triton.fusions.mhc import mhc_post
-    from op_tests.triton_tests.utils.mhc_ref import generate_mhc_post_inputs
-
     dtype = arg_to_torch_dtype[args.dtype]
     hc_mult = 4  # Always 4 for mHC
 
@@ -710,6 +712,150 @@ def _assert_triton_matches_hip_post(triton_out, hip_out, *, M, hidden_size):
 
 
 # =============================================================================
+
+
+# =============================================================================
+# E2E (End-to-End) Pipeline Benchmark
+# =============================================================================
+#
+# Pipeline Overview:
+#
+# x_l (m, n, C)  ──┐
+#                  │
+#                  ├──> mhc() ──> (h_post, h_res, layer_input)
+#                  │                                 │
+#                  │                                 ├──> layer_input (m, C)
+#                  │                                 │
+#                  │                                 v
+#                  └──────────────────────────> mhc_post() ──> x_l+1 (m, n, C)
+#                                                   │
+#                                                   └──> Uses (layer_input, x_l, h_post, h_res)
+#
+
+
+def run_e2e_benchmark(args):
+    """
+    Run E2E benchmark for the full mhc → mhc_post pipeline.
+
+    Tests: x_l → mhc() → layer_input → mhc_post() → x_l+1
+    """
+    from aiter.ops.triton.fusions.mhc import mhc_post
+
+    dtype = arg_to_torch_dtype[args.dtype]
+    sinkhorn_iters = args.sinkhorn_iters
+
+    configs = get_benchmark_configs(args)
+    x_vals_list = configs
+    x_names = ["M", "n", "C"]
+
+    # Determine which metrics to report
+    if args.metric == "all" or args.metric is None:
+        metrics = ["time-ms", "tflops", "gbps"]
+    else:
+        metrics = [args.metric]
+
+    # Build provider names that encode which metric to return
+    line_vals = []
+    for metric in metrics:
+        line_vals.append(f"triton-e2e_{metric}")
+
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        line_arg="provider",
+        line_vals=line_vals,
+        line_names=[m.replace("-", " ") for m in line_vals],
+        styles=[("blue", "-"), ("green", "-"), ("red", "-"), ("orange", "-")],
+        ylabel=metrics[0] if len(metrics) == 1 else "",
+        plot_name=f"mhc-e2e-{args.dtype}",
+        args={},
+    )
+
+    @triton.testing.perf_report([benchmark])
+    def bench_wrapper(M, n, C, provider):
+        """Benchmark E2E pipeline for given configuration."""
+        # Generate inputs using shared utility
+        x_l_flat, phi, alpha_pre, alpha_post, alpha_res, bias, _ = generate_mhc_inputs(
+            M, n, C, dtype
+        )
+        eps = 1e-6
+        hc_pre_eps = 1e-6
+        hc_post_mult_value = 1.0
+
+        K = n * C
+
+        def bench_fn():
+            """Run one iteration of the E2E pipeline."""
+            # Step 1: mhc (Triton)
+            h_post, h_res, layer_input = mhc(
+                x_l_flat,
+                phi,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                bias,
+                n,
+                eps,
+                hc_pre_eps,
+                hc_post_mult_value,
+                sinkhorn_iters,
+                None,  # config
+            )
+
+            # Reconstruct x_l for mhc_post
+            x_l = x_l_flat.view(M, n, C)
+
+            # Step 2: mhc_post (Triton)
+            x_l_plus_1 = mhc_post(
+                None,  # Let it allocate
+                layer_input,
+                x_l,
+                h_post,
+                h_res,
+                None,  # config
+            )
+            return x_l_plus_1
+
+        # Benchmark
+        quantiles = [0.5, 0.2, 0.8]
+        ms, min_ms, max_ms = triton.testing.do_bench(bench_fn, quantiles=quantiles)
+
+        # Compute metrics
+        # mhc_pre: matmul + RMSNorm + Sinkhorn + fusion ops
+        # mhc_post: matmul + residual fusion
+        flops = 2 * M * K * K * 2  # Approximate
+        element_size = 2  # bf16
+        bytes_io = M * K * element_size * 4  # rough estimate
+
+        # Return requested metric based on provider string
+        if "time-ms" in provider:
+            return ms
+        elif "tflops" in provider:
+            return flops / ms * 1e-9
+        elif "gbps" in provider:
+            return bytes_io / ms * 1e-6
+        return ms
+
+    bench_wrapper.run(save_path="." if args.o else None, print_data=True)
+
+
+def main_e2e(args):
+    """Main entry point for E2E (mhc → mhc_post) pipeline benchmark."""
+    # No HIP validation for E2E yet
+
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for mhc E2E Triton kernels...")
+
+        def fun():
+            return run_e2e_benchmark(args)
+
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
+
+    run_e2e_benchmark(args)
+    return 0
+
+
 # Main Entry Points
 # =============================================================================
 
@@ -721,6 +867,8 @@ def main():
     # Route to appropriate benchmark based on --op flag
     if args.op == "post":
         return main_post(args)
+    elif args.op == "e2e":
+        return main_e2e(args)
     else:
         return main_pre(args)
 
