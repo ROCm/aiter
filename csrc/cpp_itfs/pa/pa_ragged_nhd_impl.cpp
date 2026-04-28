@@ -271,6 +271,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
     uint kv_len_end = std::min(kv_part * KV_PART_SIZE + KV_PART_SIZE, kv_len);
     kv_page_indices += kv_indptr[b];
+    if(!kv_page_indices) return; // add protection
     out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S;
     max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
     sum_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
