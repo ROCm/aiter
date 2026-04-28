@@ -6,7 +6,9 @@ import torch
 
 
 def _get_compiled(fn):
-    return torch.compile(fn, backend="inductor", fullgraph=True, options={"max_autotune": True})
+    return torch.compile(
+        fn, backend="inductor", fullgraph=True, options={"max_autotune": True}
+    )
 
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max

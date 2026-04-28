@@ -7,7 +7,9 @@ import torch.nn.functional as F
 
 
 def _get_compiled(fn):
-    return torch.compile(fn, backend="inductor", fullgraph=True, options={"max_autotune": True})
+    return torch.compile(
+        fn, backend="inductor", fullgraph=True, options={"max_autotune": True}
+    )
 
 
 def torch_softmax(x, dim=-1):
