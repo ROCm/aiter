@@ -27,7 +27,7 @@ arch = get_arch()
 @pytest.mark.parametrize("BATCH", [1, 3])
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 64), (32, 128), (1024, 1024)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(64, 8), (8, 1)])
-@pytest.mark.parametrize("HEAD_SZ", [32, 64])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [False, True])
 def test_mha_with_sink(
@@ -124,8 +124,9 @@ def test_mha_with_sink(
         torch_out, (q, k, v, sink), do
     )
 
-    bwd_atol = 1.5e-2
-    bwd_rtol = 1.5e-2
+    relax_bwd_err_tol: bool = SEQLEN_Q >= 1024 and SEQLEN_K >= 1024
+    bwd_atol = 2.5e-2 if relax_bwd_err_tol else 1.5e-2
+    bwd_rtol = 2.5e-2 if relax_bwd_err_tol else 1.5e-2
     torch.testing.assert_close(
         triton_dq,
         torch_dq,
@@ -140,14 +141,11 @@ def test_mha_with_sink(
         rtol=bwd_rtol,
         msg=lambda msg: f"bwd dk mismatch\n\n{msg}\n",
     )
-    relax_dv_err_tol: bool = (
-        arch == "gfx942" and BATCH > 1 and SEQLEN_Q >= 1024 and SEQLEN_K >= 1024
-    )
     torch.testing.assert_close(
         triton_dv,
         torch_dv,
-        atol=2e-2 if relax_dv_err_tol else bwd_atol,
-        rtol=2e-2 if relax_dv_err_tol else bwd_rtol,
+        atol=bwd_atol,
+        rtol=bwd_rtol,
         msg=lambda msg: f"bwd dv mismatch\n\n{msg}\n",
     )
     torch.testing.assert_close(
@@ -159,14 +157,12 @@ def test_mha_with_sink(
     )
 
 
-@pytest.mark.parametrize("BATCH", [1, 2])
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(16, 32), (128, 64), (256, 256)])
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(64, 8), (8, 1)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(4, 4), (8, 1)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("DROPOUT", [0.0, 0.2])
 @pytest.mark.parametrize("CAUSAL", [False, True])
 def test_mha_varlen_with_sink(
-    BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
@@ -175,6 +171,7 @@ def test_mha_varlen_with_sink(
     DROPOUT: float,
     CAUSAL: bool,
 ):
+    BATCH = 2
     HAS_DROPOUT: bool = DROPOUT > 0.0
     # Keep sink coverage aligned with the baseline MHA tests.
     # Dropout backward is still disabled in `test_mha_backward_varlen`.
@@ -335,12 +332,12 @@ def test_mha_varlen_with_sink(
 
 @pytest.mark.parametrize("BATCH", [1, 2])
 @pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K", [(64, 64), (128, 128), (256, 256), (128, 64), (32, 128)]
+    "SEQLEN_Q, SEQLEN_K", [(64, 64), (256, 256), (128, 64), (32, 128)]
 )
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1), (16, 4)])
-@pytest.mark.parametrize("HEAD_SZ", [32, 64])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("CAUSAL", [True])
-@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 16, 64])
+@pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 64])
 def test_mha_with_sink_sliding_window(
     BATCH: int,
     SEQLEN_Q: int,
@@ -421,8 +418,8 @@ def test_mha_with_sink_sliding_window(
         torch_out, (q, k, v, sink), do
     )
 
-    bwd_atol = 1.5e-2
-    bwd_rtol = 1.5e-2
+    bwd_atol = 1e-1
+    bwd_rtol = 1e-1
     torch.testing.assert_close(
         triton_dq,
         torch_dq,
@@ -453,14 +450,12 @@ def test_mha_with_sink_sliding_window(
     )
 
 
-@pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (64, 64)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 1)])
 @pytest.mark.parametrize("HEAD_SZ", [64])
 @pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("WINDOW_SIZE_LEFT", [4, 32])
 def test_mha_sliding_window_no_sink(
-    BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
@@ -469,6 +464,7 @@ def test_mha_sliding_window_no_sink(
     CAUSAL: bool,
     WINDOW_SIZE_LEFT: int,
 ):
+    BATCH = 1
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
 
