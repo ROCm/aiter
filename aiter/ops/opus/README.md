@@ -28,9 +28,17 @@ First call triggers a JIT build of `module_deepgemm_opus` (~30-45s on
 the dev container). Subsequent Python processes reuse the compiled
 `.so`.
 
-**Inputs**: `A` is `[M, K]` or `[batch, M, K]` bf16; `B` is `[N, K]`
-bf16 (plain layout, not pre-shuffled). **Output**: `[M, N]` or
-`[batch, M, N]`.
+**Inputs**: `A` is `[M, K]` or `[batch, M, K]` bf16. `B` is bf16
+(plain layout, not pre-shuffled) in one of two shapes:
+
+- `[N, K]` — only when `batch == 1`.
+- `[batch, N, K]` — must be contiguous (strides `(N*K, K, 1)`); broadcast
+  views like `B.unsqueeze(0).expand(batch, -1, -1)` are rejected because
+  the opus launcher hardcodes `stride_b_batch == N*K`. Use
+  `B.expand(batch, -1, -1).contiguous()` (or pass a real per-batch
+  weight) when you need to broadcast.
+
+**Output**: `[M, N]` or `[batch, M, N]`.
 
 Not currently supported (returns `NotImplementedError`): `bias`,
 pre-shuffled B, non-bf16 A/B. Scale / FP8 paths are handled by other
@@ -136,7 +144,7 @@ Primary user entry. Implemented in
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `A` | Tensor | required | `[M, K]` or `[batch, M, K]` bf16 |
-| `B` | Tensor | required | `[N, K]` bf16 (plain layout) |
+| `B` | Tensor | required | `[N, K]` (batch=1 only) or contiguous `[batch, N, K]` bf16; broadcast views are rejected (see §1) |
 | `bias` | Tensor? | `None` | Must be `None`; opus kernels compile with `HAS_BIAS=false` |
 | `dtype` | torch.dtype | `bf16` | Output dtype; fp32 is supported but splitk kids (bf16-only Y) are skipped on the fp32 path |
 | `kernelId` | int? | `None` | Override: skip CSV/heuristic and launch this specific instance |
@@ -147,8 +155,11 @@ Primary user entry. Implemented in
 
 Low-level id-based dispatcher. Used by the tuner and the high-level
 wrapper. Accepts 3D inputs only (`[batch, M, K]`, `[batch, N, K]`,
-`[batch, M, N]`). Prefer `gemm_a16w16_opus` unless you need explicit
-control.
+`[batch, M, N]`) and requires contiguous strides on all three tensors
+(`(M*K, K, 1)`, `(N*K, K, 1)`, `(M*N, N, 1)` respectively); a Python
+guard raises `NotImplementedError` for broadcast / transpose / slice
+views before launching the kernel. Prefer `gemm_a16w16_opus` unless you
+need explicit control.
 
 ### Legacy shim
 
