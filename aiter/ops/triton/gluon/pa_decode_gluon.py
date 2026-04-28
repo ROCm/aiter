@@ -12,14 +12,13 @@ import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
 
-CXX_PS_REDUCE_AVAILABLE = False
+CXX_PS_REDUCE_AVAILABLE = True
 try:
     from csrc.cpp_itfs.pa.pa_ps import (
         launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_cxx,
     )
-
-    CXX_PS_REDUCE_AVAILABLE = True
 except Exception:
+    FLYDSL_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 
 FLYDSL_PS_REDUCE_AVAILABLE = True
