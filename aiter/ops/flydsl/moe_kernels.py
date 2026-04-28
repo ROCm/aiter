@@ -59,6 +59,28 @@ def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
     return None
 
 
+def _x_load_supported(
+    a_dtype: str,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    use_async_copy: bool,
+) -> bool:
+    """Mirror X-load compile-time constraints before creating tune tasks."""
+    elem_bytes = 2 if a_dtype in ("fp16", "bf16", "int4_bf16") else 1
+    total_threads = (tile_n // 32) * 64
+    bytes_x_per_tile = tile_m * tile_k * elem_bytes
+    if bytes_x_per_tile % total_threads != 0:
+        return False
+
+    bytes_per_thread_x = bytes_x_per_tile // total_threads
+    if a_dtype in ("fp16", "bf16", "int4_bf16"):
+        return bytes_per_thread_x % 16 == 0
+    if use_async_copy:
+        return bytes_per_thread_x % 16 == 0
+    return bytes_per_thread_x % 4 == 0
+
+
 def get_flydsl_stage1_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str, model_dim: Optional[int] = None
 ) -> Dict[str, Dict]:
@@ -84,6 +106,8 @@ def get_flydsl_stage1_kernels(
         for tn in tile_ns:
             for tk in tile_ks:
                 for async_copy in async_copies:
+                    if not _x_load_supported(a_dtype, tm, tn, tk, async_copy):
+                        continue
                     for wpe in waves_per_eus:
                         for kb in k_batches if wpe == 3 else [1]:
                             if is_fp4:
@@ -156,6 +180,8 @@ def get_flydsl_stage2_kernels(
             for tk in tile_ks:
                 for mode in modes:
                     for async_copy in async_copies:
+                        if not _x_load_supported(a_dtype, tm, tn, tk, async_copy):
+                            continue
                         for wpe in waves_per_eus:
                             for bnt in b_nts:
                                 base_name = flydsl_kernel_name(

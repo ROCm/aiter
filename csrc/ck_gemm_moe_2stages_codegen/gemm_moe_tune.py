@@ -465,6 +465,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights=sorted_weights,
             sort_block_m=sort_block_m,
             persist=persist,
+            use_async_copy=kparams.get("use_async_copy", False),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
         )
