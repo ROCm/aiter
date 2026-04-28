@@ -3796,20 +3796,6 @@ def compile_mixed_moe_gemm2(
                     lds_out,
                     lds_col_remap=None,
                 ):
-                    # Match origin/dev_a16w4: rely on sentinel padded rows + hardware OOB behavior.
-                    fused2 = buffer_ops.buffer_load(
-                        sorted_rsrc, row, vec_width=1, dtype=T.i32
-                    )
-                    t2 = fused2 & mask24_i32
-                    s2 = fused2 >> 24
-
-                    t_ok = arith.cmpi(CmpIPredicate.ult, t2, tokens_i32)
-                    s_ok = arith.cmpi(CmpIPredicate.ult, s2, topk_i32_v)
-                    ts_ok = arith.andi(t_ok, s_ok)
-                    t2_safe = arith.select(ts_ok, t2, arith.constant(0))
-                    s2_safe = arith.select(ts_ok, s2, arith.constant(0))
-                    t2_safe * topk_i32_v + s2_safe
-
                     if doweight_stage2:
                         tw_idx = (mi * 4) + ii
                         if tw_pf is not None:
