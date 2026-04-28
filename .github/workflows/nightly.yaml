@@ -57,6 +57,11 @@ on:
           - pr-test-amd
           - pr-test-amd-rocm720
         default: 'all'
+      runner_filter:
+        description: 'Comma-separated runner labels to include (e.g. linux-aiter-mi300x-1,linux-aiter-mi300x-2)'
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -100,11 +105,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: Load model configs from JSON
         id: load
+        env:
+          RUNNER_FILTER: ${{ github.event.inputs.runner_filter || '' }}
         run: |
-          echo "sglang_matrix=$(cat .github/configs/sglang_tests.json | jq -c .)" >> "$GITHUB_OUTPUT"
-          echo "vllm_matrix=$(cat .github/configs/vllm_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
-          echo "vllm_tests_matrix=$(cat .github/configs/vllm_tests.json | jq -c .)" >> "$GITHUB_OUTPUT"
-          echo "atom_matrix=$(cat .github/configs/atom_models.json | jq -c .)" >> "$GITHUB_OUTPUT"
+          set -eo pipefail
+          filter="${RUNNER_FILTER}"
+          jq_filter='
+            def allowed($filter):
+              if $filter == "" then true
+              else
+                ($filter | split(",") | map(gsub("^\\s+|\\s+$";""))) as $allowed
+                | any($allowed[]; . == .runner)
+              end;
+            [ .[] | select(allowed($filter)) ]
+          '
+          echo "sglang_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/sglang_tests.json)" >> "$GITHUB_OUTPUT"
+          echo "vllm_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/vllm_models.json)" >> "$GITHUB_OUTPUT"
+          echo "vllm_tests_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/vllm_tests.json)" >> "$GITHUB_OUTPUT"
+          echo "atom_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/atom_models.json)" >> "$GITHUB_OUTPUT"
 
   # ── SGLang Integration ───────────────────────────────────────────────
   sglang:

@@ -32,12 +32,18 @@ on:
         type: string
         required: false
         default: '3.10,3.12'
+      runner_filter:
+        description: 'Comma-separated runner labels to include (e.g. linux-aiter-mi300x-1,linux-aiter-mi300x-2)'
+        type: string
+        required: false
+        default: ''
 
 jobs:
   test:
     if: ${{ inputs.skip_smoke != 'true' }}
     env:
       PYTHON_FILTER: ${{ inputs.python_versions != '' && inputs.python_versions || '3.10,3.12' }}
+      RUNNER_FILTER: ${{ inputs.runner_filter || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -70,11 +76,25 @@ jobs:
         shell: bash
         env:
           FILTER: ${{ env.PYTHON_FILTER }}
+          RUNNER_FILTER: ${{ env.RUNNER_FILTER }}
           PY_VER: ${{ matrix.python_version }}
+          RUNNER_LABEL: ${{ matrix.runner }}
         run: |
-          filter=",$(echo "${FILTER:-}" | tr -d '[:space:]'),"
-          py=",${PY_VER},"
-          if [[ "$filter" == *"$py"* ]]; then
+          run_selected=true
+          py_filter=",$(echo "${FILTER:-}" | tr -d '[:space:]'),"
+          py_value=",${PY_VER},"
+          if [[ "$py_filter" != *"$py_value"* ]]; then
+            run_selected=false
+          fi
+          runner_filter_trimmed="$(echo "${RUNNER_FILTER:-}" | tr -d '[:space:]')"
+          if [[ "$run_selected" == "true" && -n "$runner_filter_trimmed" ]]; then
+            runner_filter=",$runner_filter_trimmed,"
+            runner_value=",${RUNNER_LABEL},"
+            if [[ "$runner_filter" != *"$runner_value"* ]]; then
+              run_selected=false
+            fi
+          fi
+          if [[ "$run_selected" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -83,7 +103,7 @@ jobs:
       - name: Skip unselected python version
         if: ${{ steps.filter.outputs.run != 'true' }}
         run: |
-          echo "Skipping matrix for python ${{ matrix.python_version }} (filter: ${{ env.PYTHON_FILTER }})"
+          echo "Skipping matrix entry for python ${{ matrix.python_version }} runner ${{ matrix.runner }} (python filter: ${{ env.PYTHON_FILTER }}, runner filter: ${{ env.RUNNER_FILTER }})"
 
       - name: Checkout code
         if: ${{ steps.filter.outputs.run == 'true' }}
