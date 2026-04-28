@@ -22,6 +22,7 @@ def torch_routing_sigmoid_top1(x, w, topk=1):
 def test_compile_moe_routing(M, K, N):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     topk = 1
     x = torch.randn(M, K, device="cuda", dtype=torch.float16)
     w = torch.randn(K, N, device="cuda", dtype=torch.float16)

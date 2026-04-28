@@ -20,6 +20,7 @@ def torch_topk(x, k):
 def test_compile_topk(M, N, k):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     x = torch.randn(M, N, device="cuda", dtype=torch.float32)
 
     values_eager, indices_eager = torch_topk(x, k)

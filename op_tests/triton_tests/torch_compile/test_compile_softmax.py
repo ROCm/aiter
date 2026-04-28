@@ -21,6 +21,7 @@ def torch_softmax(x, dim=-1):
 def test_compile_softmax(M, N, dtype):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     x = torch.randn(M, N, device="cuda", dtype=dtype)
 
     out_eager = torch_softmax(x)

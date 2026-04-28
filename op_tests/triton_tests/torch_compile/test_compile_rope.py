@@ -51,6 +51,7 @@ def torch_rope_gptj(x, cos, sin):
 def test_compile_rope(S, B, H, D, dtype, rotate_style):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     device = "cuda"
     x = torch.randn(S, B, H, D, device=device, dtype=dtype)
     cos, sin = generate_cos_sin(S, D, device, dtype)

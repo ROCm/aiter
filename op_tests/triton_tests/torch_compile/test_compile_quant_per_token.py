@@ -26,6 +26,7 @@ def torch_dynamic_per_token_quant_fp8(x):
 def test_compile_quant_per_token(M, N):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     x = torch.randn(M, N, device="cuda", dtype=torch.float16)
 
     qx_eager, scale_eager = torch_dynamic_per_token_quant_fp8(x)

@@ -22,6 +22,7 @@ def torch_rmsnorm(x, weight, eps):
 def test_compile_rmsnorm(M, N, dtype):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     eps = 1e-6
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     weight = torch.ones(N, device="cuda", dtype=dtype)

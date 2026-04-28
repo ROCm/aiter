@@ -23,6 +23,7 @@ def torch_gemm(x, w, bias=None):
 def test_compile_gemm(M, N, K, dtype):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     x = torch.randn(M, K, device="cuda", dtype=dtype)
     w = torch.randn(N, K, device="cuda", dtype=dtype)
 
@@ -44,6 +45,7 @@ def test_compile_gemm(M, N, K, dtype):
 def test_compile_gemm_with_bias(M, N, K, dtype):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
+    torch._dynamo.reset()
     x = torch.randn(M, K, device="cuda", dtype=dtype)
     w = torch.randn(N, K, device="cuda", dtype=dtype)
     bias = torch.randn(N, device="cuda", dtype=dtype)
