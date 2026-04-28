@@ -143,10 +143,10 @@ jobs:
             [ .[] | select(allowed($filter)) ]
           JQ
           )"
-          echo "sglang_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/sglang_tests.json)" >> "$GITHUB_OUTPUT"
-          echo "vllm_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/vllm_models.json)" >> "$GITHUB_OUTPUT"
-          echo "vllm_tests_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/vllm_tests.json)" >> "$GITHUB_OUTPUT"
-          echo "atom_matrix=$(jq -c --arg filter \"$filter\" \"$jq_filter\" .github/configs/atom_models.json)" >> "$GITHUB_OUTPUT"
+          echo "sglang_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/sglang_tests.json)" >> "$GITHUB_OUTPUT"
+          echo "vllm_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/vllm_models.json)" >> "$GITHUB_OUTPUT"
+          echo "vllm_tests_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/vllm_tests.json)" >> "$GITHUB_OUTPUT"
+          echo "atom_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/atom_models.json)" >> "$GITHUB_OUTPUT"
 
   # ── SGLang Integration ───────────────────────────────────────────────
   sglang:
