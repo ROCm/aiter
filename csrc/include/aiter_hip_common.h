@@ -144,6 +144,15 @@ struct AiterAsmKernelArgs
 
 static const std::string get_gpu_arch();
 
+// ASM kernel loading requires embedded HSA blobs (provided by QoLA at build
+// time via -DAITER_EMBEDDED_HSA_HEADER). Consumers that only need type
+// definitions (e.g. aiter::mha_fwd_args) can include this header without the
+// embedded blobs.
+#ifdef AITER_EMBEDDED_HSA_HEADER
+#if !defined(AITER_EMBEDDED_HSA_MAP)
+#error "AITER_EMBEDDED_HSA_HEADER is defined but AITER_EMBEDDED_HSA_MAP is missing."
+#endif
+
 namespace aiter_detail {
 // Taken from
 // https://github.com/llvm/llvm-project/blob/b0230f59969b9e8e7e0aff44cd34718987098462/llvm/lib/Frontend/Offloading/OffloadWrapper.cpp#L226
@@ -244,39 +253,13 @@ class AiterAsmKernel: private AiterAsmKernelFast
 
     const void* load_hsaco_file(const char* kernel_name, const char* hsaco_path)
     {
-        const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::string arch_name     = get_gpu_arch();
-        if(AITER_ASM_DIR != nullptr)
-        {
-            std::string full_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco_path;
-            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: " << full_path);
-
-            std::ifstream file(full_path, std::ios::binary | std::ios::ate);
-
-            AITER_CHECK(file.is_open(), "failed to open ", full_path.c_str());
-
-            size_t file_size = file.tellg();
-            hsaco_data.reset(new char[file_size]);
-
-            file.seekg(0, std::ios::beg);
-            AITER_CHECK(
-                file.read(hsaco_data.get(), file_size), "failed to read ", full_path.c_str());
-            return hsaco_data.get();
-        }
-        else
-        {
-#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
-            std::string fname = "hsa/" + arch_name + "/" + hsaco_path;
-            auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
-            AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
-            AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
-            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: [embedded] " << fname);
-            return hasco_obj->second.data();
-#else
-            AITER_CHECK(AITER_ASM_DIR != nullptr, "AITER_ASM_DIR not set");
-            return nullptr;
-#endif
-        }
+        std::string arch_name = get_gpu_arch();
+        std::string fname     = "hsa/" + arch_name + "/" + hsaco_path;
+        auto hasco_obj        = AITER_EMBEDDED_HSA_MAP.find(fname);
+        AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
+        AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
+        AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: [embedded] " << fname);
+        return hasco_obj->second.data();
     }
 
     public:
@@ -290,6 +273,8 @@ class AiterAsmKernel: private AiterAsmKernelFast
 
 
 } // namespace
+
+#endif // AITER_EMBEDDED_HSA_HEADER
 
 static const std::string get_gpu_arch()
 {
