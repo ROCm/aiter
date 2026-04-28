@@ -815,6 +815,7 @@ def _flydsl_stage2_wrapper(
         a2_scale=a2_scale,
         sorted_weights=sorted_weights,
         sort_block_m=parsed.get("sort_block_m", 0),
+        use_async_copy=parsed.get("use_async_copy", False),
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
         # Keep stage2 persist behavior aligned with kernel naming.
