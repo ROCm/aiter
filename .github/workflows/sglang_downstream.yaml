@@ -136,7 +136,6 @@ jobs:
             git checkout '${GITHUB_COMMIT_SHA}'
             git submodule sync --recursive
             git submodule update --init --recursive
-            PREBUILD_KERNELS=1 GPU_ARCHS='${GPU_ARCH}' python setup.py build_ext --inplace
             pip install -e .
             pip show amd-aiter || pip show aiter
           "
