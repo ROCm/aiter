@@ -57,13 +57,13 @@ on:
           - pr-test-amd
           - pr-test-amd-rocm720
         default: 'all'
-      gpu_runner_group:
-        description: 'Runner group to target (mi300, mi350, or both)'
+      gpu_arch_filter:
+        description: 'Target runner architecture (gfx942, gfx950, or both)'
         type: choice
         options:
           - both
-          - mi300
-          - mi350
+          - gfx942
+          - gfx950
         default: 'both'
       runner_filter:
         description: 'Comma-separated runner labels to include (e.g. linux-aiter-mi300x-1,linux-aiter-mi300x-2)'
@@ -114,17 +114,17 @@ jobs:
       - name: Load model configs from JSON
         id: load
         env:
-          RUNNER_GROUP: ${{ github.event.inputs.gpu_runner_group || 'both' }}
+          GPU_ARCH_FILTER: ${{ github.event.inputs.gpu_arch_filter || 'both' }}
           RUNNER_FILTER_INPUT: ${{ github.event.inputs.runner_filter || '' }}
         run: |
           set -eo pipefail
           filter="${RUNNER_FILTER_INPUT}"
           if [ -z "$filter" ]; then
-            case "${RUNNER_GROUP}" in
-              mi300)
-                filter="linux-aiter-mi300x-1,linux-aiter-mi300x-2,linux-aiter-mi300x-4,linux-aiter-mi300x-8"
+            case "${GPU_ARCH_FILTER}" in
+              gfx942)
+                filter="linux-aiter-mi300x-1,linux-aiter-mi300x-2,linux-aiter-mi300x-4,linux-aiter-mi300x-8,aiter-1gpu-runner,aiter-8gpu-runner"
                 ;;
-              mi350)
+              gfx950)
                 filter="linux-aiter-mi35x-1,linux-aiter-mi35x-8,linux-aiter-mi355-1,linux-aiter-mi355-8"
                 ;;
               *)
@@ -263,7 +263,7 @@ jobs:
 
   # ── ATOM Accuracy ──────────────────────────────────────────────────
   atom:
-    name: "ATOM (${{ matrix.model_name }})"
+    name: "ATOM (${{ matrix.model_name }}, ${{ matrix.gpu_arch }})"
     needs: [build, load-configs]
     if: >-
       always() &&
@@ -285,6 +285,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           AITER_VERSION: ${{ github.event.inputs.aiter_version }}
           ATOM_ENV_VARS: ${{ matrix.env_vars }}
+          ATOM_GPU_ARCH: ${{ matrix.gpu_arch }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
           bash .github/scripts/run_atom.sh \
@@ -296,7 +297,7 @@ jobs:
       - name: Upload logs
         uses: actions/upload-artifact@v4
         with:
-          name: atom-${{ matrix.model_name }}
+          name: atom-${{ matrix.model_name }}-${{ matrix.gpu_arch }}
           path: atom_nightly_*.txt
 
   # ── Promote ────────────────────────────────────────────────────────

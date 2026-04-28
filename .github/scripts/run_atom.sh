@@ -34,12 +34,14 @@ ATOM_BRANCH="${ATOM_BRANCH:-main}"
 ATOM_REPO="${ATOM_REPO:-ROCm/ATOM}"
 SHORT_SHA="${AITER_SHA:0:7}"
 WORKDIR="${GITHUB_WORKSPACE:-.}"
+ATOM_GPU_ARCH="${ATOM_GPU_ARCH:-gfx950}"
 
 echo "=== ATOM Accuracy Test ==="
 echo "AITER SHA:   ${AITER_SHA}"
 echo "Model:       ${MODEL_PATH}"
 echo "Threshold:   ${THRESHOLD}"
 echo "Extra args:  ${EXTRA_ARGS}"
+echo "GPU arch:    ${ATOM_GPU_ARCH}"
 echo ""
 
 # ── Checkout ATOM into workspace ──
@@ -63,7 +65,7 @@ cat >> "${ATOM_DIR}/Dockerfile.nightly" <<EOF
 RUN rm -rf /app/aiter-test && git clone https://github.com/ROCm/aiter.git /app/aiter-test && \
     cd /app/aiter-test && git checkout ${AITER_SHA} && \
     git submodule sync && git submodule update --init --recursive && \
-    MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
+    MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=${ATOM_GPU_ARCH} pip install -e .
 EOF
 
 echo 'RUN echo "=== AITER version ===" && pip show amd-aiter || true' >> "${ATOM_DIR}/Dockerfile.nightly"
