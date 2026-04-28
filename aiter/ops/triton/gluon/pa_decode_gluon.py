@@ -12,7 +12,17 @@ import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
 
-FLYDSL_PS_REDUCE_AVAILABLE = False
+CXX_PS_REDUCE_AVAILABLE = False
+try:
+    from csrc.cpp_itfs.pa.pa_ps import (
+        launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_cxx,
+    )
+
+    CXX_PS_REDUCE_AVAILABLE = True
+except Exception:
+    launch_pa_decode_ps_reduce_cxx = None
+
+FLYDSL_PS_REDUCE_AVAILABLE = True
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -4703,9 +4713,14 @@ def compile_pa_decode_ps_reduce_flydsl(
                 part_max = arith.select(lane_in_range, part_max_raw, c_neg_inf)
 
             global_max = _wave_reduce_max(part_max)
+            safe_global_max = arith.select(
+                global_max > c_neg_inf,
+                global_max,
+                c_zero_f,
+            )
             part_scale = arith.select(
-                lane_in_range,
-                ((part_max - global_max) * c_log2e).exp2(fastmath=fm_fast),
+                part_max > c_neg_inf,
+                ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
                 c_zero_f,
             )
             scaled_sum = part_sum * part_scale
@@ -4726,9 +4741,12 @@ def compile_pa_decode_ps_reduce_flydsl(
                         sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
                     )
                     sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                global_exp_sum = global_exp_sum + (
-                    (sink_value - global_max) * c_log2e
-                ).exp2(fastmath=fm_fast)
+                sink_scale = arith.select(
+                    global_max > c_neg_inf,
+                    ((sink_value - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
+                    c_zero_f,
+                )
+                global_exp_sum = global_exp_sum + sink_scale
             safe_global_exp_sum = arith.select(
                 global_exp_sum > c_zero_f,
                 global_exp_sum,
@@ -4788,6 +4806,11 @@ def compile_pa_decode_ps_reduce_flydsl(
                 chunk_max = _block_reduce(part_max, "max")
                 global_max = global_max.maximumf(chunk_max)
 
+            safe_global_max = arith.select(
+                global_max > c_neg_inf,
+                global_max,
+                c_zero_f,
+            )
             global_exp_sum = c_zero_f
             for chunk_base in range(0, max_context_partition_num, block_threads):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
@@ -4810,8 +4833,8 @@ def compile_pa_decode_ps_reduce_flydsl(
                 part_sum = arith.select(in_chunk, part_sum_raw, c_zero_f)
                 part_max = arith.select(in_chunk, part_max_raw, c_neg_inf)
                 part_scale = arith.select(
-                    in_chunk,
-                    ((part_max - global_max) * c_log2e).exp2(fastmath=fm_fast),
+                    part_max > c_neg_inf,
+                    ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
                     c_zero_f,
                 )
                 chunk_sum = _block_reduce(part_sum * part_scale, "sum")
@@ -4833,9 +4856,12 @@ def compile_pa_decode_ps_reduce_flydsl(
                         sink_rsrc, sink_off, vec_width=1, dtype=T.bf16
                     )
                     sink_value = _mlir_arith.ExtFOp(T.f32, sink_value_raw).result
-                global_exp_sum = global_exp_sum + (
-                    (sink_value - global_max) * c_log2e
-                ).exp2(fastmath=fm_fast)
+                sink_scale = arith.select(
+                    global_max > c_neg_inf,
+                    ((sink_value - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
+                    c_zero_f,
+                )
+                global_exp_sum = global_exp_sum + sink_scale
 
             safe_global_exp_sum = arith.select(
                 global_exp_sum > c_zero_f,
@@ -4864,8 +4890,10 @@ def compile_pa_decode_ps_reduce_flydsl(
                 if in_chunk:
                     part_sum = part_sum_raw
                     part_max = part_max_raw
-                    part_scale = ((part_max - global_max) * c_log2e).exp2(
-                        fastmath=fm_fast
+                    part_scale = arith.select(
+                        part_max > c_neg_inf,
+                        ((part_max - safe_global_max) * c_log2e).exp2(fastmath=fm_fast),
+                        c_zero_f,
                     )
                     weight = (part_sum * part_scale) / safe_global_exp_sum
                     part_idx_idx = arith.index_cast(T.index, part_i32)
@@ -5037,6 +5065,7 @@ def launch_pa_decode_ps_reduce_flydsl(
         stride_logits_group,
         output_ptr.shape[0],
         output_ptr.shape[2],
+        torch.cuda.current_stream(output_ptr.device),
     )
 
 
@@ -5076,6 +5105,33 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
         All parameters from the reduction kernel plus execution grid configuration
     """
     if PS:
+        if CXX_PS_REDUCE_AVAILABLE:
+            try:
+                launch_pa_decode_ps_reduce_cxx(
+                    output_ptr,
+                    exp_sums_ptr,
+                    max_logits_ptr,
+                    logits_ptr,
+                    sink_token_ptr,
+                    stride_output_bs,
+                    stride_output_len,
+                    stride_output_kv_head,
+                    stride_output_group_size,
+                    stride_exp_sums_seq,
+                    stride_exp_sums_head,
+                    stride_exp_sums_part,
+                    stride_logits_seq,
+                    stride_logits_head,
+                    stride_logits_part,
+                    stride_logits_group,
+                    query_seq_len=query_seq_len,
+                    query_group_size=query_group_size,
+                    head_size=head_size,
+                    context_partition_num=context_partition_num,
+                )
+                return
+            except ImportError:
+                pass
         try:
             launch_pa_decode_ps_reduce_flydsl(
                 output_ptr,
