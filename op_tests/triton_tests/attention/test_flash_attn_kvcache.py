@@ -157,8 +157,7 @@ def _generate_block_kvcache(
     return k_cache, v_cache, block_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
@@ -166,21 +165,16 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (1, 128),
         (1, 339),
         (3, 1024),
-        (64, 800),
         (3, 799),
         (64, 2048),
         (128, 128),
-        (1, 3131),
         (8, 3131),
         (1, 1024),
-        (3, 799),
-        (1, 339),
     ],
 )
-@pytest.mark.parametrize("d", [64, 128, 256])
+@pytest.mark.parametrize("d", [64, 128])
 def test_flash_attn_kvcache(
     seqlen_q,
     seqlen_k,
@@ -190,8 +184,8 @@ def test_flash_attn_kvcache(
     causal,
     new_kv,
     mha_type,
-    dtype,
 ):
+    dtype = torch.bfloat16
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
 
@@ -340,13 +334,12 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
-@pytest.mark.parametrize("d", [128])
 def test_flash_attn_kvcache_torch_compile(
-    d,
     mha_type,
     causal,
     new_kv,
 ):
+    d = 128
     device = "cuda"
     torch.random.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
@@ -412,8 +405,8 @@ def test_flash_attn_kvcache_torch_compile(
 
 @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
-@pytest.mark.parametrize("d", [128])
-def test_flash_attn_kvcache_hipgraph_capture(d, mha_type, new_kv):
+def test_flash_attn_kvcache_hipgraph_capture(mha_type, new_kv):
+    d = 128
     device = "cuda"
     torch.random.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)

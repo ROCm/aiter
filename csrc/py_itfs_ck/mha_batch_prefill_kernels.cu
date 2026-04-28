@@ -304,7 +304,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         kv_last_page_lens_ptr = kv_last_page_lens.data_ptr();
     }
 
-    fmha_batch_prefill_args args;
+    fmha_batch_prefill_args args{};  // zero-initialize all fields
 
     args.q_ptr             = q.data_ptr();
     args.k_ptr             = k.data_ptr();
@@ -312,6 +312,9 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.q_descale_ptr     = q_descale.has_value() ? q_descale.value().data_ptr() : nullptr;
     args.k_descale_ptr     = k_descale.has_value() ? k_descale.value().data_ptr() : nullptr;
     args.v_descale_ptr     = v_descale.has_value() ? v_descale.value().data_ptr() : nullptr;
+    // sink_ptr is independent of sink_size: when provided, the kernel always reads
+    // it as per-head logit values for the virtual sink token (sink_value = *ptr / scale_s).
+    // When null, sink_value defaults to -inf (virtual token excluded from softmax).
     args.sink_ptr          = sink_ptr_.has_value() ? sink_ptr_.value().data_ptr() : nullptr;
     args.bias_ptr          = bias_ptr;
     args.rand_val_ptr      = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
@@ -363,6 +366,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.batch_stride_o       = batch_stride_o;
     args.window_size_left     = mask.left;
     args.window_size_right    = mask.right;
+    args.sink_size            = mask.sink;
     args.mask_type            = static_cast<ck_tile::index_t>(mask.type);
     args.p_drop               = p_dropout;
     args.s_randval            = has_dropout_randval;
@@ -416,6 +420,7 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   bool is_causal,
                   int window_size_left,
                   int window_size_right,
+                  int sink_size,
                   bool return_softmax_lse,
                   bool return_dropout_randval,
                   std::optional<at::Tensor> out_,                // [total_q, hq, d]
@@ -609,18 +614,18 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     {
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         window_size_right         = 0;
-        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0" + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // casual
     }
     else if(window_size_left == -1 && window_size_right == -1)
     {
-        mask = mask_info::decode("0", max_seqlen_q, max_seqlen_k); // no mask
+        mask = mask_info::decode("0", max_seqlen_q, max_seqlen_k); // no mask; sink N/A for full attention
     }
     else
     {
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
         std::string mask_identify =
-            "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+            "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right) + "," + std::to_string(sink_size);
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
 
@@ -817,7 +822,13 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                            has_lse,
                                            qscale_type,
                                            false);
-        TORCH_CHECK(t >= 0, "invalid argument for batch_prefill");
+        TORCH_CHECK(t >= 0,
+                    "invalid argument for batch_prefill: no matching kernel found. "
+                    "page_size=", args.page_block_size,
+                    ", num_pages=", args.num_total_pages,
+                    ", dtype=", dtype_str,
+                    ". If KV cache exceeds 2GB (INT32_MAX byte offset) with page_size < kN0, "
+                    "CDNA3+ GPU (MI300/MI350) is required.");
     }
     else
     {
