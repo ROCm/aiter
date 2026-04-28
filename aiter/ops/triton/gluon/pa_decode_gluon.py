@@ -5423,35 +5423,34 @@ def pa_decode_gluon(
 
     one_shot = max_context_partition_num <= 1
 
-    if not one_shot:
-        if exp_sums is None:
-            exp_sums = torch.empty(
-                batch_size,
-                num_kv_heads,
-                max_context_partition_num,
-                equivalent_query_group_size,
-                device=query.device,
-                dtype=aiter.dtypes.fp32,
-            )
-        if max_logits is None:
-            max_logits = torch.empty(
-                batch_size,
-                num_kv_heads,
-                max_context_partition_num,
-                equivalent_query_group_size,
-                device=query.device,
-                dtype=aiter.dtypes.fp32,
-            )
-        if temporary_output is None:
-            temporary_output = torch.empty(
-                batch_size,
-                num_kv_heads,
-                max_context_partition_num,
-                equivalent_query_group_size,
-                head_size,
-                device=query.device,
-                dtype=query.dtype,
-            )
+    if exp_sums is None:
+        exp_sums = torch.empty(
+            batch_size,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_query_group_size,
+            device=query.device,
+            dtype=aiter.dtypes.fp32,
+        )
+    if max_logits is None:
+        max_logits = torch.empty(
+            batch_size,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_query_group_size,
+            device=query.device,
+            dtype=aiter.dtypes.fp32,
+        )
+    if temporary_output is None:
+        temporary_output = torch.empty(
+            batch_size,
+            num_kv_heads,
+            max_context_partition_num,
+            equivalent_query_group_size,
+            head_size,
+            device=query.device,
+            dtype=query.dtype,
+        )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
     stride_query_scale_bs = 0
