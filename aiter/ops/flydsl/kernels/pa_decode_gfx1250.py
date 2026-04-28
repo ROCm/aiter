@@ -12,8 +12,14 @@ Layout:
 
 Per workgroup (grid = num_seqs x num_kv_heads x num_partitions):
   - 128 threads = 4 wave32 warps.
-  - Each warp redundantly computes QK (8 WMMAs for HEAD=128, KVB=32).
-  - Each warp handles `HEAD_SIZE/16/NUM_WARPS` N-tiles of PV.
+  - QK is warp-split along the N (KVB) axis: each warp owns
+    N_QK_TILES_PER_WARP = (KV_COMPUTE_BLOCK_SIZE/WMMA_N) / NUM_WARPS contiguous
+    N-tiles, doing N_QK_TILES_PER_WARP * (HEAD_SIZE/WMMA_K) WMMAs.
+  - Online softmax is reduced cross-warp through LDS scratch (max + sum slabs)
+    aliased over the dead Q LDS region.
+  - PV is warp-split along the N (HEAD) axis: each warp owns
+    N_PV_TILES_PER_WARP = HEAD_SIZE/NUM_WARPS/WMMA_N output N-tiles, doing
+    N_PV_TILES_PER_WARP * (KV_COMPUTE_BLOCK_SIZE/WMMA_K) WMMAs.
 
 Requirements:
   HEAD_SIZE             multiple of NUM_WARPS*WAVE_SIZE = 128
@@ -62,8 +68,8 @@ def compile_pa_decode_main(
 ):
     if HEAD_SIZE % 32 != 0:
         raise ValueError(f"HEAD_SIZE must be multiple of 32, got {HEAD_SIZE}")
-    if KV_BLOCK_SIZE % 16 != 0:
-        raise ValueError(f"KV_BLOCK_SIZE must be multiple of 16, got {KV_BLOCK_SIZE}")
+    # if KV_BLOCK_SIZE % 16 != 0:
+    #     raise ValueError(f"KV_BLOCK_SIZE must be multiple of 16, got {KV_BLOCK_SIZE}")
     if KV_COMPUTE_BLOCK_SIZE % WMMA_K != 0:
         raise ValueError(
             f"KV_COMPUTE_BLOCK_SIZE must be multiple of WMMA_K={WMMA_K}, got {KV_COMPUTE_BLOCK_SIZE}"
@@ -95,6 +101,7 @@ def compile_pa_decode_main(
             f"{NUM_WARPS * WMMA_N}, got {KV_COMPUTE_BLOCK_SIZE}"
         )
 
+    # FIX_NEEDED: shouldn't limit KV_COMPUTE_BLOCK_SIZE for this instead fix the load function for physical blocks
     BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
     if BLOCKS_PER_COMPUTE not in (1, 2, 4): #int32 * 4 = 128b
         # We use a single vectorized buffer_load for the physical block IDs;
@@ -130,28 +137,24 @@ def compile_pa_decode_main(
     # unused after q_frags are read into registers at prologue; scratch only
     # lives during the softmax step, so they never overlap in time).
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="pa_decode_main_lds")
-    q_lds_offset = 0
-    q_lds_bytes = QUERY_GROUP_SIZE * HEAD_SIZE * elem_bytes
-    kv_one_bytes = KV_COMPUTE_BLOCK_SIZE * HEAD_SIZE * elem_bytes
-    k_stage_offsets = [q_lds_offset + q_lds_bytes + 2 * i * kv_one_bytes for i in range(2)]
-    v_stage_offsets = [k + kv_one_bytes for k in k_stage_offsets]
-    p_lds_offset = q_lds_offset + q_lds_bytes + 4 * kv_one_bytes
-    p_lds_bytes = QUERY_GROUP_SIZE * KV_COMPUTE_BLOCK_SIZE * elem_bytes
-    allocator.ptr = p_lds_offset + p_lds_bytes
-
     q_lds_elems = QUERY_GROUP_SIZE * HEAD_SIZE
     kv_lds_elems = KV_COMPUTE_BLOCK_SIZE * HEAD_SIZE
     p_lds_elems = QUERY_GROUP_SIZE * KV_COMPUTE_BLOCK_SIZE
+    q_lds_offset = 0
+    q_lds_bytes = q_lds_elems * elem_bytes
+    kv_one_bytes = kv_lds_elems * elem_bytes
+    k_stage_offsets = [q_lds_offset + q_lds_bytes + 2 * i * kv_one_bytes for i in range(2)]
+    v_stage_offsets = [k + kv_one_bytes for k in k_stage_offsets]
+    p_lds_offset = q_lds_offset + q_lds_bytes + 4 * kv_one_bytes
+    p_lds_bytes = p_lds_elems * elem_bytes
+    allocator.ptr = p_lds_offset + p_lds_bytes
+
 
     # Cross-warp reduce scratch: two slabs (one for max, one for sum) of
     # NUM_WARPS * QG f32 each. Alias both into Q's LDS region.
-    scratch_max_lds_offset = q_lds_offset
-    scratch_sum_lds_offset = q_lds_offset + NUM_WARPS * QUERY_GROUP_SIZE * 4
     scratch_slab_elems = NUM_WARPS * QUERY_GROUP_SIZE   # f32 elements per slab
-
-    # Striped-load counts (Q load stays as buffer_load; K/V go through TDM)
-    Q_TOTAL_ELEMS = QUERY_GROUP_SIZE * HEAD_SIZE
-    Q_ELEMS_PER_THREAD = (Q_TOTAL_ELEMS + block_threads - 1) // block_threads
+    scratch_max_lds_offset = q_lds_offset
+    scratch_sum_lds_offset = q_lds_offset + scratch_slab_elems * 4
 
     @flyc.kernel
     def kernel_pa_decode_main(
@@ -192,12 +195,12 @@ def compile_pa_decode_main(
 
         # --- Runtime strides ---
         num_q_heads = num_kv_heads * arith.index(QUERY_GROUP_SIZE)
-        stride_q_seq = num_q_heads * arith.index(HEAD_SIZE)
-        stride_q_head = arith.index(HEAD_SIZE)
+        # stride_q_seq = num_q_heads * arith.index(HEAD_SIZE)
+        # stride_q_head = arith.index(HEAD_SIZE)
 
-        stride_kv_blk = num_kv_heads * arith.index(KV_BLOCK_SIZE * HEAD_SIZE)
-        stride_kv_head = arith.index(KV_BLOCK_SIZE * HEAD_SIZE)
-        stride_kv_tok = arith.index(HEAD_SIZE)
+        # stride_kv_blk = num_kv_heads * arith.index(KV_BLOCK_SIZE * HEAD_SIZE)
+        # stride_kv_head = arith.index(KV_BLOCK_SIZE * HEAD_SIZE)
+        # stride_kv_tok = arith.index(HEAD_SIZE)
 
         stride_bt_seq = max_blocks
 
@@ -211,9 +214,9 @@ def compile_pa_decode_main(
         stride_lse_part = arith.index(QUERY_GROUP_SIZE)
 
         # --- Buffer resources ---
-        q_rsrc = buffer_ops.create_buffer_resource(arg_query, max_size=True)
-        k_rsrc = buffer_ops.create_buffer_resource(arg_key_cache, max_size=True)
-        v_rsrc = buffer_ops.create_buffer_resource(arg_value_cache, max_size=True)
+        # q_rsrc = buffer_ops.create_buffer_resource(arg_query, max_size=True)
+        # k_rsrc = buffer_ops.create_buffer_resource(arg_key_cache, max_size=True)
+        # v_rsrc = buffer_ops.create_buffer_resource(arg_value_cache, max_size=True)
         bt_rsrc = buffer_ops.create_buffer_resource(arg_block_tables, max_size=True)
         sl_rsrc = buffer_ops.create_buffer_resource(arg_seq_lens, max_size=True)
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
