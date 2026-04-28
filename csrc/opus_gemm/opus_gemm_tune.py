@@ -51,6 +51,64 @@ a16w16_all_kernels = {
 a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
 
 
+# ── dtype handling ──────────────────────────────────────────────────────────
+#
+# CSV convention (matches gptoss_bf16_*_gemm.csv schema): dtype / outdtype
+# columns store the str(torch.dtype) form, i.e. "torch.bfloat16" or
+# "torch.float32". CLI args use the short form ("bf16" / "fp32") for
+# convenience. Tuner internals always work in torch.dtype.
+#
+# Input dtype is currently locked to bf16 by the a16w16-family kernels
+# themselves (the launcher TORCH_CHECKs on XQ.dtype()==BFloat16). Output
+# dtype can be either bf16 or fp32 (splitk reduce kernel + a16w16
+# split-barrier C-store both support fp32 D_OUT after the previous
+# splitk_reduce_kernel<D_OUT> change). We expose --dtype anyway so the
+# scaffolding is ready for a future a8w8 / fp8 input expansion and so the
+# CSV round-trip preserves whatever the user wrote.
+_DTYPE_SHORT_TO_TORCH = {
+    "bf16": dtypes.bf16,
+    "fp32": dtypes.fp32,
+}
+
+_DTYPE_TORCH_TO_CSV_STR = {
+    dtypes.bf16: "torch.bfloat16",
+    dtypes.fp32: "torch.float32",
+}
+
+_DTYPE_CSV_STR_TO_TORCH = {v: k for k, v in _DTYPE_TORCH_TO_CSV_STR.items()}
+
+_DTYPE_TORCH_TO_BPE = {
+    dtypes.bf16: 2,
+    dtypes.fp32: 4,
+}
+
+
+def _dtype_csv_str_to_torch(s):
+    """Map a CSV cell (e.g. 'torch.bfloat16') to a torch.dtype.
+
+    Accepts both the canonical CSV form and the CLI short form; falls back
+    to bf16 with a warning for anything unrecognized so a single weird row
+    can't take down a whole tuning run.
+    """
+    if s is None:
+        return None
+    if isinstance(s, torch.dtype):
+        return s
+    s = str(s).strip()
+    if s in _DTYPE_CSV_STR_TO_TORCH:
+        return _DTYPE_CSV_STR_TO_TORCH[s]
+    if s in _DTYPE_SHORT_TO_TORCH:
+        return _DTYPE_SHORT_TO_TORCH[s]
+    logger.warning(
+        f"OpusGemmA16W16Tuner: unrecognized dtype string {s!r}, falling back to bf16"
+    )
+    return dtypes.bf16
+
+
+def _dtype_torch_to_csv_str(t):
+    return _DTYPE_TORCH_TO_CSV_STR.get(t, str(t))
+
+
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -124,7 +182,12 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     return sorted(candidates)
 
 
-def generate_data(batch, m, n, k, seed, device="cuda"):
+def generate_data(
+    batch, m, n, k, seed,
+    dtype=dtypes.bf16,
+    outdtype=dtypes.bf16,
+    device="cuda",
+):
     # gen_data is the earliest subprocess-side hook mp_tuner.work_group
     # invokes (mp_tuner.py:139-143), before worker() is ever called. This
     # is where we install the custom run_perftest override so that when
@@ -134,6 +197,14 @@ def generate_data(batch, m, n, k, seed, device="cuda"):
     # _install_opus_perftest_once() and _opus_run_perftest() above.
     _install_opus_perftest_once()
 
+    # mp_tuner pickles task tuples with `gen_args` containing primitive types
+    # only; torch.dtype objects survive pickling fine, but if the caller hands
+    # us a CSV-form string (e.g. 'torch.bfloat16') we still need to translate.
+    if isinstance(dtype, str):
+        dtype = _dtype_csv_str_to_torch(dtype)
+    if isinstance(outdtype, str):
+        outdtype = _dtype_csv_str_to_torch(outdtype)
+
     torch.manual_seed(seed)
     # Use the exact (M, N, K) from the tune request. If a candidate's kernel
     # cannot handle this K (e.g. split-barrier a16w16 needs K >= 2*B_K and
@@ -141,17 +212,27 @@ def generate_data(batch, m, n, k, seed, device="cuda"):
     # run_opus_gemm's max_delta check will flag it and mp_tuner.worker will
     # mark it invalid. Using a K floor would mask such mismatches and mis-
     # attribute perf to the wrong shape.
-    XQ = torch.randn((batch, m, k), dtype=dtypes.bf16, device=device)
-    WQ = torch.randn((batch, n, k), dtype=dtypes.bf16, device=device)
-    Y = torch.empty((batch, m, n), dtype=dtypes.bf16, device=device)
+    XQ = torch.randn((batch, m, k), dtype=dtype, device=device)
+    WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
+    Y = torch.empty((batch, m, n), dtype=outdtype, device=device)
     return XQ, WQ, Y
 
 
 MAX_DELTA_SCALE = 0.1
 
 
-def opus_gemm_ref(XQ, WQ):
-    return torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(dtypes.bf16)
+def opus_gemm_ref(XQ, WQ, out_dtype=None):
+    """Reference matmul.
+
+    out_dtype must match the tuner's Y.dtype so the post-run checkAllclose
+    in mp_tuner.worker compares same-dtype tensors (mismatched dtype raises
+    'BFloat16 did not match Float' inside checkAllclose). When omitted (e.g.
+    legacy callers) we fall back to XQ.dtype, preserving the original bf16
+    -> bf16 -> bf16 path.
+    """
+    if out_dtype is None:
+        out_dtype = XQ.dtype
+    return torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(out_dtype)
 
 
 def run_opus_gemm(XQ, WQ, Y, kernelId, splitK):
@@ -164,7 +245,7 @@ def run_opus_gemm(XQ, WQ, Y, kernelId, splitK):
     """
     _quiet_aiter_logger_once()
     _opus_gemm_a16w16_tune(XQ, WQ, Y, kernelId, splitK)
-    ref = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(dtypes.bf16)
+    ref = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(Y.dtype)
     max_delta = (Y.float() - ref.float()).abs().max().item()
     max_ref = ref.float().abs().max().item()
     bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
@@ -235,11 +316,13 @@ def run_opus_gemm_bench(XQ, WQ, Y, kernelId, splitK):
     capturing = torch.cuda.is_current_stream_capturing()
 
     if not capturing:
-        # Correctness gate (per-task, outside-capture only).
+        # Correctness gate (per-task, outside-capture only). Reference is
+        # materialized in Y.dtype so the comparison happens at the same
+        # numerical resolution the kernel produced.
         task_key = (id(XQ), id(WQ), id(Y), int(kernelId), int(splitK))
         if task_key not in _bench_max_delta_checked:
             _bench_max_delta_checked.add(task_key)
-            ref = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(dtypes.bf16)
+            ref = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(Y.dtype)
             max_delta = (Y.float() - ref.float()).abs().max().item()
             max_ref = ref.float().abs().max().item()
             bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
@@ -567,47 +650,150 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             help="Batch dim for single-shape CLI tuning (default 1).",
         )
 
+        # Default dtype / outdtype (CSV columns override per-row when present).
+        # `--dtype` is the input A/B dtype; the a16w16-family kernels lock this
+        # to bf16 today, so any other value will produce a TORCH_CHECK failure
+        # at launch -- we keep the option for forward-compat (a8w8 expansion)
+        # and to preserve the CSV round-trip. `--outdtype` selects the Y
+        # dtype: bf16 (default) or fp32 (splitk_reduce_kernel<D_OUT> picks the
+        # right path; non-splitk a16w16 already supports fp32 via store_c's
+        # `D_C==D_ACC` branch).
+        self.parser.add_argument(
+            "--dtype",
+            choices=sorted(_DTYPE_SHORT_TO_TORCH.keys()),
+            default="bf16",
+            help="Default input A/B dtype (bf16 or fp32). Per-row 'dtype' "
+            "column in the untuned CSV overrides this.",
+        )
+        self.parser.add_argument(
+            "--outdtype",
+            choices=sorted(_DTYPE_SHORT_TO_TORCH.keys()),
+            default="bf16",
+            help="Default output Y dtype (bf16 or fp32). Per-row 'outdtype' "
+            "column in the untuned CSV overrides this.",
+        )
+
     def pre_process(self, args):
-        """Override to support CLI-based single-shape tuning (-m/-n/-K)."""
+        """Override to:
+
+        * Support CLI-based single-shape tuning (-m / -n / -k).
+        * Treat (dtype, outdtype) as part of the dedup / update key. After
+          self.keys was promoted to 6 cols, GemmCommonTuner's default
+          collapse-to-self.keys logic already preserves dtype/outdtype, but
+          we still need to populate missing columns from the CLI defaults
+          (legacy CSVs without dtype columns) and to dedup using all 6 cols
+          so same-shape bf16/fp32 rows do not overwrite each other.
+        """
+        cli_dtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
+        cli_outdtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
+
         if (
             args.shape_m is not None
             and args.shape_n is not None
             and args.shape_k is not None
         ):
-            # Build a one-row untunedf directly from CLI args.
-            self.untunedf = pd.DataFrame(
-                [
-                    {
-                        "cu_num": self.get_cu_num(),
-                        "M": int(args.shape_m),
-                        "N": int(args.shape_n),
-                        "K": int(args.shape_k),
-                    }
-                ],
-                columns=self.keys,
-            )
+            # Build a one-row untunedf directly from CLI args. dtype /
+            # outdtype are part of self.keys now, so they live alongside
+            # cu_num/M/N/K naturally.
+            row = {
+                "cu_num": self.get_cu_num(),
+                "M": int(args.shape_m),
+                "N": int(args.shape_n),
+                "K": int(args.shape_k),
+                "dtype": cli_dtype_str,
+                "outdtype": cli_outdtype_str,
+            }
+            self.untunedf = pd.DataFrame([row])
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            # Match the original code path: only assign 'batch' if the
+            # column already exists. tune_summary() compares
+            # tunedf[self.untunedf.columns], so we cannot leak a 'batch'
+            # column into untunedf when result_to_df doesn't emit one.
             if "batch" in self.untunedf.columns:
                 self.untunedf["batch"] = int(args.shape_batch)
             logger.info(
                 f"OpusGemmA16W16Tuner: single-shape CLI tune "
                 f"(M={args.shape_m}, N={args.shape_n}, K={args.shape_k}, "
-                f"batch={args.shape_batch})"
+                f"batch={args.shape_batch}, dtype={args.dtype}, "
+                f"outdtype={args.outdtype})"
             )
             return
 
-        # Otherwise fall back to csv-driven behavior from GemmCommonTuner.
-        super().pre_process(args)
+        # CSV-driven path. Mirrors GemmCommonTuner.pre_process but the dedup
+        # key is now 6-wide so same-shape bf16/fp32 rows are preserved.
+        if args.all:
+            self.get_retune_gemm_list(args)
+        else:
+            self.untunedf = self.get_untuned_gemm_list(args.untune_file)
+            self.untunedf["cu_num"] = self.get_cu_num()
+            # Fill missing dtype / outdtype columns with the CLI defaults so
+            # legacy CSVs (4-col key without dtype) still tune. Per-row CSV
+            # values (already populated) win.
+            if "dtype" not in self.untunedf.columns:
+                self.untunedf["dtype"] = cli_dtype_str
+            else:
+                self.untunedf["dtype"] = self.untunedf["dtype"].fillna(cli_dtype_str)
+            if "outdtype" not in self.untunedf.columns:
+                self.untunedf["outdtype"] = cli_outdtype_str
+            else:
+                self.untunedf["outdtype"] = self.untunedf["outdtype"].fillna(
+                    cli_outdtype_str
+                )
 
-    def calculate(self, results, bpes=(2, 2, 2)):
-        return super().calculate(results, bpes=(2, 2, 2))
+            self.untunedf = self.untunedf[list(self.keys)]
+            self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+
+            if len(self.tunedf) != 0:
+                # Dedup against the full 6-key. Two CSV rows that differ
+                # only in dtype/outdtype now generate two tasks (and two
+                # tuned-CSV rows on completion).
+                key_cols = list(self.keys)
+                mask = self.untunedf[key_cols].apply(tuple, axis=1).isin(
+                    self.tunedf[key_cols].apply(tuple, axis=1)
+                )
+                if args.verbose:
+                    logger.info("skiped tuned shapes:")
+                    print(self.untunedf[mask])
+                self.untunedf = self.untunedf[~mask]
+
+    @staticmethod
+    def _bpes_from_dtype_strs(dtype_str, outdtype_str):
+        """Compute (lhs_bpe, rhs_bpe, out_bpe) from CSV-form dtype strings."""
+        in_bpe = _DTYPE_TORCH_TO_BPE.get(_dtype_csv_str_to_torch(dtype_str), 2)
+        out_bpe = _DTYPE_TORCH_TO_BPE.get(_dtype_csv_str_to_torch(outdtype_str), 2)
+        return (in_bpe, in_bpe, out_bpe)
+
+    def calculate(self, results, bpes=None):
+        """Compute (TFLOPs, GB/s) for a tuner result row.
+
+        Per-shape (dtype, outdtype) live in info[0] now (slots 4 and 5 of
+        the 6-tuple key), so we derive bpes from there directly. Callers
+        outside tune() that pre-compute bpes (e.g. update_tflops_bw on a
+        legacy 4-key CSV) can pass bpes=... explicitly to bypass.
+        """
+        if bpes is None:
+            info, _time, _err = results
+            row_key = info[0]
+            # Backwards compat: a 4-key info tuple from a legacy CSV row
+            # has no dtype info; default to bf16 in/out.
+            if len(row_key) >= 6:
+                dtype_str, outdtype_str = str(row_key[4]), str(row_key[5])
+            else:
+                dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
+            bpes = self._bpes_from_dtype_strs(dtype_str, outdtype_str)
+        return super().calculate(results, bpes=bpes)
 
     def result_to_df(self, results):
         rows = []
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
-            cu_num, M, N, K = keys
+            # 6-key tuple now; legacy 4-key tuples still work.
+            if len(keys) >= 6:
+                cu_num, M, N, K, dtype_str, outdtype_str = keys[:6]
+            else:
+                cu_num, M, N, K = keys[:4]
+                dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME or time == self.INF_TIME
@@ -623,8 +809,8 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     "N": N,
                     "K": K,
                     "bias": False,
-                    "dtype": "torch.bfloat16",
-                    "outdtype": "torch.bfloat16",
+                    "dtype": str(dtype_str),
+                    "outdtype": str(outdtype_str),
                     "scaleAB": False,
                     "bpreshuffle": False,
                     "libtype": "opus",
@@ -648,11 +834,19 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             K = df.loc[i, "K"]
             us = df.loc[i, "us"]
             kid_col = "solidx" if "solidx" in df.columns else "kernelId"
-            info = (
-                ((cu_num, M, N, K), df.loc[i, kid_col], df.loc[i, "splitK"], ""),
-                us,
-                0,
+            # If the on-disk CSV carries dtype / outdtype columns, use them
+            # to compute bpes correctly for fp32 outputs (bw calculation in
+            # particular). Otherwise fall back to bf16 in / bf16 out.
+            dtype_str = (
+                str(df.loc[i, "dtype"]) if "dtype" in df.columns else "torch.bfloat16"
             )
+            outdtype_str = (
+                str(df.loc[i, "outdtype"])
+                if "outdtype" in df.columns
+                else "torch.bfloat16"
+            )
+            keys_tuple = (cu_num, M, N, K, dtype_str, outdtype_str)
+            info = ((keys_tuple, df.loc[i, kid_col], df.loc[i, "splitK"], ""), us, 0)
             tflops, bw = self.calculate(info)
             df.loc[i, "tflops"] = tflops
             df.loc[i, "bw"] = bw
@@ -708,10 +902,44 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             batch = (
                 int(untunedf.loc[i, "batch"]) if "batch" in untunedf.columns else 1
             )
+
+            # Per-row dtype / outdtype: dtype is part of self.keys now, so
+            # the column is guaranteed to exist by pre_process. Fall back to
+            # CLI defaults only as a defensive guard for callers that bypass
+            # pre_process.
+            dtype_str = (
+                str(untunedf.loc[i, "dtype"])
+                if "dtype" in untunedf.columns
+                else _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
+            )
+            outdtype_str = (
+                str(untunedf.loc[i, "outdtype"])
+                if "outdtype" in untunedf.columns
+                else _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
+            )
+            in_dtype = _dtype_csv_str_to_torch(dtype_str)
+            out_dtype = _dtype_csv_str_to_torch(outdtype_str)
+
+            # Sanity check: a16w16-family kernels lock the input to bf16
+            # today (the launcher TORCH_CHECKs XQ.dtype()==BFloat16). If the
+            # CSV asks for a different in_dtype, every candidate will fail
+            # at launch -- skip the whole row up front with a clear log
+            # rather than waste a per-task RuntimeError on every kid.
+            if in_dtype is not dtypes.bf16:
+                logger.warning(
+                    f"OpusGemmA16W16Tuner: skipping row M={M} N={N} K={K} "
+                    f"with dtype={dtype_str} (a16w16 kernels currently only "
+                    f"accept bf16 input)"
+                )
+                tasks_data.append((0, ()))
+                continue
+
             seed = seed + 1
 
             total_kernel_nums = 0
-            info_keys = (cu_num, M, N, K)
+            # 6-tuple matches self.keys; result_to_df / calculate read
+            # dtype / outdtype from slots 4 and 5.
+            info_keys = (cu_num, M, N, K, dtype_str, outdtype_str)
 
             for kid in a16w16_kernel_ids:
                 k_inst = a16w16_all_kernels[kid]
@@ -733,16 +961,28 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
                 for splitK in splitK_range:
                     info = (info_keys, kid, splitK, "")
+                    # Pass dtype / outdtype down to generate_data via the
+                    # gen_args tuple. mp_tuner.work_group calls
+                    # `gen_data(*gen_args, device=device)`, so dtype/outdtype
+                    # are positional in slot 5 and 6 and `device` is appended
+                    # by mp_tuner as a keyword (matches generate_data's
+                    # signature).
+                    gen_args = (batch, M, N, K, seed, in_dtype, out_dtype)
+                    # Pass out_dtype to opus_gemm_ref so the reference is
+                    # materialized at the same dtype as Y; otherwise
+                    # mp_tuner.worker's checkAllclose raises
+                    # 'BFloat16 did not match Float' for bf16-in/fp32-out.
+                    ref_args = (ref_data_idx, out_dtype)
                     task.append(
                         (
                             info,
                             generate_data,
-                            (batch, M, N, K, seed),
+                            gen_args,
                             bench_func,
                             (opus_data_idx, kid, splitK),
                             perf_kwargs,
                             opus_gemm_ref,
-                            (ref_data_idx,),
+                            ref_args,
                             {},
                             None,
                             check_rtol,
@@ -811,19 +1051,24 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
 
 if __name__ == "__main__":
-    # Use the 17-column schema from gptoss_bf16_tuned_gemm.csv so base_tuner's
-    # self.columns = key + resultList matches our result_to_df output.
+    # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv.
+    # base_tuner uses self.keys for dedup / update / tune_summary; promoting
+    # dtype + outdtype into the key lets same-shape rows with different
+    # outdtype coexist in the tuned CSV instead of overwriting each other
+    # (4-key dedup would merge them on every result_to_csv pass). The
+    # downstream codegen / lookup map split is a separate concern handled
+    # by gen_instances.py:gen_lookup_dict (which also keys on outdtype to
+    # produce distinct BF16 / FP32 (M,N,K)->kid maps).
+    #
     # Column order inside the DataFrame is:
-    #   key       = [cu_num, M, N, K]             (4 cols)
-    #   resultList = [bias, dtype, outdtype, scaleAB, bpreshuffle,
+    #   key       = [cu_num, M, N, K, dtype, outdtype]   (6 cols)
+    #   resultList = [bias, scaleAB, bpreshuffle,
     #                 libtype, solidx, splitK, us, kernelName,
-    #                 err_ratio, tflops, bw]      (13 cols)
+    #                 err_ratio, tflops, bw]             (11 cols)
     # total = 17 cols, in exact reference CSV order.
-    key = ["cu_num", "M", "N", "K"]
+    key = ["cu_num", "M", "N", "K", "dtype", "outdtype"]
     resultList = [
         "bias",
-        "dtype",
-        "outdtype",
         "scaleAB",
         "bpreshuffle",
         "libtype",
