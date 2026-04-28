@@ -31,18 +31,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self._all2all_manager_created = False
 
         super().__init__(cpu_group, device, device_group, unique_name)
-        if "tp" not in unique_name:
-            # custom allreduce or torch symm mem can be used only by tp
-            use_custom_allreduce = False
-            use_torch_symm_mem = False
-        else:
-            from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+        from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
-            use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_torch_symm_mem = False
-
-        self.use_custom_allreduce = use_custom_allreduce
-        self.use_torch_symm_mem = use_torch_symm_mem
+        self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+        self.use_torch_symm_mem = False
 
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (
@@ -79,7 +71,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         #         device=self.device,
         #     )
 
-        if use_custom_allreduce and self.world_size > 1:
+        if self.use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
