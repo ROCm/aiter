@@ -119,6 +119,7 @@ def _attn_fwd_inner(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     ENABLE_PIPELINING: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
     HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
@@ -188,6 +189,12 @@ def _attn_fwd_inner(
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             mask = mask & causal_mask
 
+        if SLIDING_WINDOW > 0:
+            k_pos = start_n + tl.arange(0, BLOCK_N)
+            q_adj = OFFS_M + seqlen_k - seqlen_q
+            window_mask = k_pos[None, :] >= (q_adj[:, None] - SLIDING_WINDOW)
+            mask = mask & window_mask
+
         qk = tl.where(mask, qk, float("-inf"))
 
         if alibi_slope is not None:
@@ -203,6 +210,11 @@ def _attn_fwd_inner(
 
         # Compute scaled QK and softmax probabilities
         p = tl.math.exp2(qk - m_ij[:, None])
+
+        if SLIDING_WINDOW > 0:
+            # When all qk in a row are -inf (fully out-of-window block) and m_i was -inf,
+            # exp2(-inf - (-inf)) = NaN. Sanitize by zeroing masked elements.
+            p = tl.where(mask, p, 0.0)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -227,6 +239,10 @@ def _attn_fwd_inner(
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
         alpha = tl.math.exp2(m_i - m_ij)
+        if SLIDING_WINDOW > 0:
+            # When m_i == m_ij == -inf, exp2(-inf - (-inf)) = NaN. alpha should be 1.0
+            # (no rescaling needed since max didn't change).
+            alpha = tl.where(m_i == m_ij, 1.0, alpha)
         acc = acc * alpha[:, None]
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
@@ -272,6 +288,7 @@ _attn_fwd_repr = make_kernel_repr(
         "NUM_XCD",
         "USE_INT64_STRIDES",
         "ENABLE_SINK",
+        "SLIDING_WINDOW",
     ],
 )
 
@@ -344,6 +361,7 @@ def _attn_fwd(
     NUM_XCD: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -675,6 +693,14 @@ def _attn_fwd(
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
     is_modulo_mn = not padded_block_k and (seqlen_q % BLOCK_M == 0)
+    skipped_blocks = 0
+    if SLIDING_WINDOW > 0:
+        # Skip K blocks that are fully left of the earliest key position
+        # reachable by this Q block. The first retained block can still be
+        # partially outside the window, so we keep the per-element mask below.
+        window_start_n = start_m * BLOCK_M + seqlen_k - seqlen_q - SLIDING_WINDOW
+        skipped_blocks = tl.maximum(window_start_n, 0) // BLOCK_N
+        skipped_blocks = tl.minimum(skipped_blocks, n_blocks)
     if IS_CAUSAL:
         # There are always at least BLOCK_M // BLOCK_N masked blocks.
         # Additionally there might be one more due to dissimilar seqlens.
@@ -684,14 +710,25 @@ def _attn_fwd(
         masked_blocks = padded_block_k
     # if IS_CAUSAL, not is_modulo_mn does not always result in an additional block.
     # In this case we might exceed n_blocks so pick the min.
-    masked_blocks = min(masked_blocks, n_blocks)
-    n_full_blocks = n_blocks - masked_blocks
-    block_min = 0
+    visible_blocks = n_blocks - skipped_blocks
+    masked_blocks = min(masked_blocks, visible_blocks)
+    n_full_blocks = visible_blocks - masked_blocks
+    block_min = skipped_blocks * BLOCK_N
     block_max = n_blocks * BLOCK_N
+    if skipped_blocks > 0:
+        k_ptrs += skipped_blocks * BLOCK_N * stride_kn
+        if HAS_PE:
+            k_pe_ptrs += skipped_blocks * BLOCK_N * stride_kn
+        v_ptrs += skipped_blocks * BLOCK_N * stride_vn
+        if RETURN_SCORES:
+            s_dmask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
+        if ENABLE_DROPOUT:
+            dropout_mask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
+            philox_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
     # Compute for full blocks. Here we set causal to false regardless of its actual
     # value because there is no masking. Similarly we do not need padding.
     if n_full_blocks > 0:
-        block_max = (n_blocks - masked_blocks) * BLOCK_N
+        block_max = block_min + n_full_blocks * BLOCK_N
         acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
@@ -738,6 +775,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=True,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -802,6 +840,7 @@ def _attn_fwd(
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             ENABLE_PIPELINING=False,
+            SLIDING_WINDOW=SLIDING_WINDOW,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.

@@ -26,4 +26,8 @@ def is_fp4_avail():
 
 
 def is_fp8_avail():
-    return get_arch() in ("gfx942", "gfx950", "gfx1250")
+    return get_arch() in ("gfx942", "gfx950", "gfx1250", "gfx1200", "gfx1201")
+
+
+def is_mx_scale_preshuffling_avail():
+    return get_arch() in ("gfx950", "gfx1250")

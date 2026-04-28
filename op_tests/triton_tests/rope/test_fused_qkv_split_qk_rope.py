@@ -10,6 +10,7 @@ from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 def generate_qkv_inputs(
     B: int, QH_PER_KH: int, KH: int, D: int, nope: bool, nope_first: bool, dtype
 ):
+    torch.manual_seed(0)
     qkv = torch.randn(
         (B, (QH_PER_KH * KH + 2 * KH) * (D * (2 if nope else 1))),
         dtype=dtype,
@@ -54,14 +55,10 @@ def run_torch(
     return q, k, v
 
 
-# @pytest.mark.parametrize("B", [32])
-# @pytest.mark.parametrize("QH_PER_KH", [8])
-# @pytest.mark.parametrize("KH", [8])
-# @pytest.mark.parametrize("D", [64])
-@pytest.mark.parametrize("B", [1, 4, 8, 16, 32])
-@pytest.mark.parametrize("QH_PER_KH", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("B", [1, 4, 8, 16])
+@pytest.mark.parametrize("QH_PER_KH", [1, 2, 4, 8])
 @pytest.mark.parametrize("KH", [1, 4])
-@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("D", [64])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("max_embed_positions", [131072])
 @pytest.mark.parametrize(

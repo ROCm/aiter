@@ -56,21 +56,29 @@ jobs:
         include:
           # run_on_pr: true = run on all events; false = skip on PR (still runs on push/schedule/workflow_dispatch)
           - model_name: "DeepSeek-R1-0528"
-            label: MI325
+            label: MI300X
             model_path: "deepseek-ai/DeepSeek-R1-0528"
             extraArgs: "--kv_cache_dtype fp8 -tp 8"
             env_vars: ""
             accuracy_test_threshold: "0.94"
-            runner: aiter-8gpu-runner
+            runner: linux-aiter-mi300x-8
+            run_on_pr: true
+          - model_name: "DeepSeek-R1-0528"
+            label: MI35X
+            model_path: "deepseek-ai/DeepSeek-R1-0528"
+            extraArgs: "--kv_cache_dtype fp8 -tp 8"
+            env_vars: ""
+            accuracy_test_threshold: "0.94"
+            runner: linux-aiter-mi35x-8
             run_on_pr: true
           - model_name: "gpt-oss-120b"
-            label: MI355
+            label: MI35X
             model_path: "openai/gpt-oss-120b"
             extraArgs: "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3"
             env_vars: |
               ATOM_GPT_OSS_MODEL=1
             accuracy_test_threshold: "0.38"
-            runner: linux-aiter-mi355-1
+            runner: linux-aiter-mi35x-1
             run_on_pr: true
     runs-on: ${{ matrix.runner }}
     steps:
@@ -80,6 +88,9 @@ jobs:
         with:
           repository: ${{ env.ATOM_REPOSITORY_URL }}
           branch: ${{ env.ATOM_BRANCH }}
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
       - name: Download the ATOM base image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
@@ -125,6 +136,16 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          MODEL_MOUNT=""
+          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+            if [ -d "/models" ]; then
+              MODEL_MOUNT="-v /models:/models"
+              echo "Using host model cache mount: /models"
+            else
+              echo "Warning: /models directory not found on runner; MI35X model cache will stay container-local."
+            fi
+          fi
+
           cat > /tmp/env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
           EOF
@@ -134,6 +155,7 @@ jobs:
           cat /tmp/env_file.txt
 
           docker run -dt --device=/dev/kfd $DEVICE_FLAG \
+          $MODEL_MOUNT \
           --ipc=host --group-add video \
           --shm-size=16G \
           --privileged \
@@ -166,25 +188,37 @@ jobs:
       - name: Download Models
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && matrix.model_name == 'DeepSeek-R1-0528'
         run: |
-          if [ -d "/run" ]; then
-            echo "/run directory found, downloading model to /run/${{ matrix.model_path }}"
-            if ! docker exec atom_aiter_test bash -lc "hf download ${{ matrix.model_path }} --local-dir /run/${{ matrix.model_path }}"; then
+          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+            model_cache_dir="/models"
+          else
+            model_cache_dir="/run"
+          fi
+
+          if docker exec atom_aiter_test bash -lc "[ -d '${model_cache_dir}' ]"; then
+            echo "${model_cache_dir} directory found, downloading model to ${model_cache_dir}/${{ matrix.model_path }}"
+            if ! docker exec atom_aiter_test bash -lc "hf download ${{ matrix.model_path }} --local-dir '${model_cache_dir}/${{ matrix.model_path }}'"; then
               echo "Model download failed for '${{ matrix.model_path }}'. Aborting."
               exit 1
             fi
           else
-            echo "/run directory not found, skipping model download"
+            echo "${model_cache_dir} directory not found in container, skipping model download"
           fi
 
       - name: Run ATOM accuracy test
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           set -euo pipefail
           echo ""
           echo "========== Launching ATOM server =========="
-          if [ -d "/run/${{ matrix.model_path }}" ]; then
-            model_path="/run/${{ matrix.model_path }}"
+          if [ "${{ matrix.runner }}" = "linux-aiter-mi35x-8" ]; then
+            model_cache_dir="/models"
+          else
+            model_cache_dir="/run"
+          fi
+
+          if docker exec atom_aiter_test bash -lc "[ -d '${model_cache_dir}/${{ matrix.model_path }}' ]"; then
+            model_path="${model_cache_dir}/${{ matrix.model_path }}"
           else
             model_path="${{ matrix.model_path }}"
           fi
@@ -230,8 +264,9 @@ jobs:
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.model_name }}_atom_accuracy_output.txt
+          name: ${{ matrix.model_name }}_${{ matrix.label }}_${{ matrix.runner }}_atom_accuracy_output.txt
           path: atom_accuracy_output.txt
+          retention-days: 7
 
       - name: Clean Up
         if: (matrix.run_on_pr == true || github.event_name != 'pull_request') && always()

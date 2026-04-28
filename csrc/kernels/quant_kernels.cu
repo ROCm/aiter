@@ -2,11 +2,11 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "aiter_hip_common.h"
-#include "dispatch_utils.h"
+#include "aiter_dispatch.h"
 #include "aiter_opus_plus.h"
-#include "py_itfs_common.h"
+#include "aiter_stream.h"
+#include "quant.h"
 #include "rocprim/rocprim.hpp"
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hipcub/hipcub.hpp>
 
 const int32_t BlockSize           = 256;
@@ -477,12 +477,15 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#if defined(__GFX9__)
             const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
             uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
             asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+#else
+            buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#endif
         }
     }
 
@@ -506,7 +509,11 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             {
                 auto buffer_map = opus::make_gmem<int>(smooth_scale_map + chunk_start, chunk_size * sizeof(int));
                 smscale_map_idx_list = buffer_map.load(lane_idx + i)[0];
+#if defined(__gfx1250__)
+                opus::s_wait_loadcnt(opus::number<0>{});
+#else
                 opus::s_waitcnt_vmcnt(opus::number<0>{});
+#endif
                 if (i == 0)
                 {
                     __syncthreads();
@@ -585,52 +592,52 @@ __global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     }
 }
 
-void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
-                             torch::Tensor const& input, // [..., d]
-                             torch::Tensor const& scale) // [1]
+void static_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
+                             const aiter_tensor_t& input, // [..., d]
+                             const aiter_tensor_t& scale) // [1]
 {
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    if(out.dtype() == torch_fp8)
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    if(out.dtype() == AITER_DTYPE_fp8)
     {
-        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
-                scale.data_ptr<float>(),
+                reinterpret_cast<float*>(scale.data_ptr()),
                 cols);
         });
     }
-    else if(out.dtype() == torch::kInt8)
+    else if(out.dtype() == AITER_DTYPE_i8)
     {
-        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
-                scale.data_ptr<float>(),
+                reinterpret_cast<float*>(scale.data_ptr()),
                 cols);
         });
     }
     else
     {
-        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+        AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
     }
 }
 
 #define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)      \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {              \
-        using input_dtype = typename t2opus<scalar_t>::type;                                  \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {             \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                        \
         aiter::quant_kernel<input_dtype, DTYPE_O, THREAD_DATA><<<grid, block, 0, stream>>>( \
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                     \
-            scales.data_ptr<float>(),                                                       \
+            reinterpret_cast<float*>(scales.data_ptr()),                                    \
             reinterpret_cast<input_dtype*>(input.data_ptr()),                               \
-            scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                   \
+            scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,            \
             cols,                                                                           \
             num_rows_ptr,                                                                   \
             num_rows_factor);                                                               \
@@ -654,69 +661,69 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
         DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 0)        \
     }
 
-void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
-                              torch::Tensor const& input, // [..., d]
-                              torch::Tensor& scale)       // [1]
+void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
+                              const aiter_tensor_t& input,  // [..., d]
+                              aiter_tensor_t& scale)        // [1]
 {
     const int cols = input.size(-1);
     int rows       = input.numel() / cols;
     dim3 grid(rows);
     dim3 block(BlockSize);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    if(out.dtype() == torch_fp8)
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    if(out.dtype() == AITER_DTYPE_fp8)
     {
-        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
-                scale.data_ptr<float>(), 1, 0.0f);
+                reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
             aiter::data_to_scale_kernel<input_dtype, opus::fp8_t><<<grid, block, 0, stream>>>(
-                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
-                scale.data_ptr<float>(),
+                reinterpret_cast<float*>(scale.data_ptr()),
                 cols);
         });
     }
-    else if(out.dtype() == torch::kInt8)
+    else if(out.dtype() == AITER_DTYPE_i8)
     {
-        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
-                scale.data_ptr<float>(), 1, 0.0f);
+                reinterpret_cast<float*>(scale.data_ptr()), 1, 0.0f);
             aiter::data_to_scale_kernel<input_dtype, opus::i8_t><<<grid, block, 0, stream>>>(
-                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+                reinterpret_cast<float*>(scale.data_ptr()), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::i8_t*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
-                scale.data_ptr<float>(),
+                reinterpret_cast<float*>(scale.data_ptr()),
                 cols);
         });
     }
     else
     {
-        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+        AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
     }
 }
 
-void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
-                                    torch::Tensor const& input, // [..., d]
-                                    torch::Tensor& scales,
-                                    std::optional<torch::Tensor> scale_ub = std::nullopt,
-                                    bool shuffle_scale                    = false,
-                                    std::optional<torch::Tensor> num_rows = std::nullopt,
-                                    int num_rows_factor                   = 1)
+void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
+                                    const aiter_tensor_t& input, // [..., d]
+                                    aiter_tensor_t& scales,
+                                    std::optional<aiter_tensor_t> scale_ub,
+                                    bool shuffle_scale,
+                                    std::optional<aiter_tensor_t> num_rows,
+                                    int num_rows_factor)
 {
-    TORCH_CHECK(input.is_contiguous());
-    TORCH_CHECK(out.is_contiguous());
+    AITER_CHECK(input.is_contiguous());
+    AITER_CHECK(out.is_contiguous());
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
-    int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
+    int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
@@ -724,7 +731,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
         int thread_data_size     = 32;
         int num_thread_per_group = group_size / thread_data_size;
         int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
-        if(out.dtype() == torch_fp8)
+        if(out.dtype() == AITER_DTYPE_fp8)
         {
             int ori_cols  = out.size(-1);
             int scaleN    = ori_cols / cols;
@@ -732,14 +739,14 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             int num_group = rows;
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_FLOATING16_TYPES(
-                input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename t2opus<scalar_t>::type;
+            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+                input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
+                    using input_dtype = typename aiter::hip2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
                         reinterpret_cast<opus::fp8_t*>(out.data_ptr()),
-                        scales.data_ptr<float>(),
+                        reinterpret_cast<float*>(scales.data_ptr()),
                         reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
+                        scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
                         group_size,
                         ori_rows,
                         ori_cols,
@@ -749,7 +756,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         num_rows_factor);
                 });
         }
-        else if(out.dtype() == torch::kInt8)
+        else if(out.dtype() == AITER_DTYPE_i8)
         {
             int ori_cols  = cols;
             int scaleN    = ori_cols / cols;
@@ -757,14 +764,14 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             int num_group = rows;
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_FLOATING16_TYPES(
-                input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename t2opus<scalar_t>::type;
+            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+                input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
+                    using input_dtype = typename aiter::hip2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
                         reinterpret_cast<opus::i8_t*>(out.data_ptr()),
-                        scales.data_ptr<float>(),
+                        reinterpret_cast<float*>(scales.data_ptr()),
                         reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
+                        scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
                         group_size,
                         ori_rows,
                         ori_cols,
@@ -775,7 +782,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                 });
         }
 #if defined(__Float4_e2m1fn_x2)
-        else if(out.dtype() == torch_fp4x2)
+        else if(out.dtype() == AITER_DTYPE_fp4x2)
         {
             int ori_cols  = out.size(-1) * 2;
             int scaleN    = ori_cols / cols;
@@ -785,14 +792,14 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
             // 8) : rows;
             dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
             dim3 const block(groupQuantBlockSize);
-            AITER_DISPATCH_FLOATING16_TYPES(
-                input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-                    using input_dtype = typename t2opus<scalar_t>::type;
+            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+                input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
+                    using input_dtype = typename aiter::hip2opus<scalar_t>::type;
                     aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
                         reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
                         reinterpret_cast<float*>(scales.data_ptr()),
                         reinterpret_cast<input_dtype*>(input.data_ptr()),
-                        scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
+                        scale_ub.has_value() ? reinterpret_cast<float*>(scale_ub->data_ptr()) : nullptr,
                         group_size,
                         ori_rows,
                         ori_cols,
@@ -805,25 +812,25 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
 #endif
         else
         {
-            TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+            AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
         }
     }
     else
     {
         dim3 const grid(rows);
         dim3 const block(BlockSize);
-        if(out.dtype() == torch_fp8)
+        if(out.dtype() == AITER_DTYPE_fp8)
         {
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
                 dynamic_per_token_scaled_quant_kernel, opus::fp8_t, cols);
         }
-        else if(out.dtype() == torch::kInt8)
+        else if(out.dtype() == AITER_DTYPE_i8)
         {
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
                 dynamic_per_token_scaled_quant_kernel, opus::i8_t, cols);
         }
 #if defined(__Float4_e2m1fn_x2)
-        else if(out.dtype() == torch_fp4x2)
+        else if(out.dtype() == AITER_DTYPE_fp4x2)
         {
             DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
                 dynamic_per_token_scaled_quant_kernel, opus::fp4_t, cols);
@@ -831,33 +838,33 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
 #endif
         else
         {
-            TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+            AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
         }
     }
 }
 
-void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
-                                        torch::Tensor const& input, // [..., d]
-                                        torch::Tensor& scales,
-                                        int group_size                            = 32,
-                                        bool shuffle_scale                        = true,
-                                        std::optional<at::Tensor> const& num_rows = std::nullopt,
-                                        int num_rows_factor                       = 1)
+void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
+                                        const aiter_tensor_t& input, // [..., d]
+                                        aiter_tensor_t& scales,
+                                        int group_size,
+                                        bool shuffle_scale,
+                                        std::optional<aiter_tensor_t> num_rows,
+                                        int num_rows_factor)
 {
-    TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+    AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
                 " only support group_size [32, 64 , 128]");
-    TORCH_CHECK(out.is_contiguous());
+    AITER_CHECK(out.is_contiguous());
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
     int const row_stride  = input.stride(-2);
-    int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
+    int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
 
-    TORCH_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
+    AITER_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     int thread_data_size     = 32;
     int num_thread_per_group = group_size / thread_data_size;
@@ -871,9 +878,9 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     dim3 const block(groupQuantBlockSize);
 
 #if defined(__Float4_e2m1fn_x2)
-    AITER_DISPATCH_FLOATING16_TYPES(
-        input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
                 reinterpret_cast<opus::fp4_t*>(out.data_ptr()),
                 reinterpret_cast<float*>(scales.data_ptr()),
@@ -888,13 +895,13 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                 num_rows_factor);
         });
 #else
-    TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
+    AITER_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
 #endif
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                         \
-        using input_dtype = typename t2opus<scalar_t>::type;                                                             \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                                       \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                                  \
         const int cu_num = get_num_cu_func();                                                                          \
         const int max_warp_per_simd = 8;                                                                               \
         const int warp_per_simd = BLOCK_SIZE / (opus::get_warp_size() * 4);                                            \
@@ -903,9 +910,9 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
         aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH, MAX_EXPERT_SIZE> \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                                   \
                 reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
-                scales.data_ptr<float>(),                                                                              \
+                reinterpret_cast<float*>(scales.data_ptr()),                                                           \
                 reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
-                smooth_scale.data_ptr<float>(),                                                                        \
+                reinterpret_cast<float*>(smooth_scale.data_ptr()),                                                     \
                 smooth_scale_map_ptr,                                                                                  \
                 smooth_scale_map_hash_ptr,                                                                             \
                 grid_size,                                                                                             \
@@ -956,30 +963,30 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize) \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize); \
     }
 
 void smooth_per_token_scaled_quant(
-    torch::Tensor& out,         // [..., d]
-    torch::Tensor const& input, // [..., d]
-    torch::Tensor& scales,
-    torch::Tensor const& smooth_scale,
-    std::optional<torch::Tensor> const& smooth_scale_map = std::nullopt,
-    bool shuffle_scale                                   = false,
-    std::optional<torch::Tensor> const& num_rows         = std::nullopt,
-    int num_rows_factor                                  = 1,
-    std::optional<torch::Tensor> const& smooth_scale_map_hash = std::nullopt,
-    bool enable_ps = true)
+    aiter_tensor_t& out,         // [..., d]
+    const aiter_tensor_t& input, // [..., d]
+    aiter_tensor_t& scales,
+    const aiter_tensor_t& smooth_scale,
+    std::optional<aiter_tensor_t> smooth_scale_map,
+    bool shuffle_scale,
+    std::optional<aiter_tensor_t> num_rows,
+    int num_rows_factor,
+    std::optional<aiter_tensor_t> smooth_scale_map_hash,
+    bool enable_ps)
 {
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
-    int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
+    int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
     int32_t* smooth_scale_map_ptr =
-        smooth_scale_map.has_value() ? smooth_scale_map->data_ptr<int32_t>() : nullptr;
+        smooth_scale_map.has_value() ? reinterpret_cast<int32_t*>(smooth_scale_map->data_ptr()) : nullptr;
     int32_t* smooth_scale_map_hash_ptr =
-        smooth_scale_map_hash.has_value() ? smooth_scale_map_hash->data_ptr<int32_t>() : nullptr;
-    TORCH_CHECK(
+        smooth_scale_map_hash.has_value() ? reinterpret_cast<int32_t*>(smooth_scale_map_hash->data_ptr()) : nullptr;
+    AITER_CHECK(
         input.dim() < 4, __func__, " only support input dim <=3, but get dim: ", input.dim());
     int32_t input_dim0    = input.size(0);
     int32_t input_dim1    = input.dim() > 2 ? input.size(1) : 1;
@@ -996,27 +1003,27 @@ void smooth_per_token_scaled_quant(
     constexpr int32_t MAX_EXPERT_SIZE = 1024;
     int32_t smooth_scale_map_hash_size =
         smooth_scale_map_hash.has_value() ? smooth_scale_map_hash->numel() : 0;
-    TORCH_CHECK(
+    AITER_CHECK(
         smooth_scale_map_hash_size <= MAX_EXPERT_SIZE, __func__, " smooth_scale_map_hash_size is too large, only support <= ", MAX_EXPERT_SIZE);
-    TORCH_CHECK((input_dim0 * input_dim1 == out_dim0 * out_dim1) && (input_dim0 == out_dim0 || input_dim0 == out_dim1), 
+    AITER_CHECK((input_dim0 * input_dim1 == out_dim0 * out_dim1) && (input_dim0 == out_dim0 || input_dim0 == out_dim1),
         __func__, "This kernel view input as 3D (m,k,n) and output as 3D (m,k,n)/(k,m,n)");
     const bool transpose_out_dim01 = input_dim0 != out_dim0;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    if(out.dtype() == torch_fp8)
+    if(out.dtype() == AITER_DTYPE_fp8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
             smooth_per_token_scaled_quant_kernel, opus::fp8_t, cols);
     }
-    else if(out.dtype() == torch::kInt8)
+    else if(out.dtype() == AITER_DTYPE_i8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
             smooth_per_token_scaled_quant_kernel, opus::i8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
-    else if(out.dtype() == torch_fp4x2 || out.dtype() == torch::kUInt8)
+    else if(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8)
     {
         SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
             smooth_per_token_scaled_quant_kernel, opus::fp4_t, cols);
@@ -1024,7 +1031,7 @@ void smooth_per_token_scaled_quant(
 #endif
     else
     {
-        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+        AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
     }
 }
 
@@ -1065,20 +1072,20 @@ __global__ void partial_transpose_kernel(DTYPE* __restrict__ out,
     }
 }
 
-void partial_transpose(torch::Tensor& out,         // [rows, d]
-                       torch::Tensor const& input, // [rows, d]
-                       torch::Tensor const& num_rows)
+void partial_transpose(aiter_tensor_t& out,         // [rows, d]
+                       const aiter_tensor_t& input, // [rows, d]
+                       const aiter_tensor_t& num_rows)
 {
-    TORCH_CHECK(out.is_contiguous());
-    TORCH_CHECK(input.is_contiguous());
+    AITER_CHECK(out.is_contiguous());
+    AITER_CHECK(input.is_contiguous());
 
     uint32_t num_cu       = get_num_cu_func();
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
-    int32_t* num_rows_ptr = num_rows.data_ptr<int32_t>();
+    int32_t* num_rows_ptr = reinterpret_cast<int32_t*>(num_rows.data_ptr());
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
     if(cols <= 1024)
     {
@@ -1089,8 +1096,8 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 grid(GridSize);
         dim3 block(BlockSize);
 
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1107,8 +1114,8 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 grid(GridSize);
         dim3 block(BlockSize);
 
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1125,8 +1132,8 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 grid(GridSize);
         dim3 block(BlockSize);
 
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1143,8 +1150,8 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
         dim3 grid(GridSize);
         dim3 block(BlockSize);
 
-        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
-            using input_dtype = typename t2opus<scalar_t>::type;
+        VLLM_DISPATCH_FLOATING_TYPES_rmTorch(input.dtype(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
             aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size>
                 <<<grid, block, 0, stream>>>(reinterpret_cast<input_dtype*>(out.data_ptr()),
                                              reinterpret_cast<input_dtype*>(input.data_ptr()),
@@ -1154,7 +1161,7 @@ void partial_transpose(torch::Tensor& out,         // [rows, d]
     }
     else
     {
-        TORCH_CHECK(false, __func__, " cols is not supported: ", cols);
+        AITER_CHECK(false, __func__, " cols is not supported: ", cols);
     }
 }
 
@@ -1187,12 +1194,15 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
         #pragma unroll
         for(int i = 0; i < async_load_num; i++)
         {
-            // buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#if defined(__GFX9__)
             const int lds_ptr_sgpr = __builtin_amdgcn_readfirstlane((reinterpret_cast<uintptr_t>((smooth_scale_map_hash_shared + threadIdx.x / WARP_SIZE * WARP_SIZE + i * block_size))));
             uint32_t offset = threadIdx.x * sizeof(int) + i * block_size * sizeof(int);
             asm volatile( "s_mov_b32 m0 %0\n\t"
                 "buffer_load_dword %1, %2, 0 offen offset:0 lds\n\t"
                 ::"s"(lds_ptr_sgpr), "v"(offset), "s"(buffer_hash.cached_rsrc): "memory", "m0");
+#else
+            buffer_hash.async_load(smooth_scale_map_hash_shared + threadIdx.x + i * block_size, threadIdx.x + i * block_size);
+#endif
         }
     }
     int smscale_map_idx_list = 0;
@@ -1204,7 +1214,11 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
     auto buffer_input = opus::make_gmem<DTYPE_I>(input + (int64_t)token_idx * (int64_t)input_stride, cols * sizeof(DTYPE_I));
     vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(buffer_input, threadIdx.x * vec_size_i);
+#if defined(__gfx1250__)
+    opus::s_wait_loadcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
+#else
     opus::s_waitcnt_vmcnt(opus::number<vec_size_i * sizeof(DTYPE_I) / load_chunk_bytes>{});
+#endif
     __syncthreads();
     if constexpr(has_smscale_hash)
     {
@@ -1259,16 +1273,16 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
 
 
 #define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_HASH) \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                         \
-        using input_dtype = typename t2opus<scalar_t>::type;                                                             \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                                       \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                                  \
         int grid_size = rows;                                                                                          \
         dim3 const grid(grid_size);                                                                                    \
         aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA, TRANSPOSE_OUT_DIM01, HAS_HASH, MAX_EXPERT_SIZE> \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                                   \
                 reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
-                scales.data_ptr<float>(),                                                                              \
+                reinterpret_cast<float*>(scales.data_ptr()),                                                           \
                 reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
-                smooth_scale.data_ptr<float>(),                                                                        \
+                reinterpret_cast<float*>(smooth_scale.data_ptr()),                                                     \
                 smooth_scale_map_ptr,                                                                                  \
                 smooth_scale_map_hash_ptr,                                                                             \
                 rows,                                                                                                  \
@@ -1314,49 +1328,49 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v1(DTYPE_O* __restrict_
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize) \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize); \
     }
 
 void moe_smooth_per_token_scaled_quant_v1(
-    torch::Tensor& out,         // [..., d]
-    torch::Tensor const& input, // [..., d]
-    torch::Tensor& scales,
-    torch::Tensor const& smooth_scale,
-    torch::Tensor const& smooth_scale_map, // topk_ids
-    bool shuffle_scale                                   = false,
-    std::optional<torch::Tensor> const& smooth_scale_map_hash = std::nullopt,
-    bool transpose_out = false)
+    aiter_tensor_t& out,         // [..., d]
+    const aiter_tensor_t& input, // [..., d]
+    aiter_tensor_t& scales,
+    const aiter_tensor_t& smooth_scale,
+    const aiter_tensor_t& smooth_scale_map, // topk_ids
+    bool shuffle_scale,
+    std::optional<aiter_tensor_t> smooth_scale_map_hash,
+    bool transpose_out)
 {
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
-    int32_t* smooth_scale_map_ptr = smooth_scale_map.data_ptr<int32_t>();
+    int32_t* smooth_scale_map_ptr = reinterpret_cast<int32_t*>(smooth_scale_map.data_ptr());
     int32_t* smooth_scale_map_hash_ptr =
-        smooth_scale_map_hash.has_value() ? smooth_scale_map_hash->data_ptr<int32_t>() : nullptr;
+        smooth_scale_map_hash.has_value() ? reinterpret_cast<int32_t*>(smooth_scale_map_hash->data_ptr()) : nullptr;
     int m_repeat = out.numel() / (rows * cols);
     int32_t input_stride = input.stride(-2);
     constexpr int32_t MAX_EXPERT_SIZE = 1024;
     int32_t smooth_scale_map_hash_size =
         smooth_scale_map_hash.has_value() ? smooth_scale_map_hash->numel() : 0;
-    TORCH_CHECK(out.is_contiguous(), __func__, " out is not contiguous");
-    TORCH_CHECK(
+    AITER_CHECK(out.is_contiguous(), __func__, " out is not contiguous");
+    AITER_CHECK(
         smooth_scale_map_hash_size <= MAX_EXPERT_SIZE, __func__, " smooth_scale_map_hash_size is too large, only support <= ", MAX_EXPERT_SIZE);
     const bool transpose_out_dim01 = transpose_out;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    if(out.dtype() == torch_fp8)
+    if(out.dtype() == AITER_DTYPE_fp8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_DISPATCH(
             moe_smooth_per_token_scaled_quant_kernel_v1, opus::fp8_t, cols);
     }
-    else if(out.dtype() == torch::kInt8)
+    else if(out.dtype() == AITER_DTYPE_i8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_DISPATCH(
             moe_smooth_per_token_scaled_quant_kernel_v1, opus::i8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
-    else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
+    else if(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V1_DISPATCH(
             moe_smooth_per_token_scaled_quant_kernel_v1, opus::fp4_t, cols);
@@ -1364,7 +1378,7 @@ void moe_smooth_per_token_scaled_quant_v1(
 #endif
     else
     {
-        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+        AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
     }
 }
 
@@ -1493,20 +1507,20 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
 
 
 #define MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)  \
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                            \
-        using input_dtype = typename t2ck<scalar_t>::type;                                                \
-        int warps_per_cu = 8 * BLOCK_SIZE / WARP_SIZE;                                                    \
-        int num_tg = persistent_mode? num_cu * warps_per_cu : num_blocks;                                 \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                           \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                                      \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                             \
+        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                               \
         dim3 const grid(num_tg);                                                                          \
         aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>                                \
             <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                                      \
                 reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                               \
-                scales.data_ptr<float>(),                                                                 \
+                reinterpret_cast<float*>(scales.data_ptr()),                                              \
                 reinterpret_cast<input_dtype*>(input.data_ptr()),                                         \
-                smooth_scale.data_ptr<float>(),                                                           \
-                sorted_token_ids.data_ptr<int>(),                                                         \
-                sorted_expert_ids.data_ptr<int>(),                                                        \
-                num_valid_ids.data_ptr<int>(),                                                            \
+                reinterpret_cast<float*>(smooth_scale.data_ptr()),                                        \
+                reinterpret_cast<int*>(sorted_token_ids.data_ptr()),                                      \
+                reinterpret_cast<int*>(sorted_expert_ids.data_ptr()),                                     \
+                reinterpret_cast<int*>(num_valid_ids.data_ptr()),                                         \
                 num_experts,                                                                              \
                 num_tokens,                                                                               \
                 num_blocks,                                                                               \
@@ -1541,23 +1555,23 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
     }                                                                                        \
     else                                                                                     \
     {                                                                                        \
-        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize) \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize); \
     }
 
 
 void moe_smooth_per_token_scaled_quant_v2(
-    torch::Tensor& out,         // [..., d]
-    torch::Tensor const& input, // [..., d]
-    torch::Tensor& scales,
-    torch::Tensor const& smooth_scale,
-    torch::Tensor const& sorted_token_ids,
-    torch::Tensor const& sorted_expert_ids,
-    torch::Tensor const& num_valid_ids,
+    aiter_tensor_t& out,         // [..., d]
+    const aiter_tensor_t& input, // [..., d]
+    aiter_tensor_t& scales,
+    const aiter_tensor_t& smooth_scale,
+    const aiter_tensor_t& sorted_token_ids,
+    const aiter_tensor_t& sorted_expert_ids,
+    const aiter_tensor_t& num_valid_ids,
     int block_m,
-    bool shuffle_scale = false,
-    bool transpose_out = false)
+    bool shuffle_scale,
+    bool transpose_out)
 {
-    TORCH_CHECK(out.is_contiguous());
+    AITER_CHECK(out.is_contiguous());
     int cols = input.size(-1);
     int num_tokens = input.size(0);
     int num_experts = smooth_scale.size(0);
@@ -1568,26 +1582,26 @@ void moe_smooth_per_token_scaled_quant_v2(
     const int num_cu = get_num_cu_func();
     int block_split = 16;
     int block_m_log2split = log2(block_split);
-    TORCH_CHECK(block_m % block_split == 0, __func__, " block_m is not divisible by block_split");
+    AITER_CHECK(block_m % block_split == 0, __func__, " block_m is not divisible by block_split");
     int sub_block_m = block_m >> block_m_log2split;
     int num_blocks = sorted_expert_ids.size(0) * block_split;
     const bool persistent_mode = true;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    if(out.dtype() == torch_fp8)
+    if(out.dtype() == AITER_DTYPE_fp8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_DISPATCH(
             moe_smooth_per_token_scaled_quant_kernel_v2, opus::fp8_t, cols);
     }
-    else if(out.dtype() == torch::kInt8)
+    else if(out.dtype() == AITER_DTYPE_i8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_DISPATCH(
             moe_smooth_per_token_scaled_quant_kernel_v2, opus::i8_t, cols);
     }
 #if defined(__Float4_e2m1fn_x2)
-    else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
+    else if(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8)
     {
         MOE_SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_V2_DISPATCH(
             moe_smooth_per_token_scaled_quant_kernel_v2, opus::fp4_t, cols);
@@ -1595,9 +1609,362 @@ void moe_smooth_per_token_scaled_quant_v2(
 #endif
     else
     {
-        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+        AITER_CHECK(false, __func__, " not support output type: ", AiterDtype_to_str(out.dtype()));
     }
 }
 
+
+template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
+__global__ void mxfp4_quant_moe_sort_kernel(
+    DTYPE_O* __restrict__ out,
+    uint8_t* __restrict__ scale,
+    DTYPE_I const* __restrict__ input,
+    int32_t const* __restrict__ sorted_ids,
+    int32_t const* __restrict__ num_valid_ids,
+    const int32_t num_tokens,
+    const int32_t cols,
+    const int32_t group_size,
+    const int32_t tgs_per_block_m,
+    const int32_t sub_block_m,
+    const int32_t num_blocks,
+    const int32_t num_tg,
+    const int32_t topk,
+    const int32_t input_stride)
+{
+    int num_thread_per_group = group_size / thread_data_size;
+    int num_valid_ids_value  = num_valid_ids[0];
+    int block_idx            = blockIdx.x;
+    int lane_idx             = threadIdx.x % WARP_SIZE;
+    const int scale_k        = threadIdx.x / num_thread_per_group;
+    static constexpr int32_t vec_size_i =
+        thread_data_size == 0 ? 16 / sizeof(DTYPE_I) : thread_data_size;
+    static constexpr int32_t load_chunk_bytes =
+        (sizeof(DTYPE_I) * vec_size_i % 16 == 0 ? 16
+                                                : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
+    using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
+    using vec_f = opus::vector_t<float, vec_size_i>;
+    const float inverted_DTYPE_MAX =
+        std::is_same_v<DTYPE_O, opus::fp4_t>
+            ? 0.25
+            : (1. / static_cast<float>(opus::finfo<DTYPE_O>::max()));
+    const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
+    const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
+
+    auto fp4_scale = [](float tmp) {
+        uint32_t u32      = __builtin_bit_cast(uint32_t, tmp);
+        uint32_t exponent = (u32 >> 23) & 0b11111111;
+        if(exponent == 0b11111111)
+        {
+            return __builtin_bit_cast(float, exponent << 23);
+        }
+        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
+            exponent += 1;
+        return __builtin_bit_cast(float, exponent << 23);
+    };
+    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
+        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
+               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
+    };
+
+    for(; block_idx < num_blocks; block_idx += num_tg)
+    {
+        int sub_idx         = block_idx % tgs_per_block_m;
+        int block_m_start   = (block_idx - sub_idx) * sub_block_m;
+        int sorted_ids_base = block_m_start + sub_idx;
+        if(sorted_ids_base >= num_valid_ids_value)
+        {
+            return;
+        }
+        int token_id_info_list;
+        if (lane_idx < sub_block_m)
+        {
+            int strided_idx = sorted_ids_base + lane_idx * tgs_per_block_m;
+            token_id_info_list = (strided_idx < num_valid_ids_value)
+                ? sorted_ids[strided_idx]
+                : num_tokens;
+        }
+        int token_id_list = token_id_info_list & 0xFFFFFF;
+        int topk_id_list  = token_id_info_list >> 24;
+        for(int i = 0; i < sub_block_m; i++)
+        {
+            int token_idx = __builtin_amdgcn_readlane(token_id_list, i);
+            int topk_id   = __builtin_amdgcn_readlane(topk_id_list, i);
+            if(token_idx >= num_tokens)
+            {
+                break;
+            }
+
+            int64_t offset_base = topk == 1 ? (int64_t)(token_idx) : (int64_t)(token_idx * topk + topk_id);
+            auto buffer_input =
+                opus::make_gmem<DTYPE_I>(input + offset_base * input_stride, cols * sizeof(DTYPE_I));
+            vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(
+                buffer_input, threadIdx.x * vec_size_i);
+            vec_f vec_input_f;
+            float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
+            float absMax       = 1e-10f;
+            #pragma unroll
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                vec_input_f[j] = static_cast<float>(vec_input[j]);
+                absMax         = max(absMax, abs(vec_input_f[j]));
+            }
+            absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+
+            float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
+                                  ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                                  : absMax * inverted_DTYPE_MAX;
+
+            const int sorted_row = sorted_ids_base + i * tgs_per_block_m;
+            if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
+            {
+                uint8_t bs_e8m0 = (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
+                int addr        = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k);
+                scale[addr]     = bs_e8m0;
+            }
+
+            if(topk_id < topk || topk == 1)
+            {
+                scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(
+                    out, input_f_ptr, &row_scale, cols, offset_base * cols);
+            }
+        }
+    }
+}
+
+
+#define MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                    \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "mxfp4_quant_moe_sort_kernel", [&] { \
+        using input_dtype = typename aiter::hip2opus<scalar_t>::type;                            \
+        AITER_CHECK(group_size % THREAD_DATA == 0, __func__, " group_size is not divisible by THREAD_DATA"); \
+        int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                                  \
+        int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                     \
+        dim3 const grid(num_tg);                                                               \
+        mxfp4_quant_moe_sort_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA>             \
+            <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                           \
+                reinterpret_cast<DTYPE_O*>(output.data_ptr()),                                  \
+                reinterpret_cast<uint8_t*>(scale.data_ptr()),                                   \
+                reinterpret_cast<input_dtype const*>(input.data_ptr()),                         \
+                reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                              \
+                reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                           \
+                token_num,                                                                      \
+                cols,                                                                           \
+                group_size,                                                                     \
+                tgs_per_block_m,                                                                \
+                sub_block_m,                                                                     \
+                num_blocks,                                                                     \
+                num_tg,                                                                         \
+                topk,                                                                           \
+                input_stride);                                                                  \
+    });
+
+
+#define MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(DTYPE_O, cols_)                                   \
+    if(cols_ <= 2 * BlockSize)                                                                 \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 4)                           \
+    }                                                                                          \
+    else if(cols_ <= 4 * BlockSize)                                                            \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize / 2)                           \
+    }                                                                                          \
+    else if(cols_ <= 8 * BlockSize)                                                            \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 8, BlockSize)                               \
+    }                                                                                          \
+    else if(cols_ <= 16 * BlockSize)                                                           \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 16, BlockSize)                              \
+    }                                                                                          \
+    else if(cols_ <= 16 * BlockSize * 2)                                                       \
+    {                                                                                          \
+        MXFP4_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, 32, BlockSize)                              \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize);  \
+    }
+
+void fused_dynamic_mxfp4_quant_moe_sort_hip(
+    aiter_tensor_t& output,
+    aiter_tensor_t& scale,
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& sorted_ids,
+    const aiter_tensor_t& num_valid_ids,
+    int token_num,
+    int block_m,
+    int group_size
+)
+{
+    int cols = input.size(-1);
+    int topk = input.numel() / (cols * token_num);
+    int num_experts = (sorted_ids.size(0) + topk - topk * token_num) / block_m;
+
+    const int num_cu = get_num_cu_func();
+    int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
+    AITER_CHECK(block_m % sub_block_m == 0, __func__, " block_m is not divisible by sub_block_m");
+    int tgs_per_block_m = block_m / sub_block_m;
+    int num_blocks = (sorted_ids.size(0) + sub_block_m - 1) / sub_block_m;
+    const bool persistent_mode = false;
+    const int input_stride     = input.stride(-2);
+
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+#if defined(__Float4_e2m1fn_x2)
+    if(output.dtype() == AITER_DTYPE_fp4x2 || output.dtype() == AITER_DTYPE_u8)
+    {
+        MXFP4_QUANT_MOE_SORT_KERNEL_DISPATCH(opus::fp4_t, cols);
+    }
+    else
+    {
+        AITER_CHECK(false, __func__, ": not support output type: ", AiterDtype_to_str(output.dtype()));
+    }
+#else
+    AITER_CHECK(false, __func__, ": not support fp4x2 on this device");
+#endif
+}
+
+template <int block_size, int num_rows, int thread_data_size = 16, int group_size = 32>
+__global__ void mxfp4_moe_sort_kernel(
+    uint8_t* __restrict__ out_scale,
+    uint8_t* __restrict__ scale,
+    int32_t const* __restrict__ sorted_ids,
+    int32_t const* __restrict__ num_valid_ids,
+    const int32_t num_tokens,
+    const int32_t cols,
+    const int32_t num_blocks,
+    const int32_t num_tg,
+    const int32_t topk)
+{
+    constexpr int threads_per_row = block_size / num_rows;
+    int num_valid_ids_value  = num_valid_ids[0];
+    int block_idx            = blockIdx.x;
+    int row_i                = threadIdx.x / threads_per_row;
+    int scale_k              = threadIdx.x % threads_per_row * thread_data_size;
+    const int scale_per_row = (cols + group_size - 1) / group_size;
+    static constexpr int32_t vec_size_i = thread_data_size;
+    static constexpr int32_t load_chunk_bytes =
+        (sizeof(uint8_t) * vec_size_i % 16 == 0 ? 16
+                                                : (sizeof(uint8_t) * vec_size_i % 8 == 0 ? 8 
+                                                : (sizeof(uint8_t) * vec_size_i % 4 == 0 ? 4 : 2)));
+    using vec_i = opus::vector_t<uint8_t, vec_size_i>;
+    const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
+    const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
+    auto fp4_scale_shuffle_id = [](int32_t scaleN_pad_, int32_t x, int32_t y) {
+        return (x / 32 * scaleN_pad_) * 32 + (y / 8) * 256 + (y % 4) * 64 +
+               (x % 16) * 4 + (y % 8) / 4 * 2 + (x % 32) / 16;
+    };
+    auto buffer_scale =
+                opus::make_gmem<uint8_t>(scale, scale_per_row * num_tokens * topk * sizeof(uint8_t));
+    for(; block_idx < num_blocks; block_idx += num_tg)
+    {
+        int sorted_row = block_idx * num_rows + row_i;
+        int token_id_info = num_tokens;
+        if (sorted_row < num_valid_ids_value)
+        {
+            token_id_info = sorted_ids[sorted_row];
+        }
+        int token_idx = token_id_info & 0xFFFFFF;
+        int topk_id   = token_id_info >> 24;
+        if(token_idx < num_tokens && (topk == 1 || topk_id < topk))
+        {
+            int64_t scale_offset;
+            if (topk == 1)
+            {
+                scale_offset = (int64_t)(token_idx) * scale_per_row;
+            }
+            else
+            {
+                scale_offset = (int64_t)(token_idx * topk + topk_id) * scale_per_row;
+            }
+            vec_i vec_scale = load_vector_nbytes<uint8_t, vec_size_i, load_chunk_bytes, RT>(
+                buffer_scale, scale_offset + scale_k);
+
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                if((scale_k + j) < scaleN_valid)
+                {
+                    int addr = fp4_scale_shuffle_id(scaleN_pad, sorted_row, scale_k + j);
+                    out_scale[addr] = vec_scale[j];
+                }
+            }
+        }
+    }
+}
+
+
+#define MXFP4_MOE_SORT_KERNEL_IMPL(MAX_COL, THREAD_DATA, BLOCK_SIZE)                    \
+    constexpr int GROUP_SIZE = 32;                                                      \
+    constexpr int NUM_ROWS = BLOCK_SIZE / (MAX_COL /(GROUP_SIZE * THREAD_DATA));        \
+    AITER_CHECK(BLOCK_SIZE % (MAX_COL /(GROUP_SIZE * THREAD_DATA)) == 0);               \
+    int num_blocks = (sorted_ids.size(0) + NUM_ROWS - 1) / NUM_ROWS;                    \
+    int blocks_per_cu = 8 * 4 / (BLOCK_SIZE / WARP_SIZE);                               \
+    int num_tg = persistent_mode ? num_cu * blocks_per_cu : num_blocks;                 \
+    dim3 const grid(num_tg);                                                            \
+    mxfp4_moe_sort_kernel<BLOCK_SIZE, NUM_ROWS, THREAD_DATA, GROUP_SIZE>                \
+        <<<grid, dim3(BLOCK_SIZE), 0, stream>>>(                                        \
+            reinterpret_cast<uint8_t*>(out_scale.data_ptr()),                           \
+            reinterpret_cast<uint8_t*>(scale.data_ptr()),                               \
+            reinterpret_cast<int32_t*>(sorted_ids.data_ptr()),                          \
+            reinterpret_cast<int32_t*>(num_valid_ids.data_ptr()),                       \
+            token_num, cols, num_blocks, num_tg, topk);
+
+
+#define MXFP4_MOE_SORT_KERNEL_DISPATCH(cols_)                                                  \
+    if(cols_ <= 256)                                                                           \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(256, 4, 256)                                                \
+    }                                                                                          \
+    else if(cols_ <= 512)                                                                      \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(512, 4, 256)                                                \
+    }                                                                                          \
+    else if(cols_ <= 1024)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(1024, 4, 256)                                               \
+    }                                                                                          \
+    else if(cols_ <= 2048)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(2048, 8, 256)                                               \
+    }                                                                                          \
+    else if(cols_ <= 4096)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(4096, 16, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 6144)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(6144, 24, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 8192)                                                                     \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(8192, 32, 256)                                              \
+    }                                                                                          \
+    else if(cols_ <= 16384)                                                                    \
+    {                                                                                          \
+        MXFP4_MOE_SORT_KERNEL_IMPL(16384, 32, 256)                                             \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        AITER_CHECK(false, "input last dim has exceeded the maximum value ", 16384);            \
+    }
+
+void mxfp4_moe_sort_hip(
+    aiter_tensor_t& out_scale,
+    const aiter_tensor_t& scale,
+    const aiter_tensor_t& sorted_ids,
+    const aiter_tensor_t& num_valid_ids,
+    int token_num,
+    int cols
+)
+{
+    const int num_cu = get_num_cu_func();
+    const bool persistent_mode = false;
+    int topk = scale.numel() / ((cols + 31) / 32 * token_num);
+
+    HipDeviceGuard device_guard(scale.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    MXFP4_MOE_SORT_KERNEL_DISPATCH(cols);
+}
 
 } // namespace aiter

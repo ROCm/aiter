@@ -13,13 +13,13 @@ from torch.library import Library
 from ..jit.core import (
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
-    AITER_ROOT_DIR,
     compile_ops,
 )
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+from ..ops.flydsl.utils import is_flydsl_available
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
@@ -56,6 +56,7 @@ def gen_gemm_a8w8_bpreshuffle_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor:
     return Out
 
@@ -71,6 +72,7 @@ def gemm_a8w8_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
@@ -80,6 +82,7 @@ def gen_gemm_a8w8_bpreshuffle_cktile_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor:
     return Out
 
@@ -95,7 +98,58 @@ def gemm_a8w8_bpreshuffle_cktile(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
+    splitK: int = 0,
 ) -> Tensor: ...
+
+
+def _parse_flydsl_kernel_name(kernel_name: str):
+    """Parse tile config from flydsl kernelName, e.g.
+    'flydsl_bpreshuflle_128x64x256_F8_F8_B16_2x0x1x1_default'
+    -> (tile_m=128, tile_n=64, tile_k=256, lds_stage=2, cshuffle=0, async_copy=1, wpe=1)
+    Returns None on parse failure.
+    """
+    import re
+
+    m = re.match(
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)x(\d+)x(\d+)",
+        kernel_name,
+    )
+    if m is None:
+        return None
+    return tuple(int(m.group(i)) for i in range(1, 8))
+
+
+def gemm_a8w8_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+    kernel_name = config.get("kernelName", "")
+    parsed = _parse_flydsl_kernel_name(str(kernel_name))
+    if parsed is None:
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
+    tm, tn, tk, lds, csh, acp, wpe = parsed
+
+    flydsl_preshuffle_gemm_a8(
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale,
+        w_scale,
+        Out,
+        tm,
+        tn,
+        tk,
+        lds,
+        csh,
+        acp,
+        wpe,
+    )
+    return Out
 
 
 @compile_ops(
@@ -263,6 +317,8 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     bpreshuffle: Optional[bool] = True,
     zero_bias_buf: Optional[Tensor] = None,
 ) -> Tensor:
+    if bias is None and zero_bias_buf is None:
+        zero_bias_buf = torch.zeros(1, B.shape[0], dtype=torch.float32, device=A.device)
     _gemm_a8w8_blockscale_bpreshuffle_asm(
         A,
         B,
@@ -278,31 +334,6 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     return out
 
 
-@compile_ops(
-    "module_gemm_gfx950_a8w8_blockscale_asm",
-    fc_name="mi350_a8w8_blockscale_asm",
-    ffi_type="ctypes",
-)
-def _gfx950_a8w8_blockscale_asm(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-) -> None: ...
-
-
-def gfx950_a8w8_blockscale_asm(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-) -> Tensor:
-    _gfx950_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, out)
-    return out
-
-
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
@@ -314,29 +345,42 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     return splitK
 
 
-_CKGEMM_CONFIG_CACHE = None
+_CKGEMM_CONFIG_CACHE: dict = {}
+_CKGEMM_HAS_GFX: dict = {}
 
 
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
+def get_CKGEMM_config(M: int, N: int, K: int, tuned_file=None):
     if tuned_file is None:
-        tuned_file = "a8w8_tuned_gemm.csv"
-    global _CKGEMM_CONFIG_CACHE
-
-    if _CKGEMM_CONFIG_CACHE is None:
-        _CKGEMM_CONFIG_CACHE = {}
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_FILE
     if tuned_file not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(f"{tuned_file}").drop_duplicates()
-        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
-            ["cu_num", "M", "N", "K"]
-        ).to_dict("index")
+        # Use (gfx, cu_num, M, N, K) key when the CSV has a gfx column (new schema).
+        # Fall back to (cu_num, M, N, K) for old CSVs that pre-date the gfx column.
+        if "gfx" in ckgemm_dict.columns:
+            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+                ["gfx", "cu_num", "M", "N", "K"]
+            ).to_dict("index")
+            _CKGEMM_HAS_GFX[tuned_file] = True
+        else:
+            logger.warning(
+                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
+                "Re-run the tuner or migrate the CSV to add a gfx column."
+            )
+            _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+                ["cu_num", "M", "N", "K"]
+            ).to_dict("index")
+            _CKGEMM_HAS_GFX[tuned_file] = False
 
+    gfx = get_gfx()
     cu_num = get_cu_num()
+    has_gfx = _CKGEMM_HAS_GFX[tuned_file]
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = _CKGEMM_CONFIG_CACHE[tuned_file].get((cu_num, padded_M, N, K), None)
+        key = (gfx, cu_num, padded_M, N, K) if has_gfx else (cu_num, padded_M, N, K)
+        config = _CKGEMM_CONFIG_CACHE[tuned_file].get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
@@ -350,35 +394,53 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     return config
 
 
+_GEMM_QUANT_TYPE_CACHE: dict = {}
+_GEMM_QUANT_TYPE_HAS_GFX: dict = {}
+
+
 @functools.lru_cache(maxsize=1024)
 def get_GEMM_config_with_quant_type(
     M: int,
     N: int,
     K: int,
     q_dtype_w: torch.dtype,
-    tuned_file=f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+    tuned_file=None,
 ):
-    # Use dict to cache configs for different files
-    if not hasattr(get_GEMM_config_with_quant_type, "file_cache"):
-        get_GEMM_config_with_quant_type.file_cache = {}
-
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
     # Load file if not cached
-    if tuned_file not in get_GEMM_config_with_quant_type.file_cache:
+    if tuned_file not in _GEMM_QUANT_TYPE_CACHE:
         asmGemmDictDf = pd.read_csv(tuned_file).drop_duplicates()
-        get_GEMM_config_with_quant_type.file_cache[tuned_file] = (
-            asmGemmDictDf.set_index(["cu_num", "M", "N", "K", "q_dtype_w"]).to_dict(
-                "index"
+        # Use (gfx, cu_num, M, N, K, q_dtype_w) key when the CSV has a gfx column (new schema).
+        # Fall back to (cu_num, M, N, K, q_dtype_w) for old CSVs that pre-date the gfx column.
+        if "gfx" in asmGemmDictDf.columns:
+            _GEMM_QUANT_TYPE_CACHE[tuned_file] = asmGemmDictDf.set_index(
+                ["gfx", "cu_num", "M", "N", "K", "q_dtype_w"]
+            ).to_dict("index")
+            _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = True
+        else:
+            logger.warning(
+                f"{tuned_file} has no 'gfx' column — falling back to cu_num-only key. "
+                "Re-run the tuner or migrate the CSV to add a gfx column."
             )
-        )
+            _GEMM_QUANT_TYPE_CACHE[tuned_file] = asmGemmDictDf.set_index(
+                ["cu_num", "M", "N", "K", "q_dtype_w"]
+            ).to_dict("index")
+            _GEMM_QUANT_TYPE_HAS_GFX[tuned_file] = False
 
+    gfx = get_gfx()
     cu_num = get_cu_num()
+    has_gfx = _GEMM_QUANT_TYPE_HAS_GFX[tuned_file]
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = get_GEMM_config_with_quant_type.file_cache[tuned_file].get(
-            (cu_num, padded_M, N, K, str(q_dtype_w)), None
+        key = (
+            (gfx, cu_num, padded_M, N, K, str(q_dtype_w))
+            if has_gfx
+            else (cu_num, padded_M, N, K, str(q_dtype_w))
         )
+        config = _GEMM_QUANT_TYPE_CACHE[tuned_file].get(key, None)
         if config is not None:
             if AITER_LOG_TUNED_CONFIG:
                 msg = f"shape M:{M}, N:{N}, K:{K} q_dtype_w:{q_dtype_w}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned, in {tuned_file}!"
@@ -463,8 +525,9 @@ def gemm_a8w8_ASM(
         )
         is not None
     ):
-        assert bias is not None, "Use asm gemm must give bias, please give a \
-            bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
+        assert (
+            bias is not None
+        ), "Use asm gemm must give bias, please give a bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         kernelName = asm_config["kernelName"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -558,12 +621,15 @@ def gemm_a8w8_bpreshuffle(
     )
     if config is not None:
         libtype = config["libtype"]
+        splitK = int(config["splitK"])
         if libtype == "ck":
-            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
-            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
+            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
+        elif libtype == "flydsl" and is_flydsl_available():
+            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
     else:
-        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, 0)
 
 
 def gemm_a8w8_blockscale_fake(
@@ -597,8 +663,6 @@ def gemm_a8w8_blockscale(
     n = WQ.shape[0]
     k = XQ.shape[1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    from aiter.jit.utils.chip_info import get_gfx
-
     if isBpreshuffled:
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             return gfx950_a8w8_blockscale_ASM(XQ, WQ, x_scale, w_scale, Y)
@@ -671,6 +735,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+        elif libtype == "asm":
+            kernelName = config["kernelName"]
+            splitK = config["splitK"]
+            return gemm_a8w8_blockscale_bpreshuffle_asm(
+                XQ, WQ, Y, x_scale, w_scale, splitK=splitK, kernelName=kernelName
+            )
     return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 

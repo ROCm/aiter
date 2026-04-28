@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 import argparse
+import pandas as pd
 from aiter import dtypes
 
 from aiter.dist.parallel_state import (
@@ -220,21 +221,23 @@ def allgather_perftest(
         ref = torch.concat((ref, input_list[i + 1]), dim)
 
     rets = [el.get() for el in rets]
+    all_us = [us for _, us in rets]
+    max_err = 0.0
     for out, us in rets:
         msg = f"allgather (use custom {use_custom}): {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        # print(cpu_rslt[out.device.index])
-        print("cpu_size:", ref.shape, ", gpu_size:", out.shape)
-        checkAllclose(ref, out.to(ref), msg=msg)
-        # checkAllclose(ref, out.to(ref), msg=msg)
+        err = checkAllclose(ref, out.to(ref), msg=msg)
+        max_err = max(max_err, err)
+    return {
+        "min_us": min(all_us),
+        "max_us": max(all_us),
+        "err": max_err,
+    }
 
 
 l_dtype = ["bf16"]
 l_shape = [
-    # (4096, 2048)
     (1345,),
-    # # (16, 512),
     (128, 7168),
-    # (32, 7168),
     # exceeds max_size/world_size but satisfies all other custom ag
     # conditions (contiguous, 16-byte aligned) — should fallback to RCCL
     # threshold: 64 MB (2 GPU) / 32 MB (4 GPU) / 16 MB (8 GPU)
@@ -274,13 +277,12 @@ if __name__ == "__main__":
     if args.shape is not None:
         l_shape = [args.shape]
     l_dim = [0, -1]
+    df = []
     for dtype in l_dtype:
         for shape in l_shape:
             for dim in l_dim:
-                # allgather_acctest(8, 1, shape, dtype, use_custom=False)
-                # allgather_acctest(8, 1, shape, dtype, use_custom=True)
                 for use_custom in [False, True]:
-                    allgather_perftest(
+                    ret = allgather_perftest(
                         8,
                         1,
                         shape,
@@ -292,3 +294,21 @@ if __name__ == "__main__":
                             get_ip(), get_open_port()
                         ),
                     )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    show_cols = [
+        "tp_size",
+        "shape",
+        "dtype",
+        "withGraph",
+        "use_custom",
+        "dim",
+        "min_us",
+        "max_us",
+        "err",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+    logger.info(
+        "allgather summary (markdown):\n%s",
+        df[show_cols].to_markdown(index=False),
+    )

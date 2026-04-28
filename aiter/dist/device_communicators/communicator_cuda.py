@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
 import torch
 from torch.distributed import ProcessGroup
 
@@ -14,6 +15,11 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
+    # AITER_AR_1STAGE=1 forces 1stage, =0 forces non-1stage, unset uses auto
+    _ar_1stage_override = {"1": True, "0": False}.get(
+        os.environ.get("AITER_AR_1STAGE", "")
+    )
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -25,18 +31,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self._all2all_manager_created = False
 
         super().__init__(cpu_group, device, device_group, unique_name)
-        if "tp" not in unique_name:
-            # custom allreduce or torch symm mem can be used only by tp
-            use_custom_allreduce = False
-            use_torch_symm_mem = False
-        else:
-            from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+        from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
-            use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_torch_symm_mem = False
-
-        self.use_custom_allreduce = use_custom_allreduce
-        self.use_torch_symm_mem = use_torch_symm_mem
+        self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+        self.use_torch_symm_mem = False
 
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (
@@ -73,7 +71,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         #         device=self.device,
         #     )
 
-        if use_custom_allreduce and self.world_size > 1:
+        if self.use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
@@ -148,7 +146,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self._all2all_manager_created = True
 
     def all_reduce(
-        self, input_, use_new: bool = True, ca_fp8_quant: bool = False
+        self,
+        input_,
+        use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
     ) -> torch.Tensor:
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -167,7 +169,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_ar(input_, prefill_support)
         ):
             out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
             assert out is not None
@@ -191,7 +193,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def fused_allreduce_rmsnorm(
-        self, input_, res_inp_, weight_, eps
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n = input_.shape[-1]
         total_bytes = input_.numel() * input_.element_size()
@@ -202,10 +209,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_ar(input_, prefill_support)
             and can_use_fuse_ar_rms
         ):
-            use_1stage = True if total_bytes <= 128 * 1024 else False
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
             out, res_out = ca_comm.custom_fused_ar_rms(
                 input_, res_inp_, weight_, eps, use_1stage
             )
@@ -213,7 +224,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert res_out is not None
             return out, res_out
         # call split kernel
-        ar_out = self.all_reduce(input_)
+        ar_out = self.all_reduce(input_, prefill_support=prefill_support)
         out = torch.empty_like(ar_out)
         residual_out = torch.empty_like(ar_out)
         from aiter import rmsnorm2d_fwd_with_add
@@ -230,19 +241,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out, residual_out
 
     def fused_allreduce_rmsnorm_quant(
-        self, input_, res_inp_, weight_, eps
+        self,
+        input_,
+        res_inp_,
+        weight_,
+        eps,
+        prefill_support: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         total_bytes = input_.numel() * input_.element_size()
         if (
             int(input_.shape[-1]) in [512, 1024, 2048, 4096]
             and total_bytes <= 4096 * 1024
+            and (prefill_support or total_bytes <= 64 * 1024 * 1024)
         ):
-            use_1stage = True if total_bytes <= 128 * 1024 else False
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
             out, res_out, scale_out = self.ca_comm.custom_fused_ar_rms_quant(
                 input_, res_inp_, weight_, eps, use_1stage
             )
         else:
-            out_, res_out = self.fused_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+            out_, res_out = self.fused_allreduce_rmsnorm(
+                input_, res_inp_, weight_, eps, prefill_support
+            )
             hip_quant = get_hip_quant(QuantType.per_Token)
             out, scale_out = hip_quant(out_, quant_dtype=fp8)
         assert out is not None

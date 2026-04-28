@@ -5,8 +5,11 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import get_x_vals
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
+# TODO: Merge this with the regular GEMM A16W16
+
 
 def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
+    torch.manual_seed(0)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 

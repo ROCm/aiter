@@ -223,6 +223,8 @@ def run_ck(
             * 2
             + nhead * lse_dtype_bytes * real_seqlen_q
         )
+    fwd_flop = fwd_flop / 2 if causal else fwd_flop
+    bwd_flop = bwd_flop / 2 if causal else bwd_flop
     if dout is None or not return_lse:
         return out, dropout_mask, None, None, None, (us_fwd, fwd_flop, fwd_num_bytes)
     else:
@@ -375,7 +377,7 @@ def run_ck_seq_padding(
 
 @pytest.mark.parametrize("input_layout", ["BSHD", "KVPACKED"])
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
@@ -429,14 +431,14 @@ def test_flash_attn_varlen_func(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
     return_lse = True
     torch.random.manual_seed(0)
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     q = torch.randn(
@@ -622,7 +624,7 @@ def flash_attn_varlen_func_benchmark(
     local,
     bias_type,
     deterministic,
-    mha_type,
+    gqa_ratio,
     dtype,
     input_layout,
 ):
@@ -639,14 +641,14 @@ def flash_attn_varlen_func_benchmark(
         local=local,
         bias_type=bias_type,
         deterministic=deterministic,
-        mha_type=mha_type,
+        gqa_ratio=gqa_ratio,
         dtype=dtype,
         input_layout=input_layout,
     )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("gqa_ratio", [1, 8])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize(
     "padding_scenario",
@@ -687,7 +689,7 @@ def flash_attn_varlen_func_benchmark(
 @pytest.mark.parametrize("local", [False, True])
 def test_varlen_flash_attn_seq_padding(
     batch_size,
-    mha_type,
+    gqa_ratio,
     deterministic,
     padding_scenario,
     dtype,
@@ -700,12 +702,11 @@ def test_varlen_flash_attn_seq_padding(
     """End-to-end check that CK group-mode varlen path respects padded tokens."""
     torch.random.manual_seed(0)
 
-    nheads = 9
+    nheads = 8
     device = "cuda"
 
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    if nheads % nheads_k != 0:
-        pytest.skip("nheads must be divisible by nheads_k")
+    assert nheads % gqa_ratio == 0
+    nheads_k = nheads // gqa_ratio
 
     # Dynamically generate padding configurations
     q_padded_lens = torch.randint(seqlen_q // 2, seqlen_q + 1, (batch_size,)).tolist()
@@ -821,7 +822,7 @@ def test_varlen_flash_attn_seq_padding(
     out_tol = max(4 * ref_diff, 0.01)
 
     print(
-        f"\nGroup Mode Test (bs={batch_size}, {mha_type}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
+        f"\nGroup Mode Test (bs={batch_size}, {gqa_ratio}, {padding_scenario}, {dtype}, local={local}) | Max diff: {out_diff} | Ref diff: {ref_diff} | Tol: {out_tol}"
     )
     assert out_diff <= out_tol
 
@@ -870,7 +871,7 @@ def test_varlen_flash_attn_seq_padding(
 @benchmark()
 def varlen_flash_attn_seq_padding_benchmark(
     batch_size,
-    mha_type,
+    gqa_ratio,
     deterministic,
     padding_scenario,
     dtype,
@@ -882,7 +883,7 @@ def varlen_flash_attn_seq_padding_benchmark(
 ):
     return test_varlen_flash_attn_seq_padding(
         batch_size=batch_size,
-        mha_type=mha_type,
+        gqa_ratio=gqa_ratio,
         deterministic=deterministic,
         padding_scenario=padding_scenario,
         dtype=dtype,
@@ -913,7 +914,7 @@ if __name__ == "__main__":
         "--nheads",
         type=int,
         nargs="?",
-        default=9,
+        default=16,
         help="""Number of attention heads.
     e.g. -nh 4""",
     )
@@ -998,14 +999,14 @@ if __name__ == "__main__":
          -det false # disable deterministic attention""",
     )
     parser.add_argument(
-        "-mha",
-        "--mha_type",
-        type=str,
+        "-gr",
+        "--gqa_ratio",
+        type=int,
         nargs="+",
-        choices=["mha", "mqa", "gqa"],
-        default=["mha", "mqa", "gqa"],
-        help="""Type of multi-head attention.
-    e.g. -mha mha/mqa/gqa""",
+        choices=[1, 8],
+        default=[1, 8],
+        help="""gqa ratio.
+    e.g. -gr 1""",
     )
     parser.add_argument(
         "-dt",
@@ -1034,14 +1035,14 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         causal,
         local,
         deterministic,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.causal,
         args.local,
         args.deterministic,
@@ -1059,7 +1060,7 @@ if __name__ == "__main__":
             local,
             args.bias_type,
             deterministic,
-            mha_type,
+            gqa_ratio,
             dtypes.d_dtypes[dtype],
             args.input_layout,
         )
@@ -1070,21 +1071,21 @@ if __name__ == "__main__":
     for (
         dtype,
         (dim_qk, dim_v),
-        mha_type,
+        gqa_ratio,
         deterministic,
         padding_scenario,
         local,
     ) in itertools.product(
         args.dtype,
         args.d_qk_v,
-        args.mha_type,
+        args.gqa_ratio,
         args.deterministic,
         ["mixed", "q_only", "k_only", "no_padding"],
         args.local,
     ):
         ret = varlen_flash_attn_seq_padding_benchmark(
             args.batch_size,
-            mha_type,
+            gqa_ratio,
             deterministic,
             padding_scenario,
             dtypes.d_dtypes[dtype],
@@ -1101,3 +1102,217 @@ if __name__ == "__main__":
 
     df_padding = pd.DataFrame(padding_collected)
     aiter.logger.info(f"mha_varlen_seq_padding summary:\n{df_padding}")
+
+
+# ---------------------------------------------------------------------------
+# Sink backward tests (mha_varlen_bwd with sink / d_sink)
+# ---------------------------------------------------------------------------
+
+
+def _vsink_run_fwd(q, k, v, softmax_scale, causal):
+    """Run mha_fwd and return (out, lse)."""
+    out, lse, _, _ = aiter.mha_fwd(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        is_causal=causal,
+        window_size_left=-1,
+        window_size_right=0 if causal else -1,
+        sink_size=0,
+        return_softmax_lse=True,
+        return_dropout_randval=False,
+    )
+    return out, lse
+
+
+def _vsink_reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
+    """
+    Reference d_sink for varlen mode.
+
+    dout       : [total_q, H, Dv]
+    out        : [total_q, H, Dv]
+    lse_group  : [H, total_q]   – group-mode LSE (flattened across batches)
+    sink       : [B, H]
+    seqlens_q  : list of per-batch sequence lengths
+    returns d_sink : [H]
+    """
+    nhead = sink.shape[1]
+    d_sink = torch.zeros(nhead, device=sink.device, dtype=torch.float32)
+
+    offset = 0
+    for b, sq in enumerate(seqlens_q):
+        dout_b = dout[offset : offset + sq].float()
+        out_b = out[offset : offset + sq].float()
+        lse_b = lse_group[:, offset : offset + sq]
+
+        D_qh = (dout_b * out_b).sum(dim=-1)
+        D_hq = D_qh.permute(1, 0)
+        p_sink = torch.exp(sink[b].float().unsqueeze(-1) - lse_b)
+        d_sink += (-p_sink * D_hq).sum(dim=-1)
+        offset += sq
+
+    return d_sink
+
+
+_VSINK_DTYPES = [dtypes.fp16, dtypes.bf16]
+
+
+@pytest.mark.parametrize("dtype", _VSINK_DTYPES)
+def test_mha_varlen_bwd_sink_dsink(dtype):
+    """Numerical correctness test: mha_varlen_bwd with sink/d_sink (equal-length sequences)."""
+    device = torch.device("cuda")
+    batch, seqlen, nhead, hdim = 2, 64, 4, 64
+    hdim_v = hdim
+    softmax_scale = hdim**-0.5
+    seqlens_q = [seqlen] * batch
+
+    cu_seqlens_q = torch.tensor(
+        [0, seqlen, seqlen * 2], device=device, dtype=torch.int32
+    )
+    cu_seqlens_k = cu_seqlens_q.clone()
+    total_q = seqlen * batch
+    total_k = seqlen * batch
+
+    q = torch.randn(total_q, nhead, hdim, device=device, dtype=dtype)
+    k = torch.randn(total_k, nhead, hdim, device=device, dtype=dtype)
+    v = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
+    dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
+
+    q_b = q.view(batch, seqlen, nhead, hdim)
+    k_b = k.view(batch, seqlen, nhead, hdim)
+    v_b = v.view(batch, seqlen, nhead, hdim_v)
+    out_b, lse_b = _vsink_run_fwd(q_b, k_b, v_b, softmax_scale, causal=False)
+
+    out = out_b.view(total_q, nhead, hdim_v)
+    lse = lse_b.permute(1, 0, 2).reshape(nhead, total_q).contiguous()
+
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
+
+    dq, dk, dv, _ = aiter.mha_varlen_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        zero_tensors=False,
+        is_causal=False,
+        window_size_left=-1,
+        window_size_right=-1,
+        deterministic=False,
+        sink=sink,
+        d_sink=d_sink,
+    )
+
+    assert torch.isfinite(d_sink).all(), f"d_sink contains non-finite values: {d_sink}"
+    assert d_sink.abs().max() > 0, "mha_varlen_bwd did not update d_sink"
+    assert dq.shape == q.shape
+    assert dk.shape == k.shape
+    assert dv.shape == v.shape
+
+    d_sink_ref = _vsink_reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
+    torch.testing.assert_close(
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg="varlen d_sink mismatch vs reference",
+    )
+
+
+@pytest.mark.parametrize("dtype", _VSINK_DTYPES)
+def test_mha_varlen_bwd_sink_variable_lengths(dtype):
+    """Varlen sink test with variable-length sequences per batch entry."""
+    device = torch.device("cuda")
+    nhead, hdim = 4, 64
+    hdim_v = hdim
+    softmax_scale = hdim**-0.5
+
+    seqlens_q = [48, 80]
+    seqlens_k = [48, 80]
+    batch = len(seqlens_q)
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    cu_sq = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens_q), 0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    cu_sk = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens_k), 0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+
+    q = torch.randn(total_q, nhead, hdim, device=device, dtype=dtype)
+    k = torch.randn(total_k, nhead, hdim, device=device, dtype=dtype)
+    v = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
+    dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
+
+    out_parts, lse_parts = [], []
+    offset_q, offset_k = 0, 0
+    for sq, sk in zip(seqlens_q, seqlens_k):
+        q_b = q[offset_q : offset_q + sq].unsqueeze(0)
+        k_b = k[offset_k : offset_k + sk].unsqueeze(0)
+        v_b = v[offset_k : offset_k + sk].unsqueeze(0)
+        out_b, lse_b = _vsink_run_fwd(q_b, k_b, v_b, softmax_scale, causal=False)
+        out_parts.append(out_b.squeeze(0))
+        lse_parts.append(lse_b.squeeze(0).permute(1, 0))
+        offset_q += sq
+        offset_k += sk
+
+    out = torch.cat(out_parts, dim=0)
+    lse = torch.cat(lse_parts, dim=0).permute(1, 0).contiguous()
+
+    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
+        30.0, 60.0
+    )
+    d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
+
+    dq, dk, dv, _ = aiter.mha_varlen_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        cu_seqlens_q=cu_sq,
+        cu_seqlens_k=cu_sk,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        zero_tensors=False,
+        is_causal=False,
+        window_size_left=-1,
+        window_size_right=-1,
+        deterministic=False,
+        sink=sink,
+        d_sink=d_sink,
+    )
+
+    assert torch.isfinite(d_sink).all(), f"d_sink has non-finite values: {d_sink}"
+    assert d_sink.abs().max() > 0, "mha_varlen_bwd did not update d_sink"
+
+    d_sink_ref = _vsink_reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
+    torch.testing.assert_close(
+        d_sink,
+        d_sink_ref,
+        rtol=0.02,
+        atol=0.5,
+        msg="varlen variable-length d_sink mismatch",
+    )

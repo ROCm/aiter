@@ -16,6 +16,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton._gluon_kernels.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_gfx1250,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.moe.reduce import reduce_grouped
 
 GLUON_SUPPORTED_ARCHS = set(["gfx1250"])
@@ -85,7 +86,8 @@ def get_kernel_config_triton(m, n, k, routing_data):
     num_xcds = 1
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 2
+    arch = get_arch()
+    num_stages = 1 if arch == "gfx950" else 2
 
     split_k = 1
     if block_m == 16:
