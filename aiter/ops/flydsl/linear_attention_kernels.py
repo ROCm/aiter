@@ -107,21 +107,22 @@ def flydsl_gdr_decode(
         use_qk_l2norm,
         **kwargs,
     )
-    _run_compiled(
-        exe,
-        query,
-        key,
-        value,
-        a,
-        b,
-        dt_bias,
-        A_log,
-        indices,
-        state_,
-        out,
-        batch_size,
-        stream,
-    )
+    with torch.cuda.device(query.device.index):
+        _run_compiled(
+            exe,
+            query,
+            key,
+            value,
+            a,
+            b,
+            dt_bias,
+            A_log,
+            indices,
+            state_,
+            out,
+            batch_size,
+            stream,
+        )
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
         state.copy_(state_)
