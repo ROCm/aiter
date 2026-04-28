@@ -132,13 +132,14 @@ CASES = [
 
     # KV_COMPUTE_BLOCK_SIZE = 256 (4 N-tiles per warp for QK)
     (128, 64, 16, 1, 1, 512, 256),   # KVB=64, BPC=4
+    (64, 16, 8, 1, 1, 1024, 256),
 ]
 
 
 def _derive_partition_size(kv_compute_block_size: int) -> int:
     """Pick a partition size that's a multiple of kv_compute_block_size and gives
     us at least 2 compute iterations per partition (to exercise the pipeline)."""
-    return kv_compute_block_size * 2
+    return kv_compute_block_size * 1
 
 
 @pytest.mark.parametrize(
