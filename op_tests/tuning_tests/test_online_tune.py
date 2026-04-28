@@ -18,11 +18,21 @@ import os
 import tempfile
 import unittest
 
-
-SAMPLE_KEYS = (256, 16, 7168, 256, 256, 8,
-               "ActivationType.Silu", "torch.bfloat16",
-               "torch.float8_e4m3fnuz", "torch.float8_e4m3fnuz",
-               "QuantType.per_Token", 1, 0)
+SAMPLE_KEYS = (
+    256,
+    16,
+    7168,
+    256,
+    256,
+    8,
+    "ActivationType.Silu",
+    "torch.bfloat16",
+    "torch.float8_e4m3fnuz",
+    "torch.float8_e4m3fnuz",
+    "QuantType.per_Token",
+    1,
+    0,
+)
 
 SAMPLE_CFG = {
     "block_m": 64,
@@ -35,8 +45,12 @@ SAMPLE_CFG = {
 
 
 def simulate_online_tune_path(
-    cfg_2stages, keys, env_online_tune,
-    mp_lock_fn, reload_fn, logger_obj,
+    cfg_2stages,
+    keys,
+    env_online_tune,
+    mp_lock_fn,
+    reload_fn,
+    logger_obj,
 ):
     """Simulate the AITER_ONLINE_TUNE decision logic from fused_moe.py:837-844.
 
@@ -73,7 +87,9 @@ class TestOnlineTuneDecision(unittest.TestCase):
         logger_obj = logging.getLogger("test_online_tune")
 
         cfg, _, mp_lock_called = simulate_online_tune_path(
-            cfg_2stages, SAMPLE_KEYS, "1",
+            cfg_2stages,
+            SAMPLE_KEYS,
+            "1",
             mp_lock_fn=lambda: self.fail("mp_lock should not be called"),
             reload_fn=lambda: self.fail("reload should not be called"),
             logger_obj=logger_obj,
@@ -87,7 +103,9 @@ class TestOnlineTuneDecision(unittest.TestCase):
         logger_obj = logging.getLogger("test_online_tune")
 
         cfg, _, mp_lock_called = simulate_online_tune_path(
-            cfg_2stages, SAMPLE_KEYS, "0",
+            cfg_2stages,
+            SAMPLE_KEYS,
+            "0",
             mp_lock_fn=lambda: self.fail("mp_lock should not be called"),
             reload_fn=lambda: self.fail("reload should not be called"),
             logger_obj=logger_obj,
@@ -101,7 +119,9 @@ class TestOnlineTuneDecision(unittest.TestCase):
         logger_obj = logging.getLogger("test_online_tune")
 
         cfg, _, mp_lock_called = simulate_online_tune_path(
-            cfg_2stages, SAMPLE_KEYS, os.environ.get("AITER_ONLINE_TUNE", "0"),
+            cfg_2stages,
+            SAMPLE_KEYS,
+            os.environ.get("AITER_ONLINE_TUNE", "0"),
             mp_lock_fn=lambda: self.fail("mp_lock should not be called"),
             reload_fn=lambda: self.fail("reload should not be called"),
             logger_obj=logger_obj,
@@ -116,7 +136,9 @@ class TestOnlineTuneDecision(unittest.TestCase):
         logger_obj = logging.getLogger("test_online_tune")
 
         cfg, updated_cfgs, mp_lock_called = simulate_online_tune_path(
-            cfg_2stages, SAMPLE_KEYS, "1",
+            cfg_2stages,
+            SAMPLE_KEYS,
+            "1",
             mp_lock_fn=lambda: None,
             reload_fn=lambda: new_cfg_2stages,
             logger_obj=logger_obj,
@@ -132,7 +154,9 @@ class TestOnlineTuneDecision(unittest.TestCase):
 
         with self.assertLogs(logger_obj, level="WARNING") as cm:
             cfg, _, mp_lock_called = simulate_online_tune_path(
-                cfg_2stages, SAMPLE_KEYS, "1",
+                cfg_2stages,
+                SAMPLE_KEYS,
+                "1",
                 mp_lock_fn=lambda: None,
                 reload_fn=lambda: {},
                 logger_obj=logger_obj,
@@ -147,7 +171,9 @@ class TestOnlineTuneDecision(unittest.TestCase):
         logger_obj = logging.getLogger("test_online_tune")
 
         cfg, updated_cfgs, mp_lock_called = simulate_online_tune_path(
-            None, SAMPLE_KEYS, "1",
+            None,
+            SAMPLE_KEYS,
+            "1",
             mp_lock_fn=lambda: None,
             reload_fn=lambda: new_cfg_2stages,
             logger_obj=logger_obj,
@@ -160,7 +186,9 @@ class TestOnlineTuneDecision(unittest.TestCase):
         logger_obj = logging.getLogger("test_online_tune")
 
         cfg, _, mp_lock_called = simulate_online_tune_path(
-            None, SAMPLE_KEYS, "0",
+            None,
+            SAMPLE_KEYS,
+            "0",
             mp_lock_fn=lambda: self.fail("mp_lock should not be called"),
             reload_fn=lambda: self.fail("reload should not be called"),
             logger_obj=logger_obj,
@@ -201,14 +229,18 @@ class TestMpLock(unittest.TestCase):
             final_called = []
 
             with self.assertRaises(ValueError):
+
                 def raise_err():
                     raise ValueError("boom")
+
                 mp_lock(
                     lock_path,
                     MainFunc=raise_err,
                     FinalFunc=lambda: final_called.append(True),
                 )
-            self.assertEqual(len(final_called), 1, "FinalFunc should be called even on exception")
+            self.assertEqual(
+                len(final_called), 1, "FinalFunc should be called even on exception"
+            )
 
     def test_lock_file_cleaned_up(self):
         from aiter.jit.core import mp_lock
@@ -265,8 +297,10 @@ class TestMainFuncCSVWrite(unittest.TestCase):
         """MainFunc should NOT re-write header when file already has content."""
         with tempfile.TemporaryDirectory() as tmp:
             untune_file = os.path.join(tmp, "untuned_fmoe.csv")
-            header = ("token,model_dim,inter_dim,expert,topk,act_type,dtype,"
-                      "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1")
+            header = (
+                "token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+                "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+            )
             existing_row = "512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0"
             with open(untune_file, "w") as f:
                 f.write(header + "\n" + existing_row)
@@ -302,9 +336,19 @@ class TestGetCfg2stages(unittest.TestCase):
         import pandas as pd
 
         _INDEX_COLS = [
-            "cu_num", "token", "model_dim", "inter_dim", "expert", "topk",
-            "act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type",
-            "use_g1u1", "doweight_stage1",
+            "cu_num",
+            "token",
+            "model_dim",
+            "inter_dim",
+            "expert",
+            "topk",
+            "act_type",
+            "dtype",
+            "q_dtype_a",
+            "q_dtype_w",
+            "q_type",
+            "use_g1u1",
+            "doweight_stage1",
         ]
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
@@ -335,9 +379,19 @@ class TestGetCfg2stages(unittest.TestCase):
         import pandas as pd
 
         _INDEX_COLS = [
-            "cu_num", "token", "model_dim", "inter_dim", "expert", "topk",
-            "act_type", "dtype", "q_dtype_a", "q_dtype_w", "q_type",
-            "use_g1u1", "doweight_stage1",
+            "cu_num",
+            "token",
+            "model_dim",
+            "inter_dim",
+            "expert",
+            "topk",
+            "act_type",
+            "dtype",
+            "q_dtype_a",
+            "q_dtype_w",
+            "q_type",
+            "use_g1u1",
+            "doweight_stage1",
         ]
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:

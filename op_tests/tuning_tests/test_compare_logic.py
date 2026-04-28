@@ -57,8 +57,20 @@ def _make_bench_result(shape_str, status, e2e_us, kernel_us=None):
 
 def _make_tuned_csv(path, rows):
     """Write a tuned CSV with standard GEMM columns."""
-    cols = ["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK", "us",
-            "kernelName", "tflops", "bw", "errRatio"]
+    cols = [
+        "gfx",
+        "cu_num",
+        "M",
+        "N",
+        "K",
+        "kernelId",
+        "splitK",
+        "us",
+        "kernelName",
+        "tflops",
+        "bw",
+        "errRatio",
+    ]
     df = pd.DataFrame(rows, columns=cols)
     df.to_csv(path, index=False)
 
@@ -149,8 +161,8 @@ class TestBuildCompareUpdatePlan(unittest.TestCase):
             _make_bench_result("(64,4096,2048)", "ok", 100.0),
         ]
         post = [
-            _make_bench_result("(1,1024,512)", "ok", 50.0),       # 50% -> update
-            _make_bench_result("(32,2048,1024)", "ok", 99.0),     # 1% -> skip
+            _make_bench_result("(1,1024,512)", "ok", 50.0),  # 50% -> update
+            _make_bench_result("(32,2048,1024)", "ok", 99.0),  # 1% -> skip
             _make_bench_result("(64,4096,2048)", "error:crash", -1),  # error -> skip
         ]
         plan = self._build_plan(shapes, pre, post, threshold=3.0)
@@ -182,6 +194,7 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _make_row(self, m, n, k, kid, us):
@@ -200,12 +213,16 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
         rows = []
         for e in entries:
             row = {
-                "gfx": TEST_GFX, "cu_num": TEST_CU,
-                "M": e["M"], "N": e["N"], "K": e["K"],
+                "gfx": TEST_GFX,
+                "cu_num": TEST_CU,
+                "M": e["M"],
+                "N": e["N"],
+                "K": e["K"],
                 "shape": f"({e['M']},{e['N']},{e['K']})",
                 "pre_us": e.get("pre_us", 100.0),
                 "post_us": e.get("post_us", 50.0),
-                "pre_status": "ok", "post_status": "ok",
+                "pre_status": "ok",
+                "post_status": "ok",
                 "improvement_pct": e.get("improvement_pct", 50.0),
                 "update": e["update"],
                 "update_reason": e["update_reason"],
@@ -219,11 +236,21 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
             base_rows=[self._make_row(1, 1024, 512, 0, 100.0)],
             candidate_rows=[self._make_row(1, 1024, 512, 1, 50.0)],
         )
-        comparison = self._make_comparison([
-            {"M": 1, "N": 1024, "K": 512, "update": True, "update_reason": "threshold_met"},
-        ])
+        comparison = self._make_comparison(
+            [
+                {
+                    "M": 1,
+                    "N": 1024,
+                    "K": 512,
+                    "update": True,
+                    "update_reason": "threshold_met",
+                },
+            ]
+        )
         tuner = _StubTuner.get()
-        merged = tuner._merge_compare_filtered_results(base_path, candidate_path, comparison)
+        merged = tuner._merge_compare_filtered_results(
+            base_path, candidate_path, comparison
+        )
         self.assertEqual(len(merged), 1)
         self.assertEqual(float(merged.iloc[0]["us"]), 50.0)
 
@@ -233,11 +260,15 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
             base_rows=[self._make_row(1, 1024, 512, 0, 100.0)],
             candidate_rows=[self._make_row(1, 1024, 512, 1, 99.0)],
         )
-        comparison = self._make_comparison([
-            {"M": 1, "N": 1024, "K": 512, "update": False, "update_reason": "skip"},
-        ])
+        comparison = self._make_comparison(
+            [
+                {"M": 1, "N": 1024, "K": 512, "update": False, "update_reason": "skip"},
+            ]
+        )
         tuner = _StubTuner.get()
-        merged = tuner._merge_compare_filtered_results(base_path, candidate_path, comparison)
+        merged = tuner._merge_compare_filtered_results(
+            base_path, candidate_path, comparison
+        )
         self.assertEqual(len(merged), 1)
         self.assertEqual(float(merged.iloc[0]["us"]), 100.0)
 
@@ -253,12 +284,28 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
                 self._make_row(32, 2048, 1024, 1, 199.0),
             ],
         )
-        comparison = self._make_comparison([
-            {"M": 1, "N": 1024, "K": 512, "update": True, "update_reason": "threshold_met"},
-            {"M": 32, "N": 2048, "K": 1024, "update": False, "update_reason": "skip"},
-        ])
+        comparison = self._make_comparison(
+            [
+                {
+                    "M": 1,
+                    "N": 1024,
+                    "K": 512,
+                    "update": True,
+                    "update_reason": "threshold_met",
+                },
+                {
+                    "M": 32,
+                    "N": 2048,
+                    "K": 1024,
+                    "update": False,
+                    "update_reason": "skip",
+                },
+            ]
+        )
         tuner = _StubTuner.get()
-        merged = tuner._merge_compare_filtered_results(base_path, candidate_path, comparison)
+        merged = tuner._merge_compare_filtered_results(
+            base_path, candidate_path, comparison
+        )
         self.assertEqual(len(merged), 2)
         row_1 = merged[merged["M"].astype(int) == 1].iloc[0]
         row_32 = merged[merged["M"].astype(int) == 32].iloc[0]
@@ -271,11 +318,15 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
             base_rows=[self._make_row(1, 1024, 512, 0, 100.0)],
             candidate_rows=[self._make_row(1, 1024, 512, 1, 99.0)],
         )
-        comparison = self._make_comparison([
-            {"M": 1, "N": 1024, "K": 512, "update": False, "update_reason": "skip"},
-        ])
+        comparison = self._make_comparison(
+            [
+                {"M": 1, "N": 1024, "K": 512, "update": False, "update_reason": "skip"},
+            ]
+        )
         tuner = _StubTuner.get()
-        merged = tuner._merge_compare_filtered_results(base_path, candidate_path, comparison)
+        merged = tuner._merge_compare_filtered_results(
+            base_path, candidate_path, comparison
+        )
         self.assertEqual(len(merged), 1)
         self.assertEqual(float(merged.iloc[0]["us"]), 100.0)
 
@@ -296,9 +347,17 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
         """Candidate file doesn't exist -> returns base."""
         base_path = os.path.join(self.tmpdir, "base.csv")
         _make_tuned_csv(base_path, [self._make_row(1, 1024, 512, 0, 100.0)])
-        comparison = self._make_comparison([
-            {"M": 1, "N": 1024, "K": 512, "update": True, "update_reason": "threshold_met"},
-        ])
+        comparison = self._make_comparison(
+            [
+                {
+                    "M": 1,
+                    "N": 1024,
+                    "K": 512,
+                    "update": True,
+                    "update_reason": "threshold_met",
+                },
+            ]
+        )
         tuner = _StubTuner.get()
         merged = tuner._merge_compare_filtered_results(
             base_path, os.path.join(self.tmpdir, "nonexistent.csv"), comparison
@@ -317,11 +376,21 @@ class TestMergeCompareFilteredResults(unittest.TestCase):
                 self._make_row(1, 1024, 512, 1, 50.0),
             ],
         )
-        comparison = self._make_comparison([
-            {"M": 1, "N": 1024, "K": 512, "update": True, "update_reason": "threshold_met"},
-        ])
+        comparison = self._make_comparison(
+            [
+                {
+                    "M": 1,
+                    "N": 1024,
+                    "K": 512,
+                    "update": True,
+                    "update_reason": "threshold_met",
+                },
+            ]
+        )
         tuner = _StubTuner.get()
-        merged = tuner._merge_compare_filtered_results(base_path, candidate_path, comparison)
+        merged = tuner._merge_compare_filtered_results(
+            base_path, candidate_path, comparison
+        )
         self.assertEqual(len(merged), 2)
         row_64 = merged[merged["M"].astype(int) == 64]
         self.assertEqual(len(row_64), 1)

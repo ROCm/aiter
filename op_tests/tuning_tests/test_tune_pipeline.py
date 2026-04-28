@@ -376,7 +376,10 @@ class TestShapeGrouped(unittest.TestCase):
             _write_csv(untuned, cfg["header"], cfg["shapes"])
 
             r_ref = _run_tuner(
-                cfg["script"], untuned, tuned_ref, extra_args=["-o2", profile_ref],
+                cfg["script"],
+                untuned,
+                tuned_ref,
+                extra_args=["-o2", profile_ref],
                 timeout=timeout,
             )
             self.assertEqual(
@@ -456,11 +459,11 @@ class TestComparePipeline(unittest.TestCase):
             self.assertEqual(result.returncode, 0, "compare tuner failed")
             output = result.stdout + result.stderr
             self.assertIn(
-                "Compare Report", output,
-                "Expected 'Compare Report' in output"
+                "Compare Report", output, "Expected 'Compare Report' in output"
             )
         finally:
             import shutil
+
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_compare_update_improved(self):
@@ -474,14 +477,14 @@ class TestComparePipeline(unittest.TestCase):
             self.assertTrue(os.path.exists(tuned), "tuned CSV not created")
             output = result.stdout + result.stderr
             self.assertIn(
-                "Compare Report", output,
-                "Expected 'Compare Report' in output"
+                "Compare Report", output, "Expected 'Compare Report' in output"
             )
             df = pd.read_csv(tuned)
             df.columns = df.columns.str.strip()
             self.assertGreaterEqual(len(df), 1, "tuned CSV should have at least 1 row")
         finally:
             import shutil
+
             shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -571,24 +574,27 @@ class TestOnlineTuneE2E(unittest.TestCase):
                 print(f"\n=== ONLINE TUNE E2E STDOUT ===\n{result.stdout[-3000:]}")
                 print(f"\n=== ONLINE TUNE E2E STDERR ===\n{result.stderr[-3000:]}")
             self.assertEqual(
-                result.returncode, 0,
-                f"Online tune e2e failed with code {result.returncode}"
+                result.returncode,
+                0,
+                f"Online tune e2e failed with code {result.returncode}",
             )
 
-            self.assertIn("OUTPUT_OK=True", result.stdout,
-                          "fused_moe output shape mismatch")
+            self.assertIn(
+                "OUTPUT_OK=True", result.stdout, "fused_moe output shape mismatch"
+            )
 
             df = pd.read_csv(tuned_csv)
             df.columns = df.columns.str.strip()
             self.assertGreaterEqual(
-                len(df), 1,
-                f"Tuned CSV should have at least 1 row after online tune, got {len(df)}"
+                len(df),
+                1,
+                f"Tuned CSV should have at least 1 row after online tune, got {len(df)}",
             )
 
             self.assertIn("token", df.columns)
             self.assertTrue(
                 (df["token"] == 16).any(),
-                f"Tuned CSV should contain token=16 row. Rows: {df['token'].tolist()}"
+                f"Tuned CSV should contain token=16 row. Rows: {df['token'].tolist()}",
             )
 
 

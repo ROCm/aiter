@@ -73,7 +73,9 @@ class TestCSVValidation(unittest.TestCase):
         self._check_no_duplicates("a8w8_blockscale")
 
     def test_a8w8_bpreshuffle_no_duplicates(self):
-        self._check_no_duplicates("a8w8_bpreshuffle", extra_keys=["q_dtype_w", "libtype"])
+        self._check_no_duplicates(
+            "a8w8_bpreshuffle", extra_keys=["q_dtype_w", "libtype"]
+        )
 
     def test_a8w8_blockscale_bpreshuffle_no_duplicates(self):
         self._check_no_duplicates("a8w8_blockscale_bpreshuffle", extra_keys=["libtype"])
@@ -87,7 +89,14 @@ class TestCSVValidation(unittest.TestCase):
     def test_bf16_no_duplicates(self):
         self._check_no_duplicates(
             "bf16",
-            extra_keys=["bias", "dtype", "outdtype", "scaleAB", "bpreshuffle", "libtype"],
+            extra_keys=[
+                "bias",
+                "dtype",
+                "outdtype",
+                "scaleAB",
+                "bpreshuffle",
+                "libtype",
+            ],
         )
 
     def test_bf16_batched_no_duplicates(self):

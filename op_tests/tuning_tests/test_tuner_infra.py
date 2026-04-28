@@ -257,7 +257,9 @@ class TestPostProcess(unittest.TestCase):
         args = self._make_args()
         rets = [
             self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, -1, err=0.0),
-            self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, float("inf"), err=0.0),
+            self._make_result(
+                (TEST_GFX, 304, 1, 1024, 512), 1, 0, float("inf"), err=0.0
+            ),
             self._make_result((TEST_GFX, 304, 1, 1024, 512), 2, 0, 7.0, err=0.01),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
@@ -362,12 +364,30 @@ class TestUpdateConfigFiles(unittest.TestCase):
     def test_two_files_merge_dedup(self):
         """Two CSVs with overlapping keys -> merged, fastest us kept."""
         tuner = _StubTuner.get()
-        header = ["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK",
-                  "us", "kernelName", "tflops", "bw", "errRatio"]
-        f1 = self._write_csv("a.csv", header,
-                             [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]])
-        f2 = self._write_csv("b.csv", header,
-                             [[TEST_GFX, 304, 1, 1024, 512, 1, 0, 50.0, "k1", 2.0, 2.0, 0.005]])
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 1, 0, 50.0, "k1", 2.0, 2.0, 0.005]],
+        )
         merged_path = tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_merge")
         try:
             self.assertNotEqual(merged_path, f"{f1}{os.pathsep}{f2}")
@@ -381,26 +401,72 @@ class TestUpdateConfigFiles(unittest.TestCase):
     def test_column_mismatch_raises(self):
         """Two CSVs with different columns -> AssertionError."""
         tuner = _StubTuner.get()
-        h1 = ["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK",
-              "us", "kernelName", "tflops", "bw", "errRatio"]
-        h2 = ["gfx", "cu_num", "M", "N", "K", "extra_col",
-              "us", "kernelName", "tflops", "bw", "errRatio"]
-        f1 = self._write_csv("a.csv", h1,
-                             [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]])
-        f2 = self._write_csv("b.csv", h2,
-                             [[TEST_GFX, 304, 1, 1024, 512, "x", 100.0, "k0", 1.0, 1.0, 0.01]])
+        h1 = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        h2 = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "extra_col",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            h1,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            h2,
+            [[TEST_GFX, 304, 1, 1024, 512, "x", 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
         with self.assertRaises(AssertionError):
             tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_mismatch")
 
     def test_missing_second_file(self):
         """Second path doesn't exist -> only first file data."""
         tuner = _StubTuner.get()
-        header = ["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK",
-                  "us", "kernelName", "tflops", "bw", "errRatio"]
-        f1 = self._write_csv("a.csv", header,
-                             [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]])
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
         fake = os.path.join(self.tmpdir, "nonexistent.csv")
-        merged_path = tuner.update_config_files(f"{f1}{os.pathsep}{fake}", "test_missing")
+        merged_path = tuner.update_config_files(
+            f"{f1}{os.pathsep}{fake}", "test_missing"
+        )
         try:
             df = pd.read_csv(merged_path)
             self.assertEqual(len(df), 1)
@@ -412,12 +478,47 @@ class TestUpdateConfigFiles(unittest.TestCase):
     def test_tag_column_dedup(self):
         """CSVs with _tag column -> dedup uses keys + _tag."""
         tuner = _StubTuner.get()
-        header = ["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK",
-                  "us", "kernelName", "tflops", "bw", "errRatio", "_tag"]
-        f1 = self._write_csv("a.csv", header,
-                             [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01, "modelA"]])
-        f2 = self._write_csv("b.csv", header,
-                             [[TEST_GFX, 304, 1, 1024, 512, 1, 0, 80.0, "k1", 1.5, 1.5, 0.01, "modelB"]])
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+            "_tag",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [
+                [
+                    TEST_GFX,
+                    304,
+                    1,
+                    1024,
+                    512,
+                    0,
+                    0,
+                    100.0,
+                    "k0",
+                    1.0,
+                    1.0,
+                    0.01,
+                    "modelA",
+                ]
+            ],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 1, 0, 80.0, "k1", 1.5, 1.5, 0.01, "modelB"]],
+        )
         merged_path = tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_tag")
         try:
             df = pd.read_csv(merged_path)
@@ -429,13 +530,33 @@ class TestUpdateConfigFiles(unittest.TestCase):
     def test_two_files_non_overlapping(self):
         """Two CSVs with different keys -> both rows in output."""
         tuner = _StubTuner.get()
-        header = ["gfx", "cu_num", "M", "N", "K", "kernelId", "splitK",
-                  "us", "kernelName", "tflops", "bw", "errRatio"]
-        f1 = self._write_csv("a.csv", header,
-                             [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]])
-        f2 = self._write_csv("b.csv", header,
-                             [[TEST_GFX, 304, 32, 2048, 1024, 1, 0, 200.0, "k1", 2.0, 2.0, 0.005]])
-        merged_path = tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_nonoverlap")
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            header,
+            [[TEST_GFX, 304, 32, 2048, 1024, 1, 0, 200.0, "k1", 2.0, 2.0, 0.005]],
+        )
+        merged_path = tuner.update_config_files(
+            f"{f1}{os.pathsep}{f2}", "test_nonoverlap"
+        )
         try:
             df = pd.read_csv(merged_path)
             self.assertEqual(len(df), 2)
