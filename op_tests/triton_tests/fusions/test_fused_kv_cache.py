@@ -3,30 +3,33 @@ import pytest
 
 from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
+from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
     fused_qk_rope_reshape_and_cache,
     fused_qk_rope_cosine_cache_llama,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 
 @pytest.mark.parametrize("T", [1, 2, 4, 2048])
 @pytest.mark.parametrize("QH_per_KH", [1, 16])
 @pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [128])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("D_q_nope", [128])
+@pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
+@pytest.mark.parametrize("D_q_nope", [512])
 @pytest.mark.parametrize("D_lora", [512])
 @pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.uint8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("shuffled_kv_cache, block_size", [(True, 64), (False, 1)])
 def test_fused_qk_rope_cat_and_cache_mla(
     T: int,
     QH_per_KH: int,
     KH: int,
-    D: int,
+    D_pe: int,
     D_q_nope: int,
     D_lora: int,
     num_kv_cahce_tokens: int,
@@ -34,6 +37,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     reuse_freqs_front_part: bool,
     cache_dtype: bool,
     dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+    block_size: int,
 ):
     torch.manual_seed(0)
     pos = True
@@ -42,7 +47,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
         T,
         KH,
         QH_per_KH,
-        D,
+        D_pe,
         cached=True,
         reuse_freqs_front_part=reuse_freqs_front_part,
         nope=False,
@@ -52,23 +57,20 @@ def test_fused_qk_rope_cat_and_cache_mla(
         layout="thd",
         dtype=dtype,
     )
-    q = torch.randn((T, QH_per_KH * KH, D_q_nope + D), dtype=dtype, device="cuda")
-    q_nope, q_pe = q.split((D_q_nope, D), dim=-1)
+    q = torch.randn((T, QH_per_KH * KH, D_q_nope + D_pe), dtype=dtype, device="cuda")
+    q_nope, q_pe = q.split((D_q_nope, D_pe), dim=-1)
     k_lora = torch.randn((T, KH, D_lora), dtype=dtype, device=q.device) / (
         20 if cache_dtype == torch.uint8 else 1
     )
-    k_pe = torch.randn((T, KH, D), dtype=dtype, device=q.device) / (
+    k_pe = torch.randn((T, KH, D_pe), dtype=dtype, device=q.device) / (
         20 if cache_dtype == torch.uint8 else 1
     )
 
     if cache_dtype == torch.uint8:
-        if arch_info.get_arch() in ["gfx950"]:
-            cache_dtype_actual = torch.float8_e4m3fn
-        else:
-            cache_dtype_actual = torch.float8_e4m3fnuz
+        cache_dtype_actual = e4m3_dtype
 
     kv_cache = torch.zeros(
-        (num_kv_cahce_tokens, KH, D_lora + D), dtype=cache_dtype, device="cuda"
+        (num_kv_cahce_tokens, KH, D_lora + D_pe), dtype=cache_dtype, device="cuda"
     )
 
     if cache_dtype == torch.uint8:
@@ -137,6 +139,10 @@ def test_fused_qk_rope_cat_and_cache_mla(
     triton_kv_cache = kv_cache.clone()
     if cache_dtype == torch.uint8:
         triton_kv_cache = triton_kv_cache.view(cache_dtype_actual)
+    if shuffled_kv_cache:
+        triton_kv_cache = triton_kv_cache.view(
+            num_kv_cahce_tokens // block_size, KH, block_size, D_lora + D_pe
+        )
     triton_q, triton_decode_q_pe, triton_k_pe, triton_zeros = (
         fused_qk_rope_cat_and_cache_mla(
             q_nope,
@@ -155,6 +161,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
             q_out=None,
             decode_q_pe_out=None,
             k_pe_out=None,
+            shuffled_kv_cache=shuffled_kv_cache,
         )
     )
     triton_kv_cache = triton_kv_cache.view(kv_cache_og_dtype)
@@ -166,16 +173,34 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
     torch.testing.assert_close(torch_zeros, triton_zeros, atol=0.1, rtol=0.1)
 
+    if shuffled_kv_cache:
+        if cache_dtype == torch.uint8:
+            torch_kv_cache = torch_kv_cache.view(cache_dtype_actual)
+        torch_kv_cache = shuffle_kv_buffer(
+            torch_kv_cache.reshape(
+                num_kv_cahce_tokens // block_size, block_size, KH, D_lora + D_pe
+            ),
+            D_lora,
+        )
+
     if cache_dtype == torch.uint8:
         torch_kv_cache = torch_kv_cache.view(cache_dtype_actual).to(dtype)
         triton_kv_cache = triton_kv_cache.view(cache_dtype_actual).to(dtype)
 
-    torch.testing.assert_close(
-        torch_kv_cache[slot_mapping, :, :],
-        triton_kv_cache[slot_mapping, :, :],
-        atol=1e-1,
-        rtol=1e-1,
-    )
+    if shuffled_kv_cache:
+        torch.testing.assert_close(
+            torch_kv_cache[slot_mapping // block_size, :, :],
+            triton_kv_cache[slot_mapping // block_size, :, :],
+            atol=1e-1,
+            rtol=1e-1,
+        )
+    else:
+        torch.testing.assert_close(
+            torch_kv_cache[slot_mapping, :, :],
+            triton_kv_cache[slot_mapping, :, :],
+            atol=1e-1,
+            rtol=1e-1,
+        )
 
     torch.testing.assert_close(torch_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
 
