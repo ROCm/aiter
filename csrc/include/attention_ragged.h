@@ -25,7 +25,9 @@ void paged_attention_ragged(
 
 void paged_attention_ragged_nhd(
     torch::Tensor &out, // [num_seqs, num_heads, head_size]
-    torch::Tensor &workspace_buffer,
+    torch::Tensor &exp_sums,   // float32 workspace for partition sums
+    torch::Tensor &max_logits, // float32 workspace for partition max
+    torch::Tensor &tmp_out,    // bf16 workspace for partial outputs (same layout as CK path)
     torch::Tensor &query, // [num_seqs, num_heads, head_size]
     torch::Tensor
         &key_cache, // [num_blocks, num_heads, block_size, head_size] or

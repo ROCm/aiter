@@ -29,10 +29,10 @@ def compile(
 
     version = os.getenv("QKV_VERSION", "GOLDEN")
 
-    if head_size != 256 or kv_dtype != "__hip_bfloat16" or gqa_ratio >16:
-        print(
-                "[ERROR] pa_ragged_nhd requires head_size=256 and kv_dtype=bf16! and gqa_ratio <= 16!"
-            )
+    if head_size != 256 or kv_dtype != "__hip_bfloat16" or gqa_ratio > 16:
+        raise ValueError(
+            "pa_ragged_nhd requires head_size=256, kv_dtype=__hip_bfloat16, and gqa_ratio <= 16"
+        )
     return compile_template_op(
         src_template,
         MD_NAME,
@@ -60,13 +60,15 @@ def compile(
 
 def paged_attention_ragged_nhd(
     out,  # [num_seqs, num_heads, head_size]
-    workspace_buffer,  # [num_seqs, num_heads, max_num_partitions]
+    exp_sums,  # float32, numel >= num_seqs*num_heads*max_num_partitions (layout: pool max_bs in SGLang)
+    max_logits,  # float32, same numel as exp_sums
+    tmp_out,  # bfloat16, numel >= num_seqs*num_heads*max_num_partitions*head_size
     query,  # [num_seqs, num_heads, head_size]
     key_cache,  # [num_blocks, num_heads, head_size/x, block_size, x]
     value_cache,  # [num_blocks, num_heads, head_size, block_size]
     scale,
     kv_indptr,
-    kv_page_indices,  # [num_seqs, max_num_blocks_per_seq]dd
+    kv_page_indices,  # 1D ragged: [kv_indptr[-1]) valid
     kv_last_page_lens,  # [num_seqs]
     block_size,
     max_num_partitions,
@@ -81,6 +83,7 @@ def paged_attention_ragged_nhd(
     mtp=1,
     q_scale=None,
 ):
+    import os
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
@@ -115,8 +118,85 @@ def paged_attention_ragged_nhd(
     kv_seq_stride = (
         key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
     )
-    gqa_ratio = int(num_heads / num_kv_heads)
+    if num_kv_heads < 1 or num_heads < 1 or num_seqs < 0:
+        raise ValueError("invalid num_seqs/num_heads/num_kv_heads")
+    if num_heads % num_kv_heads != 0:
+        raise ValueError("num_heads must be divisible by num_kv_heads (GQA)")
+    gqa_ratio = num_heads // num_kv_heads
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    n_blocks = int(key_cache.size(0))
+    for t in (out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache):
+        assert t.is_contiguous(), (
+            "paged_attention_ragged_nhd(pa-256) expects contiguous out/exp_sums/max_logits/tmp_out/query/key_cache/value_cache"
+        )
+    if exp_sums.dtype != torch.float32 or max_logits.dtype != torch.float32:
+        raise ValueError("paged_attention_ragged_nhd: exp_sums and max_logits must be float32")
+    if tmp_out.dtype != torch.bfloat16:
+        raise ValueError("paged_attention_ragged_nhd: tmp_out must be bfloat16")
+    _nhp_run = int(num_seqs) * int(num_heads) * int(max_num_partitions)
+    _nhp_el = int(exp_sums.numel())
+    if _nhp_el < _nhp_run or int(max_logits.numel()) < _nhp_run:
+        raise ValueError(
+            "paged_attention_ragged_nhd: exp_sums/max_logits numel must be >= "
+            f"num_seqs*num_heads*max_num_partitions ({_nhp_run}), got exp_sums={_nhp_el}"
+        )
+    if int(tmp_out.numel()) < _nhp_run * int(head_size):
+        raise ValueError(
+            "paged_attention_ragged_nhd: tmp_out numel must be >= "
+            f"num_seqs*num_heads*max_num_partitions*head_size"
+        )
+    if kv_cache_layout == "NHD":
+        assert key_cache.size(1) == block_size and key_cache.size(2) == num_kv_heads, (
+            "key_cache NHD shape [num_blocks, block_size, num_kv_heads, head_size]"
+        )
+        assert list(value_cache.shape[:3]) == [n_blocks, block_size, num_kv_heads], (
+            "value_cache must match key_cache for [num_blocks, block_size, num_kv_heads, ...]"
+        )
+        assert key_cache.size(3) == head_size, "key_cache last dim must equal head_size"
+        assert int(value_cache.size(3)) == int(head_size), "pa-256: value last dim must equal head_size (256)"
+    #if num_seqs > 0:
+        #_kv0 = int(kv_indptr[0].item())
+        # if _kv0 != 0:
+        #     print(
+        #         "[paged_attention_ragged_nhd] warning: expected kv_indptr[0]==0 (1D ragged base), "
+        #         f"got kv_indptr[0]={_kv0}; kernel uses ptr+kv_indptr[b] on kv_page_indices"
+        #     )
+    #     assert kv_indptr[0] == 0, "kv_indptr[0] must be 0" # 保留这个 先跳过 看看后面有没有别的雷
+    #     assert int(kv_indptr.size(0)) == num_seqs + 1, "kv_indptr must be [num_seqs+1] (CSRS)"
+    #     last_idx = int(kv_indptr[-1].item())
+    #     assert last_idx >= 0
+    #     if last_idx > 0:
+    #         assert kv_page_indices.is_contiguous()
+    #         assert int(kv_page_indices.numel()) >= last_idx, (
+    #             "kv_page_indices is too small for kv_indptr[-1] (1D ragged buffer)"
+    #         )
+    #     lens = kv_indptr[1:] - kv_indptr[:-1]
+    #     max_kv_len = int(lens.max().item()) if lens.numel() else 0
+    #     if max_kv_len > 0:
+    #         need_parts = (max_kv_len + int(partition_size) - 1) // int(partition_size)
+    #         assert need_parts <= int(
+    #             max_num_partitions
+    #         ), (
+    #             f"max_num_partitions too small: need ceil(max_kv_len/partition)={need_parts} "
+    #             f"<= max_num_partitions, max_kv_len={max_kv_len}, partition_size={partition_size}"
+    #         )
+    #     for b in range(num_seqs):
+    #         lo = int(kv_indptr[b].item())
+    #         hi = int(kv_indptr[b + 1].item())
+    #         assert 0 <= lo <= hi, "kv_indptr must be non-decreasing"
+    #         if hi > lo:
+    #             seg = kv_page_indices[lo:hi]
+    #             assert bool((seg >= 0).all().item()) and bool((seg < n_blocks).all().item()), (
+    #                 f"kv_page_ids must be in [0, num_blocks), num_blocks={n_blocks}, b={b}"
+    #             )
+    # _nhp = num_seqs * num_heads * int(max_num_partitions)
+    # _meta = 2 * _nhp * 4
+    # _tmp_base = (_meta + 1023) // 1024 * 1024
+    # _need = _tmp_base + _nhp * int(head_size) * 2
+    # assert int(workspace_buffer.numel()) >= int(_need), (
+    #     f"workspace_buffer too small: need at least {_need} uint8, got {int(workspace_buffer.numel())} "
+    #     "(see pa_ragged_nhd.cpp.jinja: exp_sums|max_logits, 1024-align tmp_out)"
+    # )
     func = compile(
         gqa_ratio,
         num_kv_heads,
@@ -158,10 +238,12 @@ def paged_attention_ragged_nhd(
 
     (
         out_ptr,
+        exp_sums_ptr,
+        max_logits_ptr,
+        tmp_out_ptr,
         query_ptr,
         key_cache_ptr,
         value_cache_ptr,
-        workspace_buffer_ptr,
         scale,
         logits_soft_cap,
         num_seqs,
@@ -175,10 +257,12 @@ def paged_attention_ragged_nhd(
         stream,
     ) = torch_to_c_types(
         out,
+        exp_sums,
+        max_logits,
+        tmp_out,
         query,
         key_cache,
         value_cache,
-        workspace_buffer,
         scale,
         logits_soft_cap,
         num_seqs,
@@ -198,7 +282,9 @@ def paged_attention_ragged_nhd(
     )
     func(
         out_ptr,
-        workspace_buffer_ptr,
+        exp_sums_ptr,
+        max_logits_ptr,
+        tmp_out_ptr,
         query_ptr,
         key_cache_ptr,
         value_cache_ptr,

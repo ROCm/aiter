@@ -647,7 +647,9 @@ def paged_attention_ragged(
 
 def paged_attention_ragged_nhd(
     out: torch.Tensor,
-    workspace_buffer: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -669,7 +671,9 @@ def paged_attention_ragged_nhd(
 ) -> torch.Tensor:
     paged_attention_ragged_nhd_core(
         out,
-        workspace_buffer,
+        exp_sums,
+        max_logits,
+        tmp_out,
         query,
         key_cache,
         value_cache,
@@ -701,7 +705,7 @@ direct_register_custom_op(
 direct_register_custom_op(
     "paged_attention_ragged_nhd",
     paged_attention_ragged_nhd,
-    ["out", "workspace_buffer"],
+    ["out", "exp_sums", "max_logits", "tmp_out"],
 )
 
 

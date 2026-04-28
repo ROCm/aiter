@@ -263,6 +263,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     query += b * q_b_stride + hq * q_h_stride;
     key_cache += hk * S;
     value_cache += hk * S;
+    if(!kv_indptr ||!query || !key_cache || !value_cache || !(kv_indptr + b + 1)) return; // add protection
+    if((int)kv_indptr[b + 1]<0 || (int)kv_indptr[b]<0) return; // add protection
     uint last_kv_idx = kv_indptr[b + 1];
     uint kv_len = last_kv_idx - kv_indptr[b];
     if (kv_part * KV_PART_SIZE >= kv_len) return;
@@ -272,6 +274,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S;
     max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
     sum_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
+    if(!out_seg || !max_out || !sum_out) return;// add protection
 
     // stage1(q*k): [16, 32]x[64, 32]'
     BufferResource q_buf(query, (HQ / HK) * S * sizeof(__bf16));
@@ -517,30 +520,6 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     float maxs[4 * TOKENS_PER_WARP], sums[4 * TOKENS_PER_WARP];
     float real_max[TOKENS_PER_WARP], real_sum[TOKENS_PER_WARP];
 
-    /*
-    // old fixed split (requires HQ/HK divisible by 4):
-    float maxs[HQ / HK], sums[HQ / HK];
-    float real_max[HQ / HK / 4], real_sum[HQ / HK / 4];
-    for (uint i = 0; i < HQ / HK / 4; i++) {
-        uint m_token_id = HQ / HK / 4 * warp_id + i;
-        maxs[4 * i + 0] = *share_buf.get_max_buf(m_token_id, 0);
-        maxs[4 * i + 1] = *share_buf.get_max_buf(m_token_id, 1);
-        maxs[4 * i + 2] = *share_buf.get_max_buf(m_token_id, 2);
-        maxs[4 * i + 3] = *share_buf.get_max_buf(m_token_id, 3);
-        real_max[i] = fmaxf(
-            fmaxf(maxs[4 * i + 0], maxs[4 * i + 1]),
-            fmaxf(maxs[4 * i + 2], maxs[4 * i + 3]));
-        sums[4 * i + 0] = *share_buf.get_sum_buf(m_token_id, 0);
-        sums[4 * i + 1] = *share_buf.get_sum_buf(m_token_id, 1);
-        sums[4 * i + 2] = *share_buf.get_sum_buf(m_token_id, 2);
-        sums[4 * i + 3] = *share_buf.get_sum_buf(m_token_id, 3);
-        real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) +
-                      sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) +
-                      sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) +
-                      sums[4 * i + 3] * __expf(maxs[4 * i + 3] - real_max[i]);
-    }
-    */
-
     for (uint i = 0; i < TOKENS_PER_WARP; i++) {
         uint m_token_id = TOKENS_PER_WARP * warp_id + i;
         if (m_token_id < M) {
@@ -632,6 +611,8 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
     out_seg += b * HQ * max_part * S + hq * max_part * S;
     max_out += b * HQ * max_part * 1 + hq * max_part * 1;
     sum_out += b * HQ * max_part * 1 + hq * max_part * 1;
+    if(!kv_indptr ||!out_seg || !max_out || !sum_out || !(kv_indptr + b + 1) || !out) return;// add protection
+    if((int)kv_indptr[b + 1]<0 || (int)kv_indptr[b]<0) return; // add protection
     uint kv_len = kv_indptr[b + 1] - kv_indptr[b];
     uint part_num = (kv_len + KV_PART_SIZE - 1) / KV_PART_SIZE;
     float real_max = -FLT_MAX;
