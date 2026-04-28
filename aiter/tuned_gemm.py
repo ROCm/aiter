@@ -193,6 +193,9 @@ def get_GEMM_A16W16_config(
     return config
 
 
+shape_counts = {}
+
+
 def save_shapes(
     M,
     N,
@@ -204,25 +207,60 @@ def save_shapes(
     bpreshuffle,
 ):
     save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
-    global tuned_df
+    track_count = int(os.environ.get("AITER_TUNE_GEMM_COUNT", 0))
+    global tuned_df, shape_counts
     if save_gemm:
-        tuned_df = pd.concat(
-            [
-                tuned_df,
-                pd.DataFrame(
+        key = (M, N, K, bias is not None, str(dtype), str(otype), scaleAB, bpreshuffle)
+        if track_count:
+            shape_counts[key] = shape_counts.get(key, 0) + 1
+            rows = []
+            for k, v in shape_counts.items():
+                flops = k[0] * k[1] * k[2]  # M * N * K
+                rows.append(
                     {
-                        "M": [M],
-                        "N": [N],
-                        "K": [K],
-                        "bias": [bias is not None],
-                        "dtype": [dtype],
-                        "outdtype": [otype],
-                        "scaleAB": [scaleAB],
-                        "bpreshuffle": [bpreshuffle],
+                        "M": k[0],
+                        "N": k[1],
+                        "K": k[2],
+                        "bias": k[3],
+                        "dtype": k[4],
+                        "outdtype": k[5],
+                        "scaleAB": k[6],
+                        "bpreshuffle": k[7],
+                        "count": v,
+                        "weight": v * flops,
                     }
-                ),
+                )
+            stats_df = pd.DataFrame(rows)
+            stats_df.sort_values("weight", ascending=False, inplace=True)
+            total_weight = stats_df["weight"].sum()
+            stats_df["cumulative_pct"] = (
+                stats_df["weight"].cumsum() / total_weight * 100
+            ).round(1)
+            # Stats file for analysis
+            stats_path = untune_path.replace(".csv", "_stats.csv")
+            stats_df.to_csv(stats_path, index=False)
+            # Untuned file for tuning (same order, no extra columns)
+            tuned_df = stats_df[
+                ["M", "N", "K", "bias", "dtype", "outdtype", "scaleAB", "bpreshuffle"]
             ]
-        ).drop_duplicates()
+        else:
+            tuned_df = pd.concat(
+                [
+                    tuned_df,
+                    pd.DataFrame(
+                        {
+                            "M": [M],
+                            "N": [N],
+                            "K": [K],
+                            "bias": [bias is not None],
+                            "dtype": [dtype],
+                            "outdtype": [otype],
+                            "scaleAB": [scaleAB],
+                            "bpreshuffle": [bpreshuffle],
+                        }
+                    ),
+                ]
+            ).drop_duplicates()
         tuned_df.to_csv(untune_path, index=False)
 
 
@@ -257,11 +295,8 @@ def gemm_a16w16(
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
         bpreshuffle = True
     if A.dim() >= 3:
-        try:
-            inp_view = A.view(-1, A.size(-1))
-            batched = True
-        except RuntimeError:
-            return F.linear(A, B, bias)
+        inp_view = A.reshape(-1, A.size(-1))
+        batched = True
     else:
         inp_view = A
         batched = False
@@ -420,13 +455,15 @@ def torch_gemm(
             )
         except RuntimeError:
             out = (
-                F.linear(inp.to(dtypes.fp32), weights.to(dtypes.fp32))
+                torch.mm(inp.to(dtypes.fp32), weights.t().to(dtypes.fp32))
                 * scale_a
                 * scale_b
             )
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
-    out = F.linear(inp, weights, bias)
+    out = torch.mm(inp, weights.t())
+    if bias is not None:
+        out = out + bias
     return out
 
 
