@@ -138,31 +138,14 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     auto stream = at::hip::getCurrentHIPStream();
 
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
-    const fmha_bwd_traits traits{
-        seqlen_q,
-        seqlen_k,
-        batch_size,
-        seqlen_q, // max_seqlen_q
-        seqlen_k, // max_seqlen_k
-        head_size_q,
-        head_size_v,
-        num_heads,
-        num_heads_k,
-        q_dtype_str,
-        false, // is_group_mode
-        mask.type,
-        bias_type,
-        has_dbias,
-        p_dropout > 0,
-        false, // is_store_randval
-        deterministic,
-        nullptr, // seqstart_qs (batch mode)
-        nullptr, // seqstart_ks (batch mode)
+
+    at::Tensor workspace;
+    auto workspace_alloc = [&workspace, opts](size_t bytes, bool zero_init) -> void* {
+        workspace = zero_init
+                        ? torch::zeros({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte))
+                        : torch::empty({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte));
+        return workspace.data_ptr();
     };
-    fmha_bwd_launcher launcher(traits);
-    at::Tensor workspace = torch::empty(
-        {static_cast<int64_t>(launcher.workspace_size)}, opts.dtype(at::kByte));
-    launcher.prepare_workspace(workspace.data_ptr());
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -257,12 +240,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
             ck_tile::index_t stride_dv = dv_expanded.stride(1);
             ck_tile::index_t nhead_stride_dv = dv_expanded.stride(2);
 
-            // dq_acc: (batch_size, nheads, split, seqlen_q, hdim_q)
-            ck_tile::long_index_t batch_stride_dq_acc = 0;
-            ck_tile::long_index_t nhead_stride_dq_acc = 0;
-            ck_tile::index_t split_stride_dq_acc = 0;
-            ck_tile::index_t stride_dq_acc = 0;
-
             float p_undrop = 1.0 - p_dropout;
 
             void *bias_ptr = nullptr;
@@ -355,7 +332,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 dk_expanded.data_ptr(),
                                 dv_expanded.data_ptr(),
                                 dbias_ptr,
-                                workspace.data_ptr(),
                                 sink_data_ptr,   // sink_ptr [b, hq]
                                 d_sink_data_ptr, // d_sink_ptr [hq]
                                 nullptr, // seqstart_q_ptr
@@ -379,7 +355,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 stride_o,
                                 0, // stride_randval
                                 stride_do,
-                                stride_dq_acc,
                                 stride_dq,
                                 stride_dk,
                                 stride_dv,
@@ -392,7 +367,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 0, // nhead_stride_randval
                                 nhead_stride_do,
                                 nhead_stride_lse,
-                                nhead_stride_dq_acc,
                                 nhead_stride_dq,
                                 nhead_stride_dk,
                                 nhead_stride_dv,
@@ -405,17 +379,16 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 0, // batch_stride_randval
                                 batch_stride_do,
                                 batch_stride_lse,
-                                batch_stride_dq_acc,
                                 batch_stride_dq,
                                 batch_stride_dk,
                                 batch_stride_dv,
                                 batch_stride_dbias,
-                                split_stride_dq_acc,
                                 mask.left,
                                 mask.right,
                                 p_dropout,
                                 p_undrop,
-                                drop_seed_offset};
+                                drop_seed_offset,
+                                workspace_alloc};
         }();
 
         float t = aiter::mha_bwd(args, stream_config);
