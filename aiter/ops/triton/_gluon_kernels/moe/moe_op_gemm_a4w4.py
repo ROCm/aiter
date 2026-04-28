@@ -156,16 +156,11 @@ def _moe_gemm_a4w4_gfx1250(
     gl.assume(stride_w_e >= 0)
     gl.assume(stride_w_k >= 0)
     gl.assume(stride_w_n >= 0)
-    if stride_x_mx_m is not None:
-        gl.assume(stride_x_mx_m >= 0)
-    if stride_x_mx_k is not None:
-        gl.assume(stride_x_mx_k >= 0)
-    if stride_w_mx_e is not None:
-        gl.assume(stride_w_mx_e >= 0)
-    if stride_w_mx_k is not None:
-        gl.assume(stride_w_mx_k >= 0)
-    if stride_w_mx_n is not None:
-        gl.assume(stride_w_mx_n >= 0)
+    gl.assume(stride_x_mx_m >= 0)
+    gl.assume(stride_x_mx_k >= 0)
+    gl.assume(stride_w_mx_e >= 0)
+    gl.assume(stride_w_mx_k >= 0)
+    gl.assume(stride_w_mx_n >= 0)
     if B is not None:
         gl.assume(stride_b_e >= 0)
     gl.assume(grid_m >= 0)
