@@ -2590,7 +2590,7 @@ def compile_mixed_moe_gemm2(
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3{_async_tag}{_packed_lds_tag}"
+        f"_vscale_fix3{_async_tag}{_packed_lds_tag}_tidlds"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse a single allocation for both:
@@ -2965,6 +2965,21 @@ def compile_mixed_moe_gemm2(
                 # Sentinel clamp uses `tokens` as the upper bound: t_valid = (t < tokens).
                 tokens_i32 = arith.index_cast(T.i32, tokens_in)
 
+                # Preload sorted_idx once per row into LDS so A2/X address generation and
+                # CShuffle epilogue share the same routed-token decode source.
+                _c_tile_m_idx = arith.constant(tile_m, index=True)
+                _tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, _c_tile_m_idx)
+                _if_tid = scf.IfOp(_tid_in_range)
+                with ir.InsertionPoint(_if_tid.then_block):
+                    _tid_row = bx_m + tx
+                    _tid_val = buffer_ops.buffer_load(
+                        sorted_rsrc, _tid_row, vec_width=1, dtype=T.i32
+                    )
+                    _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
+                    vector.store(_tid_vec1, lds_tid, [tx])
+                    scf.YieldOp([])
+                gpu.barrier()
+
                 def x_tile_chunk_coord_i32(i: int):
                     return tile_chunk_coord_i32(
                         arith,
@@ -3018,10 +3033,9 @@ def compile_mixed_moe_gemm2(
                     x_row_local.append(row_local)
                     x_col_local_i32.append(col_local_i32)
 
-                    sorted_row_i = bx_m + row_local
-                    fused_i = buffer_ops.buffer_load(
-                        sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
-                    )
+                for i in range_constexpr(num_x_loads):
+                    row_local = x_row_local[i]
+                    fused_i = memref.load(lds_tid, [row_local])
                     t_i32 = arith.andi(fused_i, mask24)
                     s_i32 = arith.shrui(fused_i, arith.constant(24))
                     # Keep `blk_valid` only; remove per-row token validity checks.
@@ -3575,18 +3589,6 @@ def compile_mixed_moe_gemm2(
                 a_scale_pong, b_scale_pong = prefetch_ab_scale_tile(k0 // pack_K // 128)
                 if not use_async_copy:
                     store_x_tile_to_lds(x_regs0, lds_base_cur)
-                # Preload sorted_idx into lds_tid for epilogue precompute_row
-                _c_tile_m_idx = arith.constant(tile_m, index=True)
-                _tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, _c_tile_m_idx)
-                _if_tid = scf.IfOp(_tid_in_range)
-                with ir.InsertionPoint(_if_tid.then_block):
-                    _tid_row = bx_m + tx
-                    _tid_val = buffer_ops.buffer_load(
-                        sorted_rsrc, _tid_row, vec_width=1, dtype=T.i32
-                    )
-                    _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
-                    vector.store(_tid_vec1, lds_tid, [tx])
-                    scf.YieldOp([])
                 _async_pending_vmem = k_unroll * num_acc_n + k_unroll_packed * (
                     m_repeat_packed + num_acc_n_packed
                 )
