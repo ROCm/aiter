@@ -156,14 +156,13 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         p_dropout > 0,
         false, // is_store_randval
         deterministic,
+        nullptr, // seqstart_qs (batch mode)
+        nullptr, // seqstart_ks (batch mode)
     };
-    const fmha_bwd_launcher launcher(traits);
-    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
-    at::Tensor dq_accum;
-    if (launcher.needs_zero_dq_acc)
-        dq_accum = torch::zeros({batch_size, num_heads, nsplits, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
-    else
-        dq_accum = torch::empty({batch_size, num_heads, nsplits, seqlen_q, head_size_q}, opts.dtype(at::kFloat));
+    fmha_bwd_launcher launcher(traits);
+    at::Tensor workspace = torch::empty(
+        {static_cast<int64_t>(launcher.workspace_size)}, opts.dtype(at::kByte));
+    launcher.prepare_workspace(workspace.data_ptr());
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -259,10 +258,10 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
             ck_tile::index_t nhead_stride_dv = dv_expanded.stride(2);
 
             // dq_acc: (batch_size, nheads, split, seqlen_q, hdim_q)
-            ck_tile::long_index_t batch_stride_dq_acc = dq_accum.stride(0);
-            ck_tile::long_index_t nhead_stride_dq_acc = dq_accum.stride(1);
-            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(2);
-            ck_tile::index_t stride_dq_acc = dq_accum.stride(3);
+            ck_tile::long_index_t batch_stride_dq_acc = 0;
+            ck_tile::long_index_t nhead_stride_dq_acc = 0;
+            ck_tile::index_t split_stride_dq_acc = 0;
+            ck_tile::index_t stride_dq_acc = 0;
 
             float p_undrop = 1.0 - p_dropout;
 
@@ -356,7 +355,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 dk_expanded.data_ptr(),
                                 dv_expanded.data_ptr(),
                                 dbias_ptr,
-                                dq_accum.data_ptr(),
+                                workspace.data_ptr(),
                                 sink_data_ptr,   // sink_ptr [b, hq]
                                 d_sink_data_ptr, // d_sink_ptr [hq]
                                 nullptr, // seqstart_q_ptr

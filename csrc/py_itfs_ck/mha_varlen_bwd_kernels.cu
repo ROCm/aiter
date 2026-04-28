@@ -150,6 +150,20 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
     bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
     auto opts = q.options();
+
+    // CK launcher needs PHYSICAL (padded) seqstart on host during construction
+    // (group mode). Mirror the same "padded if provided" logic that the args
+    // struct uses for seqstart_*_ptr below — these must agree because the launcher
+    // computes per-batch dq_acc workspace offsets that the kernel later indexes
+    // using the same physical seqstart.
+    // The host tensors stay alive until the end of this function.
+    at::Tensor cu_seqlens_q_host = cu_seqlens_q_padded.has_value()
+                                       ? cu_seqlens_q_padded.value().to(at::kCPU)
+                                       : cu_seqlens_q.to(at::kCPU);
+    at::Tensor cu_seqlens_k_host = cu_seqlens_k_padded.has_value()
+                                       ? cu_seqlens_k_padded.value().to(at::kCPU)
+                                       : cu_seqlens_k.to(at::kCPU);
+
     const fmha_bwd_traits traits{
         total_q,
         total_k,
@@ -168,19 +182,18 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         p_dropout > 0,
         false, // is_store_randval
         deterministic,
+        cu_seqlens_q_host.data_ptr<int>(), // seqstart_qs
+        cu_seqlens_k_host.data_ptr<int>(), // seqstart_ks
     };
-    const fmha_bwd_launcher launcher(traits);
-    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
+    fmha_bwd_launcher launcher(traits);
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
     auto stream = at::hip::getCurrentHIPStream();
 
     auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum;
-    if (launcher.needs_zero_dq_acc)
-        dq_accum = torch::zeros({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
-    else
-        dq_accum = torch::empty({num_heads, nsplits, total_q, head_size_q}, opts.dtype(at::kFloat));
+    at::Tensor workspace = torch::empty(
+        {static_cast<int64_t>(launcher.workspace_size)}, opts.dtype(at::kByte));
+    launcher.prepare_workspace(workspace.data_ptr());
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -274,9 +287,9 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
             // dq_acc: (nheads, split, total_q, hdim_v)
             ck_tile::long_index_t batch_stride_dq_acc = 0;
-            ck_tile::long_index_t nhead_stride_dq_acc = dq_accum.stride(0);
-            ck_tile::index_t split_stride_dq_acc = dq_accum.stride(1);
-            ck_tile::index_t stride_dq_acc = dq_accum.stride(2);
+            ck_tile::long_index_t nhead_stride_dq_acc = 0;
+            ck_tile::index_t split_stride_dq_acc = 0;
+            ck_tile::index_t stride_dq_acc = 0;
 
             float p_undrop = 1.0 - p_dropout;
 
@@ -364,7 +377,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                 dk_expanded.data_ptr(),
                                 dv_expanded.data_ptr(),
                                 nullptr, // dbias
-                                dq_accum.data_ptr(), // dq_acc
+                                workspace.data_ptr(), // workspace_ptr
                                 sink_data_ptr,   // sink_ptr [b, hq]
                                 d_sink_data_ptr, // d_sink_ptr [hq]
                                 seqstart_q_ptr, // seqstart_q_ptr (physical cumulative)

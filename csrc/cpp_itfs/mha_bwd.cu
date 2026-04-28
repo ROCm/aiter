@@ -3,6 +3,7 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
@@ -133,6 +134,31 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #if ONLY_FAV3
     return asm_ret;
 #else // !ONLY_FAV3
+    if(asm_ret != -1)
+        return asm_ret;
+
+    // For group mode, the new launcher needs seqstart arrays on host during construction.
+    // Locally D2H-copy them; the host buffers stay alive only for traits/launcher
+    // construction below, then are released — they are not retained by the launcher.
+    std::vector<int> seqstart_q_host, seqstart_k_host;
+    const int* seqstart_qs_ptr = nullptr;
+    const int* seqstart_ks_ptr = nullptr;
+    if(a.is_group_mode && a.seqstart_q_ptr != nullptr && a.seqstart_k_ptr != nullptr)
+    {
+        seqstart_q_host.resize(a.batch + 1);
+        seqstart_k_host.resize(a.batch + 1);
+        HIP_CALL(hipMemcpy(seqstart_q_host.data(),
+                           a.seqstart_q_ptr,
+                           sizeof(int) * (a.batch + 1),
+                           hipMemcpyDeviceToHost));
+        HIP_CALL(hipMemcpy(seqstart_k_host.data(),
+                           a.seqstart_k_ptr,
+                           sizeof(int) * (a.batch + 1),
+                           hipMemcpyDeviceToHost));
+        seqstart_qs_ptr = seqstart_q_host.data();
+        seqstart_ks_ptr = seqstart_k_host.data();
+    }
+
     const fmha_bwd_traits traits{
         a.seqlen_q,
         a.seqlen_k,
@@ -151,6 +177,8 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         a.has_dropout,
         a.is_store_randval,
         a.is_deterministic,
+        seqstart_qs_ptr,
+        seqstart_ks_ptr,
     };
 
     fmha_bwd_args ck_args{
@@ -167,7 +195,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* dk_ptr             */ a.dk_ptr,
         /* dv_ptr             */ a.dv_ptr,
         /* dbias_ptr          */ a.dbias_ptr,
-        /* dq_acc_ptr         */ a.dq_acc_ptr,
+        /* workspace_ptr      */ a.dq_acc_ptr,
         /* sink_ptr           */ a.sink_ptr,
         /* d_sink_ptr         */ a.d_sink_ptr,
 
@@ -196,7 +224,6 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* stride_o           */ a.stride_o,
         /* stride_randval     */ a.stride_randval,
         /* stride_do          */ a.stride_do,
-        /* stride_dq_acc      */ a.stride_dq_acc,
         /* stride_dq          */ a.stride_dq,
         /* stride_dk          */ a.stride_dk,
         /* stride_dv          */ a.stride_dv,
@@ -210,7 +237,6 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* nhead_stride_randval*/ a.nhead_stride_randval,
         /* nhead_stride_do    */ a.nhead_stride_do,
         /* nhead_stride_lsed  */ a.nhead_stride_lsed,
-        /* nhead_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.nhead_stride_dq_acc),
         /* nhead_stride_dq    */ a.nhead_stride_dq,
         /* nhead_stride_dk    */ a.nhead_stride_dk,
         /* nhead_stride_dv    */ a.nhead_stride_dv,
@@ -224,13 +250,11 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* batch_stride_randval*/ a.batch_stride_randval,
         /* batch_stride_do    */ a.batch_stride_do,
         /* batch_stride_lsed  */ a.batch_stride_lsed,
-        /* batch_stride_dq_acc*/ static_cast<ck_tile::long_index_t>(a.batch_stride_dq_acc),
         /* batch_stride_dq    */ a.batch_stride_dq,
         /* batch_stride_dk    */ a.batch_stride_dk,
         /* batch_stride_dv    */ a.batch_stride_dv,
         /* batch_stride_dbias */ a.batch_stride_dbias,
 
-        /* split_stride_dq_acc*/ a.split_stride_dq_acc,
         /* window_size_left   */ a.window_size_left,
         /* window_size_right  */ a.window_size_right,
         /* mask_type          */ a.mask_type,
@@ -239,11 +263,8 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* drop_seed_offset   */ a.drop_seed_offset,
     };
 
-    if(asm_ret == -1)
-    {
-        const fmha_bwd_launcher launcher(traits);
-        return launcher.run(ck_args, s);
-    }
+    const fmha_bwd_launcher launcher(traits);
+    return launcher.run(ck_args, s);
     return asm_ret;
 #endif
 }

@@ -4,6 +4,7 @@
 #include "mha_bwd.h"
 #include "utils.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <functional>
@@ -351,6 +352,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
         (mode == mode_enum::batch ? seqlen_q : seqstart_q_host.back());
     const ck_tile::index_t shape_seqlen_k =
         (mode == mode_enum::batch ? seqlen_k : seqstart_k_host.back());
+    // For group mode, the new launcher needs seqstart on host during construction.
+    // seqstart_q_host / seqstart_k_host are already host std::vector<int> from earlier.
     const fmha_bwd_traits traits{
         shape_seqlen_q,
         shape_seqlen_k,
@@ -369,9 +372,15 @@ bool run(const ck_tile::ArgParser& arg_parser)
         p_drop > 0.0f,
         s_randval,
         deterministic,
+        (mode == mode_enum::group) ? seqstart_q_host.data() : nullptr,
+        (mode == mode_enum::group) ? seqstart_k_host.data() : nullptr,
     };
-    const fmha_bwd_launcher launcher(traits);
-    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
+    fmha_bwd_launcher launcher(traits);
+    // nsplits is still needed for the ASM atomic16 dq_accum tensor shape below.
+    // Recompute it independently since the new launcher no longer exposes dq_acc_splits.
+    const ck_tile::index_t kN0 = (hdim_q <= 128) ? 128 : 64;
+    const ck_tile::index_t nsplits =
+        deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
     const ck_tile::index_t a16_dq_acc_seq =
         v3_atomic_fp32 ? shape_seqlen_q
                        : (mode == mode_enum::batch ? (seqlen_q + 15) / 16 * 16
@@ -481,9 +490,11 @@ bool run(const ck_tile::ArgParser& arg_parser)
     ck_tile::DeviceMem drop_seed_buf(drop_prefs ? sizeof(uint64_t) : 0);
     ck_tile::DeviceMem drop_offset_buf(drop_prefs ? sizeof(uint64_t) : 0);
     ck_tile::DeviceMem alibi_slope_buf(alibi_slope_host.get_element_space_size_in_bytes());
-    ck_tile::DeviceMem dq_acc_buf(v3_atomic_fp32
-                                      ? dq_acc_host.get_element_space_size_in_bytes()
-                                      : dq_acc_host_a16.get_element_space_size_in_bytes());
+    const std::size_t asm_dq_acc_bytes =
+        v3_atomic_fp32 ? dq_acc_host.get_element_space_size_in_bytes()
+                       : dq_acc_host_a16.get_element_space_size_in_bytes();
+    const std::size_t ck_workspace_bytes = launcher.workspace_size;
+    ck_tile::DeviceMem dq_acc_buf(std::max(asm_dq_acc_bytes, ck_workspace_bytes));
 
     q_buf.ToDevice(q_host.data());
     k_buf.ToDevice(k_host.data());
@@ -676,6 +687,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    drop_seed_offset};
     }();
 
+    launcher.prepare_workspace(dq_acc_buf.GetDeviceBuffer());
     float ave_time = aiter::mha_bwd(mha_args, stream_config);
     if(ave_time < 0)
     {
@@ -910,6 +922,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     dq_buf.SetZero();
     dbias_buf.SetZero();
     dq_acc_buf.SetZero();
+    launcher.prepare_workspace(dq_acc_buf.GetDeviceBuffer());
 
     ck_tile::stream_config stream_config_v{
         nullptr, true, 0, 0, 1, arg_parser.get_str("timer") == std::string("gpu")};
