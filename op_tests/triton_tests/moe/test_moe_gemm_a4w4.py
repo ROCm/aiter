@@ -232,7 +232,7 @@ def test_op(
     device="cuda",
 ):
     if hbm_swizzling:
-        if get_arch() == "gfx950" and m % 32 != 0 or k % (32 * 8) != 0:
+        if get_arch() == "gfx950" and (m % 32 != 0 or k % (32 * 8) != 0):
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
             )
