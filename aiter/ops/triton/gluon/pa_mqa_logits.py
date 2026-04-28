@@ -673,13 +673,17 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 mask=(
                     context_idx
                     + ChunkKPerStage
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     >= split_context_start
                 )
                 & (
                     context_idx
                     + ChunkKPerStage
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
@@ -753,7 +757,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 mask=(
                     context_idx
                     + ChunkK
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
@@ -1037,7 +1043,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 mask=(
                     context_idx_
                     + ChunkKPerStage
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
@@ -1117,7 +1125,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 mask=(
                     context_idx_
                     + ChunkK
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
@@ -1537,13 +1547,17 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 mask=(
                     context_idx
                     + ChunkKPerStage
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     >= split_context_start
                 )
                 & (
                     context_idx
                     + ChunkKPerStage
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
@@ -1617,7 +1631,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 mask=(
                     context_idx
                     + ChunkK
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
@@ -1901,7 +1917,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 mask=(
                     context_idx_
                     + ChunkKPerStage
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
@@ -1981,7 +1999,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 mask=(
                     context_idx_
                     + ChunkK
-                    + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
                     < max_model_len
                 ),
             )
