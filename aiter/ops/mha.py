@@ -6,7 +6,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import CK_DIR, AITER_META_DIR, compile_ops
+from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
 from ..jit.utils.chip_info import get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
@@ -1263,6 +1263,7 @@ def _flash_attn_forward(
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     batch_size, seqlen_q, nhead_q, hdim_q = q.shape
@@ -1323,7 +1324,7 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
     if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
-        out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
+        out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
             v,
@@ -1335,7 +1336,7 @@ def _flash_attn_forward(
             return_lse,
             return_softmax,
             how_v3_bf16_cvt,
-            None,
+            out,
             bias,
             alibi_slopes,
             q_descale,
@@ -1344,7 +1345,7 @@ def _flash_attn_forward(
             None,
         )
     else:
-        out, softmax_lse, S_dmask, rng_state = mha_fwd(
+        out_, softmax_lse, S_dmask, rng_state = mha_fwd(
             q,
             k,
             v,
@@ -1358,7 +1359,7 @@ def _flash_attn_forward(
             return_softmax,
             cu_seqlens_q,
             cu_seqlens_kv,
-            None,
+            out,
             bias,
             alibi_slopes,
             q_descale,
@@ -1368,7 +1369,7 @@ def _flash_attn_forward(
             None,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
-    return out, softmax_lse, S_dmask, rng_state
+    return out_, softmax_lse, S_dmask, rng_state
 
 
 # @torch_compile_guard(mutates_args=[])
@@ -1968,6 +1969,24 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if not ENABLE_CK:
+        from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
+
+        return flash_attn_func_triton(
+            q=q,
+            k=k,
+            v=v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            sink=sink_ptr,
+        )
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2648,6 +2667,32 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    if not ENABLE_CK:
+        from .triton.attention.mha import (
+            flash_attn_varlen_func as flash_attn_varlen_func_triton,
+        )
+
+        return flash_attn_varlen_func_triton(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            out=out,
+            sink=sink_ptr,
+        )
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -2981,6 +3026,22 @@ def flash_attn_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
+    if not ENABLE_CK and sink_ptr is None:
+        from .triton.attention.mha_v3 import (
+            flash_attn_func as flash_attn_func_v3_triton,
+        )
+
+        return flash_attn_func_v3_triton(
+            q=q,
+            k=k,
+            v=v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=(window_size[0], window_size[1]),
+        )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(3)
@@ -3031,6 +3092,26 @@ def flash_attn_varlen_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
+    if not ENABLE_CK and sink_ptr is None:
+        from .triton.attention.mha_v3 import (
+            flash_attn_varlen_func as flash_attn_varlen_func_v3_triton,
+        )
+
+        return flash_attn_varlen_func_v3_triton(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=(window_size[0], window_size[1]),
+        )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     head_size_q_og = q.size(-1)
