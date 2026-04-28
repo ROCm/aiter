@@ -89,29 +89,6 @@ def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: gl.constexp
 
 
 @gluon.jit
-def unswizzle_mx_scale_gfx1250(
-    x,
-    BLOCK_N: gl.constexpr,
-    MX_SCALE_BLOCK_K: gl.constexpr,
-    SCALE_BLOCK_N: gl.constexpr,
-    N_PRESHUFFLE_FACTOR: gl.constexpr,
-    SCALE_KWIDTH: gl.constexpr,
-):
-    x = x.reshape(
-        (
-            SCALE_BLOCK_N,
-            MX_SCALE_BLOCK_K // SCALE_KWIDTH,
-            N_PRESHUFFLE_FACTOR // 4,
-            4,
-            SCALE_KWIDTH,
-        )
-    )
-    x = x.permute((0, 3, 2, 1, 4))
-    x = x.reshape((BLOCK_N, MX_SCALE_BLOCK_K))
-    return x
-
-
-@gluon.jit
 def _reduce_grouped_gfx1250(
     X,
     stride_xb: gl.uint64,
