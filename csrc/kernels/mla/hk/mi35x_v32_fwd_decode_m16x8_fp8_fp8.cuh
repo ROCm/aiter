@@ -549,6 +549,8 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
                 if constexpr(kSkipCompute == false)
                 {
+                    __builtin_amdgcn_s_setprio(num_macro_iter - 1 - m.value);
+
                     // ---- Even half: prefetch tile_odd into kv_*_alt, mfma on tile_even (k_kv_*) ----
                     constexpr uint32_t kColOdd0 = tile_odd * T::kBlockK * 2;
                     constexpr uint32_t kColOdd1 = kColOdd0 + T::kBlockK;
@@ -559,20 +561,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     kv_manager.template load_transposed_v_to_gpr<16, kColOdd1, k_kv_1_alt_begin + 2>(p_lds_kv_curr);
 
                     if constexpr(kIsFirstIter)
+                    {
                         hk::mma_ABt(oaccu_e0, kv_0, p_mfma);
-                    else
-                        hk::mma_ABt(oaccu_e0, kv_0, p_mfma, oaccu_e0);
-
-                    asm volatile("s_waitcnt lgkmcnt(2)");
-                    kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_alt_begin,
-                                                                          k_kv_0_alt_begin + 2>();
-
-                    if constexpr(kIsFirstIter)
                         hk::mma_ABt(oaccu_e1, kv_1, p_mfma);
+                    }
                     else
+                    {
+                        hk::mma_ABt(oaccu_e0, kv_0, p_mfma, oaccu_e0);
                         hk::mma_ABt(oaccu_e1, kv_1, p_mfma, oaccu_e1);
+                    }
 
                     asm volatile("s_waitcnt lgkmcnt(0)");
+                    kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_alt_begin,
+                                                                          k_kv_0_alt_begin + 2>();
                     kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_1_alt_begin,
                                                                           k_kv_1_alt_begin + 2>();
 
@@ -588,20 +589,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                         kv_manager.template load_transposed_v_to_gpr<16, kColNxt1, k_kv_1_begin + 2>(p_lds_kv_curr);
 
                         if constexpr(kIsFirstIter)
+                        {
                             hk::mma_ABt(oaccu_o0, kv_0_alt, p_mfma);
-                        else
-                            hk::mma_ABt(oaccu_o0, kv_0_alt, p_mfma, oaccu_o0);
-
-                        asm volatile("s_waitcnt lgkmcnt(2)");
-                        kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_begin,
-                                                                              k_kv_0_begin + 2>();
-
-                        if constexpr(kIsFirstIter)
                             hk::mma_ABt(oaccu_o1, kv_1_alt, p_mfma);
+                        }
                         else
+                        {
+                            hk::mma_ABt(oaccu_o0, kv_0_alt, p_mfma, oaccu_o0);
                             hk::mma_ABt(oaccu_o1, kv_1_alt, p_mfma, oaccu_o1);
+                        }
 
                         asm volatile("s_waitcnt lgkmcnt(0)");
+                        kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_begin,
+                                                                              k_kv_0_begin + 2>();
                         kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_1_begin,
                                                                               k_kv_1_begin + 2>();
                     }
