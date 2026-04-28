@@ -282,9 +282,18 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
                 context_idx
                 + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=context_idx
-            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-            >= 0,
+            mask=(
+                (
+                    context_idx
+                    + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+                    >= 0
+                )
+                & (
+                    context_idx
+                    + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+                    < max_model_len
+                )
+            ),
         )
 
     context_idx = split_context_start + split_context_length - ChunkK
@@ -310,8 +319,18 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         ptr=OutLogits_buffer,
         offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
         + (context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))),
-        mask=context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-        >= 0,
+        mask=(
+            (
+                context_idx
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+                >= 0
+            )
+            & (
+                context_idx
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+                < max_model_len
+            )
+        ),
     )
 
 
