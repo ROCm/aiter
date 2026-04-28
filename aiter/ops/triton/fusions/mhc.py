@@ -31,44 +31,44 @@ def mhc(
     config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-Single entry point ``mhc()`` runs equations 14-19 plus the layer_input apply
-step in a single Triton launch (or split-K + reduce launch pair). The
-log-domain Sinkhorn-Knopp projection of H^res (Eq 19) is fused into the
-res-stream branch of the kernel.
+    Single entry point ``mhc()`` runs equations 14-19 plus the layer_input apply
+    step in a single Triton launch (or split-K + reduce launch pair). The
+    log-domain Sinkhorn-Knopp projection of H^res (Eq 19) is fused into the
+    res-stream branch of the kernel.
 
-    This function implements:
-    - Eq 14: H̃ = x̃φ (matrix multiplication)
-    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
-    - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
-    - Eq 17: H^pre = σ(H^pre) + hc_pre_eps  (folded into layer_input below)
-    - Eq 18: H^post = hc_post_mult_value · σ(H^post)
-    - Eq 19: H^res = SinkhornKnopp(H^res)  (log-domain, in-kernel; skipped when
-      sinkhorn_iters == 0, in which case raw H^res logits are returned)
-    - layer_input[m, c] = Σᵢ (σ(H^pre[m, i]) + hc_pre_eps) · x[m, i, c]
+        This function implements:
+        - Eq 14: H̃ = x̃φ (matrix multiplication)
+        - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
+        - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
+        - Eq 17: H^pre = σ(H^pre) + hc_pre_eps  (folded into layer_input below)
+        - Eq 18: H^post = hc_post_mult_value · σ(H^post)
+        - Eq 19: H^res = SinkhornKnopp(H^res)  (log-domain, in-kernel; skipped when
+          sinkhorn_iters == 0, in which case raw H^res logits are returned)
+        - layer_input[m, c] = Σᵢ (σ(H^pre[m, i]) + hc_pre_eps) · x[m, i, c]
 
-    Args:
-        x: (M, K) input tensor where K = n*C
-        phi: (K, N) unified projection matrix where N = n + n + n²
-             Layout: [pre | post | res] where res is n²
-        alpha_pre: Scaling factor for pre-stream
-        alpha_post: Scaling factor for post-stream
-        alpha_res: Scaling factor for residual stream
-        bias: (N,) bias vector (fp32)
-        n: Stream parameter (manifold dimension)
-        eps: Epsilon for RMS-norm numerical stability
-        hc_pre_eps: Additive epsilon on σ(H^pre) before the apply step
-            (default 0.0 for Eq-17 parity).
-        hc_post_mult_value: Multiplier on σ(H^post) (default 2.0 for Eq-18 parity).
-        sinkhorn_iters: Number of in-kernel log-domain Sinkhorn-Knopp iterations
-            on H^res. ``0`` returns raw H^res logits (skips Eq 19).
-        config: Optional kernel configuration dict
+        Args:
+            x: (M, K) input tensor where K = n*C
+            phi: (K, N) unified projection matrix where N = n + n + n²
+                 Layout: [pre | post | res] where res is n²
+            alpha_pre: Scaling factor for pre-stream
+            alpha_post: Scaling factor for post-stream
+            alpha_res: Scaling factor for residual stream
+            bias: (N,) bias vector (fp32)
+            n: Stream parameter (manifold dimension)
+            eps: Epsilon for RMS-norm numerical stability
+            hc_pre_eps: Additive epsilon on σ(H^pre) before the apply step
+                (default 0.0 for Eq-17 parity).
+            hc_post_mult_value: Multiplier on σ(H^post) (default 2.0 for Eq-18 parity).
+            sinkhorn_iters: Number of in-kernel log-domain Sinkhorn-Knopp iterations
+                on H^res. ``0`` returns raw H^res logits (skips Eq 19).
+            config: Optional kernel configuration dict
 
-    Returns:
-        Tuple `(h_post, h_res, layer_input)`:
-        - h_post:      (M, n, 1)  in x.dtype  - hc_post_mult_value · σ(H^post)
-        - h_res:       (M, n, n)  in x.dtype  - doubly-stochastic Sinkhorn output
-                                                 (or raw logits when sinkhorn_iters==0)
-        - layer_input: (M, C)     in x.dtype  - Σᵢ pre_mix_i · x_i
+        Returns:
+            Tuple `(h_post, h_res, layer_input)`:
+            - h_post:      (M, n, 1)  in x.dtype  - hc_post_mult_value · σ(H^post)
+            - h_res:       (M, n, n)  in x.dtype  - doubly-stochastic Sinkhorn output
+                                                     (or raw logits when sinkhorn_iters==0)
+            - layer_input: (M, C)     in x.dtype  - Σᵢ pre_mix_i · x_i
     """
     M, K = x.shape
     C = K // n  # Derive C from K and n
@@ -262,3 +262,93 @@ res-stream branch of the kernel.
     h_post = out[:, :n].unsqueeze(-1)  # (M, n, 1)
     h_res = out[:, n:].view(M, n, n)  # (M, n, n)
     return h_post, h_res, layer_input
+
+
+def mhc_post(
+    out: Optional[torch.Tensor],
+    x: torch.Tensor,  # (m, hidden_size)  bf16/fp16
+    residual: torch.Tensor,  # (m, hc_mult, hidden_size)  bf16/fp16
+    post_layer_mix: torch.Tensor,  # (m, hc_mult) or (m, hc_mult, 1)  fp32
+    comb_res_mix: torch.Tensor,  # (m, hc_mult, hc_mult)  fp32 [dim1=src, dim2=dst]
+    config: Optional[dict] = None,
+) -> torch.Tensor:
+    """
+    mhc_post: Apply post-stream and res-stream mixing to produce updated multi-stream residual.
+
+    Implements: out[m, hc, k] = post_mix[m, hc] * x[m, k] + sum_h( comb_mix[m, h, hc] * residual[m, h, k] )
+
+    Args:
+        out: Optional pre-allocated output tensor (m, hc_mult, hidden_size)
+        x: Transformer layer output (m, hidden_size)
+        residual: Current multi-stream residual (m, hc_mult, hidden_size)
+        post_layer_mix: Post-stream coefficients (m, hc_mult) or (m, hc_mult, 1)
+        comb_res_mix: Res-stream mixing coefficients (m, hc_mult, hc_mult) [dim1=src, dim2=dst]
+        config: Optional kernel configuration dict
+
+    Returns:
+        Updated multi-stream residual (m, hc_mult, hidden_size)
+    """
+    from aiter.ops.triton._triton_kernels.fusions import _mhc_post_kernel
+    from aiter.ops.triton.utils.mhc_config_utils import get_mhc_post_config
+
+    # Step 1: Extract dimensions
+    m, hc_mult, hidden_size = residual.shape
+    assert hc_mult == 4, f"hc_mult must be 4, got {hc_mult}"
+    assert x.shape == (
+        m,
+        hidden_size,
+    ), f"x shape mismatch: expected ({m}, {hidden_size}), got {x.shape}"
+
+    # Step 2: Handle post_layer_mix shape - squeeze if (m, hc_mult, 1)
+    if post_layer_mix.ndim == 3:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+    assert post_layer_mix.shape == (
+        m,
+        hc_mult,
+    ), f"post_layer_mix shape mismatch: expected ({m}, {hc_mult}), got {post_layer_mix.shape}"
+    assert comb_res_mix.shape == (
+        m,
+        hc_mult,
+        hc_mult,
+    ), f"comb_res_mix shape mismatch: expected ({m}, {hc_mult}, {hc_mult}), got {comb_res_mix.shape}"
+
+    # Step 3: Resolve BLOCK_K (matches HIP dispatch logic)
+    if config is None:
+        config = get_mhc_post_config(hidden_size)
+    config = dict(config)  # Copy to avoid mutating cache
+    BLOCK_K = config.pop("BLOCK_K", 512)
+
+    _LOGGER.info(
+        f"MHC_POST: x={tuple(x.shape)} residual={tuple(residual.shape)} "
+        f"post_layer_mix={tuple(post_layer_mix.shape)} "
+        f"comb_res_mix={tuple(comb_res_mix.shape)} BLOCK_K={BLOCK_K}"
+    )
+
+    # Step 4: Allocate output if needed
+    if out is None:
+        out = torch.empty(m, hc_mult, hidden_size, dtype=x.dtype, device=x.device)
+
+    # Step 5: Launch kernel with grid (m, hc_mult)
+    grid = (m, hc_mult)
+    _mhc_post_kernel[grid](
+        out,
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        M=m,
+        hidden_size=hidden_size,
+        stride_x_m=x.stride(0),
+        stride_res_m=residual.stride(0),
+        stride_res_hc=residual.stride(1),
+        stride_out_m=out.stride(0),
+        stride_out_hc=out.stride(1),
+        stride_post_m=post_layer_mix.stride(0),
+        stride_comb_m=comb_res_mix.stride(0),
+        stride_comb_src=comb_res_mix.stride(1),
+        HC=hc_mult,
+        BLOCK_K=BLOCK_K,
+    )
+
+    # Step 6: Return output
+    return out

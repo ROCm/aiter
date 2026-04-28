@@ -175,3 +175,32 @@ def get_mhc_config(
     raise KeyError(
         f"No matching config for M={M}, C={C}, mode={mode} in '{config_name}'"
     )
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_mhc_post_config(hidden_size: int) -> dict:
+    """
+    Return BLOCK_K config for mhc_post kernel.
+
+    Matches HIP dispatch logic:
+      non-gfx942 + hidden_size % 1024 == 0  ->  BLOCK_K=1024
+      hidden_size % 512 == 0                 ->  BLOCK_K=512
+      hidden_size % 256 == 0                 ->  BLOCK_K=256
+
+    Args:
+        hidden_size: Hidden dimension per stream
+
+    Returns:
+        Config dict with BLOCK_K
+
+    Raises:
+        ValueError: If hidden_size is not divisible by 256
+    """
+    dev = arch_info.get_arch()
+    if dev != "gfx942" and hidden_size % 1024 == 0:
+        return {"BLOCK_K": 1024}
+    if hidden_size % 512 == 0:
+        return {"BLOCK_K": 512}
+    if hidden_size % 256 == 0:
+        return {"BLOCK_K": 256}
+    raise ValueError(f"hidden_size={hidden_size} must be divisible by 256 for mhc_post")

@@ -188,9 +188,7 @@ def test_mhc_large_values():
 
     # Layer_input scales linearly with x, so loosen its absolute tolerance for
     # x ~ N(0, 100²).
-    _assert_mhc_close(
-        triton_tuple, out_torch, layer_atol=2.0, layer_rtol=1e-2
-    )
+    _assert_mhc_close(triton_tuple, out_torch, layer_atol=2.0, layer_rtol=1e-2)
 
 
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
@@ -391,12 +389,8 @@ def test_split_k_various_splits(num_ksplit):
     # and hpre (raw logits, no Triton-side counterpart).
     post_t, _, layer_t = triton_tuple
     post_ref, _, _hpre_ref, layer_ref = out_ref
-    torch.testing.assert_close(
-        post_t.float(), post_ref.float(), atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(
-        layer_t.float(), layer_ref.float(), atol=5e-2, rtol=5e-2
-    )
+    torch.testing.assert_close(post_t.float(), post_ref.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(layer_t.float(), layer_ref.float(), atol=5e-2, rtol=5e-2)
 
 
 def test_split_k_large_k():
@@ -441,10 +435,10 @@ def test_split_k_large_k():
     )
 
 
-
 # =============================================================================
 # Triton-vs-HIP parity anchor
 # =============================================================================
+
 
 def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n):
     """Convert Triton-convention mhc inputs to HIP `aiter.mhc_pre` conventions.
@@ -562,4 +556,112 @@ def test_triton_mhc_matches_hip(M, n, C):
         atol=8e-2,
         rtol=2e-2,
         msg=f"layer_input Triton vs aiter.mhc_pre mismatch at {cfg}",
+    )
+
+
+# =============================================================================
+# mhc_post Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "m, hc_mult, hidden_size",
+    [
+        (1, 4, 256),
+        (128, 4, 1024),
+        (512, 4, 4096),
+        (1024, 4, 7168),
+        (2048, 4, 2048),
+        (64, 4, 512),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mhc_post_correctness(m, hc_mult, hidden_size, dtype):
+    """Test mhc_post against PyTorch reference."""
+    from aiter.ops.triton.fusions.mhc import mhc_post
+    from op_tests.triton_tests.utils.mhc_ref import (
+        mhc_post_torch,
+        generate_mhc_post_inputs,
+    )
+
+    x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+        m, hc_mult, hidden_size, dtype
+    )
+    ref = mhc_post_torch(x, residual, post_mix, comb_mix)
+    out = mhc_post(None, x, residual, post_mix, comb_mix)
+
+    torch.testing.assert_close(
+        out.float(),
+        ref.float(),
+        atol=1e-2,
+        rtol=1e-2,
+        msg=f"mhc_post output mismatch at (m={m}, hc_mult={hc_mult}, hidden_size={hidden_size}, dtype={dtype})",
+    )
+
+
+def test_mhc_post_preallocated_output():
+    """Verify in-place path: result is out and matches reference."""
+    from aiter.ops.triton.fusions.mhc import mhc_post
+    from op_tests.triton_tests.utils.mhc_ref import (
+        mhc_post_torch,
+        generate_mhc_post_inputs,
+    )
+
+    m, hc_mult, hidden_size = 128, 4, 1024
+    dtype = torch.bfloat16
+
+    x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+        m, hc_mult, hidden_size, dtype
+    )
+
+    # Pre-allocate output
+    out = torch.empty(m, hc_mult, hidden_size, dtype=dtype, device=x.device)
+
+    # Call mhc_post with pre-allocated output
+    result = mhc_post(out, x, residual, post_mix, comb_mix)
+
+    # Verify result is the same object as out
+    assert result is out, "mhc_post should return the pre-allocated output tensor"
+
+    # Verify correctness
+    ref = mhc_post_torch(x, residual, post_mix, comb_mix)
+    torch.testing.assert_close(
+        out.float(),
+        ref.float(),
+        atol=1e-2,
+        rtol=1e-2,
+        msg="Pre-allocated output mismatch",
+    )
+
+
+def test_mhc_post_squeeze_post_layer_mix():
+    """Pass post_layer_mix as (m, hc_mult, 1) — as mhc_pre emits it."""
+    from aiter.ops.triton.fusions.mhc import mhc_post
+    from op_tests.triton_tests.utils.mhc_ref import (
+        mhc_post_torch,
+        generate_mhc_post_inputs,
+    )
+
+    m, hc_mult, hidden_size = 64, 4, 512
+    dtype = torch.bfloat16
+
+    x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+        m, hc_mult, hidden_size, dtype
+    )
+
+    # Add extra dimension to post_mix to simulate mhc_pre output
+    post_mix_3d = post_mix.unsqueeze(-1)  # (m, hc_mult, 1)
+    assert post_mix_3d.shape == (m, hc_mult, 1)
+
+    # Call mhc_post with 3D post_layer_mix
+    out = mhc_post(None, x, residual, post_mix_3d, comb_mix)
+
+    # Verify correctness against reference with 2D post_mix
+    ref = mhc_post_torch(x, residual, post_mix, comb_mix)
+    torch.testing.assert_close(
+        out.float(),
+        ref.float(),
+        atol=1e-2,
+        rtol=1e-2,
+        msg="mhc_post with 3D post_layer_mix mismatch",
     )

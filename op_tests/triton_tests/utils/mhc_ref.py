@@ -31,6 +31,8 @@ __all__ = [
     "is_doubly_stochastic",
     "generate_mhc_inputs",
     "get_test_shapes",
+    "mhc_post_torch",
+    "generate_mhc_post_inputs",
 ]
 
 # =============================================================================
@@ -142,9 +144,7 @@ def mhc_torch(
     # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint.
     H_res_3d = H_res.view(M, n, n)
     if return_with_sinkhorn:
-        hres = sinkhorn_knopp_log_domain_torch(
-            H_res_3d, num_iters=sinkhorn_iters
-        )
+        hres = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=sinkhorn_iters)
     else:
         hres = H_res_3d  # already fp32
 
@@ -327,3 +327,57 @@ def get_test_shapes():
     return shapes
 
 
+def mhc_post_torch(
+    x: torch.Tensor,  # (m, hidden_size)
+    residual: torch.Tensor,  # (m, hc_mult, hidden_size)
+    post_layer_mix: torch.Tensor,  # (m, hc_mult) or (m, hc_mult, 1)
+    comb_res_mix: torch.Tensor,  # (m, hc_mult, hc_mult)  [dim1=src, dim2=dst]
+) -> torch.Tensor:
+    """
+    PyTorch reference for mhc_post implementing the 3-step strategy:
+    1. Multiply post-stream with x
+    2. Reduce res-stream (weighted sum over source heads)
+    3. Combine and return
+    """
+    post_layer_mix = (
+        post_layer_mix.squeeze(-1) if post_layer_mix.ndim == 3 else post_layer_mix
+    )
+    x_f32 = x.float()
+    res_f32 = residual.float()
+
+    # Step 1: post_mix * x broadcast to each dst head: (m, hc_mult, hidden_size)
+    out = post_layer_mix[:, :, None] * x_f32[:, None, :]
+
+    # Step 2: + sum over src heads: einsum[m, src_h, k] * [m, src_h, dst_hc] -> [m, dst_hc, k]
+    # comb_res_mix[m, src, dst] so contract dim-1 (src)
+    out = out + torch.einsum("mhk,mhH->mHk", res_f32, comb_res_mix.float())
+
+    # Step 3: Return in original dtype
+    return out.to(x.dtype)
+
+
+def generate_mhc_post_inputs(
+    m: int,
+    hc_mult: int,
+    hidden_size: int,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    """
+    Generate test inputs for mhc_post.
+
+    Returns:
+        Tuple of (x, residual, post_layer_mix, comb_res_mix) where:
+        - x: (m, hidden_size) in dtype
+        - residual: (m, hc_mult, hidden_size) in dtype
+        - post_layer_mix: (m, hc_mult) fp32
+        - comb_res_mix: (m, hc_mult, hc_mult) fp32
+    """
+    x = torch.randn(m, hidden_size, dtype=dtype, device=device)
+    residual = torch.randn(m, hc_mult, hidden_size, dtype=dtype, device=device)
+    post_layer_mix = torch.randn(m, hc_mult, dtype=torch.float32, device=device) * 0.1
+    comb_res_mix = (
+        torch.randn(m, hc_mult, hc_mult, dtype=torch.float32, device=device) * 0.1
+    )
+
+    return x, residual, post_layer_mix, comb_res_mix

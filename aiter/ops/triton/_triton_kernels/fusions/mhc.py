@@ -53,7 +53,7 @@ def _mhc_fused_kernel(
     Pre-stream programs compute `pre_mix = sigmoid(H_pre) + hc_pre_eps` and apply
     it to `x` to produce `layer_input[m, c] = sum_i pre_mix[m, i] * x[m, i*C + c]`.
 
-    Post and res streams write to a unified `(M, n + n_squared)` tensor following 
+    Post and res streams write to a unified `(M, n + n_squared)` tensor following
     `[post | res]`. phi/bias indexing follows `[pre | post | res]` layout. When
     NUM_SINKHORN_ITERS > 0, the res branch reshapes its `(BLOCK_M, BLOCK_N)`
     tile to `(BLOCK_M, n, n)` and runs log-domain Sinkhorn-Knopp inline before
@@ -89,7 +89,7 @@ def _mhc_fused_kernel(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
+
     # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
     # phi/bias indexing keeps the original [pre | post | res] layout
     phi_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
@@ -144,18 +144,14 @@ def _mhc_fused_kernel(
                 )
                 # Re-read x[rm, i*C + rc] (same to HIP version)
                 x_tile = tl.load(
-                    x_ptr
-                    + rm[:, None] * stride_xm
-                    + (i * C + rc[None, :]) * stride_xk,
+                    x_ptr + rm[:, None] * stride_xm + (i * C + rc[None, :]) * stride_xk,
                     mask=(rm[:, None] < M) & (rc[None, :] < C),
                     other=0.0,
                 ).to(tl.float32)
                 li_acc += pre_mix_i[:, None] * x_tile
 
             tl.store(
-                layer_input_ptr
-                + rm[:, None] * stride_li_m
-                + rc[None, :] * stride_li_c,
+                layer_input_ptr + rm[:, None] * stride_li_m + rc[None, :] * stride_li_c,
                 li_acc.to(layer_input_ptr.dtype.element_ty),
                 mask=(rm[:, None] < M) & (rc[None, :] < C),
             )
@@ -179,18 +175,14 @@ def _mhc_fused_kernel(
                 for _ in range(NUM_SINKHORN_ITERS):
                     scaled_row = log_A + log_v[:, None, :]
                     row_max = tl.max(scaled_row, axis=2)
-                    exp_shifted = tl.exp2(
-                        (scaled_row - row_max[:, :, None]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
                     row_sum_exp = tl.sum(exp_shifted, axis=2)
                     log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
                     log_u = -log_row_sums
 
                     scaled_col = log_A + log_u[:, :, None]
                     col_max = tl.max(scaled_col, axis=1)
-                    exp_shifted = tl.exp2(
-                        (scaled_col - col_max[:, None, :]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
                     col_sum_exp = tl.sum(exp_shifted, axis=1)
                     log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
                     log_v = -log_col_sums
@@ -203,7 +195,9 @@ def _mhc_fused_kernel(
             out_col_start = n
         out_col_offset = out_col_start + rn_local
         tl.store(
-            out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
+            out_ptr
+            + rm[:, None] * stride_out_m
+            + out_col_offset[None, :] * stride_out_n,
             out_activated,
             mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
         )
@@ -473,18 +467,14 @@ def _mhc_fused_reduce_kernel(
                     axis=1,
                 )
                 x_tile = tl.load(
-                    x_ptr
-                    + rm[:, None] * stride_xm
-                    + (i * C + rc[None, :]) * stride_xk,
+                    x_ptr + rm[:, None] * stride_xm + (i * C + rc[None, :]) * stride_xk,
                     mask=(rm[:, None] < M) & (rc[None, :] < C),
                     other=0.0,
                 ).to(tl.float32)
                 li_acc += pre_mix_i[:, None] * x_tile
 
             tl.store(
-                layer_input_ptr
-                + rm[:, None] * stride_li_m
-                + rc[None, :] * stride_li_c,
+                layer_input_ptr + rm[:, None] * stride_li_m + rc[None, :] * stride_li_c,
                 li_acc.to(layer_input_ptr.dtype.element_ty),
                 mask=(rm[:, None] < M) & (rc[None, :] < C),
             )
@@ -508,18 +498,14 @@ def _mhc_fused_reduce_kernel(
                 for _ in range(NUM_SINKHORN_ITERS):
                     scaled_row = log_A + log_v[:, None, :]
                     row_max = tl.max(scaled_row, axis=2)
-                    exp_shifted = tl.exp2(
-                        (scaled_row - row_max[:, :, None]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
                     row_sum_exp = tl.sum(exp_shifted, axis=2)
                     log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
                     log_u = -log_row_sums
 
                     scaled_col = log_A + log_u[:, :, None]
                     col_max = tl.max(scaled_col, axis=1)
-                    exp_shifted = tl.exp2(
-                        (scaled_col - col_max[:, None, :]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
                     col_sum_exp = tl.sum(exp_shifted, axis=1)
                     log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
                     log_v = -log_col_sums
@@ -532,7 +518,85 @@ def _mhc_fused_reduce_kernel(
             out_col_start = n
         out_col_offset = out_col_start + rn_local
         tl.store(
-            out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
+            out_ptr
+            + rm[:, None] * stride_out_m
+            + out_col_offset[None, :] * stride_out_n,
             out_activated,
             mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
+        )
+
+
+@triton.jit
+def _mhc_post_kernel(
+    out_ptr,  # (m, hc_mult, hidden_size)  bf16/fp16
+    x_ptr,  # (m, hidden_size)  bf16/fp16
+    residual_ptr,  # (m, hc_mult, hidden_size)  bf16/fp16
+    post_layer_mix_ptr,  # (m, hc_mult)  fp32
+    comb_res_mix_ptr,  # (m, hc_mult, hc_mult)  fp32  [dim1=src, dim2=dst]
+    M: tl.constexpr,
+    hidden_size: tl.constexpr,
+    stride_x_m,
+    stride_res_m,
+    stride_res_hc,
+    stride_out_m,
+    stride_out_hc,
+    stride_post_m,  # stride for post_layer_mix m-dim
+    stride_comb_m,  # stride for comb_res_mix m-dim
+    stride_comb_src,  # stride for comb_res_mix src-dim
+    HC: tl.constexpr,  # hc_mult, typically 4
+    BLOCK_K: tl.constexpr,  # tile size over hidden_size
+):
+    """
+    mhc_post kernel: compute out[m, hc, k] = post_mix[m, hc] * x[m, k] + sum_h( comb_mix[m, h, hc] * residual[m, h, k] )
+
+    Grid: (m, hc_mult) — one program per (token, output-head)
+
+    Implementation follows the 3-step strategy:
+    1. Multiply post-stream: post_mix[m, hc] * x[m, k] (element-wise)
+    2. Reduce res-stream: Σₕ comb_mix[m, h, hc] * residual[m, h, k] (weighted sum over source heads)
+    3. Write output: Store combined result to out[m, hc, k]
+    """
+    pid_m = tl.program_id(0)
+    pid_hc = tl.program_id(1)  # dst head
+
+    # Load HC scalars for comb_res_mix[:, :, pid_hc] — all source heads for this dst
+    src_heads = tl.arange(0, HC)
+    comb_ptrs = (
+        comb_res_mix_ptr + pid_m * stride_comb_m + src_heads * stride_comb_src + pid_hc
+    )
+    comb_v = tl.load(comb_ptrs)  # shape [HC], fp32
+
+    post_mix_v = tl.load(
+        post_layer_mix_ptr + pid_m * stride_post_m + pid_hc
+    )  # scalar fp32
+
+    # Inner loop over hidden_size in tiles of BLOCK_K
+    for k_start in range(0, hidden_size, BLOCK_K):
+        k_offs = k_start + tl.arange(0, BLOCK_K)
+        mask = k_offs < hidden_size
+
+        x_tile = tl.load(
+            x_ptr + pid_m * stride_x_m + k_offs, mask=mask, other=0.0
+        )  # [BLOCK_K]
+
+        # Step 1: Accumulate post_mix * x
+        acc = post_mix_v * x_tile.to(tl.float32)
+
+        # Step 2: Accumulate sum_h( comb_v[h] * residual[m, h, k] )
+        for h in tl.static_range(HC):
+            res_tile = tl.load(
+                residual_ptr + pid_m * stride_res_m + h * stride_res_hc + k_offs,
+                mask=mask,
+                other=0.0,
+            )
+            # Extract scalar from comb_v using tl.sum with masking instead of direct indexing
+            h_range = tl.arange(0, HC)
+            comb_scalar = tl.sum(tl.where(h_range == h, comb_v, 0.0))
+            acc += comb_scalar * res_tile.to(tl.float32)
+
+        # Step 3: Store final output
+        tl.store(
+            out_ptr + pid_m * stride_out_m + pid_hc * stride_out_hc + k_offs,
+            acc.to(out_ptr.dtype.element_ty),
+            mask=mask,
         )

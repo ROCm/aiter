@@ -2,13 +2,17 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-Benchmark for mHC (manifold-constrained Hyper Connection) fused kernel.
+Benchmark for mHC (manifold-constrained Hyper Connection) fused kernels.
 
-Measures performance of the Triton `mhc()` implementation across various
-input shapes and configurations, reporting time, throughput (TFLOPS), and
-bandwidth.
+Measures performance of Triton `mhc()` and `mhc_post()` implementations across
+various input shapes and configurations, reporting time, throughput (TFLOPS),
+and bandwidth.
 
-- `--with-hip`: adds the HIP kernel aiter.mhc_pre alongside the Triton kernel.
+Usage:
+  python bench_mhc.py              # Benchmark mhc (pre-transformer)
+  python bench_mhc.py --op post    # Benchmark mhc_post (post-transformer)
+
+- `--with-hip`: adds the HIP kernel alongside the Triton kernel.
   When passed, a silent Triton-vs-HIP correctness check runs as the first
   step of each `(M, n, C)` row, once per config.
   AssertionError on mismatch aborts the benchmark.
@@ -141,7 +145,7 @@ def run_benchmark(args):
         args={},
     )
 
-    # Tracks (configs that have already passed the silent Triton-vs-HIP 
+    # Tracks (configs that have already passed the silent Triton-vs-HIP
     # parity check within this benchmark run, so each
     # config is checked at most once even when multiple providers/metrics
     # are reported per row.
@@ -281,8 +285,17 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         prog="Benchmark mHC",
-        description="Benchmark mHC (manifold-constrained Hyper Connection) kernel",
+        description="Benchmark mHC (manifold-constrained Hyper Connection) kernels",
         allow_abbrev=False,
+    )
+
+    # Operation selection
+    parser.add_argument(
+        "--op",
+        type=str,
+        default="pre",
+        choices=["pre", "post"],
+        help="Which operation to benchmark: 'pre' (mhc) or 'post' (mhc_post)",
     )
 
     # Shape parameters
@@ -317,7 +330,7 @@ def parse_args():
         "-sinkhorn_iters",
         type=int,
         default=20,
-        help="Number of Sinkhorn-Knopp iterations (default: 20)",
+        help="Number of Sinkhorn-Knopp iterations for mhc (default: 20)",
     )
     parser.add_argument(
         "--with-hip",
@@ -325,11 +338,10 @@ def parse_args():
         action="store_true",
         default=False,
         help=(
-            "Also benchmark the HIP aiter.mhc_pre kernel "
-            "(mhc_pre_gemm_sqrsum + mhc_pre_big_fuse) alongside Triton. "
-            "Requires --dtype bf16. Also runs a silent Triton-vs-HIP "
-            "correctness check once per (M, n, C) before timing that row; "
-            "aborts on mismatch."
+            "Also benchmark the HIP kernel alongside Triton. "
+            "For --op pre: requires --dtype bf16. "
+            "Runs a silent Triton-vs-HIP correctness check once per (M, n, C) "
+            "before timing that row; aborts on mismatch."
         ),
     )
 
@@ -340,7 +352,7 @@ def parse_args():
         const="throughput",
         choices=["all", "time", "throughput", "bandwidth", "arithmetic_intensity"],
         default=None,
-        help="Metrics for the kernel benchmark (default: all)",
+        help="Metrics for the kernel benchmark (default: all for pre, time+bandwidth for post)",
     )
     parser.add_argument(
         "-print_vgpr",
@@ -475,10 +487,246 @@ def _assert_triton_matches_hip(triton_out, hip_out, *, M, n, C):
     )
 
 
+# =============================================================================
+# mhc_post Benchmark
+# =============================================================================
+
+
+def run_post_benchmark(args):
+    """Run mhc_post benchmark with specified configuration."""
+    from aiter.ops.triton.fusions.mhc import mhc_post
+    from op_tests.triton_tests.utils.mhc_ref import generate_mhc_post_inputs
+
+    dtype = arg_to_torch_dtype[args.dtype]
+    hc_mult = 4  # Always 4 for mHC
+
+    configs = get_benchmark_configs(args)
+    x_vals_list = [(M, C) for M, n, C in configs]  # Use (M, hidden_size)
+    x_names = ["M", "hidden_size"]
+
+    # Determine metrics
+    if args.metric == "all" or args.metric is None:
+        metrics = ["time(ms)", "bandwidth(GB/s)"]
+    else:
+        metric_map = {
+            "time": "time(ms)",
+            "bandwidth": "bandwidth(GB/s)",
+        }
+        metrics = [metric_map.get(args.metric, "bandwidth(GB/s)")]
+
+    backends = ["triton"] + (["hip"] if args.with_hip else [])
+    if args.with_hip:
+        line_vals = [f"{b}_{m}" for m in metrics for b in backends]
+    else:
+        line_vals = list(metrics)
+
+    benchmark_name = f"bench_mhc_post_{args.dtype}"
+    if args.with_hip:
+        benchmark_name += "_triton+hip"
+
+    _palette = [
+        ("blue", "-"),
+        ("green", "-"),
+        ("blue", "--"),
+        ("green", "--"),
+    ]
+
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        line_arg="provider",
+        line_vals=line_vals,
+        line_names=line_vals,
+        styles=_palette[: len(line_vals)],
+        ylabel="",
+        plot_name=benchmark_name,
+        args={},
+    )
+
+    # Track configs that have already passed correctness check
+    _checked_configs: set = set()
+
+    @triton.testing.perf_report([benchmark])
+    def bench_mhc_post_kernel(M, hidden_size, provider):
+        """Benchmark mhc_post kernel for given configuration."""
+        # Generate inputs
+        x, residual, post_mix, comb_mix = generate_mhc_post_inputs(
+            M, hc_mult, hidden_size, dtype
+        )
+
+        # Memory traffic calculation
+        elem_bytes = x.element_size()  # 2 for bf16/fp16
+        mix_bytes = 4  # fp32
+        bytes_io = (
+            M * hidden_size * elem_bytes  # read x
+            + M * hc_mult * hidden_size * elem_bytes  # read residual
+            + M * hc_mult * mix_bytes  # read post_layer_mix
+            + M * hc_mult * hc_mult * mix_bytes  # read comb_res_mix
+            + M * hc_mult * hidden_size * elem_bytes  # write out
+        )
+
+        def triton_fn():
+            return mhc_post(None, x, residual, post_mix, comb_mix)
+
+        hip_fn = None
+        if args.with_hip:
+            import aiter
+
+            out_hip = torch.empty(M, hc_mult, hidden_size, dtype=dtype, device=x.device)
+
+            def hip_fn():
+                return aiter.mhc_post(out_hip, x, residual, post_mix, comb_mix)
+
+        # Silent correctness check (once per config)
+        if args.with_hip and (M, hidden_size) not in _checked_configs:
+            _assert_triton_matches_hip_post(
+                triton_fn(), hip_fn(), M=M, hidden_size=hidden_size
+            )
+            _checked_configs.add((M, hidden_size))
+
+        backend = "hip" if provider.startswith("hip_") else "triton"
+        fn = hip_fn if backend == "hip" else triton_fn
+
+        # Benchmark
+        ms = triton.testing.do_bench(fn)
+
+        # Return requested metric based on provider string
+        if "ms" in provider:
+            return ms
+        elif "GB/s" in provider:
+            return bytes_io / (ms * 1e-3) / 1e9
+        return ms
+
+    bench_mhc_post_kernel.run(save_path="." if args.o else None, print_data=True)
+
+
+def _validate_with_hip_post(args):
+    """Validate args for --with-hip in mhc_post benchmark.
+
+    Returns 0 if args are acceptable, or a non-zero exit code for sys.exit().
+    """
+    if not args.with_hip:
+        return 0
+
+    if args.dtype != "bf16":
+        logging.error(
+            "--with-hip only supports --dtype bf16 (got %r). "
+            "aiter.mhc_post kernel is template-instantiated for bf16/fp16 "
+            "with fp32 mixing coefficients.",
+            args.dtype,
+        )
+        return 1
+
+    # Validate every (M, n, C) that will be benchmarked
+    for M_, n_, C_ in get_benchmark_configs(args):
+        # aiter.mhc_post hardcodes hc_mult == 4 via TORCH_CHECK
+        if n_ != 4:
+            logging.error(
+                "--with-hip requires n == 4 (got n=%d for M=%d, C=%d). "
+                "aiter.mhc_post hardcodes hc_mult == 4 via TORCH_CHECK.",
+                n_,
+                M_,
+                C_,
+            )
+            return 1
+
+        # aiter.mhc_post MHC_POST_KERNEL_DISPATCH requirements:
+        # - non-gfx942 + hidden_size % 1024 == 0 -> residual_block=1024, needs hidden_size >= 2048
+        # - hidden_size % 512 == 0 -> residual_block=512, needs hidden_size >= 1024
+        # - hidden_size % 256 == 0 -> residual_block=256, needs hidden_size >= 512
+        # The macro enforces: hidden_size % residual_block == 0 && hidden_size >= residual_block * 2
+        if C_ % 256 != 0:
+            logging.error(
+                "--with-hip requires C (hidden_size) divisible by 256 "
+                "(got C=%d for M=%d, n=%d). aiter.mhc_post dispatches with "
+                "residual_block in {256, 512, 1024}.",
+                C_,
+                M_,
+                n_,
+            )
+            return 1
+
+        # Check the residual_block * 2 constraint based on dispatch logic
+        import aiter.jit.utils.chip_info as chip_info
+
+        arch_id = chip_info.get_gpu_arch()
+
+        if arch_id != "gfx942" and C_ % 1024 == 0:
+            # Will use residual_block=1024
+            if C_ < 2048:
+                logging.error(
+                    "--with-hip: hidden_size %% 1024 == 0 on %s selects residual_block=1024, "
+                    "requires hidden_size >= 2048 (got C=%d for M=%d, n=%d).",
+                    arch_id,
+                    C_,
+                    M_,
+                    n_,
+                )
+                return 1
+        elif C_ % 512 == 0:
+            # Will use residual_block=512
+            if C_ < 1024:
+                logging.error(
+                    "--with-hip: hidden_size %% 512 == 0 selects residual_block=512, "
+                    "requires hidden_size >= 1024 (got C=%d for M=%d, n=%d).",
+                    C_,
+                    M_,
+                    n_,
+                )
+                return 1
+        else:
+            # Will use residual_block=256
+            if C_ < 512:
+                logging.error(
+                    "--with-hip: hidden_size %% 256 == 0 selects residual_block=256, "
+                    "requires hidden_size >= 512 (got C=%d for M=%d, n=%d).",
+                    C_,
+                    M_,
+                    n_,
+                )
+                return 1
+
+    return 0
+
+
+def _assert_triton_matches_hip_post(triton_out, hip_out, *, M, hidden_size):
+    """Silent Triton-vs-HIP parity assertions for mhc_post.
+
+    Runs torch.testing.assert_close on the output tensors. Silent on success;
+    raises AssertionError on mismatch with a descriptive (M, hidden_size) tag.
+
+    Tolerances match the test_mhc_post_matches_hip test in
+    op_tests/triton_tests/fusions/test_mhc.py:
+        out: atol=2e-2, rtol=1e-2
+    """
+    cfg = f"(M={M}, hidden_size={hidden_size})"
+    torch.testing.assert_close(
+        triton_out.float(),
+        hip_out.float(),
+        atol=2e-2,
+        rtol=1e-2,
+        msg=f"mhc_post output mismatch between Triton and HIP at {cfg}",
+    )
+
+
+# =============================================================================
+# Main Entry Points
+# =============================================================================
+
+
 def main():
     """Main entry point."""
     args = parse_args()
 
+    # Route to appropriate benchmark based on --op flag
+    if args.op == "post":
+        return main_post(args)
+    else:
+        return main_pre(args)
+
+
+def main_pre(args):
+    """Main entry point for mhc (pre-transformer) benchmark."""
     rc = _validate_with_hip(args)
     if rc != 0:
         return rc
@@ -493,6 +741,25 @@ def main():
         return 0
 
     run_benchmark(args)
+    return 0
+
+
+def main_post(args):
+    """Main entry point for mhc_post (post-transformer) benchmark."""
+    rc = _validate_with_hip_post(args)
+    if rc != 0:
+        return rc
+
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for mhc_post Triton kernels...")
+
+        def fun():
+            return run_post_benchmark(args)
+
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
+
+    run_post_benchmark(args)
     return 0
 
 
