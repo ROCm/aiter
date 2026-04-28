@@ -19,6 +19,7 @@ def generate_batched_gemm_a16w16_inputs(
     output: bool,
     layout: str = "TN",
 ):
+    torch.manual_seed(0)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
     if layout[0] == "T":
