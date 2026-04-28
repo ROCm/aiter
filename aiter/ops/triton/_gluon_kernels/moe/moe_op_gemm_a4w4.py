@@ -386,7 +386,7 @@ def _moe_gemm_a4w4_gfx1250(
     else:
         offs_x_m_scale = gl.convert_layout(offs_x_m, gl.SliceLayout(1, DOT_LAYOUT_X_SCALES))
     offs_x_k_scale = gl.arange(0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_X_SCALES))
-    offs_x_scale = offs_x_m_scale[:, None] * stride_x_mx_m + offs_x_k_scale[None, :] * stride_x_mx_k
+    offs_x_scale = offs_x_m_scale.to(index_type)[:, None] * stride_x_mx_m + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
 
     # B scale pointers
     WMxScale += expt_id * stride_w_mx_e
@@ -417,11 +417,11 @@ def _moe_gemm_a4w4_gfx1250(
         d1_w_scales = col // SCALE_KWIDTH
         d4_w_scales = col % SCALE_KWIDTH
         offs_w_scale = (
-            (pid_n * SCALE_BLOCK_N + d0_w_scales)[:, None] * stride_w_mx_n
-            + (d1_w_scales[None, :] * (PRESHUFFLE_FACTOR * SCALE_KWIDTH)
-            + d2_w_scales[:, None] * (4 * SCALE_KWIDTH)
-            + d3_w_scales[:, None] * SCALE_KWIDTH
-            + d4_w_scales[None, :]) * stride_w_mx_k
+            (pid_n * SCALE_BLOCK_N + d0_w_scales.to(index_type))[:, None] * stride_w_mx_n
+            + (d1_w_scales.to(index_type)[None, :] * (PRESHUFFLE_FACTOR * SCALE_KWIDTH)
+            + d2_w_scales.to(index_type)[:, None] * (4 * SCALE_KWIDTH)
+            + d3_w_scales.to(index_type)[:, None] * SCALE_KWIDTH
+            + d4_w_scales.to(index_type)[None, :]) * stride_w_mx_k
         )
     else:
         PRESHUFFLE_FACTOR: gl.constexpr = 1
@@ -429,7 +429,7 @@ def _moe_gemm_a4w4_gfx1250(
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
         offs_w_n_scale = pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, layout=gl.SliceLayout(1, DOT_LAYOUT_W_SCALES))
         offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, layout=gl.SliceLayout(0, DOT_LAYOUT_W_SCALES))
-        offs_w_scale = offs_w_n_scale[:, None] * stride_w_mx_n + offs_w_k_scale[None, :] * stride_w_mx_k
+        offs_w_scale = offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
 
     # shared layouts
     if PACKED_BLOCK_K_X <= 256:
@@ -489,19 +489,19 @@ def _moe_gemm_a4w4_gfx1250(
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [offs_x_m, load_idx * PACKED_BLOCK_K_X],
+                [offs_x_m.to(index_type), load_idx * PACKED_BLOCK_K_X],
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
-                offs_x_m,
+                offs_x_m.to(index_type),
                 load_idx * PACKED_BLOCK_K_X,
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [offs_w_n, load_idx * PACKED_BLOCK_K_W],
+            [offs_w_n.to(index_type), load_idx * PACKED_BLOCK_K_W],
             w_buffer.index(load_idx % NUM_BUFFERS),
         )
         load_idx += 1
@@ -530,19 +530,19 @@ def _moe_gemm_a4w4_gfx1250(
         if GatherIndx is None:
             gl.amd.gfx1250.tdm.async_load(
                 x_desc,
-                [offs_x_m, load_idx * PACKED_BLOCK_K_X],
+                [offs_x_m.to(index_type), load_idx * PACKED_BLOCK_K_X],
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
             gl.amd.gfx1250.tdm.async_gather(
                 x_desc,
-                offs_x_m,
+                offs_x_m.to(index_type),
                 load_idx * PACKED_BLOCK_K_X,
                 x_buffer.index(load_idx % NUM_BUFFERS),
             )
         gl.amd.gfx1250.tdm.async_load(
             w_desc,
-            [offs_w_n, load_idx * PACKED_BLOCK_K_W],
+            [offs_w_n.to(index_type), load_idx * PACKED_BLOCK_K_W],
             w_buffer.index(load_idx % NUM_BUFFERS),
         )
         load_idx += 1

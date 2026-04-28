@@ -128,7 +128,6 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
     num_buffers = 3
 
-    block_m = 32
     block_n = 128
     block_k = 512
     num_warps = 4
