@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Exercise ``fused_moe`` with ``AITER_PYHIP_HSACO_MOE=1`` on gfx942 (``hsaco_tools.get_kernel``).
+"""Exercise ``fused_moe`` with ``AITER_MOE_SMALL_BATCH=1`` on gfx942 (``hsaco_tools.get_kernel``).
 
 Requires: ``model_dim=4096``, ``inter_dim=128``, ``topk=10``, FP8 weights, ``doweight_stage1=False``.
 
@@ -41,7 +41,7 @@ TOPK = 10
 @pytest.mark.skipif(get_gfx() != "gfx942", reason="pyhip bundle is built for gfx942")
 def test_fused_moe_pyhip_hsaco_gfx942_tokens(token: int):
     """Same two ``.co`` files for all ``token`` (``moe_gemm_batch`` + ``moe_2stage_splitk``)."""
-    os.environ["AITER_PYHIP_HSACO_MOE"] = "1"
+    os.environ["AITER_MOE_SMALL_BATCH"] = "1"
     dtype = dtypes.bf16
     device = "cuda"
 

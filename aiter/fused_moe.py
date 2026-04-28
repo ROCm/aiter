@@ -18,6 +18,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
+from aiter.fused_moe_pyhip_hsaco import MOE_HSACO_SMALL_BATCH_MAX_B
 
 BLOCK_SIZE_M = 32
 
@@ -143,11 +144,14 @@ def fused_moe(
     splitk=0,
 ):
     ###### ONLY ALLOW TO CHANGE THIS PART STARTING FROM HERE ######
-    # fast path for small batches: prebuilt ``.co`` via ``hsaco_tools.get_kernel`` (no pyhip).
-    if os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1":
-        from aiter.fused_moe_pyhip_hsaco import try_run_moe_small_batch_hsaco
+    # HSACO small batch: prebuilt ``.co`` only for ``1 <= B <= MOE_HSACO_SMALL_BATCH_MAX_B``.
+    if (
+        os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1"
+        and 1 <= int(hidden_states.shape[0]) <= MOE_HSACO_SMALL_BATCH_MAX_B
+    ):
+        from aiter.fused_moe_pyhip_hsaco import run_moe_small_batch_hsaco
 
-        _sb_out = try_run_moe_small_batch_hsaco(
+        moe_buf = run_moe_small_batch_hsaco(
             hidden_states,
             w1,
             w2,
@@ -161,8 +165,9 @@ def fused_moe(
             num_local_tokens,
             moe_sorting_dispatch_policy,
         )
-        if _sb_out is not None:
-            return _sb_out
+
+        return moe_buf
+
     ###### ONLY ALLOW TO CHANGE THIS PART ENDING HERE ######
     if not block_size_M:
         block_size_M = -1
@@ -311,26 +316,23 @@ def fused_moe_(
         hidden_pad,
         intermediate_pad,
         isShuffled,
-        os.environ.get("AITER_PYHIP_HSACO_MOE", "0"),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
-    # B=1: pyhip test_small_batch_perf / entry_b1 uses moe_gemm_batch1 ×2 (no moe_sorting).
     if (
-        os.environ.get("AITER_PYHIP_HSACO_MOE", "0") == "1"
+        os.environ.get("AITER_MOE_SMALL_BATCH", "0") == "1"
         and M == 1
         and expert_mask is None
-        and metadata.skip_a2_quant
         and quant_type == QuantType.per_Token
         and activation == ActivationType.Silu
         and not doweight_stage1
     ):
-        from aiter.fused_moe_pyhip_hsaco import try_fused_moe_hsaco_batch1_fwd
+        from aiter.fused_moe_pyhip_hsaco import fused_moe_hsaco_batch1_fwd
 
-        _hsaco_b1 = try_fused_moe_hsaco_batch1_fwd(
+        _hsaco_b1 = fused_moe_hsaco_batch1_fwd(
             hidden_states,
             w1,
             w2,
@@ -781,7 +783,6 @@ def get_2stage_cfgs(
     hidden_pad,
     intermediate_pad,
     is_shuffled=True,
-    hsaco_moe_env: str = "0",
 ):
     _INDEX_COLS = [
         "cu_num",
@@ -854,26 +855,6 @@ def get_2stage_cfgs(
         use_g1u1,
         doweight_stage1,
     )
-
-    if hsaco_moe_env == "1":
-        from aiter.fused_moe_pyhip_hsaco import try_pyhip_hsaco_moe_metadata
-
-        _hsaco_meta = try_pyhip_hsaco_moe_metadata(
-            token,
-            model_dim,
-            inter_dim,
-            expert,
-            topk,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            q_type,
-            use_g1u1,
-            activation,
-            doweight_stage1,
-        )
-        if _hsaco_meta is not None:
-            return _hsaco_meta
 
     def MainFunc():
         with open(untune_file, "a") as f:
@@ -1226,7 +1207,6 @@ def fused_moe_2stages(
         hidden_pad,
         intermediate_pad,
         is_shuffled,
-        os.environ.get("AITER_PYHIP_HSACO_MOE", "0"),
     )
     # pyhip ``moe_gemm_batch`` gate kernel reads BF16 ``p_input`` (see pyhip ``moe.py`` ``buff_a``);
     # do not feed FP8-quantized activations from ``get_quant(per_Token)`` into that path.
