@@ -174,7 +174,7 @@ def define_layout(
         )
     else:
         VGPRS0: gl.constexpr = QUERY_SEQ_LEN_POW2
-        THREADS0: gl.constexpr = QUERY_GROUP_SIZE_POW2 // (4 * VGPRS0)
+        THREADS0: gl.constexpr = triton.cdiv(QUERY_GROUP_SIZE_POW2, (4 * VGPRS0))
         THREADS1: gl.constexpr = 64 // THREADS0
 
         qk_linear_layout: gl.constexpr = gl.BlockedLayout(
@@ -406,7 +406,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         # ONE_QUERY_GROUP_SIZE_POW2 may be 4, 8, 16
         # corresponding Q_WARPS_PER_CTA_DIM1 should be 1, 2, 4
         # corresponding Q_WARPS_PER_CTA_DIM0 should be 4, 2, 1
-        Q_WARPS_PER_CTA_DIM1: gl.constexpr = ONE_QUERY_GROUP_SIZE_POW2 // 4
+        Q_WARPS_PER_CTA_DIM1: gl.constexpr = triton.cdiv(ONE_QUERY_GROUP_SIZE_POW2, 4)
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 4 // Q_WARPS_PER_CTA_DIM1
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
@@ -1190,7 +1190,7 @@ def paged_attention_decode_sliding_window_head_1(
     shared_key_scale_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 8, order=[0])
     QUERY_GROUP_SIZE_POW2: gl.constexpr = QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2
     if ONE_QUERY_GROUP_SIZE_POW2 <= 16:
-        Q_WARPS_PER_CTA_DIM1: gl.constexpr = ONE_QUERY_GROUP_SIZE_POW2 // 4
+        Q_WARPS_PER_CTA_DIM1: gl.constexpr = triton.cdiv(ONE_QUERY_GROUP_SIZE_POW2, 4)
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 4 // Q_WARPS_PER_CTA_DIM1
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
@@ -2327,7 +2327,7 @@ def paged_attention_decode_sliding_window(
         # ONE_QUERY_GROUP_SIZE_POW2 may be 4, 8, 16
         # corresponding Q_WARPS_PER_CTA_DIM1 should be 1, 2, 4
         # corresponding Q_WARPS_PER_CTA_DIM0 should be 4, 2, 1
-        Q_WARPS_PER_CTA_DIM1: gl.constexpr = ONE_QUERY_GROUP_SIZE_POW2 // 4
+        Q_WARPS_PER_CTA_DIM1: gl.constexpr = triton.cdiv(ONE_QUERY_GROUP_SIZE_POW2, 4)
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 4 // Q_WARPS_PER_CTA_DIM1
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
@@ -3312,7 +3312,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         # ONE_QUERY_GROUP_SIZE_POW2 may be 4, 8, 16
         # corresponding Q_WARPS_PER_CTA_DIM1 should be 1, 2, 4
         # corresponding Q_WARPS_PER_CTA_DIM0 should be 4, 2, 1
-        Q_WARPS_PER_CTA_DIM1: gl.constexpr = ONE_QUERY_GROUP_SIZE_POW2 // 4
+        Q_WARPS_PER_CTA_DIM1: gl.constexpr = triton.cdiv(ONE_QUERY_GROUP_SIZE_POW2, 4)
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 4 // Q_WARPS_PER_CTA_DIM1
     else:
         Q_WARPS_PER_CTA_DIM0: gl.constexpr = 1
