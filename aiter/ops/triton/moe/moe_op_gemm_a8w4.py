@@ -333,7 +333,11 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_buffers"] if config["num_buffers"] is not None else config["num_stages"],
+            NUM_BUFFERS=(
+                config["num_buffers"]
+                if config["num_buffers"] is not None
+                else config["num_stages"]
+            ),
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             EVEN_K=K % config["block_k"] == 0,
             MASK_K_LIMIT=K % config["block_k"],
