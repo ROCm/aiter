@@ -26,7 +26,8 @@ Requirements:
   KV_BLOCK_SIZE         multiple of 16
   KV_COMPUTE_BLOCK_SIZE multiple of WMMA_K = 32, multiple of KV_BLOCK_SIZE
   PARTITION_SIZE        multiple of KV_COMPUTE_BLOCK_SIZE
-  BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE / KV_BLOCK_SIZE  in {1, 2, 4}
+  BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE / KV_BLOCK_SIZE  (any positive int;
+                                                              BPC > 4 issues multiple buffer_loads)
   QUERY_GROUP_SIZE      exactly 16 (== WMMA_M)
 
 WMMA instruction: wmma_f32_16x16x32_bf16 (or f16), wave32.
@@ -101,15 +102,12 @@ def compile_pa_decode_main(
             f"{NUM_WARPS * WMMA_N}, got {KV_COMPUTE_BLOCK_SIZE}"
         )
 
-    # FIX_NEEDED: shouldn't limit KV_COMPUTE_BLOCK_SIZE for this instead fix the load function for physical blocks
     BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
-    if BLOCKS_PER_COMPUTE not in (1, 2, 4): #int32 * 4 = 128b
-        # We use a single vectorized buffer_load for the physical block IDs;
-        # vec_width ∈ {1, 2, 4} on AMD.
-        raise ValueError(
-            f"BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE/KV_BLOCK_SIZE must be in "
-            f"{{1, 2, 4}}, got {BLOCKS_PER_COMPUTE}"
-        )
+    # Physical block IDs are loaded via buffer_load with vec_width ∈ {1, 2, 4} on AMD.
+    # For BPC > 4 we issue ceil(BPC/4) loads of size ≤ 4 each.
+    BT_VEC_WIDTH = 4 if BLOCKS_PER_COMPUTE >= 4 else BLOCKS_PER_COMPUTE
+    BT_NUM_LOADS = (BLOCKS_PER_COMPUTE + BT_VEC_WIDTH - 1) // BT_VEC_WIDTH
+    BT_TAIL_WIDTH = BLOCKS_PER_COMPUTE - (BT_NUM_LOADS - 1) * BT_VEC_WIDTH
 
     block_threads = NUM_WARPS * WAVE_SIZE          # 128
     K_QK_TILES = HEAD_SIZE // WMMA_K               # HEAD/32 = 4
@@ -125,12 +123,18 @@ def compile_pa_decode_main(
     gpu_arch = str(get_hip_arch(timeout_s=300))
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
-    # LDS layout (2-stage double-buffer for K and V, sized by KV_COMPUTE_BLOCK_SIZE):
+    # NUM_KV_STAGES = 2 enables a software-pipelined prefetch of the next compute
+    # tile's K/V into a separate LDS stage while the current tile is being
+    # consumed. With COMPUTES_PER_PARTITION == 1 there's no "next tile" to
+    # overlap with, so we collapse to a single stage and save half the K/V LDS.
+    NUM_KV_STAGES = 2 if COMPUTES_PER_PARTITION > 1 else 1
+
+    # LDS layout (NUM_KV_STAGES double-buffer for K and V, sized by KV_COMPUTE_BLOCK_SIZE):
     #   Q     [QG=16,  HEAD]                dtype       (persistent until read into q_frags)
     #   K[0]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 0, holds BLOCKS_PER_COMPUTE blocks)
     #   V[0]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 0)
-    #   K[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1)
-    #   V[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1)
+    #   K[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1, only if NUM_KV_STAGES==2)
+    #   V[1]  [KV_COMPUTE_BLOCK_SIZE, HEAD] dtype       (stage 1, only if NUM_KV_STAGES==2)
     #   P     [QG=16, KV_COMPUTE_BLOCK_SIZE] dtype
     #
     # Cross-warp reduce scratch [NUM_WARPS, QG] f32 is aliased with Q LDS (Q is
@@ -143,9 +147,12 @@ def compile_pa_decode_main(
     q_lds_offset = 0
     q_lds_bytes = q_lds_elems * elem_bytes
     kv_one_bytes = kv_lds_elems * elem_bytes
-    k_stage_offsets = [q_lds_offset + q_lds_bytes + 2 * i * kv_one_bytes for i in range(2)]
+    k_stage_offsets = [
+        q_lds_offset + q_lds_bytes + 2 * i * kv_one_bytes
+        for i in range(NUM_KV_STAGES)
+    ]
     v_stage_offsets = [k + kv_one_bytes for k in k_stage_offsets]
-    p_lds_offset = q_lds_offset + q_lds_bytes + 4 * kv_one_bytes
+    p_lds_offset = q_lds_offset + q_lds_bytes + 2 * NUM_KV_STAGES * kv_one_bytes
     p_lds_bytes = p_lds_elems * elem_bytes
     allocator.ptr = p_lds_offset + p_lds_bytes
 
@@ -232,11 +239,11 @@ def compile_pa_decode_main(
         q_lds = SmemPtr(base, q_lds_offset, elem_ty, shape=(q_lds_elems,))
         k_lds_stages = [
             SmemPtr(base, k_stage_offsets[i], elem_ty, shape=(kv_lds_elems,))
-            for i in range(2)
+            for i in range(NUM_KV_STAGES)
         ]
         v_lds_stages = [
             SmemPtr(base, v_stage_offsets[i], elem_ty, shape=(kv_lds_elems,))
-            for i in range(2)
+            for i in range(NUM_KV_STAGES)
         ]
         p_lds = SmemPtr(base, p_lds_offset, elem_ty, shape=(p_lds_elems,))
         # Cross-warp reduce scratch slabs (aliased with Q LDS region, f32)
@@ -248,9 +255,10 @@ def compile_pa_decode_main(
         )
         q_lds.get()
         k_lds_stages[0].get()
-        k_lds_stages[1].get()
         v_lds_stages[0].get()
-        v_lds_stages[1].get()
+        if NUM_KV_STAGES == 2:
+            k_lds_stages[1].get()
+            v_lds_stages[1].get()
         p_lds.get()
         scratch_max_lds.get()
         scratch_sum_lds.get()
@@ -338,14 +346,15 @@ def compile_pa_decode_main(
         BLOCKS_PER_PARTITION = COMPUTES_PER_PARTITION * BLOCKS_PER_COMPUTE
 
         def _phys_blks_for_compute(compute_iter_idx):
-            """Load BLOCKS_PER_COMPUTE physical block IDs via one vectorized buffer_load.
+            """Load BLOCKS_PER_COMPUTE physical block IDs via vectorized buffer_load(s).
 
             For compute iteration `compute_iter_idx`, we need physical block indices at
             logical positions [base, base + BLOCKS_PER_COMPUTE) where
             base = part_idx * BLOCKS_PER_PARTITION + compute_iter_idx * BLOCKS_PER_COMPUTE.
 
-            Block-table rows are contiguous in the logical_blk dim, so one vec
-            buffer_load pulls all BLOCKS_PER_COMPUTE entries at once.
+            AMD's buffer_load vec_width is capped at 4 (128 bits for i32). For
+            BPC > 4 we issue BT_NUM_LOADS loads of width BT_VEC_WIDTH (with the
+            last load possibly narrower = BT_TAIL_WIDTH).
 
             Returns: list of `T.index` values, one per block in the tile.
             """
@@ -353,17 +362,27 @@ def compile_pa_decode_main(
                 part_idx * arith.index(BLOCKS_PER_PARTITION)
                 + compute_iter_idx * arith.index(BLOCKS_PER_COMPUTE)
             )
-            bt_off = seq_idx * stride_bt_seq + base_logical
-            if BLOCKS_PER_COMPUTE == 1:
-                phys_i32 = buffer_ops.buffer_load(bt_rsrc, bt_off, vec_width=1, dtype=T.i32)
-                return [arith.index_cast(T.index, phys_i32)]
-            phys_vec = buffer_ops.buffer_load(
-                bt_rsrc, bt_off, vec_width=BLOCKS_PER_COMPUTE, dtype=T.i32
-            )
+            bt_base = seq_idx * stride_bt_seq + base_logical
+
             out = []
-            for b in range_constexpr(BLOCKS_PER_COMPUTE):
-                elem = vector.extract(phys_vec, static_position=[b], dynamic_position=[])
-                out.append(arith.index_cast(T.index, elem))
+            for ldi in range_constexpr(BT_NUM_LOADS):
+                # Last load uses BT_TAIL_WIDTH (may be < BT_VEC_WIDTH); all others use BT_VEC_WIDTH.
+                this_width = BT_TAIL_WIDTH if ldi == BT_NUM_LOADS - 1 else BT_VEC_WIDTH
+                bt_off = bt_base + arith.index(ldi * BT_VEC_WIDTH)
+                if this_width == 1:
+                    phys_i32 = buffer_ops.buffer_load(
+                        bt_rsrc, bt_off, vec_width=1, dtype=T.i32
+                    )
+                    out.append(arith.index_cast(T.index, phys_i32))
+                else:
+                    phys_vec = buffer_ops.buffer_load(
+                        bt_rsrc, bt_off, vec_width=this_width, dtype=T.i32
+                    )
+                    for b in range_constexpr(this_width):
+                        elem = vector.extract(
+                            phys_vec, static_position=[b], dynamic_position=[]
+                        )
+                        out.append(arith.index_cast(T.index, elem))
             return out
 
         def _issue_kv_load_single_block(kv_tensor, lds_memref, phys_blk, lds_byte_off):
@@ -384,15 +403,27 @@ def compile_pa_decode_main(
             tdm_ops.tensor_load_2d(desc)
 
         def _issue_kv_tile_loads(k_lds_mem, v_lds_mem, phys_blks_list):
-            """Issue TDM loads for one compute tile: BLOCKS_PER_COMPUTE K loads + same for V.
+            """Issue TDM loads for one compute tile: BLOCKS_PER_COMPUTE K loads
+            followed by BLOCKS_PER_COMPUTE V loads (K-then-V issue order).
+
+            The split issue order matters: tensor_wait drains in FIFO, so
+            issuing all K's before all V's lets us drain just the K's later
+            (via tensor_wait(BPC + outstanding-after)) while V is still in
+            flight, overlapping V's DMA with QK + softmax compute.
 
             Each block lands in a sub-region of the LDS stage (offset by block-index rows).
             """
             one_block_bytes = KV_BLOCK_SIZE * HEAD_SIZE * elem_bytes
             for b in range_constexpr(BLOCKS_PER_COMPUTE):
                 lds_sub_off = arith.index(b * one_block_bytes)
-                _issue_kv_load_single_block(arg_key_cache,   k_lds_mem, phys_blks_list[b], lds_sub_off)
-                _issue_kv_load_single_block(arg_value_cache, v_lds_mem, phys_blks_list[b], lds_sub_off)
+                _issue_kv_load_single_block(
+                    arg_key_cache, k_lds_mem, phys_blks_list[b], lds_sub_off
+                )
+            for b in range_constexpr(BLOCKS_PER_COMPUTE):
+                lds_sub_off = arith.index(b * one_block_bytes)
+                _issue_kv_load_single_block(
+                    arg_value_cache, v_lds_mem, phys_blks_list[b], lds_sub_off
+                )
 
         # Fence counts: each compute tile issues 2*BLOCKS_PER_COMPUTE TDM ops (K+V for each block).
         FENCE_OUTSTANDING = 2 * BLOCKS_PER_COMPUTE
@@ -439,14 +470,16 @@ def compile_pa_decode_main(
 
         # ---------------- Main loop over compute tiles in partition ----------------
         for compute_iter in range_constexpr(COMPUTES_PER_PARTITION):
-            cur_stage = compute_iter % 2
-            nxt_stage = (compute_iter + 1) % 2
+            cur_stage = compute_iter % NUM_KV_STAGES
+            nxt_stage = (compute_iter + 1) % NUM_KV_STAGES
             tile_first_tok = (
                 part_idx * arith.index(PARTITION_SIZE)
                 + arith.index(compute_iter * KV_COMPUTE_BLOCK_SIZE)
             )
 
-            # Prefetch next compute tile's BLOCKS_PER_COMPUTE K+V loads if it exists
+            # Prefetch next compute tile's BLOCKS_PER_COMPUTE K+V loads if it exists.
+            # _issue_kv_tile_loads issues all K's first, then all V's.
+            # FIFO drain semantics: wait_for_K drains everything down to (V's of cur tile + any prefetched).
             if compute_iter < COMPUTES_PER_PARTITION - 1:
                 next_iter_idx = arith.index(compute_iter + 1)
                 next_phys_blks = _phys_blks_for_compute(next_iter_idx)
@@ -455,10 +488,19 @@ def compile_pa_decode_main(
                     v_lds_stages[nxt_stage].get(),
                     next_phys_blks,
                 )
-                # Wait for current tile loads (let next tile's 2*BPC loads remain outstanding)
-                tdm_ops.tensor_wait(FENCE_OUTSTANDING)
+                # Outstanding before wait_for_K: cur K + cur V + next K + next V = 4*BPC.
+                # After wait_for_K: cur V + next K + next V = 3*BPC.
+                outstanding_after_k_drain = 3 * BLOCKS_PER_COMPUTE
+                # After wait_for_V: next K + next V = 2*BPC.
+                outstanding_after_v_drain = 2 * BLOCKS_PER_COMPUTE
             else:
-                tdm_ops.tensor_wait(0)
+                # Last iter: no prefetch. Outstanding = cur K + cur V = 2*BPC.
+                # After wait_for_K: cur V = BPC. After wait_for_V: 0.
+                outstanding_after_k_drain = BLOCKS_PER_COMPUTE
+                outstanding_after_v_drain = 0
+
+            # Wait for current tile's K (V continues loading in background).
+            tdm_ops.tensor_wait(outstanding_after_k_drain)
             gpu.barrier()
 
             # Current stage pointers
@@ -657,6 +699,9 @@ def compile_pa_decode_main(
                     )
                     p_lds.store(v, [off])
 
+            # Wait for current tile's V (its DMA was overlapped with QK + softmax + P-LDS write).
+            # The barrier doubles as the LDS-fence for the P-LDS writes above.
+            tdm_ops.tensor_wait(outstanding_after_v_drain)
             gpu.barrier()
 
             # ------------------------ PV WMMA ------------------------
