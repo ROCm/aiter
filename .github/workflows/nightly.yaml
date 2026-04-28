@@ -138,7 +138,7 @@ jobs:
               if $filter == "" then true
               else
                 ($filter | split(",") | map(gsub("^\\s+|\\s+$";""))) as $allowed
-                | any($allowed[]; . == .runner)
+                | .runner as $r | any($allowed[]; . == $r)
               end;
             [ .[] | select(allowed($filter)) ]
           JQ
