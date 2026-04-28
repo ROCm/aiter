@@ -41,7 +41,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  build_aiter_image:
+  build_aiter_wheels:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: build-only-aiter
     needs: check-signal
@@ -185,7 +185,7 @@ jobs:
   split_aiter_tests:
     if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
-    needs: [check-signal, build_aiter_image]
+    needs: [check-signal, build_aiter_wheels]
     outputs:
       shard_count: 5
     steps:
@@ -207,7 +207,7 @@ jobs:
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_image, split_aiter_tests]
+    needs: [build_aiter_wheels, split_aiter_tests]
     strategy:
       fail-fast: false
       matrix:
@@ -429,7 +429,7 @@ jobs:
   multi-gpu:
     name: Multi-GPU Tests (8 GPU)
     if: github.ref == 'refs/heads/main'
-    needs: build_aiter_image
+    needs: build_aiter_wheels
     strategy:
       fail-fast: false
       matrix:
