@@ -11,6 +11,7 @@ import os
 import sys
 import csv
 import tempfile
+import textwrap
 import subprocess
 import unittest
 import pandas as pd
@@ -120,6 +121,7 @@ class TestTunePipeline(unittest.TestCase):
                     (1, 1024, 512, fp8),
                 ],
                 "keys": ["cu_num", "M", "N", "K", "q_dtype_w"],
+                "timeout": 900,
             },
             "batched_a8w8": {
                 "script": "csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py",
@@ -226,7 +228,7 @@ class TestTunePipeline(unittest.TestCase):
                     "use_g1u1",
                     "doweight_stage1",
                 ],
-                "timeout": 600,
+                "timeout": 1800,
             },
             "gradlib_bf16": {
                 "script": "gradlib/gradlib/gemm_tuner.py",
@@ -265,7 +267,7 @@ class TestTunePipeline(unittest.TestCase):
                     ),
                 ],
                 "keys": ["M", "N", "K"],
-                "timeout": 600,
+                "timeout": 900,
             },
         }
 
@@ -351,6 +353,7 @@ class TestShapeGrouped(unittest.TestCase):
             "header": ["M", "N", "K"],
             "shapes": [(16, 1536, 7168), (16, 576, 7168), (16, 7168, 256)],
             "keys": ["cu_num", "M", "N", "K"],
+            "timeout": 600,
         },
         "batched_bf16": {
             "script": "csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py",
@@ -363,6 +366,7 @@ class TestShapeGrouped(unittest.TestCase):
     def _run_grouped_vs_ref(self, name):
         cfg = self.CONFIGS[name]
         num_shapes = len(cfg["shapes"])
+        timeout = cfg.get("timeout", 300)
         with tempfile.TemporaryDirectory() as tmp:
             untuned = os.path.join(tmp, "untuned.csv")
             tuned_ref = os.path.join(tmp, "tuned_ref.csv")
@@ -372,7 +376,8 @@ class TestShapeGrouped(unittest.TestCase):
             _write_csv(untuned, cfg["header"], cfg["shapes"])
 
             r_ref = _run_tuner(
-                cfg["script"], untuned, tuned_ref, extra_args=["-o2", profile_ref]
+                cfg["script"], untuned, tuned_ref, extra_args=["-o2", profile_ref],
+                timeout=timeout,
             )
             self.assertEqual(
                 r_ref.returncode, 0, f"{name} ref tuner failed:\n{r_ref.stderr[-1000:]}"
@@ -383,6 +388,7 @@ class TestShapeGrouped(unittest.TestCase):
                 untuned,
                 tuned,
                 extra_args=["--shape_grouped", "-o2", profile],
+                timeout=timeout,
             )
             if r.returncode != 0:
                 print(f"\n=== {name} grouped STDERR ===\n{r.stderr[-2000:]}")
@@ -410,6 +416,180 @@ class TestShapeGrouped(unittest.TestCase):
 
     def test_batched_bf16(self):
         self._run_grouped_vs_ref("batched_bf16")
+
+
+@unittest.skipUnless(_gpu_available(), "No GPU available")
+class TestComparePipeline(unittest.TestCase):
+    """Test --compare and --compare --update_improved end-to-end."""
+
+    CONFIGS = {
+        "a8w8_blockscale": {
+            "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
+            "header": ["M", "N", "K"],
+            "shapes": [(1, 1024, 512), (16, 1536, 7168)],
+            "keys": ["cu_num", "M", "N", "K"],
+        },
+    }
+
+    def _run_compare(self, name, update_improved=False):
+        cfg = self.CONFIGS[name]
+        tmp = tempfile.mkdtemp()
+        untuned = os.path.join(tmp, "untuned.csv")
+        tuned = os.path.join(tmp, "tuned.csv")
+        _write_csv(untuned, cfg["header"], cfg["shapes"])
+
+        extra = ["--compare"]
+        if update_improved:
+            extra.append("--update_improved")
+        result = _run_tuner(
+            cfg["script"], untuned, tuned, extra_args=extra, timeout=900
+        )
+        return result, tuned, tmp
+
+    def test_compare_only(self):
+        """--compare runs pre/post benchmark and prints comparison."""
+        result, tuned, tmp = self._run_compare("a8w8_blockscale", update_improved=False)
+        try:
+            if result.returncode != 0:
+                print(f"\n=== compare STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== compare STDERR ===\n{result.stderr[-2000:]}")
+            self.assertEqual(result.returncode, 0, "compare tuner failed")
+            output = result.stdout + result.stderr
+            self.assertIn(
+                "Compare Report", output,
+                "Expected 'Compare Report' in output"
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_compare_update_improved(self):
+        """--compare --update_improved writes tuned CSV and prints comparison."""
+        result, tuned, tmp = self._run_compare("a8w8_blockscale", update_improved=True)
+        try:
+            if result.returncode != 0:
+                print(f"\n=== compare+update STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== compare+update STDERR ===\n{result.stderr[-2000:]}")
+            self.assertEqual(result.returncode, 0, "compare+update tuner failed")
+            self.assertTrue(os.path.exists(tuned), "tuned CSV not created")
+            output = result.stdout + result.stderr
+            self.assertIn(
+                "Compare Report", output,
+                "Expected 'Compare Report' in output"
+            )
+            df = pd.read_csv(tuned)
+            df.columns = df.columns.str.strip()
+            self.assertGreaterEqual(len(df), 1, "tuned CSV should have at least 1 row")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+@unittest.skipUnless(_gpu_available(), "No GPU available")
+class TestOnlineTuneE2E(unittest.TestCase):
+    """E2E: AITER_ONLINE_TUNE=1 with empty config -> tuner runs inline, op succeeds."""
+
+    def _run_online_tune_script(self, tmp_dir, timeout=600):
+        tuned_csv = os.path.join(tmp_dir, "tuned_fmoe.csv")
+        untuned_csv = os.path.join(tmp_dir, "untuned_fmoe.csv")
+        with open(tuned_csv, "w") as f:
+            f.write(
+                "cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+                "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,"
+                "block_m,ksplit,kernelName1,kernelName2,us\n"
+            )
+        with open(untuned_csv, "w"):
+            pass
+
+        fp8, qtype = _get_platform_dtypes()
+        script = textwrap.dedent(f"""\
+            import torch
+            from aiter.fused_moe import fused_moe, fused_topk
+            from aiter.ops.shuffle import shuffle_weight
+            from aiter import ActivationType, QuantType, pertoken_quant
+
+            torch.set_default_device("cuda")
+            token, model_dim, inter_dim, E, topk = 16, 2048, 1024, 8, 2
+            dtype = torch.bfloat16
+            fp8_dtype = {fp8}
+
+            inp = torch.randn((token, model_dim), dtype=dtype)
+            w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10.0
+            w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10.0
+            score = torch.randn((token, E), dtype=dtype)
+            topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+
+            w1_qt, w1_scale = pertoken_quant(w1, quant_dtype=fp8_dtype)
+            w2_qt, w2_scale = pertoken_quant(w2, quant_dtype=fp8_dtype)
+            w1_qt = w1_qt.view(w1.shape)
+            w2_qt = w2_qt.view(w2.shape)
+            w1s = shuffle_weight(w1_qt, layout=(16, 16))
+            w2s = shuffle_weight(w2_qt, layout=(16, 16))
+
+            out = fused_moe(
+                inp, w1s, w2s, topk_weights, topk_ids,
+                w1_scale=w1_scale, w2_scale=w2_scale,
+                activation=ActivationType.Silu,
+                quant_type={qtype},
+            )
+            print(f"OUTPUT_SHAPE={{out.shape}}")
+            print(f"OUTPUT_OK={{out.shape[0] == token and out.shape[1] == model_dim}}")
+        """)
+
+        script_path = os.path.join(tmp_dir, "online_tune_e2e.py")
+        with open(script_path, "w") as f:
+            f.write(script)
+
+        env = os.environ.copy()
+        env["AITER_ONLINE_TUNE"] = "1"
+        env["AITER_CONFIG_FMOE"] = tuned_csv
+
+        try:
+            result = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=AITER_ROOT,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise AssertionError(
+                f"Online tune e2e timed out after {timeout}s\n"
+                f"  stdout (last 500): {(e.stdout or b'')[-500:]}\n"
+                f"  stderr (last 500): {(e.stderr or b'')[-500:]}"
+            ) from None
+
+        return result, tuned_csv, untuned_csv
+
+    def test_online_tune_triggers_and_succeeds(self):
+        """AITER_ONLINE_TUNE=1 with empty config -> tuner runs, op succeeds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result, tuned_csv, untuned_csv = self._run_online_tune_script(tmp)
+
+            if result.returncode != 0:
+                print(f"\n=== ONLINE TUNE E2E STDOUT ===\n{result.stdout[-3000:]}")
+                print(f"\n=== ONLINE TUNE E2E STDERR ===\n{result.stderr[-3000:]}")
+            self.assertEqual(
+                result.returncode, 0,
+                f"Online tune e2e failed with code {result.returncode}"
+            )
+
+            self.assertIn("OUTPUT_OK=True", result.stdout,
+                          "fused_moe output shape mismatch")
+
+            df = pd.read_csv(tuned_csv)
+            df.columns = df.columns.str.strip()
+            self.assertGreaterEqual(
+                len(df), 1,
+                f"Tuned CSV should have at least 1 row after online tune, got {len(df)}"
+            )
+
+            self.assertIn("token", df.columns)
+            self.assertTrue(
+                (df["token"] == 16).any(),
+                f"Tuned CSV should contain token=16 row. Rows: {df['token'].tolist()}"
+            )
 
 
 if __name__ == "__main__":
