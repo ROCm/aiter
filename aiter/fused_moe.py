@@ -270,7 +270,11 @@ def fused_moe_(
         if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
             q_dtype_a = dtypes.bf16 if M < 256 else dtypes.fp4x2
         elif activation == ActivationType.Swiglu:
-            q_dtype_a = dtypes.bf16
+            bf16_fp8_bound = 256
+            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = dtypes.fp8
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -1043,6 +1047,33 @@ def get_2stage_cfgs(
             has_bias=enable_bias,
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias,
+        )
+    if (
+        not _USE_GENERIC_SWIGLU_MXFP4_LAYOUT
+        and dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+    ):
+        return MOEMetadata(
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                split_k=max(ksplit, 1),
+                dtype=dtype,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            get_block_m(),
+            ksplit,
+            run_1stage=False,
+            has_bias=True,
+            stage2_has_bias=True,
         )
     swiglu_mxfp4_bf16_cktile = (
         q_type == QuantType.per_1x32
