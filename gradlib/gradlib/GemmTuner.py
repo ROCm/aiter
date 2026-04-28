@@ -172,6 +172,7 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
         out = out.to(otype)
     return out
 
+
 @lru_cache(maxsize=1)
 def get_flydsl_bf16_catalog(m: int, n: int, k: int):
     if get_flydsl_splitk_hgemm_kernels is None:

@@ -25,7 +25,7 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
 
-from .tensor_shim import GTensor, STensor, _to_raw, get_dtype_in_kernel
+from .tensor_shim import GTensor, STensor, get_dtype_in_kernel
 
 SPLIT_K_SEMAPHORE_MAX_LEN = 256
 
@@ -622,14 +622,8 @@ def compile_hgemm_kernel(
 
         def ldg_matrix_b(k_offset):
             vecs = []
-            b_n_intra_base = ldmatrix_b_n_idx
-            b_k_intra_vec = ldmatrix_b_k_vec_idx // LDG_VEC_SIZE
-            b_n0_base = n_offset // WARP_ATOM_N + warp_n_idx // WARP_ATOM_N
-            b_k0_base = k_offset // WARP_ATOM_K
             for kk in range_constexpr(WARP_K_STEPS):
-                b_k0 = b_k0_base + kk
                 for ii in range_constexpr(WARP_N_STEPS):
-                    b_n0 = b_n0_base + ii
                     warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
                     warp_atom_k_idx = kk * WARP_ATOM_K
                     n_idx = n_offset + warp_atom_n_idx + ldmatrix_b_n_idx
