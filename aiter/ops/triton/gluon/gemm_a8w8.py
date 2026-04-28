@@ -5,7 +5,6 @@ import json
 import torch
 
 import triton
-import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -14,12 +13,8 @@ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
-import aiter.ops.triton.gluon.triton_version as tv
 
 _LOGGER = AiterTritonLogger()
-
-# Pre-compute version check as constexpr for use in JIT kernels
-TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 
 @triton.heuristics(
@@ -103,15 +98,11 @@ def _gemm_a8w8_kernel(
         order=[0, 1],
     )
 
-    if TRITON_VERSION_GE_3_6_0:
-        # FP8 uses dot_scaled: mfma_scale_f32_16x16x128_f8f6f4 (K=128, K_WIDTH=32)
-        # INT8 uses dot: mfma_i32_16x16x64_i8 (K=64, K_WIDTH=16)
-        MFMA_K: gl.constexpr = 128 if FP8_FORMAT is not None else 64
-        MFMA_K_WIDTH: gl.constexpr = 32 if FP8_FORMAT is not None else 16
-        MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_K]
-    else:
-        MFMA_INSTR_SHAPE: gl.constexpr = [16, 16]
-        MFMA_K_WIDTH: gl.constexpr = 16
+    # FP8 uses dot_scaled: mfma_scale_f32_16x16x128_f8f6f4 (K=128, K_WIDTH=32)
+    # INT8 uses dot: mfma_i32_16x16x64_i8 (K=64, K_WIDTH=16)
+    MFMA_K: gl.constexpr = 128 if FP8_FORMAT is not None else 64
+    MFMA_K_WIDTH: gl.constexpr = 32 if FP8_FORMAT is not None else 16
+    MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, MFMA_K]
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -395,12 +386,9 @@ def _gemm_a8w8_preshuffled_kernel(
     # reshape/permute unshuffle sequence were designed for K=32, K_WIDTH=16.
     # FP8: mfma_f32_16x16x32_fp8_fp8
     # INT8: mfma_i32_16x16x32_i8
-    MFMA_INSTR_SHAPE: gl.constexpr = (
-        [16, 16, 32] if TRITON_VERSION_GE_3_6_0 else [16, 16]
-    )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=MFMA_INSTR_SHAPE,
+        instr_shape=[16, 16, 32],
         transposed=True,
         warps_per_cta=[1, NUM_WARPS],
     )
