@@ -349,6 +349,19 @@ def compile_pa_decode_main(
             # Total logical blocks in a partition (used to index block_tables).
             BLOCKS_PER_PARTITION = COMPUTES_PER_PARTITION * BLOCKS_PER_COMPUTE
 
+            # Number of physical blocks this seq actually uses. We use this to
+            # mask any block-table read whose logical index lies past the
+            # seq's live block count to phys_blk = 0 (a valid physical block —
+            # block 0 always exists in the cache). This is gluon's defensive
+            # block-level mask: even though `bt_rsrc.max_size=True` and the
+            # vLLM zero-init contract already keep us safe, this guarantees
+            # the TDM never sees an undefined `phys_blk` in adversarial cases
+            # (uninitialized block_tables, custom allocators where 0 isn't
+            # block 0, etc.).
+            KVB_idx = arith.index(KV_BLOCK_SIZE)
+            live_blocks = (seq_len + KVB_idx - arith.index(1)) / KVB_idx
+            zero_i32 = arith.constant(0, type=T.i32)
+
             def _phys_blks_for_compute(compute_iter_idx):
                 """Load BLOCKS_PER_COMPUTE physical block IDs via vectorized buffer_load(s).
 
@@ -359,6 +372,8 @@ def compile_pa_decode_main(
                 AMD's buffer_load vec_width is capped at 4 (128 bits for i32). For
                 BPC > 4 we issue BT_NUM_LOADS loads of width BT_VEC_WIDTH (with the
                 last load possibly narrower = BT_TAIL_WIDTH).
+
+                Loaded IDs whose logical index is past `live_blocks` are masked to 0.
 
                 Returns: list of `T.index` values, one per block in the tile.
                 """
@@ -377,6 +392,11 @@ def compile_pa_decode_main(
                         phys_i32 = buffer_ops.buffer_load(
                             bt_rsrc, bt_off, vec_width=1, dtype=T.i32
                         )
+                        logical_idx = base_logical + arith.index(ldi * BT_VEC_WIDTH)
+                        in_range = arith.cmpi(
+                            arith.CmpIPredicate.slt, _raw(logical_idx), _raw(live_blocks)
+                        )
+                        phys_i32 = arith.select(in_range, _raw(phys_i32), _raw(zero_i32))
                         out.append(arith.index_cast(T.index, phys_i32))
                     else:
                         phys_vec = buffer_ops.buffer_load(
@@ -386,6 +406,11 @@ def compile_pa_decode_main(
                             elem = vector.extract(
                                 phys_vec, static_position=[b], dynamic_position=[]
                             )
+                            logical_idx = base_logical + arith.index(ldi * BT_VEC_WIDTH + b)
+                            in_range = arith.cmpi(
+                                arith.CmpIPredicate.slt, _raw(logical_idx), _raw(live_blocks)
+                            )
+                            elem = arith.select(in_range, _raw(elem), _raw(zero_i32))
                             out.append(arith.index_cast(T.index, elem))
                 return out
 
