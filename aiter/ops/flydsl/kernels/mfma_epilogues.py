@@ -122,6 +122,9 @@ def c_shuffle_epilog(
     # s_setvskip inline asm. Requires the caller to pass the llvm dialect module.
     use_vskip: bool = False,
     llvm=None,
+    # Keep the newer three-phase CShuffle read scheduling opt-in. The default
+    # streaming path is still better for int8 MoE kernels.
+    batch_cshuffle_reads: bool = False,
 ):
     """LDS CShuffle epilogue skeleton.
 
@@ -224,6 +227,59 @@ def c_shuffle_epilog(
         _wide_evec = n_reps_shuffle * EVec
         vec_frag_wide = T.vec(_wide_evec, frag_elem_type)
         c_wide_evec = fx.Index(_wide_evec)
+
+    _use_batched_reads = batch_cshuffle_reads or _do_interleave or (
+        use_vskip and llvm is not None
+    )
+
+    if not _use_batched_reads:
+        for mr in range_constexpr(m_reps_shuffle):
+            row_base_m = arith.constant(mr * CShuffleMLane, index=True)
+            row_local = row_base_m + m_lane
+            row = bx_m_v + row_local
+
+            row_ctx_raw = (
+                precompute_row(row_local=row_local, row=row)
+                if precompute_row is not None
+                else None
+            )
+
+            row_ctx = row_ctx_raw
+            row_pred = None
+            if (
+                scf is not None
+                and row_ctx_raw is not None
+                and isinstance(row_ctx_raw, tuple)
+                and len(row_ctx_raw) == 2
+            ):
+                row_ctx, row_pred = row_ctx_raw
+
+            def _do_store_row():
+                row_base_lds = row_local * tile_n_idx
+                for nr in range_constexpr(n_reps_shuffle):
+                    col_base_nr = arith.constant(
+                        nr * (CShuffleNLane * EVec), index=True
+                    )
+                    col_pair0 = col_base_nr + (n_lane * c_evec)
+                    lds_idx_pair = row_base_lds + col_pair0
+                    frag = vector.load_op(vec_frag, lds_out, [lds_idx_pair])
+
+                    store_pair(
+                        row_local=row_local,
+                        row=row,
+                        row_ctx=row_ctx,
+                        col_pair0=col_pair0,
+                        col_g0=by_n_v + col_pair0,
+                        frag=frag,
+                    )
+
+            if row_pred is not None:
+                _if_row = scf.IfOp(row_pred)
+                with _if_then(_if_row, scf):
+                    _do_store_row()
+            else:
+                _do_store_row()
+        return
 
     # Phase 1: collect row metadata up-front.
     _pc_results = []
@@ -423,6 +479,7 @@ def mfma_epilog(
     skip_initial_barrier: bool = False,
     use_vskip: bool = False,
     llvm=None,
+    batch_cshuffle_reads: bool = False,
 ):
     if not use_cshuffle:
         if body_row is None:
@@ -463,4 +520,5 @@ def mfma_epilog(
         skip_initial_barrier=skip_initial_barrier,
         use_vskip=use_vskip,
         llvm=llvm,
+        batch_cshuffle_reads=batch_cshuffle_reads,
     )

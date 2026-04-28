@@ -269,7 +269,7 @@ def compile_mixed_moe_gemm1(
     _go_tag = "_go" if gate_only else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v33_g1u0_splitk"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v34_g1u0_splitk"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -2203,6 +2203,7 @@ def compile_mixed_moe_gemm1(
                         write_row_to_lds=write_row_to_lds,
                         precompute_row=precompute_row,
                         store_pair=store_pair,
+                        batch_cshuffle_reads=True,
                     )
                 elif _is_splitk:
                     # Two-pass epilogue: gate then up, each with atomic add
@@ -2235,6 +2236,7 @@ def compile_mixed_moe_gemm1(
                         write_row_to_lds=write_row_to_lds,
                         precompute_row=precompute_row,
                         store_pair=store_pair,
+                        batch_cshuffle_reads=True,
                     )
 
                     gpu.barrier()
@@ -2266,6 +2268,7 @@ def compile_mixed_moe_gemm1(
                             write_row_to_lds=write_row_to_lds,
                             precompute_row=precompute_row,
                             store_pair=store_pair,
+                            batch_cshuffle_reads=True,
                         )
                 else:
                     c_shuffle_epilog(
@@ -2292,6 +2295,7 @@ def compile_mixed_moe_gemm1(
                         write_row_to_lds=write_row_to_lds,
                         precompute_row=precompute_row,
                         store_pair=store_pair,
+                        batch_cshuffle_reads=True,
                     )
 
             _if_blk = scf.IfOp(blk_valid)
@@ -2590,7 +2594,7 @@ def compile_mixed_moe_gemm2(
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3{_async_tag}{_packed_lds_tag}_tidlds"
+        f"_vscale_fix3{_async_tag}{_packed_lds_tag}_tidlds_cshfix"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse a single allocation for both:
@@ -3928,6 +3932,7 @@ def compile_mixed_moe_gemm2(
                     interleave_n_reps=True,
                     use_vskip=bool(accumulate),
                     llvm=llvm,
+                    batch_cshuffle_reads=True,
                 )
 
             _if_blk = scf.IfOp(blk_valid)
