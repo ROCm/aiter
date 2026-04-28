@@ -224,6 +224,7 @@ class AttentionConfig:
     stride_v_cache_1: gl.constexpr
     stride_v_cache_2: gl.constexpr
     stride_v_cache_3: gl.constexpr
+    block_table_stride: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -258,6 +259,7 @@ class AttentionConfig:
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        block_table_stride,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -368,6 +370,7 @@ class AttentionConfig:
         self.stride_v_cache_1 = gl.constexpr(stride_v_cache_1)
         self.stride_v_cache_2 = gl.constexpr(stride_v_cache_2)
         self.stride_v_cache_3 = gl.constexpr(stride_v_cache_3)
+        self.block_table_stride = gl.constexpr(block_table_stride)
 
 
 @aggregate
@@ -464,7 +467,6 @@ class AsyncKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         REMOVE_INDIRECT_ACCESS,
     ):
@@ -685,7 +687,6 @@ class AsyncGatherKVLoader:
     v_head_d_offset: gl.tensor
     offs_n_k: gl.tensor
     offs_n_v: gl.tensor
-    block_table_stride: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -701,7 +702,6 @@ class AsyncGatherKVLoader:
         v_head_d_offset,
         offs_n_k,
         offs_n_v,
-        block_table_stride,
     ):
         self.cfg = cfg
         self.kv_cfg = kv_cfg
@@ -714,7 +714,6 @@ class AsyncGatherKVLoader:
         self.v_head_d_offset = v_head_d_offset
         self.offs_n_k = offs_n_k
         self.offs_n_v = offs_n_v
-        self.block_table_stride = block_table_stride
 
     @gluon.jit
     def initialize(
@@ -722,7 +721,6 @@ class AsyncGatherKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         REMOVE_INDIRECT_ACCESS,
     ):
@@ -801,7 +799,6 @@ class AsyncGatherKVLoader:
             v_head_d_offset,
             offs_n_k,
             offs_n_v,
-            block_table_stride,
         )
 
     @gluon.jit
@@ -831,7 +828,7 @@ class AsyncGatherKVLoader:
                 # The goal is to do the kv loading without masking
                 block_table_idx = gl.minimum(
                     seq_offset_k // self.cfg.BLOCK_SIZE,
-                    self.block_table_stride - 1,
+                    self.cfg.block_table_stride - 1,
                 )
                 within_block_offs = seq_offset_k % self.cfg.BLOCK_SIZE
             else:
@@ -890,7 +887,7 @@ class AsyncGatherKVLoader:
                 seq_offset_v = v_offset * self.cfg.TILE_SIZE + self.offs_n_v
                 block_table_idx = gl.minimum(
                     seq_offset_v // self.cfg.BLOCK_SIZE,
-                    self.block_table_stride - 1,
+                    self.cfg.block_table_stride - 1,
                 )
                 within_block_offs = seq_offset_v % self.cfg.BLOCK_SIZE
             else:
@@ -972,7 +969,7 @@ class AsyncGatherKVLoader:
                 return i * self.cfg.NUM_KV_BLOCKS + offs
             else:
                 # Bound tile index so i*NUM_KV_BLOCKS+offs stays inside block_table.
-                i = gl.minimum(i, self.block_table_stride // self.cfg.NUM_KV_BLOCKS - 1)
+                i = gl.minimum(i, self.cfg.block_table_stride // self.cfg.NUM_KV_BLOCKS - 1)
                 return gl.load(
                     self.block_tables_ptr_shifted + i * self.cfg.NUM_KV_BLOCKS + offs
                 )
@@ -1066,7 +1063,6 @@ class TDMKVLoader:
     cfg: AttentionConfig
     kv_cfg: TDMKVLoaderConfig
     block_tables_ptr_shifted: gl.tensor
-    last_block_idx: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -1079,7 +1075,6 @@ class TDMKVLoader:
         cfg,
         kv_cfg,
         block_tables_ptr_shifted,
-        last_block_idx,
         k_shared,
         v_shared,
         k_desc,
@@ -1093,7 +1088,6 @@ class TDMKVLoader:
         self.k_desc = k_desc
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
-        self.last_block_idx = last_block_idx
         self.kv_head_idx = kv_head_idx
 
     @gluon.jit
@@ -1102,7 +1096,6 @@ class TDMKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         REMOVE_INDIRECT_ACCESS,
     ):
@@ -1149,7 +1142,6 @@ class TDMKVLoader:
             cfg,
             kv_cfg,
             block_tables_ptr_shifted,
-            block_table_stride - 1,
             k_shared,
             v_shared,
             k_desc,
@@ -1223,7 +1215,7 @@ class TDMKVLoader:
             return i
         else:
             #return gl.load(self.block_tables_ptr_shifted + i, mask=i < self.block_table_stride, other=0)
-            i = gl.minimum(i, self.last_block_idx)
+            i = gl.minimum(i, self.cfg.block_table_stride - 1)
             return gl.load(self.block_tables_ptr_shifted + i)
 
 
@@ -1266,7 +1258,6 @@ class TDMGatherKVLoader:
     cfg: AttentionConfig
     kv_cfg: TDMKVLoaderConfig
     block_tables_ptr_shifted: gl.tensor
-    last_block_idx: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -1279,7 +1270,6 @@ class TDMGatherKVLoader:
         cfg,
         kv_cfg,
         block_tables_ptr_shifted,
-        last_block_idx,
         k_shared,
         v_shared,
         k_desc,
@@ -1293,7 +1283,6 @@ class TDMGatherKVLoader:
         self.k_desc = k_desc
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
-        self.last_block_idx = last_block_idx
         self.kv_head_idx = kv_head_idx
 
     @gluon.jit
@@ -1302,7 +1291,6 @@ class TDMGatherKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         REMOVE_INDIRECT_ACCESS,
     ):
@@ -1337,7 +1325,6 @@ class TDMGatherKVLoader:
             cfg,
             kv_cfg,
             block_tables_ptr_shifted,
-            block_table_stride - 1,
             k_shared,
             v_shared,
             k_desc,
@@ -1389,7 +1376,7 @@ class TDMGatherKVLoader:
             offs = gl.arange(0, self.cfg.NUM_KV_BLOCKS, layout=self.kv_cfg.gather_ids_layout)
             return i * self.cfg.NUM_KV_BLOCKS + offs
         else:
-            i = gl.minimum(i, self.last_block_idx)
+            i = gl.minimum(i, self.cfg.block_table_stride - 1)
             offs = gl.arange(0, self.cfg.NUM_KV_BLOCKS, layout=self.kv_cfg.gather_ids_layout)
             return gl.load(self.block_tables_ptr_shifted + i * self.cfg.NUM_KV_BLOCKS + offs)
 
@@ -1429,7 +1416,6 @@ class TDMSubtileKVLoader:
     cfg: AttentionConfig
     kv_cfg: TDMSubtileKVLoaderConfig
     block_tables_ptr_shifted: gl.tensor
-    last_block_idx: gl.tensor
     k_shared: gl.shared_memory_descriptor
     v_shared: gl.shared_memory_descriptor
     k_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -1442,7 +1428,6 @@ class TDMSubtileKVLoader:
         cfg,
         kv_cfg,
         block_tables_ptr_shifted,
-        last_block_idx,
         k_shared,
         v_shared,
         k_desc,
@@ -1456,7 +1441,6 @@ class TDMSubtileKVLoader:
         self.k_desc = k_desc
         self.v_desc = v_desc
         self.block_tables_ptr_shifted = block_tables_ptr_shifted
-        self.last_block_idx = last_block_idx
         self.kv_head_idx = kv_head_idx
 
     @gluon.jit
@@ -1465,7 +1449,6 @@ class TDMSubtileKVLoader:
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         REMOVE_INDIRECT_ACCESS,
     ):
@@ -1502,7 +1485,6 @@ class TDMSubtileKVLoader:
             cfg,
             kv_cfg,
             block_tables_ptr_shifted,
-            block_table_stride - 1,
             k_shared,
             v_shared,
             k_desc,
@@ -1554,7 +1536,7 @@ class TDMSubtileKVLoader:
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             return i
         else:
-            i = gl.minimum(i, self.last_block_idx)
+            i = gl.minimum(i, self.cfg.block_table_stride - 1)
             return gl.load(self.block_tables_ptr_shifted + i)
 
 
@@ -2443,7 +2425,7 @@ def attention_loop_tensor_subtile_split(
     MERGE_LOOP_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
     MERGE_EPI_TDM_WAITS: gl.constexpr = cfg.NUM_BUFFERS == 3
 
-    QK_scale: gl.constexpr = pgm.QK_scale
+    QK_scale = pgm.QK_scale
 
     # Buffer rotation: tile m lives in slot m%N (K and V use disjoint LDS regions).
     #   buf_tile_cur   -> tile j     ( j   %N)
@@ -2477,9 +2459,8 @@ def attention_loop_tensor_subtile_split(
         qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
         qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
 
-    m0 = reduce_max_prop_nan(qk0, -1)
-    m1 = reduce_max_prop_nan(qk1, -1)
-    m = elementwise_max_prop_nan(m0, m1)
+    qk = pgm.concat_subtile(qk0, qk1)
+    m = reduce_max_prop_nan(qk, -1)
     m_ij = elementwise_max_prop_nan(M, m)
     m_ij_scaled = m_ij * QK_scale
     m_diff_scaled = M * QK_scale - m_ij_scaled
@@ -2751,7 +2732,7 @@ def kernel_unified_attention_2d(
     stride_v_cache_1: gl.constexpr,
     stride_v_cache_2: gl.constexpr,
     stride_v_cache_3: gl.constexpr,
-    block_table_stride: gl.int32,
+    block_table_stride: gl.constexpr,
     num_seqs: gl.constexpr,
     SCALE: gl.constexpr,
     NUM_QUERY_HEADS: gl.constexpr,
@@ -2816,6 +2797,7 @@ def kernel_unified_attention_2d(
         stride_v_cache_1,
         stride_v_cache_2,
         stride_v_cache_3,
+        block_table_stride,
     )
 
     if not USE_STORE_BUFFER_OP and not USE_TDM:
@@ -2825,7 +2807,6 @@ def kernel_unified_attention_2d(
     seq_idx = find_seq_idx(
         query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
     )
-    seq_idx = 0
 
     cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
     q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
@@ -2920,13 +2901,11 @@ def kernel_unified_attention_2d(
         else:
             KVLoader: gl.constexpr = AsyncGatherKVLoader
 
-    last_block_idx = block_table_stride - 1
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
         value_cache_ptr,
         block_tables_ptr_shifted,
-        block_table_stride,
         kv_head_idx,
         REMOVE_INDIRECT_ACCESS,
     )
@@ -3182,7 +3161,7 @@ def unified_attention(
         setattr(unified_attention, "print", True)
         #print_irs_to_files(attn_kernel, "unif_attention_2d")
 
-        print_irs_to_files(attn_kernel, f"const_unified_attention_2d_causal_{causal}_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}")
+        print_irs_to_files(attn_kernel, f"unified_attention_2d_causal_{causal}_loop_{loop_variant}_buf_{num_buffers}_remove_indirect_{int(remove_indirect_access)}_gluon_wpeu_{waves_per_eu}_num_warps_{NUM_WARPS}_block_m_{BLOCK_M}_tile_size_{TILE_SIZE}_block_size_{BLOCK_SIZE}_head_size_{HEAD_SIZE}_sfl_{int(shuffled_kv_cache)}")
     return attn_kernel
 
 
