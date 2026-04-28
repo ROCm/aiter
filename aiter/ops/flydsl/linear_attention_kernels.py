@@ -85,6 +85,19 @@ def flydsl_gdr_decode(
     need_shuffle_state: bool,
     stream: torch.cuda.Stream = torch.cuda.current_stream(),
 ):
+    device = query.device
+    dtype = query.dtype
+    for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
+        assert input.is_contiguous()
+        assert input.data_ptr() % 16 == 0
+        assert input.device == device
+    assert state.data_ptr() % 16 == 0
+    for input in [key, value, a, b, dt_bias, out]:
+        assert input.dtype == dtype
+    assert state.dtype in [torch.float, torch.bfloat16]
+    assert A_log.dtype in [torch.float, torch.bfloat16]
+    assert indices.dtype == torch.int32
+
     if need_shuffle_state:
         state_ = state.permute(0, 1, 3, 2).contiguous()
     else:
@@ -92,12 +105,13 @@ def flydsl_gdr_decode(
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
-    kwargs = get_default_kwargs(
+    kwargs_ = get_default_kwargs(
         batch_size, seq_length, num_k_heads, num_v_heads, head_k_dim, head_v_dim
     )
     exe = create_shuffle_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
+        get_dtype_str(state.dtype),
         seq_length,
         num_k_heads,
         num_v_heads,
@@ -105,7 +119,7 @@ def flydsl_gdr_decode(
         head_v_dim,
         state.stride(),
         use_qk_l2norm,
-        **kwargs,
+        **kwargs_,
     )
     with torch.cuda.device(query.device.index):
         _run_compiled(
