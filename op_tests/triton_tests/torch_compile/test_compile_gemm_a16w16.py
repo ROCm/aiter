@@ -17,9 +17,7 @@ def torch_gemm(x, w, bias=None):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "M, N, K", [(128, 256, 64), (256, 512, 128), (512, 1024, 256)]
-)
+@pytest.mark.parametrize("M, N, K", [(128, 256, 64), (256, 512, 128), (512, 1024, 256)])
 def test_compile_gemm(M, N, K, dtype):
     torch.manual_seed(42)
     torch.cuda.empty_cache()

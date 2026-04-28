@@ -45,9 +45,7 @@ def torch_rope_gptj(x, cos, sin):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("rotate_style", ["neox", "gptj"])
-@pytest.mark.parametrize(
-    "S, B, H, D", [(32, 2, 8, 64), (64, 4, 16, 128)]
-)
+@pytest.mark.parametrize("S, B, H, D", [(32, 2, 8, 64), (64, 4, 16, 128)])
 def test_compile_rope(S, B, H, D, dtype, rotate_style):
     torch.manual_seed(42)
     torch.cuda.empty_cache()
