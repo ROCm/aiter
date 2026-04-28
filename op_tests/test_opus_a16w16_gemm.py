@@ -35,16 +35,32 @@ from aiter.ops.opus import gemm_a16w16_opus
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
-    # A: [batch, M, K], B: [N, K] -> bmm with B broadcast as [batch, N, K].
+    # A: [batch, M, K], B: [N, K] or [batch, N, K] -> bmm.
     # run_torch computes in fp32 then casts to match the opus path.
-    return torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(out_dtype)
+    if B.dim() == 2:
+        return torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(out_dtype)
+    return torch.bmm(A.float(), B.float().transpose(-1, -2)).to(out_dtype)
+
+
+def _make_b(batch: int, N: int, K: int) -> torch.Tensor:
+    """Build a B that gemm_a16w16_opus accepts for both batch=1 and batch>1.
+
+    The wrapper rejects 2D B + batch>1 because the opus launcher hardcodes
+    stride_b_batch == N*K (a broadcast view would silently fault). For the
+    common "shared weight across batch" case, materialize an explicit
+    `[batch, N, K]` tensor via the contiguous broadcast pattern.
+    """
+    B2D = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    if batch == 1:
+        return B2D
+    return B2D.unsqueeze(0).expand(batch, -1, -1).contiguous()
 
 
 def test_a16w16(batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16):
     # gemm_a16w16_opus accepts either 2D or 3D A; test 3D to exercise the
-    # batched reshape path. B is always 2D [N, K].
+    # batched reshape path. B is 2D when batch==1, 3D contiguous otherwise.
     A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-    B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    B = _make_b(batch, N, K)
 
     ref = _torch_ref(A, B, out_dtype)
 
@@ -86,7 +102,7 @@ def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
         tag = f"a16w16 b={batch} M={M} N={N} K={K}"
         try:
             A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
-            B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+            B = _make_b(batch, N, K)
             ref = _torch_ref(A, B, torch.bfloat16)
             Y, us = run_perftest(
                 gemm_a16w16_opus, A, B, None, torch.bfloat16,

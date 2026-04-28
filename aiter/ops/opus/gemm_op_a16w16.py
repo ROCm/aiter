@@ -55,18 +55,104 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     return Y
 
 
+# Raw pybind binding to the C++ id-based dispatcher. We wrap it in a Python
+# function below to add a stride-layout guard before the C++ call -- the
+# launcher hardcodes stride_b_batch == N*K and reads gpu memory directly,
+# so a broadcast / non-contiguous WQ silently corrupts results or faults
+# the GPU. Keep `gen_fake` and `fc_name` on the raw binding so dynamo and
+# torch.library see the underlying op.
 @compile_ops(
     "module_deepgemm_opus",
     fc_name="opus_gemm_a16w16_tune",
     gen_fake=_gen_opus_gemm_a16w16_tune_fake_tensors,
 )
-def opus_gemm_a16w16_tune(
+def _opus_gemm_a16w16_tune_raw(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
+
+def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tensor):
+    """Reject layouts that the opus launcher's hardcoded strides cannot serve.
+
+    Mirrors the kargs setup in csrc/opus_gemm/gen_instances.py
+    (_gen_flatmm_splitk_instance et al.):
+        kargs.stride_a        = K
+        kargs.stride_b        = K
+        kargs.stride_c        = N
+        kargs.stride_a_batch  = M * K
+        kargs.stride_b_batch  = N * K
+        kargs.stride_c_batch  = M * N
+    The kernel reads memory at `ptr + batch_id * stride_*_batch + ...`
+    directly. Any broadcast view (batch stride == 0), transpose, or
+    sliced layout will hit garbage / unmapped memory.
+
+    Cheap to run (a handful of integer comparisons); only raised on real
+    misuse so the hot path pays nothing.
+    """
+    for name, t in (("XQ", XQ), ("WQ", WQ), ("Y", Y)):
+        if t.dim() != 3:
+            raise ValueError(
+                f"opus_gemm_a16w16_tune: {name} must be 3D (got "
+                f"{name}.shape={tuple(t.shape)}). The C++ launcher reads "
+                f"`{name}.size(0)` as batch and indexes with hardcoded "
+                f"stride_*_batch == size(1)*size(2)."
+            )
+
+    batch, M, K = XQ.shape
+    b_w, N, K_w = WQ.shape
+    b_y, M_y, N_y = Y.shape
+    if (b_w, K_w) != (batch, K):
+        raise ValueError(
+            f"opus_gemm_a16w16_tune: WQ shape mismatch (got "
+            f"WQ.shape={tuple(WQ.shape)}, expected "
+            f"({batch}, N, {K})); XQ.shape={tuple(XQ.shape)}"
+        )
+    if (b_y, M_y, N_y) != (batch, M, N):
+        raise ValueError(
+            f"opus_gemm_a16w16_tune: Y shape mismatch (got "
+            f"Y.shape={tuple(Y.shape)}, expected ({batch}, {M}, {N}))"
+        )
+
+    # Strides must match the launcher's hardcoded assumptions.
+    expected = {
+        "XQ": (XQ, (M * K, K, 1)),
+        "WQ": (WQ, (N * K, K, 1)),
+        "Y":  (Y,  (M * N, N, 1)),
+    }
+    for name, (t, want) in expected.items():
+        got = tuple(t.stride())
+        if got != want:
+            raise NotImplementedError(
+                f"opus_gemm_a16w16_tune: {name} must have contiguous "
+                f"strides {want} (got {name}.stride()={got}, "
+                f"{name}.shape={tuple(t.shape)}). The launcher hardcodes "
+                f"stride_*_batch and stride_* values; any broadcast / "
+                f"transpose / slice produces wrong results or a memory "
+                f"access fault. Materialize with `{name} = {name}."
+                f"contiguous()` before calling."
+            )
+
+
+def opus_gemm_a16w16_tune(
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    Y: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor:
+    """Low-level id-based dispatcher (Python guard + C++ launch).
+
+    See module docstring. This Python wrapper checks XQ/WQ/Y layout up
+    front (rejecting broadcast / transpose / slice views that the C++
+    kernel would happily run with garbage data); on success it forwards
+    to the underlying pybind binding.
+    """
+    _check_a16w16_tune_layout(XQ, WQ, Y)
+    return _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, kernelId, splitK)
 
 
 # Private bf16 no-scale dispatch binding, used only by gemm_a16w16_opus
@@ -132,11 +218,8 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
         raise NotImplementedError(
             f"gemm_a16w16_opus only supports bf16/fp32 output dtype, got {dtype}"
         )
-    if B.dim() != 2:
-        raise ValueError(
-            f"B must be 2D [N, K] (got shape {tuple(B.shape)}); opus assumes "
-            "B is already in plain [N, K] layout."
-        )
+
+    # Resolve A first so we know `batch`.
     if A.dim() == 2:
         M, K = A.shape
         batch = 1
@@ -149,13 +232,70 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     else:
         raise ValueError(f"A must be 2D or 3D, got shape {tuple(A.shape)}")
 
-    N, K_b = B.shape
-    if K_b != K:
+    # B accepted shapes:
+    #   * [N, K]                       - allowed only when batch == 1
+    #   * [batch, N, K] real-strided   - allowed for any batch
+    #
+    # The opus a16w16-family launchers hardcode `kargs.stride_b_batch = N * K`
+    # (csrc/opus_gemm/gen_instances.py around lines 531/634/735/865) and the
+    # device kernel computes `ptr_b + batch_id * stride_b_batch` directly,
+    # ignoring the tensor's reported stride. A `B.unsqueeze(0).expand(batch,
+    # -1, -1)` view has batch_stride == 0, so the kernel reads garbage past
+    # B's real allocation -- this manifests as NaN, large numerical errors,
+    # or HIP "Memory access fault by GPU node-1" depending on what the
+    # caching allocator parked next to B. Reject the broken case at the
+    # Python boundary rather than letting it through.
+    if B.dim() == 2:
+        N, K_b = B.shape
+        if K_b != K:
+            raise ValueError(
+                f"K dimension mismatch: A has K={K}, B has K={K_b}"
+            )
+        if batch > 1:
+            raise NotImplementedError(
+                f"gemm_a16w16_opus: B must be 3D [batch, N, K] when A is "
+                f"batched (got A.shape={tuple(A.shape)}, "
+                f"B.shape={tuple(B.shape)}). The opus a16w16 launchers "
+                f"assume stride_b_batch == N*K (see "
+                f"csrc/opus_gemm/gen_instances.py), which is incompatible "
+                f"with the batch_stride=0 view a B.unsqueeze(0)."
+                f"expand(batch, -1, -1) would produce. Two valid fixes:\n"
+                f"  1. Broadcast explicitly:  B = B.expand({batch}, -1, "
+                f"-1).contiguous()\n"
+                f"  2. Pass a real 3D weight: B with shape ({batch}, N, K)"
+            )
+        WQ = B.unsqueeze(0)  # batch == 1 here; kernel never reads stride_b_batch.
+    elif B.dim() == 3:
+        b_b, N, K_b = B.shape
+        if K_b != K:
+            raise ValueError(
+                f"K dimension mismatch: A has K={K}, B has K={K_b}"
+            )
+        if b_b != batch:
+            raise ValueError(
+                f"B batch mismatch: A has batch={batch}, B has batch={b_b}"
+            )
+        # Reject expand-style broadcast views (batch_stride=0) up front. Any
+        # other layout (contiguous, transposed N/K, etc.) is still rejected
+        # below by the elements-per-row check; the launcher requires
+        # B[b].stride(0) == N*K and B[b].stride(1) == K.
+        bs0, bs1, bs2 = B.stride()
+        if bs0 != N * K or bs1 != K or bs2 != 1:
+            raise NotImplementedError(
+                f"gemm_a16w16_opus: B must be a contiguous 3D tensor with "
+                f"strides (N*K, K, 1) (got B.shape={tuple(B.shape)}, "
+                f"B.stride()={tuple(B.stride())}). The opus launchers "
+                f"hardcode stride_b_batch == N*K and stride_b == K; any "
+                f"non-standard layout (broadcast view, transpose, slice) "
+                f"will produce wrong results or a memory access fault. "
+                f"Materialize via B = B.contiguous() first."
+            )
+        WQ = B
+    else:
         raise ValueError(
-            f"K dimension mismatch: A has K={K}, B has K={K_b}"
+            f"B must be 2D [N, K] or 3D [batch, N, K] (got shape "
+            f"{tuple(B.shape)})"
         )
-
-    WQ = B.unsqueeze(0).expand(batch, -1, -1) if batch > 1 else B.unsqueeze(0)
 
     if out is not None:
         Y = out
@@ -184,7 +324,16 @@ def gemm_a16w16_opus(
     Parameters
     ----------
     A : [M, K] or [batch, M, K], bf16
-    B : [N, K], bf16 (plain layout; not pre-shuffled)
+    B : bf16 weight, plain layout (not pre-shuffled). Two accepted shapes:
+        * [N, K]            -- requires batch == 1 (i.e. A is 2D, or A is
+                               3D with leading dim 1).
+        * [batch, N, K]     -- contiguous strides (N*K, K, 1) only.
+                               Broadcast views (e.g. ``B.unsqueeze(0).
+                               expand(batch, -1, -1)``) are rejected
+                               because the opus launcher assumes
+                               ``stride_b_batch == N*K``; pass
+                               ``.contiguous()`` if you need to broadcast
+                               a single-batch weight across A.
     bias : must be None (opus kernels have HAS_BIAS=false)
     dtype : output dtype, bf16 or fp32 (any kernel family supports either)
     kernelId : optional explicit override. When given, bypass CSV / C++
