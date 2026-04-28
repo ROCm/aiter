@@ -62,23 +62,30 @@ std::string get_heuristic_kernel_mla(std::string q_type,
                                      CFG* cfgs,
                                      int lse = 0)
 {
-    for(const auto& el : *cfgs)
-    {
-        if (el.first.find(arch_id) != 0)
-            continue;
-        const auto& cfg = el.second;
-        
-        if (cfg.qType != q_type || cfg.kvType != kv_type)
-            continue;
-        if (cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
-            continue;
-        if (cfg.causal != causal || cfg.qSeqLen != qseqlen)
-            continue;
-        if (cfg.lse != lse)
-            continue;
-        return el.first;
+    // Plan A: 2-pass lookup. First require exact lse match; if not found and
+    // lse was requested, fall back to lse=0 entries. The qh128 binary writes
+    // ptr_LSEP unconditionally, so passing a non-null buffer is safe even
+    // when CSV row is marked lse=0.
+    for (int pass = 0; pass < 2; ++pass) {
+        int eff_lse = (pass == 0) ? lse : 0;
+        if (pass == 1 && lse == 0) break;  // no fallback needed
+        for (const auto& el : *cfgs)
+        {
+            if (el.first.find(arch_id) != 0)
+                continue;
+            const auto& cfg = el.second;
+            if (cfg.qType != q_type || cfg.kvType != kv_type)
+                continue;
+            if (cfg.Gqa != gqa || cfg.ps != ps || cfg.prefill != prefill)
+                continue;
+            if (cfg.causal != causal || cfg.qSeqLen != qseqlen)
+                continue;
+            if (cfg.lse != eff_lse)
+                continue;
+            return el.first;
+        }
     }
-    
+
     AITER_CHECK(false,
                 __func__,
                 ": cannot get heuristic kernel!"
