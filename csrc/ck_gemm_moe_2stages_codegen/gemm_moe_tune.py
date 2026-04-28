@@ -2656,6 +2656,9 @@ class FmoeTuner(TunerCommon):
             if blockM not in [16, 32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
+                # a16wi4 constraint: block_m == kn1.tile_m == kn2.tile_m.
+                # Mismatched tile_m breaks correctness, so only consider
+                # stage1 kernels whose tile_m equals the current blockM.
                 ktm = kparams["tile_m"]
                 if ktm != blockM:
                     continue
@@ -2723,6 +2726,9 @@ class FmoeTuner(TunerCommon):
                 )
 
             for kname, kparams in flydsl_s2_kernels.items():
+                # a16wi4 constraint: block_m == kn1.tile_m == kn2.tile_m.
+                # Stage2 kernels must match blockM as well; otherwise the
+                # tuner can emit a row that fails op_tests/test_moe_2stage.
                 s2_tile_m = kparams["tile_m"]
                 if s2_tile_m != blockM:
                     continue
@@ -2731,7 +2737,7 @@ class FmoeTuner(TunerCommon):
                 if kparams.get("persist", None) is not None:
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
-                s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
+                s2_kname = kname
 
                 s2_ref_kwargs = {}
                 s2_compare_fn = None
