@@ -22,6 +22,9 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+_USE_GENERIC_SWIGLU_MXFP4_LAYOUT = (
+    os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "1") == "1"
+)
 
 
 def _moe_sorting_impl(
@@ -264,7 +267,12 @@ def fused_moe_(
     ):
         q_dtype_a = dtypes.fp8
     if quant_type == QuantType.per_1x32:
-        q_dtype_a = dtypes.fp4x2
+        if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
+            q_dtype_a = dtypes.bf16 if M < 256 else dtypes.fp4x2
+        elif activation == ActivationType.Swiglu:
+            q_dtype_a = dtypes.bf16
+        else:
+            q_dtype_a = dtypes.fp4x2
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -1036,6 +1044,13 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias,
         )
+    swiglu_mxfp4_bf16_cktile = (
+        q_type == QuantType.per_1x32
+        and activation == ActivationType.Swiglu
+        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+    )
     if (
         not explicit_ck_2stage
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1043,9 +1058,14 @@ def get_2stage_cfgs(
         and q_dtype_w in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
-        and ksplit > 1
+        and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
     ):
+        # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
+        # keeping the generic preshuffled fp4 weights. CK2stages has no
+        # heuristic kernel for that A16W4 combination, so use CK-Tile and force
+        # a real split-k.
         _split_k = max(ksplit, 2) if activation == ActivationType.Swiglu else ksplit
+        _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
@@ -1053,6 +1073,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
                 split_k=_split_k,
+                dtype=dtype,
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -1060,7 +1081,7 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             ),
-            16 if token < 2048 else 32 if token < 16384 else 64,
+            _cktile_block_m,
             _split_k,
             run_1stage,
             has_bias=activation == ActivationType.Swiglu,
@@ -1095,17 +1116,6 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
         ck_has_bias = _needs_swiglu_bias_support(dtype, q_type, activation)
-        ck_ksplit = (
-            0
-            if (
-                q_type == QuantType.per_1x32
-                and activation == ActivationType.Swiglu
-                and q_dtype_a == dtypes.fp4x2
-                and q_dtype_w == dtypes.fp4x2
-                and is_shuffled
-            )
-            else int(ksplit)
-        )
         return MOEMetadata(
             functools.partial(
                 ck_moe_stage1,
@@ -1113,12 +1123,12 @@ def get_2stage_cfgs(
                 activation=activation,
                 quant_type=q_type,
                 dtype=dtype,
-                splitk=ck_ksplit,
+                splitk=int(ksplit),
                 use_non_temporal_load=use_non_temporal_load,
             ),
             stage2_func,
             block_m,
-            ck_ksplit,
+            int(ksplit),
             run_1stage,
             has_bias=ck_has_bias,
             stage2_has_bias=ck_has_bias,
@@ -1869,7 +1879,7 @@ def cktile_moe_stage1(
     sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
     tmp_out = (
         torch.zeros(
-            (sorted_size, w1.shape[1]), dtype=hidden_states.dtype, device=out.device
+            (sorted_size, w1.shape[1]), dtype=dtype, device=out.device
         )
         if split_k > 1
         else out
@@ -1941,9 +1951,6 @@ def cktile_moe_stage2(
     bias2=None,
     kernel_name="",
 ):
-    # Stage2 aggregates routed experts back into per-token outputs.
-    # Start from zero so the atomic accumulation path never sees stale values.
-    out.zero_()
     bias2 = _normalize_bias_for_kernel(bias2, out.dtype)
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
