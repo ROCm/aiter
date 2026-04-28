@@ -248,9 +248,7 @@ def mla_decode_fwd(
         # Plan A safety: always allocate final_lse buffer.
         # qh128 ASM kernel (mla_a8w8_qh128_m32x4_n16x2_msk0_ps) writes ptr_LSEP
         # unconditionally; passing nullptr crashes on gfx950 at large batch.
-        final_lse_buf = torch.empty(
-            (total_s, nhead), dtype=dtypes.fp32, device=device
-        )
+        final_lse_buf = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
         final_lse = final_lse_buf if return_lse else None
 
         aiter.mla_decode_stage1_asm_fwd(
@@ -425,9 +423,7 @@ def mla_decode_fwd(
         # Plan A safety: always allocate final_lse buffer.
         # qh128 ASM kernel (mla_a8w8_qh128_m32x4_n16x2_msk0_ps) writes ptr_LSEP
         # unconditionally; passing nullptr crashes on gfx950 at large batch.
-        final_lse_buf = torch.empty(
-            (total_s, nhead), dtype=dtypes.fp32, device=device
-        )
+        final_lse_buf = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
         final_lse = final_lse_buf if return_lse else None
 
         use_hk = (
