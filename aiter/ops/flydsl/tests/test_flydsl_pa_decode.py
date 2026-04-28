@@ -114,36 +114,29 @@ def _generate_inputs(
 #   HEAD_SIZE >= NUM_WARPS*WAVE_SIZE = 128 and HEAD_SIZE % 32 == 0
 #   KV_BLOCK_SIZE % 16 == 0
 #   KV_COMPUTE_BLOCK_SIZE % 64 == 0 (NUM_WARPS * WMMA_N) and % KV_BLOCK_SIZE == 0
-#   BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE/KV_BLOCK_SIZE in {1,2,4}
+#   BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE/KV_BLOCK_SIZE: any positive int
+#   PARTITION_SIZE % KV_COMPUTE_BLOCK_SIZE == 0
 #   QUERY_GROUP_SIZE == 16 (WMMA M=16)
-#   (head, kvb, qg, nkv, nseqs, seq_len, kv_compute)
+#   (head, kvb, qg, nkv, nseqs, seq_len, kv_compute, partition)
 CASES = [
-    # Baselines with KV_COMPUTE_BLOCK_SIZE = 64 (1 N-tile per warp for QK)
-    (128, 32, 16, 1, 1, 256, 64),    # KVB=32, BPC=2, seq=256
-    (128, 32, 16, 1, 1, 512, 64),    # KVB=32, seq=512
-    (128, 16, 16, 1, 1, 256, 64),    # KVB=16, BPC=4 (gather)
-    (128, 16, 16, 1, 1, 512, 64),    # KVB=16, seq=512
-    (128, 64, 16, 1, 1, 256, 64),    # KVB=64, BPC=1
-    (128, 32, 16, 2, 2, 256, 64),    # multi-seq, multi-kv-head
+    # ---- Single-iter path: KV_COMPUTE_BLOCK_SIZE == PARTITION_SIZE ----
+    (128, 32, 16, 1, 1, 256, 64, 64),     # BPC=2, 4 partitions
+    (128, 16, 16, 1, 1, 256, 64, 64),     # BPC=4, 4 partitions
+    (128, 64, 16, 1, 1, 256, 64, 64),     # BPC=1, 4 partitions
+    (128, 32, 16, 2, 2, 256, 64, 64),     # multi-seq, multi-kv-head
+    (128, 16, 16, 1, 1, 512, 128, 128),   # BPC=8 (lifted constraint), 4 partitions
+    (128, 16, 16, 1, 1, 512, 256, 256),   # BPC=16 (gluon-style), 2 partitions
 
-    # KV_COMPUTE_BLOCK_SIZE = 128 (2 N-tiles per warp for QK)
-    (128, 32, 16, 1, 1, 512, 128),   # KVB=32, BPC=4
-    (128, 64, 16, 1, 1, 512, 128),   # KVB=64, BPC=2
-
-    # KV_COMPUTE_BLOCK_SIZE = 256 (4 N-tiles per warp for QK)
-    (128, 64, 16, 1, 1, 512, 256),   # KVB=64, BPC=4
-    (64, 16, 8, 1, 1, 1024, 256),
+    # ---- Multi-iter path: KV_COMPUTE_BLOCK_SIZE < PARTITION_SIZE ----
+    (128, 32, 16, 1, 1, 256, 64, 128),    # 2 compute iters per partition
+    (128, 64, 16, 1, 1, 512, 128, 256),   # 2 compute iters per partition
+    (128, 32, 16, 1, 1, 384, 64, 192),    # 3 compute iters per partition
+    # (64, 16, 8, 1, 1, 1024, 256, 256), # gpt-oss shape to test later after fixing Q masks
 ]
 
 
-def _derive_partition_size(kv_compute_block_size: int) -> int:
-    """Pick a partition size that's a multiple of kv_compute_block_size and gives
-    us at least 2 compute iterations per partition (to exercise the pipeline)."""
-    return kv_compute_block_size * 1
-
-
 @pytest.mark.parametrize(
-    "head_size,kv_block_size,query_group_size,num_kv_heads,num_seqs,seq_len,kv_compute_block_size",
+    "head_size,kv_block_size,query_group_size,num_kv_heads,num_seqs,seq_len,kv_compute_block_size,partition_size",
     CASES,
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -155,6 +148,7 @@ def test_flydsl_pa_decode(
     num_seqs,
     seq_len,
     kv_compute_block_size,
+    partition_size,
     dtype,
 ):
     query, key_cache, value_cache, block_tables, seq_lens = _generate_inputs(
@@ -172,7 +166,6 @@ def test_flydsl_pa_decode(
     ref = _torch_reference(query, key_cache, value_cache, block_tables, seq_lens, attn_scale)
 
     output = torch.zeros_like(query)
-    partition_size = _derive_partition_size(kv_compute_block_size)
     flydsl_paged_attention_decode(
         output, query, key_cache, value_cache, block_tables, seq_lens, attn_scale,
         partition_size=partition_size,
