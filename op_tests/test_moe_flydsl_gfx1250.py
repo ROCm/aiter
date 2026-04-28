@@ -16,6 +16,30 @@ import logging
 import torch
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# FlyDSL TensorAdaptor compat shim for MXFP4/E8M0 tensors.
+# FlyDSL's _FLOAT8_DTYPES only lists the 4 standard fp8 variants. When aiter
+# hands it `torch.float4_e2m1fn_x2` (DLPack dtype code 14) or
+# `torch.float8_e8m0fnu` it hits "Unsupported DLPack dtype code" in
+# DLTensorAdaptor because those types have no DLPack extension codes yet.
+# Mirror the existing fp8 workaround (view as uint8 before __dlpack__).
+# ---------------------------------------------------------------------------
+def _patch_flydsl_tensor_adaptor_dlpack():
+    try:
+        from flydsl.compiler import jit_argument as _jit_arg
+    except Exception:
+        return
+    extra = tuple(
+        dt for dt in (
+            getattr(torch, "float8_e8m0fnu", None),
+            getattr(torch, "float4_e2m1fn_x2", None),
+        ) if dt is not None and dt not in _jit_arg._FLOAT8_DTYPES
+    )
+    if extra:
+        _jit_arg._FLOAT8_DTYPES = tuple(_jit_arg._FLOAT8_DTYPES) + extra
+
+_patch_flydsl_tensor_adaptor_dlpack()
+
 import aiter
 from aiter import dtypes, ActivationType, QuantType
 from aiter.test_common import checkAllclose, benchmark, run_perftest

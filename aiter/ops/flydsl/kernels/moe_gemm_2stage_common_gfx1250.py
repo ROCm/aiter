@@ -422,8 +422,26 @@ class _Stage1GateUpPackedWrapper:
             if hasattr(stage1_exe, attr):
                 setattr(self, attr, getattr(stage1_exe, attr))
 
+    @staticmethod
+    def _tensor_key(t):
+        """Stable cache key surviving .view() / dtype reinterpret_cast.
+
+        Using id(t) breaks when the caller (e.g. aiter.fused_moe) calls
+        `.view(torch.uint8)` on an fp8_e8m0 scale every invocation: every
+        fresh Python view has a new id, so the cache misses and we redo
+        the ~1GB `torch.cat` repack every call. Keying on the underlying
+        storage pointer + numel + element_size survives those benign view
+        creations while still distinguishing different tensors.
+        """
+        import torch
+        if t is None:
+            return None
+        if isinstance(t, torch.Tensor):
+            return (int(t.data_ptr()), int(t.numel()), int(t.element_size()))
+        return id(t)
+
     def _get_packed_operands(self, arg_w, arg_scale_w):
-        key = (id(arg_w), id(arg_scale_w))
+        key = (self._tensor_key(arg_w), self._tensor_key(arg_scale_w))
         cached = self._cache.get(key)
         if cached is not None:
             return cached[0]
@@ -446,8 +464,9 @@ class _Stage1GateUpPackedWrapper:
         else:
             packed_scale_w = arg_scale_w
 
-        # Store (result, original_refs) — the strong refs to originals
-        # prevent id() reuse while the entry is alive.
+        # Keep strong refs to the originals so the storage (and thus the
+        # data_ptr-based key) cannot be reclaimed + reused while the entry
+        # is alive.
         self._cache[key] = ((packed_w, packed_scale_w), (arg_w, arg_scale_w))
         return packed_w, packed_scale_w
 

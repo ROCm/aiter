@@ -685,7 +685,11 @@ def _gfx1250_moe_stage1(
     **_kwargs,
 ):
     """gfx1250 FlyDSL MOE stage1 wrapper (gate+up GEMM with activation)."""
-    from aiter.ops.flydsl.moe_kernels import _run_compiled, _view_safe
+    from aiter.ops.flydsl.moe_kernels import (
+        _run_compiled, _view_safe,
+        _MXSCALE_FORMAT_PACK, _mxscale_align_up, _mxscale_pick_tile_n,
+        _mxscale_zero_pad_last, _mxscale_pad_weight_k,
+    )
     _ensure_flydsl_kernels_path()
 
     token_num = hidden_states.shape[0]
@@ -709,6 +713,64 @@ def _gfx1250_moe_stage1(
         # leaks into stage2 as garbage (→ inf/nan). Match FlyDSL UT semantics by
         # zero-initialising the output buffer up-front.
         out.zero_()
+
+    # ------------------------------------------------------------------
+    # K/N alignment: pick tile_n dividing both N (=2*inter_dim) and
+    # inter_dim (required by _Stage1GateUpPackedWrapper), and zero-pad
+    # K (=model_dim) up to a multiple of tile_k when the model shape is
+    # not natively WMMA_K-aligned (e.g. GPT-OSS model_dim=2880).
+    # ------------------------------------------------------------------
+    if in_dtype in _MXSCALE_FORMAT_PACK:
+        pack_a, pack_b, weight_shuffled = _MXSCALE_FORMAT_PACK[in_dtype]
+        # Prefer the caller's default tile_n when it divides both N dims
+        # (keeps DeepSeek on its validated tile_n=128 path). Only fall back
+        # to a larger search when the default doesn't fit — e.g. GPT-OSS
+        # (inter_dim=2880, 2*inter_dim=5760) where 128 leaves a 64-wide
+        # remainder. In that case we match FlyDSL's ``bench_best_tile``
+        # heuristic (largest multiple of align that divides both N dims,
+        # capped at 256 — FlyDSL's bench target). We also require the
+        # warp-tile alignment ``tile_n % 32 == 0`` so the kernel picker
+        # can pick a multi-warp shape with ``warp_tile_n % 16 == 0``;
+        # 240/nw never satisfies that except n_warp=1 which is buggy for
+        # the Stage1GateUpPackedWrapper path on GPToss (NaN outputs).
+        default_ok = (2 * inter_dim) % int(tile_n) == 0 and inter_dim % int(tile_n) == 0
+        if default_ok:
+            tile_n_eff = int(tile_n)
+        else:
+            tile_n_eff = _mxscale_pick_tile_n(
+                256, 2 * inter_dim, inter_dim,
+                in_dtype=in_dtype, align=32,
+            )
+        model_dim_padded = _mxscale_align_up(model_dim, tile_k)
+        if model_dim_padded != model_dim:
+            delta_k = model_dim_padded - model_dim
+            # Activations (hidden_states, a1_scale) change every call -> skip
+            # cache. Weights / weight scales are static across many calls -> cache
+            # the padded copy so we don't redo a ~100MB memcpy on every fused_moe
+            # invocation for shapes like GPT-OSS (model_dim=2880 -> 2944).
+            hidden_states = _mxscale_zero_pad_last(hidden_states, delta_k // pack_a)
+            w1 = _mxscale_pad_weight_k(w1, delta_k // pack_b, weight_shuffled, cache=True)
+            # E8M0 scale pad: 0x00 = 2^-127 (mathematically neutral when paired
+            # with weight=0). Some HW may treat 0x00 as an exception sentinel;
+            # AITER_GFX1250_SCALE_PAD_ONE=1 forces 0x7F (= 1.0) instead so we
+            # can A/B test whether the pad sentinel is the source of NaN.
+            _scale_pad_val = 0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0
+            if a1_scale is not None and a1_scale.numel() > 0:
+                a1_scale = _mxscale_zero_pad_last(a1_scale, delta_k // 32, _scale_pad_val)
+            if w1_scale is not None and w1_scale.numel() > 0:
+                w1_scale = _mxscale_zero_pad_last(w1_scale, delta_k // 32, _scale_pad_val, cache=True)
+    else:
+        tile_n_eff = tile_n
+        model_dim_padded = model_dim
+
+    # FlyDSL dev builds (e.g. 0.1.3.1.dev485) don't yet map DLPack dtype code 14
+    # (fp8_e8m0) to an MLIR type, so view E8M0 scales as raw uint8. The bytes
+    # are identical and kernels reinterpret the scale as i8 internally anyway.
+    def _scale_as_uint8(t):
+        return t.view(torch.uint8) if t is not None and t.dtype == dtypes.fp8_e8m0 else t
+
+    a1_scale = _scale_as_uint8(a1_scale)
+    w1_scale = _scale_as_uint8(w1_scale)
 
     flat_a_scale = (
         a1_scale.view(-1) if a1_scale is not None else torch.empty(0, device=dev)
@@ -739,13 +801,22 @@ def _gfx1250_moe_stage1(
             compile_moe_gemm1,
         )
 
+    if int(os.environ.get("AITER_GFX1250_PROBE", "0")):
+        logger.info(
+            f"[probe] stage1 in_dtype={in_dtype} model_dim={model_dim} "
+            f"-> padded={model_dim_padded} delta_k={model_dim_padded-model_dim} "
+            f"inter_dim={inter_dim} tile_n={tile_n_eff} tile_k={tile_k} "
+            f"block_m={block_m} E={E} topk={topk} token_num={token_num} "
+            f"a1_scale={'yes' if a1_scale is not None and a1_scale.numel() > 0 else 'no'} "
+            f"w1_scale={'yes' if w1_scale is not None and w1_scale.numel() > 0 else 'no'}"
+        )
     exe = compile_moe_gemm1(
-        model_dim=model_dim,
+        model_dim=model_dim_padded,
         inter_dim=inter_dim,
         experts=E,
         topk=topk,
         tile_m=block_m,
-        tile_n=tile_n,
+        tile_n=tile_n_eff,
         tile_k=tile_k,
         doweight_stage1=(sorted_weights is not None),
         in_dtype=in_dtype,
@@ -764,7 +835,7 @@ def _gfx1250_moe_stage1(
         num_valid_ids,
         token_num,
         inter_dim,
-        model_dim,
+        model_dim_padded,
         _grid_y,
         torch.cuda.current_stream(),
     )
@@ -793,7 +864,11 @@ def _gfx1250_moe_stage2(
     **_kwargs,
 ):
     """gfx1250 FlyDSL MOE stage2 wrapper (down-projection GEMM)."""
-    from aiter.ops.flydsl.moe_kernels import _run_compiled, _view_safe
+    from aiter.ops.flydsl.moe_kernels import (
+        _run_compiled, _view_safe,
+        _MXSCALE_FORMAT_PACK, _mxscale_align_up, _mxscale_pick_tile_n,
+        _mxscale_zero_pad_last, _mxscale_pad_weight_k,
+    )
     _ensure_flydsl_kernels_path()
 
     token_num = inter_states.shape[0]
@@ -816,6 +891,41 @@ def _gfx1250_moe_stage2(
         # caller passed an empty()-allocated buffer we must zero it first or
         # the accumulated result is garbage.
         out.zero_()
+
+    # ------------------------------------------------------------------
+    # K/N alignment: pick tile_n dividing N (=model_dim), and zero-pad
+    # the K dim (=inter_dim) on activation/weight/scales to a multiple
+    # of tile_k. See _gfx1250_moe_stage1 for rationale.
+    # ------------------------------------------------------------------
+    if in_dtype in _MXSCALE_FORMAT_PACK:
+        pack_a, pack_b, weight_shuffled = _MXSCALE_FORMAT_PACK[in_dtype]
+        default_ok = model_dim % int(tile_n) == 0
+        if default_ok:
+            tile_n_eff = int(tile_n)
+        else:
+            tile_n_eff = _mxscale_pick_tile_n(
+                256, model_dim, in_dtype=in_dtype, align=32,
+            )
+        inter_dim_padded = _mxscale_align_up(inter_dim, tile_k)
+        if inter_dim_padded != inter_dim:
+            delta_k = inter_dim_padded - inter_dim
+            inter_states = _mxscale_zero_pad_last(inter_states, delta_k // pack_a)
+            w2 = _mxscale_pad_weight_k(w2, delta_k // pack_b, weight_shuffled, cache=True)
+            _scale_pad_val = 0x7F if int(os.environ.get("AITER_GFX1250_SCALE_PAD_ONE", "0")) else 0
+            if a2_scale is not None and a2_scale.numel() > 0:
+                a2_scale = _mxscale_zero_pad_last(a2_scale, delta_k // 32, _scale_pad_val)
+            if w2_scale is not None and w2_scale.numel() > 0:
+                w2_scale = _mxscale_zero_pad_last(w2_scale, delta_k // 32, _scale_pad_val, cache=True)
+    else:
+        tile_n_eff = tile_n
+        inter_dim_padded = inter_dim
+
+    # See stage1 comment: view fp8_e8m0 scales as uint8 for FlyDSL DLPack.
+    def _scale_as_uint8(t):
+        return t.view(torch.uint8) if t is not None and t.dtype == dtypes.fp8_e8m0 else t
+
+    a2_scale = _scale_as_uint8(a2_scale)
+    w2_scale = _scale_as_uint8(w2_scale)
 
     flat_a_scale = (
         a2_scale.view(-1) if a2_scale is not None else torch.empty(0, device=dev)
@@ -842,13 +952,22 @@ def _gfx1250_moe_stage2(
             compile_moe_gemm2,
         )
 
+    if int(os.environ.get("AITER_GFX1250_PROBE", "0")):
+        logger.info(
+            f"[probe] stage2 in_dtype={in_dtype} inter_dim={inter_dim} "
+            f"-> padded={inter_dim_padded} delta_k={inter_dim_padded-inter_dim} "
+            f"model_dim={model_dim} tile_n={tile_n_eff} tile_k={tile_k} "
+            f"block_m={block_m} E={E} topk={topk} token_num={token_num} "
+            f"a2_scale={'yes' if a2_scale is not None and a2_scale.numel() > 0 else 'no'} "
+            f"w2_scale={'yes' if w2_scale is not None and w2_scale.numel() > 0 else 'no'}"
+        )
     exe = compile_moe_gemm2(
         model_dim=model_dim,
-        inter_dim=inter_dim,
+        inter_dim=inter_dim_padded,
         experts=E,
         topk=topk,
         tile_m=block_m,
-        tile_n=tile_n,
+        tile_n=tile_n_eff,
         tile_k=tile_k,
         doweight_stage2=(sorted_weights is not None),
         in_dtype=in_dtype,
@@ -868,7 +987,7 @@ def _gfx1250_moe_stage2(
         num_valid_ids,
         token_num,
         model_dim,
-        inter_dim,
+        inter_dim_padded,
         m_blocks,
         torch.cuda.current_stream(),
     )
