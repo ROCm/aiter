@@ -343,11 +343,12 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, CLEAR_GPUS=True):
     a_dtype = e4m3_type
     layout = "TN"  # Kernel will occasionally crash for layouts other than TN.
     out_dtype = torch.bfloat16
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    torch.manual_seed(42)  # for reproducibility
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    torch.manual_seed(42)  # for reproducibility
 
     # clean up to avoid hangs in large tests
     if CLEAR_GPUS:
