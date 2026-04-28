@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
 
-FLYDSL_PS_REDUCE_AVAILABLE = True
+FLYDSL_PS_REDUCE_AVAILABLE = False
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
