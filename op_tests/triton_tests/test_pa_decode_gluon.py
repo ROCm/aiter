@@ -83,6 +83,7 @@ CASE_SET_NAME_OPTIONS = [
     "normal_accuracy_aot",
     "sliding_window_accuracy",
     "sliding_window_performance",
+    "gluon_vs_hip_performance",
 ]
 
 
@@ -1234,6 +1235,390 @@ def run_gluon_kernel(
             )
 
 
+@perftest()
+def run_hip_pa(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_query_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    kv_cache_dtype: str,
+    kv_cache_layout: str,
+    scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+    logits_soft_cap: float,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    sliding_window: int = 0,
+) -> torch.Tensor:
+    """Run HIP paged attention v1 kernel with flash (HND) KV cache layout."""
+    _PARTITION_SIZE_ROCM = 256
+
+    num_seqs, num_heads, head_size = query.shape
+    block_size = key_cache.shape[2] if kv_cache_layout == "HND" else key_cache.shape[1]
+
+    output = torch.empty_like(query)
+    max_num_partitions = (
+        max_seq_len + _PARTITION_SIZE_ROCM - 1
+    ) // _PARTITION_SIZE_ROCM
+    assert _PARTITION_SIZE_ROCM % block_size == 0
+
+    nbyes_per_qo_elem = torch.finfo(output.dtype).bits // 8
+    workspace_buffer = torch.empty(
+        (num_seqs * num_heads * max_num_partitions * head_size) * nbyes_per_qo_elem
+        + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
+        dtype=torch.uint8,
+        device=output.device,
+    )
+
+    torch.ops.aiter.paged_attention_v1(
+        output,
+        workspace_buffer,
+        query,
+        key_cache,
+        value_cache,
+        scale,
+        block_tables,
+        cu_query_lens,
+        seq_lens,
+        max_seq_len,
+        alibi_slopes,
+        kv_cache_dtype,
+        kv_cache_layout,
+        logits_soft_cap,
+        k_scale,
+        v_scale,
+        None,
+        _PARTITION_SIZE_ROCM,
+        sliding_window=sliding_window,
+    )
+    return output
+
+
+@benchmark()
+def run_pa_gluon_vs_hip_test(
+    context_length: int,
+    batch_size: int,
+    num_heads: Tuple[int, int],
+    head_size: int,
+    block_size: int,
+    compute_type: torch.dtype,
+    query_length: int,
+    quant_mode: str,
+    context_partition_size: int,
+    trans_v: bool,
+    kv_varlen: bool,
+    use_aot_impl: bool,
+    quant_q: bool,
+    quant_kv: bool,
+    use_sinks: bool,
+    sliding_window: int,
+    ps: bool,
+) -> Dict[str, Union[float, str]]:
+    """Performance comparison: shuffle layout + gluon PA vs flash layout + HIP PA."""
+    data_type = compute_type
+    if compute_type == aiter.dtypes.fp8:
+        data_type = torch.bfloat16
+    results = {}
+    seed = 123
+    setup_seed(seed)
+    device = "cuda:0"
+    torch.set_default_device(device)
+    num_query_heads, num_kv_heads = num_heads
+    assert num_query_heads % num_kv_heads == 0
+
+    max_context_length = max(16384, context_length)
+    max_blocks_per_sequence = (max_context_length + block_size - 1) // block_size
+    total_blocks = max_blocks_per_sequence * batch_size
+    blocks_per_sequence = (context_length + block_size - 1) // block_size
+
+    query_output_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    sequence_lengths_qo = torch.randint(
+        1, 5, (batch_size,), dtype=torch.int32, device=device
+    ).fill_(query_length)
+    query_output_indptr[1 : batch_size + 1] = torch.cumsum(sequence_lengths_qo, dim=0)
+    total_queries = query_output_indptr[-1].item()
+
+    qkv_tensor = torch.randn(
+        total_queries, num_query_heads + 2 * num_kv_heads, head_size, dtype=data_type
+    )
+    query, _, _ = torch.split(
+        qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
+    )
+    query.uniform_(*UNIFORM_RANGE)
+
+    if kv_varlen:
+        random.seed(seed)
+        kv_len_list = [
+            random.randint(query_length, context_length) for _ in range(batch_size)
+        ]
+    else:
+        kv_len_list = [context_length] * batch_size
+
+    context_lengths = torch.tensor(kv_len_list, dtype=torch.int32, device=device)
+
+    random.seed(seed)
+    block_tables_list = []
+    for _ in range(batch_size):
+        block_table = [
+            random.randint(0, total_blocks - 1) for _ in range(blocks_per_sequence)
+        ]
+        block_tables_list.append(block_table)
+    block_tables = torch.tensor(block_tables_list, dtype=torch.int32, device=device)
+
+    key_caches, value_caches = create_kv_cache(
+        total_blocks,
+        block_size,
+        1,
+        num_kv_heads,
+        head_size,
+        "auto",
+        data_type,
+        seed,
+        device,
+        1 if quant_kv else 2,
+    )
+    key_cache, value_cache = key_caches[0], value_caches[0]
+    softmax_scale = 1.0 / (head_size**0.5)
+
+    # Quantization
+    if quant_mode == "per_token":
+        if quant_q:
+            quantized_query, query_scale_factors = pertoken_quant(
+                query, quant_dtype=aiter.dtypes.fp8
+            )
+        else:
+            quantized_query = query
+            query_scale_factors = None
+
+        if quant_kv:
+            if compute_type not in [aiter.dtypes.fp8]:
+                (
+                    quantized_keys,
+                    key_scale_factors_flat,
+                    quantized_values,
+                    value_scale_factors_flat,
+                    key_scale_original,
+                    value_scale_original,
+                ) = quantize_kv_cache_symmetric(
+                    key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+                )
+            else:
+                quantized_keys = key_cache.to(aiter.dtypes.fp8)
+                quantized_values = value_cache.to(aiter.dtypes.fp8)
+                key_scale_factors_flat = None
+                value_scale_factors_flat = None
+                key_scale_original = torch.tensor(1, dtype=torch.float32, device=device)
+                value_scale_original = torch.tensor(
+                    1, dtype=torch.float32, device=device
+                )
+        else:
+            quantized_keys = key_cache
+            quantized_values = value_cache
+            key_scale_factors_flat = None
+            value_scale_factors_flat = None
+            key_scale_original = None
+            value_scale_original = None
+    else:  # per_tensor
+        if quant_q:
+            quantized_query, query_scale_factors = per_tensor_quant(
+                query, quant_dtype=aiter.dtypes.fp8
+            )
+        else:
+            quantized_query = query
+            query_scale_factors = None
+
+        if quant_kv:
+            (
+                quantized_keys,
+                key_scale_factors_flat,
+                quantized_values,
+                value_scale_factors_flat,
+                key_scale_original,
+                value_scale_original,
+            ) = quantize_kv_cache_per_tensor(
+                key_cache, value_cache, quant_dtype=aiter.dtypes.fp8
+            )
+        else:
+            quantized_keys = key_cache
+            quantized_values = value_cache
+            key_scale_factors_flat = None
+            value_scale_factors_flat = None
+            key_scale_original = None
+            value_scale_original = None
+
+    kv_len_list_effective = [
+        min(cl, sliding_window) if sliding_window > 0 else cl for cl in kv_len_list
+    ]
+    pa_rw_bytes = head_size * (
+        2 * sum(kv_len_list_effective) * num_kv_heads * quantized_keys.dtype.itemsize
+        + 2 * query_length * num_query_heads * quantized_query.dtype.itemsize
+    )
+
+    # ============================================================
+    # 1) Gluon PA with shuffle layout
+    # ============================================================
+    if trans_v:
+        gluon_quantized_values = shuffle_value_cache_layout(quantized_values)
+    else:
+        gluon_quantized_values = quantized_values
+
+    num_seqs = batch_size
+    max_ctx_len = (
+        min(context_lengths.max().item(), sliding_window)
+        if sliding_window > 0
+        else context_lengths.max().item()
+    )
+    if sliding_window > 0:
+        max_context_partition_num = 1
+    elif ps:
+        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+    else:
+        max_context_partition_num = triton.cdiv(max_ctx_len, context_partition_size)
+
+    equivalent_query_group_size = query_length * (num_query_heads // num_kv_heads)
+    intermediate_shape = (
+        num_seqs,
+        num_kv_heads,
+        max_context_partition_num,
+        equivalent_query_group_size,
+    )
+
+    exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
+    max_logits = torch.empty(intermediate_shape, dtype=torch.float32, device=device)
+    temporary_output = torch.empty(
+        *intermediate_shape,
+        head_size,
+        dtype=data_type,
+        device=device,
+    )
+    final_output_gluon = torch.empty(
+        total_queries, num_query_heads, head_size, dtype=data_type, device=device
+    )
+
+    _, gluon_time = run_gluon_kernel(
+        final_output_gluon,
+        quantized_query,
+        quantized_keys,
+        gluon_quantized_values,
+        context_lengths,
+        block_tables,
+        softmax_scale,
+        query_length,
+        max_context_partition_num,
+        context_partition_size,
+        compute_type,
+        query_scale=query_scale_factors,
+        key_scale=key_scale_original,
+        value_scale=value_scale_original,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        alibi_slopes=None,
+        use_aot_impl=use_aot_impl,
+        sinks=None,
+        sliding_window=sliding_window,
+        ps=ps,
+    )
+    results["us_gluon"] = gluon_time
+
+    # ============================================================
+    # 2) HIP PA with flash (HND) layout
+    # ============================================================
+    # Convert KV cache to flash (HND) layout:
+    #   key_cache shuffle: [num_blocks, num_kv_heads, head_size//x, block_size, x]
+    #   -> flash HND:      [num_blocks, num_kv_heads, block_size, head_size]
+    from einops import rearrange
+
+    hip_key_cache = rearrange(
+        quantized_keys, "b h d1 s d2 -> b h s (d1 d2)"
+    ).contiguous()
+    if trans_v:
+        # Un-shuffle V cache back from [num_blocks, num_kv_heads, block_size//x, head_size, x]
+        # to flash HND layout [num_blocks, num_kv_heads, block_size, head_size]
+        hip_value_cache = rearrange(
+            gluon_quantized_values, "b h s1 d s2 -> b h (s1 s2) d"
+        ).contiguous()
+    else:
+        # Convert from [num_blocks, num_kv_heads, head_size, block_size]
+        # to flash HND layout [num_blocks, num_kv_heads, block_size, head_size]
+        hip_value_cache = rearrange(quantized_values, "b h d s -> b h s d").contiguous()
+
+    # HIP PA only supports query_length=1 (decode). For query_length>1, skip.
+    if query_length == 1:
+        cu_query_lens = torch.arange(
+            0, batch_size + 1, dtype=torch.int32, device=device
+        )
+
+        # Determine kv_cache_dtype and scales for HIP PA
+        if quant_kv and quantized_keys.dtype == aiter.dtypes.fp8:
+            hip_kv_cache_dtype = "fp8"
+            # For per-token quant, use the flat scale vectors reshaped for HIP PA
+            # HIP PA expects k_scale/v_scale as 1-element tensors for per-tensor
+            if quant_mode == "per_token" and key_scale_factors_flat is not None:
+                k_scale_hip = torch.tensor([1.0], dtype=torch.float32, device=device)
+                v_scale_hip = torch.tensor([1.0], dtype=torch.float32, device=device)
+            elif quant_mode == "per_tensor" and key_scale_original is not None:
+                k_scale_hip = key_scale_original.view(-1)[:1].contiguous()
+                v_scale_hip = value_scale_original.view(-1)[:1].contiguous()
+            else:
+                k_scale_hip = torch.tensor([1.0], dtype=torch.float32, device=device)
+                v_scale_hip = torch.tensor([1.0], dtype=torch.float32, device=device)
+        else:
+            hip_kv_cache_dtype = "auto"
+            k_scale_hip = torch.tensor([1.0], dtype=torch.float32, device=device)
+            v_scale_hip = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+        hip_output, hip_time = run_hip_pa(
+            query,
+            hip_key_cache,
+            hip_value_cache,
+            block_tables,
+            cu_query_lens,
+            context_lengths,
+            int(context_lengths.max().item()),
+            hip_kv_cache_dtype,
+            "HND",
+            softmax_scale,
+            None,
+            0.0,
+            k_scale_hip,
+            v_scale_hip,
+            sliding_window=sliding_window,
+        )
+        results["us_hip_pa"] = hip_time
+
+        # Bandwidth
+        hip_bandwidth = pa_rw_bytes / (hip_time * 1e6 * 1.024**4)
+        results["hip_pa_bandwidth(TB/s)"] = hip_bandwidth
+
+        # Compare correctness between gluon and hip
+        err = checkAllclose(
+            final_output_gluon,
+            hip_output,
+            msg=f"[Gluon vs HIP PA] gluon={gluon_time:.2f}us, hip={hip_time:.2f}us",
+        )
+        results["err_gluon_vs_hip"] = err
+
+        # Performance ratio
+        results["perf_hip_vs_gluon"] = f"{gluon_time / hip_time:.0%}"
+    else:
+        results["us_hip_pa"] = "N/A (ql>1)"
+        results["hip_pa_bandwidth(TB/s)"] = "N/A"
+        results["err_gluon_vs_hip"] = "N/A"
+        results["perf_hip_vs_gluon"] = "N/A"
+
+    # Gluon bandwidth
+    gluon_bandwidth = pa_rw_bytes / (gluon_time * 1e6 * 1.024**4)
+    results["gluon_bandwith(TB/s)"] = gluon_bandwidth
+    results["err_gluon"] = 0
+
+    sys.stdout.flush()
+    return results
+
+
 @benchmark()
 def run_pa_gluon_test(
     context_length: int,
@@ -2315,15 +2700,15 @@ def normal_performance_test():
     USE_TORCH_FLASH_REF_OPTIONS = [False]
     CONTEXT_PARTITION_SIZE_OPTIONS = [256]
 
-    HEAD_DIMENSION_OPTIONS = [128]
-    CONTEXT_LENGTH_OPTIONS = [2048, 4096, 8192]
+    HEAD_DIMENSION_OPTIONS = [256]
+    CONTEXT_LENGTH_OPTIONS = [8192]
     BATCH_SIZE_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128]
-    QUERY_LENGTH_OPTIONS = [1, 2, 3, 4]
+    QUERY_LENGTH_OPTIONS = [1]
     COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True], ["bf16", False, False]]
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
-    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
+    HEAD_CONFIGURATIONS = [(4, 1)]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
@@ -2369,7 +2754,7 @@ def normal_performance_aot_test():
     QUANT_MODE_OPTIONS = ["per_tensor"]
     TRANS_V_OPTIONS = [False]
     KV_VARLEN_OPTIONS = [False]
-    HEAD_CONFIGURATIONS = [(64, 4), (64, 8)]
+    HEAD_CONFIGURATIONS = [(4, 1)]
     BLOCK_SIZE_OPTIONS = [16]
     parse_arg_and_run_test()
     BLOCK_SIZE_OPTIONS = [64]
@@ -2457,6 +2842,215 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
+def _run_single_gluon_vs_hip_test(args):
+    """Run a single gluon vs HIP PA performance comparison test case."""
+    test_config, current, total = args
+
+    print(
+        f"\n[{current}/{total}] Gluon vs HIP PA: "
+        f"compute_type={test_config['compute_type']}, "
+        f"quant_q_and_kv=({test_config['quant_q']}, {test_config['quant_kv']}), "
+        f"trans_v={test_config['trans_v']}, "
+        f"block_size={test_config['block_size']}, "
+        f"num_heads={test_config['num_heads']}, "
+        f"context_lengths={test_config['context_length']}, "
+        f"batch_size={test_config['batch_size']}, "
+        f"query_length={test_config['query_length']}, "
+        f"head_size={test_config['head_size']}"
+    )
+
+    result = run_pa_gluon_vs_hip_test(
+        context_length=test_config["context_length"],
+        batch_size=test_config["batch_size"],
+        num_heads=test_config["num_heads"],
+        head_size=test_config["head_size"],
+        block_size=test_config["block_size"],
+        compute_type=test_config["compute_type"],
+        query_length=test_config["query_length"],
+        quant_mode=test_config["quant_mode"],
+        context_partition_size=test_config["context_partition_size"],
+        trans_v=test_config["trans_v"],
+        kv_varlen=test_config["kv_varlen"],
+        use_aot_impl=test_config["use_aot_impl"],
+        quant_q=test_config["quant_q"],
+        quant_kv=test_config["quant_kv"],
+        use_sinks=test_config["sinks"],
+        sliding_window=test_config["sliding_window"],
+        ps=test_config["ps"],
+    )
+
+    return result
+
+
+def run_multi_gluon_vs_hip_test(
+    block_sizes,
+    head_configs,
+    context_lengths,
+    batch_sizes,
+    head_sizes,
+    query_lengths,
+    quant_mode,
+    trans_v,
+    kv_varlen,
+    compute_types_quant_q_and_kv,
+    context_partition_size_options,
+) -> pd.DataFrame:
+    """Run gluon vs HIP PA performance comparison tests."""
+    test_configs = []
+
+    for hc in head_configs:
+        for ct, quant_q, quant_kv in compute_types_quant_q_and_kv:
+            for trans_v_mode in trans_v:
+                for context_partition_size in context_partition_size_options:
+                    qm_cnt = 0
+                    for qm in quant_mode:
+                        qm_cnt += 1
+                        if not quant_q and not quant_kv and qm_cnt > 1:
+                            continue
+                        for bs in block_sizes:
+                            for head_size in head_sizes:
+                                for ql in query_lengths:
+                                    for bsz in batch_sizes:
+                                        for cl in context_lengths:
+                                            test_config = {
+                                                "use_torch_flash_ref": False,
+                                                "compute_type": ct,
+                                                "quant_q": quant_q,
+                                                "quant_kv": quant_kv,
+                                                "trans_v": trans_v_mode,
+                                                "kv_varlen": False,
+                                                "context_partition_size": context_partition_size,
+                                                "quant_mode": qm,
+                                                "block_size": bs,
+                                                "num_heads": hc,
+                                                "context_length": cl,
+                                                "batch_size": bsz,
+                                                "query_length": ql,
+                                                "head_size": head_size,
+                                                "use_aot_impl": False,
+                                                "sinks": False,
+                                                "sliding_window": 0,
+                                                "ps": True,
+                                            }
+                                            test_configs.append(test_config)
+
+    total = len(test_configs)
+    print(f"\nTotal gluon vs HIP PA test cases: {total}")
+
+    results = []
+    for idx, test_config in enumerate(test_configs):
+        result = _run_single_gluon_vs_hip_test((test_config, idx + 1, total))
+        results.append(result)
+
+    return pd.DataFrame(results)
+
+
+def gluon_vs_hip_performance_test():
+    """Compare performance: shuffle layout + gluon PA vs flash layout + HIP PA."""
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global COMPUTE_TYPE_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
+    HEAD_DIMENSION_OPTIONS = [256]
+    CONTEXT_LENGTH_OPTIONS = [1024, 2048, 8192, 9216]
+    BATCH_SIZE_OPTIONS = [4, 8, 16, 32, 64]
+    QUERY_LENGTH_OPTIONS = [1]
+    # bf16 without quant + fp8 kv cache with bf16 query
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [
+        ["bf16", False, False],
+        ["fp8", False, True],
+    ]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
+    TRANS_V_OPTIONS = [True]
+    KV_VARLEN_OPTIONS = [False]
+    HEAD_CONFIGURATIONS = [(4, 1)]
+
+    BLOCK_SIZE_OPTIONS = [16]
+    results_df = run_multi_gluon_vs_hip_test(
+        BLOCK_SIZE_OPTIONS,
+        HEAD_CONFIGURATIONS,
+        CONTEXT_LENGTH_OPTIONS,
+        BATCH_SIZE_OPTIONS,
+        HEAD_DIMENSION_OPTIONS,
+        QUERY_LENGTH_OPTIONS,
+        QUANT_MODE_OPTIONS,
+        TRANS_V_OPTIONS,
+        KV_VARLEN_OPTIONS,
+        [
+            [dtypes.d_dtypes[ct], qq, qk]
+            for ct, qq, qk in COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+        ],
+        CONTEXT_PARTITION_SIZE_OPTIONS,
+    )
+
+    output_file = f"gluon_vs_hip_pa_perf.block_size_16.triton.{TRITON_VERSION}.csv"
+    results_df.to_csv(output_file, index=False)
+    print(f"\nResults saved to {output_file}")
+    print(f"\nSummary:\n{results_df}")
+
+    # Print performance comparison summary
+    columns_to_print = [
+        "us_gluon",
+        "gluon_bandwith(TB/s)",
+        "us_hip_pa",
+        "hip_pa_bandwidth(TB/s)",
+        "perf_hip_vs_gluon",
+    ]
+    valid_columns = [col for col in columns_to_print if col in results_df.columns]
+    if valid_columns:
+        print("\n=== Gluon PA vs HIP PA Performance Summary ===")
+        for col in valid_columns:
+            col_data = results_df[col]
+            if pd.api.types.is_numeric_dtype(col_data):
+                valid = col_data.dropna()
+                if len(valid) > 0:
+                    print(f"  {col}: mean={valid.mean():.4f}")
+
+    BLOCK_SIZE_OPTIONS = [64]
+    results_df2 = run_multi_gluon_vs_hip_test(
+        BLOCK_SIZE_OPTIONS,
+        HEAD_CONFIGURATIONS,
+        CONTEXT_LENGTH_OPTIONS,
+        BATCH_SIZE_OPTIONS,
+        HEAD_DIMENSION_OPTIONS,
+        QUERY_LENGTH_OPTIONS,
+        QUANT_MODE_OPTIONS,
+        TRANS_V_OPTIONS,
+        KV_VARLEN_OPTIONS,
+        [
+            [dtypes.d_dtypes[ct], qq, qk]
+            for ct, qq, qk in COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+        ],
+        CONTEXT_PARTITION_SIZE_OPTIONS,
+    )
+
+    output_file2 = f"gluon_vs_hip_pa_perf.block_size_64.triton.{TRITON_VERSION}.csv"
+    results_df2.to_csv(output_file2, index=False)
+    print(f"\nResults saved to {output_file2}")
+    print(f"\nSummary:\n{results_df2}")
+
+    valid_columns = [col for col in columns_to_print if col in results_df2.columns]
+    if valid_columns:
+        print("\n=== Gluon PA vs HIP PA Performance Summary (block_size=64) ===")
+        for col in valid_columns:
+            col_data = results_df2[col]
+            if pd.api.types.is_numeric_dtype(col_data):
+                valid = col_data.dropna()
+                if len(valid) > 0:
+                    print(f"  {col}: mean={valid.mean():.4f}")
+
+
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):
     if case_set_name == "normal_accuracy":
@@ -2471,12 +3065,15 @@ def test_multi_case_set(case_set_name):
         sliding_window_accuracy_test()
     elif case_set_name == "sliding_window_performance":
         sliding_window_performance_test()
+    elif case_set_name == "gluon_vs_hip_performance":
+        gluon_vs_hip_performance_test()
 
 
 if __name__ == "__main__":
-    normal_accuracy_test()
-    normal_accuracy_aot_test()
-    normal_performance_test()
-    normal_performance_aot_test()
-    sliding_window_accuracy_test()
-    sliding_window_performance_test()
+    # normal_accuracy_test()
+    # normal_accuracy_aot_test()
+    # normal_performance_test()
+    # normal_performance_aot_test()
+    # sliding_window_accuracy_test()
+    # sliding_window_performance_test()
+    gluon_vs_hip_performance_test()
