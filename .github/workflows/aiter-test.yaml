@@ -83,6 +83,8 @@ jobs:
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash -lc '
+              git config --global --add safe.directory /workspace &&
+              git -C /workspace rev-parse HEAD >/dev/null &&
               shopt -s nullglob &&
               rm -rf dist build aiter_meta ./*.egg-info &&
               pip install -r requirements.txt &&
