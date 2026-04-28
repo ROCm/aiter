@@ -13,6 +13,7 @@ from aiter.ops.triton.attention.mha_v3 import (
 )
 from aiter.test_mha_common import (
     attention_ref,
+    attention_ref_with_tol,
     generate_random_padding_mask,
     generate_qkv,
 )
@@ -27,60 +28,6 @@ pytestmark = pytest.mark.skipif(
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
-
-
-def _attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
-    """Run attention reference and compute adaptive tolerances.
-
-    Follows the upstream flash attention tolerance pattern
-    (see tests/test_flash_attn.py in Dao-AILab/flash-attention). Runs two
-    PyTorch references (upcast and non-upcast) and uses the gap between them as
-    a baseline for tolerance.
-
-    Returns (out, (dq, dk, dv), fwd_tol, [dq_tol, dk_tol, dv_tol])
-    where each tol is (atol, rtol).
-    """
-    has_dropout = kwargs.get("dropout_p", 0.0) > 0.0
-
-    def _run_ref(upcast, reorder_ops=False):
-        q_ = q.detach().clone().requires_grad_(True)
-        k_ = k.detach().clone().requires_grad_(True)
-        v_ = v.detach().clone().requires_grad_(True)
-        with torch.enable_grad():
-            out, _, _ = attention_ref(
-                q_, k_, v_, upcast=upcast, reorder_ops=reorder_ops, **kwargs
-            )
-        dq, dk, dv = torch.autograd.grad(out, (q_, k_, v_), do)
-        return out, dq, dk, dv
-
-    def _tol(ref_val, pt_val, is_forward=False):
-        baseline = (pt_val - ref_val).abs().max().item()
-        if is_fp8:
-            mult = 4
-            atol_floor = 5e-1 if is_forward else 1.0
-            rtol_floor = 1e-1
-        elif has_dropout:
-            # Dropout scaling (1/(1-p)) amplifies precision errors in the
-            # fused kernel differently than in the reference. The baseline
-            # between two references uses the same mask so it underestimates
-            # the kernel-vs-reference gap.
-            mult = 2
-            atol_floor = 1e-1 if is_forward else 2.0
-            rtol_floor = 1e-1
-        else:
-            mult = 2
-            atol_floor = 1e-2 if is_forward else 1.5e-2
-            rtol_floor = 1e-5
-        atol = max(mult * baseline, atol_floor)
-        return atol, rtol_floor
-
-    out, dq, dk, dv = _run_ref(upcast=True)
-    out_pt, dq_pt, dk_pt, dv_pt = _run_ref(upcast=False, reorder_ops=True)
-
-    fwd_tol = _tol(out, out_pt, is_forward=True)
-    bwd_tols = [_tol(dq, dq_pt), _tol(dk, dk_pt), _tol(dv, dv_pt)]
-
-    return out, (dq, dk, dv), fwd_tol, bwd_tols
 
 
 def assert_cosine_similarity(actual, expected, threshold=0.96, norm_floor=1e-3):
@@ -309,7 +256,7 @@ def test_mha_backward(
     )
 
     # Reference forward + backward with adaptive tolerances
-    torch_out, torch_grads, fwd_tol, bwd_tols = _attention_ref_with_tol(
+    torch_out, torch_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
         q,
         k,
         v,
@@ -408,7 +355,7 @@ def test_mha_backward_varlen(
     triton_dv = dk_pad_fn(triton_dv)
 
     # Reference forward + backward with adaptive tolerances
-    torch_out, torch_grads, fwd_tol, bwd_tols = _attention_ref_with_tol(
+    torch_out, torch_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
         q,
         k,
         v,
