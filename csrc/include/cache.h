@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 #include <map>
@@ -100,6 +100,25 @@ void fused_qk_rope_concat_and_cache_mla(
     torch::Tensor& positions, // [num_tokens]
     torch::Tensor& cos_cache, // [max_positions, pe_dim//2]
     torch::Tensor& sin_cache, // [max_positions, pe_dim//2]
+    bool is_neox,
+    bool is_nope_first);
+
+void fused_qk_norm_rope_group_quant_cache_mla(
+    torch::Tensor& q_nope,        // [num_tokens, num_heads, qk_lora_rank]
+    torch::Tensor& q_pe,          // [num_tokens, num_heads, pe_dim] (read-only input)
+    torch::Tensor& kv_c,          // [num_tokens, k_num_heads, kv_lora_rank]
+    torch::Tensor& k_pe,          // [num_tokens, k_num_heads, pe_dim] (read-only input)
+    torch::Tensor& k_pe_out,      // [num_tokens, k_num_heads, pe_dim] (RoPE'd output)
+    torch::Tensor& k_weight,      // [kv_lora_rank] RMSNorm weights for K
+    torch::Tensor& kv_cache,      // [num_blocks, block_size, k_num_heads, kv_lora_rank + pe_dim)]
+    torch::Tensor& q_out,         // [num_tokens, num_heads, qk_lora_rank+pe_dim] (fp8: quant nope+pe; bf16: nope+RoPE'd pe)
+    torch::Tensor& q_scale_out,   // [num_tokens, num_heads, num_groups] uint8 e8m0 scales (fp8 path)
+    torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    torch::Tensor& positions,     // [num_tokens]
+    torch::Tensor& cos_cache,     // [max_position, rot_dim//2]
+    torch::Tensor& sin_cache,     // [max_position, rot_dim//2]
+    double eps,                   // epsilon for RMS norm
+    int group_size,               // group size for group quantization (default 64)
     bool is_neox,
     bool is_nope_first);
 
