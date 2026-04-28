@@ -25,10 +25,6 @@ GDR_GLOBAL_CONFIG_MAP = None
 GDR_GPU_ARCH = get_rocm_arch()
 
 
-GDR_GLOBAL_CONFIG_MAP = None
-GDR_GPU_ARCH = get_rocm_arch()
-
-
 def get_default_kwargs(
     dtype_str,
     state_dtype_str,
