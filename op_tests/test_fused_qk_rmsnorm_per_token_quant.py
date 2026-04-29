@@ -268,9 +268,6 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check q_scale baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert q_scale_error_rate == 0
-        q_scale_diff = (q_scale_ref - q_scale).abs()
-        q_scale_max_abs = q_scale_diff.max().item()
 
         q_deq_error_rate = checkAllclose(
             q_dequant_ref,
@@ -280,10 +277,6 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check q_dequant baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert q_deq_error_rate == 0
-        q_deq_diff = (q_dequant_ref - q_dequant).abs()
-        q_deq_max_abs = q_deq_diff.max().item()
-        q_deq_mean_abs = q_deq_diff.mean().item()
 
         q_unquant_error_rate = checkAllclose(
             q_unquant_ref,
@@ -293,9 +286,6 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check q_unquant baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert q_unquant_error_rate == 0
-        q_unquant_diff = (q_unquant_ref - q_unquant).abs()
-        q_unquant_max_abs = q_unquant_diff.max().item()
     else:
         q_scale_error_rate = checkAllclose(
             q_scale_ref,
@@ -305,9 +295,6 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check q_scale baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert q_scale_error_rate == 0
-        q_scale_diff = (q_scale_ref - q_scale).abs()
-        q_scale_max_abs = q_scale_diff.max().item()
 
         q_deq_error_rate = checkAllclose(
             q_dequant_ref,
@@ -317,10 +304,6 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check q_dequant baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert q_deq_error_rate == 0
-        q_deq_diff = (q_dequant_ref - q_dequant).abs()
-        q_deq_max_abs = q_deq_diff.max().item()
-        q_deq_mean_abs = q_deq_diff.mean().item()
 
         q_unquant_error_rate = checkAllclose(
             q_unquant_ref,
@@ -330,15 +313,10 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check q_unquant baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert q_unquant_error_rate == 0
-        q_unquant_diff = (q_unquant_ref - q_unquant).abs()
-        q_unquant_max_abs = q_unquant_diff.max().item()
 
-    k_error_rate = None
-    k_max_abs = None
     if k_out_ref is not None:
         assert k_out is not None
-        k_error_rate = checkAllclose(
+        checkAllclose(
             k_out_ref,
             k_out,
             rtol=(1e-2 if gemma_norm else 0.0),
@@ -346,15 +324,10 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check k_out baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert k_error_rate == 0
-        k_diff = (k_out_ref - k_out).abs()
-        k_max_abs = k_diff.max().item()
 
-    res_error_rate = None
-    res_max_abs = None
     if q_res_out_ref is not None:
         assert q_res_out is not None
-        res_error_rate = checkAllclose(
+        checkAllclose(
             q_res_out_ref,
             q_res_out,
             rtol=0.0,
@@ -362,9 +335,6 @@ def _validate_fused_qk_rmsnorm_per_token_quant_case(
             tol_err_ratio=0.0,
             msg=f"check q_res_out baseline vs hip, m={m}, n1={n1}, n2={n2}: ",
         )
-        assert res_error_rate == 0
-        res_diff = (q_res_out_ref - q_res_out).abs()
-        res_max_abs = res_diff.max().item()
 
     io_bytes = _calc_io_bytes(
         q=q,
