@@ -303,14 +303,16 @@ namespace py = pybind11;
           py::arg("kv_cache"),                                                      \
           py::arg("slot_mapping"),                                                  \
           py::arg("quant_block_size"),                                              \
-          py::arg("scale_fmt"));                                                    \
+          py::arg("scale_fmt"),                                                     \
+          py::arg("preshuffle") = false);                                           \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
           py::arg("dst_k"),                                                         \
           py::arg("dst_scale"),                                                     \
           py::arg("block_table"),                                                   \
-          py::arg("cu_seq_lens"));                                                  \
+          py::arg("cu_seq_lens"),                                                   \
+          py::arg("preshuffle") = false);                                           \
     m.def("fused_qk_rope_concat_and_cache_mla",                                     \
           &aiter::fused_qk_rope_concat_and_cache_mla,                               \
           py::arg("q_nope"),                                                        \
@@ -395,6 +397,21 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
           py::arg("use_1stage"));                                                              \
+    m.def("fused_allreduce_rmsnorm_quant_per_group",                                            \
+          &aiter::fused_allreduce_rmsnorm_quant_per_group,                                      \
+          py::arg("_fa"),                                                                       \
+          py::arg("inp"),                                                                       \
+          py::arg("res_inp"),                                                                   \
+          py::arg("res_out"),                                                                   \
+          py::arg("out"),                                                                       \
+          py::arg("scale_out"),                                                                 \
+          py::arg("w"),                                                                         \
+          py::arg("eps"),                                                                       \
+          py::arg("group_size"),                                                                \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"),                                                                 \
+          py::arg("use_1stage"),                                                                \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \

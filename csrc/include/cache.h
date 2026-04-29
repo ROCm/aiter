@@ -71,18 +71,21 @@ void concat_and_cache_mla(aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_
                           const std::string& kv_cache_dtype,
                           aiter_tensor_t& scale);
 
+
 void indexer_k_quant_and_cache(aiter_tensor_t& k,            // [num_tokens, head_dim]
                                aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
                                aiter_tensor_t& slot_mapping,  // [num_tokens]
                                int64_t quant_block_size,
-                               const std::string& scale_fmt);
+                               const std::string& scale_fmt，
+                               bool preshuffle = false);
 
 void cp_gather_indexer_k_quant_cache(
     const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
     aiter_tensor_t& dst_k,              // [num_tokens, head_dim]
     aiter_tensor_t& dst_scale,          // [num_tokens, head_dim / quant_block_size * 4]
     const aiter_tensor_t& block_table,  // [batch_size, num_blocks]
-    const aiter_tensor_t& cu_seq_lens); // [batch_size + 1]
+    const aiter_tensor_t& cu_seq_lens,  // [batch_size + 1]
+    bool preshuffle = false);
 
 void fused_qk_rope_concat_and_cache_mla(
     aiter_tensor_t& q_nope,       // [num_tokens, num_heads, qk_lora_rank]
