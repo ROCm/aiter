@@ -139,6 +139,21 @@ def unified_attention(
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
+    # FIX: Normalize empty tensors to None to prevent null pointer dereference
+    # Empty tensors have data_ptr()=0 which causes memory access faults in the kernel.
+    # This happens when vLLM passes empty tensors instead of None for unused descale factors.
+    # See: https://github.com/vllm-project/vllm/issues/...
+    def _normalize_empty_tensor(tensor):
+        """Convert empty tensors to None to prevent null pointer dereference in kernel."""
+        if tensor is not None and tensor.numel() == 0:
+            return None
+        return tensor
+
+    q_descale = _normalize_empty_tensor(q_descale)
+    k_descale = _normalize_empty_tensor(k_descale)
+    v_descale = _normalize_empty_tensor(v_descale)
+    output_scale = _normalize_empty_tensor(output_scale)
+
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
     SLIDING_WINDOW = 1 + window_size[0]
