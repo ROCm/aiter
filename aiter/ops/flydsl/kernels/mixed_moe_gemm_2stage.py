@@ -267,9 +267,13 @@ def compile_mixed_moe_gemm1(
     _sk_tag = f"_sk{k_batch}" if _is_splitk else ""
     _g_tag = "_g1u1" if _use_g1u1 else "_g1u0"
     _go_tag = "_go" if gate_only else ""
+    _stage1_group_size_m = int(os.environ.get("FLIR_MOE_STAGE1_GROUP_SIZE_M", "2"))
+    if _stage1_group_size_m < 1:
+        _stage1_group_size_m = 1
+    _gm_tag = f"_gm{_stage1_group_size_m}" if _stage1_group_size_m > 1 else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v35_tidlds_g1u0_splitk"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v36_tidlds{_gm_tag}_g1u0_splitk"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -515,8 +519,34 @@ def compile_mixed_moe_gemm1(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            by = gpu.block_id("x")  # tile along inter_dim (N)
-            bx_persist = gpu.block_id("y")  # persistent WG index
+            by_phys = gpu.block_id("x")  # physical tile along inter_dim (N)
+            bx_persist_phys = gpu.block_id("y")  # physical persistent WG index
+            by = by_phys
+            bx_persist = bx_persist_phys
+            if _stage1_group_size_m > 1:
+                if gate_only or (not _use_g1u1):
+                    _num_pid_n = n_in / arith.constant(tile_n, index=True)
+                else:
+                    _num_pid_n = (
+                        n_in
+                        / arith.constant(2, index=True)
+                        / arith.constant(tile_n, index=True)
+                    )
+                _c_gm = arith.constant(_stage1_group_size_m, index=True)
+                _c_pm_map = arith.constant(persist_m, index=True)
+                _num_pid_m = (
+                    size_expert_ids_in + _c_pm_map - arith.constant(1, index=True)
+                ) / _c_pm_map
+                _pid = bx_persist_phys * _num_pid_n + by_phys
+                _group_span = _c_gm * _num_pid_n
+                _group_id = _pid / _group_span
+                _first_m = _group_id * _c_gm
+                _remaining_m = _num_pid_m - _first_m
+                _is_tail_group = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_gm)
+                _group_m = arith.select(_is_tail_group, _remaining_m, _c_gm)
+                _local = _pid % _group_span
+                bx_persist = _first_m + (_local % _group_m)
+                by = _local / _group_m
             by_n = by * arith.constant(tile_n, index=True)
 
             if _is_splitk:
