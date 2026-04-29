@@ -90,6 +90,26 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     )
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    emit_bf16: bool = False,
+):
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        group_size,
+        prefill_support,
+        emit_bf16=emit_bf16,
+    )
+
+
 def tensor_model_parallel_custom_all_gather(input_: torch.Tensor) -> torch.Tensor:
     _assert_no_custom_group("tensor_model_parallel_custom_all_gather")
     return get_tp_group().custom_all_gather(input_)
