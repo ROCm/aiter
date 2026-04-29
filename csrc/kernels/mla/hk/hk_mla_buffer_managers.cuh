@@ -1041,7 +1041,11 @@ class KvManager8bitsV3
         kNumSubBlockRows * kNumSubBlockCols * sizeof(kv_t); // 4*32*1=128
     static constexpr uint32_t kNumBytesPer2SubBlocksWithPadding =
         kNumBytesPerSubBlock * 2 + kNumPaddingDw * sizeof(uint32_t); // 128*2+2*4=256+8=264
-    static constexpr uint32_t kNum2SubBlocks = T::kNumWarps; // 8
+    // LDS layout: 32x64 block split into 8 sub-block slots; INDEPENDENT of kNumWarps.
+    static constexpr uint32_t kNum2SubBlocks = 8;
+    static_assert(kNum2SubBlocks % T::kNumWarps == 0,
+                  "kNum2SubBlocks (8) must be a multiple of kNumWarps");
+    static constexpr uint32_t kNumPassesPerWarp = kNum2SubBlocks / T::kNumWarps; // 1 (8w) or 2 (4w)
     static constexpr uint32_t kNumBytesPerBlock =
         kNumBytesPer2SubBlocksWithPadding * kNum2SubBlocks;                 // 264*8=2112
     static constexpr uint32_t kNumRowsPerWarp = kNumSubBlockRows * 2;       // 8

@@ -32,7 +32,11 @@ typedef uint32_t v2ui __attribute__((ext_vector_type(2)));
 typedef uint32_t v4ui __attribute__((ext_vector_type(4)));
 typedef uint32_t v8ui __attribute__((ext_vector_type(8)));
 
-template <typename q_t_, typename kv_t_, typename out_t_, int32_t kPageSize_ = 1>
+template <typename q_t_, typename kv_t_, typename out_t_,
+          int32_t kNumWarps_,
+          int32_t kOccupancy_,
+          int32_t kBlockM_,
+          int32_t kPageSize_>
 struct HkMlaDecodeFwdTraits
 {
     static constexpr int32_t kKvNumHead     = 1;
@@ -44,14 +48,15 @@ struct HkMlaDecodeFwdTraits
     static constexpr int32_t kPageSize      = kPageSize_;
     static_assert(kPageSize >= 1 && (kPageSize & (kPageSize - 1)) == 0,
                   "kPageSize must be a positive power of 2.");
-    static constexpr int32_t kNumWarps      = 8;
+    static constexpr int32_t kNumWarps      = kNumWarps_;
     static constexpr int32_t kNumThreads    = kNumWarps * opus::get_warp_size();
-    static constexpr int32_t kOccupancy     = 1;
-    static constexpr int32_t kBlockM        = 128; // Block=ThreadBlock
+    static constexpr int32_t kOccupancy     = kOccupancy_;
+    static constexpr int32_t kBlockM        = kBlockM_; // Block=ThreadBlock
     static constexpr int32_t kBlockN        = 32;
     static constexpr int32_t kBlockK        = 32;
     static constexpr int32_t kTileM         = kBlockM / kNumWarps; // Tile=ThreadWarp
     static constexpr int32_t kNumTilesM     = kBlockM / kTileM;
+    static_assert(kTileM == 16, "kTileM must be 16 (kBlockM / kNumWarps).");
     static constexpr int32_t kRoundMode     = 1; // 0: round to nearest even.
                                                  // 1: round to nearest away.
                                                  // 2: round to zero

@@ -689,7 +689,7 @@ def clone_3rdparty(third_party: str) -> None:
         dir_path = HIP_KITTENS_DIR
         third_party_info = {
             "url": "https://github.com/HazyResearch/HipKittens.git",
-            "commit": "b027c06ba935b80a53a7c7f7f82c0f9cbd0bf3cb",
+            "commit": "a5e308a7ec633b1e94a952de629f41653a0874f3",
         }
     elif third_party == "ComposableKernel":
         # TODO: ComposableKernel will be supported in the future
