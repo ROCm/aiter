@@ -36,11 +36,14 @@ def fp32_to_e2m1(val: torch.Tensor) -> torch.Tensor:
     mag = torch.where(a >= 0.75, torch.tensor(2, dtype=torch.uint8, device=dev), mag)
     mag = torch.where(a >= 1.25, torch.tensor(3, dtype=torch.uint8, device=dev), mag)
     mag = torch.where(a >= 1.75, torch.tensor(4, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 2.5,  torch.tensor(5, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 3.5,  torch.tensor(6, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 5.0,  torch.tensor(7, dtype=torch.uint8, device=dev), mag)
-    sign = torch.where(val < 0, torch.tensor(8, dtype=torch.uint8, device=dev),
-                       torch.tensor(0, dtype=torch.uint8, device=dev))
+    mag = torch.where(a >= 2.5, torch.tensor(5, dtype=torch.uint8, device=dev), mag)
+    mag = torch.where(a >= 3.5, torch.tensor(6, dtype=torch.uint8, device=dev), mag)
+    mag = torch.where(a >= 5.0, torch.tensor(7, dtype=torch.uint8, device=dev), mag)
+    sign = torch.where(
+        val < 0,
+        torch.tensor(8, dtype=torch.uint8, device=dev),
+        torch.tensor(0, dtype=torch.uint8, device=dev),
+    )
     return sign | mag
 
 
@@ -65,10 +68,18 @@ def ref_quant_mxfp4_even_round(inp: torch.Tensor, group_size: int = 32):
     return packed, scale_e8m0
 
 
-@pytest.mark.parametrize("shape", [
-    (4096, 128), (4096, 256), (4096, 1024),
-    (1, 32), (3, 128), (125, 64), (4097, 256),
-])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4096, 128),
+        (4096, 256),
+        (4096, 1024),
+        (1, 32),
+        (3, 128),
+        (125, 64),
+        (4097, 256),
+    ],
+)
 @pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
 def test_no_shuffle(shape, float_dtype):
     torch.manual_seed(42)
@@ -79,23 +90,31 @@ def test_no_shuffle(shape, float_dtype):
     py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
 
     scale_hip_u8 = scale_hip.view(torch.uint8).cpu()
-    assert torch.equal(scale_hip_u8, py_scale), (
-        f"Scale mismatch: {(scale_hip_u8 != py_scale).sum()} elements differ"
-    )
+    assert torch.equal(
+        scale_hip_u8, py_scale
+    ), f"Scale mismatch: {(scale_hip_u8 != py_scale).sum()} elements differ"
 
     packed_hip_u8 = packed_hip.view(torch.uint8).cpu()
     diff = (packed_hip_u8.to(torch.int16) - py_packed.to(torch.int16)).abs()
     bad = (diff > 0) & (diff != 1) & (diff != 16) & (diff != 17)
-    assert not bad.any(), (
-        f"Packed diff too large for shape {shape}: max={diff.max().item()}"
-    )
+    assert (
+        not bad.any()
+    ), f"Packed diff too large for shape {shape}: max={diff.max().item()}"
 
 
-@pytest.mark.parametrize("shape", [
-    (4096, 128), (4096, 256), (4096, 1024),
-    (16, 64), (48, 64),
-    (32, 192), (80, 320), (256, 96),
-])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4096, 128),
+        (4096, 256),
+        (4096, 1024),
+        (16, 64),
+        (48, 64),
+        (32, 192),
+        (80, 320),
+        (256, 96),
+    ],
+)
 @pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
 def test_e8m0_shuffle(shape, float_dtype):
     rows, cols = shape
@@ -119,30 +138,42 @@ def test_e8m0_shuffle(shape, float_dtype):
 
     packed_out_u8 = packed_out.view(torch.uint8).cpu()
     expected_w_u8 = expected_w.view(torch.uint8).cpu()
-    assert torch.equal(packed_out_u8, expected_w_u8), (
-        f"E8M0 weight mismatch: {(packed_out_u8 != expected_w_u8).sum()} differ"
-    )
+    assert torch.equal(
+        packed_out_u8, expected_w_u8
+    ), f"E8M0 weight mismatch: {(packed_out_u8 != expected_w_u8).sum()} differ"
 
     scale_ref_u8 = scale_ref.view(torch.uint8).flatten().cpu()
     scale_out_u8 = scale_out.view(torch.uint8).flatten().cpu()
 
     def _fp4_scale_shuffle_id(scaleN_pad, x, y):
-        return ((x // 32 * scaleN_pad) * 32 + (y // 8) * 256
-                + (y % 4) * 64 + (x % 16) * 4 + (y % 8) // 4 * 2 + (x % 32) // 16)
+        return (
+            (x // 32 * scaleN_pad) * 32
+            + (y // 8) * 256
+            + (y % 4) * 64
+            + (x % 16) * 4
+            + (y % 8) // 4 * 2
+            + (x % 32) // 16
+        )
 
     for row in range(rows):
         for g in range(scaleN):
             si = _fp4_scale_shuffle_id(scaleN_pad, row, g)
             li = row * scaleN + g
-            assert scale_out_u8[si].item() == scale_ref_u8[li].item(), (
-                f"Scale shuffle mismatch at row={row}, group={g}"
-            )
+            assert (
+                scale_out_u8[si].item() == scale_ref_u8[li].item()
+            ), f"Scale shuffle mismatch at row={row}, group={g}"
 
 
-@pytest.mark.parametrize("shape", [
-    (4096, 256), (4096, 1024),
-    (32, 256), (64, 512), (96, 256),
-])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4096, 256),
+        (4096, 1024),
+        (32, 256),
+        (64, 512),
+        (96, 256),
+    ],
+)
 @pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("gate_up", [False, True])
 def test_a16w4_shuffle(shape, float_dtype, gate_up):
@@ -166,7 +197,8 @@ def test_a16w4_shuffle(shape, float_dtype, gate_up):
     ).squeeze(0)
     expected_s = shuffle_scale_a16w4(
         scale_ref.view(torch.uint8).reshape(rows, scaleN),
-        experts_cnt=1, gate_up=gate_up,
+        experts_cnt=1,
+        gate_up=gate_up,
     )
 
     packed_out_u8 = packed_out.view(torch.uint8).cpu()
@@ -217,16 +249,42 @@ def test_single_group():
 @pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
 def test_e2m1_boundary_values(float_dtype):
     boundary_vals = [
-        0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75,
-        2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, -6.0,
-        0.0, 0.24, 0.26, 0.74, 0.76, 1.24, 1.26, 1.74,
-        1.76, 2.49, 2.51, 3.49, 3.51, 4.99, 5.01, -0.25,
+        0.0,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        1.25,
+        1.5,
+        1.75,
+        2.0,
+        2.5,
+        3.0,
+        3.5,
+        4.0,
+        5.0,
+        6.0,
+        -6.0,
+        0.0,
+        0.24,
+        0.26,
+        0.74,
+        0.76,
+        1.24,
+        1.26,
+        1.74,
+        1.76,
+        2.49,
+        2.51,
+        3.49,
+        3.51,
+        4.99,
+        5.01,
+        -0.25,
     ]
     inp = torch.tensor([boundary_vals], dtype=float_dtype, device="cuda")
     packed, scale = quant_mxfp4_even_round_hip(inp, group_size=32)
-    py_packed, py_scale = ref_quant_mxfp4_even_round(
-        inp.cpu(), group_size=32
-    )
+    py_packed, py_scale = ref_quant_mxfp4_even_round(inp.cpu(), group_size=32)
     assert torch.equal(scale.view(torch.uint8).cpu(), py_scale)
     packed_u8 = packed.view(torch.uint8).cpu()
     diff = (packed_u8.to(torch.int16) - py_packed.to(torch.int16)).abs()

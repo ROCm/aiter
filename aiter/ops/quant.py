@@ -694,8 +694,7 @@ def quant_mxfp4_even_round(
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
     shuffle_weight: bool = False,
-) -> None:
-    ...
+) -> None: ...
 
 
 def quant_mxfp4_even_round_hip(
@@ -724,13 +723,19 @@ def quant_mxfp4_even_round_hip(
             rows_pad, scaleN_pad, dtype=torch.uint8, device=x.device
         ).view(fp8_e8m0)
     else:
-        out_scale = torch.empty(
-            rows, scaleN, dtype=torch.uint8, device=x.device
-        ).view(fp8_e8m0)
+        out_scale = torch.empty(rows, scaleN, dtype=torch.uint8, device=x.device).view(
+            fp8_e8m0
+        )
 
     quant_mxfp4_even_round(
-        x, out_packed, out_scale, group_size,
-        e8m0_shuffle, a16w4_shuffle, gate_up, shuffle_weight,
+        x,
+        out_packed,
+        out_scale,
+        group_size,
+        e8m0_shuffle,
+        a16w4_shuffle,
+        gate_up,
+        shuffle_weight,
     )
     return out_packed, out_scale
 
