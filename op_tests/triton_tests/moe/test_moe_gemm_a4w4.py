@@ -10,6 +10,7 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+    is_gluon_supported,
     mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
@@ -238,6 +239,10 @@ def test_op(
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
             )
+
+    # skip gluon backend if not supported
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip(f"Gluon backend is not supported on {get_arch()}")
 
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)
