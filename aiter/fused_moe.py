@@ -22,6 +22,7 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 BLOCK_SIZE_M = 32
 
 _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+_ACT_TYPE_DISABLED_KEY = "__ignore__"
 
 
 def _moe_sorting_impl(
@@ -141,6 +142,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    swiglu_limit=0.0,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -166,6 +168,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -227,6 +230,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -264,7 +268,6 @@ def fused_moe_(
     ):
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    bf16_fp8_bound = 0 
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -362,6 +365,8 @@ def fused_moe_(
             intermediate_pad=intermediate_pad,
             bias1=bias1,
             bias2=bias2,
+            # only for flydsl dsv4
+            swiglu_limit=swiglu_limit,
         )
 
 
@@ -772,8 +777,20 @@ def get_2stage_cfgs(
         import pandas as pd
 
         df = pd.read_csv(tune_file)
+        # Keep CSV schema unchanged but disable act_type during lookup.
+        if "act_type" in df.columns:
+            df["act_type"] = _ACT_TYPE_DISABLED_KEY
         if "_tag" in df.columns:
             df = df[df["_tag"].fillna("") == ""]
+        # Disabling act_type can merge multiple rows into the same lookup key.
+        # Keep the first row deterministically to avoid index collisions.
+        dup_mask = df.duplicated(subset=_INDEX_COLS, keep="first")
+        if dup_mask.any():
+            logger.warning(
+                f"[fused_moe] duplicate tuned rows after disabling act_type in {tune_file}; "
+                f"keeping first match for {int(dup_mask.sum())} rows"
+            )
+            df = df.loc[~dup_mask]
         df = df.set_index(_INDEX_COLS).to_dict("index")
         return df
 
@@ -792,10 +809,19 @@ def get_2stage_cfgs(
         if "_tag" not in df.columns:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
+        if "act_type" in df.columns:
+            df["act_type"] = _ACT_TYPE_DISABLED_KEY
         fb_df = df[df["_tag"] == "flydsl_fallback"]
         if fb_df.empty:
             _flydsl_fallback_cache[tune_file] = {}
             return {}
+        dup_mask = fb_df.duplicated(subset=_INDEX_COLS, keep="first")
+        if dup_mask.any():
+            logger.warning(
+                f"[fused_moe] duplicate fallback rows after disabling act_type in {tune_file}; "
+                f"keeping first match for {int(dup_mask.sum())} rows"
+            )
+            fb_df = fb_df.loc[~dup_mask]
         result = fb_df.set_index(_INDEX_COLS).to_dict("index")
         _flydsl_fallback_cache[tune_file] = result
         return result
@@ -815,7 +841,7 @@ def get_2stage_cfgs(
         inter_dim,
         expert,
         topk,
-        str(activation),
+        _ACT_TYPE_DISABLED_KEY,
         str(dtype),
         str(q_dtype_a),
         str(q_dtype_w),
@@ -1544,6 +1570,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
+    swiglu_limit=0.0,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
@@ -1627,8 +1654,11 @@ def torch_moe_stage1(
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
         if use_swiglu:
-            out = swiglu(gate, up)
+            out = swiglu(gate, up, limit=swiglu_limit)
         else:
+            if swiglu_limit != 0:
+                gate = gate.clamp(min=None, max=swiglu_limit)
+                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
             out = torch_act(gate) * up
     else:
         out = torch_act(out)

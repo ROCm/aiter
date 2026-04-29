@@ -37,6 +37,7 @@ def build_silu_and_mul_fq_module(
     topk: int,
     quant_mode: str = "fp4",
     gui_layout: bool = False,
+    swiglu_limit: float = 0.0,
 ):
     """Return a JIT launcher for fused silu_and_mul + optional quant + scale sort.
 
@@ -246,6 +247,9 @@ def build_silu_and_mul_fq_module(
                     up_f32 = up_bf16.extf(vec_f32_ty)
 
                     neg_log2e = arith.constant(-1.4426950408889634, type=f32)
+                    if const_expr(swiglu_limit != 0):
+                        _limit = arith.constant(float(swiglu_limit), type=f32)
+                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
                     act_vals = []
                     for vi in range_constexpr(VEC):
                         g = vector.extract(
@@ -254,6 +258,10 @@ def build_silu_and_mul_fq_module(
                         u = vector.extract(
                             up_f32, static_position=[vi], dynamic_position=[]
                         )
+                        if const_expr(swiglu_limit != 0):
+                            g = arith.minimumf(g, _limit)
+                            u = arith.minimumf(u, _limit)
+                            u = arith.maximumf(u, _neg_limit)
                         t = g * neg_log2e
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []

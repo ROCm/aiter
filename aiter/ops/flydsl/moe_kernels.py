@@ -536,11 +536,12 @@ def _get_compiled_silu_fused(
     topk: int,
     quant_mode: str = "fp4",
     gui_layout: bool = False,
+    swiglu_limit: float = 0.0,
 ):
     """Compile and cache the fused silu_and_mul + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
-    return build_silu_and_mul_fq_module(inter_dim, topk, quant_mode, gui_layout)
+    return build_silu_and_mul_fq_module(inter_dim, topk, quant_mode, gui_layout, swiglu_limit)
 
 
 # Public API
@@ -763,7 +764,7 @@ def flydsl_moe_stage1(
     if _gui_sk_fused:
         _quant_mode = "fp4" if _need_fp4 else "fp8"
         _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim, topk, _quant_mode, gui_layout=True
+            inter_dim, topk, _quant_mode, gui_layout=True, swiglu_limit=swiglu_limit
         )
         _run_compiled(
             _silu_fused_k,
@@ -780,7 +781,7 @@ def flydsl_moe_stage1(
         )
     elif _gui_sk:
         _silu_fused_k = _get_compiled_silu_fused(
-            inter_dim, topk, "none", gui_layout=True
+            inter_dim, topk, "none", gui_layout=True, swiglu_limit=swiglu_limit
         )
         _run_compiled(
             _silu_fused_k,
@@ -796,7 +797,7 @@ def flydsl_moe_stage1(
             ),
         )
     elif _splitk_fp4:
-        _silu_fused_k = _get_compiled_silu_fused(inter_dim, topk)
+        _silu_fused_k = _get_compiled_silu_fused(inter_dim, topk, swiglu_limit=swiglu_limit)
         _run_compiled(
             _silu_fused_k,
             (

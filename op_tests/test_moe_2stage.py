@@ -57,6 +57,7 @@ def test_fmoe(
     intermediate_pad=0,
     preshuffle=True,
     strict_accuracy=True,
+    swiglu_limit=0.0,
 ):
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
@@ -216,6 +217,7 @@ def test_fmoe(
         w1_scale=w1_scale,
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
+        swiglu_limit=swiglu_limit,
     )
 
     # ######################## stage 2 start ###########
@@ -266,6 +268,7 @@ def test_fmoe(
         hidden_pad=hidden_pad,
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
+        swiglu_limit=swiglu_limit,
         num_iters=5,
         num_warmup=2,
     )
@@ -442,6 +445,13 @@ parser.add_argument(
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
 )
+parser.add_argument(
+    "--swiglu-limit",
+    "-sl",
+    type=float,
+    default=0.0,
+    help="Limit the number of experts for swiglu activation type. Default is 0.0.",
+)
 
 args = parser.parse_args()
 
@@ -549,6 +559,12 @@ def _effective_act_type(quant_type, aq_dtype, wq_dtype, act_type):
     return act_type
 
 
+def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
+    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+        return swiglu_limit
+    return 0.0
+
+
 def _iter_legacy_cases():
     """Yield (kwargs, extras) for the original CLI-driven sweep."""
     extras = {"model": "legacy"}
@@ -654,7 +670,28 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
-    ret = test_fmoe(**kwargs)
+    swiglu_limit = _effective_swiglu_limit(
+        kwargs["qType"],
+        kwargs["AQDType"],
+        kwargs["WQDType"],
+        args.swiglu_limit,
+    )
+    _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+    _force_moe_bound_zero = (
+        kwargs["qType"],
+        kwargs["AQDType"],
+        kwargs["WQDType"],
+    ) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4)
+    if _force_moe_bound_zero:
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+    try:
+        ret = test_fmoe(**kwargs, swiglu_limit=swiglu_limit)
+    finally:
+        if _force_moe_bound_zero:
+            if _old_moe_bound is None:
+                os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+            else:
+                os.environ["AITER_BF16_FP8_MOE_BOUND"] = _old_moe_bound
     if ret is None:
         continue
     ret.update(extras)

@@ -274,10 +274,6 @@ def compile_mixed_moe_gemm1(
     _gui_tag = "_gui" if gate_up_interleave else ""
     _as1_tag = "_as1" if a_scale_one else ""
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
-    _act_tag = "" if act == "silu" else f"_{act}"
-    _slim_tag = (
-        f"_slim{str(swiglu_limit).replace('.', 'p')}" if swiglu_limit != 0 else ""
-    )
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
         f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_fp8q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}{_gui_tag}{_as1_tag}{_xcd_tag}_v32"
