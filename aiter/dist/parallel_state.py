@@ -453,6 +453,23 @@ class GroupCoordinator:
             prefill_support=prefill_support,
         )
 
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
+            input_, residual_inp_, weight_, eps, group_size, prefill_support,
+            emit_bf16=emit_bf16,
+        )
+
     def _fused_allreduce_rmsnorm_out_place(
         self,
         input_: torch.Tensor,
@@ -1003,6 +1020,7 @@ def init_model_parallel_group(
     group_ranks: List[List[int]],
     local_rank: int,
     backend: str,
+    use_device_communicator: bool = True,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
 ) -> GroupCoordinator:
@@ -1010,7 +1028,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_device_communicator=True,
+        use_device_communicator=use_device_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
     )
@@ -1051,6 +1069,76 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
+def has_custom_group() -> bool:
+    """Return whether any custom group is initialized."""
+    return bool(_CUSTOM)
+
+
+class CustomGroupConfig:
+    """Configuration builder for custom communication groups.
+
+    Each group is defined by a rank list that can be:
+    - 1D List[int]: all ranks form a single communication group,
+      e.g. [0,1,2,3,4,5,6,7] → one TP8 group
+    - 2D List[List[int]]: multiple independent subgroups,
+      e.g. [[0,1,2,3],[4,5,6,7]] → two independent TP4 groups
+
+    Usage:
+        config = CustomGroupConfig()
+        config.add_group("tp_group", [[0,1,2,3],[4,5,6,7]])
+        config.add_group("dp_group", [[0,4],[1,5],[2,6],[3,7]])
+        ensure_model_parallel_initialized(..., custom_group_config=config.data())
+
+    Or pass a raw dict directly:
+        ensure_model_parallel_initialized(..., custom_group_config={
+            "tp_group": [[0,1,2,3],[4,5,6,7]],
+            "dp_group": [[0,4],[1,5],[2,6],[3,7]],
+        })
+    """
+
+    def __init__(self):
+        self._groups: Dict[str, List] = {}
+
+    def add_group(
+        self,
+        name: str,
+        ranks: List,
+    ) -> "CustomGroupConfig":
+        assert name not in self._groups, f"custom group '{name}' already exists"
+        assert ranks, f"custom group '{name}': ranks list must not be empty"
+        self._groups[name] = ranks
+        return self
+
+    def data(self) -> Dict[str, List]:
+        assert self._groups, "no custom groups have been added"
+        return dict(self._groups)
+
+
+_CUSTOM: Dict[str, "GroupCoordinator"] = {}
+
+
+def get_custom_group(
+    name: Optional[str] = None,
+) -> "Union[GroupCoordinator, Dict[str, GroupCoordinator]]":
+    """Get custom group coordinator(s).
+
+    - If only one custom group is initialized, returns the GroupCoordinator
+      instance directly (name is optional).
+    - If multiple custom groups are initialized and name is None, returns the
+      full dict so the caller can select by name.
+    - If name is given, returns that specific GroupCoordinator.
+    """
+    assert _CUSTOM, "custom allreduce group is not initialized"
+    if name is not None:
+        assert name in _CUSTOM, (
+            f"custom group '{name}' not found, " f"available: {list(_CUSTOM.keys())}"
+        )
+        return _CUSTOM[name]
+    if len(_CUSTOM) == 1:
+        return next(iter(_CUSTOM.values()))
+    return dict(_CUSTOM)
+
+
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
 
@@ -1070,10 +1158,20 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
-        context
-    ):
-        yield context
+    if _CUSTOM:
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            context = stack.enter_context(get_tp_group().graph_capture())
+            stack.enter_context(get_pp_group().graph_capture(context))
+            for group in _CUSTOM.values():
+                stack.enter_context(group.graph_capture(context))
+            yield context
+    else:
+        with get_tp_group().graph_capture() as context, get_pp_group().graph_capture(
+            context
+        ):
+            yield context
 
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
@@ -1150,6 +1248,7 @@ def initialize_model_parallel(
     # decode_context_model_parallel_size: Optional[int] = 1,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
+    custom_group_config: Optional[Dict[str, List]] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1160,6 +1259,12 @@ def initialize_model_parallel(
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
         backend: name of torch distributed communication backend.
+        custom_group_config: optional dict mapping group names to rank lists.
+            Each value can be:
+            - 1D List[int]: all ranks form a single group,
+              e.g. [0,1,2,3,4,5,6,7]
+            - 2D List[List[int]]: multiple independent subgroups,
+              e.g. [[0,1,2,3],[4,5,6,7]]
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1200,6 +1305,11 @@ def initialize_model_parallel(
         -1, data_parallel_size, pipeline_model_parallel_size, tensor_model_parallel_size
     )  # noqa
 
+    # When custom groups are provided, all communication goes through them
+    # (standard ops assert via _assert_no_custom_group). Skip expensive
+    # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
+    need_std_comm = custom_group_config is None
+
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
@@ -1211,6 +1321,7 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
+        use_device_communicator=need_std_comm,
         use_message_queue_broadcaster=True,
         group_name="tp",
     )
@@ -1240,7 +1351,11 @@ def initialize_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pp"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="pp",
     )
 
     global _DP
@@ -1248,7 +1363,11 @@ def initialize_model_parallel(
     group_ranks = all_ranks.transpose(1, 3).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     _DP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="dp"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="dp",
     )
 
     global _EP
@@ -1260,8 +1379,64 @@ def initialize_model_parallel(
     )
     group_ranks = [x.tolist() for x in group_ranks]
     _EP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="ep"
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_device_communicator=need_std_comm,
+        group_name="ep",
     )
+
+    # Build the custom allreduce group(s) (optional).
+    global _CUSTOM
+    assert not _CUSTOM, "custom allreduce group is already initialized"
+    if custom_group_config is not None:
+        for gname, ranks in custom_group_config.items():
+            assert (
+                isinstance(ranks, list) and len(ranks) > 0
+            ), f"custom group '{gname}': value must be a non-empty list"
+
+            if all(isinstance(r, int) for r in ranks):
+                # 1D list: all ranks form a single group
+                group_ranks = [ranks]
+            elif all(isinstance(g, list) for g in ranks):
+                # 2D list: multiple independent subgroups
+                group_ranks = ranks
+                subgroup_size = len(group_ranks[0])
+                for g in group_ranks:
+                    assert len(g) == subgroup_size, (
+                        f"custom group '{gname}': all subgroups must "
+                        f"have the same size, expected {subgroup_size} "
+                        f"but got {len(g)}"
+                    )
+                    assert all(isinstance(r, int) for r in g), (
+                        f"custom group '{gname}': subgroup elements "
+                        f"must be integers"
+                    )
+            else:
+                raise AssertionError(
+                    f"custom group '{gname}': value must be List[int] "
+                    f"(1D) or List[List[int]] (2D)"
+                )
+
+            all_ranks_flat = [r for g in group_ranks for r in g]
+            assert len(all_ranks_flat) == world_size, (
+                f"custom group '{gname}': total ranks "
+                f"({len(all_ranks_flat)}) must equal world_size "
+                f"({world_size})"
+            )
+            assert (
+                len(set(all_ranks_flat)) == world_size
+            ), f"custom group '{gname}': contains duplicate ranks"
+            assert set(all_ranks_flat) == set(range(world_size)), (
+                f"custom group '{gname}': must cover all ranks " f"0..{world_size - 1}"
+            )
+
+            _CUSTOM[gname] = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name=f"custom_{gname}",
+            )
 
     logger.info(
         "rank %s in world size %s is assigned as "
@@ -1280,6 +1455,7 @@ def ensure_model_parallel_initialized(
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
+    custom_group_config: Optional[Dict[str, List]] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1292,6 +1468,7 @@ def ensure_model_parallel_initialized(
             pipeline_model_parallel_size,
             backend,
             data_parallel_size,
+            custom_group_config=custom_group_config,
         )
         return
 
@@ -1372,6 +1549,11 @@ def destroy_model_parallel():
     if _EP:
         _EP.destroy()
     _EP = None
+
+    global _CUSTOM
+    for group in _CUSTOM.values():
+        group.destroy()
+    _CUSTOM = {}
 
 
 def destroy_distributed_environment():
