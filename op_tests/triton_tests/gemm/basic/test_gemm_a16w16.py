@@ -40,15 +40,29 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
 
 def get_x_vals():
-    x_vals = [(1, 1, 1)]  # minimal case
-    x_vals += [(3, 5, 2)]  # irregular shape
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
-    # GPT-OSS-120B attention projections
-    x_vals += [(2**i, 5120, 2880) for i in range(5, 9)]  # GPTOSS QKV input projection
-    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
-    x_vals += [(2**i, 128, 2880) for i in range(5, 9)]  # Router GEMM
-    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
+    x_vals = [
+        (1, 1, 1),
+        (1, 16, 16),
+        (16, 1, 16),
+        (16, 16, 1),
+        # Irregular shapes (masking & OOB)
+        (3, 5, 7),
+        (17, 33, 65),
+        (63, 127, 255),
+        (65, 129, 257),
+        #
+        (64, 64, 64),
+        (128, 128, 128),
+        # Multiple blocks
+        (128, 256, 512),
+        (256, 512, 256),
+        # Asymmetric shapes
+        (32, 256, 128),
+        (256, 32, 128),
+        (128, 128, 1024),
+        (1024, 128, 128),
+        (1536, 512, 768),
+    ]
     return x_vals
 
 
@@ -65,27 +79,28 @@ def test_gemm_a16_w16(M: int, N: int, K: int):
 
     torch_out = F.linear(x, w, bias=None)
 
-    triton_out = gemm_a16w16(
-        x,
-        w,
-    )
+    triton_out = gemm_a16w16(x, w)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
 # Smaller set for testing activations, setting the output tensor and dtype
 def get_fewer_x_vals():
-    x_vals = [(16, 1024, 1024)]
-    x_vals += [(128, 8192, 512)]
-    x_vals += [(256, 512, 8192)]
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 5, 8)]
+    x_vals = [
+        (64, 64, 64),
+        (128, 256, 512),
+        (256, 512, 256),
+        (128, 128, 1024),
+        (1024, 128, 128),
+        (1536, 512, 768),
+    ]
     return x_vals
 
 
 # A smaller set of shapes that tests fused activations, different dtypes
 # and output tensor arg. We don't want the larger set above to test
 # all these combinations.
-@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
+@pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu", "silu_exp2"])
 @pytest.mark.parametrize("M, N, K", get_fewer_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
@@ -103,23 +118,16 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
         torch_out = F.gelu(torch_out)
     elif activation == "gelu_tanh":
         torch_out = F.gelu(torch_out, approximate="tanh")
-    elif activation == "silu":
+    elif activation in ("silu", "silu_exp2"):
         torch_out = F.silu(torch_out)
 
-    triton_out = gemm_a16w16(
-        x,
-        w,
-        None,
-        out_dtype,
-        y,
-        activation=activation,
-    )
+    triton_out = gemm_a16w16(x, w, None, out_dtype, y, activation=activation)
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
