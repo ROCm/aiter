@@ -700,7 +700,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator.to(OUTPUT_DTYPE),
+                attention_accumulator,
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -995,7 +995,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     store_temporary_result(
         max_logits,
         exp_sums,
-        attention_accumulator.to(OUTPUT_DTYPE),
+        attention_accumulator,
         max_logits_ptr,
         exp_sums_ptr,
         output_ptr,
@@ -1583,7 +1583,7 @@ def paged_attention_decode_sliding_window_head_1(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator.to(OUTPUT_DTYPE),
+                attention_accumulator,
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -2110,8 +2110,6 @@ def paged_attention_decode_sliding_window_head_1(
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
 
-    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
-
     if not ONE_SHOT:
         # Store results to global memory
         store_temporary_result(
@@ -2127,6 +2125,7 @@ def paged_attention_decode_sliding_window_head_1(
             output_mask,
         )
     else:
+        attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
         if QUERY_SEQ_LEN_POW2 == 1:
             attention_accumulator = gl.reshape(
                 attention_accumulator,
@@ -2655,7 +2654,7 @@ def paged_attention_decode_sliding_window(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator.to(OUTPUT_DTYPE),
+                attention_accumulator,
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -3103,8 +3102,6 @@ def paged_attention_decode_sliding_window(
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
 
-    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
-
     if not ONE_SHOT:
         # Store results to global memory
         store_temporary_result(
@@ -3120,6 +3117,7 @@ def paged_attention_decode_sliding_window(
             output_mask,
         )
     else:
+        attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
         # Reshape to 3D and store
         # attention_accumulator is [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
         # Reshape to [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
@@ -3642,7 +3640,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator.to(OUTPUT_DTYPE),
+                attention_accumulator,
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -3941,7 +3939,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
-    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
 
     # Store results to global memory
     store_temporary_result(
@@ -5336,7 +5333,7 @@ def pa_decode_gluon(
     temporary_output : torch.Tensor
         Buffer for partial attention outputs from each context partition.
         - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
-        - Dtype: torch.float32
+        - Dtype: torch.float32 for multi-partition decode; output dtype for one-shot decode
 
     alibi_slopes : torch.Tensor, optional
         ALiBi (Attention with Linear Biases) slopes for positional encoding.
@@ -5451,7 +5448,7 @@ def pa_decode_gluon(
             equivalent_query_group_size,
             head_size,
             device=query.device,
-            dtype=query.dtype,
+            dtype=aiter.dtypes.fp32,
         )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
