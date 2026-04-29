@@ -1553,7 +1553,36 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
         }
     }
 
-    mrope_utils::warp_rms_norm_<T, VEC_SIZE>(x_vec, w_vec, HEAD_SIZE, eps);
+    // ===========================================================
+    // Inline RMSNorm (vs the shared mrope_utils::warp_rms_norm_)
+    // ===========================================================
+    // Cache the FP32 reads of x_vec[i] in v[] so the writeback loop doesn't
+    // re-read bf16 from x_vec (would be redundant v_lshlrev_b32 conversions),
+    // then pack the result via pack_f32_to_vec_t (10 instr per bf16x2 pair vs
+    // the compiler default ~26 instr — see f32x2_to_bf16x2_rne in
+    // rope_common.h). Bit-exact RNE equivalent to warp_rms_norm_ — only
+    // difference is NaN payload normalisation (canonical 0x7fff bf16 NaN).
+    {
+        float v[VEC_SIZE];
+        float acc = 0.f;
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE; ++i)
+        {
+            v[i] = (float)x_vec[i];
+            acc += v[i] * v[i];
+        }
+        acc         = mrope_utils::block_utils::warp_reduce_sum<float>(acc);
+        float s_val = rsqrtf(acc / (float)HEAD_SIZE + eps);
+
+        float n[VEC_SIZE];
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE; ++i)
+        {
+            n[i] = v[i] * s_val * (float)w_vec[i];
+        }
+        mrope_utils::pack_f32_to_vec_t(x_vec, n);
+    }
+
     vec_t<T, VEC_SIZE> out_vec;
 
     if constexpr(IS_NEOX)
@@ -1564,35 +1593,44 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
             cos_sin_vec, opus::number<NEIGHBOR_XOR>{});
         auto nb_x_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_SIZE>(
             x_vec, opus::number<NEIGHBOR_XOR>{});
-        if(is_lower_half)
-        {
+
+        // Replace the divergent `if(is_lower_half){}else{}` (which made the
+        // compiler emit two copies of the RoPE math AND the FP32→bf16 cvt
+        // sequence with s_and_saveexec / s_xor / s_or EXEC mask flips between
+        // them) with a per-lane v_cndmask select. Both expressions are
+        // evaluated in the SAME FP32 op order as the original divergent code
+        // (mul + mul + sub for lower, mul + mul + add for upper) — bit-exact
+        // equivalent. Then a single pack_f32_to_vec_t cvt path is reused for
+        // every lane.
+        float out_f32[VEC_SIZE];
 #pragma unroll
-            for(int i = 0; i < VEC_SIZE; ++i)
-            {
-                out_vec[i] = (float)x_vec[i] * (float)cos_sin_vec[i] -
-                             (float)nb_x_vec[i] * (float)nb_cos_sin_vec[i]; // x0 * cos - x1 * sin
-            }
-        }
-        else
+        for(int i = 0; i < VEC_SIZE; ++i)
         {
-#pragma unroll
-            for(int i = 0; i < VEC_SIZE; ++i)
-            {
-                out_vec[i] = (float)x_vec[i] * (float)nb_cos_sin_vec[i] +
-                             (float)nb_x_vec[i] * (float)cos_sin_vec[i]; // x1 * cos + x0 * sin
-            }
+            const float c   = (float)cos_sin_vec[i];
+            const float nc  = (float)nb_cos_sin_vec[i];
+            const float x0  = (float)x_vec[i];
+            const float nx0 = (float)nb_x_vec[i];
+
+            const float lower = x0 * c - nx0 * nc;  // matches old lower branch
+            const float upper = x0 * nc + nx0 * c;  // matches old upper branch
+            out_f32[i]        = is_lower_half ? lower : upper;
         }
+        mrope_utils::pack_f32_to_vec_t(out_vec, out_f32);
     }
     else
     {
+        // Stage RoPE results in FP32 then pack via pack_f32_to_vec_t for the
+        // same conversion-instruction-count win as the RMSNorm writeback.
+        float out_f32[VEC_SIZE];
 #pragma unroll
         for(int i = 0; i < VEC_SIZE / 2; ++i)
         {
-            out_vec[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
+            out_f32[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
                                  (float)x_vec[2 * i + 1] * (float)sin_vec[i];
-            out_vec[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] +
+            out_f32[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] +
                                  (float)x_vec[2 * i + 0] * (float)sin_vec[i];
         }
+        mrope_utils::pack_f32_to_vec_t(out_vec, out_f32);
     }
 
     if(is_q)
