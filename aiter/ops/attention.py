@@ -939,7 +939,7 @@ def get_mla_metadata_info_v1(
         int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16
         or (
-            get_gfx() == "gfx942"
+            get_gfx() in ("gfx942", "gfx950")
             and num_head_qo == 128
             and kv_dtype == dtypes.fp8
             and q_dtype == dtypes.fp8
@@ -1252,7 +1252,7 @@ def decode_update_mla_metadata_v1(
             and max_seqlen_qo == 4
         )
         or (
-            arch_id == "gfx942"
+            arch_id in ("gfx942", "gfx950")
             and num_heads_per_head_k == 128
             and q_is_fp8
             and kv_is_fp8
