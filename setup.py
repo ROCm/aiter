@@ -79,16 +79,6 @@ if not IS_WINDOWS and is_develop_mode():
     except Exception:
         pass
 
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "uninstall", "-y", "amd-triton"],
-        )
-    except Exception:
-        pass
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "amd-triton"],
-    )
-
 
 def write_install_mode():
     """Write install_mode so core.py uses aiter_meta/ (install) vs repo root (develop).
@@ -417,7 +407,6 @@ else:
         "psutil",
         "packaging",
         FLYDSL_VERSION,
-        "amd-triton",
     ]
 
 setup(

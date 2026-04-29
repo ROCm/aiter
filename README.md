@@ -115,7 +115,11 @@ pip install -r requirements.txt
 
 ### Triton
 
-AITER includes Triton-based operators that require [amd-triton](https://pypi.org/project/amd-triton/). It is automatically installed during `pip install -e .`.
+AITER includes Triton-based operators that require [amd-triton](https://pypi.org/project/amd-triton/).
+
+```bash
+pip install -r requirements-triton.txt
+```
 
 ### Opus — Lightweight C++ Template for Kernel Development
 
