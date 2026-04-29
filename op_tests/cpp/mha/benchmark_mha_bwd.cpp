@@ -499,15 +499,12 @@ bool run(const ck_tile::ArgParser& arg_parser)
     // Pre-allocated dq_acc_buf serves the workspace_alloc callback (sized to max of
     // ASM dq_accum and CK launcher workspace requirements).
     auto workspace_alloc = [&dq_acc_buf](size_t bytes, bool zero_init) -> void* {
-        if(bytes > dq_acc_buf.GetBufferSize())
-        {
-            std::cerr << "benchmark workspace_alloc: requested " << bytes
-                      << " bytes but dq_acc_buf is " << dq_acc_buf.GetBufferSize() << "\n";
-            return nullptr;
-        }
+        AITER_CHECK(bytes <= dq_acc_buf.GetBufferSize(),
+                    "benchmark workspace_alloc: requested ", bytes,
+                    " bytes but dq_acc_buf is ", dq_acc_buf.GetBufferSize());
         if(zero_init)
         {
-            dq_acc_buf.SetZero();
+            HIP_CHECK_ERROR(hipMemset(dq_acc_buf.GetDeviceBuffer(), 0, bytes));
         }
         return dq_acc_buf.GetDeviceBuffer();
     };

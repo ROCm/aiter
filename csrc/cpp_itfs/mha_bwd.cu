@@ -143,8 +143,13 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     std::vector<int> seqstart_q_host, seqstart_k_host;
     const int* seqstart_qs_ptr = nullptr;
     const int* seqstart_ks_ptr = nullptr;
-    if(a.is_group_mode && a.seqstart_q_ptr != nullptr && a.seqstart_k_ptr != nullptr)
+    if(a.is_group_mode)
     {
+        if(a.seqstart_q_ptr == nullptr || a.seqstart_k_ptr == nullptr)
+        {
+            AITER_LOG_ERROR("mha_bwd: group mode requires seqstart_q_ptr and seqstart_k_ptr");
+            return -1;
+        }
         seqstart_q_host.resize(a.batch + 1);
         seqstart_k_host.resize(a.batch + 1);
         HIP_CALL(hipMemcpy(seqstart_q_host.data(),
