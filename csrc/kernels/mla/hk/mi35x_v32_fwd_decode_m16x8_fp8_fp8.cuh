@@ -363,19 +363,19 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             // GEMM on RoPE
             constexpr uint32_t num_rope_iter = (k_q_rope_end + 1 - k_q_rope_begin) / 4;
-            if constexpr(kSkipCompute == false)
-            {
-                opus::static_for<num_rope_iter>([&](auto idx) {
-                    constexpr uint32_t reg_start = idx.value * 4 + k_q_rope_begin;
-                    using q_range_0 =
-                        hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
-                                            2>;
-                    using q_range_1 = hkdart::
-                        split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
-                    hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
-                    hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
+            opus::static_for<num_rope_iter>([&](auto idx) {
+                constexpr uint32_t reg_start = idx.value * 4 + k_q_rope_begin;
+                using q_range_0 =
+                    hkdart::split_many_t<hkdart::type_list<hkdart::range<reg_start, reg_start + 1>>,
+                                        2>;
+                using q_range_1 = hkdart::
+                    split_many_t<hkdart::type_list<hkdart::range<reg_start + 2, reg_start + 3>>, 2>;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_0> q_0;
+                hk::art<q_t, T::kTileM, T::kBlockK, hk::row_l, hk::rt_16x32_s, q_range_1> q_1;
 
-                    // Load K from LDS to GPR
+                // Load K from LDS to GPR
+                if constexpr(kSkipCompute == false)
+                {
                     constexpr int32_t tile_idx = (reg_start - k_q_rope_begin) / 2;
                     kv_manager.template load_k_to_gpr<0, (tile_idx + 0 + 16) * T::kBlockK>(
                         kv_0, p_lds_kv_curr);
@@ -385,37 +385,40 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                         kv_1, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<16, (tile_idx + 1 + 16) * T::kBlockK>(
                         kv_1, p_lds_kv_curr);
-
-                    asm volatile("s_waitcnt lgkmcnt(2)");
-                    hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
+                }
+                
+                if constexpr((idx.value == 0) && (kIsGlobalLast == false) && (kCheckBoundaryNext == false))
+                {
+                    if((kv_tile_start + 2 * T::kBlockN) < kv_end)
+                    {
+                        if((kv_tile_start + 3 * T::kBlockN) <= kv_end)
+                        {
+                            row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
+                                                                    kv_ld_row_base_idx,
+                                                                    kv_tile_start + 2 * T::kBlockN,
+                                                                    kv_tile_end + 2 * T::kBlockN);
+                        }
+                        else
+                        {
+                            row_kv_ld_next_next = get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices,
+                                                                    kv_ld_row_base_idx,
+                                                                    kv_tile_start + 2 * T::kBlockN,
+                                                                    kv_end);
+                        }
+                    }
+                }
+                
+                if constexpr(kSkipCompute == false)
+                {
                     asm volatile("s_waitcnt lgkmcnt(0)");
+                    hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
                     hk::mma_ABt(p_comp, kv_1, q_1, p_comp);
-                });
-            }
+                }
+            });
+
             if constexpr(kSkipCompute == false)
             {
                 __builtin_amdgcn_s_setprio(2);
-            }
-
-            if constexpr((kIsGlobalLast == false) && (kCheckBoundaryNext == false))
-            {
-                if((kv_tile_start + 2 * T::kBlockN) < kv_end)
-                {
-                    if((kv_tile_start + 3 * T::kBlockN) <= kv_end)
-                    {
-                        row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
-                                                                   kv_ld_row_base_idx,
-                                                                   kv_tile_start + 2 * T::kBlockN,
-                                                                   kv_tile_end + 2 * T::kBlockN);
-                    }
-                    else
-                    {
-                        row_kv_ld_next_next = get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices,
-                                                                  kv_ld_row_base_idx,
-                                                                  kv_tile_start + 2 * T::kBlockN,
-                                                                  kv_end);
-                    }
-                }
             }
 
             // Element-wise scale. Boundary problem is handled here as well.
@@ -493,16 +496,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             //   - interleaved:    2x v_mul_f32    covering vgprs [base+2, base+3]
             // The interleaved phase is mfma-paired (rotation: scale_{i+1} after mfma_i),
             // and uses single-precision v_mul_f32 so it doesn't trip the v_pk hazard.
-            auto pk_pre_scale = [&](auto idx_c) {
-                constexpr uint32_t base = k_o_begin + decltype(idx_c)::value * 4;
-                const float2 r2 = {rescale, rescale};
+            // pk_mul_pair(r, base_c): v_pk_mul_f32 on vgprs [base, base+1] *= r
+            auto pk_mul_pair = [&](float r, auto base_c) {
+                constexpr uint32_t base = decltype(base_c)::value;
+                const float2 r2 = {r, r};
                 asm volatile("v_pk_mul_f32 v[%0:%1], %2, v[%0:%1]"
                              : : "n"(base), "n"(base + 1), "v"(r2));
             };
-            auto mul_interleave = [&](auto idx_c) {
-                constexpr uint32_t base = k_o_begin + decltype(idx_c)::value * 4;
-                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 2), "v"(rescale));
-                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 3), "v"(rescale));
+            // mul_pair(r, base_c): two v_mul_f32 on vgprs [base, base+1] *= r
+            auto mul_pair = [&](float r, auto base_c) {
+                constexpr uint32_t base = decltype(base_c)::value;
+                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base),     "v"(r));
+                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 1), "v"(r));
             };
 
             if constexpr(kSkipCompute == false)
@@ -511,7 +516,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 // Issued before any PV mfma so the mfma->v_pk hazard never fires.
                 if constexpr(kIsFirstIter == false)
                 {
-                    opus::static_for<32>([&](auto i) { pk_pre_scale(i); });
+                    opus::static_for<32>([&](auto i) {
+                        if constexpr(i.value % 8 == 0) {
+                            __builtin_amdgcn_s_setprio(3 - i.value / 8);
+                        }
+                        pk_mul_pair(rescale, opus::number<k_o_begin + i.value * 4>{});
+                    });
                 }
 
                 // Prologue: load tile 0 into k_kv_0/k_kv_1 and finalize (full drain).
@@ -528,10 +538,10 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
                 // 2-buffer rotation prologue: finish scaling sub-tile 0 with 2x v_mul_f32
                 // (vgprs +2/+3) so the first PV mfma sees fully-rescaled C. The +0/+1
-                // half was scaled by the pk_pre_scale block above.
+                // half was scaled by the pk_mul_pair block above.
                 if constexpr(kIsFirstIter == false)
                 {
-                    mul_interleave(opus::number<0>{});
+                    mul_pair(rescale, opus::number<k_o_begin + 2>{});
                 }
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
@@ -606,13 +616,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                         // busy with this mfma's 16-cycle dispatch. The +0/+1 half was scaled
                         // by the pre-PV-loop pk block.
                         hk::mma_ABt(oaccu_e0_a, kv_0_top, p_mfma, oaccu_e0_a);
-                        mul_interleave(opus::number<scale_base + 1>{});  // -> e0_b
+                        mul_pair(rescale, opus::number<k_o_begin + (scale_base + 1) * 4 + 2>{});  // -> e0_b
                         hk::mma_ABt(oaccu_e0_b, kv_0_bot, p_mfma, oaccu_e0_b);
-                        mul_interleave(opus::number<scale_base + 2>{});  // -> e1_a
+                        mul_pair(rescale, opus::number<k_o_begin + (scale_base + 2) * 4 + 2>{});  // -> e1_a
                         hk::mma_ABt(oaccu_e1_a, kv_1_top, p_mfma, oaccu_e1_a);
-                        mul_interleave(opus::number<scale_base + 3>{});  // -> e1_b
+                        mul_pair(rescale, opus::number<k_o_begin + (scale_base + 3) * 4 + 2>{});  // -> e1_b
                         hk::mma_ABt(oaccu_e1_b, kv_1_bot, p_mfma, oaccu_e1_b);
-                        mul_interleave(opus::number<scale_base + 4>{});  // -> o0_a (odd half)
+                        mul_pair(rescale, opus::number<k_o_begin + (scale_base + 4) * 4 + 2>{});  // -> o0_a (odd half)
                     }
 
                     asm volatile("s_waitcnt lgkmcnt(0)");
@@ -644,18 +654,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     {
                         // o0_a was scaled at the tail of the even half above.
                         hk::mma_ABt(oaccu_o0_a, kv_0_alt_top, p_mfma, oaccu_o0_a);
-                        mul_interleave(opus::number<scale_base + 5>{});  // -> o0_b
+                        mul_pair(rescale, opus::number<k_o_begin + (scale_base + 5) * 4 + 2>{});  // -> o0_b
                         hk::mma_ABt(oaccu_o0_b, kv_0_alt_bot, p_mfma, oaccu_o0_b);
-                        mul_interleave(opus::number<scale_base + 6>{});  // -> o1_a
+                        mul_pair(rescale, opus::number<k_o_begin + (scale_base + 6) * 4 + 2>{});  // -> o1_a
                         hk::mma_ABt(oaccu_o1_a, kv_1_alt_top, p_mfma, oaccu_o1_a);
-                        mul_interleave(opus::number<scale_base + 7>{});  // -> o1_b
+                        mul_pair(rescale, opus::number<k_o_begin + (scale_base + 7) * 4 + 2>{});  // -> o1_b
                         hk::mma_ABt(oaccu_o1_b, kv_1_alt_bot, p_mfma, oaccu_o1_b);
 
                         // Hand off to next macro: scale its first sub-tile (e0_a).
                         // Skipped on the final macro -- nothing follows the last mfma.
                         if constexpr(has_next_even)
                         {
-                            mul_interleave(opus::number<scale_base + 8>{});  // -> next macro's e0_a
+                            mul_pair(rescale, opus::number<k_o_begin + (scale_base + 8) * 4 + 2>{});  // -> next macro's e0_a
                         }
                     }
 
