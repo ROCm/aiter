@@ -69,10 +69,14 @@ struct opus_gemm_a8w8_noscale_traits {
 
 #ifndef OPUS_GEMM_NOSCALE_KARGS_DEFINED
 #define OPUS_GEMM_NOSCALE_KARGS_DEFINED
+// Shared kargs struct: must match the definition in
+// opus_gemm_traits_a16w16.cuh exactly. The bias fields exist for the a16w16
+// split-barrier HAS_BIAS path; a8w8 launchers always pass nullptr / 0.
 struct opus_gemm_noscale_kargs {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
+    const void* __restrict__ ptr_bias;
     int m;
     int n;
     int k;
@@ -83,5 +87,6 @@ struct opus_gemm_noscale_kargs {
     int stride_a_batch;
     int stride_b_batch;
     int stride_c_batch;
+    int stride_bias_batch;
 };
 #endif
