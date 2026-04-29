@@ -1009,6 +1009,10 @@ def flydsl_preshuffle_gemm_a8(
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     out_contig = Out.contiguous()
+    # FlyDSL's preshuffle kernel requires an arg_bias slot (used only when
+    # epilogue != "none"). Pass an empty tensor as a placeholder for the
+    # default epilogue="none" path.
+    _dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     _run_compiled(
         exe,
         out_contig.view(-1),
@@ -1016,6 +1020,7 @@ def flydsl_preshuffle_gemm_a8(
         _as_i8(WQ.contiguous()).view(-1),
         x_scale.contiguous().view(-1),
         w_scale.contiguous().view(-1),
+        _dummy_bias,
         m,
         n,
         fx.Stream(torch.cuda.current_stream()),
