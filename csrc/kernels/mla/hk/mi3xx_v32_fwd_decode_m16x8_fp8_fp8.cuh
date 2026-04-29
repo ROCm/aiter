@@ -87,9 +87,9 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     hkdart::clobber<p_mfma_ranges>();
     hkdart::clobber<o_ranges>();
 
-    QManagerV3<T> q_manager;
-    KvManagerV2<T> kv_manager;
-    VtManagerV1<T> vt_manager;
+    QManager8bitsV3<T> q_manager;
+    KvManager8bitsV2<T> kv_manager;
+    VtManager8bitsV1<T> vt_manager;
     OManager16bitsV2<T, out_t> o_manager;
     OManager32bitsV2<T, split_t> split_o_manager;
 

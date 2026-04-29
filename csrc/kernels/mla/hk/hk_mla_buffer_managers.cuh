@@ -6,7 +6,7 @@
 #include "hk_mla_utils.cuh"
 
 template <typename T>
-class QManagerV1
+class QManager8bitsV1
 {
     private:
     using q_t = typename T::q_t;
@@ -43,7 +43,7 @@ class QManagerV1
 // Lanes load Q from VRAM by row so as to fulfill cache line. Then, lanes exchange data via
 // ds_bpermute_b32.
 template <typename T>
-class QManagerV2
+class QManager8bitsV2
 {
     private:
     using q_t = typename T::q_t;
@@ -116,7 +116,7 @@ class QManagerV2
     }
 
     public:
-    __device__ QManagerV2()
+    __device__ QManager8bitsV2()
     {
         const uint32_t lane_idx = opus::lane_id();
         m_src_lane_0            = (lane_idx % 16) * 4 + (lane_idx / 32);
@@ -194,7 +194,7 @@ class QManagerV2
 
 // Lanes load Q from VRAM by row so as to fulfill cache line. Then, lanes exchange data via LDS.
 template <typename T>
-class QManagerV3
+class QManager8bitsV3
 {
     private:
     using q_t = typename T::q_t;
@@ -249,7 +249,7 @@ class QManagerV3
     }
 
     public:
-    __device__ QManagerV3() {}
+    __device__ QManager8bitsV3() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
@@ -319,7 +319,7 @@ class QManagerV3
 
 // Compared with V3, V4 uses LDS async load.
 template <typename T>
-class QManagerV4
+class QManager8bitsV4
 {
     protected:
     using q_t = typename T::q_t;
@@ -432,7 +432,7 @@ class QManagerV4
     }
 
     public:
-    __device__ QManagerV4() {}
+    __device__ QManager8bitsV4() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
@@ -491,18 +491,18 @@ class QManagerV4
 
 // Compared with V4, V5 uses 3 LDS buffers to load Q to reduce barrier & waitcnt time.
 template <typename T>
-class QManagerV5 : public QManagerV4<T>
+class QManager8bitsV5 : public QManager8bitsV4<T>
 {
     private:
     using q_t = typename T::q_t;
 
     public:
-    __device__ QManagerV5() : QManagerV4<T>() {}
+    __device__ QManager8bitsV5() : QManager8bitsV4<T>() {}
 
     __device__ __forceinline__ static constexpr uint32_t get_lds_size_in_byte()
     {
         // using 3 buffers
-        return 3 * T::kNumWarps * QManagerV4<T>::get_lds_size_per_block_in_byte();
+        return 3 * T::kNumWarps * QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
     }
 
     template <uint32_t GPR_NOPE_START, uint32_t GPR_ROPE_START>
@@ -512,13 +512,13 @@ class QManagerV5 : public QManagerV4<T>
                                                   const uintptr_t p_lds)
     {
         const uintptr_t p_lds_warp_0 =
-            p_lds + 3 * warp_idx * QManagerV4<T>::get_lds_size_per_block_in_byte();
+            p_lds + 3 * warp_idx * QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
         const uintptr_t p_lds_warp_1 =
-            p_lds_warp_0 + QManagerV4<T>::get_lds_size_per_block_in_byte();
+            p_lds_warp_0 + QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
         const uintptr_t p_lds_warp_2 =
-            p_lds_warp_1 + QManagerV4<T>::get_lds_size_per_block_in_byte();
+            p_lds_warp_1 + QManager8bitsV4<T>::get_lds_size_per_block_in_byte();
         const q_t* p_q_buffer_warp = &q_buffer[{q_start, 0, 0, 0}] +
-                                     warp_idx * QManagerV4<T>::kNumElemPerCol * T::kQkHeadDim;
+                                     warp_idx * QManager8bitsV4<T>::kNumElemPerCol * T::kQkHeadDim;
 
         this->template vram_2_lds<0>(p_q_buffer_warp, p_lds_warp_0);
         this->template vram_2_lds<64>(p_q_buffer_warp, p_lds_warp_1);
@@ -591,7 +591,7 @@ __device__ __forceinline__ int32_t get_kv_ld_row(const int32_t* p_kv_indices,
 }
 
 template <typename T>
-class KvManagerV1
+class KvManager8bitsV1
 {
     private:
     using kv_t = typename T::kv_t;
@@ -791,7 +791,7 @@ class KvManagerV1
 };
 
 template <typename T>
-class KvManagerV2
+class KvManager8bitsV2
 {
     private:
     using kv_t = typename T::kv_t;
@@ -1024,7 +1024,7 @@ class KvManagerV2
 };
 
 template <typename T>
-class KvManagerV3
+class KvManager8bitsV3
 {
     private:
     using kv_t = typename T::kv_t;
@@ -1303,7 +1303,7 @@ class KvManagerV3
     //   kColOffset : col offset of the tile within the 512-col head_dim (multiple of 32, < 512).
     //   GPR        : index of the first of the 2 destination VGPRs.
     // Runtime param:
-    //   p_lds_v    : LDS base address of the current V block (KvManagerV3 layout).
+    //   p_lds_v    : LDS base address of the current V block (KvManager8bitsV3 layout).
     template <uint32_t kRowOffset, uint32_t kColOffset, uint32_t GPR>
     __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_v)
     {
@@ -1327,7 +1327,7 @@ class KvManagerV3
         hkm::ds_read_b64_tr_b8<GPR>(p_lds_v_lane, kFixedOffset);
 #else
         static_assert(false,
-                      "KVManagerV3::load_transposed_v_to_gpr() is not expected to be called.");
+                      "KVManager8bitsV3::load_transposed_v_to_gpr() is not expected to be called.");
 #endif
     }
 
@@ -1357,13 +1357,13 @@ class KvManagerV3
                      : "i"(GPR_0+1), "i"(GPR_1));
 #else
         static_assert(false,
-                      "KVManagerV3::finalize_load_transposed_v_to_gpr() is not expected to be called.");
+                      "KVManager8bitsV3::finalize_load_transposed_v_to_gpr() is not expected to be called.");
 #endif
     }
 };
 
 template <typename T>
-class VtManagerV1
+class VtManager8bitsV1
 {
     private:
     using kv_t = T::kv_t;
