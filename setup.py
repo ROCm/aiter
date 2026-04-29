@@ -79,9 +79,12 @@ if not IS_WINDOWS and is_develop_mode():
     except Exception:
         pass
 
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "amd-triton"],
-    )
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "amd-triton"],
+        )
+    except Exception:
+        pass
     subprocess.check_call(
         [sys.executable, "-m", "pip", "install", "amd-triton"],
     )
