@@ -541,7 +541,9 @@ def _get_compiled_silu_fused(
     """Compile and cache the fused silu_and_mul + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
 
-    return build_silu_and_mul_fq_module(inter_dim, topk, quant_mode, gui_layout, swiglu_limit)
+    return build_silu_and_mul_fq_module(
+        inter_dim, topk, quant_mode, gui_layout, swiglu_limit
+    )
 
 
 # Public API
@@ -797,7 +799,9 @@ def flydsl_moe_stage1(
             ),
         )
     elif _splitk_fp4:
-        _silu_fused_k = _get_compiled_silu_fused(inter_dim, topk, swiglu_limit=swiglu_limit)
+        _silu_fused_k = _get_compiled_silu_fused(
+            inter_dim, topk, swiglu_limit=swiglu_limit
+        )
         _run_compiled(
             _silu_fused_k,
             (
