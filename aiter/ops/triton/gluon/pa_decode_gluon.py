@@ -5296,7 +5296,9 @@ def pa_decode_gluon(
         Length of query sequences. Must be <= 4.
 
     max_context_partition_num : int
-        Maximum number of context partitions.
+        Caller-provided upper bound for context partitions/splits. In PS mode,
+        this is typically from get_recommended_splits(); otherwise it is based
+        on the active context length or sliding window.
 
     context_partition_size : int
         Size of each context partition for partitioned attention computation.
@@ -5323,7 +5325,7 @@ def pa_decode_gluon(
     exp_sums : torch.Tensor
         Buffer for exponential sums used in online softmax computation.
         - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-          where max_context_partition_num = ceil(max_context_length / context_partition_size)
+          where max_context_partition_num is the caller-provided partition/split count
         - Dtype: torch.float32
 
     max_logits : torch.Tensor

@@ -2545,9 +2545,9 @@ def test_multi_case_set(case_set_name):
 
 
 if __name__ == "__main__":
-    # normal_accuracy_test()
-    # normal_accuracy_aot_test()
-    # normal_performance_test()
-    # normal_performance_aot_test()
+    normal_accuracy_test()
+    normal_accuracy_aot_test()
+    normal_performance_test()
+    normal_performance_aot_test()
     sliding_window_accuracy_test()
-    # sliding_window_performance_test()
+    sliding_window_performance_test()
