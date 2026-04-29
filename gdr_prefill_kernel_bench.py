@@ -72,6 +72,7 @@ CHUNK_KERNEL_PREFIXES = [
     "fused_solve_tril_recompute_w_u_kernel",
     "fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel",
     "chunk_gdn_fwd_h_opt3",
+    "chunk_gdn_fwd_h_flydsl_vk",
 ]
 
 

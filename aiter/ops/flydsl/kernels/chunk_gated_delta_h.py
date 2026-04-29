@@ -159,7 +159,7 @@ def compile_chunk_gated_delta_h(
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64  # 32
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64  # 2
 
-    @flyc.kernel(name="chunk_gdn_fwd_h_opt3")
+    @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_vk")
     def gdn_h_kernel(
         k_tensor: fx.Tensor,
         v_tensor: fx.Tensor,
