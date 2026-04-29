@@ -232,7 +232,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
         PF_LO=SCALE_PRESHUFFLE_LO,
         KW=SCALE_PRESHUFFLE_KW,
     )
-    as_mask = (as_m_local < (M - tile_m * BLOCK_SIZE_M))[:, None]
 
     # --- B scales (N direction is the outer dim) ---
     bs_n_local = gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(1, b_scale_layout))
@@ -247,7 +246,6 @@ def gemm_mxfp4_preshuffle_gfx1250(
         PF_LO=SCALE_PRESHUFFLE_LO,
         KW=SCALE_PRESHUFFLE_KW,
     )
-    bs_mask = (bs_n_local < (N - tile_n * BLOCK_SIZE_N))[:, None]
 
     # =====================================================================
     # Allocate shared memory (A and B data only, scales skip LDS)
@@ -306,16 +304,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
     cur_BS = gl.amd.gfx1250.buffer_load(bs_base_ptr, bs_base)
 
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        if load_idx < k_tiles:
-            slot = load_idx % NUM_BUFFERS
-            k = load_idx
-
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [0, k * BLOCK_K_BYTES], smem_A.index(slot), pred=1
-            )
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [0, (k * BLOCK_K_BYTES) * 16], smem_B.index(slot), pred=1
-            )
+        slot = load_idx % NUM_BUFFERS
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc, [0, load_idx * BLOCK_K_BYTES], smem_A.index(slot)
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [0, (load_idx * BLOCK_K_BYTES) * 16], smem_B.index(slot)
+        )
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
@@ -340,13 +335,12 @@ def gemm_mxfp4_preshuffle_gfx1250(
 
         # TDM load next tile (A, B only)
         slot = load_idx % NUM_BUFFERS
-        k = load_idx
 
         gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, k * BLOCK_K_BYTES], smem_A.index(slot), pred=1
+            a_desc, [0, load_idx * BLOCK_K_BYTES], smem_A.index(slot)
         )
         gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, (k * BLOCK_K_BYTES) * 16], smem_B.index(slot), pred=1
+            b_desc, [0, (load_idx * BLOCK_K_BYTES) * 16], smem_B.index(slot)
         )
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
