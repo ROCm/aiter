@@ -38,9 +38,6 @@ def _gluon_rms_norm_kernel(
     # create a swizzled shared layout for the weights
     sharedLayoutWeights: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
 
-    # create a swizzled shared layout for the output
-    gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
-
     # tensor descriptor for input
     input_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         input_ptr,  # base pointer of tesnor
