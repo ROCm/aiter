@@ -316,19 +316,26 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM in parallel, before CK) ---
-        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
-        os.environ["AITER_AOT_IMPORT"] = "1"
-        try:
-            from aiter.aot.flydsl.common import start_aot, wait_aot
+        # Set AITER_SKIP_FLYDSL_AOT=1 to skip when flydsl is unavailable
+        # (e.g. manylinux_2_28 build host where flydsl wheel cannot install
+        # because flydsl only publishes manylinux_2_35). The runtime JIT path
+        # still works if the user installs flydsl in their consumer env.
+        if os.environ.get("AITER_SKIP_FLYDSL_AOT", "0") == "1":
+            print("[aiter] AITER_SKIP_FLYDSL_AOT=1 — skipping FlyDSL AOT pre-compilation")
+        else:
+            _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+            os.environ["AITER_AOT_IMPORT"] = "1"
+            try:
+                from aiter.aot.flydsl.common import start_aot, wait_aot
 
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
-            wait_aot(_flydsl_pool, _flydsl_futures)
-        finally:
-            if _prev_aot_import is None:
-                os.environ.pop("AITER_AOT_IMPORT", None)
-            else:
-                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+                flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+                _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
+                wait_aot(_flydsl_pool, _flydsl_futures)
+            finally:
+                if _prev_aot_import is None:
+                    os.environ.pop("AITER_AOT_IMPORT", None)
+                else:
+                    os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
