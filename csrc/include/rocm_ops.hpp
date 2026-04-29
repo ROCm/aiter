@@ -839,6 +839,20 @@ namespace py = pybind11;
           py::arg("sink")         = std::nullopt, \
           py::arg("d_sink")       = std::nullopt);
 
+#define FMHA_FWD_F16_ASM_PYBIND                          \
+    m.def("fmha_fwd_f16_asm",                            \
+          &aiter::torch_itfs::fmha_fwd_f16,              \
+          py::arg("q"),                                  \
+          py::arg("k"),                                  \
+          py::arg("v"),                                  \
+          py::arg("softmax_scale"),                      \
+          py::arg("is_causal"),                          \
+          py::arg("return_lse"),                         \
+          py::arg("i_perm") = 2,                         \
+          py::arg("o_perm") = 0,                         \
+          py::arg("sink")   = std::nullopt,              \
+          py::arg("out")    = std::nullopt);
+
 #define MHA_FWD_ASM_PYBIND                        \
     m.def("fmha_v3_fwd",                          \
           &aiter::torch_itfs::fmha_v3_fwd,        \

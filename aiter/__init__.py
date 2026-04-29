@@ -116,6 +116,15 @@ else:
             e,
         )
 
+    # FMHA fwd f16 ASM (independent of CK) — kept in a separate try block so
+    # it stays importable even when `module_aiter_core` fails to build on
+    # e.g. gfx1250.
+    try:
+        from .ops.fmha_fwd_f16_asm import fmha_fwd_f16_asm  # noqa: F401,E402
+        from .fused_fmha_fwd_f16 import fmha_fwd_f16  # noqa: F401,E402
+    except (ImportError, RuntimeError, OSError, KeyError) as e:
+        logger.warning("aiter.fmha_fwd_f16 unavailable: %s", e)
+
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:
     from .ops.triton.comms import (
