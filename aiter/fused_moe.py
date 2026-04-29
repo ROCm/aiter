@@ -18,6 +18,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
+import pyhip
 
 BLOCK_SIZE_M = 32
 
@@ -142,43 +143,56 @@ def fused_moe(
     bias2=None,
     splitk=0,
 ):
-    # fast path for small batches
-    if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 16 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
-        ((quant_type == QuantType.No and w1.dtype == torch.bfloat16) or (quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
+    # Fast path for small batches for Qwen3.5 397B FP8 PTPC (Only used for decoding phase: batch size 1~32)
+    if os.environ.get('AITER_MOE_SMALL_BATCH', '0') == '1' and hidden_states.shape[0] <= 32 and hidden_states.dtype == torch.bfloat16 and expert_mask is None and activation == ActivationType.Silu and \
+        ((quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz)):
+
+        from pyhip.contrib.moe import moe_gemm_batch1, moe_gemm_batch, moe_2stage_splitk
+        fp8_ptpc = ((quant_type == QuantType.per_Token and w1.dtype == torch.float8_e4m3fnuz))
         B = hidden_states.shape[0]
         E, N1, K1 = w1.shape
         N2, K2 = w2.shape[1], w2.shape[2]
         TOPK = topk_ids.shape[1]
+        #print("B=%d, E=%d, N1=%d, K1=%d, N2=%d, K2=%d, TOPK=%d"%(B, E, N1, K1, N2, K2, TOPK))
         assert N1 == 2 * K2
         gemm1_out = torch.empty([B, TOPK, N1 // 2], dtype=hidden_states.dtype, device=hidden_states.device)
+        # print(f"================================================= batch size {B} ========================================================")
         if B == 1:
             assert N1 == 2 * K2
-            gemm2_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
-            pyhip.kernels.moe.moe_gemm_batch1([N1 // 32, TOPK],[256], w1.dtype, K1, N1, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, 1)
-            pyhip.kernels.moe.moe_gemm_batch1([N2 // 32, TOPK],[64], w1.dtype, K2, N2, False, gemm1_out.data_ptr(), w2.data_ptr(), gemm2_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, 1)
-            return gemm2_out
+            # Skip moe_sorting for batch size 1
+            cur_out = torch.zeros([1, N2], dtype=hidden_states.dtype, device=hidden_states.device)
+            moe_gemm_batch1([N1 // 32, TOPK],[256], w1.dtype, True, hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, 1, N1, K1)
+            moe_gemm_batch1([N2 // 32, TOPK],[64], w1.dtype, False, gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), topk_ids.data_ptr(), topk_weight.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, 1, N2, K2)
+
+            return cur_out
         else:
             BLOCK_M = 16
-            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = moe_sorting(
                 topk_ids,
                 topk_weight,
                 E,
                 K1,     # reduce dim is same with output dim
                 hidden_states.dtype,
                 BLOCK_M,
-                expert_mask,
-                num_local_tokens,
+                expert_mask, # None,
+                num_local_tokens,#None,
                 moe_sorting_dispatch_policy,
             )
+            grid = sorted_expert_ids.shape[0]
 
-            pyhip.kernels.moe.moe_gemm_batch([N1 // 32, sorted_expert_ids.shape[0]], [256],
-                                             w1.dtype, TOPK, K1, N1, True,
-                                             hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-            pyhip.kernels.moe.moe_gemm_batch([N2 // 32, sorted_expert_ids.shape[0]], [64],
-                                             w1.dtype, TOPK, K2, N2, False,
-                                             gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+            if B * TOPK <= E:
+                grid = B * TOPK
 
-            return moe_buf
+            moe_gemm_batch([N1 // 32, grid], [256],
+                            w1.dtype, True,
+                            hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B, N1, K1, TOPK)
+            BLOCK_TILE_SIZE_M = 16
+            BLOCK_TILE_SIZE_N = 64
+            moe_2stage_splitk([N2 // BLOCK_TILE_SIZE_N, grid], [64],
+                            w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                            gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, fp8_ptpc)
+
+            return cur_out
 
     if not block_size_M:
         block_size_M = -1
