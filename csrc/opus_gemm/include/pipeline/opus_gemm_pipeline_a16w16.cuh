@@ -441,10 +441,107 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus
         return half_tile_m * T::HALF_B_M * kargs.stride_c + half_tile_n * T::HALF_B_N;
     };
 
+    // ── HAS_BIAS prefetch (plan B) ────────────────────────────────────────
+    // bias is per-row, so the 4 store_c calls (half_tile_m, half_tile_n) only
+    // depend on half_tile_m. Prefetch into 2 register tiles (bv_half[0/1]),
+    // each indexed by the same partition_layout_c iteration order as u_gc_m.
+    // Issued buffer_loads overlap with the wave_id_m=0 barrier above and
+    // with the first store_if below.
+    //
+    // Why VGPR (buffer_load) instead of SGPR (s_load): per-element m_off varies
+    // across lanes (the partition spreads B_M across 64 lanes), so a single
+    // SGPR scalar cannot represent "this lane's bias". splitk_reduce uses
+    // s_load because there each (b, m) is fixed per block; here it's per
+    // register element.
+    //
+    // Bias is stored in D_ACC (fp32) so the addition happens in the same
+    // accumulator domain as v_c -- precision matches the existing acc path
+    // and matches splitk_reduce's behavior.
+    // We mirror the iteration that store_if<VEC_C>(g_c, ..., u_gc, ...) does
+    // internally:
+    //   using LT = layout_load_traits<Layout, vec>;
+    //   constexpr auto issue_space     = LT::issue_space;       // NON-vec
+    //   constexpr auto issue_space_vec = LT::issue_space_vec;
+    //   constexpr auto u_r = make_layout<-1>(issue_space);
+    //   static_ford(issue_space_vec, [&](auto... ids){
+    //       constexpr index_t idx = u_r(ids...);
+    //       slice(vc, idx, idx + vec);   // vc indices [idx, idx+vec)
+    //   });
+    // u_r is built from the NON-vectorized issue_space so its return value
+    // is the starting 1D index into vc (a vector_t of size elem_c). We
+    // mirror the same pattern for bias prefetch / add.
+    //
+    // BIAS_VEC_SLOTS_ = number of distinct (m_off) chunks in vc, equal to
+    // elem_c / VEC_C. The vec-iter slot is slot_idx / VEC_C (since u_r is
+    // built on the non-vec issue_space, slot_idx steps by VEC_C between
+    // adjacent ids).
+    using LT_BIAS = layout_load_traits<decltype(u_gc_m), T::VEC_C>;
+    constexpr auto bias_issue_space     = LT_BIAS::issue_space;      // NON-vec
+    constexpr auto bias_issue_space_vec = LT_BIAS::issue_space_vec;
+    constexpr auto u_r_bias = make_layout<-1>(bias_issue_space);
+    constexpr int BIAS_VEC_SLOTS_ = static_cast<int>(
+        opus::get<0>(opus::reduce_tuple_mul(bias_issue_space_vec)).value);
+
+    using D_BIAS_ = typename T::D_BIAS;
+    [[maybe_unused]] D_ACC v_bias_half_[2][BIAS_VEC_SLOTS_];
+    if constexpr (T::HAS_BIAS) {
+        const D_BIAS_* bias_ptr = reinterpret_cast<const D_BIAS_*>(kargs.ptr_bias);
+        const long bias_count =
+            kargs.stride_bias_batch == 0 ? (long)kargs.m
+                                         : (long)kargs.batch * kargs.m;
+        auto g_bias = make_gmem(bias_ptr,
+                                (unsigned int)(bias_count * sizeof(D_BIAS_)));
+        const int bias_row0_base = batch_id * kargs.stride_bias_batch
+                                   + row + 0 * T::HALF_B_M;
+        const int bias_row1_base = batch_id * kargs.stride_bias_batch
+                                   + row + 1 * T::HALF_B_M;
+
+        // Issue all bias buffer_loads up front; vmcnt accumulates and is
+        // drained by a single s_waitcnt_vmcnt(0) just before the first add.
+        // Each {ids...} corresponds to a chunk of VEC_C vc elements that
+        // share a single m offset (per-row bias).
+        static_ford(bias_issue_space_vec, [&](auto... ids) {
+            constexpr index_t slot_start = u_r_bias(ids...);
+            constexpr index_t vec_slot = slot_start / T::VEC_C;
+            const int m_off = u_gc_m(ids...);
+            auto bv0 = g_bias.template load<1>(bias_row0_base + m_off);
+            v_bias_half_[0][vec_slot] = static_cast<D_ACC>(bv0[0]);
+            auto bv1 = g_bias.template load<1>(bias_row1_base + m_off);
+            v_bias_half_[1][vec_slot] = static_cast<D_ACC>(bv1[0]);
+        });
+    }
+
+    bool bias_waited_ = false;
     auto store_c = [&](auto& vc, int half_tile_m, int half_tile_n) {
         int g_c_offset = c_offset(half_tile_m, half_tile_n);
         int m_base = row + half_tile_m * T::HALF_B_M;
         int n_base = col + half_tile_n * T::HALF_B_N;
+
+        if constexpr (T::HAS_BIAS) {
+            // Wait once on first entry: drain vmcnt for the prefetched bias
+            // buffer_loads. After this all 4 store_c calls reuse the same
+            // bv_half buffers without re-waiting. No s_barrier / lgkmcnt
+            // needed (bias is wave-local; LDS already drained).
+            if (!bias_waited_) {
+                s_waitcnt_vmcnt(0_I);
+                bias_waited_ = true;
+            }
+            const int row_idx = half_tile_m;
+            // Add bias in fp32 acc domain. {ids...} ranges over the same
+            // partition layout used by store_if<VEC_C>; for each chunk
+            // vc[slot_start .. slot_start + VEC_C] share a single m, so we
+            // add the same scalar v_bias_half_[row_idx][vec_slot] to all
+            // VEC_C elements.
+            static_ford(bias_issue_space_vec, [&](auto... ids) {
+                constexpr index_t slot_start = u_r_bias(ids...);
+                constexpr index_t vec_slot = slot_start / T::VEC_C;
+                const D_ACC b = v_bias_half_[row_idx][vec_slot];
+                #pragma unroll
+                for (int j = 0; j < T::VEC_C; ++j) {
+                    vc[slot_start + j] += b;
+                }
+            });
+        }
 
         auto pred = [&](auto... ids) {
             return (m_base + u_gc_m(ids...)) < kargs.m && (n_base + u_gc_n(ids...)) < kargs.n;

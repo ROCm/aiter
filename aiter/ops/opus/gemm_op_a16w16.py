@@ -9,22 +9,28 @@ Public entry points:
   Shape-driven wrapper. The typical user writes `gemm_a16w16_opus(A, B)`
   and never sees a kid number. Internal path:
 
-    1. Reshape A/B to 3D, allocate Y, validate (bias unsupported;
-       bpreshuffle and non-bf16 A/B also unsupported).
-    2. If `kernelId` is given explicitly -> opus_gemm_a16w16_tune.
-    3. Otherwise query opus-private tuned CSV via aiter.ops.opus.common;
-       on hit -> opus_gemm_a16w16_tune with the tuned (solidx, splitK).
-    4. On miss -> optionally autolog the shape
-       (AITER_OPUS_LOG_UNTUNED=1) and fall through to the private
-       bf16 no-scale fallback binding `_opus_gemm_bf16_dispatch`,
-       which forwards to the C++ entry `opus_gemm` whose bf16 branch
-       does its own lookup + heuristic dispatch (see
-       csrc/opus_gemm/opus_gemm.cu).
+    1. Reshape A/B to 3D, allocate Y, validate (bias allowed across the
+       split-barrier / splitk kid families; bpreshuffle and non-bf16 A/B
+       unsupported).
+    2. If `kernelId` is given explicitly -> opus_gemm_a16w16_tune (bias
+       is forwarded; the C++ dispatcher rejects non-bias-aware kids).
+    3. Otherwise query opus-private tuned CSV via aiter.ops.opus.common
+       (key includes bias=True/False); on hit -> opus_gemm_a16w16_tune
+       with the tuned (solidx, splitK).
+    4. On miss -> autolog the shape (AITER_OPUS_LOG_UNTUNED=1) and fall
+       through to the private bf16 no-scale binding
+       `_opus_gemm_bf16_dispatch`, which forwards to the C++ entry
+       `opus_gemm` whose bf16 branch does its own lookup + heuristic
+       dispatch (see csrc/opus_gemm/opus_gemm.cu). bias is forwarded
+       through this path: the C++ entry skips its bias-agnostic lookup
+       map when bias is present and goes straight to the heuristic
+       dispatcher (which always returns a bias-aware kid).
 
-* `opus_gemm_a16w16_tune(XQ, WQ, Y, kernelId, splitK)`
+* `opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)`
   Low-level pybind binding to the id-based tune dispatcher. Exposes a
   specific kernel instance by `kernelId` plus optional literal KBatch
-  via `splitK`. Intended for the tuner, for debugging a specific kid,
+  via `splitK` and an optional bias tensor (D_OUT-typed, [M] or
+  [batch, M]). Intended for the tuner, for debugging a specific kid,
   and for aiter-global integrations (e.g. future tuned_gemm.solMap).
 
 All entry points share the JIT module `module_deepgemm_opus`, which
@@ -49,6 +55,7 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor:
@@ -70,6 +77,7 @@ def _opus_gemm_a16w16_tune_raw(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
@@ -141,6 +149,7 @@ def opus_gemm_a16w16_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
+    bias=None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor:
@@ -150,9 +159,41 @@ def opus_gemm_a16w16_tune(
     front (rejecting broadcast / transpose / slice views that the C++
     kernel would happily run with garbage data); on success it forwards
     to the underlying pybind binding.
+
+    Parameters
+    ----------
+    bias : optional D_OUT-typed bias tensor, accepted shapes:
+           [M] (broadcast across batch; requires batch==1) or [batch, M].
+           Only honored on bias-aware kid ranges (split-barrier kid 4..9
+           and a16w16_flatmm_splitk kid 200..299); the C++ dispatcher
+           rejects bias on other kids.
+
+    Backwards-compatibility note
+    ----------------------------
+    Older callers used ``opus_gemm_a16w16_tune(XQ, WQ, Y, kernelId, splitK)``
+    with positional args (no bias slot). When the 4th positional argument
+    is an int, we silently treat it as kernelId and shift remaining args
+    accordingly so existing tuner / test scripts keep working without an
+    edit. Mixed-style calls (``..., bias=t, kernelId=k``) keep their kwargs
+    semantics.
     """
+    # Positional-int back-compat: opus_gemm_a16w16_tune(XQ, WQ, Y, kid, splitK).
+    # When `bias` arrives as an int (which torch_library would otherwise
+    # reject as not Optional[Tensor]), reinterpret as kernelId.
+    if isinstance(bias, int) and not isinstance(bias, bool):
+        # Positional int means "this was meant to be kernelId"; treat the
+        # next positional (kernelId) as splitK and the original splitK
+        # (default 0) as truly unset.
+        if splitK != 0 and kernelId == 0:
+            # Shouldn't happen in old call sites, but be defensive.
+            new_splitK = splitK
+        else:
+            new_splitK = kernelId
+        kernelId = bias
+        splitK = new_splitK
+        bias = None
     _check_a16w16_tune_layout(XQ, WQ, Y)
-    return _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, kernelId, splitK)
+    return _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, bias, kernelId, splitK)
 
 
 # Private bf16 no-scale dispatch binding, used only by gemm_a16w16_opus
@@ -172,6 +213,7 @@ def _gen_opus_gemm_bf16_dispatch_fake_tensors(
     group_layout: Optional[torch.Tensor] = None,
     x_scale: Optional[torch.Tensor] = None,
     w_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return Y
 
@@ -188,6 +230,7 @@ def _opus_gemm_bf16_dispatch(
     group_layout: Optional[torch.Tensor] = None,
     x_scale: Optional[torch.Tensor] = None,
     w_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor: ...
 
 
@@ -204,11 +247,6 @@ _SPLITK_KID_MAX = 299
 
 
 def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
-    if bias is not None:
-        raise NotImplementedError(
-            "gemm_a16w16_opus does not currently support bias (opus kernels "
-            "compile with HAS_BIAS=false). Pass bias=None."
-        )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
         raise NotImplementedError(
             f"gemm_a16w16_opus only supports bf16 A/B "
@@ -302,6 +340,49 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     else:
         Y = torch.empty(batch, M, N, dtype=dtype, device=A.device)
 
+    # Bias validation. dtype must match Y dtype (match_d_out convention).
+    # Shape protocol:
+    #   * batch == 1: accept [M] or [1, M]; both leave the C++ launcher
+    #     seeing stride_bias_batch == 0 (broadcast across batch).
+    #   * batch  > 1: require [batch, M]; the launcher will set
+    #     stride_bias_batch == M.
+    # This matches the C++-side BIAS_HOST_VALIDATE block in
+    # csrc/opus_gemm/gen_instances.py. Strict for now; can be relaxed once
+    # we have a real call site needing batch>1 + 1D broadcast.
+    if bias is not None:
+        if bias.dtype != dtype:
+            raise ValueError(
+                f"gemm_a16w16_opus: bias dtype must match output dtype "
+                f"(got bias.dtype={bias.dtype}, dtype={dtype})"
+            )
+        if not bias.is_contiguous():
+            raise ValueError(
+                f"gemm_a16w16_opus: bias must be contiguous (got "
+                f"bias.stride()={tuple(bias.stride())})"
+            )
+        if bias.dim() == 1:
+            if bias.shape[0] != M:
+                raise ValueError(
+                    f"gemm_a16w16_opus: 1D bias length must equal M (got "
+                    f"bias.shape={tuple(bias.shape)}, M={M})"
+                )
+            if batch != 1:
+                raise ValueError(
+                    f"gemm_a16w16_opus: 1D bias [M] requires batch==1; pass "
+                    f"[batch, M] for batch>1 (got A.shape={tuple(A.shape)})"
+                )
+        elif bias.dim() == 2:
+            if tuple(bias.shape) != (batch, M):
+                raise ValueError(
+                    f"gemm_a16w16_opus: 2D bias must be [batch, M] (got "
+                    f"bias.shape={tuple(bias.shape)}, batch={batch}, M={M})"
+                )
+        else:
+            raise ValueError(
+                f"gemm_a16w16_opus: bias must be 1D [M] or 2D [batch, M] "
+                f"(got bias.shape={tuple(bias.shape)})"
+            )
+
     return XQ, WQ, Y, M, N, K, batch, reshape_out_to_2d
 
 
@@ -334,7 +415,19 @@ def gemm_a16w16_opus(
                                ``stride_b_batch == N*K``; pass
                                ``.contiguous()`` if you need to broadcast
                                a single-batch weight across A.
-    bias : must be None (opus kernels have HAS_BIAS=false)
+    bias : optional per-row bias, dtype must equal `dtype` (match_d_out).
+        Accepted shapes:
+        * [M]                  -- broadcast across batch; requires
+                                  batch == 1 (A is 2D or A is 3D with
+                                  leading dim 1).
+        * [batch, M]           -- per-batch row vector.
+        bias is consumed by the a16w16 split-barrier (kid 4..9) and the
+        a16w16_flatmm_splitk (kid 200..299) families. CSV-miss requests
+        with bias fall back to the C++ heuristic dispatcher (which only
+        returns bias-aware kids), so any (M, N, K) is supported even
+        without a tuned bias-aware winner -- accuracy is preserved at
+        whatever the heuristic kid achieves; performance may not be
+        optimal until the shape is re-tuned with `--bias`.
     dtype : output dtype, bf16 or fp32 (any kernel family supports either)
     kernelId : optional explicit override. When given, bypass CSV / C++
         dispatch and launch this specific tuned instance via
@@ -351,12 +444,17 @@ def gemm_a16w16_opus(
         A, B, bias, dtype, out
     )
 
-    # 1) Explicit-kid override path.
+    # 1) Explicit-kid override path. The C++ dispatcher gates non-bias-aware
+    #    kids when bias is present, so we just forward.
     if kernelId is not None:
-        opus_gemm_a16w16_tune(XQ, WQ, Y, int(kernelId), int(splitK or 0))
+        opus_gemm_a16w16_tune(XQ, WQ, Y, bias, int(kernelId), int(splitK or 0))
         return _finalize_output(Y, reshape_out_to_2d)
 
-    # 2) Default path: opus-private tuned CSV lookup.
+    # 2) Default path: opus-private tuned CSV lookup. lookup_tuned() keys
+    #    on bias=True/False as part of its 9-column tuple, so bias=True
+    #    only matches rows that were tuned with the bias path. CSV miss on
+    #    bias=True falls through to the explicit error below; we never
+    #    silently route bias to the no-bias fallback.
     cfg = _opus_common.lookup_tuned(
         M=M,
         N=N,
@@ -372,12 +470,14 @@ def gemm_a16w16_opus(
         # Both bf16 and fp32 Y are now valid for splitk kids (the reduce
         # kernel handles the cast / passthrough), so no Y.dtype gating is
         # needed here -- always honor the tuned winner.
-        opus_gemm_a16w16_tune(XQ, WQ, Y, kid, int(cfg["splitK"]))
+        opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kid, int(cfg["splitK"]))
         return _finalize_output(Y, reshape_out_to_2d)
 
-    # 3) CSV miss (or incompatible tuned winner): optionally record the
-    #    shape and delegate to the C++ bf16 dispatcher, which is (or
-    #    becomes, pending PR2' C++ changes) a lookup + heuristic branch.
+    # 3) CSV miss: log the shape (for offline tuning later) and fall
+    #    through to the C++ heuristic dispatcher via opus_gemm. Bias is
+    #    forwarded through; the C++ entry skips its bias-agnostic lookup
+    #    map when bias is present and routes directly to the heuristic
+    #    (which only ever returns bias-aware split-barrier / splitk kids).
     _opus_common.maybe_log_untuned_shape(
         M=M,
         N=N,
@@ -388,7 +488,7 @@ def gemm_a16w16_opus(
         scaleAB=False,
         bpreshuffle=False,
     )
-    _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None)
+    _opus_gemm_bf16_dispatch(XQ, WQ, Y, None, None, None, bias)
     return _finalize_output(Y, reshape_out_to_2d)
 
 
