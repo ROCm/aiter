@@ -7,6 +7,7 @@
 #include "dispatch_utils.h"
 #include "hip_float8.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <type_traits>
 
 #ifdef __HIP_DEVICE_COMPILE__
 #include "opus/opus.hpp"
@@ -7238,10 +7239,19 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
 // bitwise-identical output to the prior bpermute-based reduce.
 // All lanes hold the full sum on return — XOR butterfly is symmetric, so no
 // follow-up broadcast is needed.
+//
+// Body is wrapped in #ifdef __HIP_DEVICE_COMPILE__ to match the rest of this
+// file: opus.hpp is only included in the device pass (see line 11), so the
+// opus::* references below would fail host-pass non-dependent-name lookup
+// and break any TU that includes rope_common.h without otherwise pulling in
+// opus.hpp (e.g. csrc/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu).
+// In the host pass the body is empty and the function returns `val`
+// unchanged — fine because these helpers are __device__-only.
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val)
 {
     static_assert(sizeof(T) == 4, "warp_reduce_sum requires 4-byte type");
+#ifdef __HIP_DEVICE_COMPILE__
     {
         const int v_i32 = __builtin_bit_cast(int, val);
         val += __builtin_bit_cast(
@@ -7267,16 +7277,19 @@ __inline__ __device__ T warp_reduce_sum(T val)
                          opus::number<0xf>{},
                          opus::number<0xf>{},
                          opus::bool_constant<false>{});
+#endif
     return val;
 }
 
 // 16-lane (half-warp) version of warp_reduce_sum: skips the XOR-by-16 step so
 // lanes 0..15 and lanes 16..31 reduce independently within their group.
 // Used by pair-packed kernels where each half-warp processes a separate head.
+// Body is #ifdef'd for the same reason as warp_reduce_sum above.
 template <typename T>
 __inline__ __device__ T half_warp_reduce_sum(T val)
 {
     static_assert(sizeof(T) == 4, "half_warp_reduce_sum requires 4-byte type");
+#ifdef __HIP_DEVICE_COMPILE__
     {
         const int v_i32 = __builtin_bit_cast(int, val);
         val += __builtin_bit_cast(
@@ -7297,6 +7310,7 @@ __inline__ __device__ T half_warp_reduce_sum(T val)
                          opus::number<0xf>{},
                          opus::number<0xf>{},
                          opus::bool_constant<false>{});
+#endif
     return val;
 }
 
@@ -7410,9 +7424,20 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
 // path through warp_shfl_sync_vec(threadIdx.x + neighbor_offset), this saves
 // ~5 cycles per dword (ds_swizzle ~5 cyc vs ds_bpermute ~10 cyc) and removes
 // one VALU dependency chain (the runtime neighbor_offset computation).
+//
+// Unlike warp_reduce_sum / half_warp_reduce_sum where opus::* only appears in
+// the body (and so can be hidden with #ifdef __HIP_DEVICE_COMPILE__ to keep
+// the host pass building), here opus::number<XorOffset> is a default
+// argument in the SIGNATURE — the signature is parsed in both passes, so
+// it cannot be #ifdef'd. We use std::integral_constant<int, XorOffset>
+// instead (which doesn't need opus.hpp). Existing callers passing
+// opus::number<X>{} continue to work because opus::number<I> is publicly
+// derived from std::integral_constant<index_t, I> (csrc/include/opus/opus.hpp:57)
+// — pass-by-value slicing of the empty derived type to its empty base is a no-op.
 template <typename T, int vec_size, int XorOffset>
-__inline__ __device__ vec_t<T, vec_size> warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
-                                                                opus::number<XorOffset> = {})
+__inline__ __device__ vec_t<T, vec_size>
+warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
+                       std::integral_constant<int, XorOffset> = {})
 {
     static_assert(XorOffset > 0 && XorOffset < 32,
                   "ds_swizzle XOR mask must be in [1, 31] within a 32-lane segment");
