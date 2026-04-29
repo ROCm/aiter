@@ -123,7 +123,7 @@ def _ceil_div(a: int, b: int) -> int:
 def _flatmm_splitk_pfk(k) -> int:
     """Host-side computation of Traits::prefetch_k_iter for a splitk instance.
 
-    Mirrors opus_flatmm_splitk_traits's formula so the heuristic can pre-compute
+    Mirrors opus_flatmm_splitk_traits_gfx950's formula so the heuristic can pre-compute
     the per-split iter budget without a device call. Hardcodes LDS=163840 (gfx950),
     same convention as the traits struct.
     """
@@ -543,8 +543,8 @@ def _kid_rejects_shape(k_inst, M, N, K):
 
     Bugs (a) live in this repo's own TORCH_CHECKs and will never be "fixed"
     without touching generated launchers; (b) reflect kernel-level bugs in
-    non-splitk pipelines (csrc/opus_gemm/include/pipeline/opus_gemm_pipeline_a16w16.cuh
-    and opus_gemm_pipeline_a16w16_flatmm.cuh) -- tracking a fix outside this
+    non-splitk pipelines (csrc/opus_gemm/include/gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh
+    and opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh) -- tracking a fix outside this
     file. Until those are fixed, the tuner simply hides the broken kids.
     """
     B_K = k_inst.B_K

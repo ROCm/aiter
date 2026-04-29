@@ -14,7 +14,24 @@ Public API:
   * opus_gemm_a16w16_tune  — id-based low-level binding (tuner / override).
 """
 
-from .gemm_op_a16w16 import opus_gemm_a16w16_tune, gemm_a16w16_opus
+from ._arch import _check_arch
+
+# Gate import on gfx950 today: the a16w16 kernels use gfx950-only intrinsics
+# (MFMA-32x32x16, ds_read_b64_tr) and the 160 KiB LDS budget. Other archs
+# fall through to a clear ImportError instead of either a JIT compile
+# failure or a silent runtime mismatch. Future opus subpackages declare
+# their own supported sets in their own __init__.
+_check_arch(
+    {"gfx950"},
+    feature="aiter.ops.opus (a16w16)",
+    hint=(
+        "opus_gemm uses gfx950-only intrinsics (MFMA, ds_read_b64_tr) and "
+        "the 160 KiB LDS budget. Set GPU_ARCHS=gfx950 (or run on a gfx950 "
+        "device) to use this module."
+    ),
+)
+
+from .gemm_op_a16w16 import opus_gemm_a16w16_tune, gemm_a16w16_opus  # noqa: E402
 
 __all__ = [
     "opus_gemm_a16w16_tune",

@@ -3,7 +3,7 @@
 //
 // Split-K reduce kernel: tile-agnostic; sums an fp32 workspace across the
 // split-K axis, casts fp32 -> D_OUT, and writes to C. Split out of
-// opus_gemm_pipeline_a16w16_flatmm_splitk.cuh so the reduce path can be
+// opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh so the reduce path can be
 // shared by future split-K main pipelines (a8w8 etc.) without dragging in
 // the full a16w16 flatmm pipeline header.
 //
@@ -86,6 +86,9 @@ __global__ void splitk_reduce_kernel(
     int bias_stride_batch = 0)
 {
 #ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the
+    // multi-arch wheel rationale.
     constexpr int VEC   = VEC_;
     constexpr int BLOCK = BLOCK_;
     constexpr bool HAS_BIAS = HAS_BIAS_;
@@ -208,5 +211,8 @@ __global__ void splitk_reduce_kernel(
         }
     }
     // else: whole VEC chunk is past N -> write nothing.
+#else
+    // Non-gfx950 device pass: empty stub. See gfx950 branch above.
+#endif  // __gfx950__
 #endif  // __HIP_DEVICE_COMPILE__
 }

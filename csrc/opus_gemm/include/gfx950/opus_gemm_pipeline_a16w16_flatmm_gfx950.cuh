@@ -9,7 +9,7 @@
 // [N, K] row-major (pre-transposed); no shuffle at runtime.
 #pragma once
 
-#include "opus_gemm_traits_a16w16.cuh"
+#include "opus_gemm_traits_a16w16_gfx950.cuh"
 
 // ============================================================================
 // Layout functions -- device-only; skipping them on the host pass saves ~50%
@@ -166,9 +166,13 @@ inline __device__ auto make_layout_rb_flatmm(int lane_id) {
 
 template<typename Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, Traits::WG_PER_CU)
-void gemm_a16w16_flatmm_kernel(opus_gemm_flatmm_kargs kargs)
+void gemm_a16w16_flatmm_kernel(opus_gemm_flatmm_kargs_gfx950 kargs)
 {
 #ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    // gfx950-only kernel body. Non-gfx950 device passes (multi-arch wheels)
+    // fall into the empty #else stub. See opus_gemm_pipeline_a16w16_gfx950.cuh for
+    // the full rationale.
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -501,5 +505,8 @@ void gemm_a16w16_flatmm_kernel(opus_gemm_flatmm_kargs kargs)
         auto v_c_out = cast<D_C>(v_c);
         store_if<T::VEC_C>(g_c, pred, v_c_out, u_gc, 0);
     }
+#else
+    // Non-gfx950 device pass: empty stub. See gfx950 branch above.
+#endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }
