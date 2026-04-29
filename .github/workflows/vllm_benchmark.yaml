@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [labeled]
+    types: [labeled, synchronize]
     branches: [main]
   workflow_dispatch:
 
