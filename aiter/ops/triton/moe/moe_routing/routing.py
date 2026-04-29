@@ -5,6 +5,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
 @dataclass
@@ -115,6 +116,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        USE_TDM=is_tdm_avail(),
         num_warps=1,
     )
 
@@ -183,6 +185,7 @@ def sort_tokens_fused(
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        USE_TDM=is_tdm_avail(),
         num_warps=1,
     )
 
