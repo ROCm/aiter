@@ -35,8 +35,6 @@ DS_LOADS_PER_FRAG = 4
 LDS_PAD_A_BYTES = 16
 LDS_PAD_B_BYTES = 16
 LDS_PAD_D_BYTES = 16
-E8M0_IDENTITY = 0x7F7F7F7F
-
 _STAGE_NAMES = ("ping", "pong", "pang", "pung")
 
 
@@ -307,7 +305,6 @@ def compile_gemm_a8w8_blockscale(
             arg_w_scale, num_records_bytes=w_scale_total_bytes
         )
 
-        identity_scale = arith.constant(E8M0_IDENTITY, type=T.i32)
         scale_zero = arith.constant(0.0, type=T.f32)
 
         stages_a = [
@@ -331,13 +328,16 @@ def compile_gemm_a8w8_blockscale(
         stages_a_mem = [p.get() for p in stages_a]
         stages_b_mem = [p.get() for p in stages_b]
 
-        def tdm_issue_x(k_base, buffer_idx):
-            """Async HBM→LDS copy of one X tile (tile_m × tile_k) at K-offset
-            `k_base`. Lands in LDS stage `buffer_idx`. Completes asynchronously;
-            pair with tdm_ops.tensor_wait to synchronize."""
-            desc = tdm_ops.make_tensor_descriptor_2d(
+        # ── TDM descriptor hoisting ──────────────────────────────────────
+        # Build full descriptors once at kernel entry (k_base=0, stage 0).
+        # GROUP1 (8 i32 config words) is wave-uniform and lives in SGPRs for
+        # the whole kernel. GROUP0's pred + addr_hi are kernel-constant; only
+        # lo32 advances per K-tile (one s_add_co_i32) and the LDS addr rotates
+        # through `num_buffers` pre-extracted slots.
+        def _make_desc_x(lds_mem, k_base):
+            return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_x,
-                lds_memref=stages_a_mem[buffer_idx],
+                lds_memref=lds_mem,
                 global_offset=(blk_m, k_base),
                 tensor_shape=(tile_m, tile_k),
                 strides=(K, 1),
@@ -347,14 +347,11 @@ def compile_gemm_a8w8_blockscale(
                 pad_amount=LDS_PAD_A_BYTES,
                 num_warps=num_warps,
             )
-            tdm_ops.tensor_load_2d(desc)
 
-        def tdm_issue_w(k_base, buffer_idx):
-            """Async HBM→LDS copy of one W tile (tile_n × tile_k) at K-offset
-            `k_base`. Lands in LDS stage `buffer_idx`."""
-            desc = tdm_ops.make_tensor_descriptor_2d(
+        def _make_desc_w(lds_mem, k_base):
+            return tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_w,
-                lds_memref=stages_b_mem[buffer_idx],
+                lds_memref=lds_mem,
                 global_offset=(blk_n, k_base),
                 tensor_shape=(tile_n, tile_k),
                 strides=(K, 1),
@@ -364,14 +361,73 @@ def compile_gemm_a8w8_blockscale(
                 pad_amount=LDS_PAD_B_BYTES,
                 num_warps=num_warps,
             )
-            tdm_ops.tensor_load_2d(desc)
 
-        def issue_tdm_loads(k_base, buffer_idx):
-            """Issue the two async TDM copies (X + W) for one K-tile into LDS
-            stage `buffer_idx`. The s_setprio bump + drop makes the two TDM
-            issues dispatch back-to-back without interleaving scalar work."""
-            tdm_issue_x(k_base, buffer_idx)
-            tdm_issue_w(k_base, buffer_idx)
+        _desc_x_init = _make_desc_x(stages_a_mem[0], arith.index(0))
+        _desc_w_init = _make_desc_w(stages_b_mem[0], arith.index(0))
+
+        dgroup1_x = _desc_x_init.dgroup1
+        dgroup1_w = _desc_w_init.dgroup1
+        addr_hi_x = vector.extract(
+            _desc_x_init.dgroup0, static_position=[3], dynamic_position=[]
+        )
+        addr_hi_w = vector.extract(
+            _desc_w_init.dgroup0, static_position=[3], dynamic_position=[]
+        )
+        addr_lo_x_init = vector.extract(
+            _desc_x_init.dgroup0, static_position=[2], dynamic_position=[]
+        )
+        addr_lo_w_init = vector.extract(
+            _desc_w_init.dgroup0, static_position=[2], dynamic_position=[]
+        )
+
+        # Per-stage LDS i32 addresses (pre-extracted; selected by buf_idx).
+        # Use range_constexpr so the AST rewriter does NOT convert this into an
+        # scf.for — `i` must remain a Python int for stages_*_mem[i] indexing.
+        stages_a_lds_addr = []
+        stages_b_lds_addr = []
+        for i in range_constexpr(num_buffers):
+            stages_a_lds_addr.append(
+                vector.extract(
+                    _make_desc_x(stages_a_mem[i], arith.index(0)).dgroup0,
+                    static_position=[1],
+                    dynamic_position=[],
+                )
+            )
+            stages_b_lds_addr.append(
+                vector.extract(
+                    _make_desc_w(stages_b_mem[i], arith.index(0)).dgroup0,
+                    static_position=[1],
+                    dynamic_position=[],
+                )
+            )
+
+        # K-axis is innermost (stride=1), elem_bytes=1 → +tile_k bytes per tile.
+        # NB: this is a 32-bit advance; relies on glb_base + total K span not
+        # crossing a 4 GiB boundary measured from `addr_lo_*_init`. Safe for
+        # any realistic GEMM K (e.g. K=16384 → span 16 KiB).
+        adv_x_i32 = arith.constant(tile_k, type=T.i32)
+        adv_w_i32 = arith.constant(tile_k, type=T.i32)
+        pred_const = arith.constant(1, type=T.i32)
+
+        def issue_tdm_loads(buf_idx, lo_x, lo_w):
+            """Hoisted-descriptor TDM issue for one K-tile into LDS stage
+            `buf_idx`. Constructs only GROUP0 (4-elem vector) inline; GROUP1 +
+            addr_hi are pre-extracted SGPRs from kernel entry. s_setprio
+            brackets keep the X and W issues back-to-back. Returns
+            (next_lo_x, next_lo_w) advanced by tile_k for the next call."""
+            rocdl.s_setprio(2)
+            dg0_x = vector.from_elements(
+                T.vec(4, T.i32),
+                [pred_const, stages_a_lds_addr[buf_idx], lo_x, addr_hi_x],
+            )
+            tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0_x, dgroup1_x))
+            dg0_w = vector.from_elements(
+                T.vec(4, T.i32),
+                [pred_const, stages_b_lds_addr[buf_idx], lo_w, addr_hi_w],
+            )
+            tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0_w, dgroup1_w))
+            rocdl.s_setprio(0)
+            return arith.addi(lo_x, adv_x_i32), arith.addi(lo_w, adv_w_i32)
 
         w_is_wave_uniform = warp_tile_n <= scale_block_n
         if w_is_wave_uniform:
@@ -532,18 +588,12 @@ def compile_gemm_a8w8_blockscale(
                     a_frag = a_frags[ks * wmma_m_rep + wm]
                     b_frag = b_frags[ks * wmma_n_rep + wn]
                     # ISA operand order: (B, A, C), reversed from math.
-                    temp = rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+                    temp = rocdl.wmma_f32_16x16x128_fp8_fp8(
                         T.vec(8, T.f32),
                         b_frag,
                         a_frag,
                         temp,
-                        identity_scale,
-                        identity_scale,
-                        fmtA=0,
-                        fmtB=0,
-                        scaleAType=0,
-                        scaleBType=0,
-                    )
+                    ).result
                 return temp
 
             def compute_scale(wm, wn, sc_x_base, sc_w_base):
@@ -583,9 +633,9 @@ def compile_gemm_a8w8_blockscale(
 
                     # new wmma
                     wm1, wn1, idx1 = acc_coords[i + wmma_pipeline_depth]
-                    # rocdl.s_setprio(2)
+                    rocdl.s_setprio(2)
                     temp1 = issue_wmma_temp(sc, wm1, wn1)
-                    # rocdl.s_setprio(0)
+                    rocdl.s_setprio(0)
 
                 # drain remaining
                 wmma_with_scale(temp0, wm0, wn0, idx0, sc_x_base, sc_w_base)
@@ -659,8 +709,12 @@ def compile_gemm_a8w8_blockscale(
 
         # PROLOGUE
         # Step 1: Prologue — issue TDM for the first pre_loaded tiles, fence.
+        # `lo_x`/`lo_w` track the global-address lo32 across all subsequent
+        # TDM issues; the prologue advances them by `prologue_tiles * tile_k`.
+        lo_x = addr_lo_x_init
+        lo_w = addr_lo_w_init
         for i in range_constexpr(prologue_tiles):
-            issue_tdm_loads(arith.index(i * tile_k), i)
+            lo_x, lo_w = issue_tdm_loads(i, lo_x, lo_w)
 
         # Step 3: initial scale preload. Keep raw scales and multiply on-use in
         # the WMMA/FMA helper to avoid carrying a full combined scale array.
@@ -683,7 +737,9 @@ def compile_gemm_a8w8_blockscale(
 
             cur_a, cur_b = load_operand_frags(0)
 
-            # Main loop start
+            # Main loop start. lo_x / lo_w are appended to the loop carry so
+            # each substage's TDM issue is just a 4-elem vector pack + a 32-bit
+            # advance (no per-call descriptor rebuild).
             main_loop_end_k = main_loop_iters * num_buffers * tile_k
             if main_loop_iters > 0:
                 init_state = _pack_state_reg_preload(
@@ -694,10 +750,12 @@ def compile_gemm_a8w8_blockscale(
                     cur_w_raw,
                     prefetch_x_raw,
                     prefetch_w_raw,
-                )
+                ) + [lo_x, lo_w]
                 for iter_k_base, state in range(
                     0, main_loop_end_k, num_buffers * tile_k, init=init_state
                 ):
+                    cur_lo_x = state[-2]
+                    cur_lo_w = state[-1]
                     (
                         cur_accs,
                         cur_a,
@@ -706,7 +764,7 @@ def compile_gemm_a8w8_blockscale(
                         cur_w_raw,
                         prefetch_x_raw,
                         prefetch_w_raw,
-                    ) = _unpack_state_reg_preload(state)
+                    ) = _unpack_state_reg_preload(state[:-2])
                     tile_idx_rt = iter_k_base / arith.index(tile_k)
 
                     for substage in range_constexpr(num_buffers):
@@ -720,10 +778,9 @@ def compile_gemm_a8w8_blockscale(
                         )
 
                         load_buffer = (substage + num_buffers - 1) % num_buffers
-                        load_k = iter_k_base + arith.index(
-                            (substage + num_buffers - 1) * tile_k
+                        cur_lo_x, cur_lo_w = issue_tdm_loads(
+                            load_buffer, cur_lo_x, cur_lo_w
                         )
-                        issue_tdm_loads(load_k, load_buffer)
 
                         tdm_ops.tensor_wait(MAIN_TDM_OUTSTANDING)
                         gpu.barrier()
@@ -746,7 +803,7 @@ def compile_gemm_a8w8_blockscale(
                         cur_w_raw,
                         prefetch_x_raw,
                         prefetch_w_raw,
-                    )
+                    ) + [cur_lo_x, cur_lo_w]
                 (
                     accs,
                     cur_a,
@@ -755,7 +812,9 @@ def compile_gemm_a8w8_blockscale(
                     cur_w_raw,
                     prefetch_x_raw,
                     prefetch_w_raw,
-                ) = _unpack_state_reg_preload(results)
+                ) = _unpack_state_reg_preload(results[:-2])
+                lo_x = results[-2]
+                lo_w = results[-1]
             else:
                 accs = list(accs)
 
@@ -767,7 +826,7 @@ def compile_gemm_a8w8_blockscale(
 
                 load_tile = extra_base_tile + step + num_buffers - 1
                 load_buffer = load_tile % num_buffers
-                issue_tdm_loads(arith.index(load_tile * tile_k), load_buffer)
+                lo_x, lo_w = issue_tdm_loads(load_buffer, lo_x, lo_w)
 
                 tdm_ops.tensor_wait(MAIN_TDM_OUTSTANDING)
                 gpu.barrier()
@@ -827,21 +886,22 @@ def compile_gemm_a8w8_blockscale(
             if main_loop_iters > 0:
                 init_state = _pack_state_no_op_preload(
                     accs, cur_x_raw, cur_w_raw, prefetch_x_raw, prefetch_w_raw
-                )
+                ) + [lo_x, lo_w]
                 for iter_k_base, state in range(
                     0, main_loop_end_k, num_buffers * tile_k, init=init_state
                 ):
+                    cur_lo_x = state[-2]
+                    cur_lo_w = state[-1]
                     cur_accs, cur_x_raw, cur_w_raw, prefetch_x_raw, prefetch_w_raw = (
-                        _unpack_state_no_op_preload(state)
+                        _unpack_state_no_op_preload(state[:-2])
                     )
                     tile_idx_rt = iter_k_base / arith.index(tile_k)
 
                     for substage in range_constexpr(num_buffers):
                         load_buffer = (substage + num_buffers - 1) % num_buffers
-                        load_k = iter_k_base + arith.index(
-                            (substage + num_buffers - 1) * tile_k
+                        cur_lo_x, cur_lo_w = issue_tdm_loads(
+                            load_buffer, cur_lo_x, cur_lo_w
                         )
-                        issue_tdm_loads(load_k, load_buffer)
 
                         compute_stage = substage % num_buffers
                         fresh_a, fresh_b = load_operand_frags(compute_stage)
@@ -863,10 +923,12 @@ def compile_gemm_a8w8_blockscale(
 
                     results = yield _pack_state_no_op_preload(
                         cur_accs, cur_x_raw, cur_w_raw, prefetch_x_raw, prefetch_w_raw
-                    )
+                    ) + [cur_lo_x, cur_lo_w]
                 accs, cur_x_raw, cur_w_raw, prefetch_x_raw, prefetch_w_raw = (
-                    _unpack_state_no_op_preload(results)
+                    _unpack_state_no_op_preload(results[:-2])
                 )
+                lo_x = results[-2]
+                lo_w = results[-1]
             else:
                 accs = list(accs)
 
@@ -876,7 +938,7 @@ def compile_gemm_a8w8_blockscale(
             for step in range_constexpr(extra_tiles):
                 load_tile = extra_base_tile + step + num_buffers - 1
                 load_buffer = load_tile % num_buffers
-                issue_tdm_loads(arith.index(load_tile * tile_k), load_buffer)
+                lo_x, lo_w = issue_tdm_loads(load_buffer, lo_x, lo_w)
 
                 compute_stage = (extra_base_tile + step) % num_buffers
                 fresh_a, fresh_b = load_operand_frags(compute_stage)
