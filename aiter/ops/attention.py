@@ -81,7 +81,7 @@ def gen_pa_fwd_asm(
         return torch.empty_like(Q)
 
 
-@compile_ops("module_attention", gen_fake=gen_pa_fwd_native_fake)
+@compile_ops("module_attention", gen_fake=gen_pa_fwd_native_fake, develop=True)
 def pa_fwd_naive(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
@@ -652,7 +652,7 @@ direct_register_custom_op(
 MD_NAME = "module_mla_asm"
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
+@compile_ops(MD_NAME, ffi_type="ctypes", develop=True)
 def mla_decode_stage1_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -688,7 +688,7 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
+@compile_ops(MD_NAME, ffi_type="ctypes", develop=True)
 def mla_prefill_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
@@ -873,7 +873,7 @@ def get_ps_metadata_v1(
 ) -> None: ...
 
 
-@compile_ops(MD_NAME, ffi_type="ctypes")
+@compile_ops(MD_NAME, ffi_type="ctypes", develop=True)
 def mla_prefill_ps_asm_fwd(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -933,10 +933,8 @@ def get_mla_metadata_info_v1(
         )
     )
 
-    # In sparse mode, each expanded batch has 1 Q token
-    effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     max_qo_tiles_per_batch = (
-        int(math.ceil(effective_seqlen_qo * num_head_qo / 128))
+        int(math.ceil(max_seqlen_qo * num_head_qo / 128))
         if num_head_qo == 16
         or (
             get_gfx() == "gfx942"
@@ -946,19 +944,13 @@ def get_mla_metadata_info_v1(
         )
         or (
             get_gfx() == "gfx950"
-            and (num_head_qo * effective_seqlen_qo) % 128 == 0
-            and kv_dtype == dtypes.bf16
-            and q_dtype == dtypes.bf16
-        )
-        or (
-            get_gfx() == "gfx950"
             and num_head_qo == 64
             and q_dtype == dtypes.fp8
             and kv_dtype == dtypes.fp8
-            and effective_seqlen_qo == 1
+            and max_seqlen_qo == 1
         )
         or use_qseqlen_fold
-        else int(math.ceil(effective_seqlen_qo * num_head_qo / 16))
+        else int(math.ceil(max_seqlen_qo * num_head_qo / 16))
     )
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
