@@ -7,6 +7,19 @@ import pandas as pd
 import torch
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_ROOT_DIR
+from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
+from aiter.utility.mp_tuner import mp_tuner
+from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune
+
+# opus_gemm_common is a sibling file in csrc/opus_gemm/. The script is
+# expected to be run from that directory (or with that directory on
+# sys.path) so the bare-name import resolves without needing a package
+# layout.
+from opus_gemm_common import (
+    a16w16_kernels_list,
+    a16w16_flatmm_kernels_list,
+    a16w16_flatmm_splitk_kernels_list,
+)
 
 # opus-private tuned CSV default path. Lives under aiter/ops/opus/configs/
 # so all opus artifacts are co-located. The Python user-facing wrapper in
@@ -17,9 +30,6 @@ OPUS_A16W16_TUNED_CSV = os.getenv(
     "AITER_OPUS_A16W16_TUNED_CSV",
     f"{AITER_ROOT_DIR}/aiter/ops/opus/configs/opus_gemm_a16w16_tuned.csv",
 )
-from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune
 
 
 # Silence per-task `avg: X us/iter with hipgraph` and `no valida data after
@@ -32,11 +42,6 @@ from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_gemm_a1
 #   that we want to keep. We re-enable aiter logger at INFO for the tuner
 #   summary in a finally block.
 _AITER_VERBOSE = bool(int(os.environ.get("AITER_VERBOSE", "0")))
-from opus_gemm_common import (
-    a16w16_kernels_list,
-    a16w16_flatmm_kernels_list,
-    a16w16_flatmm_splitk_kernels_list,
-)
 
 
 # Merge all three a16w16-family pipelines into one tuner search:
@@ -433,7 +438,6 @@ def _opus_run_perftest(
     # Inside the subprocess the bench func is `func` directly (kwargs may
     # be empty). We accept num_rotate_args / needTrace purely for signature
     # compatibility; the opus tuner never sets them.
-    stream = torch.cuda.current_stream()
 
     # Warmup on the main stream. Keeps the first measurement stable and
     # triggers JIT / kernel loads before capture.
