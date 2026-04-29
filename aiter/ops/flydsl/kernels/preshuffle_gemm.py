@@ -907,7 +907,7 @@ def compile_preshuffle_gemm_a8(
                                     for imxdl in range_constexpr(_fp4_pack_M):
                                         mi_idx = mi_p * _fp4_pack_M + imxdl
                                         curr_row_a_lds = row_a_lds + (mi_idx * 16)
-                                        if (
+                                        if const_expr(
                                             (a0_prefetch is not None)
                                             and (k_idx == 0)
                                             and (mi_idx == 0)
