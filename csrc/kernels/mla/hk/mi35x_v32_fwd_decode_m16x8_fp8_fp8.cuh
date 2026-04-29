@@ -487,8 +487,33 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             constexpr uint32_t num_pv_iter    = T::kVoHeadDim / (T::kBlockK * 2); // 8
             constexpr uint32_t num_macro_iter = num_pv_iter / 2;                  // 4
 
+            // PV scaler workaround: HW bug -- mfma blocks the following v_pk_* even with
+            // no data dependency. Per sub-tile (4 vgprs) we split the rescale in half:
+            //   - pre-PV-loop:    1x v_pk_mul_f32 covering vgprs [base+0, base+1]
+            //   - interleaved:    2x v_mul_f32    covering vgprs [base+2, base+3]
+            // The interleaved phase is mfma-paired (rotation: scale_{i+1} after mfma_i),
+            // and uses single-precision v_mul_f32 so it doesn't trip the v_pk hazard.
+            auto pk_pre_scale = [&](auto idx_c) {
+                constexpr uint32_t base = k_o_begin + decltype(idx_c)::value * 4;
+                const float2 r2 = {rescale, rescale};
+                asm volatile("v_pk_mul_f32 v[%0:%1], %2, v[%0:%1]"
+                             : : "n"(base), "n"(base + 1), "v"(r2));
+            };
+            auto mul_interleave = [&](auto idx_c) {
+                constexpr uint32_t base = k_o_begin + decltype(idx_c)::value * 4;
+                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 2), "v"(rescale));
+                asm volatile("v_mul_f32_e32 v[%0], %1, v[%0]" : : "n"(base + 3), "v"(rescale));
+            };
+
             if constexpr(kSkipCompute == false)
             {
+                // Pre-PV-loop scale: 32x v_pk_mul_f32 (one per sub-tile, scales vgprs +0/+1).
+                // Issued before any PV mfma so the mfma->v_pk hazard never fires.
+                if constexpr(kIsFirstIter == false)
+                {
+                    opus::static_for<32>([&](auto i) { pk_pre_scale(i); });
+                }
+
                 // Prologue: load tile 0 into k_kv_0/k_kv_1 and finalize (full drain).
                 kv_manager.template load_transposed_v_to_gpr<0,  0,           k_kv_0_begin>    (p_lds_kv_curr);
                 kv_manager.template load_transposed_v_to_gpr<16, 0,           k_kv_0_begin + 2>(p_lds_kv_curr);
@@ -501,11 +526,12 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 4, true>();
                 pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 6, false>();
 
-                // 2-buffer rotation prologue: pre-scale the very first sub-tile (m=0, e0_a)
-                // so the first PV mfma below sees an already-rescaled C operand.
+                // 2-buffer rotation prologue: finish scaling sub-tile 0 with 2x v_mul_f32
+                // (vgprs +2/+3) so the first PV mfma sees fully-rescaled C. The +0/+1
+                // half was scaled by the pk_pre_scale block above.
                 if constexpr(kIsFirstIter == false)
                 {
-                    hk::mul_vgpr<0, 0>(oaccu, oaccu, rescale);
+                    mul_interleave(opus::number<0>{});
                 }
 
                 asm volatile("s_waitcnt lgkmcnt(0)");
@@ -575,16 +601,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     else
                     {
                         // 2-buffer rotation: e0_a was already scaled (prologue OR prev macro's tail).
-                        // After each mfma, scale the next sub-tile so it settles on the VALU pipe
-                        // while the MFMA pipe is busy with this mfma's 12-cycle dispatch.
+                        // After each mfma, finish scaling the next sub-tile (2x v_mul_f32 on
+                        // vgprs +2/+3) so it settles on the VALU pipe while the MFMA pipe is
+                        // busy with this mfma's 16-cycle dispatch. The +0/+1 half was scaled
+                        // by the pre-PV-loop pk block.
                         hk::mma_ABt(oaccu_e0_a, kv_0_top, p_mfma, oaccu_e0_a);
-                        hk::mul_vgpr<0, scale_base + 1>(oaccu, oaccu, rescale);  // -> e0_b
+                        mul_interleave(opus::number<scale_base + 1>{});  // -> e0_b
                         hk::mma_ABt(oaccu_e0_b, kv_0_bot, p_mfma, oaccu_e0_b);
-                        hk::mul_vgpr<0, scale_base + 2>(oaccu, oaccu, rescale);  // -> e1_a
+                        mul_interleave(opus::number<scale_base + 2>{});  // -> e1_a
                         hk::mma_ABt(oaccu_e1_a, kv_1_top, p_mfma, oaccu_e1_a);
-                        hk::mul_vgpr<0, scale_base + 3>(oaccu, oaccu, rescale);  // -> e1_b
+                        mul_interleave(opus::number<scale_base + 3>{});  // -> e1_b
                         hk::mma_ABt(oaccu_e1_b, kv_1_bot, p_mfma, oaccu_e1_b);
-                        hk::mul_vgpr<0, scale_base + 4>(oaccu, oaccu, rescale);  // -> o0_a (odd half)
+                        mul_interleave(opus::number<scale_base + 4>{});  // -> o0_a (odd half)
                     }
 
                     asm volatile("s_waitcnt lgkmcnt(0)");
@@ -616,18 +644,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     {
                         // o0_a was scaled at the tail of the even half above.
                         hk::mma_ABt(oaccu_o0_a, kv_0_alt_top, p_mfma, oaccu_o0_a);
-                        hk::mul_vgpr<0, scale_base + 5>(oaccu, oaccu, rescale);  // -> o0_b
+                        mul_interleave(opus::number<scale_base + 5>{});  // -> o0_b
                         hk::mma_ABt(oaccu_o0_b, kv_0_alt_bot, p_mfma, oaccu_o0_b);
-                        hk::mul_vgpr<0, scale_base + 6>(oaccu, oaccu, rescale);  // -> o1_a
+                        mul_interleave(opus::number<scale_base + 6>{});  // -> o1_a
                         hk::mma_ABt(oaccu_o1_a, kv_1_alt_top, p_mfma, oaccu_o1_a);
-                        hk::mul_vgpr<0, scale_base + 7>(oaccu, oaccu, rescale);  // -> o1_b
+                        mul_interleave(opus::number<scale_base + 7>{});  // -> o1_b
                         hk::mma_ABt(oaccu_o1_b, kv_1_alt_bot, p_mfma, oaccu_o1_b);
 
                         // Hand off to next macro: scale its first sub-tile (e0_a).
                         // Skipped on the final macro -- nothing follows the last mfma.
                         if constexpr(has_next_even)
                         {
-                            hk::mul_vgpr<0, scale_base + 8>(oaccu, oaccu, rescale);  // -> next macro's e0_a
+                            mul_interleave(opus::number<scale_base + 8>{});  // -> next macro's e0_a
                         }
                     }
 
