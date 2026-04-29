@@ -269,7 +269,7 @@ def compile_mixed_moe_gemm1(
     _go_tag = "_go" if gate_only else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v34_g1u0_splitk"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v35_tidlds_g1u0_splitk"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -691,6 +691,21 @@ def compile_mixed_moe_gemm1(
                 mask24 = arith.constant(0xFFFFFF)
                 tokens_i32 = arith.index_cast(T.i32, tokens_in)
 
+                # Preload sorted_idx once per row into LDS so X address generation
+                # and the CShuffle epilogue share the same routed-token decode.
+                _c_tile_m_idx = arith.constant(tile_m, index=True)
+                _tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, _c_tile_m_idx)
+                _if_tid = scf.IfOp(_tid_in_range)
+                with ir.InsertionPoint(_if_tid.then_block):
+                    _tid_row = bx_m + tx
+                    _tid_val = buffer_ops.buffer_load(
+                        sorted_rsrc, _tid_row, vec_width=1, dtype=T.i32
+                    )
+                    _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
+                    vector.store(_tid_vec1, lds_tid, [tx])
+                    scf.YieldOp([])
+                gpu.barrier()
+
                 def x_tile_chunk_coord_i32(i: int):
                     return tile_chunk_coord_i32(
                         arith,
@@ -725,10 +740,7 @@ def compile_mixed_moe_gemm1(
                     x_row_local.append(row_local)
                     x_col_local_i32.append(col_local_i32)
 
-                    sorted_row_i = bx_m + row_local
-                    fused_i = buffer_ops.buffer_load(
-                        sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
-                    )
+                    fused_i = memref.load(lds_tid, [row_local])
                     t_i32 = arith.andi(fused_i, mask24)
                     s_i32 = arith.shrui(fused_i, arith.constant(24))
                     t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
@@ -1559,17 +1571,6 @@ def compile_mixed_moe_gemm1(
                 a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(
                     _k0_scale
                 )
-                _c_tile_m_idx = arith.constant(tile_m, index=True)
-                _tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, _c_tile_m_idx)
-                _if_tid = scf.IfOp(_tid_in_range)
-                with ir.InsertionPoint(_if_tid.then_block):
-                    _tid_row = bx_m + tx
-                    _tid_val = buffer_ops.buffer_load(
-                        sorted_rsrc, _tid_row, vec_width=1, dtype=T.i32
-                    )
-                    _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
-                    vector.store(_tid_vec1, lds_tid, [tx])
-                    scf.YieldOp([])
 
                 acc_gate = [acc_init] * num_acc_n * m_repeat
                 acc_up = [acc_init] * num_acc_n * m_repeat if _has_up_path else None
