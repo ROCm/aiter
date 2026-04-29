@@ -27,7 +27,7 @@ if not is_flydsl_available():
     )
 
 try:
-    from aiter.ops.flydsl.kernels.chunk_gated_delta_h import (
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         chunk_gated_delta_rule_fwd_h_flydsl,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
@@ -216,7 +216,7 @@ PREFILL_PARAMS = [
         Hv=64,
         tp=8,
         full_prompt_len=8192,
-        model_name="Qwen3.5-tp4-8k",
+        model_name="Qwen3.5-tp8-8k",
     ),
 ]
 
