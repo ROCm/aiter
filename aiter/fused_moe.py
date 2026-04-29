@@ -337,7 +337,7 @@ def fused_moe_fake(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = 0,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
@@ -371,7 +371,7 @@ def fused_moe_(
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: Optional[torch.Tensor] = None,
-    moe_sorting_dispatch_policy: bool = 0,
+    moe_sorting_dispatch_policy: int = 0,
     dtype: Optional[torch.dtype] = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
@@ -1019,8 +1019,8 @@ def get_2stage_cfgs(
                 if _knames is not None:
                     kernelName1 = _knames[1]  # presorted ps variant
     else:
-        block_m = cfg["block_m"]
-        ksplit = cfg["ksplit"]
+        block_m = int(cfg["block_m"])
+        ksplit = int(cfg["ksplit"])
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
@@ -1211,7 +1211,7 @@ def fused_moe_2stages(
                 sorted_ids=sorted_ids,
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
-                topk=1,
+                topk=topk,
                 block_size=block_size_M,
             )
         else:
