@@ -35,89 +35,42 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  sglang:
+  select-sglang-tests:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    name: Sglang ${{ matrix.model }} ${{ matrix.test_type }} (8 GPU)
     needs: [check-signal]
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_tests: ${{ steps.select.outputs.has_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select SGLang tests
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: python3 ./.github/scripts/sglang_downstream.py select-tests
+
+  sglang:
+    if: needs.select-sglang-tests.outputs.has_tests == 'true'
+    name: Sglang ${{ github.event_name == 'pull_request' && 'PR' || 'Downstream' }} ${{ matrix.model }} ${{ matrix.test_type }} (8 GPU)
+    needs: [check-signal, select-sglang-tests]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
-            model: DeepSeek-R1-MXFP4
-            model_id: amd/DeepSeek-R1-MXFP4-Preview
-            model_path_env: DEEPSEEK_R1_MXFP4_MODEL_PATH
-            test_type: Accuracy
-            timeout_minutes: 130
-            extra_exec_args: ""
-            test_command: python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4 --nightly --timeout-per-file 7200
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
-            model: DeepSeek-R1-MXFP4
-            model_id: amd/DeepSeek-R1-MXFP4-Preview
-            model_path_env: DEEPSEEK_R1_MXFP4_MODEL_PATH
-            test_type: Performance
-            timeout_minutes: 180
-            extra_exec_args: ""
-            test_command: python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
-            model: Qwen3-235B-MXFP4
-            model_id: amd/Qwen3-235B-A22B-Instruct-2507-mxfp4
-            model_path_env: QWEN3_MODEL_PATH
-            test_type: Accuracy + Performance
-            timeout_minutes: 70
-            extra_exec_args: ""
-            test_command: python3 run_suite.py --hw amd --suite nightly-8-gpu-mi35x-qwen3-235b-mxfp4 --nightly --timeout-per-file 3600
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
-            model: Qwen 3.5
-            model_id: Qwen/Qwen3.5-397B-A17B
-            model_path_env: QWEN35_MODEL_PATH
-            test_type: Accuracy
-            timeout_minutes: 70
-            extra_exec_args: ""
-            test_command: python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-qwen35 --nightly --timeout-per-file 3600
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
-            model: Qwen 3.5 FP8
-            model_id: Qwen/Qwen3.5-397B-A17B-FP8
-            model_path_env: QWEN35_FP8_MODEL_PATH
-            test_type: Performance
-            timeout_minutes: 100
-            extra_exec_args: -e SGLANG_USE_AITER=1
-            test_command: python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-qwen35-fp8 --nightly --timeout-per-file 5400
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
-            model: DeepSeek-V3.2
-            model_id: deepseek-ai/DeepSeek-V3.2
-            model_path_env: DEEPSEEK_V32_MODEL_PATH
-            test_type: Accuracy
-            timeout_minutes: 70
-            extra_exec_args: ""
-            test_command: python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
-            model: DeepSeek-V3.2 Basic
-            model_id: deepseek-ai/DeepSeek-V3.2
-            model_path_env: DEEPSEEK_V32_MODEL_PATH
-            test_type: Performance
-            timeout_minutes: 100
-            extra_exec_args: ""
-            test_command: python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-basic --nightly --timeout-per-file 5400
+      matrix: ${{ fromJSON(needs.select-sglang-tests.outputs.matrix) }}
 
     env:
       SGL_BRANCH: main
       GPU_ARCH: gfx950
       SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi35x-gpu-8
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
     steps:
       - name: Checkout aiter repo
@@ -137,61 +90,7 @@ jobs:
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
 
       - name: Patch sglang CI scripts for aiter runners
-        run: |
-          cd "${SGLANG_WORKSPACE}"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path_str: str, old: str, new: str) -> None:
-              path = Path(path_str)
-              text = path.read_text()
-              if old not in text:
-                  raise SystemExit(f"Expected snippet not found in {path}: {old!r}")
-              path.write_text(text.replace(old, new, 1))
-
-          hostname_override = 'HOSTNAME_VALUE="${SGLANG_CI_HOSTNAME_OVERRIDE:-$(hostname)}"'
-          for rel in (
-              "scripts/ci/amd/amd_ci_start_container.sh",
-              "scripts/ci/amd/amd_ci_install_dependency.sh",
-              "scripts/ci/amd/amd_ci_exec.sh",
-          ):
-              replace_once(rel, "HOSTNAME_VALUE=$(hostname)", hostname_override)
-
-          replace_once(
-              "scripts/ci/amd/amd_ci_install_dependency.sh",
-              "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .",
-              "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .",
-          )
-
-          # Mount host /models into the container so models persist across runs
-          replace_once(
-              "scripts/ci/amd/amd_ci_start_container.sh",
-              "$CACHE_VOLUME \\",
-              "$CACHE_VOLUME \\\n  -v /models:/models \\",
-          )
-
-          # Point HF cache to /models so downloaded models persist on the mount
-          replace_once(
-              "scripts/ci/amd/amd_ci_start_container.sh",
-              "-e HF_HOME=/sgl-data/hf-cache",
-              "-e HF_HOME=/models/huggingface",
-          )
-          replace_once(
-              "test/registered/amd/accuracy/mi35x/test_qwen35_eval_mi35x.py",
-              'QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"',
-              'QWEN35_MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B")',
-          )
-          replace_once(
-              "test/registered/amd/test_qwen3_instruct_mxfp4.py",
-              'QWEN3_MODEL_PATH = "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4"',
-              'QWEN3_MODEL_PATH = os.environ.get("QWEN3_MODEL_PATH", "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4")',
-          )
-          replace_once(
-              "test/registered/amd/accuracy/mi35x/test_deepseek_v32_eval_mi35x.py",
-              'model_path="deepseek-ai/DeepSeek-V3.2",',
-              'model_path=os.environ.get("DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"),',
-          )
-          PY
+        run: python3 ./.github/scripts/sglang_downstream.py patch-sglang "${SGLANG_WORKSPACE}"
 
       - name: Start CI container
         run: |
@@ -231,59 +130,67 @@ jobs:
           "
 
       - name: Prepare model (${{ matrix.model }})
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
         run: |
-          set -ex
-          MODEL_ID="${{ matrix.model_id }}"
-          MODEL_DIR="/models/${MODEL_ID}"
-          docker exec \
-            -e HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" \
-            -e MODEL_ID="${MODEL_ID}" \
-            -e MODEL_DIR="${MODEL_DIR}" \
-            ci_sglang bash -lc '
-            set -ex
-            if [ -f "${MODEL_DIR}/.complete" ] || [ -f "${MODEL_DIR}/config.json" ]; then
-              echo "Model already cached at ${MODEL_DIR}"
-            else
-              echo "Model not found at ${MODEL_DIR}, downloading..."
-              mkdir -p "$(dirname "${MODEL_DIR}")" /models/.tmp
-              TMP_MODEL_DIR="/models/.tmp/${MODEL_ID//\//__}-$(date +%s%N)-${RANDOM}-$$"
-              rm -rf "${TMP_MODEL_DIR}"
-              huggingface-cli download "${MODEL_ID}" --local-dir "${TMP_MODEL_DIR}"
-              test -f "${TMP_MODEL_DIR}/config.json"
-              echo "ok" > "${TMP_MODEL_DIR}/.complete"
-
-              if [ -f "${MODEL_DIR}/.complete" ] || [ -f "${MODEL_DIR}/config.json" ]; then
-                echo "Model was cached by another runner at ${MODEL_DIR}"
-                rm -rf "${TMP_MODEL_DIR}"
-              elif mv -T "${TMP_MODEL_DIR}" "${MODEL_DIR}"; then
-                echo "Published model at ${MODEL_DIR}"
-              else
-                echo "Failed to publish ${MODEL_DIR}; checking if another runner published it"
-                if rmdir "${MODEL_DIR}" 2>/dev/null && mv -T "${TMP_MODEL_DIR}" "${MODEL_DIR}"; then
-                  echo "Published model at ${MODEL_DIR} after removing empty target directory"
-                else
-                  rm -rf "${TMP_MODEL_DIR}"
-                  test -f "${MODEL_DIR}/.complete" -o -f "${MODEL_DIR}/config.json"
-                fi
-              fi
-            fi
-            echo "Model ready at ${MODEL_DIR}"
-            ls -la "${MODEL_DIR}"
-          '
+          models=("${{ matrix.model_id }}")
+          if [ -n "${{ matrix.extra_model_id }}" ]; then
+            models+=("${{ matrix.extra_model_id }}")
+          fi
+          python3 ./.github/scripts/sglang_downstream.py prepare-model "${models[@]}"
 
       - name: ${{ matrix.test_type }} Test MI35x (8-GPU ${{ matrix.model }})
         timeout-minutes: ${{ matrix.timeout_minutes }}
+        env:
+          MODEL_ID: ${{ matrix.model_id }}
+          MODEL_PATH_ENV: ${{ matrix.model_path_env }}
+          EXTRA_MODEL_ID: ${{ matrix.extra_model_id }}
+          EXTRA_MODEL_PATH_ENV: ${{ matrix.extra_model_path_env }}
+          TEST_TYPE: ${{ matrix.test_type }}
+          EXTRA_EXEC_ARGS: ${{ matrix.extra_exec_args }}
+          TEST_COMMAND: ${{ matrix.test_command }}
+          SECOND_TEST_TYPE: ${{ matrix.second_test_type }}
+          SECOND_EXTRA_EXEC_ARGS: ${{ matrix.second_extra_exec_args }}
+          SECOND_TEST_COMMAND: ${{ matrix.second_test_command }}
         run: |
           set -ex
           cd "${SGLANG_WORKSPACE}"
           > github_summary.md
+
+          EXEC_ENV_ARGS=(
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md"
+            -e "${MODEL_PATH_ENV}=/models/${MODEL_ID}"
+          )
+          if [ -n "${EXTRA_MODEL_PATH_ENV}" ]; then
+            EXEC_ENV_ARGS+=(-e "${EXTRA_MODEL_PATH_ENV}=/models/${EXTRA_MODEL_ID}")
+          fi
+
+          TEST_EXIT_CODE=0
+          echo "::group::${TEST_TYPE}"
+          # shellcheck disable=SC2086
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            -e ${{ matrix.model_path_env }}="/models/${{ matrix.model_id }}" \
-            ${{ matrix.extra_exec_args }} \
-            ${{ matrix.test_command }} || TEST_EXIT_CODE=$?
+            "${EXEC_ENV_ARGS[@]}" \
+            ${EXTRA_EXEC_ARGS} \
+            ${TEST_COMMAND} || TEST_EXIT_CODE=$?
+          echo "::endgroup::"
+
+          if [ -n "${SECOND_TEST_COMMAND}" ]; then
+            SECOND_TEST_EXIT_CODE=0
+            echo "::group::${SECOND_TEST_TYPE}"
+            # shellcheck disable=SC2086
+            bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+              "${EXEC_ENV_ARGS[@]}" \
+              ${SECOND_EXTRA_EXEC_ARGS} \
+              ${SECOND_TEST_COMMAND} || SECOND_TEST_EXIT_CODE=$?
+            echo "::endgroup::"
+
+            if [ "${TEST_EXIT_CODE}" -eq 0 ]; then
+              TEST_EXIT_CODE="${SECOND_TEST_EXIT_CODE}"
+            fi
+          fi
+
           echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
-          exit ${TEST_EXIT_CODE:-0}
+          exit "${TEST_EXIT_CODE}"
 
       - name: Clean Up
         if: always()
