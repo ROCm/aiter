@@ -256,6 +256,9 @@ if PREBUILD_KERNELS != 0:
             req_md_names = [
                 "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_nskip_nqscale",
                 "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_nskip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_mask_nlse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_mask_lse_ndropout_skip_nqscale",
+                "mha_varlen_fwd_bf16_nlogits_nbias_nmask_lse_ndropout_skip_nqscale",
             ]
             variants = get_mha_varlen_prebuild_variants_by_names(req_md_names, ck_dir)
             base_args = core.get_args_of_build("module_mha_varlen_fwd")
