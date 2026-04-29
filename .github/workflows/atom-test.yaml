@@ -89,6 +89,9 @@ jobs:
           repository: ${{ env.ATOM_REPOSITORY_URL }}
           branch: ${{ env.ATOM_BRANCH }}
 
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+
       - name: Download the ATOM base image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |

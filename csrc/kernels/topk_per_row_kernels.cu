@@ -1435,6 +1435,18 @@ __global__ void radix_topk_one_block_kernel(T const* in,
         return;
     }
 
+    // Long-row path: kernel internally treats in[0..row_len) as the valid
+    // window. Shift `in` (and `in_idx`) up by `rowStart` so that the radix
+    // pipeline reads the actual valid columns rather than the masked-out
+    // [0, rowStart) prefix that fp8_mqa_logits fills with -inf. Internal
+    // indices i are then relative to rowStart; we add rowStart back to
+    // out_idx at the end of this branch to get absolute column indices.
+    in += rowStart;
+    if(in_idx)
+    {
+        in_idx += rowStart;
+    }
+
     const IdxT buf_len = calc_buf_len<T, IdxT, unsigned>(len);
     bufs += batch_id * buf_len * 2 * (sizeof(T) + sizeof(IdxT));
 
@@ -1520,6 +1532,23 @@ __global__ void radix_topk_one_block_kernel(T const* in,
                 select_min,
                 pass);
             break;
+        }
+    }
+
+    // Long-row path was using rowStart-relative indices inside the radix
+    // pipeline (because we shifted `in` by rowStart above). Translate them
+    // back to absolute column indices for downstream consumers. Sentinels
+    // (-1, written when fewer than k valid candidates exist) are preserved.
+    if(rowStart > 0)
+    {
+        __syncthreads();
+        for(int i = threadIdx.x; i < k; i += BlockSize)
+        {
+            IdxT v = out_idx[i];
+            if(v >= 0)
+            {
+                out_idx[i] = v + rowStart;
+            }
         }
     }
 }
