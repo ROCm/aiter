@@ -92,43 +92,98 @@ def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
 
 
+@lru_cache(maxsize=1)
+def get_native_gemm_funcs():
+    from aiter.tuned_gemm import is_skinny_default_shape, skinny_gemm, torch_gemm
+
+    return torch_gemm, skinny_gemm, is_skinny_default_shape
+
+
+def run_torch_gemm_a16w16(
+    input,
+    weight,
+    bias=None,
+    scale_a=None,
+    scale_b=None,
+    otype=dtypes.bf16,
+):
+    native_torch_gemm, _, _ = get_native_gemm_funcs()
+    return native_torch_gemm(
+        input,
+        weight,
+        0,
+        bias=bias,
+        otype=otype,
+        scale_a=scale_a,
+        scale_b=scale_b,
+    )
+
+
+def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
+    _, native_skinny_gemm, _ = get_native_gemm_funcs()
+    return native_skinny_gemm(
+        input,
+        weight,
+        2,
+        bias=bias,
+        otype=otype,
+    )
+
+
 def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
     if flydsl_hgemm is None:
         raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
+    stages = config.get("stages", config.get("stage", 2))
+    fused_bias = None
+    if (
+        bias is not None
+        and (otype is None or otype == input.dtype)
+        and bias.dtype == input.dtype
+    ):
+        fused_bias = bias
     out = flydsl_hgemm(
         input,
         weight,
+        bias=fused_bias,
+        kernel_family=config.get("kernel_family"),
         tile_m=config["tile_m"],
         tile_n=config["tile_n"],
         tile_k=config["tile_k"],
         split_k=config["split_k"],
         block_m_warps=config["block_m_warps"],
         block_n_warps=config["block_n_warps"],
-        stages=config["stage"],
-        async_copy=config["async_copy"],
+        n_tile_repeat=config.get("n_tile_repeat", 1),
+        persistent_n_tiles=config.get("persistent_n_tiles", 1),
+        waves_per_eu=config.get("waves_per_eu", 0),
+        b_to_lds_unroll=config.get("b_to_lds_unroll", 0),
+        stages=stages,
+        async_copy=config.get("async_copy", False),
         b_to_lds=config["b_to_lds"],
         b_preshuffle=config["b_preshuffle"],
         auto_shuffle_b=False,
-        c_to_lds=config["c_to_lds"],
+        c_to_lds=config.get("c_to_lds", False),
     )
-    if bias is not None:
-        out = out + bias
+
+    if bias is not None and fused_bias is None:
+        out = out.to(bias.dtype) + bias
     if otype is not None and out.dtype != otype:
         out = out.to(otype)
     return out
 
 
 @lru_cache(maxsize=1)
-def get_flydsl_bf16_catalog():
+def get_flydsl_bf16_catalog(m: int, n: int, k: int):
     if get_flydsl_splitk_hgemm_kernels is None:
         return []
-    kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16")
+    kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16", m=m, n=n, k=k)
     catalog = [
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
     ]
-    logger.info(f"FlyDSL bf16 catalog size: {len(catalog)} kernels")
+    logger.info(
+        f"FlyDSL bf16 catalog size for M={m}, N={n}, K={k}: {len(catalog)} kernels"
+    )
     return catalog
 
 
@@ -489,6 +544,10 @@ class Gemm:
         tasks = []
         if "all" in self.libtype or "flydsl" in self.libtype:
             tasks.extend(self.flydsl_gemm_all_sols())
+        if "all" in self.libtype or "skinny" in self.libtype:
+            tasks.extend(self.skinny_gemm_all_sols())
+        if "all" in self.libtype or "torch" in self.libtype:
+            tasks.extend(self.torch_gemm_all_sols())
         if "all" in self.libtype or "triton" in self.libtype:
             tasks.extend(self.triton_gemm_all_sols())
         if "all" in self.libtype or "asm" in self.libtype:
@@ -518,7 +577,7 @@ class Gemm:
             return []
 
         task = []
-        flydsl_catalog = get_flydsl_bf16_catalog()
+        flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
         weight_idx = 6 if self.is_shuffle else 1
         for solidx, kernel_name, config in flydsl_catalog:
             if config["b_preshuffle"] != self.is_shuffle:
@@ -585,7 +644,128 @@ class Gemm:
         logger.info(
             "FlyDSL candidate count for "
             f"M={self.m}, N={self.n}, K={self.k}, outdtype={self.outdtype}, "
-            f"bpreshuffle={self.is_shuffle}: {len(task)}/{len(flydsl_catalog)}"
+            f"bpreshuffle={self.is_shuffle}: {len(task)}"
+        )
+        return task
+
+    def skinny_gemm_all_sols(self):
+        _, _, native_is_skinny_default_shape = get_native_gemm_funcs()
+        if self.is_shuffle:
+            logger.warning(
+                f"Skinny gemm does not support weight shuffle, but bpreshuffle is {self.is_shuffle}"
+            )
+            return []
+        if not native_is_skinny_default_shape(self.m, self.n, self.k, self.indtype):
+            logger.info(
+                f"Skip skinny gemm candidate for M={self.m}, N={self.n}, K={self.k}, indtype={self.indtype}"
+            )
+            return []
+        info = (
+            (
+                self.m,
+                self.n,
+                self.k,
+                False if self.bias is None else True,
+                str(self.indtype),
+                str(self.outdtype),
+                self.scaleAB,
+                self.is_shuffle,
+            ),
+            2,
+            0,
+            "skinny",
+            "sol2",
+        )
+        task = []
+        task.append(
+            (
+                info,
+                generate_data,
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    self.indtype,
+                    self.outdtype,
+                    self.scaleAB,
+                    self.is_shuffle,
+                    0,
+                    True if self.bias is not None else False,
+                ),
+                run_skinny_gemm_a16w16,
+                ([0, 1, 3], self.outdtype),
+                {
+                    "num_warmup": self.num_warmup,
+                    "num_iters": 101,
+                },
+                get_gemm_ref,
+                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                {},
+                None,
+                self.rtol,
+                self.atol,
+            )
+        )
+        return task
+
+    def torch_gemm_all_sols(self):
+        if self.is_shuffle:
+            logger.warning(
+                "Torch native a16w16 does not support weight shuffle, "
+                f"but bpreshuffle is {self.is_shuffle}"
+            )
+            return []
+        if self.indtype not in [dtypes.fp16, dtypes.bf16, dtypes.fp8]:
+            logger.warning(
+                "Torch native a16w16 only supports fp16/bf16/fp8 input, "
+                f"but actual indtype is {self.indtype}"
+            )
+            return []
+        info = (
+            (
+                self.m,
+                self.n,
+                self.k,
+                False if self.bias is None else True,
+                str(self.indtype),
+                str(self.outdtype),
+                self.scaleAB,
+                self.is_shuffle,
+            ),
+            0,
+            0,
+            "torch",
+            "native",
+        )
+        task = []
+        task.append(
+            (
+                info,
+                generate_data,
+                (
+                    self.m,
+                    self.n,
+                    self.k,
+                    self.indtype,
+                    self.outdtype,
+                    self.scaleAB,
+                    self.is_shuffle,
+                    0,
+                    True if self.bias is not None else False,
+                ),
+                run_torch_gemm_a16w16,
+                ([0, 1, 3, 4, 7], self.outdtype),
+                {
+                    "num_warmup": self.num_warmup,
+                    "num_iters": 101,
+                },
+                get_gemm_ref,
+                ([0, 1, 3, 4, 7], self.indtype, self.outdtype),
+                {},
+                None,
+                self.rtol,
+                self.atol,
+            )
         )
         return task
 
@@ -803,7 +983,15 @@ class Gemm:
 def libtype_list(string):
     values = string.split(",")
     for value in values:
-        if value not in ["all", "asm", "hipblaslt", "triton", "flydsl"]:
+        if value not in [
+            "all",
+            "asm",
+            "hipblaslt",
+            "triton",
+            "flydsl",
+            "torch",
+            "skinny",
+        ]:
             raise argparse.ArgumentTypeError(f"Invalid libtype: {value}")
     return values
 
@@ -814,6 +1002,7 @@ class GemmTuner(GemmCommonTuner):
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",
         "batch": 1,
+        "config_env_name": "AITER_CONFIG_GEMM_BF16",
     }
 
     def _setup_specific_arguments(self):
@@ -861,12 +1050,13 @@ class GemmTuner(GemmCommonTuner):
             type=libtype_list,
             default=["all"],
             required=False,
-            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl']",
+            help="choose libtype to be tuned, support ['all', 'asm', 'hipblaslt', 'triton', 'flydsl', 'torch', 'skinny']",
         )
 
     def __init__(
         self,
         key=[
+            "gfx",
             "cu_num",
             "M",
             "N",
@@ -898,8 +1088,81 @@ class GemmTuner(GemmCommonTuner):
 
         self.hipb_prefer_ratio = 0.995
         self.cu_num = self.get_cu_num()
+        self.gfx = self.get_gfx()
         self.gemmobj = None
         self.num_warmup = 10
+
+    def _clear_op_caches(self):
+        from aiter.tuned_gemm import get_GEMM_A16W16_config_, get_GEMM_A16W16_config
+
+        get_GEMM_A16W16_config_.cache_clear()
+        get_GEMM_A16W16_config.cache_clear()
+
+    def run_config(self, args):
+        from aiter.tuned_gemm import gemm_a16w16
+        from aiter.test_common import run_perftest, checkAllclose
+
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            M = int(untunedf.loc[i, "M"])
+            N = int(untunedf.loc[i, "N"])
+            K = int(untunedf.loc[i, "K"])
+            bias = untunedf.loc[i, "bias"]
+            indtype = str(untunedf.loc[i, "dtype"])
+            outdtype = str(untunedf.loc[i, "outdtype"])
+            scaleAB = untunedf.loc[i, "scaleAB"]
+            bpreshuffle = untunedf.loc[i, "bpreshuffle"]
+            shape_str = f"({M}, {N}, {K}, {indtype}, bias={bias})"
+            try:
+                inp, weights, _, bias_tensor, x_scale, _, shuffleweights, w_scale = (
+                    generate_data(
+                        M,
+                        N,
+                        K,
+                        eval(indtype),
+                        eval(outdtype),
+                        scaleAB,
+                        bpreshuffle,
+                        0,
+                        bias,
+                    )
+                )
+                w = shuffleweights if bpreshuffle else weights
+                scale_a = x_scale if scaleAB else None
+                scale_b = w_scale if scaleAB else None
+                out, us = run_perftest(
+                    gemm_a16w16,
+                    inp,
+                    w,
+                    bias=bias_tensor,
+                    otype=eval(outdtype),
+                    scale_a=scale_a,
+                    scale_b=scale_b,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = get_gemm_ref(
+                    inp,
+                    weights,
+                    bias_tensor,
+                    x_scale,
+                    w_scale,
+                    eval(indtype),
+                    eval(outdtype),
+                )
+                _atol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                _rtol = 5e-2 if eval(outdtype) == torch.bfloat16 else 1e-2
+                err_ratio = checkAllclose(
+                    out, ref, atol=_atol, rtol=_rtol, msg=f"run_config {shape_str}"
+                )
+                status = "ok" if err_ratio <= args.errRatio else "mismatch"
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as e:
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
+                )
+        return results
 
     def calculate_perf(
         self,
@@ -912,7 +1175,7 @@ class GemmTuner(GemmCommonTuner):
         info, time, err_ratio = results
         if time <= 0:
             return -1, -1
-        cu_num, m, n, k = info
+        gfx, cu_num, m, n, k = info
         flops = m * n * k * 2
         tflops = round(flops / (time * 1000000), 2)
 
@@ -960,6 +1223,7 @@ class GemmTuner(GemmCommonTuner):
                             bpreshuffle=ds["bpreshuffle"],
                         )
             self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
+            self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
             self.untunedf = self.untunedf[self.keys]
             untunedf_cols = self.untunedf.columns
@@ -991,7 +1255,8 @@ class GemmTuner(GemmCommonTuner):
         print(self.tunedf)
         if self.tunedf is None or (
             self.tunedf[
-                (self.tunedf["cu_num"] == self.cu_num)
+                (self.tunedf["gfx"] == self.gfx)
+                & (self.tunedf["cu_num"] == self.cu_num)
                 & (self.tunedf["M"] == m)
                 & (self.tunedf["N"] == n)
                 & (self.tunedf["K"] == k)
@@ -1002,6 +1267,7 @@ class GemmTuner(GemmCommonTuner):
             ].empty
         ):
             entry = {
+                "gfx": [self.gfx],
                 "cu_num": [self.cu_num],
                 "M": [m],
                 "N": [n],
@@ -1028,7 +1294,9 @@ class GemmTuner(GemmCommonTuner):
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
             outdtype = outdtype if outdtype is not None else indtype
-            self.set_run_iters((self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype))
+            self.set_run_iters(
+                (self.gfx, self.cu_num, ds["M"], ds["N"], ds["K"]), eval(indtype)
+            )
 
             gemmobj = Gemm(
                 ds["M"],
@@ -1064,6 +1332,7 @@ class GemmTuner(GemmCommonTuner):
             splitK = info[2]
             kernelName = info[4]
             libtype = info[3]
+            res_one.append(get_gfx())
             res_one.append(get_cu_num())
             for ele in info[0]:
                 res_one.append(ele)
@@ -1076,7 +1345,7 @@ class GemmTuner(GemmCommonTuner):
             res_one.append(kernelName)
             res_one.append(err_ratio)
             ret = (
-                (self.cu_num, info[0][0], info[0][1], info[0][2]),
+                (self.gfx, self.cu_num, info[0][0], info[0][1], info[0][2]),
                 us,
                 err_ratio,
             )
@@ -1171,7 +1440,7 @@ class GemmTuner(GemmCommonTuner):
             resultsdf.to_csv(profile_file, index=False)
 
     def set_run_iters(self, input, inputdtype):
-        cu_num, m, n, k, *rest = input
+        gfx, cu_num, m, n, k, *rest = input
         flops = m * n * k * 2
         # bpe = self.get_bpe(inputdtype)
         if flops < 128 * 5120 * 256 * 2:

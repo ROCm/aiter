@@ -31,18 +31,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self._all2all_manager_created = False
 
         super().__init__(cpu_group, device, device_group, unique_name)
-        if "tp" not in unique_name:
-            # custom allreduce or torch symm mem can be used only by tp
-            use_custom_allreduce = False
-            use_torch_symm_mem = False
-        else:
-            from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+        from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
-            use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_torch_symm_mem = False
-
-        self.use_custom_allreduce = use_custom_allreduce
-        self.use_torch_symm_mem = use_torch_symm_mem
+        self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
+        self.use_torch_symm_mem = False
 
         # lazy import to avoid documentation build error
         from aiter.dist.device_communicators.custom_all_reduce import (
@@ -79,7 +71,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         #         device=self.device,
         #     )
 
-        if use_custom_allreduce and self.world_size > 1:
+        if self.use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
@@ -177,15 +169,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_ar(input_, prefill_support)
         ):
-            inp_size = input_.numel() * input_.element_size()
-            if not prefill_support and inp_size > 64 * 1024 * 1024:
-                pass  # fall through to rccl for large prefill tensors
-            else:
-                out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
-                assert out is not None
-                return out
+            out = ca_comm.custom_all_reduce(input_, use_new, ca_fp8_quant)
+            assert out is not None
+            return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
@@ -221,23 +209,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             ca_comm is not None
             and not ca_comm.disabled
-            and ca_comm.should_custom_ar(input_)
+            and ca_comm.should_custom_ar(input_, prefill_support)
             and can_use_fuse_ar_rms
         ):
-            if not prefill_support and total_bytes > 64 * 1024 * 1024:
-                pass  # fall through to rccl for large prefill tensors
-            else:
-                use_1stage = (
-                    self._ar_1stage_override
-                    if self._ar_1stage_override is not None
-                    else (total_bytes <= 128 * 1024)
-                )
-                out, res_out = ca_comm.custom_fused_ar_rms(
-                    input_, res_inp_, weight_, eps, use_1stage
-                )
-                assert out is not None
-                assert res_out is not None
-                return out, res_out
+            use_1stage = (
+                self._ar_1stage_override
+                if self._ar_1stage_override is not None
+                else (total_bytes <= 128 * 1024)
+            )
+            out, res_out = ca_comm.custom_fused_ar_rms(
+                input_, res_inp_, weight_, eps, use_1stage
+            )
+            assert out is not None
+            assert res_out is not None
+            return out, res_out
         # call split kernel
         ar_out = self.all_reduce(input_, prefill_support=prefill_support)
         out = torch.empty_like(ar_out)

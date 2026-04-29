@@ -10,12 +10,14 @@ from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.2"
+FLYDSL_VERSION = "flydsl==0.1.5.dev504"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 if IS_WINDOWS:
@@ -156,7 +158,7 @@ if not _is_metadata_only() and not IS_WINDOWS:
 
 
 def _load_modules_from_config():
-    cfg_path = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
+    cfg_path = OPT_COMPILER_CONFIG
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -178,6 +180,7 @@ def get_exclude_ops():
 
     for module in all_modules:
         if PREBUILD_KERNELS == 1:
+            # Exclude tune modules; for MHA keep only fmha_v3 fwd variants
             if "_tune" in module:
                 exclude_ops.append(module)
             if "mha" in module and module not in [
@@ -217,10 +220,35 @@ if PREBUILD_KERNELS != 0:
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
+        from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
         import glob
 
         exclude_ops = get_exclude_ops()
         all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
+
+        moe_base_args = None
+        filtered_opts_args_build = []
+        for one_opt_args in all_opts_args_build:
+            if one_opt_args["md_name"] == "module_moe_ck2stages":
+                moe_base_args = one_opt_args
+                continue
+            filtered_opts_args_build.append(one_opt_args)
+        all_opts_args_build = filtered_opts_args_build
+
+        if ENABLE_CK and moe_base_args is not None:
+            moe_variants = get_moe_ck2stages_prebuild_variants(core.AITER_CSRC_DIR)
+            for v in moe_variants:
+                all_opts_args_build.append(
+                    {
+                        "md_name": v["md_name"],
+                        "srcs": moe_base_args["srcs"],
+                        "flags_extra_cc": moe_base_args["flags_extra_cc"],
+                        "flags_extra_hip": moe_base_args["flags_extra_hip"],
+                        "extra_include": moe_base_args["extra_include"],
+                        "blob_gen_cmd": v["blob_gen_cmd"],
+                        "third_party": moe_base_args["third_party"],
+                    }
+                )
 
         if PREBUILD_KERNELS == 1 and ENABLE_CK:
             extra_args_build = []
@@ -287,8 +315,40 @@ if PREBUILD_KERNELS != 0:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
+        # --- FlyDSL AOT pre-compilation (MOE + GEMM in parallel, before CK) ---
+        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+        os.environ["AITER_AOT_IMPORT"] = "1"
+        try:
+            from aiter.aot.flydsl.common import start_aot, wait_aot
+
+            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
+            _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
+            wait_aot(_flydsl_pool, _flydsl_futures)
+        finally:
+            if _prev_aot_import is None:
+                os.environ.pop("AITER_AOT_IMPORT", None)
+            else:
+                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+
+        # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
             list(executor.map(build_one_module, all_opts_args_build))
+
+        # Retune GEMM shapes on the live GPU after the main build phase.
+        if PRETUNE_MODULES:
+            from aiter.utility.pretune import run_pretune_modules  # noqa: E402
+
+            cfg_path = OPT_COMPILER_CONFIG
+            with open(cfg_path, "r", encoding="utf-8") as _f:
+                _cfg = json.load(_f)
+            run_pretune_modules(
+                PRETUNE_MODULES,
+                _cfg,
+                core,
+                build_one_module,
+                csrc_dir=f"{this_dir}/csrc",
+                repo_dir=this_dir,
+            )
 
 
 class NinjaBuildExtension(build_ext):
@@ -317,6 +377,7 @@ setup_requires = [
     "psutil",
     "ninja",
     "setuptools_scm",
+    "vcs_versioning",  # transitive dep of setuptools_scm>=10
 ]
 if PREBUILD_KERNELS != 0:
     setup_requires.append("pandas")

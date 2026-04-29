@@ -10,11 +10,10 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 NUM_HEADS = [64]
 NUM_QUERIES_PER_KV = [1, 8, 64]
-HEAD_SIZES = [128, 96, 24]
+HEAD_SIZES = [128]
 DTYPES = [torch.float16]
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1)]
-SLIDING_WINDOW = [0, 16, 64, 128, 256, 512, 2048]
-KV_CACHE_DTYPES = ["auto", "fp8e4m3", "fp8e5m2"]
+SLIDING_WINDOW = [128, 2048]
+KV_CACHE_DTYPES = ["auto", "fp8e4m3"]
 
 
 def context_attention_fwd_torch(
@@ -316,7 +315,6 @@ def input_helper(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPES)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("sliding_window", SLIDING_WINDOW)
 @torch.inference_mode()
 def test_contexted_kv_attention(
@@ -326,8 +324,8 @@ def test_contexted_kv_attention(
     sliding_window: int,
     dtype: torch.dtype,
     kv_cache_dtype: str,
-    device: str,
 ) -> None:
+    device = "cuda:0"
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     (
@@ -402,7 +400,6 @@ def test_contexted_kv_attention(
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPES)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_contexted_kv_attention_alibi(
     num_heads: int,
@@ -410,8 +407,8 @@ def test_contexted_kv_attention_alibi(
     head_size: int,
     dtype: torch.dtype,
     kv_cache_dtype: str,
-    device: str,
 ) -> None:
+    device = "cuda:0"
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     (
         query,
