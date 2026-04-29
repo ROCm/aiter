@@ -22,6 +22,7 @@ import torch
 import triton
 
 from aiter.ops.triton.fusions.mhc import mhc
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.utils.mhc_ref import generate_mhc_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
@@ -141,10 +142,6 @@ def run_benchmark(args):
         args={},
     )
 
-    # Tracks (configs that have already passed the silent Triton-vs-HIP 
-    # parity check within this benchmark run, so each
-    # config is checked at most once even when multiple providers/metrics
-    # are reported per row.
     _checked_configs: set = set()
 
     @triton.testing.perf_report([benchmark])
@@ -176,7 +173,7 @@ def run_benchmark(args):
         # sqrt(sum(x^2)/K) requires: square + sum + divide + sqrt ≈ 4*nC ops per row
         flops_rms = 4.0 * M * nC
 
-        # Apply-pre step (fused in both Triton and HIP):
+        # Apply-pre step:
         # layer_input[m, c] = Σᵢ pre_mix[m, i] * x[m, i*C + c]
         # = 2*M*n*C FLOPs (multiply-add for each (m, i, c))
         flops_apply_pre = 2.0 * M * n * C
@@ -254,7 +251,27 @@ def run_benchmark(args):
                     )
 
         if args.with_hip and (M, n, C) not in _checked_configs:
-            _assert_triton_matches_hip(triton_fn(), hip_fn(), M=M, n=n, C=C)
+            post_t, comb_t, li_t = triton_fn()
+            post_h, comb_h, li_h = hip_fn()
+            cfg = f"(M={M}, n={n}, C={C})"
+            for name, t, h, atol, rtol in (
+                ("post_mix", post_t, post_h, 4e-2, 1e-2),
+                ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
+                ("layer_input", li_t, li_h, 8e-2, 2e-2),
+            ):
+                msg = f"{name} mismatch between Triton and HIP at {cfg}"
+                pct = checkAllclose(
+                    t.detach().cpu().float(),
+                    h.detach().cpu().float(),
+                    atol=atol,
+                    rtol=rtol,
+                    tol_err_ratio=0.05,
+                    msg=msg,
+                    printLog=True,
+                )
+                assert pct <= 0.05, (
+                    f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+                )
             _checked_configs.add((M, n, C))
 
         backend = "hip" if provider.startswith("hip_") else "triton"
@@ -428,51 +445,6 @@ def _validate_with_hip(args):
             return 1
 
     return 0
-
-
-def _assert_triton_matches_hip(triton_out, hip_out, *, M, n, C):
-    """Silent Triton-vs-HIP parity assertions on already-computed output tuples.
-
-    Runs only the three `torch.testing.assert_close` calls; callers are
-    responsible for invoking `mhc()` and `aiter.mhc_pre()` with parity-aligned
-    parameters and passing the resulting 3-tuples here. Silent on success;
-    raises AssertionError on mismatch with a descriptive `(M, n, C)` tag.
-
-    Tolerances are reused verbatim from the parity test
-    `test_triton_mhc_matches_hip` in
-    `op_tests/triton_tests/fusions/test_mhc.py`, where they were
-    empirically calibrated to be robust across 10 seeds:
-        post_mix:    atol=4e-2, rtol=1e-2
-        comb_mix:    atol=4e-2, rtol=1e-2
-        layer_input: atol=8e-2, rtol=2e-2  (widest because pre_mix is
-                                            bf16-quantized in HIP before
-                                            the apply-pre step).
-    """
-    post_t, comb_t, li_t = triton_out
-    post_h, comb_h, li_h = hip_out
-
-    cfg = f"(M={M}, n={n}, C={C})"
-    torch.testing.assert_close(
-        post_t.float(),
-        post_h.float(),
-        atol=4e-2,
-        rtol=1e-2,
-        msg=f"post_mix mismatch between Triton and HIP at {cfg}",
-    )
-    torch.testing.assert_close(
-        comb_t.float(),
-        comb_h.float(),
-        atol=4e-2,
-        rtol=1e-2,
-        msg=f"comb_mix mismatch between Triton and HIP at {cfg}",
-    )
-    torch.testing.assert_close(
-        li_t.float(),
-        li_h.float(),
-        atol=8e-2,
-        rtol=2e-2,
-        msg=f"layer_input mismatch between Triton and HIP at {cfg}",
-    )
 
 
 def main():

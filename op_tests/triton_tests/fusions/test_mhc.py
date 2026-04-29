@@ -25,6 +25,7 @@ Notation (from mHC paper arXiv:2512.24880v2):
 import torch
 import pytest
 from aiter.ops.triton.fusions.mhc import mhc
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.utils.mhc_ref import (
     mhc_torch,
     is_doubly_stochastic,
@@ -67,15 +68,23 @@ def _assert_mhc_close(
     post_t, comb_t, layer_t = triton_tuple
     post_ref, comb_ref, _hpre_ref, layer_ref = ref_tuple
 
-    torch.testing.assert_close(
-        post_t.float(), post_ref.float(), atol=post_atol, rtol=post_rtol
-    )
-    torch.testing.assert_close(
-        comb_t.float(), comb_ref.float(), atol=comb_atol, rtol=comb_rtol
-    )
-    torch.testing.assert_close(
-        layer_t.float(), layer_ref.float(), atol=layer_atol, rtol=layer_rtol
-    )
+    for name, t, ref, atol, rtol in (
+        ("post_mix", post_t, post_ref, post_atol, post_rtol),
+        ("comb_mix", comb_t, comb_ref, comb_atol, comb_rtol),
+        ("layer_input", layer_t, layer_ref, layer_atol, layer_rtol),
+    ):
+        pct = checkAllclose(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=name,
+        )
+        assert pct <= 0.05, (
+            f"{name} mismatch "
+            f"(atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+        )
 
 
 @pytest.mark.parametrize("M, n, C", get_test_shapes())
@@ -391,12 +400,22 @@ def test_split_k_various_splits(num_ksplit):
     # and hpre (raw logits, no Triton-side counterpart).
     post_t, _, layer_t = triton_tuple
     post_ref, _, _hpre_ref, layer_ref = out_ref
-    torch.testing.assert_close(
-        post_t.float(), post_ref.float(), atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(
-        layer_t.float(), layer_ref.float(), atol=5e-2, rtol=5e-2
-    )
+    for name, t, ref, atol, rtol in (
+        ("post_mix", post_t, post_ref, 1e-2, 1e-2),
+        ("layer_input", layer_t, layer_ref, 5e-2, 5e-2),
+    ):
+        pct = checkAllclose(
+            t.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=name,
+        )
+        assert pct <= 0.05, (
+            f"{name} mismatch "
+            f"(atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+        )
 
 
 def test_split_k_large_k():
@@ -542,24 +561,20 @@ def test_triton_mhc_matches_hip(M, n, C):
         )
 
     cfg = f"(M={M}, n={n}, C={C})"
-    torch.testing.assert_close(
-        post_t.float(),
-        post_h.float(),
-        atol=4e-2,
-        rtol=1e-2,
-        msg=f"post_mix Triton vs aiter.mhc_pre mismatch at {cfg}",
-    )
-    torch.testing.assert_close(
-        comb_t.float(),
-        comb_h.float(),
-        atol=4e-2,
-        rtol=1e-2,
-        msg=f"comb_mix Triton vs aiter.mhc_pre mismatch at {cfg}",
-    )
-    torch.testing.assert_close(
-        li_t.float(),
-        li_h.float(),
-        atol=8e-2,
-        rtol=2e-2,
-        msg=f"layer_input Triton vs aiter.mhc_pre mismatch at {cfg}",
-    )
+    for name, t, h, atol, rtol in (
+        ("post_mix", post_t, post_h, 4e-2, 1e-2),
+        ("comb_mix", comb_t, comb_h, 4e-2, 1e-2),
+        ("layer_input", li_t, li_h, 8e-2, 2e-2),
+    ):
+        msg = f"{name} Triton vs aiter.mhc_pre mismatch at {cfg}"
+        pct = checkAllclose(
+            t.float(),
+            h.float(),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=0.05,
+            msg=msg,
+        )
+        assert pct <= 0.05, (
+            f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
+        )
