@@ -11,7 +11,7 @@ template<int BLOCK_SIZE_,
         typename BLOCK_,
         typename DTYPE_,
         typename VEC_>
-struct opus_gemm_a8w8_noscale_traits {
+struct opus_gemm_a8w8_noscale_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -67,12 +67,12 @@ struct opus_gemm_a8w8_noscale_traits {
     static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
 };
 
-#ifndef OPUS_GEMM_NOSCALE_KARGS_DEFINED
-#define OPUS_GEMM_NOSCALE_KARGS_DEFINED
+#ifndef OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
+#define OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
 // Shared kargs struct: must match the definition in
-// opus_gemm_traits_a16w16.cuh exactly. The bias fields exist for the a16w16
+// opus_gemm_traits_a16w16_gfx950.cuh exactly. The bias fields exist for the a16w16
 // split-barrier HAS_BIAS path; a8w8 launchers always pass nullptr / 0.
-struct opus_gemm_noscale_kargs {
+struct opus_gemm_noscale_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
