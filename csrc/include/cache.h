@@ -77,14 +77,16 @@ void indexer_k_quant_and_cache(torch::Tensor& k,        // [num_tokens, head_dim
                                torch::Tensor& kv_cache, // [num_blocks, block_size, cache_stride]
                                torch::Tensor& slot_mapping, // [num_tokens]
                                int64_t quant_block_size,    // quantization block size
-                               const std::string& scale_fmt);
+                               const std::string& scale_fmt,
+                               bool preshuffle = false);
 
 void cp_gather_indexer_k_quant_cache(
     const torch::Tensor& kv_cache,     // [num_blocks, block_size, cache_stride]
     torch::Tensor& dst_k,              // [num_tokens, head_dim]
     torch::Tensor& dst_scale,          // [num_tokens, head_dim / quant_block_size * 4]
     const torch::Tensor& block_table,  // [batch_size, num_blocks]
-    const torch::Tensor& cu_seq_lens); // [batch_size + 1]
+    const torch::Tensor& cu_seq_lens,  // [batch_size + 1]
+    bool preshuffle = false);
 
 void fused_qk_rope_concat_and_cache_mla(
     torch::Tensor& q_nope,       // [num_tokens, num_heads, qk_lora_rank]
