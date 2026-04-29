@@ -1,4 +1,4 @@
 {
-  "base_image": "rocm/vllm-dev:nightly_main_20250917@sha256:1089a07f140d38030f1600cf2feb1f079fc7def242d4a77629a90d6002fc203e",
+  "base_image": "vllm/vllm-openai-rocm:v0.19.1",
   "vllm_commit": "b31621279ff71666c13393e51a7d4ac8df1a70e9"
 }

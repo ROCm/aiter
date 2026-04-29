@@ -73,11 +73,20 @@ replace_once(
 )
 PY
 
-# ── Resolve SGLang base image (with retry) ──
-SGL_IMAGE=$(python3 - <<'PY'
-import json, re, time, urllib.request, urllib.error
+# ── Detect GPU arch for image selection ──
+GPU_ARCH=$(rocminfo 2>/dev/null | grep -oP 'gfx\d+' | head -1 || echo "gfx942")
+case "${GPU_ARCH}" in
+  gfx950) GPU_TAG="mi35x" ;;
+  *)      GPU_TAG="mi30x" ;;
+esac
+echo "Detected GPU: ${GPU_ARCH} → image tag: ${GPU_TAG}"
 
-prefixes = ["v0.5.10-rocm700-mi30x-", "v0.5.10rc0-rocm700-mi30x-"]
+# ── Resolve SGLang base image (with retry) ──
+SGL_IMAGE=$(python3 - "${GPU_TAG}" <<'PY'
+import json, re, sys, time, urllib.request, urllib.error
+
+gpu_tag = sys.argv[1]
+prefixes = [f"v0.5.10.post1-rocm720-{gpu_tag}-"]
 patterns = {p: re.compile(rf"^{re.escape(p)}\d{{8}}(?:-preview)?$") for p in prefixes}
 
 max_retries = 3
@@ -99,7 +108,7 @@ for attempt in range(1, max_retries + 1):
             if matches[p]:
                 print(f"rocm/sgl-dev:{sorted(matches[p], reverse=True)[0]}")
                 exit(0)
-        raise SystemExit("No public MI30X SGLang image found")
+        raise SystemExit(f"No public {gpu_tag} SGLang image found")
     except (urllib.error.URLError, OSError) as e:
         if attempt < max_retries:
             wait = 15 * attempt
