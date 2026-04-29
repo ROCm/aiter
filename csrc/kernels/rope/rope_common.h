@@ -7228,12 +7228,45 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
     return __shfl_xor(val, offset, 32);
 }
 
+// XOR-style butterfly sum reduce within a 32-lane subgroup.
+// Lowers to: 3x ds_swizzle_b32 (offset 16, 8, 4 via XOR mask) +
+//            2x v_*_dpp        (offset 2, 1   via opus::mov_dpp quad_perm).
+// Order is intentionally 16 -> 1 (descending) to match the historical
+//   for(offset=16; offset>0; offset>>=1) val += __shfl_xor(val, offset);
+// implementation. ds_swizzle and DPP latencies are symmetric, so reversing the
+// order vs the natural DPP-first form is a free constraint that buys us
+// bitwise-identical output to the prior bpermute-based reduce.
+// All lanes hold the full sum on return — XOR butterfly is symmetric, so no
+// follow-up broadcast is needed.
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val)
 {
-#pragma unroll
-    for(int offset = 16; offset > 0; offset >>= 1)
-        val += warp_shfl_xor_sync(val, offset);
+    static_assert(sizeof(T) == 4, "warp_reduce_sum requires 4-byte type");
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (16 << 10) | 0x1f)); /* XOR by 16 */
+    }
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (8 << 10) | 0x1f)); /* XOR by 8  */
+    }
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (4 << 10) | 0x1f)); /* XOR by 4  */
+    }
+    val += opus::mov_dpp(val,
+                         opus::number<0x4e>{}, /* quad_perm:[2,3,0,1], i.e. XOR by 2 */
+                         opus::number<0xf>{},  /* row_mask  */
+                         opus::number<0xf>{},  /* bank_mask */
+                         opus::bool_constant<false>{} /* bound_ctrl */);
+    val += opus::mov_dpp(val,
+                         opus::number<0xb1>{}, /* quad_perm:[1,0,3,2], i.e. XOR by 1 */
+                         opus::number<0xf>{},
+                         opus::number<0xf>{},
+                         opus::bool_constant<false>{});
     return val;
 }
 
@@ -7341,6 +7374,30 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
     return out;
 }
 
+// Constant-pattern XOR-style cross-lane shuffle for each 32-bit dword inside a vec.
+// Lowers to ds_swizzle_b32 (BitwiseMode XOR, AND=0x1F) within a 32-lane segment.
+// XorOffset must be a compile-time constant in [1, 31]. Compared to the lane-arith
+// path through warp_shfl_sync_vec(threadIdx.x + neighbor_offset), this saves
+// ~5 cycles per dword (ds_swizzle ~5 cyc vs ds_bpermute ~10 cyc) and removes
+// one VALU dependency chain (the runtime neighbor_offset computation).
+template <typename T, int vec_size, int XorOffset>
+__inline__ __device__ vec_t<T, vec_size> warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
+                                                                opus::number<XorOffset> = {})
+{
+    static_assert(XorOffset > 0 && XorOffset < 32,
+                  "ds_swizzle XOR mask must be in [1, 31] within a 32-lane segment");
+    constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
+    vec_t<T, vec_size> out;
+#pragma unroll
+    for(int i = 0; i < ITERS; ++i)
+    {
+        const int v_i32 = reinterpret_cast<int*>(&val)[i];
+        reinterpret_cast<int*>(&out)[i] =
+            __builtin_amdgcn_ds_swizzle(v_i32, (XorOffset << 10) | 0x1f);
+    }
+    return out;
+}
+
 template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void
 warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_dim, float rms_eps)
@@ -7353,11 +7410,9 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_d
         float v = (float)input[i];
         acc += v * v;
     }
-    int warp_id   = threadIdx.x / 32;
-    int warp_t_id = threadIdx.x % 32;
-    acc           = block_utils::warp_reduce_sum<float>(acc);
-    acc           = block_utils::warp_shfl_sync<float>(acc, 0);
-    auto s_val    = rsqrtf(acc / rms_dim + rms_eps);
+    // XOR butterfly leaves the same sum in every lane — no extra broadcast needed.
+    acc        = block_utils::warp_reduce_sum<float>(acc);
+    auto s_val = rsqrtf(acc / rms_dim + rms_eps);
 #pragma unroll
     for(int i = 0; i < VEC_SIZE; ++i)
     {
