@@ -51,6 +51,8 @@ jobs:
           - runner: linux-aiter-mi35x-8
             label: MI35X
             model: DeepSeek-R1-MXFP4
+            model_id: amd/DeepSeek-R1-MXFP4-Preview
+            model_path_env: DEEPSEEK_R1_MXFP4_MODEL_PATH
             test_type: Accuracy
             timeout_minutes: 130
             extra_exec_args: ""
@@ -58,6 +60,8 @@ jobs:
           - runner: linux-aiter-mi35x-8
             label: MI35X
             model: DeepSeek-R1-MXFP4
+            model_id: amd/DeepSeek-R1-MXFP4-Preview
+            model_path_env: DEEPSEEK_R1_MXFP4_MODEL_PATH
             test_type: Performance
             timeout_minutes: 180
             extra_exec_args: ""
@@ -65,6 +69,8 @@ jobs:
           - runner: linux-aiter-mi35x-8
             label: MI35X
             model: Qwen3-235B-MXFP4
+            model_id: amd/Qwen3-235B-A22B-Instruct-2507-mxfp4
+            model_path_env: QWEN3_MODEL_PATH
             test_type: Accuracy + Performance
             timeout_minutes: 70
             extra_exec_args: ""
@@ -72,6 +78,8 @@ jobs:
           - runner: linux-aiter-mi35x-8
             label: MI35X
             model: Qwen 3.5
+            model_id: Qwen/Qwen3.5-397B-A17B
+            model_path_env: QWEN35_MODEL_PATH
             test_type: Accuracy
             timeout_minutes: 70
             extra_exec_args: ""
@@ -79,6 +87,8 @@ jobs:
           - runner: linux-aiter-mi35x-8
             label: MI35X
             model: Qwen 3.5 FP8
+            model_id: Qwen/Qwen3.5-397B-A17B-FP8
+            model_path_env: QWEN35_FP8_MODEL_PATH
             test_type: Performance
             timeout_minutes: 100
             extra_exec_args: -e SGLANG_USE_AITER=1
@@ -86,6 +96,8 @@ jobs:
           - runner: linux-aiter-mi35x-8
             label: MI35X
             model: DeepSeek-V3.2
+            model_id: deepseek-ai/DeepSeek-V3.2
+            model_path_env: DEEPSEEK_V32_MODEL_PATH
             test_type: Accuracy
             timeout_minutes: 70
             extra_exec_args: ""
@@ -93,6 +105,8 @@ jobs:
           - runner: linux-aiter-mi35x-8
             label: MI35X
             model: DeepSeek-V3.2 Basic
+            model_id: deepseek-ai/DeepSeek-V3.2
+            model_path_env: DEEPSEEK_V32_MODEL_PATH
             test_type: Performance
             timeout_minutes: 100
             extra_exec_args: ""
@@ -148,6 +162,35 @@ jobs:
               "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .",
               "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .",
           )
+
+          # Mount host /models into the container so models persist across runs
+          replace_once(
+              "scripts/ci/amd/amd_ci_start_container.sh",
+              "$CACHE_VOLUME \\",
+              "$CACHE_VOLUME \\\n  -v /models:/models \\",
+          )
+
+          # Point HF cache to /models so downloaded models persist on the mount
+          replace_once(
+              "scripts/ci/amd/amd_ci_start_container.sh",
+              "-e HF_HOME=/sgl-data/hf-cache",
+              "-e HF_HOME=/models/huggingface",
+          )
+          replace_once(
+              "test/registered/amd/accuracy/mi35x/test_qwen35_eval_mi35x.py",
+              'QWEN35_MODEL_PATH = "Qwen/Qwen3.5-397B-A17B"',
+              'QWEN35_MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", "Qwen/Qwen3.5-397B-A17B")',
+          )
+          replace_once(
+              "test/registered/amd/test_qwen3_instruct_mxfp4.py",
+              'QWEN3_MODEL_PATH = "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4"',
+              'QWEN3_MODEL_PATH = os.environ.get("QWEN3_MODEL_PATH", "amd/Qwen3-235B-A22B-Instruct-2507-mxfp4")',
+          )
+          replace_once(
+              "test/registered/amd/accuracy/mi35x/test_deepseek_v32_eval_mi35x.py",
+              'model_path="deepseek-ai/DeepSeek-V3.2",',
+              'model_path=os.environ.get("DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"),',
+          )
           PY
 
       - name: Start CI container
@@ -156,7 +199,7 @@ jobs:
           docker rm -f ci_sglang || true
           cd "${SGLANG_WORKSPACE}"
           GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh
-          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python'
+          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python; test -d /models'
 
       - name: Setup pip config
         run: |
@@ -187,6 +230,47 @@ jobs:
             pip show amd-aiter || pip show aiter
           "
 
+      - name: Prepare model (${{ matrix.model }})
+        run: |
+          set -ex
+          MODEL_ID="${{ matrix.model_id }}"
+          MODEL_DIR="/models/${MODEL_ID}"
+          docker exec \
+            -e HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" \
+            -e MODEL_ID="${MODEL_ID}" \
+            -e MODEL_DIR="${MODEL_DIR}" \
+            ci_sglang bash -lc '
+            set -ex
+            if [ -f "${MODEL_DIR}/.complete" ] || [ -f "${MODEL_DIR}/config.json" ]; then
+              echo "Model already cached at ${MODEL_DIR}"
+            else
+              echo "Model not found at ${MODEL_DIR}, downloading..."
+              mkdir -p "$(dirname "${MODEL_DIR}")" /models/.tmp
+              TMP_MODEL_DIR="/models/.tmp/${MODEL_ID//\//__}-$(date +%s%N)-${RANDOM}-$$"
+              rm -rf "${TMP_MODEL_DIR}"
+              huggingface-cli download "${MODEL_ID}" --local-dir "${TMP_MODEL_DIR}"
+              test -f "${TMP_MODEL_DIR}/config.json"
+              echo "ok" > "${TMP_MODEL_DIR}/.complete"
+
+              if [ -f "${MODEL_DIR}/.complete" ] || [ -f "${MODEL_DIR}/config.json" ]; then
+                echo "Model was cached by another runner at ${MODEL_DIR}"
+                rm -rf "${TMP_MODEL_DIR}"
+              elif mv -T "${TMP_MODEL_DIR}" "${MODEL_DIR}"; then
+                echo "Published model at ${MODEL_DIR}"
+              else
+                echo "Failed to publish ${MODEL_DIR}; checking if another runner published it"
+                if rmdir "${MODEL_DIR}" 2>/dev/null && mv -T "${TMP_MODEL_DIR}" "${MODEL_DIR}"; then
+                  echo "Published model at ${MODEL_DIR} after removing empty target directory"
+                else
+                  rm -rf "${TMP_MODEL_DIR}"
+                  test -f "${MODEL_DIR}/.complete" -o -f "${MODEL_DIR}/config.json"
+                fi
+              fi
+            fi
+            echo "Model ready at ${MODEL_DIR}"
+            ls -la "${MODEL_DIR}"
+          '
+
       - name: ${{ matrix.test_type }} Test MI35x (8-GPU ${{ matrix.model }})
         timeout-minutes: ${{ matrix.timeout_minutes }}
         run: |
@@ -195,6 +279,7 @@ jobs:
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e ${{ matrix.model_path_env }}="/models/${{ matrix.model_id }}" \
             ${{ matrix.extra_exec_args }} \
             ${{ matrix.test_command }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
