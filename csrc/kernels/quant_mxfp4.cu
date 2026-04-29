@@ -77,7 +77,8 @@ __device__ __forceinline__ int a16w4_shuffle_scale_id(
 }
 
 template <typename float_type, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
-__global__ void quant_mxfp4_even_round_kernel(
+__global__ __launch_bounds__(kBlockThreads)
+void quant_mxfp4_even_round_kernel(
     const float_type* __restrict__ inp,
     uint8_t* __restrict__ out_packed,
     float* __restrict__ out_scale,
@@ -115,11 +116,18 @@ __global__ void quant_mxfp4_even_round_kernel(
 
     uint32_t max_bits = __float_as_uint(group_max);
     max_bits          = (max_bits + EVEN_ROUND_VAL_TO_ADD) & EVEN_ROUND_FP32_SIGN_EXP_MASK;
-    float max_rounded = __uint_as_float(max_bits);
 
-    float scale_unbiased = floorf(log2f(max_rounded)) - EVEN_ROUND_FP4_EMAX;
-    scale_unbiased       = fminf(fmaxf(scale_unbiased, -127.0f), 127.0f);
-    float dequant_scale  = exp2f(scale_unbiased);
+    uint32_t raw_exp = max_bits >> 23;
+    float dequant_scale;
+    uint8_t biased_exp;
+    if (__builtin_expect(raw_exp >= 3, 1)) {
+        uint32_t exp_out = raw_exp - 2;
+        dequant_scale = __uint_as_float(exp_out << 23);
+        biased_exp = (uint8_t)exp_out;
+    } else {
+        dequant_scale = 0x1.0p-127f;
+        biased_exp = 0;
+    }
 
     u8x16_t packed;
 
@@ -172,7 +180,6 @@ __global__ void quant_mxfp4_even_round_kernel(
     }
     *reinterpret_cast<u8x16_t*>(out_packed + w_base) = packed;
 
-    uint8_t biased_exp = (__float_as_uint(dequant_scale) >> 23) & 0xFF;
     int scale_idx;
     if constexpr (e8m0_shuffle) {
         scale_idx = fp4_scale_shuffle_id(scaleN_pad, (int)x, y);
@@ -223,12 +230,12 @@ void quant_mxfp4_even_round(
     AITER_CHECK(!shuffle_weight || e8m0_shuffle || a16w4_shuffle,
                 __func__, " shuffle_weight requires e8m0_shuffle or a16w4_shuffle");
 
-    int64_t ori_rows = inp.size(0);
-    int32_t ori_cols = inp.size(1);
+    const int64_t ori_rows = inp.size(0);
+    const int32_t ori_cols = inp.size(1);
     AITER_CHECK(ori_cols % group_size == 0, __func__, " cols must be divisible by group_size");
 
-    int32_t scaleN     = ori_cols / group_size;
-    int32_t scaleN_pad = e8m0_shuffle ? ((scaleN + 7) / 8) * 8 : scaleN;
+    const int32_t scaleN     = ori_cols / group_size;
+    const int32_t scaleN_pad = e8m0_shuffle ? ((scaleN + 7) / 8) * 8 : scaleN;
 
     if (a16w4_shuffle) {
         AITER_CHECK(ori_rows % 32 == 0, __func__, " a16w4 scale shuffle requires rows % 32 == 0");
@@ -244,8 +251,8 @@ void quant_mxfp4_even_round(
         }
     }
 
-    int64_t total_groups = ori_rows * (int64_t)scaleN_pad;
-    int64_t grid_size    = (total_groups + kBlockThreads - 1) / kBlockThreads;
+    const int64_t total_groups = ori_rows * (int64_t)scaleN_pad;
+    const int64_t grid_size    = (total_groups + kBlockThreads - 1) / kBlockThreads;
     AITER_CHECK(grid_size <= 2147483647LL, __func__, " grid size exceeds maximum");
 
     HipDeviceGuard device_guard(inp.device_id);
