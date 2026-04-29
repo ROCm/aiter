@@ -38,7 +38,7 @@ def get_default_kwargs(
     d = {}
     d["NUM_BLOCKS_PER_V_DIM"] = 1
     d["NUM_WARPS"] = 4
-    d["WARP_THREADS_K"] = 8
+    d["WARP_THREADS_K"] = 16
     global GDR_GLOBAL_CONFIG_MAP
     global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
