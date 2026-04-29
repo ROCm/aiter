@@ -157,6 +157,7 @@ else
   echo "Model not found at ${MODEL_DIR}, downloading..."
   mkdir -p "$(dirname "${MODEL_DIR}")" /models/.tmp
   TMP_MODEL_DIR="/models/.tmp/${MODEL_ID//\//__}-$(date +%s%N)-${RANDOM}-$$"
+  export TMP_MODEL_DIR
   rm -rf "${TMP_MODEL_DIR}"
   python3 - <<'PY'
 import os
