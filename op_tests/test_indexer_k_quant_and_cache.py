@@ -4,7 +4,6 @@
 import torch
 import aiter
 from aiter.test_common import checkAllclose, run_perftest, benchmark
-from aiter import dtypes
 from aiter import (
     pertoken_quant,
     dtypes,
@@ -111,7 +110,9 @@ def test_indexer_k_quant_and_cache(
     scale_fmt = "ue8m0"
     # Zero-init so unwritten padding slots (if any) match between ref and kernel.
     kv_cache = torch.zeros((block_num, block_size, head_dim + 4), dtype=dtypes.fp8)
-    run_torch(k, kv_cache, slot_mapping, quant_block_size, scale_fmt, preshuffle=preshuffle)
+    run_torch(
+        k, kv_cache, slot_mapping, quant_block_size, scale_fmt, preshuffle=preshuffle
+    )
     kv_cache2 = torch.zeros((block_num, block_size, head_dim + 4), dtype=dtypes.fp8)
     _, us = run_perftest(
         indexer_k_quant_and_cache,
