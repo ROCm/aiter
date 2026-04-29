@@ -20,13 +20,16 @@ This module provides:
     3) remap threads into (MLane, NLane) = (8,32) and read half2 from LDS,
        then call `store_pair(...)` to emit the final global store/atomic.
 
+  When ``lds_out_split`` is provided, the epilogue runs in split-LDS mode:
+  waves are partitioned into two groups (group A uses ``lds_out``, group B
+  uses ``lds_out_split``), each handling half of the N dimension.
+
 These helpers are intentionally *dialect-agnostic*: callers pass the dialect
 modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import Callable
 
 from flydsl._mlir import ir
@@ -34,17 +37,7 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 
-
-@contextmanager
-def _if_then(if_op, scf):
-    """Compat helper for SCF IfOp then-region across old/new Python APIs."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
+from .kernels_common import _if_then
 
 
 def default_epilog(
@@ -141,7 +134,7 @@ def c_shuffle_epilog(
         raise ValueError(f"e_vec must be positive, got {e_vec}")
     if (int(tile_n) % (int(cshuffle_nlane) * int(e_vec))) != 0:
         raise ValueError(
-            f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane*e_vec}, got tile_n={tile_n}"
+            f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane * e_vec}, got tile_n={tile_n}"
         )
 
     # ===================== Split-LDS mode (early return) =====================
@@ -183,7 +176,7 @@ def c_shuffle_epilog(
 
         def _write_row_split(mi: int, ii: int, row_in_tile, row):
             row_base_lds = row_in_tile * _half_n_idx
-            _if_g = scf.IfOp(_is_group_b, has_else=True)
+            _if_g = scf.IfOp(_is_group_b)
             with ir.InsertionPoint(_if_g.then_block):
                 write_row_to_lds(
                     mi=mi,
@@ -266,7 +259,7 @@ def c_shuffle_epilog(
                     col_pair0_local = col_base_nr + (n_lane_s * c_evec)
                     lds_idx = row_base_lds + col_pair0_local
 
-                    _if_ld = scf.IfOp(_is_group_b, [vec_frag], has_else=True)
+                    _if_ld = scf.IfOp(_is_group_b, [vec_frag])
                     with ir.InsertionPoint(_if_ld.then_block):
                         fb = vector.load_op(vec_frag, lds_out_split, [lds_idx])
                         scf.YieldOp([fb])
