@@ -189,14 +189,6 @@ jobs:
           docker exec ci_sglang bash -lc "
             set -ex
             pip uninstall -y amd-aiter aiter || true
-            pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
-            TRITON_INDEX_URL="https://pypi.amd.com/triton/rocm-7.0.0/simple/"
-            ROCM_VERSION=\$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print \$3}')
-            if [ -n "\$ROCM_VERSION" ]; then
-              ROCM_MAJOR_MINOR=\$(echo "\$ROCM_VERSION" | cut -d. -f1,2)
-              TRITON_INDEX_URL="https://pypi.amd.com/triton/rocm-\${ROCM_MAJOR_MINOR}.0/simple/"
-            fi
-            pip install --extra-index-url "\$TRITON_INDEX_URL" amd-triton
             rm -rf /tmp/aiter-under-test
             git clone '${GITHUB_REPO_URL}' /tmp/aiter-under-test
             cd /tmp/aiter-under-test
@@ -204,6 +196,8 @@ jobs:
             git submodule sync --recursive
             git submodule update --init --recursive
             pip install -e .
+            ./.github/scripts/install_triton.sh
+            pip show amd-triton || true
             pip show amd-aiter || pip show aiter
           "
 
