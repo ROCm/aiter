@@ -521,7 +521,7 @@ def compile_mixed_moe_gemm1(
             by = gpu.block_id("x")  # tile along inter_dim (N)
             bx_persist = gpu.block_id("y")  # persistent WG index
 
-            if xcd_swizzle > 0:
+            if const_expr(xcd_swizzle > 0):
                 _NUM_XCDS_S1 = 8
                 _c1_sw = arith.constant(1, index=True)
                 _c_tn_sw = arith.constant(tile_n, index=True)
@@ -580,7 +580,7 @@ def compile_mixed_moe_gemm1(
             _lds_out_elem_type = (
                 T.f32 if _need_quant else (T.bf16 if out_is_bf16 else T.f16)
             )
-            if _split_lds_out and _use_cshuffle_epilog:
+            if const_expr(_split_lds_out and _use_cshuffle_epilog):
                 _half_out_elems = int(tile_m) * (int(tile_n) // 2)
                 lds_out = SmemPtr(
                     base_ptr_pong,
@@ -1297,7 +1297,7 @@ def compile_mixed_moe_gemm1(
                                 )
                             for ikxdl in range_constexpr(pack_K):
                                 k_idx = ku128 * pack_K + ikxdl
-                                if k_idx < ku_count:
+                                if const_expr(k_idx < ku_count):
                                     gate_bp0, gate_bp1 = gate_b_tile_in[k_idx]
                                     if const_expr(not _single_b):
                                         up_bp0, up_bp1 = up_b_tile_in[k_idx]
@@ -1864,7 +1864,7 @@ def compile_mixed_moe_gemm1(
                         prefetch_x_to_lds(k_tail1, lds_x_ping)
                     else:
                         x_regs_ping = load_x_tile(k_tail1)
-                    if _pad_ku_skip > 0:
+                    if const_expr(_pad_ku_skip > 0):
                         gate_w_ping, up_w_ping = load_b_tile(
                             k_tail1 // arith.constant(2, index=True),
                             ku_limit=_tail_ku,
@@ -1894,7 +1894,7 @@ def compile_mixed_moe_gemm1(
                         store_x_tile_to_lds(x_regs_ping, lds_x_ping)
                     rocdl.s_waitcnt(0)
                     _barrier()
-                    if _pad_ku_skip > 0:
+                    if const_expr(_pad_ku_skip > 0):
                         a_tile_ping = prefetch_full_a_from_lds(
                             lds_x_ping, ku_limit=_tail_ku
                         )
@@ -1991,7 +1991,7 @@ def compile_mixed_moe_gemm1(
 
                 def _act_vec4(gate_v4, up_v4):
                     """Dispatch activation based on `act` parameter."""
-                    if act == "swiglu":
+                    if const_expr(act == "swiglu"):
                         return _swiglu_mul_vec4(gate_v4, up_v4)
                     else:
                         return _silu_mul_vec4(gate_v4, up_v4)
@@ -2337,7 +2337,7 @@ def compile_mixed_moe_gemm1(
                                         _w,
                                     )
                                 out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
-                                if _e_vec == 2:
+                                if const_expr(_e_vec == 2):
                                     store_val = arith.TruncIOp(T.i16, packed_i32)
                                     store_raw = (
                                         store_val._value
@@ -4529,7 +4529,7 @@ def compile_mixed_moe_gemm2(
         gx = (
             n_in - _model_dim_pad_idx + _tile_n_idx - arith.constant(1, index=True)
         ) / _tile_n_idx
-        if _persistent:
+        if const_expr(_persistent):
             gy = arith.constant(_cu_num, index=True)
         else:
             _c_pm_l = arith.constant(persist_m, index=True)
