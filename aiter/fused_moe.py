@@ -263,7 +263,8 @@ def fused_moe_(
         and a1_scale is not None
     ):
         q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = 256
+    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    bf16_fp8_bound = 0 
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -1280,6 +1281,8 @@ def fused_moe_2stages(
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
+    if metadata.stage1.func is _flydsl_stage1_wrapper:
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1295,7 +1298,6 @@ def fused_moe_2stages(
             w1_scale.view(dtypes.fp8_e8m0) if w1.dtype == dtypes.fp4x2 else w1_scale
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
-        swiglu_limit=swiglu_limit,
         **extra_stage1_args,
     )
     if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
