@@ -31,6 +31,26 @@ def _fused_qk_rmsnorm_group_quant_kernel(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_fused_qk_rmsnorm_group_quant", fc_name="fused_qk_rmsnorm_per_token_quant"
+)
+def _fused_qk_rmsnorm_per_token_quant_kernel(
+    q_out_quantized: Tensor,
+    q_out_scale: Tensor,
+    q: Tensor,
+    q_weight: Tensor,
+    q_epsilon: float,
+    q_out_unquantized: Optional[Tensor] = None,
+    k_out: Optional[Tensor] = None,
+    q_res_out: Optional[Tensor] = None,
+    k: Optional[Tensor] = None,
+    k_weight: Optional[Tensor] = None,
+    k_epsilon: Optional[float] = None,
+    q_residual: Optional[Tensor] = None,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
 def fused_qk_rmsnorm_group_quant(
     q_out_quantized: Tensor,
     q_out_scale: Tensor,
@@ -48,6 +68,11 @@ def fused_qk_rmsnorm_group_quant(
     transpose_scale: bool = False,
     gemma_norm: bool = False,
 ) -> None:
+    if group_size <= 0:
+        raise ValueError(
+            "fused_qk_rmsnorm_group_quant requires group_size > 0; "
+            "use fused_qk_rmsnorm_per_token_quant for per-token quant"
+        )
     if q_out_quantized.dtype not in (dtypes.fp8, dtypes.fp4x2):
         raise ValueError(
             "fused_qk_rmsnorm_group_quant currently supports fp8/fp4x2 output quant only; "
@@ -85,5 +110,47 @@ def fused_qk_rmsnorm_group_quant(
         q_residual,
         group_size,
         transpose_scale,
+        gemma_norm,
+    )
+
+
+def fused_qk_rmsnorm_per_token_quant(
+    q_out_quantized: Tensor,
+    q_out_scale: Tensor,
+    q: Tensor,
+    q_weight: Tensor,
+    q_epsilon: float,
+    q_out_unquantized: Optional[Tensor] = None,
+    k_out: Optional[Tensor] = None,
+    q_res_out: Optional[Tensor] = None,
+    k: Optional[Tensor] = None,
+    k_weight: Optional[Tensor] = None,
+    k_epsilon: Optional[float] = None,
+    q_residual: Optional[Tensor] = None,
+    gemma_norm: bool = False,
+) -> None:
+    if q_out_quantized.dtype != dtypes.fp8:
+        raise ValueError(
+            "fused_qk_rmsnorm_per_token_quant currently supports fp8 output quant only; "
+            f"got {q_out_quantized.dtype}"
+        )
+    if q_out_scale.dim() != 2 or q_out_scale.size(1) != 1:
+        raise ValueError(
+            "fused_qk_rmsnorm_per_token_quant expects q_out_scale with shape [m, 1]"
+        )
+
+    _fused_qk_rmsnorm_per_token_quant_kernel(
+        q_out_quantized,
+        q_out_scale,
+        q,
+        q_weight,
+        q_epsilon,
+        q_out_unquantized,
+        k_out,
+        q_res_out,
+        k,
+        k_weight,
+        k_epsilon,
+        q_residual,
         gemma_norm,
     )
