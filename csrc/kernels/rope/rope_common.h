@@ -7428,6 +7428,108 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_xor_sync_vec(vec_t<T, vec_siz
     return out;
 }
 
+// Pack two FP32 values into a single bf16x2 dword using round-to-nearest-even.
+//
+// Reference / adapted from:
+//   aiter/csrc/kernels/mla/hk/hk_mla_buffer_managers.cuh,
+//   `float_2_bf16_pair<kRoundMode = 0>` (gfx94 RNE branch).
+// The 10-instruction sequence and the constants 0x7FFF / 0x7FFF0000 /
+// 0xFFFF0000 are taken from there. Differences in this version:
+//   - input constraint changed from "i"(src_0) (which requires the caller to
+//     pin a register number as a compile-time integer constant) to "v"(a_bits)
+//     (a regular VGPR-bound value), so any callsite with compiler-allocated
+//     FP32 scratch can use this helper directly;
+//   - signature takes (float, float) and bit-casts internally, instead of
+//     (uint32_t, uint32_t);
+//   - scratch outputs are early-clobber (`=&s` / `=&v`) since with "v" inputs
+//     we can no longer rely on the immediate constraint to prevent aliasing;
+//   - only RNE is implemented (the RNA/RTZ paths from the original are not
+//     ported because all callers in this file want bit-equivalence with
+//     __hip_bfloat16(float)).
+//
+// Round semantics (bit-identical to __hip_bfloat16(float) ctor for non-NaN inputs):
+//   bf16 = (x + 0x7FFF + ((x >> 16) & 1)) >> 16
+// This is the standard RNE bias trick — adds 0x7FFF for normal rounding, plus the
+// 17-bit ("round") position to break ties to even.
+//
+// NaN handling differs from the ctor: the ctor preserves the NaN payload upper
+// bits (and OR-s 0x10000 if those bits are zero, to keep the NaN signaling); this
+// helper replaces all NaN inputs with the canonical FP32_NAN (0x7FFF0000), which
+// truncates to BF16 0x7FFF (BF16 quiet NaN). For RMSNorm + RoPE outputs, neither
+// path produces NaN under finite inputs (eps>0 prevents div-by-zero in rsqrt,
+// and rotate is a linear combination of finites), so the difference is unreachable.
+//
+// On gfx94 (CDNA3) this lowers to a 10-instruction VALU sequence with NO EXEC
+// mask manipulation (vs 26 instructions for two scalar __hip_bfloat16(float)
+// expansions, each of which serializes the warp via s_and_saveexec / s_xor /
+// s_or around the NaN-check). On gfx95 (CDNA4) it would be a single
+// v_cvt_pk_bf16_f32 — not implemented here yet.
+__device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
+{
+    constexpr uint32_t ROUND_BIAS = 0x7fffu;     // RNE bias
+    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN → BF16 0x7fff
+    constexpr uint32_t MERGE_MASK = 0xffff0000u; // upper-half mask for and_or merge
+    uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
+    uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
+    uint32_t result;
+    // tmp scratch is read+written; nan_mask is an SGPR pair output of v_cmp_u_f32.
+    // We declare them as early-clobber outputs so the compiler doesn't alias them
+    // with any input register.
+    using uint64x1_t = uint64_t;
+    uint64x1_t nan_mask;
+    uint32_t tmp;
+    asm volatile(
+        // a-side: round + nan-replace, then put bf16 in low 16 bits of result
+        "v_cmp_u_f32 %[mask], %[a], %[a]\n\t"            // mask = isnan(a)
+        "v_bfe_u32 %[tmp], %[a], 16, 1\n\t"              // tmp = (a >> 16) & 1
+        "v_add3_u32 %[tmp], %[a], %[tmp], %[bias]\n\t"   // tmp = a + bias + bit
+        "v_cndmask_b32 %[res], %[tmp], %[nan], %[mask]\n\t" // if nan use canonical
+        "v_lshrrev_b32 %[res], 16, %[res]\n\t"           // result_low = bf16(a)
+        // b-side: round + nan-replace, then merge upper half with result
+        "v_cmp_u_f32 %[mask], %[b], %[b]\n\t"            // mask = isnan(b)
+        "v_bfe_u32 %[tmp], %[b], 16, 1\n\t"              // tmp = (b >> 16) & 1
+        "v_add3_u32 %[tmp], %[b], %[tmp], %[bias]\n\t"   // tmp = b + bias + bit
+        "v_cndmask_b32 %[tmp], %[tmp], %[nan], %[mask]\n\t" // if nan use canonical
+        "v_and_or_b32 %[res], %[tmp], %[mmsk], %[res]"   // result = (tmp & 0xFFFF0000) | result_low
+        : [mask] "=&s"(nan_mask), [tmp] "=&v"(tmp), [res] "=&v"(result)
+        : [a] "v"(a_bits),
+          [b] "v"(b_bits),
+          [bias] "v"(ROUND_BIAS),
+          [nan] "v"(FP32_NAN),
+          [mmsk] "v"(MERGE_MASK));
+    return result;
+}
+
+// Pack an array of N FP32 values into a vec_t<T, N>, using packed bf16x2
+// conversion (round-to-nearest-even) when T is bfloat16, falling back to
+// scalar static_cast for other element types. N must be even.
+//
+// The bf16 path saves ~50% of the conversion cost relative to the default
+// per-element static_cast<bf16>(float) — see the comment on
+// f32x2_to_bf16x2_rne above.
+template <typename T, int N>
+__device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float (&src)[N])
+{
+    static_assert(N % 2 == 0, "pack_f32_to_vec_t requires even N (pairs into bf16x2)");
+    if constexpr(std::is_same_v<T, hip_bfloat16>)
+    {
+        uint32_t* dst_dw = reinterpret_cast<uint32_t*>(&dst);
+#pragma unroll
+        for(int i = 0; i < N / 2; ++i)
+        {
+            dst_dw[i] = f32x2_to_bf16x2_rne(src[2 * i], src[2 * i + 1]);
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < N; ++i)
+        {
+            dst[i] = static_cast<T>(src[i]);
+        }
+    }
+}
+
 template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void
 warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_dim, float rms_eps)

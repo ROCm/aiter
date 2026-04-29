@@ -1636,32 +1636,48 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
 //           half_warp_reduce_sum() in rope_common.h skips the XOR-by-16
 //           step so the two halves reduce independently).
 //
-//   (2) DOUBLE BUFFERING (2 head_pairs per warp, same token)
+//   (2) BUNDLED VMEM ISSUE (multiple outstanding loads, same token)
+//       NOTE on naming: this is NOT classical software-pipelined double
+//       buffering — there is no `prefetch t0; for i: prefetch ti; compute
+//       t(i-1)` loop. There is no loop at all. Each warp processes ONE
+//       (token, head_quad) tile and exits. What we do is just batch
+//       multiple HBM round-trips so they fly in parallel; the win is from
+//       load↔load overlap, not load↔compute overlap.
+//
 //       Step (1) gave us "1 warp = 1 head_pair" with 4 VMEM ops per pair
-//       (q/k load + w + cos_sin + store). The kernel is still
-//       VMEM-latency-bound on MI300X: the load → first-use distance can be
-//       hundreds of cycles and a single in-flight load doesn't fill that.
+//       (q/k load + w + cos_sin + store). At single in-flight load per
+//       warp the kernel is VMEM-latency-bound on MI300X: load → first-use
+//       distance is hundreds of cycles and one outstanding load can't fill
+//       that.
 //
-//       So this kernel issues TWO head_pairs of work per warp, both for
-//       the SAME token, and bundles all the loads in the prologue:
+//       So this kernel doubles the work per warp to TWO head_pairs of the
+//       SAME token and bundles ALL their input loads in the prologue:
 //
-//           prologue:
-//             global_load_dwordx4 x_pair_0   [iter 0 q/k, heads 4p+0,4p+1]
-//             global_load_dwordx4 x_pair_1   [iter 1 q/k, heads 4p+2,4p+3, +offset 2*HEAD_SIZE]
+//           prologue (no loop, all issued back-to-back):
+//             global_load_dwordx4 x_pair_0   [pair 0 q/k, heads 4p+0,4p+1]
+//             global_load_dwordx4 x_pair_1   [pair 1 q/k, heads 4p+2,4p+3,
+//                                             +offset 2*HEAD_SIZE]
 //             global_load_dwordx4 w_vec      [shared by both pairs]
 //             global_load_dwordx4 cos_sin    [shared by both pairs, same token]
 //
-//       The compiler then naturally emits a decreasing waitcnt sequence
-//       vmcnt(3) → vmcnt(2) → vmcnt(1) so all 4 loads stay in-flight at
-//       once. Each load's latency is hidden behind the others' arrival —
-//       this is the "double-buffer" effect: while compute is consuming
-//       iter-0 data, iter-1 data is still loading from HBM.
+//       The compiler sinks each consumer behind a decreasing waitcnt
+//       (vmcnt(3) → vmcnt(2) → ... → vmcnt(0)) so all 4 HBM round-trips
+//       are in flight simultaneously — total wait is max() of the four,
+//       not sum(). One load's latency is hidden behind ANOTHER LOAD's
+//       latency, not behind compute.
+//
+//       (Cross-loop producer-consumer pipelining — the "real" double
+//       buffer that interleaves prefetch ti with compute t(i-1) — needs a
+//       loop. We tried it via TPW=2 (1 warp = 2 tokens) and it didn't
+//       help: the kernel is already at ~50-60% HBM peak BW with ~10
+//       waves/SIMD, and cross-warp occupancy is already hiding the
+//       load latency that a loop-level pipeline would have to fight for.)
 //
 //       Same-token bundling adds two more wins on top of (1):
 //         * w_vec and cos_sin are now loaded ONCE for ALL FOUR heads, not
 //           once per pair (so 2× more reuse than pair packing alone).
 //         * The NEOX cos_sin shuffle (warp_shfl_xor_sync_vec) only needs
-//           to run once per warp; both iter-0 and iter-1 RoPE rotations
+//           to run once per warp; both pair-0 and pair-1 RoPE rotations
 //           reuse the same shuffled cos_sin_vec / nb_cos_sin_vec.
 //
 // Per-warp VMEM cost (4 heads of work):
@@ -1684,7 +1700,23 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
 // falls back to the single-head fused_rope_rms_1way_kernel for any other
 // shape; that path is untouched and produces bitwise-identical output to
 // the pre-quad-kernel baseline.
-template <typename T, int HEAD_SIZE, bool IS_NEOX>
+//
+// QUAD_Q_CT / QUAD_K_CT (compile-time):
+//   When > 0 the kernel uses them as constexpr divisors so the compiler
+//   folds `spec / quad_q` / `spec % quad_q` into a magic-number multiply
+//   (5 VALU ops: mul_hi + lshr + mul_lo + sub) instead of the runtime
+//   signed integer-divide expansion (~30 ops including v_rcp_iflag_f32).
+//   Pass 0 to keep the runtime path. Selected by the host dispatcher
+//   based on the actual num_heads_q / num_heads_k.
+//
+//   Empirical impact at T=8192, HEAD_SIZE=128, bf16 on MI308X: 3-5% faster
+//   per-warp than the runtime path (kernel is dominated by VMEM latency,
+//   not int-div). VGPR usage and occupancy are identical.
+template <typename T,
+          int HEAD_SIZE,
+          bool IS_NEOX,
+          int QUAD_Q_CT = 0,
+          int QUAD_K_CT = 0>
 __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
                                                    const T* k_,
                                                    const T* w_q,
@@ -1720,9 +1752,13 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     auto out_q         = out_q_ + batch_id * num_tokens * num_heads_q * HEAD_SIZE;
     auto out_k         = out_k_ + batch_id * num_tokens * num_heads_k * HEAD_SIZE;
 
-    // "quad" count per token = how many groups-of-4-heads each token contributes
-    const int quad_q     = num_heads_q / 4;
-    const int quad_k     = num_heads_k / 4;
+    // "quad" count per token = how many groups-of-4-heads each token contributes.
+    // When QUAD_Q_CT / QUAD_K_CT are non-zero compile-time constants, the
+    // div/mod below becomes a constant-divisor magic-multiply (~3 VALU ops);
+    // otherwise the compiler emits the full runtime int-div sequence
+    // (~30 ops, sat on the critical path before any VMEM can issue).
+    const int quad_q     = (QUAD_Q_CT > 0) ? QUAD_Q_CT : (num_heads_q / 4);
+    const int quad_k     = (QUAD_K_CT > 0) ? QUAD_K_CT : (num_heads_k / 4);
     const int warp_q_end = num_tokens * quad_q;
     const bool is_q      = global_warp_id < warp_q_end;
 
@@ -1735,15 +1771,31 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     int quad_idx_in_token;
     if(is_q)
     {
-        const int spec     = global_warp_id;
-        token_id           = spec / quad_q;
-        quad_idx_in_token  = spec % quad_q;
+        const int spec = global_warp_id;
+        if constexpr(QUAD_Q_CT > 0)
+        {
+            token_id          = spec / QUAD_Q_CT;
+            quad_idx_in_token = spec % QUAD_Q_CT;
+        }
+        else
+        {
+            token_id          = spec / quad_q;
+            quad_idx_in_token = spec % quad_q;
+        }
     }
     else
     {
-        const int spec     = global_warp_id - warp_q_end;
-        token_id           = spec / quad_k;
-        quad_idx_in_token  = spec % quad_k;
+        const int spec = global_warp_id - warp_q_end;
+        if constexpr(QUAD_K_CT > 0)
+        {
+            token_id          = spec / QUAD_K_CT;
+            quad_idx_in_token = spec % QUAD_K_CT;
+        }
+        else
+        {
+            token_id          = spec / quad_k;
+            quad_idx_in_token = spec % quad_k;
+        }
     }
 
     // ===========================================================
@@ -1803,25 +1855,34 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
     // RMSNorm × 2 (one reduce per pair, both use shared w_vec)
     // ===========================================================
     {
+        // Cache FP32 reads so the writeback loop doesn't re-read BF16 from
+        // x_pair_0/1 (would be redundant lshl b32 conversions). Same RNE on
+        // writeback via pack_f32_to_vec_t (10 instr per bf16x2 pair vs the
+        // compiler default 26 instr — see f32x2_to_bf16x2_rne in rope_common.h).
+        float v0[VEC_PAIR], v1[VEC_PAIR];
         float acc0 = 0.f, acc1 = 0.f;
 #pragma unroll
         for(int i = 0; i < VEC_PAIR; ++i)
         {
-            float v0 = (float)x_pair_0[i];
-            float v1 = (float)x_pair_1[i];
-            acc0 += v0 * v0;
-            acc1 += v1 * v1;
+            v0[i] = (float)x_pair_0[i];
+            v1[i] = (float)x_pair_1[i];
+            acc0 += v0[i] * v0[i];
+            acc1 += v1[i] * v1[i];
         }
-        acc0          = mrope_utils::block_utils::half_warp_reduce_sum<float>(acc0);
-        acc1          = mrope_utils::block_utils::half_warp_reduce_sum<float>(acc1);
-        float s_val0  = rsqrtf(acc0 / (float)HEAD_SIZE + eps);
-        float s_val1  = rsqrtf(acc1 / (float)HEAD_SIZE + eps);
+        acc0         = mrope_utils::block_utils::half_warp_reduce_sum<float>(acc0);
+        acc1         = mrope_utils::block_utils::half_warp_reduce_sum<float>(acc1);
+        float s_val0 = rsqrtf(acc0 / (float)HEAD_SIZE + eps);
+        float s_val1 = rsqrtf(acc1 / (float)HEAD_SIZE + eps);
+
+        float n0[VEC_PAIR], n1[VEC_PAIR];
 #pragma unroll
         for(int i = 0; i < VEC_PAIR; ++i)
         {
-            x_pair_0[i] = static_cast<T>((float)x_pair_0[i] * s_val0 * (float)w_vec[i]);
-            x_pair_1[i] = static_cast<T>((float)x_pair_1[i] * s_val1 * (float)w_vec[i]);
+            n0[i] = v0[i] * s_val0 * (float)w_vec[i];
+            n1[i] = v1[i] * s_val1 * (float)w_vec[i];
         }
+        mrope_utils::pack_f32_to_vec_t(x_pair_0, n0);
+        mrope_utils::pack_f32_to_vec_t(x_pair_1, n1);
     }
 
     // ===========================================================
@@ -1838,47 +1899,62 @@ __global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
             x_pair_0, opus::number<NEIGHBOR_XOR_PAIR>{});
         auto nb_x_pair_1 = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_PAIR>(
             x_pair_1, opus::number<NEIGHBOR_XOR_PAIR>{});
-        if(is_lower_half)
-        {
+
+        // Replace divergent `if(is_lower_half){}else{}` (which forced the
+        // compiler to emit two copies of the rope math AND of the FP32→BF16
+        // cvt sequence, with s_and_saveexec / s_xor / s_or EXEC mask
+        // switches between them) with a per-lane cndmask select. Both
+        // expressions are evaluated in the SAME FP32 op order as the
+        // original divergent code (mul + mul + sub for lower, mul + mul +
+        // add for upper), then cndmask picks the right one — bit-exact
+        // equivalent for every lane, single cvt path per output.
+        // FP32 results are staged then packed via pack_f32_to_vec_t which
+        // for bfloat16 lowers to v_cmp_u_f32 + v_bfe_u32 + v_add3_u32 +
+        // v_cndmask + v_and_or_b32 (10 instr per bf16x2 pair vs 26 for the
+        // default scalar __hip_bfloat16(float) ctor expansion).
+        float out0_f32[VEC_PAIR], out1_f32[VEC_PAIR];
 #pragma unroll
-            for(int i = 0; i < VEC_PAIR; ++i)
-            {
-                out_pair_0[i] = (float)x_pair_0[i] * (float)cos_sin_vec[i] -
-                                (float)nb_x_pair_0[i] * (float)nb_cos_sin_vec[i];
-                out_pair_1[i] = (float)x_pair_1[i] * (float)cos_sin_vec[i] -
-                                (float)nb_x_pair_1[i] * (float)nb_cos_sin_vec[i];
-            }
-        }
-        else
+        for(int i = 0; i < VEC_PAIR; ++i)
         {
-#pragma unroll
-            for(int i = 0; i < VEC_PAIR; ++i)
-            {
-                out_pair_0[i] = (float)x_pair_0[i] * (float)nb_cos_sin_vec[i] +
-                                (float)nb_x_pair_0[i] * (float)cos_sin_vec[i];
-                out_pair_1[i] = (float)x_pair_1[i] * (float)nb_cos_sin_vec[i] +
-                                (float)nb_x_pair_1[i] * (float)cos_sin_vec[i];
-            }
+            const float c   = (float)cos_sin_vec[i];
+            const float nc  = (float)nb_cos_sin_vec[i];
+            const float x0  = (float)x_pair_0[i];
+            const float x1  = (float)x_pair_1[i];
+            const float nx0 = (float)nb_x_pair_0[i];
+            const float nx1 = (float)nb_x_pair_1[i];
+
+            const float lower0 = x0 * c - nx0 * nc;   // matches old lower branch
+            const float upper0 = x0 * nc + nx0 * c;   // matches old upper branch
+            const float lower1 = x1 * c - nx1 * nc;
+            const float upper1 = x1 * nc + nx1 * c;
+
+            out0_f32[i] = is_lower_half ? lower0 : upper0;
+            out1_f32[i] = is_lower_half ? lower1 : upper1;
         }
+        mrope_utils::pack_f32_to_vec_t(out_pair_0, out0_f32);
+        mrope_utils::pack_f32_to_vec_t(out_pair_1, out1_f32);
     }
     else
     {
+        float out0_f32[VEC_PAIR], out1_f32[VEC_PAIR];
 #pragma unroll
         for(int i = 0; i < VEC_PAIR / 2; ++i)
         {
-            out_pair_0[2 * i + 0] =
+            out0_f32[2 * i + 0] =
                 (float)x_pair_0[2 * i + 0] * (float)cos_vec_pair[i] -
                 (float)x_pair_0[2 * i + 1] * (float)sin_vec_pair[i];
-            out_pair_0[2 * i + 1] =
+            out0_f32[2 * i + 1] =
                 (float)x_pair_0[2 * i + 1] * (float)cos_vec_pair[i] +
                 (float)x_pair_0[2 * i + 0] * (float)sin_vec_pair[i];
-            out_pair_1[2 * i + 0] =
+            out1_f32[2 * i + 0] =
                 (float)x_pair_1[2 * i + 0] * (float)cos_vec_pair[i] -
                 (float)x_pair_1[2 * i + 1] * (float)sin_vec_pair[i];
-            out_pair_1[2 * i + 1] =
+            out1_f32[2 * i + 1] =
                 (float)x_pair_1[2 * i + 1] * (float)cos_vec_pair[i] +
                 (float)x_pair_1[2 * i + 0] * (float)sin_vec_pair[i];
         }
+        mrope_utils::pack_f32_to_vec_t(out_pair_0, out0_f32);
+        mrope_utils::pack_f32_to_vec_t(out_pair_1, out1_f32);
     }
 
     // ===========================================================
@@ -1924,19 +2000,23 @@ void fused_rope_rms_1way(const T* q,
     dim3 threadsPerBlock(block_size);
 
     // Quad fast path: 1 warp processes 4 heads (2 adjacent head_pairs of the
-    // same token, half-warp layout, double-buffered). See the kernel-side
-    // comment on fused_rope_rms_1way_quad_kernel for the full derivation;
-    // requires num_heads_q % 4 == 0 && num_heads_k % 4 == 0.
+    // same token, half-warp layout, all input loads bundled into the prologue
+    // so 4 HBM round-trips overlap). See the kernel-side comment on
+    // fused_rope_rms_1way_quad_kernel for the full derivation; requires
+    // num_heads_q % 4 == 0 && num_heads_k % 4 == 0.
     const bool can_quad = (num_heads_q % 4 == 0) && (num_heads_k % 4 == 0);
     if(can_quad)
     {
         auto total_warps_quad = num_tokens * ((num_heads_q + num_heads_k) / 4);
         dim3 numBlocks(
             (total_warps_quad + num_warps_per_block - 1) / num_warps_per_block, batch_size);
-#define DISPATCH_NEOX_QUAD(HEAD_SIZE)                                       \
+        // Inner macro: pick (IS_NEOX, QUAD_Q_CT, QUAD_K_CT) and launch.
+        // QUAD_Q_CT/QUAD_K_CT = 0 means runtime division; > 0 makes the
+        // div/mod inside the kernel a constant-divisor magic-multiply.
+#define DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, QQ, QK)                            \
     if(!is_interleaved)                                                     \
     {                                                                       \
-        fused_rope_rms_1way_quad_kernel<T, HEAD_SIZE, true>                 \
+        fused_rope_rms_1way_quad_kernel<T, HEAD_SIZE, true, QQ, QK>         \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(q,                  \
                                                         k,                  \
                                                         w_q,                \
@@ -1952,7 +2032,7 @@ void fused_rope_rms_1way(const T* q,
     }                                                                       \
     else                                                                    \
     {                                                                       \
-        fused_rope_rms_1way_quad_kernel<T, HEAD_SIZE, false>                \
+        fused_rope_rms_1way_quad_kernel<T, HEAD_SIZE, false, QQ, QK>        \
             <<<numBlocks, threadsPerBlock, 0, stream>>>(q,                  \
                                                         k,                  \
                                                         w_q,                \
@@ -1966,6 +2046,27 @@ void fused_rope_rms_1way(const T* q,
                                                         out_q,              \
                                                         out_k);             \
     }
+        // Outer macro: route common (num_heads_q, num_heads_k) shapes to the
+        // compile-time-divisor specialization, default to runtime path.
+        // Specialized list intentionally short — each adds ~one .so MB after
+        // template expansion across (T, HEAD_SIZE, IS_NEOX) → ~24 instances.
+#define DISPATCH_NEOX_QUAD(HEAD_SIZE)                              \
+    if(num_heads_q == 24 && num_heads_k == 24)                     \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 6, 6)                     \
+    }                                                              \
+    else if(num_heads_q == 32 && num_heads_k == 32)                \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 8, 8)                     \
+    }                                                              \
+    else if(num_heads_q == 16 && num_heads_k == 16)                \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 4, 4)                     \
+    }                                                              \
+    else                                                           \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 0, 0)                     \
+    }
         switch(head_size)
         {
         case 64: DISPATCH_NEOX_QUAD(64) break;
@@ -1973,6 +2074,7 @@ void fused_rope_rms_1way(const T* q,
         case 256: DISPATCH_NEOX_QUAD(256) break;
         }
 #undef DISPATCH_NEOX_QUAD
+#undef DISPATCH_NEOX_QUAD_CT
         return;
     }
 
