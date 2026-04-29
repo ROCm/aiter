@@ -2,12 +2,11 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
 import itertools
-from typing import Literal, Optional
 import torch
 import triton
 from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _mxfp4_quant_kernel,
@@ -282,7 +281,7 @@ def moe_gemm_a4w4(
     unpadded_N=None,
     unpadded_K=None,
     config=None,
-    backend: Optional[Literal["triton", "gluon"]] = None,
+    backend= None, # "triton" | "gluon"
 ):
     """
     Y[:, :] = 0.
