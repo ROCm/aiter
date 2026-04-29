@@ -67,12 +67,13 @@ SPLIT_K_GLOBAL_SIGNAL: dict[SplitKStreamKey, torch.Tensor] = {}
 
 # Keep the generic auto-generated catalog aligned with the upstream FlyDSL
 # reference tuning space. The wider local one-off search space introduced
-# gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192).
+# gfx950-faulting candidates (for example tile_k=160 and tile_n=160/192),
+# and higher split-K values are now capped at 8 for better accuracy.
 HGEMM_TILE_N_OPTIONS = (64, 128, 256)
 HGEMM_TILE_K_OPTIONS = (64, 128, 256)
 HGEMM_TILE_M_OPTIONS = (16, 32, 48, 64, 96, 128, 256)
-HGEMM_BASE_SPLIT_K_OPTIONS = (1, 2, 4, 8, 16)
-HGEMM_MAX_SPLIT_K = 16
+HGEMM_BASE_SPLIT_K_OPTIONS = tuple(range(1, 9))
+HGEMM_MAX_SPLIT_K = 8
 KERNEL_CONFIG_VARIANTS = (
     {
         "block_m_warps": 1,
