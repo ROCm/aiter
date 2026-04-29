@@ -488,14 +488,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             // __builtin_amdgcn_s_barrier();
             // __builtin_amdgcn_sched_barrier(0);
 
-            if constexpr(kSkipCompute == false)
-            {
-                pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin, true>();
-                pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin + 2, false>();
-                pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 4, true>();
-                pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 6, false>();
-            }
-
             // GEMM on PV -- fully double-buffered using p_comp aliases as alt V tile buffer.
             //
             // Macro-iter handles 2 PV tiles (even tile via k_kv_*, odd tile via kv_*_alt).
@@ -507,10 +499,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             constexpr uint32_t num_pv_iter    = T::kVoHeadDim / (T::kBlockK * 2); // 8
             constexpr uint32_t num_macro_iter = num_pv_iter / 2;                  // 4
 
-            // Drain stale lgkm ops (e.g. ds_bpermute residue from warpReduce above) so
-            // in-loop lgkmcnt(2) waits refer only to the V loads we just issued.
-            asm volatile("s_waitcnt lgkmcnt(0)");
-
             if constexpr(kSkipCompute == false)
             {
                 // Prologue: load tile 0 into k_kv_0/k_kv_1 and finalize (full drain).
@@ -518,9 +506,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 kv_manager.template load_transposed_v_to_gpr<16, 0,           k_kv_0_begin + 2>(p_lds_kv_curr);
                 kv_manager.template load_transposed_v_to_gpr<0,  T::kBlockK,  k_kv_1_begin>    (p_lds_kv_curr);
                 kv_manager.template load_transposed_v_to_gpr<16, T::kBlockK,  k_kv_1_begin + 2>(p_lds_kv_curr);
-                asm volatile("s_waitcnt lgkmcnt(2)");
-                kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_begin, k_kv_0_begin + 2>();
+
+                // Pack 4f32 to fp8 and overlap with the load_transposed_v_to_gpr
+                pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin, true>();
+                pack_4f32_to_fp8<k_p_mfma_begin, k_p_comp_begin + 2, false>();
+                pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 4, true>();
+                pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 6, false>();
+
                 asm volatile("s_waitcnt lgkmcnt(0)");
+                kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_begin, k_kv_0_begin + 2>();
                 kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_1_begin, k_kv_1_begin + 2>();
             }
 
