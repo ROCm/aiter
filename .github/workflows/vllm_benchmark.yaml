@@ -118,15 +118,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        model:
-          - 'mistralai/Mixtral-8x7B-Instruct-v0.1'
-          - 'deepseek-ai/DeepSeek-R1'
-        kv_cache_dtype:
-          - 'default_kvcache'
-          - 'fp8_kvcache'
-        exclude:
-          - model: 'deepseek-ai/DeepSeek-R1'
-            kv_cache_dtype: 'fp8_kvcache'
+        include:
+          - model: openai/gpt-oss-120b
+            kv_cache_dtype: fp8_kvcache
+            tp: 1
+            extra_args: --gpu-memory-utilization 0.3
+            extra_env_args: ""
+          - model: deepseek-ai/DeepSeek-R1-0528
+            kv_cache_dtype: default_kvcache
+            tp: 8
+            extra_args: --block-size 1
+            extra_env_args: ""
+          - model: moonshotai/Kimi-K2.5
+            kv_cache_dtype: default_kvcache
+            tp: 8
+            extra_args: --block-size 1 --trust-remote-code
+            extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
         
     steps:
       - name: Docker login
@@ -143,26 +150,25 @@ jobs:
 
           logFile="result_$(echo '${{ matrix.model }}' | sed 's/\//_/g')_kv_${{ matrix.kv_cache_dtype }}.log"
 
-          if [[ "${{ matrix.model }}" == *DeepSeek* ]]; then
-              extraArgs="--block-size 1"
-          else
-              extraArgs=""
-          fi
-
-          if [[ "${{ matrix.kv_cache_dtype }}" == "fp8_kvcache" ]]; then
-              extraArgs="${extraArgs} --kv-cache-dtype fp8"
+          extraArgs="${{ matrix.extra_args }}"
+          if [[ -n "${{ matrix.kv_cache_dtype }}" ]]; then
+            if [[ "${{ matrix.kv_cache_dtype }}" == "fp8_kvcache" ]]; then
+                extraArgs="${extraArgs} --kv-cache-dtype fp8"
+            fi
           fi
 
           docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
+              ${{ matrix.extra_env_args }} \
               rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} python -m vllm.entrypoints.cli.main bench latency \
               --model "${{ matrix.model }}" \
               --batch-size 123 --input-len 456 --output-len 78 \
               --num-iters-warmup 3 --num-iters 10 \
-              -tp 8 --load-format dummy ${extraArgs} |& tee ${logFile}
-          grep "Avg latency:" ${logFile} | awk '{print $3}'
+              -tp ${{ matrix.tp }} --load-format dummy ${extraArgs} |& tee "${logFile}"
+
+          grep "Avg latency:" "${logFile}" | awk '{print $3}'
   
       - name: Clean up
         if: always()
