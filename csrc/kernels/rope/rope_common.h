@@ -7270,6 +7270,36 @@ __inline__ __device__ T warp_reduce_sum(T val)
     return val;
 }
 
+// 16-lane (half-warp) version of warp_reduce_sum: skips the XOR-by-16 step so
+// lanes 0..15 and lanes 16..31 reduce independently within their group.
+// Used by pair-packed kernels where each half-warp processes a separate head.
+template <typename T>
+__inline__ __device__ T half_warp_reduce_sum(T val)
+{
+    static_assert(sizeof(T) == 4, "half_warp_reduce_sum requires 4-byte type");
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (8 << 10) | 0x1f)); /* XOR by 8 */
+    }
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (4 << 10) | 0x1f)); /* XOR by 4 */
+    }
+    val += opus::mov_dpp(val,
+                         opus::number<0x4e>{}, /* quad_perm:[2,3,0,1], i.e. XOR by 2 */
+                         opus::number<0xf>{},
+                         opus::number<0xf>{},
+                         opus::bool_constant<false>{});
+    val += opus::mov_dpp(val,
+                         opus::number<0xb1>{}, /* quad_perm:[1,0,3,2], i.e. XOR by 1 */
+                         opus::number<0xf>{},
+                         opus::number<0xf>{},
+                         opus::bool_constant<false>{});
+    return val;
+}
+
 template <typename T>
 __inline__ __device__ T warp_shfl_sync(T val, int src_id)
 {
