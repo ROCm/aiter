@@ -529,6 +529,14 @@ def _moe_gemm_a4w4_gfx1250(
 
     # apply activation function
     if APPLY_SWIGLU and SPLIT_K == 1:
+        if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
+            SWIGLU_LAYOUT: gl.constexpr = gl.BlockedLayout(
+                size_per_thread=[1, 2],
+                threads_per_warp=[16, 2],
+                warps_per_cta=[NUM_WARPS, 1],
+                order=[1, 0],
+            )
+            acc = gl.convert_layout(acc, SWIGLU_LAYOUT)
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL)
         out = gl.convert_layout(out, WMMA_LAYOUT)
         gl.static_assert(
