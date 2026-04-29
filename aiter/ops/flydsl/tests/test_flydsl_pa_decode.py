@@ -142,7 +142,7 @@ CASES = [
     (128, 32, 16, 1, 1, 256, 64, 128),    # 2 compute iters per partition
     (128, 64, 16, 1, 1, 512, 128, 256),   # 2 compute iters per partition
     (128, 32, 16, 1, 1, 384, 64, 192),    # 3 compute iters per partition
-    # (64, 16, 8, 1, 1, 1024, 256, 256), # gpt-oss shape to test later after fixing Q masks
+    (64, 16, 8, 1, 1, 1024, 256, 256), # gpt-oss shape to test later after fixing Q masks
 ]
 
 
