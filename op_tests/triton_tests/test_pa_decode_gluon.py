@@ -1545,7 +1545,7 @@ def run_pa_gluon_test(
     temporary_output = torch.empty(
         *intermediate_shape,
         head_size,
-        dtype=reference_output_quant.dtype,
+        dtype=torch.float32,
         device=reference_output_quant.device,
     )
     # Create output tensor with the same shape as reference
