@@ -85,8 +85,13 @@ def compile_pa_decode_main(
             f"PARTITION_SIZE {PARTITION_SIZE} must be multiple of "
             f"KV_COMPUTE_BLOCK_SIZE {KV_COMPUTE_BLOCK_SIZE}"
         )
-    if QUERY_GROUP_SIZE != WMMA_M:
-        raise ValueError(f"QUERY_GROUP_SIZE must be exactly {WMMA_M}, got {QUERY_GROUP_SIZE}")
+    # Real query-group sizes ∈ [1, WMMA_M] are padded internally to WMMA_M (the
+    # WMMA M-tile size). QGS > WMMA_M would need an M-axis warp split — not
+    # currently supported.
+    if not (1 <= QUERY_GROUP_SIZE <= WMMA_M):
+        raise ValueError(
+            f"QUERY_GROUP_SIZE must be in [1, {WMMA_M}], got {QUERY_GROUP_SIZE}"
+        )
     if dtype not in ("bf16", "f16"):
         raise ValueError(f"dtype must be 'bf16' or 'f16', got {dtype!r}")
     # Each warp owns HEAD_SIZE/NUM_WARPS output cols — must be multiple of WMMA_N.
@@ -141,9 +146,13 @@ def compile_pa_decode_main(
     # unused after q_frags are read into registers at prologue; scratch only
     # lives during the softmax step, so they never overlap in time).
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="pa_decode_main_lds")
-    q_lds_elems = QUERY_GROUP_SIZE * HEAD_SIZE
+    # Use WMMA_M (the *padded* M-tile size) for the in-LDS Q and P heights.
+    # When the real `QUERY_GROUP_SIZE` is < WMMA_M, the unused rows in LDS
+    # are simply never written (Q TDM only loads real rows; the row-mask in
+    # QK + masked stores keep their data from leaking out).
+    q_lds_elems = WMMA_M * HEAD_SIZE
     kv_lds_elems = KV_COMPUTE_BLOCK_SIZE * HEAD_SIZE
-    p_lds_elems = QUERY_GROUP_SIZE * KV_COMPUTE_BLOCK_SIZE
+    p_lds_elems = WMMA_M * KV_COMPUTE_BLOCK_SIZE
     q_lds_offset = 0
     q_lds_bytes = q_lds_elems * elem_bytes
     kv_one_bytes = kv_lds_elems * elem_bytes
@@ -158,8 +167,11 @@ def compile_pa_decode_main(
 
 
     # Cross-warp reduce scratch: two slabs (one for max, one for sum) of
-    # NUM_WARPS * QG f32 each. Alias both into Q's LDS region.
-    scratch_slab_elems = NUM_WARPS * QUERY_GROUP_SIZE   # f32 elements per slab
+    # NUM_WARPS * WMMA_M f32 each. Alias both into Q's LDS region.
+    # WMMA_M (not QUERY_GROUP_SIZE) is the per-warp stride so warp-w's slot
+    # for row r is at `w*WMMA_M + r` regardless of real QGS — otherwise warps
+    # would alias each other when QGS < WMMA_M.
+    scratch_slab_elems = NUM_WARPS * WMMA_M   # f32 elements per slab
     scratch_max_lds_offset = q_lds_offset
     scratch_sum_lds_offset = q_lds_offset + scratch_slab_elems * 4
 
@@ -289,6 +301,26 @@ def compile_pa_decode_main(
             # lane decomposition for ds_load_tr16_b128 (B-operand transposed read)
             lane8     = lane16 % arith.index(8)
             lane_ngrp = lane16 / arith.index(8)
+
+            # ---------------- Row mask for padded query-group rows ----------------
+            # When the real QUERY_GROUP_SIZE < WMMA_M, rows [QGS, WMMA_M) are
+            # padding. After QK we set those rows' scores to NEG_FINITE_MAX
+            # (rather than -inf, to avoid `exp2(-inf - -inf) = NaN` cascading
+            # through the softmax for fully-masked rows). The masked stores
+            # at the end then drop the padded rows entirely.
+            #
+            # row = lane_kgrp * 8 + mi, with mi ∈ [0,8).
+            # row_valid_per_mi[mi] is the per-lane i1 saying "this lane's
+            # mi-th element is a real row (not padding)".
+            NEG_FINITE_MAX = -3.4e38
+            neg_finite_max_f32 = arith.constant(NEG_FINITE_MAX, type=T.f32)
+            qgs_idx = arith.index(QUERY_GROUP_SIZE)
+            row_valid_per_mi = []
+            for _mi in range(8):
+                row = lane_kgrp * arith.index(8) + arith.index(_mi)
+                row_valid_per_mi.append(
+                    arith.cmpi(arith.CmpIPredicate.slt, _raw(row), _raw(qgs_idx))
+                )
 
             def _load_wmma_B_frag_tr(lds_ptr, n_col_base, k_base_elem, row_stride):
                 """Load a vec<16xelem> WMMA B fragment via 2 × ds_load_tr16_b128.
@@ -585,6 +617,26 @@ def compile_pa_decode_main(
                         in_range, _raw(qk_accs[n_local]), _raw(neg_inf_vec8)
                     )
 
+                # Mask padded query-group rows (when QGS_real < WMMA_M).
+                # Per-mi extract / scalar select / from_elements (matches the
+                # existing pattern used in step 9 below for pv_accs rescale).
+                # Use NEG_FINITE_MAX (not -inf) so fully-masked rows don't NaN
+                # through the softmax recurrence.
+                if QUERY_GROUP_SIZE < WMMA_M:
+                    for n_local in range_constexpr(N_QK_TILES_PER_WARP):
+                        new_vals = []
+                        for mi in range_constexpr(8):
+                            v = vector.extract(
+                                qk_accs[n_local], static_position=[mi], dynamic_position=[]
+                            )
+                            v = arith.select(
+                                row_valid_per_mi[mi],
+                                _raw(v),
+                                _raw(neg_finite_max_f32),
+                            )
+                            new_vals.append(v)
+                        qk_accs[n_local] = vector.from_elements(T.vec(8, T.f32), new_vals)
+
                 # ------------------------ Online softmax (cross-warp) ------------------------
                 # Step 1: per-lane local max across this warp's N_QK_TILES_PER_WARP N-tiles.
                 row_local_max = []
@@ -619,7 +671,7 @@ def compile_pa_decode_main(
                 # is fine on AMD LDS and avoids a scf.if. We go with that.
                 for mi in range_constexpr(8):
                     row = lane_kgrp * arith.index(8) + arith.index(mi)
-                    off = warp_id * arith.index(QUERY_GROUP_SIZE) + row
+                    off = warp_id * arith.index(WMMA_M) + row
                     scratch_max_lds.store(warp_max[mi], [off])
                 gpu.barrier()
 
@@ -632,7 +684,7 @@ def compile_pa_decode_main(
                     )
                     for w in range_constexpr(1, NUM_WARPS):
                         partial = fxFloat32(
-                            scratch_max_lds.load([arith.index(w * QUERY_GROUP_SIZE) + row])
+                            scratch_max_lds.load([arith.index(w * WMMA_M) + row])
                         )
                         acc = acc.maximumf(partial)
                     row_max_reduced.append(acc.ir_value())
@@ -675,7 +727,7 @@ def compile_pa_decode_main(
                 # Step 7: cross-warp sum reduce via LDS.
                 for mi in range_constexpr(8):
                     row = lane_kgrp * arith.index(8) + arith.index(mi)
-                    off = warp_id * arith.index(QUERY_GROUP_SIZE) + row
+                    off = warp_id * arith.index(WMMA_M) + row
                     scratch_sum_lds.store(warp_sum[mi], [off])
                 gpu.barrier()
 
@@ -687,7 +739,7 @@ def compile_pa_decode_main(
                     )
                     for w in range_constexpr(1, NUM_WARPS):
                         partial = fxFloat32(
-                            scratch_sum_lds.load([arith.index(w * QUERY_GROUP_SIZE) + row])
+                            scratch_sum_lds.load([arith.index(w * WMMA_M) + row])
                         )
                         acc = acc + partial
                     row_sum_reduced.append(acc.ir_value())
@@ -783,6 +835,9 @@ def compile_pa_decode_main(
 
             # Accumulator: each warp writes its N_PV_TILES_PER_WARP × vec<8xf32>
             # WMMA C layout: row = lane_kgrp*8 + mi, col = lane16 within the 16-col N-tile
+            # Stores are predicated by `row < QUERY_GROUP_SIZE` so padded rows
+            # (when QGS_real < WMMA_M) don't corrupt the next partition's slot
+            # in the row-major output buffer (whose row-stride is QGS_real).
             for pv_n in range_constexpr(N_PV_TILES_PER_WARP):
                 global_n_tile = warp_id * arith.index(N_PV_TILES_PER_WARP) + arith.index(pv_n)
                 for mi in range_constexpr(8):
@@ -792,15 +847,24 @@ def compile_pa_decode_main(
                     val = vector.extract(
                         pv_accs[pv_n], static_position=[mi], dynamic_position=[]
                     )
-                    buffer_ops.buffer_store(val, out_rsrc, off)
+                    # cmpi inlined into `if` test (FlyDSL's AST rewriter only
+                    # converts to scf.if when the test contains a Call).
+                    if arith.cmpi(
+                        arith.CmpIPredicate.slt, _raw(row), _raw(qgs_idx)
+                    ):
+                        buffer_ops.buffer_store(val, out_rsrc, off)
 
             # max_logits / exp_sums: per-lane 8 rows, only lane16==0 writes to avoid 16× redundant writes.
             # But they all have same values, so benign-race writes are fine.
+            # Same row-predicate as the output store above.
             for mi in range_constexpr(8):
                 row_idx = lane_kgrp * arith.index(8) + arith.index(mi)
                 off = lse_base + row_idx
-                buffer_ops.buffer_store(m_state[mi], ml_rsrc, off)
-                buffer_ops.buffer_store(l_state[mi], es_rsrc, off)
+                if arith.cmpi(
+                    arith.CmpIPredicate.slt, _raw(row_idx), _raw(qgs_idx)
+                ):
+                    buffer_ops.buffer_store(m_state[mi], ml_rsrc, off)
+                    buffer_ops.buffer_store(l_state[mi], es_rsrc, off)
 
     cache_tag = (HEAD_SIZE, KV_BLOCK_SIZE, QUERY_GROUP_SIZE, PARTITION_SIZE,
                  KV_COMPUTE_BLOCK_SIZE, dtype, NUM_WARPS)
