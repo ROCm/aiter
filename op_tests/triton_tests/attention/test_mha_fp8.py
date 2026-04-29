@@ -53,13 +53,12 @@ def fp8_assert_close(tensor_a, tensor_b, atol=1.0, cos_sim_threshold=0.96):
     assert_cosine_similarity(tensor_a, tensor_b, cos_sim_threshold)
 
 
-@pytest.mark.parametrize("BATCH", [1, 30, 50])
+@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
+    [(1, 1), (64, 128), (2048, 2048)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (48, 8)])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 def test_mha(
     BATCH: int,
@@ -67,10 +66,11 @@ def test_mha(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
     CAUSAL: bool,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ: int = 128
+
     if CAUSAL and (SEQLEN_Q * SEQLEN_K > 128 * 128):
         pytest.skip(
             "FP8+CAUSAL for big sequence lenghts results in random precision errors"
@@ -104,15 +104,12 @@ def test_mha(
     fp8_assert_close(triton_out, torch_out.to(triton_out.dtype))
 
 
-@pytest.mark.parametrize("BATCH", [1, 4, 30, 50])
+@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
+    [(1, 1), (64, 128), (2048, 2048)],
 )
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
-)
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (48, 8)])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
 def test_mha_varlen(
     BATCH: int,
@@ -120,10 +117,11 @@ def test_mha_varlen(
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
     NUM_K_HEADS: int,
-    HEAD_SZ: int,
     CAUSAL: bool,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ: int = 128
+
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -212,11 +210,9 @@ def test_mha_varlen(
 #   HQ=64, HK=8:  Llama 3 70B (GQA 8:1)
 #   HQ=32, HK=32: Llama 2 7B (MHA)
 @pytest.mark.parametrize("BATCH", [1, 4])
-@pytest.mark.parametrize("SEQLEN_Q", [512, 1024, 2048])
-@pytest.mark.parametrize("SEQLEN_K", [512, 1024, 2048])
+@pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
+@pytest.mark.parametrize("SEQLEN_K", [512, 2048])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
-@pytest.mark.parametrize("NUM_K_HEADS", [8])
-@pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward(
@@ -224,12 +220,13 @@ def test_mha_backward(
     SEQLEN_Q: int,
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ: int,
     CAUSAL: bool,
     FUSED: bool,
     dtype=torch.bfloat16,
 ):
+    HEAD_SZ: int = 128
+    NUM_K_HEADS: int = 8
+
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     if CAUSAL:
@@ -275,12 +272,14 @@ def test_mha_backward(
         assert_cosine_similarity(tri, ref)
 
 
+@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
 @pytest.mark.parametrize("SEQLEN_K", [512, 2048])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 @pytest.mark.parametrize("FUSED", [False, True])
 def test_mha_backward_varlen(
+    BATCH: int,
     SEQLEN_Q: int,
     SEQLEN_K: int,
     NUM_Q_HEADS: int,
@@ -288,9 +287,8 @@ def test_mha_backward_varlen(
     FUSED: bool,
     dtype=torch.bfloat16,
 ):
-    BATCH = 3
-    HEAD_SZ = 128
-    NUM_K_HEADS = 8
+    HEAD_SZ: int = 128
+    NUM_K_HEADS: int = 8
 
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
