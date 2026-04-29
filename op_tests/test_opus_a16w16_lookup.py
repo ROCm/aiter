@@ -44,7 +44,6 @@ import torch
 
 from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune
 
-
 DEFAULT_TUNED_CSV = os.path.join(
     os.path.dirname(__file__),
     "..",
@@ -163,9 +162,7 @@ def main() -> int:
         return 2
 
     cu_num = torch.cuda.get_device_properties(0).multi_processor_count
-    print(
-        f"Device cu_num = {cu_num}; CSV has {len(lookup)} unique (cu_num,M,N,K) keys"
-    )
+    print(f"Device cu_num = {cu_num}; CSV has {len(lookup)} unique (cu_num,M,N,K) keys")
 
     items = list(lookup.items())
     matching = [(k, v) for k, v in items if k[0] == cu_num]
