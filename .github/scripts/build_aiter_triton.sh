@@ -14,8 +14,11 @@ pip uninstall -y aiter || true
 pip install --upgrade "pybind11>=3.0.1"
 pip install --upgrade "ninja>=1.11.1"
 pip install tabulate
+
+# Set AMD PyPI index so pip can resolve amd-triton from pyproject.toml requires
+export PIP_EXTRA_INDEX_URL=https://pypi.amd.com/triton/simple/rocm-7-2-0/
+
 pip install -e .
-pip install --force-reinstall -r requirements-triton.txt
 
 # Read BUILD_TRITON env var, default to 1. If 1, install Triton; if 0, skip installation.
 BUILD_TRITON=${BUILD_TRITON:-1}
