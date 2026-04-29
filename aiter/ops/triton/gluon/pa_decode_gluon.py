@@ -303,6 +303,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr = 0,
+    OUTPUT_DTYPE: gl.constexpr = gl.float32,
 ):
     """
     Gluon-based paged attention decode kernel with FP8 support for large blocks.
@@ -367,10 +368,6 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
 
-    if COMPUTE_TYPE.is_fp8():
-        OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
-    else:
-        OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential calculations
     CONTIGUOUS_KV_ELEMENTS_16B_LOAD: gl.constexpr = KV_16B_ELEMENT_COUNT
 
@@ -700,7 +697,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator,
+                attention_accumulator.to(OUTPUT_DTYPE),
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -995,7 +992,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     store_temporary_result(
         max_logits,
         exp_sums,
-        attention_accumulator,
+        attention_accumulator.to(OUTPUT_DTYPE),
         max_logits_ptr,
         exp_sums_ptr,
         output_ptr,
@@ -1083,6 +1080,7 @@ def paged_attention_decode_sliding_window_head_1(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
+    OUTPUT_DTYPE: gl.constexpr = gl.float32,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -1154,11 +1152,6 @@ def paged_attention_decode_sliding_window_head_1(
         KV_16B_ELEMENT_COUNT: gl.constexpr = 16
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
-
-    if COMPUTE_TYPE.is_fp8():
-        OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
-    else:
-        OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
 
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
 
@@ -1583,7 +1576,7 @@ def paged_attention_decode_sliding_window_head_1(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator,
+                attention_accumulator.to(OUTPUT_DTYPE),
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -2110,6 +2103,8 @@ def paged_attention_decode_sliding_window_head_1(
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
 
+    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
+
     if not ONE_SHOT:
         # Store results to global memory
         store_temporary_result(
@@ -2125,7 +2120,6 @@ def paged_attention_decode_sliding_window_head_1(
             output_mask,
         )
     else:
-        attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
         if QUERY_SEQ_LEN_POW2 == 1:
             attention_accumulator = gl.reshape(
                 attention_accumulator,
@@ -2229,6 +2223,7 @@ def paged_attention_decode_sliding_window(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
+    OUTPUT_DTYPE: gl.constexpr = gl.float32,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -2300,10 +2295,6 @@ def paged_attention_decode_sliding_window(
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
 
-    if COMPUTE_TYPE.is_fp8():
-        OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
-    else:
-        OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
 
     K_HEAD_SIZE_SPLITS: gl.constexpr = HEAD_SIZE_POW2 // KV_16B_ELEMENT_COUNT
@@ -2654,7 +2645,7 @@ def paged_attention_decode_sliding_window(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator,
+                attention_accumulator.to(OUTPUT_DTYPE),
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -3102,6 +3093,8 @@ def paged_attention_decode_sliding_window(
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
 
+    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
+
     if not ONE_SHOT:
         # Store results to global memory
         store_temporary_result(
@@ -3117,7 +3110,6 @@ def paged_attention_decode_sliding_window(
             output_mask,
         )
     else:
-        attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
         # Reshape to 3D and store
         # attention_accumulator is [QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
         # Reshape to [QUERY_SEQ_LEN_POW2, ONE_QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2]
@@ -3214,6 +3206,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr = 3,
     SLIDING_WINDOW: gl.constexpr = 0,
+    OUTPUT_DTYPE: gl.constexpr = gl.float32,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -3285,10 +3278,6 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     else:
         KV_16B_ELEMENT_COUNT: gl.constexpr = 8
 
-    if COMPUTE_TYPE.is_fp8():
-        OUTPUT_DTYPE: gl.constexpr = tl.bfloat16
-    else:
-        OUTPUT_DTYPE: gl.constexpr = COMPUTE_TYPE
     LOG2_E: gl.constexpr = 1.4426950408889634  # log2(e) for exponential conversion
 
     # Calculate MTP (Multi-Token Prefill) layout parameters
@@ -3640,7 +3629,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             store_temporary_result(
                 max_logits,
                 exp_sums,
-                attention_accumulator,
+                attention_accumulator.to(OUTPUT_DTYPE),
                 max_logits_ptr,
                 exp_sums_ptr,
                 output_ptr,
@@ -3939,6 +3928,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         exp_sums_reciprocal[:, None], layout=pv_mfma_layout
     )
     attention_accumulator = attention_accumulator * exp_sums_reciprocal_cvt
+    attention_accumulator = attention_accumulator.to(OUTPUT_DTYPE)
 
     # Store results to global memory
     store_temporary_result(
@@ -4362,6 +4352,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     sinks_ptr,
     PS,
     CDNA_VERSION,
+    OUTPUT_DTYPE,
 ):
     """
     Wrapper function for paged attention decode kernel with dynamic kernel selection.
@@ -4455,6 +4446,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
             CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=ONE_SHOT,
+            OUTPUT_DTYPE=OUTPUT_DTYPE,
         )
         return
 
@@ -4522,6 +4514,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         IS_CAUSAL=IS_CAUSAL,
         CDNA_VERSION=CDNA_VERSION,
         SLIDING_WINDOW=SLIDING_WINDOW,
+        OUTPUT_DTYPE=OUTPUT_DTYPE,
     )
 
 
@@ -5448,7 +5441,7 @@ def pa_decode_gluon(
             equivalent_query_group_size,
             head_size,
             device=query.device,
-            dtype=aiter.dtypes.fp32,
+            dtype=query.dtype,
         )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
@@ -5603,6 +5596,7 @@ def pa_decode_gluon(
         sinks_ptr=sinks,
         PS=ps,
         CDNA_VERSION=cdna_version,
+        OUTPUT_DTYPE=torch_to_triton_dtype[output_for_kernel.dtype],
     )
     # output is already reshaped via output_5d view
     if not one_shot:
