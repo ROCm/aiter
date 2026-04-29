@@ -31,9 +31,7 @@ class OpusGemmInstance:
     def name(self) -> str:
         parts = [
             "opus_gemm",
-            "x".join(
-                map(str, [self.BLOCK_SIZE, self.B_M, self.B_N, self.B_K])
-            ),
+            "x".join(map(str, [self.BLOCK_SIZE, self.B_M, self.B_N, self.B_K])),
             "x".join(map(str, [self.T_M, self.T_N])),
             "x".join(map(str, [self.W_M, self.W_N, self.W_K])),
             "x".join(map(str, [self.GROUP_M, self.GROUP_N, self.GROUP_K])),
@@ -53,8 +51,23 @@ class OpusGemmInstance:
 def _a16w16(bs, bm, bn, bk, tn, wm, wn, wk):
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
-        bs, bm, bn, bk, 2, tn, wm, wn, wk,
-        vec, vec, 4, 0, 0, 0, "a16w16", ["fp32_t", "bf16_t"],
+        bs,
+        bm,
+        bn,
+        bk,
+        2,
+        tn,
+        wm,
+        wn,
+        wk,
+        vec,
+        vec,
+        4,
+        0,
+        0,
+        0,
+        "a16w16",
+        ["fp32_t", "bf16_t"],
     )
 
 
@@ -67,11 +80,21 @@ def _a16w16_flatmm_splitk(bm, bn, bk, wg_per_cu):
     # branch for splitk kids regardless of Y.dtype (which must be bf16).
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
-        256, bm, bn, bk,
-        2, 1,            # T_M, T_N
-        16, 16, 32,      # MFMA 16x16x32
-        vec, vec, 4,     # VEC
-        0, 0, 0,         # GROUP (unused)
+        256,
+        bm,
+        bn,
+        bk,
+        2,
+        1,  # T_M, T_N
+        16,
+        16,
+        32,  # MFMA 16x16x32
+        vec,
+        vec,
+        4,  # VEC
+        0,
+        0,
+        0,  # GROUP (unused)
         "a16w16_flatmm_splitk",
         ["fp32_t"],
         wg_per_cu,
@@ -85,11 +108,21 @@ def _a16w16_flatmm(bm, bn, bk, wg_per_cu):
     # instantiate <fp32_t> when Y.dtype is torch.float32 (mirrors a16w16).
     vec = 16 // 2  # VEC_A = VEC_B = 8 for bf16
     return OpusGemmInstance(
-        256, bm, bn, bk,
-        2, 1,            # T_M, T_N (T_N hardcoded to 1 for the warp-spec pipeline)
-        16, 16, 32,      # MFMA 16x16x32
-        vec, vec, 4,     # VEC
-        0, 0, 0,         # GROUP (unused)
+        256,
+        bm,
+        bn,
+        bk,
+        2,
+        1,  # T_M, T_N (T_N hardcoded to 1 for the warp-spec pipeline)
+        16,
+        16,
+        32,  # MFMA 16x16x32
+        vec,
+        vec,
+        4,  # VEC
+        0,
+        0,
+        0,  # GROUP (unused)
         "a16w16_flatmm",
         ["bf16_t", "fp32_t"],
         wg_per_cu,
