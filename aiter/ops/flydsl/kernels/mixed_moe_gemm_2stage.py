@@ -270,7 +270,17 @@ def compile_mixed_moe_gemm1(
     _stage1_group_size_m = int(os.environ.get("FLIR_MOE_STAGE1_GROUP_SIZE_M", "2"))
     if _stage1_group_size_m < 1:
         _stage1_group_size_m = 1
-    _gm_tag = f"_gm{_stage1_group_size_m}" if _stage1_group_size_m > 1 else ""
+    _stage1_num_pid_n_static = (
+        ((2 * inter_dim) if (gate_only and _use_g1u1) else inter_dim) // tile_n
+    )
+    _stage1_group2_fast = (
+        _stage1_group_size_m == 2 and (_stage1_num_pid_n_static % 2) == 0
+    )
+    _gm_tag = (
+        f"_gm{_stage1_group_size_m}{'f' if _stage1_group2_fast else ''}"
+        if _stage1_group_size_m > 1
+        else ""
+    )
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v37_tidlds_aread{_gm_tag}_g1u0_splitk"
@@ -532,21 +542,42 @@ def compile_mixed_moe_gemm1(
                         / arith.constant(2, index=True)
                         / arith.constant(tile_n, index=True)
                     )
-                _c_gm = arith.constant(_stage1_group_size_m, index=True)
                 _c_pm_map = arith.constant(persist_m, index=True)
                 _num_pid_m = (
                     size_expert_ids_in + _c_pm_map - arith.constant(1, index=True)
                 ) / _c_pm_map
-                _pid = bx_persist_phys * _num_pid_n + by_phys
-                _group_span = _c_gm * _num_pid_n
-                _group_id = _pid / _group_span
-                _first_m = _group_id * _c_gm
-                _remaining_m = _num_pid_m - _first_m
-                _is_tail_group = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_gm)
-                _group_m = arith.select(_is_tail_group, _remaining_m, _c_gm)
-                _local = _pid % _group_span
-                bx_persist = _first_m + (_local % _group_m)
-                by = _local / _group_m
+                if _stage1_group2_fast:
+                    # Specialize GROUP_SIZE_M=2 to constant /2 and %2 operations.
+                    _c2 = arith.constant(2, index=True)
+                    _m_pair = bx_persist_phys / _c2
+                    _m_in_pair = bx_persist_phys % _c2
+                    _n_half = _num_pid_n / _c2
+                    _n_half_idx = by_phys / _c2
+                    _n_odd = by_phys % _c2
+                    _fast_bx = _m_pair * _c2 + _n_odd
+                    _fast_by = _m_in_pair * _n_half + _n_half_idx
+                    _last_m = _num_pid_m - arith.constant(1, index=True)
+                    _has_odd_tail_m = arith.cmpi(
+                        CmpIPredicate.eq, _num_pid_m % _c2, arith.constant(1, index=True)
+                    )
+                    _is_tail_m = arith.cmpi(
+                        CmpIPredicate.eq, bx_persist_phys, _last_m
+                    )
+                    _use_tail = arith.andi(_has_odd_tail_m, _is_tail_m)
+                    bx_persist = arith.select(_use_tail, bx_persist_phys, _fast_bx)
+                    by = arith.select(_use_tail, by_phys, _fast_by)
+                else:
+                    _c_gm = arith.constant(_stage1_group_size_m, index=True)
+                    _pid = bx_persist_phys * _num_pid_n + by_phys
+                    _group_span = _c_gm * _num_pid_n
+                    _group_id = _pid / _group_span
+                    _first_m = _group_id * _c_gm
+                    _remaining_m = _num_pid_m - _first_m
+                    _is_tail_group = arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_gm)
+                    _group_m = arith.select(_is_tail_group, _remaining_m, _c_gm)
+                    _local = _pid % _group_span
+                    bx_persist = _first_m + (_local % _group_m)
+                    by = _local / _group_m
             by_n = by * arith.constant(tile_n, index=True)
 
             if _is_splitk:
