@@ -400,6 +400,7 @@ jobs:
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${GPU_ARCHS}" \
             -e ENABLE_CK="${ENABLE_CK}" \
+            -e AITER_SKIP_FLYDSL_AOT=1 \
             -e PYBIN="${PYBIN}" \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
