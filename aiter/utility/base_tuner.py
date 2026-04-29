@@ -288,7 +288,8 @@ class TunerCommon:
             .drop_duplicates(subset=dedup_keys, keep="first")
             .reset_index(drop=True)
         )
-        new_file_path = f"/tmp/{merge_name}.csv"
+        pid = os.getpid()
+        new_file_path = f"/tmp/{merge_name}.{pid}.csv"
         merge_df.to_csv(new_file_path, index=False)
         return new_file_path
 
@@ -1035,14 +1036,11 @@ class TunerCommon:
         compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
         os.makedirs(compare_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(output_file))[0]
-        fd, compare_report_file = tempfile.mkstemp(
-            prefix=f"{base_name}.",
-            suffix=".compare.txt",
-            dir=compare_dir,
-            text=True,
+        pid = os.getpid()
+        compare_report_file = os.path.join(
+            compare_dir, f"{base_name}.{pid}.compare.txt"
         )
-        os.chmod(compare_report_file, 0o600)
-        with os.fdopen(fd, "w") as f:
+        with open(compare_report_file, "w") as f:
             f.write(
                 f"Compare report for {self.name}\n"
                 f"Shapes: {len(self.untunedf)}\n"
@@ -1104,11 +1102,13 @@ class TunerCommon:
         processed_batches,
         compare_candidate_file=None,
     ):
-        fd, batch_compare_output_file = tempfile.mkstemp(
-            prefix=f"{self.name}_compare_batch_{processed_batches}_",
-            suffix=".csv",
+        pid = os.getpid()
+        compare_dir = os.path.join(tempfile.gettempdir(), "aiter_compare")
+        os.makedirs(compare_dir, exist_ok=True)
+        batch_compare_output_file = os.path.join(
+            compare_dir,
+            f"{self.name}_compare_batch_{processed_batches}_{pid}.csv",
         )
-        os.close(fd)
         candidate_base_file = (
             compare_candidate_file
             if compare_candidate_file and os.path.exists(compare_candidate_file)

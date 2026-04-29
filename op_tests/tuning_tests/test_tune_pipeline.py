@@ -52,7 +52,7 @@ def _write_csv(path, header, rows):
             writer.writerow(row)
 
 
-def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300):
+def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
     cmd = [
         sys.executable,
         os.path.join(AITER_ROOT, script),
@@ -60,13 +60,13 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300):
         untuned,
         "-o",
         tuned,
-        "--mp",
-        "1",
         "--warmup",
         "2",
         "--iters",
         "5",
     ]
+    if mp is not None:
+        cmd.extend(["--mp", str(mp)])
     if extra_args:
         cmd.extend(extra_args)
     env = os.environ.copy()
@@ -105,12 +105,16 @@ class TestTunePipeline(unittest.TestCase):
                     (1, 1024, 512, "torch.int8"),
                     (1, 1024, 512, fp8),
                 ],
+                "shapes_mp1": [
+                    (1, 1024, 512, "torch.int8"),
+                ],
                 "keys": ["cu_num", "M", "N", "K", "q_dtype_w"],
             },
             "a8w8_blockscale": {
                 "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
                 "header": ["M", "N", "K"],
                 "shapes": [(1, 1024, 512)],
+                "shapes_mp1": [(1, 1024, 512)],
                 "keys": ["cu_num", "M", "N", "K"],
             },
             "a8w8_bpreshuffle": {
@@ -120,19 +124,25 @@ class TestTunePipeline(unittest.TestCase):
                     (1, 1024, 512, "torch.int8"),
                     (1, 1024, 512, fp8),
                 ],
+                "shapes_mp1": [
+                    (1, 1024, 512, "torch.int8"),
+                ],
                 "keys": ["cu_num", "M", "N", "K", "q_dtype_w"],
                 "timeout": 900,
+                "timeout_mp1": 1200,
             },
             "batched_a8w8": {
                 "script": "csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py",
                 "header": ["B", "M", "N", "K"],
                 "shapes": [(2, 1, 512, 256)],
+                "shapes_mp1": [(2, 1, 512, 256)],
                 "keys": ["cu_num", "B", "M", "N", "K"],
             },
             "batched_bf16": {
                 "script": "csrc/ck_batched_gemm_bf16/batched_gemm_bf16_tune.py",
                 "header": ["B", "M", "N", "K"],
                 "shapes": [(2, 1, 512, 256)],
+                "shapes_mp1": [(2, 1, 512, 256)],
                 "keys": ["cu_num", "B", "M", "N", "K"],
             },
             "fmoe": {
@@ -213,6 +223,23 @@ class TestTunePipeline(unittest.TestCase):
                         1,
                     ),
                 ],
+                "shapes_mp1": [
+                    # single small bf16 shape for mp=1
+                    (
+                        4,
+                        2304,
+                        1536,
+                        8,
+                        2,
+                        "ActivationType.Silu",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "torch.bfloat16",
+                        "QuantType.No",
+                        1,
+                        0,
+                    ),
+                ],
                 "keys": [
                     "cu_num",
                     "token",
@@ -229,6 +256,7 @@ class TestTunePipeline(unittest.TestCase):
                     "doweight_stage1",
                 ],
                 "timeout": 1800,
+                "timeout_mp1": 2400,
             },
             "gradlib_bf16": {
                 "script": "gradlib/gradlib/gemm_tuner.py",
@@ -266,81 +294,142 @@ class TestTunePipeline(unittest.TestCase):
                         "False",
                     ),
                 ],
+                "shapes_mp1": [
+                    # single small decode shape for mp=1
+                    (
+                        1,
+                        1024,
+                        512,
+                        "False",
+                        "torch.bfloat16",
+                        "torch.float32",
+                        "False",
+                        "False",
+                    ),
+                ],
                 "keys": ["M", "N", "K"],
                 "timeout": 900,
+                "timeout_mp1": 1800,
             },
         }
 
-    def _run_one(self, name):
+    def _run_one(self, name, mp=1):
         cfg = self.TUNERS[name]
-        timeout = cfg.get("timeout", 300)
+        timeout = (
+            cfg.get("timeout_mp1", cfg.get("timeout", 300))
+            if mp == 1
+            else cfg.get("timeout", 300)
+        )
+        shapes = cfg.get("shapes_mp1", cfg["shapes"]) if mp == 1 else cfg["shapes"]
+        mp_label = f"mp={mp}" if mp is not None else "mp=default"
         with tempfile.TemporaryDirectory() as tmp:
             untuned = os.path.join(tmp, "untuned.csv")
             tuned = os.path.join(tmp, "tuned.csv")
-            _write_csv(untuned, cfg["header"], cfg["shapes"])
+            _write_csv(untuned, cfg["header"], shapes)
 
-            result = _run_tuner(cfg["script"], untuned, tuned, timeout=timeout)
+            result = _run_tuner(cfg["script"], untuned, tuned, timeout=timeout, mp=mp)
             if result.returncode != 0:
-                print(f"\n=== {name} STDOUT ===\n{result.stdout[-2000:]}")
-                print(f"\n=== {name} STDERR ===\n{result.stderr[-2000:]}")
+                print(f"\n=== {name} ({mp_label}) STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== {name} ({mp_label}) STDERR ===\n{result.stderr[-2000:]}")
             self.assertEqual(
                 result.returncode,
                 0,
-                f"{name} tuner exited with code {result.returncode}",
+                f"{name} ({mp_label}) tuner exited with code {result.returncode}",
             )
-            self.assertTrue(os.path.exists(tuned), f"{name}: tuned CSV not created")
+            self.assertTrue(
+                os.path.exists(tuned), f"{name} ({mp_label}): tuned CSV not created"
+            )
 
             df = pd.read_csv(tuned)
             df.columns = df.columns.str.strip()
             self.assertGreaterEqual(
                 len(df),
-                len(cfg["shapes"]),
-                f"{name}: expected >= {len(cfg['shapes'])} rows",
+                len(shapes),
+                f"{name} ({mp_label}): expected >= {len(shapes)} rows",
             )
             for key in cfg["keys"]:
-                self.assertIn(key, df.columns, f"{name}: missing column {key}")
+                self.assertIn(
+                    key, df.columns, f"{name} ({mp_label}): missing column {key}"
+                )
             for _, row in df.iterrows():
                 us = float(row.get("us", -1))
-                self.assertNotEqual(us, 0, f"{name}: us == 0 for {dict(row)}")
+                self.assertNotEqual(
+                    us, 0, f"{name} ({mp_label}): us == 0 for {dict(row)}"
+                )
 
-    def test_a8w8(self):
-        self._run_one("a8w8")
+    def test_a8w8_mp1(self):
+        self._run_one("a8w8", mp=1)
 
-    def test_a8w8_blockscale(self):
-        self._run_one("a8w8_blockscale")
+    def test_a8w8_mp_default(self):
+        self._run_one("a8w8", mp=None)
 
-    def test_a8w8_bpreshuffle(self):
-        self._run_one("a8w8_bpreshuffle")
+    def test_a8w8_blockscale_mp1(self):
+        self._run_one("a8w8_blockscale", mp=1)
 
-    def test_batched_a8w8(self):
-        self._run_one("batched_a8w8")
+    def test_a8w8_blockscale_mp_default(self):
+        self._run_one("a8w8_blockscale", mp=None)
 
-    def test_batched_bf16(self):
-        self._run_one("batched_bf16")
+    def test_a8w8_bpreshuffle_mp1(self):
+        self._run_one("a8w8_bpreshuffle", mp=1)
 
-    def test_fmoe(self):
-        self._run_one("fmoe")
+    def test_a8w8_bpreshuffle_mp_default(self):
+        self._run_one("a8w8_bpreshuffle", mp=None)
 
-    def test_gradlib_bf16(self):
+    def test_batched_a8w8_mp1(self):
+        self._run_one("batched_a8w8", mp=1)
+
+    def test_batched_a8w8_mp_default(self):
+        self._run_one("batched_a8w8", mp=None)
+
+    def test_batched_bf16_mp1(self):
+        self._run_one("batched_bf16", mp=1)
+
+    def test_batched_bf16_mp_default(self):
+        self._run_one("batched_bf16", mp=None)
+
+    def test_fmoe_mp1(self):
+        self._run_one("fmoe", mp=1)
+
+    def test_fmoe_mp_default(self):
+        self._run_one("fmoe", mp=None)
+
+    def _run_gradlib(self, mp):
         """gradlib spawns an internal subprocess; use /tmp paths that persist."""
         cfg = self.TUNERS["gradlib_bf16"]
-        timeout = cfg.get("timeout", 300)
-        untuned = "/tmp/_test_gradlib_untuned.csv"
-        tuned = "/tmp/_test_gradlib_tuned.csv"
+        timeout = (
+            cfg.get("timeout_mp1", cfg.get("timeout", 300))
+            if mp == 1
+            else cfg.get("timeout", 300)
+        )
+        shapes = cfg.get("shapes_mp1", cfg["shapes"]) if mp == 1 else cfg["shapes"]
+        pid = os.getpid()
+        mp_tag = f"mp{mp}" if mp is not None else "mp_default"
+        untuned = f"/tmp/_test_gradlib_untuned_{pid}_{mp_tag}.csv"
+        tuned = f"/tmp/_test_gradlib_tuned_{pid}_{mp_tag}.csv"
+        mp_label = f"mp={mp}" if mp is not None else "mp=default"
         try:
-            _write_csv(untuned, cfg["header"], cfg["shapes"])
+            _write_csv(untuned, cfg["header"], shapes)
             if os.path.exists(tuned):
                 os.remove(tuned)
-            result = _run_tuner(cfg["script"], untuned, tuned, timeout=timeout)
+            result = _run_tuner(cfg["script"], untuned, tuned, timeout=timeout, mp=mp)
             if result.returncode != 0:
-                print(f"\n=== gradlib STDOUT ===\n{result.stdout[-2000:]}")
-                print(f"\n=== gradlib STDERR ===\n{result.stderr[-2000:]}")
-            self.assertEqual(result.returncode, 0, "gradlib tuner failed")
-            self.assertTrue(os.path.exists(tuned), "gradlib: tuned CSV not created")
+                print(f"\n=== gradlib ({mp_label}) STDOUT ===\n{result.stdout[-2000:]}")
+                print(f"\n=== gradlib ({mp_label}) STDERR ===\n{result.stderr[-2000:]}")
+            self.assertEqual(result.returncode, 0, f"gradlib ({mp_label}) tuner failed")
+            self.assertTrue(
+                os.path.exists(tuned),
+                f"gradlib ({mp_label}): tuned CSV not created",
+            )
         finally:
             for f in (untuned, tuned):
                 if os.path.exists(f):
                     os.remove(f)
+
+    def test_gradlib_bf16_mp1(self):
+        self._run_gradlib(mp=1)
+
+    def test_gradlib_bf16_mp_default(self):
+        self._run_gradlib(mp=None)
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")

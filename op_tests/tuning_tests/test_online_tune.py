@@ -118,14 +118,21 @@ class TestOnlineTuneDecision(unittest.TestCase):
         cfg_2stages = {}
         logger_obj = logging.getLogger("test_online_tune")
 
-        cfg, _, mp_lock_called = simulate_online_tune_path(
-            cfg_2stages,
-            SAMPLE_KEYS,
-            os.environ.get("AITER_ONLINE_TUNE", "0"),
-            mp_lock_fn=lambda: self.fail("mp_lock should not be called"),
-            reload_fn=lambda: self.fail("reload should not be called"),
-            logger_obj=logger_obj,
-        )
+        saved = os.environ.pop("AITER_ONLINE_TUNE", None)
+        try:
+            env_val = os.environ.get("AITER_ONLINE_TUNE", "0")
+            cfg, _, mp_lock_called = simulate_online_tune_path(
+                cfg_2stages,
+                SAMPLE_KEYS,
+                env_val,
+                mp_lock_fn=lambda: self.fail("mp_lock should not be called"),
+                reload_fn=lambda: self.fail("reload should not be called"),
+                logger_obj=logger_obj,
+            )
+        finally:
+            if saved is not None:
+                os.environ["AITER_ONLINE_TUNE"] = saved
+
         self.assertFalse(mp_lock_called)
         self.assertIsNone(cfg)
 
@@ -325,7 +332,9 @@ class TestMainFuncCSVWrite(unittest.TestCase):
             with open(untune_file) as f:
                 lines = f.read().strip().split("\n")
             self.assertEqual(len(lines), 3, "Should have header + 2 data rows")
-            header_count = sum(1 for l in lines if l.startswith("token,model_dim"))
+            header_count = sum(
+                1 for line in lines if line.startswith("token,model_dim")
+            )
             self.assertEqual(header_count, 1, "Header should appear only once")
 
 
