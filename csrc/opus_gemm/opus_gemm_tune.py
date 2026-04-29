@@ -186,6 +186,7 @@ def generate_data(
     batch, m, n, k, seed,
     dtype=dtypes.bf16,
     outdtype=dtypes.bf16,
+    bias=False,
     device="cuda",
 ):
     # gen_data is the earliest subprocess-side hook mp_tuner.work_group
@@ -215,27 +216,44 @@ def generate_data(
     XQ = torch.randn((batch, m, k), dtype=dtype, device=device)
     WQ = torch.randn((batch, n, k), dtype=dtype, device=device)
     Y = torch.empty((batch, m, n), dtype=outdtype, device=device)
-    return XQ, WQ, Y
+    # bias dtype matches Y (match_d_out convention). Shape uses [batch, M] so
+    # the kernel sees stride_bias_batch=M; the [M] broadcast variant is also
+    # supported but exercised separately via the user-facing API tests rather
+    # than the tuner.
+    if bias:
+        bias_t = torch.randn((batch, m), dtype=outdtype, device=device)
+    else:
+        bias_t = None
+    return XQ, WQ, Y, bias_t
 
 
 MAX_DELTA_SCALE = 0.1
 
 
-def opus_gemm_ref(XQ, WQ, out_dtype=None):
-    """Reference matmul.
+def opus_gemm_ref(XQ, WQ, bias=None, out_dtype=None):
+    """Reference matmul (+ optional per-row bias).
 
     out_dtype must match the tuner's Y.dtype so the post-run checkAllclose
     in mp_tuner.worker compares same-dtype tensors (mismatched dtype raises
     'BFloat16 did not match Float' inside checkAllclose). When omitted (e.g.
     legacy callers) we fall back to XQ.dtype, preserving the original bf16
     -> bf16 -> bf16 path.
+
+    bias is summed in fp32 to match the kernel-side fp32 acc + cast order;
+    accepted shapes are [M] (broadcast across batch) or [batch, M].
     """
     if out_dtype is None:
         out_dtype = XQ.dtype
-    return torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(out_dtype)
+    acc = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2))
+    if bias is not None:
+        # Per-row broadcast: unsqueeze last dim so bias [..., M] -> [..., M, 1]
+        # and add across N. Works for both [M] and [batch, M] shapes thanks
+        # to torch broadcasting rules.
+        acc = acc + bias.float().unsqueeze(-1)
+    return acc.to(out_dtype)
 
 
-def run_opus_gemm(XQ, WQ, Y, kernelId, splitK):
+def run_opus_gemm(XQ, WQ, Y, bias, kernelId, splitK):
     """Eager-path tuner func: runs the kernel AND an on-the-fly max_delta check.
 
     The check raises RuntimeError when the output is numerically off; mp_tuner's
@@ -244,8 +262,8 @@ def run_opus_gemm(XQ, WQ, Y, kernelId, splitK):
     graph capture).
     """
     _quiet_aiter_logger_once()
-    _opus_gemm_a16w16_tune(XQ, WQ, Y, kernelId, splitK)
-    ref = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(Y.dtype)
+    _opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
+    ref = opus_gemm_ref(XQ, WQ, bias, Y.dtype)
     max_delta = (Y.float() - ref.float()).abs().max().item()
     max_ref = ref.float().abs().max().item()
     bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
@@ -284,7 +302,7 @@ def _quiet_aiter_logger_once():
 _bench_max_delta_checked = set()  # module-level per-subprocess cache
 
 
-def run_opus_gemm_bench(XQ, WQ, Y, kernelId, splitK):
+def run_opus_gemm_bench(XQ, WQ, Y, bias, kernelId, splitK):
     """Tuner bench func with capture-safe stream sync + per-task max_delta
     safety check.
 
@@ -311,7 +329,7 @@ def run_opus_gemm_bench(XQ, WQ, Y, kernelId, splitK):
         candidate us=-1, err_ratio=1.0.
     """
     _quiet_aiter_logger_once()
-    _opus_gemm_a16w16_tune(XQ, WQ, Y, kernelId, splitK)
+    _opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
 
     capturing = torch.cuda.is_current_stream_capturing()
 
@@ -319,10 +337,12 @@ def run_opus_gemm_bench(XQ, WQ, Y, kernelId, splitK):
         # Correctness gate (per-task, outside-capture only). Reference is
         # materialized in Y.dtype so the comparison happens at the same
         # numerical resolution the kernel produced.
-        task_key = (id(XQ), id(WQ), id(Y), int(kernelId), int(splitK))
+        task_key = (id(XQ), id(WQ), id(Y),
+                    id(bias) if bias is not None else 0,
+                    int(kernelId), int(splitK))
         if task_key not in _bench_max_delta_checked:
             _bench_max_delta_checked.add(task_key)
-            ref = torch.bmm(XQ.float(), WQ.float().transpose(-1, -2)).to(Y.dtype)
+            ref = opus_gemm_ref(XQ, WQ, bias, Y.dtype)
             max_delta = (Y.float() - ref.float()).abs().max().item()
             max_ref = ref.float().abs().max().item()
             bound = max(max_ref * MAX_DELTA_SCALE, 1.0)
@@ -330,7 +350,7 @@ def run_opus_gemm_bench(XQ, WQ, Y, kernelId, splitK):
                 raise RuntimeError(
                     f"maxDelta {max_delta:.1f} > bound {bound:.1f} "
                     f"(max|ref|={max_ref:.1f}, scale={MAX_DELTA_SCALE}) "
-                    f"for kid={kernelId} splitK={splitK}"
+                    f"for kid={kernelId} splitK={splitK} bias={bias is not None}"
                 )
 
         # Capture-safe sync: guarantees the warmup kernel has completed
@@ -547,6 +567,22 @@ def _kid_rejects_shape(k_inst, M, N, K):
     return False
 
 
+def _kid_rejects_bias(k_inst, bias):
+    """Reject candidates that cannot consume a non-empty bias.
+
+    Currently only a16w16 split-barrier (kid 4..9) and a16w16_flatmm_splitk
+    (kid 200..299) implement the HAS_BIAS path. The flatmm warp-spec
+    pipeline still has HAS_BIAS=false hardcoded -- its launcher rejects
+    non-empty bias with TORCH_CHECK; rather than spam mp_tuner with
+    `bias not supported` errors, we drop those candidates up front.
+
+    Mirrors the dispatcher gate in opus_gemm.cu (opus_kid_supports_bias).
+    """
+    if not bias:
+        return False
+    return k_inst.kernel_tag not in ("a16w16", "a16w16_flatmm_splitk")
+
+
 class OpusGemmA16W16Tuner(GemmCommonTuner):
     ARG_DEFAULTS = {
         **GemmCommonTuner.ARG_DEFAULTS,
@@ -673,33 +709,51 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "column in the untuned CSV overrides this.",
         )
 
+        # --bias is the per-shape bias toggle. Per-row 'bias' column in the
+        # untuned CSV (e.g. gptoss_bf16_untuned_gemm.csv) overrides the
+        # default; only the single-shape CLI path (-m/-n/-k) uses this
+        # default directly. bias dtype matches Y (match_d_out convention)
+        # and shape uses [batch, M] inside the tuner -- per-batch row vector
+        # so stride_bias_batch=M, no broadcast surface here.
+        self.parser.add_argument(
+            "--bias",
+            action="store_true",
+            default=False,
+            dest="bias",
+            help="Default 'bias' value when single-shape tuning (-m/-n/-k) "
+            "or when the untuned CSV lacks a 'bias' column. Tuner emits "
+            "bias=True / bias=False as a separate dedup key so the same "
+            "(M,N,K) can be tuned with and without bias independently.",
+        )
+
     def pre_process(self, args):
         """Override to:
 
         * Support CLI-based single-shape tuning (-m / -n / -k).
-        * Treat (dtype, outdtype) as part of the dedup / update key. After
-          self.keys was promoted to 6 cols, GemmCommonTuner's default
-          collapse-to-self.keys logic already preserves dtype/outdtype, but
-          we still need to populate missing columns from the CLI defaults
-          (legacy CSVs without dtype columns) and to dedup using all 6 cols
-          so same-shape bf16/fp32 rows do not overwrite each other.
+        * Treat (bias, dtype, outdtype) as part of the dedup / update key.
+          self.keys is now 7-wide; same (M,N,K,outdtype) tuned with and
+          without bias generates two distinct rows in the tuned CSV. We
+          still need to populate missing columns from the CLI defaults
+          (legacy CSVs without dtype/bias columns).
         """
         cli_dtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
         cli_outdtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
+        cli_bias = bool(args.bias)
 
         if (
             args.shape_m is not None
             and args.shape_n is not None
             and args.shape_k is not None
         ):
-            # Build a one-row untunedf directly from CLI args. dtype /
-            # outdtype are part of self.keys now, so they live alongside
+            # Build a one-row untunedf directly from CLI args. bias / dtype
+            # / outdtype are part of self.keys now, so they live alongside
             # cu_num/M/N/K naturally.
             row = {
                 "cu_num": self.get_cu_num(),
                 "M": int(args.shape_m),
                 "N": int(args.shape_n),
                 "K": int(args.shape_k),
+                "bias": cli_bias,
                 "dtype": cli_dtype_str,
                 "outdtype": cli_outdtype_str,
             }
@@ -714,21 +768,33 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             logger.info(
                 f"OpusGemmA16W16Tuner: single-shape CLI tune "
                 f"(M={args.shape_m}, N={args.shape_n}, K={args.shape_k}, "
-                f"batch={args.shape_batch}, dtype={args.dtype}, "
-                f"outdtype={args.outdtype})"
+                f"batch={args.shape_batch}, bias={cli_bias}, "
+                f"dtype={args.dtype}, outdtype={args.outdtype})"
             )
             return
 
         # CSV-driven path. Mirrors GemmCommonTuner.pre_process but the dedup
-        # key is now 6-wide so same-shape bf16/fp32 rows are preserved.
+        # key is now 7-wide so same-shape bf16/fp32 / bias=true/false rows
+        # are preserved.
         if args.all:
             self.get_retune_gemm_list(args)
         else:
             self.untunedf = self.get_untuned_gemm_list(args.untune_file)
             self.untunedf["cu_num"] = self.get_cu_num()
-            # Fill missing dtype / outdtype columns with the CLI defaults so
-            # legacy CSVs (4-col key without dtype) still tune. Per-row CSV
-            # values (already populated) win.
+            # Fill missing bias / dtype / outdtype columns with the CLI
+            # defaults so legacy CSVs (4-col key without these) still tune.
+            # Per-row CSV values (already populated) win.
+            if "bias" not in self.untunedf.columns:
+                self.untunedf["bias"] = cli_bias
+            else:
+                # CSV cells are typically the strings "True" / "False"; the
+                # raw read-back can leave them as bool already. Coerce to
+                # bool so downstream comparisons (.apply(tuple)) match the
+                # tuned CSV's bool representation produced by result_to_df.
+                self.untunedf["bias"] = self.untunedf["bias"].fillna(cli_bias).map(
+                    lambda v: bool(v) if isinstance(v, bool)
+                    else str(v).strip().lower() == "true"
+                )
             if "dtype" not in self.untunedf.columns:
                 self.untunedf["dtype"] = cli_dtype_str
             else:
@@ -744,9 +810,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
 
             if len(self.tunedf) != 0:
-                # Dedup against the full 6-key. Two CSV rows that differ
-                # only in dtype/outdtype now generate two tasks (and two
-                # tuned-CSV rows on completion).
+                # Dedup against the full 7-key. Two CSV rows that differ
+                # only in bias/dtype/outdtype now generate two tasks (and
+                # two tuned-CSV rows on completion).
                 key_cols = list(self.keys)
                 mask = self.untunedf[key_cols].apply(tuple, axis=1).isin(
                     self.tunedf[key_cols].apply(tuple, axis=1)
@@ -766,17 +832,19 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
     def calculate(self, results, bpes=None):
         """Compute (TFLOPs, GB/s) for a tuner result row.
 
-        Per-shape (dtype, outdtype) live in info[0] now (slots 4 and 5 of
-        the 6-tuple key), so we derive bpes from there directly. Callers
-        outside tune() that pre-compute bpes (e.g. update_tflops_bw on a
-        legacy 4-key CSV) can pass bpes=... explicitly to bypass.
+        Per-shape (bias, dtype, outdtype) live in info[0] now. The 7-key
+        layout puts them at slots 4 (bias bool), 5 (dtype), 6 (outdtype).
+        Callers outside tune() that pre-compute bpes (e.g. update_tflops_bw
+        on a legacy 4/6-key CSV) can pass bpes=... explicitly to bypass.
         """
         if bpes is None:
             info, _time, _err = results
             row_key = info[0]
-            # Backwards compat: a 4-key info tuple from a legacy CSV row
-            # has no dtype info; default to bf16 in/out.
-            if len(row_key) >= 6:
+            # Backwards compat: legacy 4-key / 6-key tuples have no bias
+            # slot; route to dtype/outdtype slots that match each layout.
+            if len(row_key) >= 7:
+                dtype_str, outdtype_str = str(row_key[5]), str(row_key[6])
+            elif len(row_key) >= 6:
                 dtype_str, outdtype_str = str(row_key[4]), str(row_key[5])
             else:
                 dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
@@ -788,12 +856,15 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
         for el in results:
             info, time, err_ratio = el
             keys, kernelId, splitK, kernelName = info
-            # 6-key tuple now; legacy 4-key tuples still work.
-            if len(keys) >= 6:
+            # 7-key tuple now; legacy 4/6-key tuples still work.
+            if len(keys) >= 7:
+                cu_num, M, N, K, bias_v, dtype_str, outdtype_str = keys[:7]
+            elif len(keys) >= 6:
                 cu_num, M, N, K, dtype_str, outdtype_str = keys[:6]
+                bias_v = False
             else:
                 cu_num, M, N, K = keys[:4]
-                dtype_str, outdtype_str = "torch.bfloat16", "torch.bfloat16"
+                bias_v, dtype_str, outdtype_str = False, "torch.bfloat16", "torch.bfloat16"
             kernelName = (
                 "None"
                 if time == self.INVALID_TIME or time == self.INF_TIME
@@ -808,7 +879,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     "M": M,
                     "N": N,
                     "K": K,
-                    "bias": False,
+                    "bias": bool(bias_v),
                     "dtype": str(dtype_str),
                     "outdtype": str(outdtype_str),
                     "scaleAB": False,
@@ -834,9 +905,13 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             K = df.loc[i, "K"]
             us = df.loc[i, "us"]
             kid_col = "solidx" if "solidx" in df.columns else "kernelId"
-            # If the on-disk CSV carries dtype / outdtype columns, use them
-            # to compute bpes correctly for fp32 outputs (bw calculation in
-            # particular). Otherwise fall back to bf16 in / bf16 out.
+            # If the on-disk CSV carries bias / dtype / outdtype columns,
+            # use them to keep the keys_tuple aligned with the new 7-wide
+            # layout. Legacy CSVs without these columns fall back to
+            # bias=False, bf16 in / bf16 out.
+            bias_v = (
+                bool(df.loc[i, "bias"]) if "bias" in df.columns else False
+            )
             dtype_str = (
                 str(df.loc[i, "dtype"]) if "dtype" in df.columns else "torch.bfloat16"
             )
@@ -845,7 +920,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 if "outdtype" in df.columns
                 else "torch.bfloat16"
             )
-            keys_tuple = (cu_num, M, N, K, dtype_str, outdtype_str)
+            keys_tuple = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
             info = ((keys_tuple, df.loc[i, kid_col], df.loc[i, "splitK"], ""), us, 0)
             tflops, bw = self.calculate(info)
             df.loc[i, "tflops"] = tflops
@@ -891,8 +966,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
         task = []
         tasks_data = []
-        opus_data_idx = [0, 1, 2]
-        ref_data_idx = [0, 1]
+        # generate_data returns a 4-tuple now: (XQ, WQ, Y, bias_or_None).
+        # opus_data_idx feeds run_opus_gemm_bench(XQ, WQ, Y, bias, ...) -> 4
+        # data slots; opus_gemm_ref(XQ, WQ, bias, out_dtype) consumes the
+        # first 3 indexed slots plus its own out_dtype kwarg.
+        opus_data_idx = [0, 1, 2, 3]
+        ref_data_idx = [0, 1, 3]
         seed = 0
 
         for i in range(len(untunedf)):
@@ -903,10 +982,14 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 int(untunedf.loc[i, "batch"]) if "batch" in untunedf.columns else 1
             )
 
-            # Per-row dtype / outdtype: dtype is part of self.keys now, so
-            # the column is guaranteed to exist by pre_process. Fall back to
-            # CLI defaults only as a defensive guard for callers that bypass
-            # pre_process.
+            # Per-row bias / dtype / outdtype: bias is part of self.keys now,
+            # so the column is guaranteed to exist by pre_process. Fall back
+            # to CLI defaults only as a defensive guard for callers that
+            # bypass pre_process.
+            bias_v = (
+                bool(untunedf.loc[i, "bias"]) if "bias" in untunedf.columns
+                else bool(args.bias)
+            )
             dtype_str = (
                 str(untunedf.loc[i, "dtype"])
                 if "dtype" in untunedf.columns
@@ -937,9 +1020,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             seed = seed + 1
 
             total_kernel_nums = 0
-            # 6-tuple matches self.keys; result_to_df / calculate read
-            # dtype / outdtype from slots 4 and 5.
-            info_keys = (cu_num, M, N, K, dtype_str, outdtype_str)
+            # 7-tuple matches self.keys; result_to_df / calculate read
+            # bias / dtype / outdtype from slots 4 / 5 / 6.
+            info_keys = (cu_num, M, N, K, bias_v, dtype_str, outdtype_str)
 
             for kid in a16w16_kernel_ids:
                 k_inst = a16w16_all_kernels[kid]
@@ -951,6 +1034,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 # See _kid_rejects_shape() for the full rule set.
                 if _kid_rejects_shape(k_inst, M, N, K):
                     continue
+                # bias=True is only consumed by split-barrier (a16w16) and
+                # splitk (a16w16_flatmm_splitk) kids; flatmm kids reject any
+                # non-empty bias at launch time. Skip them upfront so the
+                # tuner doesn't spam mp_tuner with bias-rejection errors.
+                if _kid_rejects_bias(k_inst, bias_v):
+                    continue
 
                 # SplitK candidate set per shape+kid. Non-splitk kids always
                 # get splitK=0; splitk kids go through the heuristic.
@@ -961,17 +1050,14 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 
                 for splitK in splitK_range:
                     info = (info_keys, kid, splitK, "")
-                    # Pass dtype / outdtype down to generate_data via the
-                    # gen_args tuple. mp_tuner.work_group calls
-                    # `gen_data(*gen_args, device=device)`, so dtype/outdtype
-                    # are positional in slot 5 and 6 and `device` is appended
-                    # by mp_tuner as a keyword (matches generate_data's
-                    # signature).
-                    gen_args = (batch, M, N, K, seed, in_dtype, out_dtype)
-                    # Pass out_dtype to opus_gemm_ref so the reference is
-                    # materialized at the same dtype as Y; otherwise
-                    # mp_tuner.worker's checkAllclose raises
-                    # 'BFloat16 did not match Float' for bf16-in/fp32-out.
+                    # Pass bias / dtype / outdtype down to generate_data via
+                    # the gen_args tuple. mp_tuner.work_group calls
+                    # `gen_data(*gen_args, device=device)`, so positional
+                    # order matches generate_data's signature
+                    # (batch, m, n, k, seed, dtype, outdtype, bias).
+                    gen_args = (batch, M, N, K, seed, in_dtype, out_dtype, bias_v)
+                    # opus_gemm_ref(XQ, WQ, bias, out_dtype): pass the
+                    # data-indexed args plus out_dtype as a positional.
                     ref_args = (ref_data_idx, out_dtype)
                     task.append(
                         (
@@ -1053,22 +1139,21 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
 if __name__ == "__main__":
     # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv.
     # base_tuner uses self.keys for dedup / update / tune_summary; promoting
-    # dtype + outdtype into the key lets same-shape rows with different
-    # outdtype coexist in the tuned CSV instead of overwriting each other
-    # (4-key dedup would merge them on every result_to_csv pass). The
-    # downstream codegen / lookup map split is a separate concern handled
-    # by gen_instances.py:gen_lookup_dict (which also keys on outdtype to
-    # produce distinct BF16 / FP32 (M,N,K)->kid maps).
+    # bias + dtype + outdtype into the key lets same-shape rows with
+    # different bias / outdtype coexist in the tuned CSV instead of
+    # overwriting each other. lookup_tuned() in aiter/ops/opus/common.py
+    # already includes bias in its 9-column key, so the tuned-CSV producer
+    # and consumer agree on a bias-aware lookup.
     #
     # Column order inside the DataFrame is:
-    #   key       = [cu_num, M, N, K, dtype, outdtype]   (6 cols)
-    #   resultList = [bias, scaleAB, bpreshuffle,
+    #   key        = [cu_num, M, N, K, bias, dtype, outdtype]  (7 cols)
+    #   resultList = [scaleAB, bpreshuffle,
     #                 libtype, solidx, splitK, us, kernelName,
-    #                 err_ratio, tflops, bw]             (11 cols)
-    # total = 17 cols, in exact reference CSV order.
-    key = ["cu_num", "M", "N", "K", "dtype", "outdtype"]
+    #                 err_ratio, tflops, bw]                   (10 cols)
+    # total = 17 cols, in exact reference CSV order (bias slot 5 in the
+    # tuned CSV is fed from the key now instead of being hardcoded False).
+    key = ["cu_num", "M", "N", "K", "bias", "dtype", "outdtype"]
     resultList = [
-        "bias",
         "scaleAB",
         "bpreshuffle",
         "libtype",

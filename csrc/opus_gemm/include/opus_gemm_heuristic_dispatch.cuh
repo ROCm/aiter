@@ -42,18 +42,21 @@
 #pragma once
 
 #include <functional>
+#include <optional>
 #include <torch/extension.h>
 
 #include "opus_gemm_common.cuh"
 #include "opus_gemm_manifest.h"
 
 // a16w16-family launcher signature (split-barrier, flatmm, flatmm_splitk):
-// same 3 tensors + int splitK so all three populate the same
-// GENERATE_A16W16_TUNE_LOOKUP map. Non-splitk launchers ignore splitK;
-// the splitk launcher treats it as literal KBatch.
+// 3 tensors + std::optional<bias> + int splitK so all three populate the
+// same GENERATE_A16W16_TUNE_LOOKUP map. Non-splitk launchers ignore splitK;
+// the splitk launcher treats it as literal KBatch. bias is consumed by the
+// split-barrier and splitk launchers; the flatmm launcher rejects any
+// non-empty bias up front (HAS_BIAS=false on its warp-spec epilogue).
 using OpusA16W16NoscaleKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, int)>;
+                  torch::Tensor &, std::optional<torch::Tensor>, int)>;
 
 // Single template body shared by both bf16 and fp32 specializations.
 // All splitk kids are forced to <fp32_t> (their main kernel only has the

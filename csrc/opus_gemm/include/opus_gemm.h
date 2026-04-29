@@ -10,10 +10,12 @@ torch::Tensor opus_gemm(torch::Tensor& XQ,
                         torch::Tensor& Y,
                         std::optional<torch::Tensor> group_layout,
                         std::optional<torch::Tensor> x_scale,
-                        std::optional<torch::Tensor> w_scale);
+                        std::optional<torch::Tensor> w_scale,
+                        std::optional<torch::Tensor> bias);
 
 torch::Tensor opus_gemm_a16w16_tune(torch::Tensor& XQ,
                                     torch::Tensor& WQ,
                                     torch::Tensor& Y,
+                                    std::optional<torch::Tensor> bias,
                                     int kernelId,
                                     int splitK);

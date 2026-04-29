@@ -568,11 +568,59 @@ template torch::Tensor
                 os.path.join(self.instances_path, f"{k.name}_C{CDtype}.cpp")
             ).write_text(instance)
 
+    # Shared host-side bias validation + kargs population. Inserted into every
+    # A16W16_TUNE_TAGS launcher (split-barrier / flatmm / flatmm_splitk).
+    #
+    #   * bias is std::optional<torch::Tensor>; kargs.ptr_bias / stride_bias_batch
+    #     are populated from it (or set to nullptr / 0 when absent).
+    #   * Shape protocol (matches plan + reduce / split-barrier kernel side):
+    #       [M]            ->  stride_bias_batch=0  AND batch must == 1
+    #       [batch, M]     ->  stride_bias_batch=M
+    #     anything else (or non-contiguous, or dtype != Y.dtype()) hard-errors
+    #     up front -- the kernel side has no further runtime check.
+    #   * dtype: matched to Y.dtype() (the launcher template param D_C); this
+    #     is what the user-facing match_d_out convention requires.
+    BIAS_HOST_VALIDATE = """
+    const void* ptr_bias_ = nullptr;
+    int stride_bias_batch_ = 0;
+    if (bias.has_value()) {{
+        const auto& bt = bias.value();
+        TORCH_CHECK(bt.is_contiguous(),
+            "bias must be contiguous (got non-contiguous tensor)");
+        TORCH_CHECK(bt.dtype() == Y.dtype(),
+            "bias dtype must match Y dtype (got bias=", bt.dtype(),
+            " Y=", Y.dtype(), ")");
+        if (bt.dim() == 1) {{
+            TORCH_CHECK(bt.size(0) == M,
+                "bias 1D length must equal M (got bias.size(0)=", bt.size(0),
+                " M=", M, ")");
+            TORCH_CHECK(batch == 1,
+                "bias 1D [M] requires batch == 1; pass [batch, M] for batch>1");
+            stride_bias_batch_ = 0;
+        }} else if (bt.dim() == 2) {{
+            TORCH_CHECK(bt.size(0) == batch && bt.size(1) == M,
+                "bias 2D shape must equal [batch, M] (got [", bt.size(0), ", ",
+                bt.size(1), "] vs batch=", batch, " M=", M, ")");
+            stride_bias_batch_ = M;
+        }} else {{
+            TORCH_CHECK(false, "bias must be 1D [M] or 2D [batch, M]; got dim=",
+                bt.dim());
+        }}
+        ptr_bias_ = bt.data_ptr();
+    }}
+"""
+
     def _gen_noscale_instance(self, k, pipeline_header, kernel_func, da, db, traits_name, kargs_name):
+        # a16w16 split-barrier supports HAS_BIAS via the noscale kargs path.
+        # a8w8_noscale kids share the same kargs struct but always pass
+        # nullptr / 0; their bias arg is rejected at the dispatcher level.
+        is_a16w16_split_barrier = (k.kernel_tag == "a16w16")
         traits_extra = ""
-        if k.kernel_tag == "a16w16":
-            traits_extra = (f",\n        opus::seq<{k.T_M}, {k.T_N}, 1>,"
-                           f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>")
+        if is_a16w16_split_barrier:
+            traits_extra = (
+                f",\n        opus::seq<{k.T_M}, {k.T_N}, 1>,"
+                f"\n        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>"
+            )
 
         min_k = 2 * k.B_K
         # Kid-specific K-bound checks. Split-barrier pipeline requires
@@ -583,16 +631,93 @@ template torch::Tensor
         "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
     TORCH_CHECK(loops_ % 2 == 0,
         "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
+    // Odd-K is unsafe across the a16w16 family: the splitk pipeline shows
+    // up to ~7% maxdelta on bf16-acc paths when K is odd (predates this
+    // PR). Reject odd K uniformly so callers get a clear error instead
+    // of silent ~3% accuracy regressions; relax once the underlying K-tail
+    // handling is fixed.
+    TORCH_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
     TORCH_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
 """
 
         # a16w16 kids live in opus_gemm_a16w16_tune_lookup.h alongside the
-        # flatmm + splitk launchers, so their std::function slot requires the
-        # 4-arg signature (XQ, WQ, Y, int splitK). The body ignores splitK
-        # (split-barrier pipeline has no split-K concept). a8w8 kids never
-        # enter the a16w16 lookup; they keep the 3-arg signature.
-        extra_param  = ",\n    int /*splitK*/"           if k.kernel_tag in A16W16_TUNE_TAGS else ""
-        extra_tmpl_param = ",\n    int" if k.kernel_tag in A16W16_TUNE_TAGS else ""
+        # flatmm + splitk launchers, so their std::function slot requires
+        # the 5-arg signature (XQ, WQ, Y, std::optional<bias>, int splitK).
+        # The body ignores splitK (split-barrier pipeline has no split-K
+        # concept). a8w8 kids never enter the a16w16 lookup; they keep the
+        # 3-arg signature.
+        if k.kernel_tag in A16W16_TUNE_TAGS:
+            extra_param = (
+                ",\n    std::optional<torch::Tensor> bias,"
+                "\n    int /*splitK*/"
+            )
+        else:
+            extra_param = ""
+
+        # a16w16 split-barrier: emit two traits / kernel specializations
+        # (HAS_BIAS=true / HAS_BIAS=false) and runtime-dispatch on
+        # bias.has_value(). HAS_BIAS=true must NEVER be entered with a null
+        # bias pointer because the in-kernel prefetch issues unconditional
+        # buffer_loads -- a null rsrc would generate out-of-bounds garbage
+        # that the if constexpr guard cannot screen.
+        if is_a16w16_split_barrier:
+            launch_block = f"""
+    using TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
+        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+        opus::tuple<{da}, {db}, D_C, fp32_t>,
+        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
+        false,                                 // HAS_BIAS
+        D_C>;                                  // D_BIAS = D_C (matches Y dtype)
+    using TraitsBias = {traits_name}<{k.BLOCK_SIZE},
+        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+        opus::tuple<{da}, {db}, D_C, fp32_t>,
+        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
+        true,                                  // HAS_BIAS
+        D_C>;                                  // D_BIAS = D_C
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    if (bias.has_value()) {{{{
+        {kernel_func}<TraitsBias><<<grid, block, 0, stream>>>(kargs);
+    }}}} else {{{{
+        {kernel_func}<TraitsNoBias><<<grid, block, 0, stream>>>(kargs);
+    }}}}"""
+        else:
+            launch_block = f"""
+    using Traits = {traits_name}<{k.BLOCK_SIZE},
+        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+        opus::tuple<{da}, {db}, D_C, fp32_t>,
+        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra}>;
+
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    {kernel_func}<Traits><<<grid, block, 0, stream>>>(kargs);"""
+
+        # bias-aware kargs population: only emit for a16w16 split-barrier
+        # (the only noscale path that actually consumes bias). a8w8 noscale
+        # uses the same struct but its launcher never reaches here with
+        # bias.has_value()=true (dispatcher rejects).
+        if is_a16w16_split_barrier:
+            bias_kargs_block = (
+                self.BIAS_HOST_VALIDATE
+                + "    kargs.ptr_bias = ptr_bias_;\n"
+                + "    kargs.stride_bias_batch = stride_bias_batch_;\n"
+            )
+        elif k.kernel_tag in A16W16_TUNE_TAGS:
+            # Other A16W16_TUNE_TAGS handled by their own _gen_*_instance.
+            # Defensive guard in case of future routing changes.
+            bias_kargs_block = (
+                "    TORCH_CHECK(!bias.has_value(),\n"
+                "        \"bias not supported on this a16w16 kid\");\n"
+            )
+        else:
+            bias_kargs_block = ""
+
+        # noscale kargs has the new ptr_bias / stride_bias_batch fields.
+        # Struct value-initialization (`{}`) already zero-fills them, so
+        # a8w8 callers that never see a `bias` arg do not need explicit
+        # nullptr / 0 assignments.
+        kargs_init_extra = ""
 
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
@@ -614,11 +739,6 @@ torch::Tensor
     int N = WQ.size(1);
     int K = XQ.size(2);
 {k_check}
-    using Traits = {traits_name}<{k.BLOCK_SIZE},
-        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-        opus::tuple<{da}, {db}, D_C, fp32_t>,
-        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra}>;
-
     {kargs_name} kargs{{}};
     kargs.ptr_a = XQ.data_ptr();
     kargs.ptr_b = WQ.data_ptr();
@@ -633,23 +753,26 @@ torch::Tensor
     kargs.stride_a_batch = M * K;
     kargs.stride_b_batch = N * K;
     kargs.stride_c_batch = M * N;
-
+{kargs_init_extra}{bias_kargs_block}
     int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
     int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
     dim3 block({k.BLOCK_SIZE});
-
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    {kernel_func}<Traits><<<grid, block, 0, stream>>>(kargs);
+{launch_block}
 
     return Y;
 }}}}
 """
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
-        inst_extra_param = ",\n    int" if k.kernel_tag in A16W16_TUNE_TAGS else ""
+        if k.kernel_tag in A16W16_TUNE_TAGS:
+            inst_extra_param = ",\n    std::optional<torch::Tensor>,\n    int"
+        else:
+            inst_extra_param = ""
         INSTANCE_TEMPLATE = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include <optional>
+#include <torch/extension.h>
 #include "impl/{{name}}.cuh"
 template torch::Tensor
 {{name}}<{{dtype}}>(
@@ -688,6 +811,12 @@ template torch::Tensor
         Traits::prefetch_k_iter * {k.B_K}, " (pfk=", Traits::prefetch_k_iter, ")");
     TORCH_CHECK(M >= 1 && N >= 1 && K >= 1, "M, N, K must be >= 1");
     TORCH_CHECK(batch >= 1, "batch must be >= 1");
+    // Odd-K is unsafe across the a16w16 family (see _gen_noscale_instance
+    // for the rationale); reject uniformly until the K-tail handling is
+    // fixed.
+    TORCH_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
 """
 
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
@@ -704,12 +833,24 @@ torch::Tensor
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
+    std::optional<torch::Tensor> bias,
     int /*splitK*/)   // flatmm (non-splitk) ignores splitK; shares tune-lookup slot signature
 {{{{
     int batch = XQ.size(0);
     int M = XQ.size(1);
     int N = WQ.size(1);
     int K = XQ.size(2);
+
+    // a16w16_flatmm pipeline still has HAS_BIAS=false hardcoded -- bias
+    // support on the warp-specialized 4-wave epilogue is not yet
+    // implemented (see plan: a16w16_flatmm bias support deferred). The
+    // launcher must accept the optional bias arg to match the
+    // GENERATE_A16W16_TUNE_LOOKUP std::function slot, but reject any
+    // non-empty bias up front so the user gets a clear error instead of
+    // silently dropping the bias.
+    TORCH_CHECK(!bias.has_value(),
+        "bias is not yet supported on a16w16_flatmm kid; use a16w16 "
+        "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
 
     using Traits = {traits_name}<{k.BLOCK_SIZE},
         opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
@@ -750,12 +891,15 @@ torch::Tensor
 
         INSTANCE_TEMPLATE = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include <optional>
+#include <torch/extension.h>
 #include "impl/{name}.cuh"
 template torch::Tensor
 {name}<{dtype}>(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
+    std::optional<torch::Tensor>,
     int);
 """
         for CDtype in k.output_dtypes:
@@ -794,6 +938,7 @@ torch::Tensor
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
+    std::optional<torch::Tensor> bias,
     int splitK)
 {{{{
     static_assert(std::is_same<D_C, fp32_t>::value,
@@ -811,14 +956,22 @@ torch::Tensor
         "(reduce kernel casts fp32 workspace to D_OUT)");
     TORCH_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
         "M, N, K, batch must be >= 1");
-
+    // Odd-K is unsafe: splitk pipeline shows ~3-7% maxdelta on odd K (e.g.
+    // K=257 / 513) while even K stays near bf16 noise floor. The bug lives
+    // in the K-tail handling (mask_va_tail / reduce-tail interplay) and
+    // predates this PR. Reject uniformly until fixed.
+    TORCH_CHECK(K % 2 == 0,
+        "K=", K, " must be even (a16w16 family rejects odd K due to a "
+        "latent K-tail accumulation bug; pass an even K)");
+{self.BIAS_HOST_VALIDATE}
     using Traits = {traits_name}<{k.BLOCK_SIZE},
         opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-        opus::tuple<{da}, {db}, fp32_t, fp32_t, {da}>,   // D_C=fp32 forced
+        opus::tuple<{da}, {db}, fp32_t, fp32_t, {da}>,   // D_C=fp32 forced; D_BIAS=D_A (matches Y)
         opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
         opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
         {k.WG_PER_CU},
-        false>;                                           // HAS_BIAS=false
+        false>;                                           // main kernel HAS_BIAS=false
+                                                          // (bias only consumed by reduce kernel)
 
     // splitK semantic: literal KBatch. 0 and 1 both mean no split.
     int split_k = (splitK <= 1) ? 1 : splitK;
@@ -854,7 +1007,7 @@ torch::Tensor
     kargs.ptr_b         = WQ.data_ptr();
     kargs.ptr_workspace = workspace.data_ptr();
     kargs.ptr_c         = Y.data_ptr();
-    kargs.ptr_bias      = nullptr;  // HAS_BIAS=false; field reserved for future.
+    kargs.ptr_bias      = ptr_bias_;          // populated by BIAS_HOST_VALIDATE
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
     kargs.split_k = split_k;
     kargs.stride_a        = K;
@@ -865,6 +1018,7 @@ torch::Tensor
     kargs.stride_b_batch  = N * K;
     kargs.stride_ws_batch = padded_M * padded_N;
     kargs.stride_c_batch  = M * N;
+    kargs.stride_bias_batch = stride_bias_batch_;
 
     dim3 grid_main(num_tiles_m * num_tiles_n * split_k, 1, batch);
     dim3 block_main({k.BLOCK_SIZE});
@@ -881,19 +1035,43 @@ torch::Tensor
 
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
+    // Reduce kernel: 4 specializations (D_OUT bf16/fp32 x HAS_BIAS true/false).
+    // bias dtype is locked to Y.dtype() by BIAS_HOST_VALIDATE.
     if (Y.dtype() == at::ScalarType::BFloat16) {{{{
-        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16>
-            <<<grid_reduce, block_reduce, 0, stream>>>(
-                reinterpret_cast<const float*>(workspace.data_ptr()),
-                reinterpret_cast<__bf16*>(Y.data_ptr()),
-                split_k, M, N, batch, padded_M, padded_N);
+        if (bias.has_value()) {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<__bf16*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    reinterpret_cast<const __bf16*>(ptr_bias_),
+                    stride_bias_batch_);
+        }}}} else {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<__bf16*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    nullptr, 0);
+        }}}}
     }}}} else {{{{
         // Y.dtype() == Float per the TORCH_CHECK above.
-        splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float>
-            <<<grid_reduce, block_reduce, 0, stream>>>(
-                reinterpret_cast<const float*>(workspace.data_ptr()),
-                reinterpret_cast<float*>(Y.data_ptr()),
-                split_k, M, N, batch, padded_M, padded_N);
+        if (bias.has_value()) {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<float*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    reinterpret_cast<const float*>(ptr_bias_),
+                    stride_bias_batch_);
+        }}}} else {{{{
+            splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float>
+                <<<grid_reduce, block_reduce, 0, stream>>>(
+                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<float*>(Y.data_ptr()),
+                    split_k, M, N, batch, padded_M, padded_N,
+                    nullptr, 0);
+        }}}}
     }}}}
 
     return Y;
@@ -903,12 +1081,15 @@ torch::Tensor
 
         INSTANCE_TEMPLATE = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include <optional>
+#include <torch/extension.h>
 #include "impl/{name}.cuh"
 template torch::Tensor
 {name}<{dtype}>(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
+    std::optional<torch::Tensor>,
     int);
 """
         for CDtype in k.output_dtypes:
@@ -1079,6 +1260,7 @@ template torch::Tensor
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include <cstdlib>
+#include <optional>
 #include <torch/extension.h>
 """
         MANIFEST_SCALE = """
@@ -1101,7 +1283,12 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &Y);
 """
-        # a16w16 family (4 args with splitK): shared signature for tune lookup.
+        # a16w16 family (5 args with optional bias + splitK): shared
+        # signature for tune lookup. All three a16w16-family launchers
+        # (split-barrier / flatmm / flatmm_splitk) accept the optional bias
+        # argument so they can populate the same std::function slot in
+        # GENERATE_A16W16_TUNE_LOOKUP. flatmm rejects non-empty bias at
+        # runtime; the other two consume it.
         MANIFEST_NOSCALE_4ARG = """
 template <typename D_C>
 torch::Tensor
@@ -1109,6 +1296,7 @@ torch::Tensor
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
+    std::optional<torch::Tensor> bias,
     int splitK);
 """
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
