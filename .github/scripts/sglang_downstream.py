@@ -158,7 +158,7 @@ else
   mkdir -p "$(dirname "${MODEL_DIR}")" /models/.tmp
   TMP_MODEL_DIR="/models/.tmp/${MODEL_ID//\//__}-$(date +%s%N)-${RANDOM}-$$"
   rm -rf "${TMP_MODEL_DIR}"
-  huggingface-cli download "${MODEL_ID}" --local-dir "${TMP_MODEL_DIR}"
+  hf download "${MODEL_ID}" --local-dir "${TMP_MODEL_DIR}"
   test -f "${TMP_MODEL_DIR}/config.json"
   echo "ok" > "${TMP_MODEL_DIR}/.complete"
 
