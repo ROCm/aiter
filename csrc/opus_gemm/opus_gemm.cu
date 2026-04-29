@@ -102,7 +102,8 @@ torch::Tensor opus_gemm(
   torch::Tensor &Y,
   std::optional<torch::Tensor> group_layout,
   std::optional<torch::Tensor> x_scale,
-  std::optional<torch::Tensor> w_scale)
+  std::optional<torch::Tensor> w_scale,
+  std::optional<torch::Tensor> bias)
 {
   TORCH_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
   TORCH_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
@@ -116,6 +117,10 @@ torch::Tensor opus_gemm(
 
   if (XQ.dtype() == torch_fp8)
   {
+    // a8w8 / a8w8_scale launchers do not consume bias yet; reject up front
+    // rather than silently dropping it.
+    TORCH_CHECK(!bias.has_value(),
+                "opus_gemm: bias is not supported on a8w8 / a8w8_scale paths");
     if (has_scale)
     {
       TORCH_CHECK(Y.dtype() == at::ScalarType::Float,
@@ -136,14 +141,22 @@ torch::Tensor opus_gemm(
     // auto-clamp to pfk anyway so no extra information is needed at this
     // entry point. Kernels that ignore splitK (a16w16 / flatmm) just
     // drop it.
+    //
+    // Bias routing
+    // ------------
+    // bias is forwarded to whichever launcher the lookup / heuristic
+    // picks. The lookup map only contains bias-aware kids today
+    // (a16w16_flatmm_kernels_list is empty -- see opus_gemm_common.py;
+    // only split-barrier 4..9 and a16w16_flatmm_splitk 200..299 ever
+    // appear), so a non-empty bias is always safe at this entry.
     int batch = XQ.size(0);
     if (Y.dtype() == at::ScalarType::BFloat16)
     {
-      opus_dispatch_a16w16<bf16_t>(M, N, K, batch)(XQ, WQ, Y, 0);
+      opus_dispatch_a16w16<bf16_t>(M, N, K, batch)(XQ, WQ, Y, bias, 0);
     }
     else if (Y.dtype() == at::ScalarType::Float)
     {
-      opus_dispatch_a16w16<fp32_t>(M, N, K, batch)(XQ, WQ, Y, 0);
+      opus_dispatch_a16w16<fp32_t>(M, N, K, batch)(XQ, WQ, Y, bias, 0);
     }
     else
     {
@@ -214,11 +227,23 @@ OpusA16W16TuneKernel opus_a16w16_tune_dispatch<fp32_t>(int id)
 // require a dispatcher change.
 static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
+// Split-barrier a16w16 kids live in [4, 10). Used to gate which kids accept
+// a non-empty bias (a16w16_flatmm 100..115 keeps HAS_BIAS=false until its
+// warp-spec epilogue gets bias support).
+static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
+static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
+
+static inline bool opus_kid_supports_bias(int kid)
+{
+  return (kid >= OPUS_A16W16_SB_KID_MIN && kid < OPUS_A16W16_SB_KID_MAX) ||
+         (kid >= OPUS_SPLITK_KID_MIN && kid < OPUS_SPLITK_KID_MAX);
+}
 
 torch::Tensor opus_gemm_a16w16_tune(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
+    std::optional<torch::Tensor> bias,
     int kernelId,
     int splitK)
 {
@@ -227,6 +252,15 @@ torch::Tensor opus_gemm_a16w16_tune(
   TORCH_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
   TORCH_CHECK(XQ.dtype() == WQ.dtype(),
               "XQ and WQ should have the same dtype!");
+  // Gate non-bias-capable kids early. The launcher itself will also do the
+  // detailed shape/dtype check on a non-empty bias; this guard just gives a
+  // clear "wrong kid" error before we even enter the launcher.
+  TORCH_CHECK(!bias.has_value() || opus_kid_supports_bias(kernelId),
+              "opus_gemm_a16w16_tune: bias is currently only supported on "
+              "a16w16 split-barrier kids [", OPUS_A16W16_SB_KID_MIN, ", ",
+              OPUS_A16W16_SB_KID_MAX, ") or a16w16_flatmm_splitk kids [",
+              OPUS_SPLITK_KID_MIN, ", ", OPUS_SPLITK_KID_MAX,
+              "); got kid=", kernelId);
 
   if (XQ.dtype() == at::ScalarType::BFloat16)
   {
@@ -239,15 +273,15 @@ torch::Tensor opus_gemm_a16w16_tune(
                   || Y.dtype() == at::ScalarType::Float,
                   "opus_gemm_a16w16_tune splitk kid requires bf16 or fp32 Y "
                   "(reduce kernel writes the correct dtype)");
-      opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, splitK);
+      opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
     }
     else if (Y.dtype() == at::ScalarType::BFloat16)
     {
-      opus_a16w16_tune_dispatch<bf16_t>(kernelId)(XQ, WQ, Y, splitK);
+      opus_a16w16_tune_dispatch<bf16_t>(kernelId)(XQ, WQ, Y, bias, splitK);
     }
     else if (Y.dtype() == at::ScalarType::Float)
     {
-      opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, splitK);
+      opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
     }
     else
     {

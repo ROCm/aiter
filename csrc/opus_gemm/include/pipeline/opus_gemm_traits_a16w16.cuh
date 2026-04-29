@@ -4,9 +4,12 @@
 // Traits for a16w16 (bf16) pipelines. This header carries two independent
 // traits structs and two kargs structs:
 //
-//   opus_gemm_a16w16_traits<..., TILE, WAVE>
+//   opus_gemm_a16w16_traits<..., TILE, WAVE, HAS_BIAS=false, D_BIAS=void>
 //     Split-barrier pipeline used by opus_gemm_pipeline_a16w16.cuh.
 //     Configurable TILE (T_M, T_N, T_K) and WAVE (W_M, W_N, W_K). 4-tuple DTYPE.
+//     HAS_BIAS / D_BIAS default off so existing instantiations remain valid.
+//     When HAS_BIAS=true the kernel reads kargs.ptr_bias as a D_BIAS* row vector
+//     (shape [M] or [batch, M]; selected via kargs.stride_bias_batch).
 //
 //   opus_gemm_a16w16_flatmm_traits<..., MFMA, WG_PER_CU, HAS_BIAS>
 //     4-wave warp-specialized pipeline (2 producer + 2 consumer) used by
@@ -26,7 +29,9 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename TILE_,
-        typename WAVE_>
+        typename WAVE_,
+        bool HAS_BIAS_ = false,
+        typename D_BIAS_ = void>
 struct opus_gemm_a16w16_traits {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -45,6 +50,9 @@ struct opus_gemm_a16w16_traits {
     using D_C   = opus::tuple_element_t<2, DTYPE>;
     using D_ACC = opus::tuple_element_t<3, DTYPE>;
     static_assert(std::is_same<D_A, D_B>::value);
+
+    static constexpr bool HAS_BIAS = HAS_BIAS_;
+    using D_BIAS = std::conditional_t<std::is_same_v<D_BIAS_, void>, D_C, D_BIAS_>;
 
     static constexpr int T_M = opus::get<0>(TILE{});
     static constexpr int T_N = opus::get<1>(TILE{});
@@ -87,10 +95,24 @@ struct opus_gemm_a16w16_traits {
 
 #ifndef OPUS_GEMM_NOSCALE_KARGS_DEFINED
 #define OPUS_GEMM_NOSCALE_KARGS_DEFINED
+// Shared kargs struct between a16w16 split-barrier and a8w8 noscale launchers.
+// Must match the definition in opus_gemm_traits_a8w8_noscale.cuh exactly
+// (header-include order chooses which TU gets the canonical definition).
+//
+// bias fields:
+//   ptr_bias          : null when HAS_BIAS=false; otherwise points to D_BIAS
+//                       buffer holding the per-row bias vector. dtype matches
+//                       T::D_BIAS (== T::D_C in default instantiations).
+//   stride_bias_batch : in elements of D_BIAS.
+//                       0  -> bias is shape [M] and broadcast across batches;
+//                       M  -> bias is shape [batch, M], one set per batch.
+//                       Reduce / split-barrier kernels read this stride only;
+//                       host validates shape <-> stride consistency.
 struct opus_gemm_noscale_kargs {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
+    const void* __restrict__ ptr_bias;
     int m;
     int n;
     int k;
@@ -101,6 +123,7 @@ struct opus_gemm_noscale_kargs {
     int stride_a_batch;
     int stride_b_batch;
     int stride_c_batch;
+    int stride_bias_batch;
 };
 #endif
 
@@ -380,9 +403,12 @@ struct opus_gemm_flatmm_splitk_kargs {
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
     void*       __restrict__ ptr_workspace; // fp32 [split_k, B, padded_M, padded_N]
     void*       __restrict__ ptr_c;         // bf16 [B, M, N] (filled by reduce kernel)
-    // FIXME: bias not yet implemented. HAS_BIAS=false is hardcoded in all
-    // registered instances; this field is reserved for future use and must
-    // be passed as nullptr.
+    // bias is consumed only by the reduce kernel (main kernel ignores it).
+    // ptr_bias = nullptr when HAS_BIAS=false; dtype matches D_BIAS (== D_C
+    // for the user-facing matched-dtype convention).
+    // stride_bias_batch in elements of D_BIAS:
+    //   0  -> bias shape [M], broadcast across batches;
+    //   M  -> bias shape [batch, M], per-batch row vector.
     const void* __restrict__ ptr_bias;
     int m;
     int n;
@@ -397,5 +423,6 @@ struct opus_gemm_flatmm_splitk_kargs {
     int stride_b_batch;
     int stride_ws_batch;                    // = padded_M * padded_N
     int stride_c_batch;                     // = M * N
+    int stride_bias_batch;                  // 0 (broadcast [M]) or M ([batch, M])
 };
 #endif
