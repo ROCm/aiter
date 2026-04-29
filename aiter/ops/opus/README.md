@@ -66,6 +66,7 @@ The launchers reject these up front to avoid silent miscompares:
 | pre-shuffled B | not supported; pass plain layout. |
 | `bias.dtype == dtype` | match-output; otherwise a host-side `TORCH_CHECK` fires. |
 | `bias` shape ∈ {`[M]` (only `batch==1`), `[batch, M]`} | reduce / split-barrier kernels expect this exact layout. |
+| GPU arch must be **gfx950 (MI350)** today | opus uses gfx950-only intrinsics (MFMA-32x32x16, ds_read_b64_tr) and the 160 KiB LDS budget. Three-layer enforcement: Python import-time `_check_arch` rejects the package on non-gfx950 devices; the C++ host dispatcher routes per `gcnArchName` and currently only implements the gfx950 branch (others fail with a clear "pipeline TBD" message); each `__global__` kernel body wraps real code in `#if defined(__gfx950__)` so multi-arch wheels (e.g. `GPU_ARCHS='gfx942;gfx950'`) still compile, but the gfx942 device pass produces an empty kernel stub that is unreachable at runtime. To add support for a new arch, extend `OpusGfxArch` in `csrc/opus_gemm/opus_gemm.cu` and add a per-arch dispatch function. |
 
 Scale / FP8 paths are handled by other opus submodules (a8w8 /
 a8w8_blockscale, landing in follow-up PRs); they share the same

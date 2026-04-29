@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// a16w16 family heuristic dispatcher.
+// a16w16 family heuristic dispatcher (gfx950).
+//
+// gfx950-specific because the kernel symbols it returns are gfx950 tile
+// sizes (e.g. 256x256x64 split-barrier, splitk 64x64x64 WG=2). Future archs
+// will have their own opus_gemm_heuristic_dispatch_<arch>.cuh next to this
+// one; the public OpusA16W16NoscaleKernel launcher signature stays
+// arch-agnostic so the arch router in opus_gemm.cu can dispatch without
+// caring about the per-arch tile choice.
 //
 // Split out of opus_gemm.cu so the dispatcher tree (M-bucket -> kernel)
 // has its own home and can be edited without touching the
@@ -45,7 +52,7 @@
 #include <optional>
 #include <torch/extension.h>
 
-#include "opus_gemm_common.cuh"
+#include "../opus_gemm_common.cuh"
 #include "opus_gemm_manifest.h"
 
 // a16w16-family launcher signature (split-barrier, flatmm, flatmm_splitk):
@@ -63,7 +70,7 @@ using OpusA16W16NoscaleKernel = std::function<
 // fp32_t instantiation; the reduce kernel D_OUT is selected at launch
 // time based on Y.dtype()). split-barrier kid 9 follows CDataType.
 template <typename CDataType>
-inline OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch(
+inline OpusA16W16NoscaleKernel opus_a16w16_heuristic_dispatch_gfx950(
     int M, int N, int K, int /*batch*/)
 {
   const bool split_barrier_ok =

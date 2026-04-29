@@ -4,16 +4,16 @@
 // Traits for a16w16 (bf16) pipelines. This header carries two independent
 // traits structs and two kargs structs:
 //
-//   opus_gemm_a16w16_traits<..., TILE, WAVE, HAS_BIAS=false, D_BIAS=void>
-//     Split-barrier pipeline used by opus_gemm_pipeline_a16w16.cuh.
+//   opus_gemm_a16w16_traits_gfx950<..., TILE, WAVE, HAS_BIAS=false, D_BIAS=void>
+//     Split-barrier pipeline used by opus_gemm_pipeline_a16w16_gfx950.cuh.
 //     Configurable TILE (T_M, T_N, T_K) and WAVE (W_M, W_N, W_K). 4-tuple DTYPE.
 //     HAS_BIAS / D_BIAS default off so existing instantiations remain valid.
 //     When HAS_BIAS=true the kernel reads kargs.ptr_bias as a D_BIAS* row vector
 //     (shape [M] or [batch, M]; selected via kargs.stride_bias_batch).
 //
-//   opus_gemm_a16w16_flatmm_traits<..., MFMA, WG_PER_CU, HAS_BIAS>
+//   opus_gemm_a16w16_flatmm_traits_gfx950<..., MFMA, WG_PER_CU, HAS_BIAS>
 //     4-wave warp-specialized pipeline (2 producer + 2 consumer) used by
-//     opus_gemm_pipeline_a16w16_flatmm.cuh. Derives prefetch depth dynamically
+//     opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh. Derives prefetch depth dynamically
 //     from the LDS budget. Locked T_M=2/T_N=1/T_K=1. 5-tuple DTYPE.
 //     Ported from gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp.cc.
 #pragma once
@@ -32,7 +32,7 @@ template<int BLOCK_SIZE_,
         typename WAVE_,
         bool HAS_BIAS_ = false,
         typename D_BIAS_ = void>
-struct opus_gemm_a16w16_traits {
+struct opus_gemm_a16w16_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -93,8 +93,8 @@ struct opus_gemm_a16w16_traits {
     static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
 };
 
-#ifndef OPUS_GEMM_NOSCALE_KARGS_DEFINED
-#define OPUS_GEMM_NOSCALE_KARGS_DEFINED
+#ifndef OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
+#define OPUS_GEMM_NOSCALE_KARGS_GFX950_DEFINED
 // Shared kargs struct between a16w16 split-barrier and a8w8 noscale launchers.
 // Must match the definition in opus_gemm_traits_a8w8_noscale.cuh exactly
 // (header-include order chooses which TU gets the canonical definition).
@@ -108,7 +108,7 @@ struct opus_gemm_a16w16_traits {
 //                       M  -> bias is shape [batch, M], one set per batch.
 //                       Reduce / split-barrier kernels read this stride only;
 //                       host validates shape <-> stride consistency.
-struct opus_gemm_noscale_kargs {
+struct opus_gemm_noscale_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
@@ -143,7 +143,7 @@ template<int BLOCK_SIZE_,   // workgroup size (locked to 256 for 4 waves)
         typename MFMA_,     // opus::seq<W_M, W_N, W_K>
         int WG_PER_CU_,
         bool HAS_BIAS_>
-struct opus_gemm_a16w16_flatmm_traits {
+struct opus_gemm_a16w16_flatmm_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -231,8 +231,22 @@ struct opus_gemm_a16w16_flatmm_traits {
     // Hardcoded gfx950 LDS size (160 KiB = 163840 B). Cannot use
     // opus::get_smem_size() here because it's guarded by __gfx950__ which is
     // only defined on the device pass; host pass would see 65536 and cause
-    // pfk<3 and break static_asserts. All aiter a16w16 kernels are gfx950-only
-    // (enforced via --offload-arch=gfx950 in JIT config), so this is safe.
+    // pfk<3 and break static_asserts.
+    //
+    // All aiter a16w16 kernels are gfx950-only today. Three-layer enforcement:
+    //   1. Python: aiter/ops/opus/__init__.py calls _arch._check_arch({"gfx950"})
+    //      at import time; non-gfx950 GPUs get a clean ImportError. The helper
+    //      is reusable for future opus submodules with different supported sets.
+    //   2. Host:   opus_dispatch_a16w16<T> / opus_a16w16_tune_dispatch<T> in
+    //      opus_gemm.cu are arch routers built on opus_get_gfx_arch(). Only
+    //      the gfx950 branch is wired up today (delegates to
+    //      opus_dispatch_a16w16_gfx950<T>); other archs return TORCH_CHECK
+    //      fail with a 'pipeline TBD' message. Future archs are added by
+    //      extending OpusGfxArch + adding a per-arch dispatch function.
+    //   3. Device: each __global__ kernel body wraps real code in
+    //      #if defined(__gfx950__) so non-gfx950 device passes (in multi-arch
+    //      wheels like GPU_ARCHS='gfx942;gfx950') compile to an empty stub.
+    //      Combined with layer 1/2 the empty stub is unreachable at runtime.
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
     static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
@@ -261,7 +275,7 @@ struct opus_gemm_a16w16_flatmm_traits {
 // Kernel arguments for the a16w16 flatmm pipeline.
 // Layout: A[batch, M, K] bf16 row-major, B[batch, N, K] bf16 row-major
 // (pre-transposed, no shuffle needed), C[batch, M, N] bf16 row-major.
-struct opus_gemm_flatmm_kargs {
+struct opus_gemm_flatmm_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void*       __restrict__ ptr_c;
@@ -288,7 +302,7 @@ struct opus_gemm_flatmm_kargs {
 // reduce kernel sums splits + casts to bf16 C)
 // ============================================================================
 //
-// 7 template parameters match opus_gemm_a16w16_flatmm_traits, with
+// 7 template parameters match opus_gemm_a16w16_flatmm_traits_gfx950, with
 // additional static_assert D_C=float (splitk main kernel writes fp32
 // partial sums to workspace). Ported from
 // gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp_splitk.cc lines 34-143.
@@ -300,7 +314,7 @@ template<int BLOCK_SIZE_,   // workgroup size (locked to 256)
         typename MFMA_,     // opus::seq<W_M, W_N, W_K>
         int WG_PER_CU_,
         bool HAS_BIAS_>
-struct opus_flatmm_splitk_traits {
+struct opus_flatmm_splitk_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -370,7 +384,7 @@ struct opus_flatmm_splitk_traits {
     static constexpr int smem_per_group_load_size = slots * (smem_linear_wave_per_async_load + smem_padding) * sizeof(D_A);
 
     // Dynamic prefetch depth from LDS budget. gfx950 = 160 KiB (hardcoded
-    // as in opus_gemm_a16w16_flatmm_traits above; host pass cannot use
+    // as in opus_gemm_a16w16_flatmm_traits_gfx950 above; host pass cannot use
     // opus::get_smem_size() because it's device-gated).
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
@@ -398,7 +412,7 @@ struct opus_flatmm_splitk_traits {
 // bf16 C[B, M, N].
 //
 // Host must satisfy split_k * pfk * B_K <= K (launcher auto-clamps otherwise).
-struct opus_gemm_flatmm_splitk_kargs {
+struct opus_gemm_flatmm_splitk_kargs_gfx950 {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
     void*       __restrict__ ptr_workspace; // fp32 [split_k, B, padded_M, padded_N]

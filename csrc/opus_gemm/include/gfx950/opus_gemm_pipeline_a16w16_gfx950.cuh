@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// FP8 noscale pipeline for a8w8 (fp8, W_K=128).
-// T_M=2, T_N=4 wave mapping. No scale factors.
-// MMA uses cbsz/blgp args (0,0) required by fp8 MFMA.
+// BF16 noscale pipeline for a16w16 (bf16).
+// TILE and WAVE dimensions are configurable via Traits. No scale factors.
+// BF16 MFMA does not accept cbsz/blgp args.
 #pragma once
 
-#include "opus_gemm_traits_a8w8_noscale.cuh"
+#include "opus_gemm_traits_a16w16_gfx950.cuh"
 
 // ============================================================================
-// Layout functions for noscale kernels (T_M=2, T_N=4 wave mapping)
+// Layout functions for noscale kernels (TILE/WAVE from Traits)
 // Guarded: these are __device__ functions only needed on the device pass.
 // ============================================================================
 
@@ -154,16 +154,24 @@ inline __device__ auto make_layout_rb_noscale(int lane_id, int wave_id_n) {
         opus::unfold_p_coord(rb_block_dim, opus::tuple{wave_id_n / T::T_M, lane_id_n % T::T_N, wave_id_n % T::T_M, lane_id_n / T::T_N, lane_id / T::W_N}));
 }
 
-#endif // __HIP_DEVICE_COMPILE__
+#endif // __HIP_DEVICE_COMPILE__ (layout functions)
 
 // ============================================================================
-// FP8 noscale GEMM kernel (a8w8 without scale)
+// BF16 noscale GEMM kernel (a16w16)
 // Kernel definition visible on both passes (host pass needs it for stub generation).
 // ============================================================================
 
 template<typename Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kernel(opus_gemm_noscale_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kernel(opus_gemm_noscale_kargs_gfx950 kargs) {
 #ifdef __HIP_DEVICE_COMPILE__
+#if defined(__gfx950__)
+    // Real kernel body. Non-gfx950 device passes drop into the empty #else
+    // branch below so multi-arch wheels (e.g. GPU_ARCHS='gfx942;gfx950')
+    // compile cleanly without pulling in MFMA / ds_read_b64_tr / 160 KiB
+    // LDS intrinsics that don't exist on other archs. The Python import
+    // guard (aiter/ops/opus/_arch.py) plus the host arch router in
+    // opus_gemm.cu prevent runtime dispatch from ever reaching the empty
+    // stub, so the unreachable case stays unreachable.
     using namespace opus;
 
     using T = opus::remove_cvref_t<Traits>;
@@ -267,7 +275,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -278,7 +286,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -289,18 +297,18 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_b[0] = load<T::VEC_B>(s_b[toc][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[tic][1].ptr, u_gb, u_sb, b_offset(1, tile + 2));
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
+        v_b[0] = load<T::VEC_B>(s_b[toc][0], u_rb);
 
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -313,7 +321,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -324,7 +332,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -335,18 +343,18 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
         async_load<T::VEC_B>(g_b, s_b[toc][1].ptr, u_gb, u_sb, b_offset(1, tile + 3));
         s_waitcnt_vmcnt(number<T::a_buffer_load_insts + 2 * T::b_buffer_load_insts>{});
         __builtin_amdgcn_s_barrier();
+        v_b[0] = load<T::VEC_B>(s_b[tic][0], u_rb);
 
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -362,7 +370,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
         s_waitcnt_lgkmcnt(0_I);
 
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -372,7 +380,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -383,8 +391,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
-        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0]);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -401,7 +409,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0], 0, 0);
+        v_c[0][0] = mma(v_a, v_b[0], v_c[0][0]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -412,7 +420,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1], 0, 0);
+        v_c[0][1] = mma(v_a, v_b[1], v_c[0][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -422,8 +430,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
 
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_s_setprio(1);
-        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0], 0, 0);
-        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1], 0, 0);
+        v_c[1][0] = mma(v_a, v_b[0], v_c[1][0]);
+        v_c[1][1] = mma(v_a, v_b[1], v_c[1][1]);
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
@@ -441,10 +449,107 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
         return half_tile_m * T::HALF_B_M * kargs.stride_c + half_tile_n * T::HALF_B_N;
     };
 
+    // ── HAS_BIAS prefetch (plan B) ────────────────────────────────────────
+    // bias is per-row, so the 4 store_c calls (half_tile_m, half_tile_n) only
+    // depend on half_tile_m. Prefetch into 2 register tiles (bv_half[0/1]),
+    // each indexed by the same partition_layout_c iteration order as u_gc_m.
+    // Issued buffer_loads overlap with the wave_id_m=0 barrier above and
+    // with the first store_if below.
+    //
+    // Why VGPR (buffer_load) instead of SGPR (s_load): per-element m_off varies
+    // across lanes (the partition spreads B_M across 64 lanes), so a single
+    // SGPR scalar cannot represent "this lane's bias". splitk_reduce uses
+    // s_load because there each (b, m) is fixed per block; here it's per
+    // register element.
+    //
+    // Bias is stored in D_ACC (fp32) so the addition happens in the same
+    // accumulator domain as v_c -- precision matches the existing acc path
+    // and matches splitk_reduce's behavior.
+    // We mirror the iteration that store_if<VEC_C>(g_c, ..., u_gc, ...) does
+    // internally:
+    //   using LT = layout_load_traits<Layout, vec>;
+    //   constexpr auto issue_space     = LT::issue_space;       // NON-vec
+    //   constexpr auto issue_space_vec = LT::issue_space_vec;
+    //   constexpr auto u_r = make_layout<-1>(issue_space);
+    //   static_ford(issue_space_vec, [&](auto... ids){
+    //       constexpr index_t idx = u_r(ids...);
+    //       slice(vc, idx, idx + vec);   // vc indices [idx, idx+vec)
+    //   });
+    // u_r is built from the NON-vectorized issue_space so its return value
+    // is the starting 1D index into vc (a vector_t of size elem_c). We
+    // mirror the same pattern for bias prefetch / add.
+    //
+    // BIAS_VEC_SLOTS_ = number of distinct (m_off) chunks in vc, equal to
+    // elem_c / VEC_C. The vec-iter slot is slot_idx / VEC_C (since u_r is
+    // built on the non-vec issue_space, slot_idx steps by VEC_C between
+    // adjacent ids).
+    using LT_BIAS = layout_load_traits<decltype(u_gc_m), T::VEC_C>;
+    constexpr auto bias_issue_space     = LT_BIAS::issue_space;      // NON-vec
+    constexpr auto bias_issue_space_vec = LT_BIAS::issue_space_vec;
+    constexpr auto u_r_bias = make_layout<-1>(bias_issue_space);
+    constexpr int BIAS_VEC_SLOTS_ = static_cast<int>(
+        opus::get<0>(opus::reduce_tuple_mul(bias_issue_space_vec)).value);
+
+    using D_BIAS_ = typename T::D_BIAS;
+    [[maybe_unused]] D_ACC v_bias_half_[2][BIAS_VEC_SLOTS_];
+    if constexpr (T::HAS_BIAS) {
+        const D_BIAS_* bias_ptr = reinterpret_cast<const D_BIAS_*>(kargs.ptr_bias);
+        const long bias_count =
+            kargs.stride_bias_batch == 0 ? (long)kargs.m
+                                         : (long)kargs.batch * kargs.m;
+        auto g_bias = make_gmem(bias_ptr,
+                                (unsigned int)(bias_count * sizeof(D_BIAS_)));
+        const int bias_row0_base = batch_id * kargs.stride_bias_batch
+                                   + row + 0 * T::HALF_B_M;
+        const int bias_row1_base = batch_id * kargs.stride_bias_batch
+                                   + row + 1 * T::HALF_B_M;
+
+        // Issue all bias buffer_loads up front; vmcnt accumulates and is
+        // drained by a single s_waitcnt_vmcnt(0) just before the first add.
+        // Each {ids...} corresponds to a chunk of VEC_C vc elements that
+        // share a single m offset (per-row bias).
+        static_ford(bias_issue_space_vec, [&](auto... ids) {
+            constexpr index_t slot_start = u_r_bias(ids...);
+            constexpr index_t vec_slot = slot_start / T::VEC_C;
+            const int m_off = u_gc_m(ids...);
+            auto bv0 = g_bias.template load<1>(bias_row0_base + m_off);
+            v_bias_half_[0][vec_slot] = static_cast<D_ACC>(bv0[0]);
+            auto bv1 = g_bias.template load<1>(bias_row1_base + m_off);
+            v_bias_half_[1][vec_slot] = static_cast<D_ACC>(bv1[0]);
+        });
+    }
+
+    bool bias_waited_ = false;
     auto store_c = [&](auto& vc, int half_tile_m, int half_tile_n) {
         int g_c_offset = c_offset(half_tile_m, half_tile_n);
         int m_base = row + half_tile_m * T::HALF_B_M;
         int n_base = col + half_tile_n * T::HALF_B_N;
+
+        if constexpr (T::HAS_BIAS) {
+            // Wait once on first entry: drain vmcnt for the prefetched bias
+            // buffer_loads. After this all 4 store_c calls reuse the same
+            // bv_half buffers without re-waiting. No s_barrier / lgkmcnt
+            // needed (bias is wave-local; LDS already drained).
+            if (!bias_waited_) {
+                s_waitcnt_vmcnt(0_I);
+                bias_waited_ = true;
+            }
+            const int row_idx = half_tile_m;
+            // Add bias in fp32 acc domain. {ids...} ranges over the same
+            // partition layout used by store_if<VEC_C>; for each chunk
+            // vc[slot_start .. slot_start + VEC_C] share a single m, so we
+            // add the same scalar v_bias_half_[row_idx][vec_slot] to all
+            // VEC_C elements.
+            static_ford(bias_issue_space_vec, [&](auto... ids) {
+                constexpr index_t slot_start = u_r_bias(ids...);
+                constexpr index_t vec_slot = slot_start / T::VEC_C;
+                const D_ACC b = v_bias_half_[row_idx][vec_slot];
+                #pragma unroll
+                for (int j = 0; j < T::VEC_C; ++j) {
+                    vc[slot_start + j] += b;
+                }
+            });
+        }
 
         auto pred = [&](auto... ids) {
             return (m_base + u_gc_m(ids...)) < kargs.m && (n_base + u_gc_n(ids...)) < kargs.n;
@@ -462,5 +567,8 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a8w8_noscale_kerne
     store_c(v_c[0][1], 0, 1);
     store_c(v_c[1][0], 1, 0);
     store_c(v_c[1][1], 1, 1);
+#else
+    // Non-gfx950 device pass: empty stub. See gfx950 branch above.
+#endif // __gfx950__
 #endif // __HIP_DEVICE_COMPILE__
 }

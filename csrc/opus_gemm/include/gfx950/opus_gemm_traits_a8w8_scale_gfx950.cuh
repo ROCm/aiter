@@ -12,7 +12,7 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_>
-struct opus_gemm_a8w8_scale_traits {
+struct opus_gemm_a8w8_scale_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -76,7 +76,7 @@ struct opus_gemm_a8w8_scale_traits {
     static constexpr int sfb_buffer_load_insts = (HALF_B_N / GROUP_N) * (B_K / GROUP_K);
 };
 
-struct opus_gemm_scale_kargs {
+struct opus_gemm_scale_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
