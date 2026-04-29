@@ -214,7 +214,6 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("fused_quant", [False, True])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
@@ -224,7 +223,6 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_swiglu,
-    fused_quant,
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
@@ -244,7 +242,6 @@ def test_op(
     # TODO: Uncomment after pytorch adds support for manual_seed
     # torch.manual_seed(0)
 
-    act_mxfp4 = "mxfloat4_e2m1"
     weight_mxfp4 = "mxfloat4_e2m1"
     weight_dtype_str = weight_mxfp4[2:]
 
@@ -292,10 +289,6 @@ def test_op(
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
-    if not act_mxfp4 and fused_quant:
-        quant_static_scale = ref_y.abs().max().float() / 448.0
-    else:
-        quant_static_scale = None
 
     # run kernel
     tri_y = moe_gemm_a4w4(
@@ -304,7 +297,7 @@ def test_op(
         x_mx_scales_tri,
         w_scale_tri,
         x_static_scale,
-        quant_static_scale,
+        None,
         bias_tri,
         rdata,
         gindx,
@@ -315,6 +308,4 @@ def test_op(
         apply_swiglu,
         backend=backend,
     )
-    if not act_mxfp4 and fused_quant:
-        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)

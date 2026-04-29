@@ -32,8 +32,6 @@ def matmul_launch_metadata(grid, kernel, args):
         ret["name"] += "_bias"
     if args["APPLY_SWIGLU"]:
         ret["name"] += "_swiglu"
-    if args["Quant_static_scale"] is not None:
-        ret["name"] += "_quant"
 
     fM = n_tokens
     fK = K if K is not None else n_tokens
