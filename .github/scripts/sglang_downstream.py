@@ -9,7 +9,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 TESTS = [
     {
         "runner": "linux-aiter-mi35x-8",
@@ -150,7 +149,7 @@ SGLANG_CI_PATCHES = [
 ]
 
 
-PREPARE_MODEL_SCRIPT = r'''
+PREPARE_MODEL_SCRIPT = r"""
 set -ex
 if [ -f "${MODEL_DIR}/.complete" ] || [ -f "${MODEL_DIR}/config.json" ]; then
   echo "Model already cached at ${MODEL_DIR}"
@@ -180,7 +179,7 @@ else
 fi
 echo "Model ready at ${MODEL_DIR}"
 ls -la "${MODEL_DIR}"
-'''
+"""
 
 
 def write_output(name: str, value: str) -> None:
@@ -188,7 +187,9 @@ def write_output(name: str, value: str) -> None:
         output.write(f"{name}={value}\n")
 
 
-def write_summary(selected: list[dict], pr_skipped: list[dict], disabled: list[dict]) -> None:
+def write_summary(
+    selected: list[dict], pr_skipped: list[dict], disabled: list[dict]
+) -> None:
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
         summary.write("## SGLang Downstream Test Selection\n\n")
         summary.write(f"- Selected tests: `{len(selected)}`\n")
