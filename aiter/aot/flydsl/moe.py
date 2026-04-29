@@ -76,6 +76,19 @@ def parse_csv(csv_path: str):
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
+            act_type = row.get("act_type", "")
+            act = (
+                "swiglu"
+                if act_type.strip().split(".")[-1].lower() == "swiglu"
+                else "silu"
+            )
+            q_type = row.get("q_type", "")
+            dtype = row.get("dtype", "")
+            enable_bias = (
+                act == "swiglu"
+                and q_type.strip().split(".")[-1] == "per_1x32"
+                and dtype in ("torch.bfloat16", "torch.float16")
+            )
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -90,6 +103,8 @@ def parse_csv(csv_path: str):
                     "topk": topk,
                     "doweight_stage1": doweight_stage1,
                     "cu_num": cu_num,
+                    "act": act,
+                    "enable_bias": enable_bias,
                 }
                 key = job_identity(job)
                 if key in seen:
@@ -118,6 +133,7 @@ def _precompile_to_cache(
     a_dtype: str = "fp4",
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
+    act: str = "silu",
     doweight_stage1: bool = False,
     waves_per_eu: int = 3,
     k_batch: int = 1,
@@ -127,6 +143,9 @@ def _precompile_to_cache(
     persist: bool = False,
     sort_block_m: int = 0,
     cu_num: int = 0,
+    a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
+    enable_bias: bool = False,
     **kwargs,
 ):
     """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
@@ -140,10 +159,22 @@ def _precompile_to_cache(
 
     dev = torch.device("cpu")
     _stream = 0
-    is_fp4 = b_dtype == "fp4"
+    is_fp4_weight = b_dtype == "fp4"
     tokens = tile_m
     E = experts
     _grid_y = 1
+
+    def _storage_numel(element_count: int, dtype: str) -> int:
+        return element_count // 2 if dtype == "fp4" else element_count
+
+    def _storage_dtype(dtype: str):
+        if dtype in ("fp4", "fp8"):
+            return torch.uint8
+        if dtype in ("fp16", "f16"):
+            return torch.float16
+        if dtype == "bf16":
+            return torch.bfloat16
+        return torch.int8
 
     # Dummy routing tensors (shape matters, data doesn't)
     sorted_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
@@ -161,20 +192,39 @@ def _precompile_to_cache(
         if stage == 1:
 
             _is_splitk = k_batch > 1
-            n_in = inter_dim * 2 if is_fp4 else inter_dim
+            n_in = inter_dim * 2 if is_fp4_weight else inter_dim
             k_in = model_dim
 
-            if is_fp4:
+            if is_fp4_weight:
+                gemm_out_dtype = (
+                    "bf16" if _is_splitk and out_dtype in ("fp4", "fp8") else out_dtype
+                )
+                gemm_out_elems = tokens * topk * inter_dim
+                if _is_splitk:
+                    gemm_out_elems *= 2
                 out = torch.zeros(
-                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(gemm_out_elems, gemm_out_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(gemm_out_dtype),
                 )
-                a = torch.zeros(tokens * model_dim // 2, device=dev, dtype=torch.uint8)
+                a = torch.zeros(
+                    _storage_numel(tokens * model_dim, a_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(a_dtype),
+                )
                 w = torch.zeros(
-                    E * 2 * inter_dim * model_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(E * 2 * inter_dim * model_dim, b_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(b_dtype),
                 )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                a_scale = (
+                    torch.zeros(1, device=dev, dtype=torch.uint8)
+                    if a_dtype in ("fp4", "fp8")
+                    else torch.empty(0, device=dev, dtype=torch.float32)
+                )
                 w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
                 out_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                bias = torch.zeros(1, device=dev, dtype=torch.float32)
                 args = _s1_args_fp4(
                     out,
                     a,
@@ -191,6 +241,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    bias=bias if enable_bias else None,
                     stream=_stream,
                 )
             else:
@@ -231,31 +282,45 @@ def _precompile_to_cache(
                 doweight_stage1=doweight_stage1,
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
-                out_dtype=out_dtype,
+                out_dtype=gemm_out_dtype if is_fp4_weight else out_dtype,
+                act=act,
+                use_async_copy=True,
                 waves_per_eu=waves_per_eu,
                 k_batch=k_batch,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
+                a_scale_one=a_scale_one,
+                xcd_swizzle=xcd_swizzle,
+                enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
 
         elif stage == 2:
 
             accumulate = mode != "reduce"
-            _persist_m = -1 if persist else 4
+            _persist_m = 1 if a_dtype == "fp8" else (-1 if persist else 4)
             n_in = model_dim
             k_in = inter_dim
 
-            if is_fp4:
+            if is_fp4_weight:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
                 a = torch.zeros(
-                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(tokens * topk * inter_dim, a_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(a_dtype),
                 )
                 w = torch.zeros(
-                    E * model_dim * inter_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(E * model_dim * inter_dim, b_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(b_dtype),
                 )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                a_scale = (
+                    torch.zeros(1, device=dev, dtype=torch.uint8)
+                    if a_dtype in ("fp4", "fp8")
+                    else torch.empty(0, device=dev, dtype=torch.float32)
+                )
                 w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                bias = torch.zeros(1, device=dev, dtype=torch.float32)
                 args = _s2_args_fp4(
                     out,
                     a,
@@ -271,6 +336,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    bias=bias if enable_bias else None,
                     stream=_stream,
                 )
             else:
@@ -304,13 +370,16 @@ def _precompile_to_cache(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
-                doweight_stage2=False,
+                doweight_stage2=not doweight_stage1,
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
                 out_dtype=out_dtype,
                 accumulate=accumulate,
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
+                b_nt=b_nt,
+                xcd_swizzle=xcd_swizzle,
+                enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
 
