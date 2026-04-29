@@ -273,7 +273,7 @@ def compile_mixed_moe_gemm1(
     _gm_tag = f"_gm{_stage1_group_size_m}" if _stage1_group_size_m > 1 else ""
     module_name = (
         f"mfma_moe1_{act}_a{a_dtype}_w{b_dtype}_{out_s}{_g_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v36_tidlds{_gm_tag}_g1u0_splitk"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{_fp4q_tag}{_sort_tag}{_async_tag}{_sk_tag}{_go_tag}_v37_tidlds_aread{_gm_tag}_g1u0_splitk"
     ).replace("-", "_")
 
     # -- LDS sizing (split ping/pong allocators) --
@@ -1475,6 +1475,16 @@ def compile_mixed_moe_gemm1(
                                 )
                                 _new_us = _rearrange_b_scale(_new_us)
 
+                        # Pull next-half A LDS reads before B VMEM to increase
+                        # distance to the following half's MFMA consumers.
+                        for _a_j in range_constexpr(len(_pp_a_reads[_p])):
+                            _ak, _ami = _pp_a_reads[_p][_a_j]
+                            _a_all[(_ak, _ami)] = load_a_subtile(
+                                _ak,
+                                _ami,
+                                lds_read,
+                            )
+
                         # B VMEM loads
                         for _b_j in range_constexpr(len(_pp_b_loads[_p])):
                             _b_type, _b_ku, _b_ni = _pp_b_loads[_p][_b_j]
@@ -1492,17 +1502,6 @@ def compile_mixed_moe_gemm1(
                                     up_n_blk_list[_b_ni],
                                     up_n_intra_list[_b_ni],
                                 )
-
-                        # A ds_reads
-                        # rocdl.sched_barrier(0)
-                        for _a_j in range_constexpr(len(_pp_a_reads[_p])):
-                            _ak, _ami = _pp_a_reads[_p][_a_j]
-                            _a_all[(_ak, _ami)] = load_a_subtile(
-                                _ak,
-                                _ami,
-                                lds_read,
-                            )
-                        # rocdl.sched_barrier(0)
 
                         # MFMAs on prev data
                         # rocdl.s_setprio(1)
