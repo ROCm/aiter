@@ -18,11 +18,11 @@ from opus_gemm_common import (
 )
 
 PIPELINE_HEADER_MAP = {
-    "a8w8_scale": "pipeline/opus_gemm_pipeline_a8w8_scale.cuh",
-    "a8w8": "pipeline/opus_gemm_pipeline_a8w8_noscale.cuh",
-    "a16w16": "pipeline/opus_gemm_pipeline_a16w16.cuh",
-    "a16w16_flatmm": "pipeline/opus_gemm_pipeline_a16w16_flatmm.cuh",
-    "a16w16_flatmm_splitk": "pipeline/opus_gemm_pipeline_a16w16_flatmm_splitk.cuh",
+    "a8w8_scale": "gfx950/opus_gemm_pipeline_a8w8_scale_gfx950.cuh",
+    "a8w8": "gfx950/opus_gemm_pipeline_a8w8_noscale_gfx950.cuh",
+    "a16w16": "gfx950/opus_gemm_pipeline_a16w16_gfx950.cuh",
+    "a16w16_flatmm": "gfx950/opus_gemm_pipeline_a16w16_flatmm_gfx950.cuh",
+    "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
 }
 
 KERNEL_FUNC_MAP = {
@@ -53,19 +53,19 @@ NOSCALE_TAGS = {"a8w8", "a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"}
 A16W16_TUNE_TAGS = {"a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"}
 
 TRAITS_NAME_MAP = {
-    "a8w8_scale": "opus_gemm_a8w8_scale_traits",
-    "a8w8": "opus_gemm_a8w8_noscale_traits",
-    "a16w16": "opus_gemm_a16w16_traits",
-    "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits",
-    "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits",
+    "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
+    "a8w8": "opus_gemm_a8w8_noscale_traits_gfx950",
+    "a16w16": "opus_gemm_a16w16_traits_gfx950",
+    "a16w16_flatmm": "opus_gemm_a16w16_flatmm_traits_gfx950",
+    "a16w16_flatmm_splitk": "opus_flatmm_splitk_traits_gfx950",
 }
 
 KARGS_NAME_MAP = {
-    "a8w8_scale": "opus_gemm_scale_kargs",
-    "a8w8": "opus_gemm_noscale_kargs",
-    "a16w16": "opus_gemm_noscale_kargs",
-    "a16w16_flatmm": "opus_gemm_flatmm_kargs",
-    "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs",
+    "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
+    "a8w8": "opus_gemm_noscale_kargs_gfx950",
+    "a16w16": "opus_gemm_noscale_kargs_gfx950",
+    "a16w16_flatmm": "opus_gemm_flatmm_kargs_gfx950",
+    "a16w16_flatmm_splitk": "opus_gemm_flatmm_splitk_kargs_gfx950",
 }
 
 WARP_SIZE = 64
@@ -261,7 +261,7 @@ class opus_gemm_codegen:
     def _validate_a16w16_flatmm(k: OpusGemmInstance):
         """Validate an a16w16_flatmm instance at codegen time.
 
-        Mirrors the static_asserts in opus_gemm_a16w16_flatmm_traits: derives
+        Mirrors the static_asserts in opus_gemm_a16w16_flatmm_traits_gfx950: derives
         pfk from LDS budget / WG_PER_CU and requires pfk >= 3 (depth-1 pipeline
         entry point). Raises ValueError if invalid.
         """
@@ -1059,7 +1059,7 @@ torch::Tensor
     constexpr int REDUCE_VEC = 16;
     constexpr int REDUCE_BS  = 64;
     // Note: no padded_N % REDUCE_VEC check. splitk_reduce_kernel has a tail
-    // path (see splitk_reduce.cuh) that handles the (n_base + VEC > N) case
+    // path (see splitk_reduce_gfx950.cuh) that handles the (n_base + VEC > N) case
     // with per-element scalar stores, so any N (including odd /
     // non-power-of-16) is safe.
     dim3 grid_reduce((N + REDUCE_VEC * REDUCE_BS - 1) / (REDUCE_VEC * REDUCE_BS),

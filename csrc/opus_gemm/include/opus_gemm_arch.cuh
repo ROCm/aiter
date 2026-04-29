@@ -15,10 +15,13 @@
 //   4. Add include + switch case in opus_gemm.cu.
 #pragma once
 
-// torch-free probe. Uses aiter's AITER_CHECK (from aiter_hip_common.h)
-// so the header pulls only hip_runtime + a few stdlib bits, not the
-// ~50K-line <c10/util/Exception.h>.
-#include "aiter_hip_common.h"  // AITER_CHECK + hip_runtime
+// We deliberately include <c10/util/Exception.h> instead of <torch/torch.h>
+// here: TORCH_CHECK is the only thing this header needs from torch, and the
+// full <torch/torch.h> drags in all of ATen + autograd which is much heavier.
+// This file is a near-leaf header; keeping its include cost tiny matters when
+// future opus subpackages start including it.
+#include <hip/hip_runtime.h>
+#include <c10/util/Exception.h>
 
 #include <string>
 #include <utility>
@@ -48,9 +51,9 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
     using namespace opus_arch_detail;
     static const OpusArchInfo info = []() {
         int dev = -1;
-        AITER_CHECK(hipGetDevice(&dev) == hipSuccess, "opus_gemm: hipGetDevice failed");
+        TORCH_CHECK(hipGetDevice(&dev) == hipSuccess, "opus_gemm: hipGetDevice failed");
         hipDeviceProp_t prop{};
-        AITER_CHECK(hipGetDeviceProperties(&prop, dev) == hipSuccess,
+        TORCH_CHECK(hipGetDeviceProperties(&prop, dev) == hipSuccess,
                     "opus_gemm: hipGetDeviceProperties failed");
         std::string name(prop.gcnArchName);
         OpusGfxArch a = OpusGfxArch::Unknown;

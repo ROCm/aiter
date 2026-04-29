@@ -14,10 +14,10 @@
 //                  float; any other 16-bit / 32-bit type that opus::vector_t
 //                  supports also works mechanically because the store path
 //                  dispatches on sizeof(D_OUT).
-//   * HAS_BIAS_  - when true, fold a per-output-feature bias (D_BIAS_ vector
-//                  along N, F.linear convention) into acc before the cast to
-//                  D_OUT. Defaults off so the no-bias template instantiation
-//                  stays binary-identical to the pre-bias code path.
+//   * HAS_BIAS_  - when true, fold a per-row bias (D_BIAS_ scalar) into acc
+//                  before the cast to D_OUT. Defaults off so the no-bias
+//                  template instantiation stays binary-identical to the
+//                  pre-bias code path.
 //   * D_BIAS_    - bias element type. Currently 2B (bf16) or 4B (fp32). Must
 //                  match the on-disk bias buffer dtype; mirrors the user-
 //                  facing "match D_OUT" convention but is template-distinct
@@ -47,26 +47,36 @@
 //                          linear byte offset, not per-row column bounds).
 //
 // Bias semantics (HAS_BIAS_=true):
-//   * Bias is per-output-feature (per-N, F.linear convention), so each
-//     thread loads VEC bias values at its own n_base offset. We use
-//     buffer_load (VGPR vmem) rather than the old SGPR s_load_dword
-//     pattern because the bias value differs per thread.
-//   * Layout: bias_stride_batch = 0 means [N] (broadcast across batch);
-//     bias_stride_batch = N means [batch, N]. The kernel reads
-//     `b * stride_bias_batch + n_base` and is shape-agnostic.
-//   * Issue order: bias buffer_load is fired BEFORE the split-K vmcnt
-//     accumulation so it overlaps with the vmem reduction. vmcnt(0) at
-//     the end of the split-K loop drains both workspace and bias loads.
-//   * Math is done in fp32 on top of the existing acc[VEC] before the
-//     cast, so precision matches the existing fp32 reduction.
+//   * Bias is per-row (per-m), so every thread in a block (which fixes one
+//     (b, m) pair via block_id_y = bm_id) reads the SAME scalar. We use an
+//     SGPR scalar load (s_load_dword) instead of a per-thread vmem buffer
+//     load -- this matches the load_sfb pattern in a8w8_scale and avoids
+//     redundant L1 traffic.
+//   * bias_ptr is forwarded as the host-computed `ptr_bias`; the inline asm
+//     "s" constraint lets the compiler readfirstlane the address into an
+//     SGPR pair (no manual move needed).
+//   * bf16 bias: s_load_dword is 4B-aligned, so we issue the load at byte
+//     offset (m >> 1) * 4 (which fetches bf16[m&~1] and bf16[m|1]) and pick
+//     the correct half via (m & 1). bf16 -> fp32 is `<<16`. Out-of-range
+//     reads on the "other" half are safe because the kargs-side buffer is
+//     contiguous M (or batch*M) elements wide; the unused half is dropped.
+//   * fp32 bias: a single dword via s_load_dword + bit_cast to float.
+//   * Layout: bias_stride_batch = 0 means [M] (broadcast across batch);
+//     bias_stride_batch = M means [batch, M]. The kernel only reads
+//     `b * stride_bias_batch + m` and is shape-agnostic.
+//   * Issue order: s_load is fired BEFORE the split-K vmcnt accumulation
+//     loop. lgkmcnt(0) is awaited just before the bias add, by which time
+//     the vmem accumulation has already drained on its own (vmcnt(0) inside
+//     g_ws.load loop). The two counters are independent so the bias load
+//     overlaps the entire split-K loop.
+//   * Math is done in fp32 on top of the existing acc[VEC] before the cast,
+//     so precision matches the existing fp32 reduction (no bf16 round-trip).
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
-#include <cstdint>   // uint16_t / uint32_t used by the bias-fold and bf16 store paths
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
-         bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT,
-         bool HAS_OOB_ = true>
+         bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT>
 __global__ void splitk_reduce_kernel(
     const float* __restrict__ workspace,
     D_OUT*       __restrict__ c_out,
@@ -82,7 +92,6 @@ __global__ void splitk_reduce_kernel(
     constexpr int VEC   = VEC_;
     constexpr int BLOCK = BLOCK_;
     constexpr bool HAS_BIAS = HAS_BIAS_;
-    constexpr bool HAS_OOB = HAS_OOB_;
     using D_BIAS = D_BIAS_;
 
     // STEP = elements per buffer_store_dwordx4. STEP * sizeof(D_OUT) == 16.
@@ -105,27 +114,28 @@ __global__ void splitk_reduce_kernel(
     const int b = bm_id / M;
     const int m = bm_id - b * M;
 
-    // ── Bias prefetch (per-N vector load) ──────────────────────────────────
-    // Bias is per-output-feature [N] (F.linear convention). Each thread
-    // loads VEC bias values at its own n_base. Fired before the split-K
-    // accumulation so the vmem loads overlap.
-    opus::vector_t<float, VEC> bias_fp32;
+    // ── Bias prefetch (SGPR scalar load) ──────────────────────────────────
+    // Fired BEFORE the split-K vmcnt accumulation so it overlaps with the
+    // vmem reduction. The single dword lands in an SGPR; we extract the bf16
+    // half (or read the fp32 directly) into a fp32 scalar after the loop
+    // once lgkmcnt has drained.
+    float bias_fp32 = 0.0f;
+    uint32_t bias_dword = 0;
     if constexpr (HAS_BIAS) {
-        #pragma unroll
-        for (int t = 0; t < VEC; ++t) bias_fp32[t] = 0.0f;
-        const D_BIAS* bias_base_ptr = bias + b * bias_stride_batch;
-        auto g_bias = opus::make_gmem(bias_base_ptr,
-                        (unsigned int)((bias_stride_batch ? bias_stride_batch : N)
-                                       * sizeof(D_BIAS)));
-        // Load VEC bias elements as groups of 4 (buffer_load_dwordx4 for
-        // fp32; buffer_load_b64 pairs for bf16 -- opus::load handles both).
-        #pragma unroll
-        for (int g = 0; g < VEC / 4; ++g) {
-            auto bv4 = g_bias.template load<4>(n_base + g * 4);
-            #pragma unroll
-            for (int j = 0; j < 4; ++j)
-                bias_fp32[g * 4 + j] = static_cast<float>(bv4[j]);
-        }
+        // Host-side ptr already has any allocator-base offset baked in. We
+        // add the per-batch row offset here so the SGPR address is exactly
+        // the row's bf16 / fp32 base; b * stride_bias_batch collapses to 0
+        // when stride_bias_batch=0 (broadcast [M]).
+        const D_BIAS* bias_row_ptr = bias + b * bias_stride_batch;
+        // Byte offset to the dword that contains bias[m]. For bf16 this
+        // covers bias[m & ~1] and bias[m | 1]; for fp32 it's bias[m] alone.
+        const int byte_offset = (sizeof(D_BIAS) == 2)
+            ? ((m >> 1) * 4)
+            : (m * 4);
+        asm volatile("s_load_dword %0, %1, %2\n\t"
+                     : "=s"(bias_dword)
+                     : "s"(bias_row_ptr), "s"(byte_offset)
+                     : "memory");
     }
 
     const int  ws_row_base  = b * padded_M * padded_N + m * padded_N + n_base;
@@ -149,12 +159,23 @@ __global__ void splitk_reduce_kernel(
     }
 
     if constexpr (HAS_BIAS) {
-        // Bias vmem loads were issued before the split-K loop. By the time
-        // the loop finishes (vmcnt(0) inside g_ws.load), all bias loads
-        // have also drained (they share the same vmcnt counter). No
-        // additional wait is needed.
+        // Wait on the scalar load issued at the head of the kernel. The
+        // split-K vmem accumulation above is on vmcnt and is unaffected.
+        asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+
+        if constexpr (sizeof(D_BIAS) == 4) {
+            bias_fp32 = __builtin_bit_cast(float, bias_dword);
+        } else {
+            // bf16: pick high or low 16 bits depending on m parity. bf16 ->
+            // fp32 is "shift left 16" because bf16 is the high half of fp32.
+            const uint16_t half = (m & 1) ? static_cast<uint16_t>(bias_dword >> 16)
+                                          : static_cast<uint16_t>(bias_dword & 0xffffu);
+            const uint32_t bf32 = static_cast<uint32_t>(half) << 16;
+            bias_fp32 = __builtin_bit_cast(float, bf32);
+        }
+
         #pragma unroll
-        for (int t = 0; t < VEC; ++t) acc[t] += bias_fp32[t];
+        for (int t = 0; t < VEC; ++t) acc[t] += bias_fp32;
     }
 
     opus::vector_t<D_OUT, VEC> out;
@@ -165,88 +186,31 @@ __global__ void splitk_reduce_kernel(
                                (unsigned int)((size_t)batch * M * N * sizeof(D_OUT)));
     const int c_idx = b * M * N + m * N + n_base;  // in D_OUT elements
 
-    // Store-path macro helpers (compile-time offsets -> buffer_store_dwordx4/x2/dword/short).
-    using opus::slice;
-    using opus::number;
-#define OPUS_REDUCE_ST8(OFF) g_c.template store<8>(slice(out, number<OFF>{}, number<OFF+8>{}), c_idx + (OFF))
-#define OPUS_REDUCE_ST4(OFF) g_c.template store<4>(slice(out, number<OFF>{}, number<OFF+4>{}), c_idx + (OFF))
-#define OPUS_REDUCE_ST2(OFF) g_c.template store<2>(slice(out, number<OFF>{}, number<OFF+2>{}), c_idx + (OFF))
-#define OPUS_REDUCE_ST1(OFF) g_c.template store<1>(out[OFF], c_idx + (OFF))
-
-    if constexpr (!HAS_OOB) {
-        // Non-OOB: N is tile-aligned so no partial-VEC tail, but still
-        // need to skip threads whose n_base is past N (reduce grid is
-        // over-provisioned: grid.x = ceil(N, VEC*BLOCK)).
-        if (n_base + VEC <= N) {
-            opus::static_for<VEC / STEP>([&](auto g_c_idx) {
-                constexpr int g = decltype(g_c_idx)::value;
-                g_c.template store<STEP>(
-                    slice(out, number<g * STEP>{}, number<(g + 1) * STEP>{}),
-                    c_idx + g * STEP);
-            });
+    if (n_base + VEC <= N) {
+        // Fast path: entire VEC chunk is in-row -> VEC/STEP x buffer_store_dwordx4.
+        // static_for promotes the loop index to constexpr so opus::slice's
+        // compile-time bounds (opus::number<>) can be formed.
+        opus::static_for<VEC / STEP>([&](auto g_c_idx) {
+            constexpr int g = decltype(g_c_idx)::value;
+            g_c.template store<STEP>(
+                opus::slice(out,
+                            opus::number<g * STEP>{},
+                            opus::number<(g + 1) * STEP>{}),
+                c_idx + g * STEP);
+        });
+    } else if (n_base < N) {
+        // Tail path: only the first `valid` elements of the VEC chunk are in
+        // row m. Scalar-store them one by one; the remaining (VEC - valid)
+        // elements would otherwise spill into row m+1 via a 128-bit vector
+        // store (buffer rsrc cannot catch this because the target byte offset
+        // is still < rsrc.size in a row-major tensor).
+        const int valid = N - n_base;
+        #pragma unroll
+        for (int j = 0; j < VEC; ++j) {
+            if (j < valid) g_c.template store<1>(out[j], c_idx + j);
         }
-    } else {
-        if (n_base + VEC <= N) {
-            // Fast path: entire VEC chunk is in-row.
-            opus::static_for<VEC / STEP>([&](auto g_c_idx) {
-                constexpr int g = decltype(g_c_idx)::value;
-                g_c.template store<STEP>(
-                    slice(out, number<g * STEP>{}, number<(g + 1) * STEP>{}),
-                    c_idx + g * STEP);
-            });
-        } else if (n_base < N) {
-            // Tail path: decompose valid ∈ [1, VEC-1] into descending
-            // power-of-2 chunks so we emit dwordx4/dwordx2/dword/short
-            // instead of VEC scalar stores.
-            // Ref: demon_gcn/opus_gemm/mxfp8_e8m0/gemm_mxfp_a8w8_1d1d.hpp
-            static_assert(VEC == 16, "reduce tail switch assumes VEC=16");
-            const int valid = N - n_base;
-            if constexpr (sizeof(D_OUT) == 2) {
-                // bf16: STEP=8, store<8>=dwordx4, store<4>=dwordx2, store<2>=dword, store<1>=short
-                switch (valid) {
-                    case  1: OPUS_REDUCE_ST1( 0); break;
-                    case  2: OPUS_REDUCE_ST2( 0); break;
-                    case  3: OPUS_REDUCE_ST2( 0); OPUS_REDUCE_ST1( 2); break;
-                    case  4: OPUS_REDUCE_ST4( 0); break;
-                    case  5: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST1( 4); break;
-                    case  6: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); break;
-                    case  7: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); OPUS_REDUCE_ST1( 6); break;
-                    case  8: OPUS_REDUCE_ST8( 0); break;
-                    case  9: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST1( 8); break;
-                    case 10: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST2( 8); break;
-                    case 11: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST2( 8); OPUS_REDUCE_ST1(10); break;
-                    case 12: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); break;
-                    case 13: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST1(12); break;
-                    case 14: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); break;
-                    case 15: OPUS_REDUCE_ST8( 0); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); OPUS_REDUCE_ST1(14); break;
-                }
-            } else {
-                // fp32: STEP=4, store<4>=dwordx4, store<2>=dwordx2, store<1>=dword
-                switch (valid) {
-                    case  1: OPUS_REDUCE_ST1( 0); break;
-                    case  2: OPUS_REDUCE_ST2( 0); break;
-                    case  3: OPUS_REDUCE_ST2( 0); OPUS_REDUCE_ST1( 2); break;
-                    case  4: OPUS_REDUCE_ST4( 0); break;
-                    case  5: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST1( 4); break;
-                    case  6: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); break;
-                    case  7: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); OPUS_REDUCE_ST1( 6); break;
-                    case  8: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); break;
-                    case  9: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST1( 8); break;
-                    case 10: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST2( 8); break;
-                    case 11: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST2( 8); OPUS_REDUCE_ST1(10); break;
-                    case 12: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); break;
-                    case 13: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST1(12); break;
-                    case 14: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); break;
-                    case 15: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST4( 4); OPUS_REDUCE_ST4( 8); OPUS_REDUCE_ST2(12); OPUS_REDUCE_ST1(14); break;
-                }
-            }
-        }
-        // else: whole VEC chunk is past N -> write nothing.
     }
-#undef OPUS_REDUCE_ST8
-#undef OPUS_REDUCE_ST4
-#undef OPUS_REDUCE_ST2
-#undef OPUS_REDUCE_ST1
+    // else: whole VEC chunk is past N -> write nothing.
 #else
     // Non-gfx950 device pass: empty stub. See gfx950 branch above.
 #endif  // __gfx950__
