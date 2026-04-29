@@ -74,6 +74,7 @@
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
+#include <cstdint>   // uint16_t / uint32_t used by the bias-fold and bf16 store paths
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT>

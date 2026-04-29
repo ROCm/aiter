@@ -348,6 +348,9 @@
         "flags_extra_hip": [
             "'-mllvm --amdgpu-mfma-vgpr-form'"
         ],
+        "flags_extra_hip_per_source": {
+            "*.device.cu": ["-D__HIPCC_RTC__"]
+        },
         "md_name": "'module_deepgemm_opus'",
         "extra_ldflags": "None",
         "extra_include": [
