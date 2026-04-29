@@ -70,12 +70,14 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            token = int(row["token"])
             model_dim = int(row["model_dim"])
             inter_dim = int(row["inter_dim"])
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
+            block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
             act = (
                 "swiglu"
@@ -106,17 +108,22 @@ def parse_csv(csv_path: str):
                     "act": act,
                     "enable_bias": enable_bias,
                 }
-                key = job_identity(job)
-                if key in seen:
-                    continue
-                seen.add(key)
-
                 params = get_flydsl_kernel_params(name)
                 if params is None:
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
 
-                jobs.append({**job, **params})
+                if params["stage"] == 2:
+                    job["token_num"] = token
+                    job["block_m"] = block_m
+
+                full_job = {**job, **params}
+                key = job_identity(full_job)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                jobs.append(full_job)
 
     return jobs
 
@@ -140,9 +147,11 @@ def _precompile_to_cache(
     b_nt: int = 2,
     gate_mode: str = "separated",
     mode: str = "atomic",
-    persist: bool = False,
+    persist=None,
     sort_block_m: int = 0,
     cu_num: int = 0,
+    token_num: int = 0,
+    block_m: int = 0,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
@@ -175,6 +184,76 @@ def _precompile_to_cache(
         if dtype == "bf16":
             return torch.bfloat16
         return torch.int8
+
+    def _runtime_sort_blocks() -> int:
+        # Match fused_moe.moe_sorting allocation for sorted_expert_ids.
+        token_count = token_num if token_num > 0 else tokens
+        sorting_block_m = block_m if block_m > 0 else tile_m
+        max_tokens_padded = token_count * topk + E * sorting_block_m - topk
+        return (max_tokens_padded + sorting_block_m - 1) // sorting_block_m
+
+    def _runtime_stage2_m_blocks() -> int:
+        token_count = token_num if token_num > 0 else tokens
+        _sbm = sort_block_m if sort_block_m > 0 else tile_m
+        sort_blocks = _runtime_sort_blocks()
+        if _sbm == tile_m:
+            return min(sort_blocks, token_count * topk)
+        total_sorted = sort_blocks * _sbm
+        return (total_sorted + tile_m - 1) // tile_m
+
+    def _precompile_silu_fused(gemm_out_dtype: str):
+        if k_batch <= 1:
+            return
+        if gemm_out_dtype not in ("fp4", "fp8"):
+            quant_mode = "none"
+        else:
+            quant_mode = gemm_out_dtype
+
+        from aiter.ops.flydsl.kernels.silu_and_mul_fq import (
+            build_silu_and_mul_fq_module,
+        )
+
+        silu_fused = build_silu_and_mul_fq_module(
+            inter_dim,
+            topk,
+            quant_mode,
+            gate_mode == "interleave",
+        )
+        sorted_len = max(tokens * topk, _runtime_sort_blocks() * tile_m)
+        padded_cols = ((inter_dim // 32) + 7) // 8 * 8
+        scale_rows = (sorted_len + 255) // 256 * 256
+        tmp_out = torch.zeros(
+            tokens * topk * inter_dim * 2, device=dev, dtype=torch.bfloat16
+        )
+        out_buf = torch.zeros(
+            (
+                tokens * topk * inter_dim * 2
+                if quant_mode == "none"
+                else _storage_numel(tokens * topk * inter_dim, quant_mode)
+            ),
+            device=dev,
+            dtype=torch.uint8,
+        )
+        out_scale_sorted = torch.zeros(
+            scale_rows * padded_cols,
+            device=dev,
+            dtype=torch.uint8,
+        )
+        sorted_token_ids = torch.zeros(sorted_len, device=dev, dtype=torch.int32)
+        num_valid = torch.zeros(1, device=dev, dtype=torch.int32)
+        _run_compiled(
+            silu_fused,
+            (
+                tmp_out.view(-1, inter_dim * 2),
+                out_buf.view(-1),
+                out_scale_sorted,
+                sorted_token_ids,
+                num_valid,
+                tokens,
+                sorted_len,
+                _stream,
+            ),
+        )
 
     # Dummy routing tensors (shape matters, data doesn't)
     sorted_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
@@ -294,11 +373,21 @@ def _precompile_to_cache(
                 enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
+            if is_fp4_weight:
+                _precompile_silu_fused(out_dtype)
 
         elif stage == 2:
 
             accumulate = mode != "reduce"
-            _persist_m = 1 if a_dtype == "fp8" else (-1 if persist else 4)
+            _m_blocks = _runtime_stage2_m_blocks()
+            if persist is True:
+                _persist_m = -1
+            elif persist is False:
+                _persist_m = 4 if _m_blocks > 256 else 1
+            else:
+                _persist_m = -1 if _m_blocks > 256 else 1
+            if a_dtype == "fp8":
+                _persist_m = 1
             n_in = model_dim
             k_in = inter_dim
 
@@ -334,7 +423,7 @@ def _precompile_to_cache(
                     tokens,
                     n_in,
                     k_in,
-                    _grid_y,
+                    _m_blocks,
                     dev,
                     bias=bias if enable_bias else None,
                     stream=_stream,
