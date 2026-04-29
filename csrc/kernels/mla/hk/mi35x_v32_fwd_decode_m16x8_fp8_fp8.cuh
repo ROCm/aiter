@@ -116,6 +116,34 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges>    p_mfma;
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges>    oaccu;
 
+    // PV-only 1-mfma sub-views over the same VGPRs as kv_0/kv_1/kv_0_alt/kv_1_alt.
+    // Each is one 16x32 fp8 tile (2 vgprs/lane) so mma_ABt issues exactly 1 mfma.
+    using kv_0_top_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_0_begin + 0, k_kv_0_begin + 1>>, 2>;
+    using kv_0_bot_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_0_begin + 2, k_kv_0_begin + 3>>, 2>;
+    using kv_1_top_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_1_begin + 0, k_kv_1_begin + 1>>, 2>;
+    using kv_1_bot_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_1_begin + 2, k_kv_1_begin + 3>>, 2>;
+    using kv_0_alt_top_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_0_alt_begin + 0, k_kv_0_alt_begin + 1>>, 2>;
+    using kv_0_alt_bot_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_0_alt_begin + 2, k_kv_0_alt_begin + 3>>, 2>;
+    using kv_1_alt_top_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_1_alt_begin + 0, k_kv_1_alt_begin + 1>>, 2>;
+    using kv_1_alt_bot_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_1_alt_begin + 2, k_kv_1_alt_begin + 3>>, 2>;
+
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_top_ranges>     kv_0_top;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_bot_ranges>     kv_0_bot;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_top_ranges>     kv_1_top;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_bot_ranges>     kv_1_bot;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_alt_top_ranges> kv_0_alt_top;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_alt_bot_ranges> kv_0_alt_bot;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_alt_top_ranges> kv_1_alt_top;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_alt_bot_ranges> kv_1_alt_bot;
+
     // Runtime constants
     const uint32_t warp_idx           = __builtin_amdgcn_readfirstlane(threadIdx.x / opus::get_warp_size());
     const uint32_t lane_idx           = opus::lane_id();
@@ -443,46 +471,6 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
             const uintptr_t p_lds_o    = kDoEpilogue ? p_lds_kv_next : 0;
             const float reci_row_sum_e = kDoEpilogue ? (1.0f / row_sum_e) : .0f;
 
-            if constexpr((kSkipCompute == false) && (kIsFirstIter == false))
-            {
-                __builtin_amdgcn_s_setprio(3);
-                hk::mul_vgpr<0, 0>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 1>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 2>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 3>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 4>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 5>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 6>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 7>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(2);
-                hk::mul_vgpr<0, 8>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 9>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 10>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 11>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 12>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 13>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 14>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 15>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(1);
-                hk::mul_vgpr<0, 16>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 17>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 18>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 19>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 20>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 21>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 22>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 23>(oaccu, oaccu, rescale);
-                __builtin_amdgcn_s_setprio(0);
-                hk::mul_vgpr<0, 24>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 25>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 26>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 27>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 28>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 29>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 30>(oaccu, oaccu, rescale);
-                hk::mul_vgpr<0, 31>(oaccu, oaccu, rescale);
-            }
-
             // Wait for transpose V to complete
             // asm volatile("s_waitcnt lgkmcnt(0)");
             // __builtin_amdgcn_s_barrier();
@@ -513,6 +501,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 4, true>();
                 pack_4f32_to_fp8<k_p_mfma_begin + 1, k_p_comp_begin + 6, false>();
 
+                // 2-buffer rotation prologue: pre-scale the very first sub-tile (m=0, e0_a)
+                // so the first PV mfma below sees an already-rescaled C operand.
+                if constexpr(kIsFirstIter == false)
+                {
+                    hk::mul_vgpr<0, 0>(oaccu, oaccu, rescale);
+                }
+
                 asm volatile("s_waitcnt lgkmcnt(0)");
                 kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_begin, k_kv_0_begin + 2>();
                 kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_1_begin, k_kv_1_begin + 2>();
@@ -523,23 +518,38 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 constexpr uint32_t tile_odd       = tile_even + 1;     // 1,3,5,7
                 constexpr uint32_t tile_next_even = tile_even + 2;     // next macro's even tile
                 constexpr bool     has_next_even  = tile_next_even < num_pv_iter;
+                constexpr uint32_t scale_base     = m.value * 8;       // mul_vgpr<0, scale_base+k>
 
                 constexpr uint32_t oaccu_base_even = k_o_begin + tile_even * 8 * 2;
                 constexpr uint32_t oaccu_base_odd  = k_o_begin + tile_odd  * 8 * 2;
 
-                using oaccu_e_0 = hkdart::split_many_t<
-                    hkdart::type_list<hkdart::range<oaccu_base_even + 0, oaccu_base_even + 7>>, 4>;
-                using oaccu_e_1 = hkdart::split_many_t<
-                    hkdart::type_list<hkdart::range<oaccu_base_even + 8, oaccu_base_even + 15>>, 4>;
-                using oaccu_o_0 = hkdart::split_many_t<
-                    hkdart::type_list<hkdart::range<oaccu_base_odd  + 0, oaccu_base_odd  + 7>>, 4>;
-                using oaccu_o_1 = hkdart::split_many_t<
-                    hkdart::type_list<hkdart::range<oaccu_base_odd  + 8, oaccu_base_odd  + 15>>, 4>;
+                // Each sub-tile is one 16x16 mfma worth of accum (4 vgprs).
+                using oaccu_e0_a_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_even +  0, oaccu_base_even +  3>>, 4>;
+                using oaccu_e0_b_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_even +  4, oaccu_base_even +  7>>, 4>;
+                using oaccu_e1_a_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_even +  8, oaccu_base_even + 11>>, 4>;
+                using oaccu_e1_b_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_even + 12, oaccu_base_even + 15>>, 4>;
+                using oaccu_o0_a_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_odd  +  0, oaccu_base_odd  +  3>>, 4>;
+                using oaccu_o0_b_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_odd  +  4, oaccu_base_odd  +  7>>, 4>;
+                using oaccu_o1_a_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_odd  +  8, oaccu_base_odd  + 11>>, 4>;
+                using oaccu_o1_b_r = hkdart::split_many_t<
+                    hkdart::type_list<hkdart::range<oaccu_base_odd  + 12, oaccu_base_odd  + 15>>, 4>;
 
-                hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_e_0> oaccu_e0;
-                hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_e_1> oaccu_e1;
-                hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_o_0> oaccu_o0;
-                hk::art<comp_t, T::kBlockK, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_o_1> oaccu_o1;
+                // 1 mfma per mma_ABt: D shape = kTileM x kTileM = 16x16.
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_e0_a_r> oaccu_e0_a;
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_e0_b_r> oaccu_e0_b;
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_e1_a_r> oaccu_e1_a;
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_e1_b_r> oaccu_e1_b;
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_o0_a_r> oaccu_o0_a;
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_o0_b_r> oaccu_o0_b;
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_o1_a_r> oaccu_o1_a;
+                hk::art<comp_t, T::kTileM, T::kTileM, hk::col_l, hk::rt_16x16_s, oaccu_o1_b_r> oaccu_o1_b;
 
                 if constexpr(kSkipCompute == false)
                 {
@@ -556,13 +566,25 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
                     if constexpr(kIsFirstIter)
                     {
-                        hk::mma_ABt(oaccu_e0, kv_0, p_mfma);
-                        hk::mma_ABt(oaccu_e1, kv_1, p_mfma);
+                        // No rescale on the first KV chunk -- back-to-back 1-mfma calls.
+                        hk::mma_ABt(oaccu_e0_a, kv_0_top, p_mfma);
+                        hk::mma_ABt(oaccu_e0_b, kv_0_bot, p_mfma);
+                        hk::mma_ABt(oaccu_e1_a, kv_1_top, p_mfma);
+                        hk::mma_ABt(oaccu_e1_b, kv_1_bot, p_mfma);
                     }
                     else
                     {
-                        hk::mma_ABt(oaccu_e0, kv_0, p_mfma, oaccu_e0);
-                        hk::mma_ABt(oaccu_e1, kv_1, p_mfma, oaccu_e1);
+                        // 2-buffer rotation: e0_a was already scaled (prologue OR prev macro's tail).
+                        // After each mfma, scale the next sub-tile so it settles on the VALU pipe
+                        // while the MFMA pipe is busy with this mfma's 12-cycle dispatch.
+                        hk::mma_ABt(oaccu_e0_a, kv_0_top, p_mfma, oaccu_e0_a);
+                        hk::mul_vgpr<0, scale_base + 1>(oaccu, oaccu, rescale);  // -> e0_b
+                        hk::mma_ABt(oaccu_e0_b, kv_0_bot, p_mfma, oaccu_e0_b);
+                        hk::mul_vgpr<0, scale_base + 2>(oaccu, oaccu, rescale);  // -> e1_a
+                        hk::mma_ABt(oaccu_e1_a, kv_1_top, p_mfma, oaccu_e1_a);
+                        hk::mul_vgpr<0, scale_base + 3>(oaccu, oaccu, rescale);  // -> e1_b
+                        hk::mma_ABt(oaccu_e1_b, kv_1_bot, p_mfma, oaccu_e1_b);
+                        hk::mul_vgpr<0, scale_base + 4>(oaccu, oaccu, rescale);  // -> o0_a (odd half)
                     }
 
                     asm volatile("s_waitcnt lgkmcnt(0)");
@@ -581,37 +603,41 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                         kv_manager.template load_transposed_v_to_gpr<16, kColNxt0, k_kv_0_begin + 2>(p_lds_kv_curr);
                         kv_manager.template load_transposed_v_to_gpr<0,  kColNxt1, k_kv_1_begin>    (p_lds_kv_curr);
                         kv_manager.template load_transposed_v_to_gpr<16, kColNxt1, k_kv_1_begin + 2>(p_lds_kv_curr);
+                    }
 
-                        if constexpr(kIsFirstIter)
-                        {
-                            hk::mma_ABt(oaccu_o0, kv_0_alt, p_mfma);
-                            hk::mma_ABt(oaccu_o1, kv_1_alt, p_mfma);
-                        }
-                        else
-                        {
-                            hk::mma_ABt(oaccu_o0, kv_0_alt, p_mfma, oaccu_o0);
-                            hk::mma_ABt(oaccu_o1, kv_1_alt, p_mfma, oaccu_o1);
-                        }
+                    if constexpr(kIsFirstIter)
+                    {
+                        hk::mma_ABt(oaccu_o0_a, kv_0_alt_top, p_mfma);
+                        hk::mma_ABt(oaccu_o0_b, kv_0_alt_bot, p_mfma);
+                        hk::mma_ABt(oaccu_o1_a, kv_1_alt_top, p_mfma);
+                        hk::mma_ABt(oaccu_o1_b, kv_1_alt_bot, p_mfma);
+                    }
+                    else
+                    {
+                        // o0_a was scaled at the tail of the even half above.
+                        hk::mma_ABt(oaccu_o0_a, kv_0_alt_top, p_mfma, oaccu_o0_a);
+                        hk::mul_vgpr<0, scale_base + 5>(oaccu, oaccu, rescale);  // -> o0_b
+                        hk::mma_ABt(oaccu_o0_b, kv_0_alt_bot, p_mfma, oaccu_o0_b);
+                        hk::mul_vgpr<0, scale_base + 6>(oaccu, oaccu, rescale);  // -> o1_a
+                        hk::mma_ABt(oaccu_o1_a, kv_1_alt_top, p_mfma, oaccu_o1_a);
+                        hk::mul_vgpr<0, scale_base + 7>(oaccu, oaccu, rescale);  // -> o1_b
+                        hk::mma_ABt(oaccu_o1_b, kv_1_alt_bot, p_mfma, oaccu_o1_b);
 
+                        // Hand off to next macro: scale its first sub-tile (e0_a).
+                        // Skipped on the final macro -- nothing follows the last mfma.
+                        if constexpr(has_next_even)
+                        {
+                            hk::mul_vgpr<0, scale_base + 8>(oaccu, oaccu, rescale);  // -> next macro's e0_a
+                        }
+                    }
+
+                    if constexpr(has_next_even)
+                    {
                         asm volatile("s_waitcnt lgkmcnt(0)");
                         kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_0_begin,
                                                                               k_kv_0_begin + 2>();
                         kv_manager.template finalize_load_transposed_v_to_gpr<k_kv_1_begin,
                                                                               k_kv_1_begin + 2>();
-                    }
-                    else
-                    {
-                        // Final macro-iter: no next tile to prefetch, just consume tile_odd.
-                        if constexpr(kIsFirstIter)
-                        {
-                            hk::mma_ABt(oaccu_o0, kv_0_alt, p_mfma);
-                            hk::mma_ABt(oaccu_o1, kv_1_alt, p_mfma);
-                        }
-                        else
-                        {
-                            hk::mma_ABt(oaccu_o0, kv_0_alt, p_mfma, oaccu_o0);
-                            hk::mma_ABt(oaccu_o1, kv_1_alt, p_mfma, oaccu_o1);
-                        }
                     }
                 }
 
@@ -620,10 +646,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     constexpr uint32_t col_off_even = tile_even * (T::kBlockK * 2);
                     constexpr uint32_t col_off_odd  = tile_odd  * (T::kBlockK * 2);
 
-                    hk::mul_vgpr(oaccu_e0, oaccu_e0, reci_row_sum_e);
-                    hk::mul_vgpr(oaccu_e1, oaccu_e1, reci_row_sum_e);
-                    hk::mul_vgpr(oaccu_o0, oaccu_o0, reci_row_sum_e);
-                    hk::mul_vgpr(oaccu_o1, oaccu_o1, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_e0_a, oaccu_e0_a, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_e0_b, oaccu_e0_b, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_e1_a, oaccu_e1_a, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_e1_b, oaccu_e1_b, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_o0_a, oaccu_o0_a, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_o0_b, oaccu_o0_b, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_o1_a, oaccu_o1_a, reci_row_sum_e);
+                    hk::mul_vgpr(oaccu_o1_b, oaccu_o1_b, reci_row_sum_e);
 
                     if constexpr(kEpilogueType == PvGemmEpilogueType::OutputFinal)
                     {
