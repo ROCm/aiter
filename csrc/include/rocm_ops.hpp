@@ -438,6 +438,21 @@ namespace py = pybind11;
           py::arg("reg_ptr"),                                                                  \
           py::arg("reg_bytes"),                                                                \
           py::arg("use_1stage"));                                                              \
+    m.def("fused_allreduce_rmsnorm_quant_per_group",                                            \
+          &aiter::fused_allreduce_rmsnorm_quant_per_group,                                      \
+          py::arg("_fa"),                                                                       \
+          py::arg("inp"),                                                                       \
+          py::arg("res_inp"),                                                                   \
+          py::arg("res_out"),                                                                   \
+          py::arg("out"),                                                                       \
+          py::arg("scale_out"),                                                                 \
+          py::arg("w"),                                                                         \
+          py::arg("eps"),                                                                       \
+          py::arg("group_size"),                                                                \
+          py::arg("reg_ptr"),                                                                   \
+          py::arg("reg_bytes"),                                                                 \
+          py::arg("use_1stage"),                                                                \
+          py::arg("bf16_out_ptr") = static_cast<int64_t>(0));                                   \
     m.def("dispose", &aiter::dispose, py::arg("_fa"));                                         \
     m.def("meta_size", &aiter::meta_size);                                                     \
     m.def("register_input_buffer",                                                             \
