@@ -37,74 +37,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  build_vllm_image:
-    name: Build vLLM Image
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.draft == false &&
-      (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
-      contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: [check-signal]
-    runs-on: build-only-aiter
-
-    steps:
-      - name: Checkout aiter repo
-        uses: actions/checkout@v4
-    
-      - name: Sync submodules
-        run: |
-          set -e
-          git submodule sync
-          git submodule update --init --recursive --depth 1 --jobs 4
-
-      - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Download the vLLM base image
-        run: |
-          docker pull ${{ env.BASE_IMAGE }}
-      
-      - name: Generate Dockerfile
-        run: |
-          cat <<EOF > Dockerfile.mod
-          FROM ${{ env.BASE_IMAGE }}
-
-          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
-          RUN pip uninstall -y aiter
-          RUN pip config set global.default-timeout 60 \
-              && pip config set global.retries 10
-          RUN pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
-          RUN pip install --upgrade "pybind11>=3.0.1"
-          RUN pip show pybind11
-
-          RUN git clone ${{ env.GITHUB_REPO_URL}} /aiter && \\
-              cd /aiter && \\
-              git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
-              git submodule sync && git submodule update --init --recursive && \\
-              pip install -e .
-
-          RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
-
-          ENTRYPOINT [""]
-          EOF
-
-      - name: Show Dockerfile
-        run: cat Dockerfile.mod
-
-      - name: Build Docker image
-        run: |
-          IMAGE_TAG=rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-          docker build --network=host --no-cache -t $IMAGE_TAG -f Dockerfile.mod .
-
-      - name: Push Docker image
-        run: |
-          IMAGE_TAG=rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
-          docker push $IMAGE_TAG
-
-      - name: Success message
-        run: |
-          echo "Successfully prepared image: rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}"
-
   vllm_benchmark:
     name: vLLM Benchmark (8 GPU)
     timeout-minutes: 60
@@ -113,7 +45,7 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: build_vllm_image
+    needs: check-signal
     runs-on: linux-aiter-mi300x-8
     strategy:
       fail-fast: false
@@ -136,12 +68,24 @@ jobs:
             extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
         
     steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Sync submodules
+        run: |
+          set -e
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Download the vLLM image
+      - name: Download the vLLM base image
         run: |
-          docker pull rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }}
+          docker pull ${{ env.BASE_IMAGE }}
     
       - name: Run benchmarks
         run: |
@@ -160,19 +104,28 @@ jobs:
           docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
+              -v "${{ github.workspace }}:/workspace" -w /workspace \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
               ${{ matrix.extra_env_args }} \
-              rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} python -m vllm.entrypoints.cli.main bench latency \
-              --model "${{ matrix.model }}" \
-              --batch-size 123 --input-len 456 --output-len 78 \
-              --num-iters-warmup 3 --num-iters 10 \
-              -tp ${{ matrix.tp }} --load-format dummy ${extraArgs} |& tee "${logFile}"
+              ${{ env.BASE_IMAGE }} bash -lc "
+                set -e
+                git config --global --add safe.directory /workspace
+                pip uninstall -y aiter amd-aiter || true
+                pip config set global.default-timeout 60
+                pip config set global.retries 10
+                pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
+                pip install --upgrade 'pybind11>=3.0.1'
+                pip install -e .
+                python -m vllm.entrypoints.cli.main bench latency \
+                  --model \"${{ matrix.model }}\" \
+                  --batch-size 123 --input-len 456 --output-len 78 \
+                  --num-iters-warmup 3 --num-iters 10 \
+                  -tp ${{ matrix.tp }} --load-format dummy ${extraArgs}
+              " |& tee "${logFile}"
 
           grep "Avg latency:" "${logFile}" | awk '{print $3}'
   
       - name: Clean up
         if: always()
         run: |
-          docker stop aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
-          docker rm -f aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
-          docker rmi rocm/aiter-ci:${{ env.GITHUB_COMMIT_SHA }} || true
+          docker rmi ${{ env.BASE_IMAGE }} || true
