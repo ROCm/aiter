@@ -16,6 +16,7 @@ env:
   VLLM_BRANCH: "main"
   VLLM_REPOSITORY_URL: "https://github.com/vllm-project/vllm"
   BASE_IMAGE: rocm/vllm-dev:nightly
+  AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-whl-${{ github.run_id }}
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -37,6 +38,66 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
+  build_aiter_wheel:
+    name: Build Aiter wheel
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    needs: check-signal
+    runs-on: build-only-aiter
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Sync submodules
+        run: |
+          set -e
+          git submodule sync
+          git submodule update --init --recursive --depth 1 --jobs 4
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Aiter wheel in vLLM base image
+        run: |
+          set -euo pipefail
+          docker pull ${{ env.BASE_IMAGE }}
+          docker run --rm \
+            --network=host \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            ${{ env.BASE_IMAGE }} \
+            bash -lc '
+              set -euo pipefail
+              git config --global --add safe.directory /workspace
+              shopt -s nullglob
+              rm -rf dist build aiter_meta ./*.egg-info
+              pip uninstall -y aiter amd-aiter || true
+              pip config set global.default-timeout 60
+              pip config set global.retries 10
+              pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
+              pip install -r requirements.txt
+              pip install --upgrade pandas zmq einops numpy==1.26.2
+              pip install --upgrade "pybind11>=3.0.1"
+              pip install --upgrade "ninja>=1.11.1"
+              pip install --upgrade "setuptools_scm[toml]>=6.2" wheel packaging psutil
+              pip install tabulate
+              python setup.py bdist_wheel
+              ls -lh dist/*.whl
+            '
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          path: dist/*.whl
+          retention-days: 14
+
   vllm_benchmark:
     name: vLLM Benchmark (8 GPU)
     timeout-minutes: 60
@@ -45,7 +106,7 @@ jobs:
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:vllm') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    needs: check-signal
+    needs: build_aiter_wheel
     runs-on: linux-aiter-mi300x-8
     strategy:
       fail-fast: false
@@ -68,17 +129,11 @@ jobs:
             extra_env_args: -e VLLM_USE_TRITON_FLASH_ATTN=0
         
     steps:
-      - name: Checkout aiter repo
-        uses: actions/checkout@v4
+      - name: Download Aiter wheel artifact
+        uses: actions/download-artifact@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-
-      - name: Sync submodules
-        run: |
-          set -e
-          git submodule sync
-          git submodule update --init --recursive --depth 1 --jobs 4
+          name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
+          path: aiter_wheels
 
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
@@ -108,14 +163,17 @@ jobs:
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
               ${{ matrix.extra_env_args }} \
               ${{ env.BASE_IMAGE }} bash -lc "
-                set -e
-                git config --global --add safe.directory /workspace
+                set -euo pipefail
+                shopt -s nullglob
+                wheels=(/workspace/aiter_wheels/*.whl)
+                if [ \"\${#wheels[@]}\" -ne 1 ]; then
+                  echo \"::error::Expected exactly one Aiter wheel artifact, found \${#wheels[@]}\"
+                  exit 1
+                fi
+                ls -lh /workspace/aiter_wheels
                 pip uninstall -y aiter amd-aiter || true
-                pip config set global.default-timeout 60
-                pip config set global.retries 10
-                pip config set global.index-url https://ausartifactory.amd.com/artifactory/api/pypi/hw-cpe-prod-remote/simple
-                pip install --upgrade 'pybind11>=3.0.1'
-                pip install -e .
+                pip install --no-deps \"\${wheels[0]}\"
+                pip show amd-aiter || pip show aiter
                 python -m vllm.entrypoints.cli.main bench latency \
                   --model \"${{ matrix.model }}\" \
                   --batch-size 123 --input-len 456 --output-len 78 \
