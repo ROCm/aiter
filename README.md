@@ -115,10 +115,19 @@ pip install -r requirements.txt
 
 ### Triton
 
-AITER includes Triton-based operators that require [amd-triton](https://pypi.org/project/amd-triton/).
+AITER includes Triton-based operators that require amd-triton ([ROCm 7.0](https://pypi.amd.com/triton/rocm-7.0.0/simple/), [ROCm 7.1](https://pypi.amd.com/triton/rocm-7.1.0/simple/), [ROCm 7.2](https://pypi.amd.com/triton/rocm-7.2.0/simple/)), with the correct version selected based on your ROCm installation.
+
+If you install with `python3 setup.py develop`, amd-triton is installed automatically. If you use `pip install -e .`, run the following commands manually:
 
 ```bash
-pip install -r requirements-triton.txt
+pip uninstall -y triton pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
+TRITON_INDEX_URL="https://pypi.amd.com/triton/rocm-7.0.0/simple/"
+ROCM_VERSION=$(dpkg -l rocm-core 2>/dev/null | awk '/^ii/{print $3}')
+if [[ -n "$ROCM_VERSION" ]]; then
+    ROCM_MAJOR_MINOR=$(echo "$ROCM_VERSION" | cut -d. -f1,2)
+    TRITON_INDEX_URL="https://pypi.amd.com/triton/rocm-${ROCM_MAJOR_MINOR}.0/simple/"
+fi
+pip install --extra-index-url "$TRITON_INDEX_URL" amd-triton
 ```
 
 ### Opus — Lightweight C++ Template for Kernel Development

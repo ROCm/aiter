@@ -71,13 +71,45 @@ if not IS_WINDOWS and is_develop_mode():
             ]
         )
 
+    for pkg in [
+        "triton",
+        "pytorch-triton",
+        "pytorch-triton-rocm",
+        "triton-rocm",
+        "amd-triton",
+    ]:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", pkg])
+        except Exception:
+            pass
+
+    triton_index_url = "https://pypi.amd.com/triton/rocm-7.0.0/simple/"
     try:
-        pkg_version("triton")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "uninstall", "-y", "triton"]
+        out = subprocess.check_output(
+            ["dpkg", "-l", "rocm-core"], stderr=subprocess.DEVNULL, text=True
         )
+        for line in out.splitlines():
+            if line.startswith("ii"):
+                version = line.split()[2]
+                major_minor = ".".join(version.split(".")[:2])
+                triton_index_url = (
+                    f"https://pypi.amd.com/triton/rocm-{major_minor}.0/simple/"
+                )
+                break
     except Exception:
         pass
+
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--extra-index-url",
+            triton_index_url,
+            "amd-triton",
+        ]
+    )
 
 
 def write_install_mode():
