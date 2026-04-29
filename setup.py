@@ -315,27 +315,20 @@ if PREBUILD_KERNELS != 0:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        # --- FlyDSL AOT pre-compilation (MOE only, before CK) ---
+        # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
         _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
         os.environ["AITER_AOT_IMPORT"] = "1"
         try:
-            from aiter.aot.flydsl.common import run_aot_worker
+            from aiter.aot.flydsl.common import start_aot, wait_aot
 
             flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            os.makedirs(flydsl_cache_dir, exist_ok=True)
-            os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = flydsl_cache_dir
-            label, _ok, fail = run_aot_worker("moe")
-            if fail > 0:
-                raise AssertionError(f"{label}: {fail} compile failure(s)")
+            pool, futures = start_aot(flydsl_cache_dir)
+            wait_aot(pool, futures)
         finally:
             if _prev_aot_import is None:
                 os.environ.pop("AITER_AOT_IMPORT", None)
             else:
                 os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
-
-        # Temporary fast path: validate FlyDSL MoE AOT only, skip CK builds.
-        all_opts_args_build = []
-        PRETUNE_MODULES = ""
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
