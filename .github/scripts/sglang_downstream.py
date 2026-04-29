@@ -158,7 +158,16 @@ else
   mkdir -p "$(dirname "${MODEL_DIR}")" /models/.tmp
   TMP_MODEL_DIR="/models/.tmp/${MODEL_ID//\//__}-$(date +%s%N)-${RANDOM}-$$"
   rm -rf "${TMP_MODEL_DIR}"
-  hf download "${MODEL_ID}" --local-dir "${TMP_MODEL_DIR}"
+  python3 - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id=os.environ["MODEL_ID"],
+    local_dir=os.environ["TMP_MODEL_DIR"],
+    token=os.environ.get("HF_TOKEN") or None,
+)
+PY
   test -f "${TMP_MODEL_DIR}/config.json"
   echo "ok" > "${TMP_MODEL_DIR}/.complete"
 
