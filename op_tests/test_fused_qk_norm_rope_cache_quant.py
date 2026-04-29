@@ -914,6 +914,161 @@ def test_qk_norm_rope_2way(
     return ret
 
 
+@perftest()
+def run_torch_qk_norm_rope_1way(
+    q: Tensor,  # contiguous (batch_size * num_tokens * num_heads_q * head_size)
+    k: Tensor,  # contiguous (batch_size * num_tokens * num_heads_k * head_size)
+    w_q: Tensor,  # contiguous (head_size)
+    w_k: Tensor,  # contiguous (head_size)
+    cos_sin: Tensor,  # contiguous (num_tokens * head_size)
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+):
+    is_neox_style = not is_interleaved
+    q_shape = q.shape
+    k_shape = k.shape
+    q_by_head = rms_norm_forward(
+        q.view(batch_size, num_tokens, num_heads_q, head_size), w_q, eps
+    )
+    k_by_head = rms_norm_forward(
+        k.view(batch_size, num_tokens, num_heads_k, head_size), w_k, eps
+    )
+    cos_sin = cos_sin.view(num_tokens, head_size)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    q = apply_rotary_emb_torch(q_by_head, cos, sin, is_neox_style)
+    k = apply_rotary_emb_torch(k_by_head, cos, sin, is_neox_style)
+    q = q.reshape(q_shape)
+    k = k.reshape(k_shape)
+    return q, k
+
+
+@perftest()
+def run_fused_qk_norm_rope_1way(
+    q: Tensor,  # contiguous (batch_size * num_tokens * num_heads_q * head_size)
+    k: Tensor,  # contiguous (batch_size * num_tokens * num_heads_k * head_size)
+    w_q: Tensor,  # contiguous (head_size)
+    w_k: Tensor,  # contiguous (head_size)
+    cos_sin: Tensor,  # contiguous (num_tokens * head_size)
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+):
+    out_q = torch.empty(
+        (batch_size, num_tokens, num_heads_q, head_size),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    out_k = torch.empty(
+        (batch_size, num_tokens, num_heads_k, head_size),
+        dtype=k.dtype,
+        device=k.device,
+    )
+    aiter.fused_qk_norm_rope_1way(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+        out_q,
+        out_k,
+    )
+    return out_q, out_k
+
+
+@benchmark()
+def test_qk_norm_rope_1way(
+    dtype,
+    batch_size,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    head_size,
+    is_interleaved,
+    eps=1e-6,
+):
+    q = torch.randn(
+        (batch_size, num_tokens, num_heads_q, head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    k = torch.randn(
+        (batch_size, num_tokens, num_heads_k, head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    w_q = torch.randn(head_size, dtype=dtype, device="cuda")
+    w_k = torch.randn(head_size, dtype=dtype, device="cuda")
+    cos_sin = torch.randn(
+        (num_tokens, head_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    (q_ref, k_ref), avg_torch = run_torch_qk_norm_rope_1way(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+    )
+    (q_out, k_out), avg_cu = run_fused_qk_norm_rope_1way(
+        q,
+        k,
+        w_q,
+        w_k,
+        cos_sin,
+        batch_size,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        is_interleaved,
+        eps,
+    )
+
+    info = f"dtype:{dtype}, batch_size:{batch_size}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}"
+    info += f", head_size:{head_size}, is_interleaved:{is_interleaved}, eps:{eps}"
+    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
+    checkAllclose(q_ref, q_out, msg="q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_ref, k_out, msg="k", rtol=1e-2, atol=0.05)
+    print(msg, flush=True)
+
+    ret = {}
+    ret["dtype"] = dtype
+    ret["batch_size"] = batch_size
+    ret["num_tokens"] = num_tokens
+    ret["num_heads_q"] = num_heads_q
+    ret["num_heads_k"] = num_heads_k
+    ret["head_size"] = head_size
+    ret["is_interleaved"] = "1" if is_interleaved else "0"
+    ret["avg_torch"] = avg_torch
+    ret["avg_cu"] = avg_cu
+    ret["speedup"] = avg_torch / avg_cu
+    return ret
+
+
 @benchmark()
 def test_qk_norm_rope_cache_block_quant(
     dtype,
@@ -2282,6 +2437,26 @@ if __name__ == "__main__":
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_2way summary (markdown):\n%s", df_md)
+
+    # 1way tests (Qwen-Image-2-style: single token stream norm + RoPE)
+    df = []
+    for head_size in args.head_sizes:
+        for num_tokens in args.token:
+            for is_neox_styles in args.is_neox_styles:
+                ret = test_qk_norm_rope_1way(
+                    dtype,
+                    batch_size,
+                    num_tokens,
+                    num_heads_q,
+                    num_heads_k,
+                    head_size,
+                    not is_neox_styles,
+                    eps=1e-6,
+                )
+                df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("qk_norm_rope_1way summary (markdown):\n%s", df_md)
 
     # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     df = []
