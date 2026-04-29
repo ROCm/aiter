@@ -77,6 +77,10 @@ on:
         type: string
         required: false
         default: ''
+      enable_ck:
+        description: 'Build with Composable Kernel templates. Set to false for experimental CK-free wheel (smaller, MI450-ready, drops CK-only modules).'
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       release_type:
@@ -131,6 +135,11 @@ on:
         type: string
         required: false
         default: ''
+      enable_ck:
+        description: 'Build with Composable Kernel templates'
+        type: boolean
+        required: false
+        default: true
     outputs:
       wheel_names:
         description: 'Space-separated list of built wheel filenames'
@@ -167,6 +176,7 @@ jobs:
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
       TORCH_PIN: ${{ inputs.torch_pin || github.event.inputs.torch_pin }}
       TORCH_INDEX_URL: ${{ inputs.torch_index_url || github.event.inputs.torch_index_url }}
+      ENABLE_CK: ${{ (inputs.enable_ck == false || github.event.inputs.enable_ck == 'false') && '0' || '1' }}
 
     steps:
       - name: Checkout aiter repo
@@ -378,12 +388,18 @@ jobs:
           IMG="${BUILD_DOCKER_IMAGE}"
           ROCM_TAG="${IMG##*:}"
           PRETEND_VER="${BASE_VER}+${ROCM_TAG}.manylinux_2_28"
+          # CK-free wheels get an explicit .ckfree suffix in local version so users
+          # never confuse them with default CK-built wheels.
+          if [ "${ENABLE_CK}" = "0" ]; then
+            PRETEND_VER="${PRETEND_VER}.ckfree"
+          fi
           echo "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VER}"
 
           docker exec \
             -e SETUPTOOLS_SCM_PRETEND_VERSION="${PRETEND_VER}" \
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${GPU_ARCHS}" \
+            -e ENABLE_CK="${ENABLE_CK}" \
             -e PYBIN="${PYBIN}" \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
@@ -395,6 +411,7 @@ jobs:
               python --version
               which python gcc
               gcc --version | head -1
+              echo "ENABLE_CK=${ENABLE_CK}"
               python setup.py bdist_wheel
               ls dist/*.whl
             '
