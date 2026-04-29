@@ -189,7 +189,7 @@ PREFILL_PARAMS = [
         Hv=64,
         tp=4,
         full_prompt_len=1024,
-        model_name="meta-Qwen3.5",
+        model_name="Qwen3.5-tp4-1k",
     ),
     PrefillArgs(
         K=128,
@@ -198,7 +198,7 @@ PREFILL_PARAMS = [
         Hv=64,
         tp=4,
         full_prompt_len=8192,
-        model_name="meta-Qwen3.5",
+        model_name="Qwen3.5-tp4-8k",
     ),
     PrefillArgs(
         K=128,
@@ -207,7 +207,7 @@ PREFILL_PARAMS = [
         Hv=64,
         tp=8,
         full_prompt_len=1024,
-        model_name="meta-Qwen3.5",
+        model_name="Qwen3.5-tp8-1k",
     ),
     PrefillArgs(
         K=128,
@@ -216,7 +216,7 @@ PREFILL_PARAMS = [
         Hv=64,
         tp=8,
         full_prompt_len=8192,
-        model_name="meta-Qwen3.5",
+        model_name="Qwen3.5-tp4-8k",
     ),
 ]
 

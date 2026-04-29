@@ -122,16 +122,28 @@ def compile_chunk_gated_delta_h(
     LDS_K_ELEMS = BT * LDS_K_STRIDE
     LDS_K_BYTES = LDS_K_ELEMS * 2
 
-    LDS_VN_STRIDE = BV
+    # OPT-D: lds_vn stride padding (break 2-way bank conflict, +8 B/row).
+    LDS_VN_PAD = 4  # 4 bf16 = 8 bytes
+    LDS_VN_STRIDE = BV + LDS_VN_PAD
     LDS_VN_ELEMS = BT * LDS_VN_STRIDE
     LDS_VN_BYTES = LDS_VN_ELEMS * 2
 
-    LDS_H_STRIDE = BV
+    # OPT-H: lds_h stride padding (break 2-way bank conflict on ds_read_u16).
+    LDS_H_PAD = 4  # 4 bf16 = 8 bytes
+    LDS_H_STRIDE = BV + LDS_H_PAD
     LDS_H_ELEMS = K * LDS_H_STRIDE
     LDS_H_BYTES = LDS_H_ELEMS * 2
 
+    # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
+    # on revision change (port of FlyDSL commit d4643e0e).
+    _K5_KERNEL_REVISION = 2  # OPT-D/H/F/7/4 applied
+
     GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(None, arch=GPU_ARCH, global_sym_name="gdn_h_smem")
+    allocator = SmemAllocator(
+        None,
+        arch=GPU_ARCH,
+        global_sym_name=f"gdn_h_smem_v{_K5_KERNEL_REVISION}",
+    )
     lds_w_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_w_offset + LDS_W_BYTES
     lds_k_offset = allocator._align(allocator.ptr, 16)
@@ -312,21 +324,20 @@ def compile_chunk_gated_delta_h(
                 h_accs.append(acc_zero)
 
         # -- Load initial state if provided --
+        # OPT-F: 4 x scalar f32 load -> 1 x buffer_load_dwordx4 (16 B).
+        # h0 is [V, K] so K is innermost; 4 consecutive K positions are
+        # contiguous in memory -> a single vec_load(4) covers them.
         if const_expr(USE_INITIAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT):
                     h0_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
-                    h0_elems = []
-                    for elem_i in range_constexpr(4):
-                        h0_row = (
-                            fx.Int32(kb * 64)
-                            + wid * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        h0_off = h0_base + h0_col * fx.Int32(K) + h0_row
-                        h0_elems.append(h0_[fx.Index(h0_off)])
-                    loaded_vec = vector.from_elements(T.f32x4, h0_elems)
+                    h0_row_base = (
+                        fx.Int32(kb * 64)
+                        + wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                    )
+                    h0_off_base = h0_base + h0_col * fx.Int32(K) + h0_row_base
+                    loaded_vec = h0_.vec_load((fx.Index(h0_off_base),), 4)
                     acc_idx = kb * N_REPEAT + nr
                     h_accs[acc_idx] = arith.addf(h_accs[acc_idx], loaded_vec)
 
@@ -358,13 +369,19 @@ def compile_chunk_gated_delta_h(
             i_t_i32 = arith.index_cast(T.i32, i_t)
 
             # -- 1. Compute w LDS offsets (w data already prefetched) --
+            # OPT-4: XOR swizzle to break 64-way bank conflict on lds_w.
+            # Pattern: swz_col = col ^ ((row & 7) << 3) at 8-bf16 granularity
+            # matching LOAD_VEC_WIDTH. Read path (W A-frag below) applies the
+            # SAME swizzle. lds_k / lds_h are NOT swizzled (ds_read_tr_b16
+            # spans 4 rows per instr; a row-dependent XOR would break the HW
+            # transpose alignment).
             w_prefetch_lds_all = []
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for batch in range_constexpr(NUM_LOAD_BATCHES_64):
                     row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                    w_prefetch_lds_all.append(
-                        row * fx.Int32(LDS_W_STRIDE) + fx.Int32(kb * 64) + load_col_base
-                    )
+                    col = fx.Int32(kb * 64) + load_col_base
+                    swz_col = _xor_swizzle(row, col)
+                    w_prefetch_lds_all.append(row * fx.Int32(LDS_W_STRIDE) + swz_col)
 
             # -- Store h snapshot to LDS --
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -385,16 +402,22 @@ def compile_chunk_gated_delta_h(
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
-                        lds_h_idx = lds_h_row * fx.Int32(BV) + lds_h_col
+                        # OPT-H: stride is LDS_H_STRIDE = BV + LDS_H_PAD
+                        lds_h_idx = lds_h_row * fx.Int32(LDS_H_STRIDE) + lds_h_col
                         lds_h[fx.Index(lds_h_idx)] = bf16_val
 
             gpu.barrier()
 
-            for vk_base in range_constexpr(0, LDS_H_ELEMS, BLOCK_THREADS):
+            # OPT-H: LDS -> HBM transpose loop.
+            # Iteration count uses VK_TOTAL = K * BV (actual elements, NOT
+            # LDS_H_ELEMS which now includes padding). Reading uses the padded
+            # LDS_H_STRIDE so we hit the same layout as the writer above.
+            VK_TOTAL = K * BV
+            for vk_base in range_constexpr(0, VK_TOTAL, BLOCK_THREADS):
                 linear = fx.Int32(vk_base) + tid
                 k_idx = linear % fx.Int32(K)
                 v_loc = linear // fx.Int32(K)
-                lds_read_idx = k_idx * fx.Int32(BV) + v_loc
+                lds_read_idx = k_idx * fx.Int32(LDS_H_STRIDE) + v_loc
                 bf16_tile = lds_h[fx.Index(lds_read_idx)]
                 v_global = i_v * fx.Int32(BV) + v_loc
                 h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k_idx
@@ -508,6 +531,8 @@ def compile_chunk_gated_delta_h(
                     w_lds_col_idx = arith.index(
                         kb * 64 + ks * WMMA_K
                     ) + lane_m_base_idx * arith.index(8)
+                    # OPT-4: apply SAME XOR swizzle as the write side.
+                    w_lds_col_idx = _xor_swizzle_idx(w_lds_row_idx, w_lds_col_idx)
                     w_lds_idx = (
                         w_lds_row_idx * arith.index(LDS_W_STRIDE) + w_lds_col_idx
                     )
@@ -522,11 +547,14 @@ def compile_chunk_gated_delta_h(
                             + tr_k_group
                         )
                         h_v_col = fx.Int32(nr * 16) + tr_col_sub * fx.Int32(4)
-                        h_lds_elem = h_k_row * fx.Int32(BV) + h_v_col
+                        # OPT-H: stride is LDS_H_STRIDE = BV + LDS_H_PAD
+                        h_lds_elem = h_k_row * fx.Int32(LDS_H_STRIDE) + h_v_col
                         h_lds_byte = h_lds_elem * fx.Int32(2) + fx.Int32(lds_h_offset)
 
                         h_lo = _ds_read_tr_bf16x4(h_lds_byte)
-                        h_hi = _ds_read_tr_bf16x4(h_lds_byte + fx.Int32(4 * BV * 2))
+                        h_hi = _ds_read_tr_bf16x4(
+                            h_lds_byte + fx.Int32(4 * LDS_H_STRIDE * 2)
+                        )
                         b_frag = vector.shuffle(h_lo, h_hi, [0, 1, 2, 3, 4, 5, 6, 7])
 
                         bv_accs[nr] = _mfma_bf16_16x16x32(a_frag, b_frag, bv_accs[nr])
@@ -698,7 +726,10 @@ def compile_chunk_gated_delta_h(
                         )
 
                         vn_lo = _ds_read_tr_bf16x4(vn_lds_byte)
-                        vn_hi = _ds_read_tr_bf16x4(vn_lds_byte + fx.Int32(4 * BV * 2))
+                        # OPT-D: stride is LDS_VN_STRIDE = BV + LDS_VN_PAD
+                        vn_hi = _ds_read_tr_bf16x4(
+                            vn_lds_byte + fx.Int32(4 * LDS_VN_STRIDE * 2)
+                        )
                         vn_b_frag = vector.shuffle(
                             vn_lo, vn_hi, [0, 1, 2, 3, 4, 5, 6, 7]
                         )
@@ -715,6 +746,9 @@ def compile_chunk_gated_delta_h(
         h_accs_final = list(results[:NUM_H_ACCS])
 
         # -- Epilogue: store final state --
+        # OPT-7: 4 x scalar f32 store -> 1 x buffer_store_dwordx4 (16 B).
+        # acc_val is already f32x4 with element i at K offset i -> vec_store
+        # directly (no extract + from_elements needed).
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for nr in range_constexpr(N_REPEAT):
@@ -722,18 +756,13 @@ def compile_chunk_gated_delta_h(
                     acc_val = h_accs_final[acc_idx]
 
                     ht_col = i_v * fx.Int32(BV) + fx.Int32(nr * 16) + lane_n
-                    for elem_i in range_constexpr(4):
-                        f32_val = vector.extract(
-                            acc_val, static_position=[elem_i], dynamic_position=[]
-                        )
-                        ht_row = (
-                            fx.Int32(kb * 64)
-                            + wid * fx.Int32(16)
-                            + lane_m_base * fx.Int32(4)
-                            + fx.Int32(elem_i)
-                        )
-                        ht_off = ht_base + ht_col * fx.Int32(K) + ht_row
-                        ht_[fx.Index(ht_off)] = f32_val
+                    ht_row_base = (
+                        fx.Int32(kb * 64)
+                        + wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                    )
+                    ht_off_base = ht_base + ht_col * fx.Int32(K) + ht_row_base
+                    ht_.vec_store((fx.Index(ht_off_base),), acc_val, 4)
 
     # -- Host launcher ------------------------------------------------------
     @flyc.jit
