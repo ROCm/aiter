@@ -99,17 +99,20 @@ if not IS_WINDOWS and is_develop_mode():
     except Exception:
         pass
 
-    subprocess.check_call(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--extra-index-url",
-            triton_index_url,
-            "amd-triton",
-        ]
-    )
+    try:
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--extra-index-url",
+                triton_index_url,
+                "amd-triton",
+            ]
+        )
+    except Exception:
+        pass
 
 
 def write_install_mode():
