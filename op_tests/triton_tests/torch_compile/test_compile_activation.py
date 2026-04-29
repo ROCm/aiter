@@ -5,11 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-
-def _get_compiled(fn):
-    return torch.compile(
-        fn, backend="inductor", fullgraph=True, options={"max_autotune": True}
-    )
+from . import _get_compiled
 
 
 def torch_silu_mul(x):
