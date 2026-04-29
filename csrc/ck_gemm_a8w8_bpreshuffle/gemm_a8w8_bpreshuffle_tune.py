@@ -484,6 +484,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 continue
             if M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128:
                 continue
+            # XCD workgroup-id swizzle needs enough workgroups to leave room
+            # for cross-XCD remapping. With <64 wg the swizzle degenerates
+            # into noise (empirically <1.5% of picked-xcd4 winners fall below
+            # this threshold), so skip xcd>0 candidates to halve the
+            # candidate count on small shapes.
+            if getattr(ki, "xcd_swizzle", 0) > 0 and num_ctas < 64:
+                continue
             kernel_name = ki.name
             info = (info_keys, i, 0, kernel_name, "flydsl")
             tasks.append(
