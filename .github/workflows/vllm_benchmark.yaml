@@ -114,7 +114,7 @@ jobs:
         include:
           - model: openai/gpt-oss-120b
             kv_cache_dtype: fp8_kvcache
-            tp: 1
+            tp: 8
             extra_args: --gpu-memory-utilization 0.3
             extra_env_args: ""
           - model: deepseek-ai/DeepSeek-R1-0528
