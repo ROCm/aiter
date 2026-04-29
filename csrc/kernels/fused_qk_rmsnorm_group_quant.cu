@@ -842,24 +842,27 @@ void fused_qk_rmsnorm_group_quant(
                 ", n2=",
                 n2);
     // --- grid_y strategy ---
-    // When n2 > n1 across different BlockSize tiers ("K dominates"), the fused
-    // path wastes threads on Q.  For small/medium m, separate Q/K blocks
-    // (grid_y=2) add parallelism on under-saturated CUs.  For large m the fused
-    // path wins through better cache locality within one block.
-    auto block_size_tier = [&](int n) -> int {
-        if(n <= 512) return 64;
-        if(n <= 1024) return 128;
-        if(n <= 2048) return quant_is_fp4 ? 256 : 128;
-        if(n <= 4096) return 256;
-        return 512;
+    // When n2 > n1 across different size tiers ("K dominates"), the fused path
+    // wastes threads on Q.  For small/medium m, separate Q/K blocks (grid_y=2)
+    // add parallelism on under-saturated CUs.  For large m the fused path wins
+    // through better cache locality within one block.
+    //
+    // size_tier() is a rough heuristic to detect gross n1-vs-n2 mismatch; it
+    // intentionally does NOT mirror the exact BlockSize dispatch below (which
+    // depends on grid_y itself, creating a circular dependency).
+    auto size_tier = [](int n) -> int {
+        if(n <= 1024) return 0;
+        if(n <= 2048) return 1;
+        if(n <= 4096) return 2;
+        return 3;
     };
     const bool k_dominates =
-        has_second_input && n2 > n1 && (block_size_tier(n1) != block_size_tier(n2));
+        has_second_input && n2 > n1 && (size_tier(n1) != size_tier(n2));
     const int grid_y =
         (has_second_input && (m <= 1024 || (k_dominates && m <= 4096))) ? 2 : 1;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp1));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();  
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
 
     // --- BlockSize / thread_data_size selection ---
     const int max_n = n1 > n2 ? n1 : n2;
