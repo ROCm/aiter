@@ -40,6 +40,7 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    _get_compiled_silu_fused,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -86,6 +87,8 @@ def parse_csv(csv_path: str):
             )
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
+            # TODO: Replace this GPT-OSS-specific bias inference with an
+            # explicit CSV/config field once the model config can express it.
             enable_bias = (
                 act == "swiglu"
                 and q_type.strip().split(".")[-1] == "per_1x32"
@@ -185,41 +188,63 @@ def _precompile_to_cache(
             return torch.bfloat16
         return torch.int8
 
-    def _runtime_sort_blocks() -> int:
-        # Match fused_moe.moe_sorting allocation for sorted_expert_ids.
+    def _aot_sort_blocks() -> int:
         token_count = token_num if token_num > 0 else tokens
         sorting_block_m = block_m if block_m > 0 else tile_m
         max_tokens_padded = token_count * topk + E * sorting_block_m - topk
         return (max_tokens_padded + sorting_block_m - 1) // sorting_block_m
 
-    def _runtime_stage2_m_blocks() -> int:
+    def _aot_stage2_m_blocks() -> int:
         token_count = token_num if token_num > 0 else tokens
         _sbm = sort_block_m if sort_block_m > 0 else tile_m
-        sort_blocks = _runtime_sort_blocks()
+        sort_blocks = _aot_sort_blocks()
         if _sbm == tile_m:
             return min(sort_blocks, token_count * topk)
         total_sorted = sort_blocks * _sbm
         return (total_sorted + tile_m - 1) // tile_m
 
-    def _precompile_silu_fused(gemm_out_dtype: str):
-        if k_batch <= 1:
-            return
-        if gemm_out_dtype not in ("fp4", "fp8"):
-            quant_mode = "none"
+    def _aot_stage2_persist_m(m_blocks: int) -> int:
+        if persist is True:
+            persist_m = -1
+        elif persist is False:
+            persist_m = 4 if m_blocks > 256 else 1
         else:
-            quant_mode = gemm_out_dtype
+            persist_m = -1 if m_blocks > 256 else 1
 
-        from aiter.ops.flydsl.kernels.silu_and_mul_fq import (
-            build_silu_and_mul_fq_module,
-        )
+        if a_dtype == "fp8":
+            persist_m = 1
 
-        silu_fused = build_silu_and_mul_fq_module(
+        return persist_m
+
+    def _precompile_silu_fused():
+        is_splitk = k_batch > 1
+        need_fp4 = out_dtype == "fp4"
+        need_fp8 = out_dtype == "fp8"
+        fuse_any_quant = need_fp4 or need_fp8
+        gate_up_interleave = gate_mode == "interleave"
+        splitk_fp4 = is_splitk and need_fp4
+        gui_sk = gate_up_interleave and is_splitk
+        gui_sk_fused = gui_sk and fuse_any_quant
+
+        if gui_sk_fused:
+            quant_mode = "fp4" if need_fp4 else "fp8"
+            gui_layout = True
+        elif gui_sk:
+            quant_mode = "none"
+            gui_layout = True
+        elif splitk_fp4:
+            quant_mode = "fp4"
+            gui_layout = False
+        else:
+            return
+
+        silu_fused = _get_compiled_silu_fused(
             inter_dim,
             topk,
             quant_mode,
-            gate_mode == "interleave",
+            gui_layout,
         )
-        sorted_len = max(tokens * topk, _runtime_sort_blocks() * tile_m)
+        sorted_len = max(tokens * topk, _aot_sort_blocks() * tile_m)
         padded_cols = ((inter_dim // 32) + 7) // 8 * 8
         scale_rows = (sorted_len + 255) // 256 * 256
         tmp_out = torch.zeros(
@@ -374,20 +399,13 @@ def _precompile_to_cache(
             )
             _run_compiled(exe, args)
             if is_fp4_weight:
-                _precompile_silu_fused(out_dtype)
+                _precompile_silu_fused()
 
         elif stage == 2:
 
             accumulate = mode != "reduce"
-            _m_blocks = _runtime_stage2_m_blocks()
-            if persist is True:
-                _persist_m = -1
-            elif persist is False:
-                _persist_m = 4 if _m_blocks > 256 else 1
-            else:
-                _persist_m = -1 if _m_blocks > 256 else 1
-            if a_dtype == "fp8":
-                _persist_m = 1
+            _m_blocks = _aot_stage2_m_blocks()
+            _persist_m = _aot_stage2_persist_m(_m_blocks)
             n_in = model_dim
             k_in = inter_dim
 
