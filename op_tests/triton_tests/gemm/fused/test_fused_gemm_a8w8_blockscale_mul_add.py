@@ -54,6 +54,7 @@ def test_fused_gemm_a8w8_blockscale_mul_add(
     b_type_is_scalar,
     fuse_type,
 ):
+    torch.manual_seed(0)
 
     (
         x,

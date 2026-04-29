@@ -736,7 +736,7 @@ class CustomAllreduce:
             )
 
     def close(self):
-        if not self.disabled and self._ptr:
+        if not self.disabled and getattr(self, "_ptr", 0):
             ops.dispose(self._ptr)
             self._ptr = 0
 
