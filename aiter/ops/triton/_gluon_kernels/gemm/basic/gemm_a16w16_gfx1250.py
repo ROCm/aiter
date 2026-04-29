@@ -188,13 +188,12 @@ def _gemm_a16w16_basic_kernel(
 
     accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
-    # L2 prefetch helpers compute offsets relative to the descriptor's current
-    # position. Since the per-block (M, N) offset is baked into the base, we
-    # pass 0 for off_am/off_bn/load_idx so off_k is purely a K-direction delta.
+    # Per-block (M, N) offset is baked into the descriptor base, so the
+    # prefetch helpers receive 0 for off_am/off_bn; only K varies.
     if USE_L2_PREFETCH:
         gemm_l2_prefetch_prologue(
             L2_PREFETCH_DISTANCE,
-            0,
+            load_idx,
             a_desc,
             b_desc,
             0,
@@ -207,30 +206,30 @@ def _gemm_a16w16_basic_kernel(
 
     # Fill the pipeline
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
-        )
-
-        # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [0, load_idx * BLOCK_K],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [load_idx * BLOCK_K, 0],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [load_idx * BLOCK_K, 0],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [0, load_idx * BLOCK_K],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         load_idx += 1
@@ -239,32 +238,32 @@ def _gemm_a16w16_basic_kernel(
     num_k_tiles = gl.cdiv(K, BLOCK_K)
 
     for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
-        )
-
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
 
-        # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [0, load_idx * BLOCK_K],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [load_idx * BLOCK_K, 0],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [load_idx * BLOCK_K, 0],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [0, load_idx * BLOCK_K],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         load_idx += 1
@@ -272,7 +271,7 @@ def _gemm_a16w16_basic_kernel(
         if USE_L2_PREFETCH:
             gemm_l2_prefetch(
                 L2_PREFETCH_DISTANCE - 1,
-                0,
+                load_idx,
                 a_desc,
                 b_desc,
                 0,
@@ -1059,7 +1058,7 @@ def _gemm_a16w16_k_subtiling_kernel(
     )
 
 
-@gluon.jit(repr=_gemm_a16w16_lds_pipeline_repr, loop_carried_load_percent=0)
+@gluon.jit(repr=_gemm_a16w16_lds_pipeline_repr)
 def _gemm_a16w16_lds_pipeline_kernel(
     a_ptr,
     b_ptr,
@@ -1178,13 +1177,12 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
     accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
-    # L2 prefetch helpers compute offsets relative to the descriptor's current
-    # position. Since the per-block (M, N) offset is baked into the base, we
-    # pass 0 for off_am/off_bn/load_idx so off_k is purely a K-direction delta.
+    # Per-block (M, N) offset is baked into the descriptor base, so the
+    # prefetch helpers receive 0 for off_am/off_bn; only K varies.
     if USE_L2_PREFETCH:
         gemm_l2_prefetch_prologue(
             L2_PREFETCH_DISTANCE,
-            0,
+            load_idx,
             a_desc,
             b_desc,
             0,
@@ -1197,30 +1195,30 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
     # TDM prologue: fill the pipeline with NUM_BUFFERS-1 tiles
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
-        )
-
-        # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [0, load_idx * BLOCK_K],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [load_idx * BLOCK_K, 0],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [load_idx * BLOCK_K, 0],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [0, load_idx * BLOCK_K],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         load_idx += 1
@@ -1261,30 +1259,30 @@ def _gemm_a16w16_lds_pipeline_kernel(
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
     # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
-    gl.amd.gfx1250.tdm.async_load(
-        a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
-    )
-    gl.amd.gfx1250.tdm.async_load(
-        b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
-    )
-
-    # Walk the descriptors forward one K tile.
     if PHYSICAL_MK:
-        a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [0, BLOCK_K], update_bounds=False
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc,
+            [0, load_idx * BLOCK_K],
+            a_buffer.index(load_idx % NUM_BUFFERS),
         )
     else:
-        a_desc = gl.amd.gfx1250.tdm.advance(
-            a_desc, [BLOCK_K, 0], update_bounds=False
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc,
+            [load_idx * BLOCK_K, 0],
+            a_buffer.index(load_idx % NUM_BUFFERS),
         )
 
     if PHYSICAL_KN:
-        b_desc = gl.amd.gfx1250.tdm.advance(
-            b_desc, [BLOCK_K, 0], update_bounds=False
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc,
+            [load_idx * BLOCK_K, 0],
+            b_buffer.index(load_idx % NUM_BUFFERS),
         )
     else:
-        b_desc = gl.amd.gfx1250.tdm.advance(
-            b_desc, [0, BLOCK_K], update_bounds=False
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc,
+            [0, load_idx * BLOCK_K],
+            b_buffer.index(load_idx % NUM_BUFFERS),
         )
 
     # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
@@ -1297,7 +1295,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
     if USE_L2_PREFETCH:
         gemm_l2_prefetch(
             L2_PREFETCH_DISTANCE - 1,
-            0,
+            load_idx,
             a_desc,
             b_desc,
             0,
@@ -1343,30 +1341,30 @@ def _gemm_a16w16_lds_pipeline_kernel(
 
 
         # Issue TDM for the tile that is (NUM_BUFFERS-1) steps ahead
-        gl.amd.gfx1250.tdm.async_load(
-            a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
-        )
-        gl.amd.gfx1250.tdm.async_load(
-            b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
-        )
-
-        # Walk the descriptors forward one K tile.
         if PHYSICAL_MK:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [0, load_idx * BLOCK_K],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            a_desc = gl.amd.gfx1250.tdm.advance(
-                a_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                a_desc,
+                [load_idx * BLOCK_K, 0],
+                a_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         if PHYSICAL_KN:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [BLOCK_K, 0], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [load_idx * BLOCK_K, 0],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
         else:
-            b_desc = gl.amd.gfx1250.tdm.advance(
-                b_desc, [0, BLOCK_K], update_bounds=False
+            gl.amd.gfx1250.tdm.async_load(
+                b_desc,
+                [0, load_idx * BLOCK_K],
+                b_buffer.index(load_idx % NUM_BUFFERS),
             )
 
         # Tighter wait: after issuing the new TDM there are (NUM_BUFFERS-1)*2
@@ -1379,7 +1377,7 @@ def _gemm_a16w16_lds_pipeline_kernel(
         if USE_L2_PREFETCH:
             gemm_l2_prefetch(
                 L2_PREFETCH_DISTANCE - 1,
-                0,
+                load_idx,
                 a_desc,
                 b_desc,
                 0,
@@ -1449,8 +1447,8 @@ def _gemm_a16w16_lds_pipeline_kernel(
     # Final WMMA for the last pre-loaded tile
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
-    if NUM_BUFFERS > 2:
-        gl.amd.sched_barrier(0)
+    #   if NUM_BUFFERS > 2:
+    #       gl.amd.sched_barrier(0)
 
     # Bias
     if ADD_BIAS:
