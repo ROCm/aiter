@@ -1,105 +1,102 @@
-#pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
 
-#include <map>
+#include "aiter_tensor.h"
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace aiter {
 
-void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& block_mapping);
+void swap_blocks(aiter_tensor_t& src, aiter_tensor_t& dst, const aiter_tensor_t& block_mapping);
 
-// Note: the key_caches and value_caches vectors are constant but
-// not the Tensors they contain. The vectors need to be const refs
-// in order to satisfy pytorch's C++ operator registration code.
-void copy_blocks(std::vector<torch::Tensor> const& key_caches,
-                 std::vector<torch::Tensor> const& value_caches,
-                 const torch::Tensor& block_mapping);
+void copy_blocks(std::vector<aiter_tensor_t> const& key_caches,
+                 std::vector<aiter_tensor_t> const& value_caches,
+                 const aiter_tensor_t& block_mapping);
 
-void reshape_and_cache(torch::Tensor& key,
-                       torch::Tensor& value,
-                       torch::Tensor& key_cache,
-                       torch::Tensor& value_cache,
-                       torch::Tensor& slot_mapping,
+void reshape_and_cache(aiter_tensor_t& key,
+                       aiter_tensor_t& value,
+                       aiter_tensor_t& key_cache,
+                       aiter_tensor_t& value_cache,
+                       aiter_tensor_t& slot_mapping,
                        const std::string& kv_cache_dtype,
-                       std::optional<torch::Tensor> k_scale,
-                       std::optional<torch::Tensor> v_scale,
+                       std::optional<aiter_tensor_t> k_scale,
+                       std::optional<aiter_tensor_t> v_scale,
                        const bool asm_layout);
 
-void reshape_and_cache_flash(torch::Tensor& key,
-                             torch::Tensor& value,
-                             torch::Tensor& key_cache,
-                             torch::Tensor& value_cache,
-                             torch::Tensor& slot_mapping,
+void reshape_and_cache_flash(aiter_tensor_t& key,
+                             aiter_tensor_t& value,
+                             aiter_tensor_t& key_cache,
+                             aiter_tensor_t& value_cache,
+                             aiter_tensor_t& slot_mapping,
                              const std::string& kv_cache_dtype,
-                             torch::Tensor& k_scale,
-                             torch::Tensor& v_scale);
+                             aiter_tensor_t& k_scale,
+                             aiter_tensor_t& v_scale);
 
-void reshape_and_cache_with_pertoken_quant(torch::Tensor& key,
-                                           torch::Tensor& value,
-                                           torch::Tensor& key_cache,
-                                           torch::Tensor& value_cache,
-                                           torch::Tensor& k_dequant_scales,
-                                           torch::Tensor& v_dequant_scales,
-                                           torch::Tensor& slot_mapping,
+void reshape_and_cache_with_pertoken_quant(aiter_tensor_t& key,
+                                           aiter_tensor_t& value,
+                                           aiter_tensor_t& key_cache,
+                                           aiter_tensor_t& value_cache,
+                                           aiter_tensor_t& k_dequant_scales,
+                                           aiter_tensor_t& v_dequant_scales,
+                                           aiter_tensor_t& slot_mapping,
                                            const bool asm_layout);
 
-void reshape_and_cache_with_block_quant(torch::Tensor& key,
-                                        torch::Tensor& value,
-                                        torch::Tensor& key_cache,
-                                        torch::Tensor& value_cache,
-                                        torch::Tensor& k_dequant_scales,
-                                        torch::Tensor& v_dequant_scales,
-                                        torch::Tensor& slot_mapping,
+void reshape_and_cache_with_block_quant(aiter_tensor_t& key,
+                                        aiter_tensor_t& value,
+                                        aiter_tensor_t& key_cache,
+                                        aiter_tensor_t& value_cache,
+                                        aiter_tensor_t& k_dequant_scales,
+                                        aiter_tensor_t& v_dequant_scales,
+                                        aiter_tensor_t& slot_mapping,
                                         const bool asm_layout);
 
 void reshape_and_cache_with_block_quant_for_asm_pa(
-    torch::Tensor& key,              // [batch_size, seq_len, num_heads, head_size]
-    torch::Tensor& value,            // [batch_size, seq_len, num_heads, head_size]
-    torch::Tensor& key_cache,        // [num_blocks, num_heads, head_size/x, block_size:16, x]
-    torch::Tensor& value_cache,      // [num_blocks, num_heads, head_size, block_size:16]
-    torch::Tensor& k_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
-    torch::Tensor& v_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
-    torch::Tensor& slot_mapping,     // [num_tokens]
+    aiter_tensor_t& key,              // [batch_size, seq_len, num_heads, head_size]
+    aiter_tensor_t& value,            // [batch_size, seq_len, num_heads, head_size]
+    aiter_tensor_t& key_cache,        // [num_blocks, num_heads, head_size/x, block_size:16, x]
+    aiter_tensor_t& value_cache,      // [num_blocks, num_heads, head_size, block_size:16]
+    aiter_tensor_t& k_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    aiter_tensor_t& v_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    aiter_tensor_t& slot_mapping,     // [num_tokens]
     const bool asm_layout,
     const int ori_block_size = 128);
 
-void concat_and_cache_mla(torch::Tensor& kv_c,         // [num_tokens, kv_lora_rank]
-                          torch::Tensor& k_pe,         // [num_tokens, pe_dim]
-                          torch::Tensor& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
-                                                       // pe_dim)]
-                          torch::Tensor& slot_mapping, // [num_tokens] or [num_actual_tokens]
+void concat_and_cache_mla(aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_rank]
+                          aiter_tensor_t& k_pe,         // [num_tokens, pe_dim]
+                          aiter_tensor_t& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
+                                                        // pe_dim)]
+                          aiter_tensor_t& slot_mapping,  // [num_tokens] or [num_actual_tokens]
                           const std::string& kv_cache_dtype,
-                          torch::Tensor& scale);
+                          aiter_tensor_t& scale);
 
-void indexer_k_quant_and_cache(torch::Tensor& k,        // [num_tokens, head_dim]
-                               torch::Tensor& kv_cache, // [num_blocks, block_size, cache_stride]
-                               torch::Tensor& slot_mapping, // [num_tokens]
-                               int64_t quant_block_size,    // quantization block size
+void indexer_k_quant_and_cache(aiter_tensor_t& k,            // [num_tokens, head_dim]
+                               aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
+                               aiter_tensor_t& slot_mapping,  // [num_tokens]
+                               int64_t quant_block_size,
                                const std::string& scale_fmt);
 
 void cp_gather_indexer_k_quant_cache(
-    const torch::Tensor& kv_cache,     // [num_blocks, block_size, cache_stride]
-    torch::Tensor& dst_k,              // [num_tokens, head_dim]
-    torch::Tensor& dst_scale,          // [num_tokens, head_dim / quant_block_size * 4]
-    const torch::Tensor& block_table,  // [batch_size, num_blocks]
-    const torch::Tensor& cu_seq_lens); // [batch_size + 1]
+    const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
+    aiter_tensor_t& dst_k,              // [num_tokens, head_dim]
+    aiter_tensor_t& dst_scale,          // [num_tokens, head_dim / quant_block_size * 4]
+    const aiter_tensor_t& block_table,  // [batch_size, num_blocks]
+    const aiter_tensor_t& cu_seq_lens); // [batch_size + 1]
 
 void fused_qk_rope_concat_and_cache_mla(
-    torch::Tensor& q_nope,       // [num_tokens, num_heads, qk_lora_rank]
-    torch::Tensor& q_pe,         // [num_tokens, num_heads, pe_dim]
-    torch::Tensor& kv_c,         // [num_tokens, kv_lora_rank]
-    torch::Tensor& k_pe,         // [num_tokens, pe_dim]
-    torch::Tensor& kv_cache,     // [num_blocks, block_size, (kv_lora_rank +
-                                 // pe_dim)]
-    torch::Tensor& q_out,        // [num_tokens, num_heads, qk_lora_rank+pe_dim]
-    torch::Tensor& slot_mapping, // [num_tokens] or [num_actual_tokens]
-    torch::Tensor& k_scale,
-    torch::Tensor& q_scale,
-    torch::Tensor& positions, // [num_tokens]
-    torch::Tensor& cos_cache, // [max_positions, pe_dim//2]
-    torch::Tensor& sin_cache, // [max_positions, pe_dim//2]
+    aiter_tensor_t& q_nope,       // [num_tokens, num_heads, qk_lora_rank]
+    aiter_tensor_t& q_pe,         // [num_tokens, num_heads, pe_dim]
+    aiter_tensor_t& kv_c,         // [num_tokens, kv_lora_rank]
+    aiter_tensor_t& k_pe,         // [num_tokens, pe_dim]
+    aiter_tensor_t& kv_cache,     // [num_blocks, block_size, (kv_lora_rank + pe_dim)]
+    aiter_tensor_t& q_out,        // [num_tokens, num_heads, qk_lora_rank+pe_dim]
+    aiter_tensor_t& slot_mapping, // [num_tokens] or [num_actual_tokens]
+    aiter_tensor_t& k_scale,
+    aiter_tensor_t& q_scale,
+    aiter_tensor_t& positions, // [num_tokens]
+    aiter_tensor_t& cos_cache, // [max_positions, pe_dim//2]
+    aiter_tensor_t& sin_cache, // [max_positions, pe_dim//2]
     bool is_neox,
     bool is_nope_first);
 
