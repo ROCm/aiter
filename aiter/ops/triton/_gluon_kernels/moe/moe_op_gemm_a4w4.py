@@ -139,7 +139,7 @@ def _moe_gemm_a4w4_gfx1250(
     BLOCK_K: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
     SPLIT_K: gl.constexpr,
-    SWIZZLE_MX_SCALE: gl.constexpr, # "GFX1250_SCALE" | None
+    SWIZZLE_MX_SCALE: gl.constexpr,  # "GFX1250_SCALE" | None
     NUM_BUFFERS: gl.constexpr,
     UPCAST_INDICES: gl.constexpr,
     # layouts
@@ -227,14 +227,16 @@ def _moe_gemm_a4w4_gfx1250(
     #   2 MXFP4 elements are packed into 1 int8
     #   in the K dimension
     X_M_DIVISOR: gl.constexpr = 1
-    X_K_DIVISOR: gl.constexpr = 2 # 2 MXFP4 elements packed into 1 byte
-    W_K_DIVISOR: gl.constexpr = 2 # 2 MXFP4 elements packed into 1 byte
+    X_K_DIVISOR: gl.constexpr = 2  # 2 MXFP4 elements packed into 1 byte
+    W_K_DIVISOR: gl.constexpr = 2  # 2 MXFP4 elements packed into 1 byte
     W_N_DIVISOR: gl.constexpr = 1
     PACKED_BLOCK_M_X: gl.constexpr = BLOCK_M // X_M_DIVISOR
     PACKED_BLOCK_K_X: gl.constexpr = BLOCK_K // X_K_DIVISOR
     PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // W_K_DIVISOR
     PACKED_BLOCK_N_W: gl.constexpr = BLOCK_N // W_N_DIVISOR
-    MX_SCALE_BLOCK_K: gl.constexpr = BLOCK_K // MX_PACK_DIVISOR # 32 elements share 1 scale element
+    MX_SCALE_BLOCK_K: gl.constexpr = (
+        BLOCK_K // MX_PACK_DIVISOR
+    )  # 32 elements share 1 scale element
 
     # wmma layouts
     DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
@@ -271,11 +273,20 @@ def _moe_gemm_a4w4_gfx1250(
     # A scale pointers
     if GatherIndx is None:
         XMxScale += start_m * stride_x_mx_m
-        offs_x_m_scale = offs_x_m + gl.arange(0, PACKED_BLOCK_M_X, layout=gl.SliceLayout(1, DOT_LAYOUT_X_SCALES))
+        offs_x_m_scale = offs_x_m + gl.arange(
+            0, PACKED_BLOCK_M_X, layout=gl.SliceLayout(1, DOT_LAYOUT_X_SCALES)
+        )
     else:
-        offs_x_m_scale = gl.convert_layout(offs_x_m, gl.SliceLayout(1, DOT_LAYOUT_X_SCALES))
-    offs_x_k_scale = gl.arange(0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_X_SCALES))
-    offs_x_scale = offs_x_m_scale.to(index_type)[:, None] * stride_x_mx_m + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
+        offs_x_m_scale = gl.convert_layout(
+            offs_x_m, gl.SliceLayout(1, DOT_LAYOUT_X_SCALES)
+        )
+    offs_x_k_scale = gl.arange(
+        0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_X_SCALES)
+    )
+    offs_x_scale = (
+        offs_x_m_scale.to(index_type)[:, None] * stride_x_mx_m
+        + offs_x_k_scale.to(index_type)[None, :] * stride_x_mx_k
+    )
 
     # B scale pointers
     WMxScale += expt_id * stride_w_mx_e
@@ -299,26 +310,36 @@ def _moe_gemm_a4w4_gfx1250(
         # .permute((0, 3, 2, 1, 4))
         # .reshape((BLOCK_N, MX_SCALE_BLOCK_K))
         row = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, DOT_LAYOUT_W_SCALES))
-        col = gl.arange(0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_W_SCALES))
+        col = gl.arange(
+            0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, DOT_LAYOUT_W_SCALES)
+        )
         d0_w_scales = row // PRESHUFFLE_FACTOR
         d3_w_scales = (row % PRESHUFFLE_FACTOR) // (PRESHUFFLE_FACTOR // 4)
         d2_w_scales = row % (PRESHUFFLE_FACTOR // 4)
         d1_w_scales = col // SCALE_KWIDTH
         d4_w_scales = col % SCALE_KWIDTH
-        offs_w_scale = (
-            (pid_n * SCALE_BLOCK_N + d0_w_scales.to(index_type))[:, None] * stride_w_mx_n
-            + (d1_w_scales.to(index_type)[None, :] * (PRESHUFFLE_FACTOR * SCALE_KWIDTH)
+        offs_w_scale = (pid_n * SCALE_BLOCK_N + d0_w_scales.to(index_type))[
+            :, None
+        ] * stride_w_mx_n + (
+            d1_w_scales.to(index_type)[None, :] * (PRESHUFFLE_FACTOR * SCALE_KWIDTH)
             + d2_w_scales.to(index_type)[:, None] * (4 * SCALE_KWIDTH)
             + d3_w_scales.to(index_type)[:, None] * SCALE_KWIDTH
-            + d4_w_scales.to(index_type)[None, :]) * stride_w_mx_k
-        )
+            + d4_w_scales.to(index_type)[None, :]
+        ) * stride_w_mx_k
     else:
         PRESHUFFLE_FACTOR: gl.constexpr = 1
         PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K
         SCALE_BLOCK_N: gl.constexpr = BLOCK_N
-        offs_w_n_scale = pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, layout=gl.SliceLayout(1, DOT_LAYOUT_W_SCALES))
-        offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, layout=gl.SliceLayout(0, DOT_LAYOUT_W_SCALES))
-        offs_w_scale = offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
+        offs_w_n_scale = pid_n * SCALE_BLOCK_N + gl.arange(
+            0, SCALE_BLOCK_N, layout=gl.SliceLayout(1, DOT_LAYOUT_W_SCALES)
+        )
+        offs_w_k_scale = gl.arange(
+            0, PACKED_MX_BLOCK, layout=gl.SliceLayout(0, DOT_LAYOUT_W_SCALES)
+        )
+        offs_w_scale = (
+            offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+            + offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
+        )
 
     # shared layouts
     if PACKED_BLOCK_K_X <= 256:
@@ -398,9 +419,7 @@ def _moe_gemm_a4w4_gfx1250(
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * NUM_LOADS_IN_BATCH)
     cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
     cur_w = (
-        w_buffer.index(wmma_idx % NUM_BUFFERS)
-        .permute((1, 0))
-        .load(layout=DOT_LAYOUT_W)
+        w_buffer.index(wmma_idx % NUM_BUFFERS).permute((1, 0)).load(layout=DOT_LAYOUT_W)
     )
     wmma_idx += 1
     cur_x_scales = gl.amd.gfx1250.buffer_load(XMxScale, offs_x_scale)
@@ -413,7 +432,9 @@ def _moe_gemm_a4w4_gfx1250(
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for col in range(num_k_iter - (NUM_BUFFERS - 1)):
         # issue wmma
-        acc = gl.amd.gfx1250.wmma_scaled(cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc)
+        acc = gl.amd.gfx1250.wmma_scaled(
+            cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
+        )
 
         # fill next tile to LDS
         if GatherIndx is None:
@@ -461,7 +482,9 @@ def _moe_gemm_a4w4_gfx1250(
     # epilogue: drain remaining tiles
     for k_ep in gl.static_range(NUM_BUFFERS - 2):
         # issue wmma
-        acc = gl.amd.gfx1250.wmma_scaled(cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc)
+        acc = gl.amd.gfx1250.wmma_scaled(
+            cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
+        )
 
         # wait for next tile to be filled
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - k_ep) * NUM_LOADS_IN_BATCH)
@@ -486,7 +509,9 @@ def _moe_gemm_a4w4_gfx1250(
         cur_w_scales = next_w_scales
 
     # issue last wmma
-    acc = gl.amd.gfx1250.wmma_scaled(cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc)
+    acc = gl.amd.gfx1250.wmma_scaled(
+        cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
+    )
 
     # bias
     offs_m = BLOCK_M * block_id + gl.arange(

@@ -281,7 +281,7 @@ def moe_gemm_a4w4(
     unpadded_N=None,
     unpadded_K=None,
     config=None,
-    backend= None, # "triton" | "gluon"
+    backend=None,  # "triton" | "gluon"
 ):
     """
     Y[:, :] = 0.
@@ -372,7 +372,9 @@ def moe_gemm_a4w4(
         WMMA_LAYOUT_PACKED = get_wmma_layout(
             config["num_warps"], True, swizzle_mx_scale == "GFX1250_SCALE"
         )
-        assert config["split_k"] == 1, "Split-k is not supported for Gluon backend on gfx1250"
+        assert (
+            config["split_k"] == 1
+        ), "Split-k is not supported for Gluon backend on gfx1250"
         _moe_gemm_a4w4_gfx1250[(grid,)](
             y,
             y.stride(0),
