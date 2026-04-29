@@ -65,12 +65,19 @@ def test_a16w16(batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16):
     ref = _torch_ref(A, B, out_dtype)
 
     Y, us = run_perftest(
-        gemm_a16w16_opus, A, B, None, out_dtype,
+        gemm_a16w16_opus,
+        A,
+        B,
+        None,
+        out_dtype,
     )
 
     err = checkAllclose(
-        Y, ref, msg=f"a16w16 b={batch} m={M} n={N} k={K}",
-        rtol=0.1, atol=0.5,
+        Y,
+        ref,
+        msg=f"a16w16 b={batch} m={M} n={N} k={K}",
+        rtol=0.1,
+        atol=0.5,
     )
     flops = 2.0 * batch * M * N * K
     tflops = flops / us / 1e6
@@ -83,19 +90,16 @@ def test_a16w16(batch: int, M: int, N: int, K: int, out_dtype=torch.bfloat16):
 
 def load_shapes_from_csv(csv_path):
     import pandas as pd
+
     df = pd.read_csv(csv_path)
-    shapes = list(
-        zip(df["M"].astype(int), df["N"].astype(int), df["K"].astype(int))
-    )
+    shapes = list(zip(df["M"].astype(int), df["N"].astype(int), df["K"].astype(int)))
     return list(dict.fromkeys(shapes))
 
 
 def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
     shapes = load_shapes_from_csv(csv_path)
     print(f"\n{'=' * 80}")
-    print(
-        f"a16w16 sweep from {csv_path}: {len(shapes)} unique shapes, batch={batch}"
-    )
+    print(f"a16w16 sweep from {csv_path}: {len(shapes)} unique shapes, batch={batch}")
     print("=" * 80)
     passed = failed = 0
     for M, N, K in shapes:
@@ -105,20 +109,20 @@ def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
             B = _make_b(batch, N, K)
             ref = _torch_ref(A, B, torch.bfloat16)
             Y, us = run_perftest(
-                gemm_a16w16_opus, A, B, None, torch.bfloat16,
+                gemm_a16w16_opus,
+                A,
+                B,
+                None,
+                torch.bfloat16,
             )
             err = checkAllclose(Y, ref, msg=tag, rtol=0.1, atol=0.5)
             tflops = 2.0 * batch * M * N * K / us / 1e6
-            print(
-                f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}"
-            )
+            print(f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
             passed += 1
         except Exception as e:
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
-    print(
-        f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}"
-    )
+    print(f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}")
     return failed == 0
 
 
@@ -131,7 +135,8 @@ if __name__ == "__main__":
     parser.add_argument("-k", type=int, default=256)
     parser.add_argument("-b", "--batch", type=int, default=8)
     parser.add_argument(
-        "-d", "--dtype",
+        "-d",
+        "--dtype",
         type=str,
         default="bf16",
         choices=["bf16", "fp32"],

@@ -47,7 +47,6 @@ from torch import Tensor
 from ...jit.core import compile_ops
 from . import common as _opus_common
 
-
 # ---- Low-level pybind bindings --------------------------------------------
 
 
@@ -129,7 +128,7 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
     expected = {
         "XQ": (XQ, (M * K, K, 1)),
         "WQ": (WQ, (N * K, K, 1)),
-        "Y":  (Y,  (M * N, N, 1)),
+        "Y": (Y, (M * N, N, 1)),
     }
     for name, (t, want) in expected.items():
         got = tuple(t.stride())
@@ -286,9 +285,7 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     if B.dim() == 2:
         N, K_b = B.shape
         if K_b != K:
-            raise ValueError(
-                f"K dimension mismatch: A has K={K}, B has K={K_b}"
-            )
+            raise ValueError(f"K dimension mismatch: A has K={K}, B has K={K_b}")
         if batch > 1:
             raise NotImplementedError(
                 f"gemm_a16w16_opus: B must be 3D [batch, N, K] when A is "
@@ -306,9 +303,7 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     elif B.dim() == 3:
         b_b, N, K_b = B.shape
         if K_b != K:
-            raise ValueError(
-                f"K dimension mismatch: A has K={K}, B has K={K_b}"
-            )
+            raise ValueError(f"K dimension mismatch: A has K={K}, B has K={K_b}")
         if b_b != batch:
             raise ValueError(
                 f"B batch mismatch: A has batch={batch}, B has batch={b_b}"
@@ -331,8 +326,7 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
         WQ = B
     else:
         raise ValueError(
-            f"B must be 2D [N, K] or 3D [batch, N, K] (got shape "
-            f"{tuple(B.shape)})"
+            f"B must be 2D [N, K] or 3D [batch, N, K] (got shape " f"{tuple(B.shape)})"
         )
 
     if out is not None:

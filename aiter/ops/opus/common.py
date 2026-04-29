@@ -43,7 +43,6 @@ import torch
 
 from aiter.jit.core import AITER_ROOT_DIR
 
-
 # ---- Env / default paths --------------------------------------------------
 
 OPUS_A16W16_TUNED_CSV = os.getenv(
@@ -149,9 +148,7 @@ def lookup_tuned(
 
     Dict contains 'solidx' (kernelId), 'splitK', 'kernelName'.
     """
-    key = _key_from_runtime(
-        M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle
-    )
+    key = _key_from_runtime(M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle)
     return _load_tuned_dict().get(key)
 
 

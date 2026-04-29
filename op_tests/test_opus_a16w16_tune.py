@@ -19,11 +19,11 @@ from opus_gemm_common import (
 
 from aiter import dtypes
 from aiter.test_common import checkAllclose
+
 # opus_gemm_a16w16_tune is the user-facing pybind binding, stays under
 # aiter/ops/opus/ (not the shim in aiter/ops/deepgemm.py, which prints a
 # DeprecationWarning).
 from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune
-
 
 # 33 kids total across three pipelines:
 #   * 6 split-barrier a16w16 (ids 4..9)           - ignore splitK
@@ -116,12 +116,17 @@ def main():
     parser.add_argument("--kid", type=int, default=None, help="Test a single kernel ID")
     parser.add_argument("--batch", type=int, default=1, help="Batch size")
     parser.add_argument(
-        "--dtype", type=str, default="bf16", choices=["bf16", "fp32"],
+        "--dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp32"],
         help="Output dtype (splitk kids now support both bf16 and fp32 via "
-             "splitk_reduce_kernel<D_OUT>)",
+        "splitk_reduce_kernel<D_OUT>)",
     )
     parser.add_argument(
-        "--tag", type=str, default=None,
+        "--tag",
+        type=str,
+        default=None,
         choices=["a16w16", "a16w16_flatmm", "a16w16_flatmm_splitk"],
         help="Filter kids by pipeline tag",
     )
