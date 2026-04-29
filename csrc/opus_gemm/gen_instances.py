@@ -25,6 +25,27 @@ PIPELINE_HEADER_MAP = {
     "a16w16_flatmm_splitk": "gfx950/opus_gemm_pipeline_a16w16_flatmm_splitk_gfx950.cuh",
 }
 
+# Traits header carries the traits struct + kargs struct definitions for a
+# given pipeline tag. These headers contain ONLY type definitions (no free
+# function templates), so a fused TU can include all of them without ODR
+# clashes -- unlike pipeline headers, which define same-named layout
+# helpers (make_layout_ga_noscale et al.) in multiple files. Used by the
+# fused host TU to obtain the Traits + kargs definitions without dragging
+# in the pipeline body.
+TRAITS_HEADER_MAP = {
+    "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8": "gfx950/opus_gemm_traits_a8w8_noscale_gfx950.cuh",
+    "a16w16": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_flatmm": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+    "a16w16_flatmm_splitk": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
+}
+
+# Splitk reduce kernel is shared infrastructure used by every
+# a16w16_flatmm_splitk launcher. Forward-declared in the fused host TU
+# so its `<<<>>>` calls type-check, and instantiated in each splitk
+# device.cu so the linker can pick the GPU IR up.
+SPLITK_REDUCE_HEADER = "gfx950/splitk_reduce_gfx950.cuh"
+
 KERNEL_FUNC_MAP = {
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8": "gemm_a8w8_noscale_kernel",
@@ -82,6 +103,39 @@ class opus_gemm_codegen:
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
+        # Compile-time split:
+        #
+        # Build layout:
+        #   * One fused HOST TU (instances/all_instances_host.cu)
+        #     instantiates every launcher's `template torch::Tensor
+        #     xxx<dtype>(...)`. It includes `<torch/extension.h>` ONCE
+        #     and forward-declares the kernel templates (so the
+        #     launcher body's `<<<...>>>` typechecks and emits an
+        #     undefined `__device_stub__` reference). It does NOT
+        #     include any pipeline header, so it sidesteps the ODR
+        #     clash between same-named layout helpers that live in
+        #     a16w16 / a8w8 pipeline headers.
+        #   * One device TU per (kid, dtype) at instances/{name}_C{dtype}.device.cu
+        #     includes that kid's pipeline header and emits
+        #     `template __global__ void kernel<Traits>(...)`. The host
+        #     stub generated here resolves the fused host TU's
+        #     undefined reference at link time (-fno-gpu-rdc allows
+        #     this because the linker still merges fat-binary segments
+        #     across all input .o's).
+        #
+        # The accumulator rows below are populated by the per-kid
+        # _gen_*_instance methods and consumed by _emit_fused_host_tu
+        # / _emit_device_tus at the end of gen_instances().
+        # Each row is a dict with the kid's full configuration:
+        #   { "kid_name", "dtype", "host_decl", "device_decl",
+        #     "launcher_body", "traits_aliases", "kernel_func",
+        #     "kargs_name" }
+        self._host_instantiations = []
+        self._device_instantiations = []
+        self._kid_records = []
+        # Pipeline headers for each kernel_tag (used by the per-kid
+        # device TU only).
+        self._kid_pipeline_header = {}
 
     # ── a16w16 compile-time + VGPR spill validator ──
 
@@ -484,39 +538,118 @@ class opus_gemm_codegen:
             )
 
         pipeline_header = PIPELINE_HEADER_MAP[k.kernel_tag]
+        traits_header = TRAITS_HEADER_MAP[k.kernel_tag]
         kernel_func = KERNEL_FUNC_MAP[k.kernel_tag]
         da, db = INPUT_DTYPE_MAP[k.kernel_tag]
         traits_name = TRAITS_NAME_MAP[k.kernel_tag]
         kargs_name = KARGS_NAME_MAP[k.kernel_tag]
 
+        # Track per-kid pipeline header so the per-kid device.cu can
+        # include exactly the right one without re-running the full
+        # logic in _gen_*_instance.
+        self._kid_pipeline_header[k.name] = pipeline_header
+
         if k.kernel_tag == "a16w16_flatmm":
             self._gen_flatmm_instance(
-                k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
             )
         elif k.kernel_tag == "a16w16_flatmm_splitk":
             self._gen_flatmm_splitk_instance(
-                k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
             )
         elif k.kernel_tag in NOSCALE_TAGS:
             self._gen_noscale_instance(
-                k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
             )
         else:
             self._gen_scale_instance(
-                k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+                k,
+                pipeline_header,
+                traits_header,
+                kernel_func,
+                da,
+                db,
+                traits_name,
+                kargs_name,
             )
 
     def _gen_scale_instance(
-        self, k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
     ):
+        # Pre-declared Traits alias (visible to both passes).
+        # See _gen_noscale_instance for the rationale of the host/device
+        # pass split.
+        traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+    opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>>;
+"""
+
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include <torch/all.h>
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#endif
+// Pipeline body vs. traits-only split:
+//
+//   * Per-kid TU (default) includes the full pipeline header, which
+//     contains the __global__ kernel template definition + all device
+//     layout helpers. This is what drives device codegen.
+//
+//   * Fused host TU (defines OPUS_FUSED_HOST_TU before #include)
+//     includes only the traits header (kargs + Traits structs, no
+//     free function templates) and forward-declares the kernel
+//     template. The fused TU then writes a launcher body whose
+//     <<<...>>> generates an undefined `__device_stub__` reference
+//     resolved at link time by the per-kid device.cu's explicit
+//     instantiation. Skipping the pipeline header here is what avoids
+//     the ODR clash on `make_layout_ga_noscale` & friends, which are
+//     defined in multiple pipeline headers under the same name.
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+#else
 #include "{pipeline_header}"
-
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
 torch::Tensor
 {k.name}(
@@ -531,11 +664,7 @@ torch::Tensor
     int N = WQ.size(1);
     int K = XQ.size(2);
 
-    using Traits = {traits_name}<{k.BLOCK_SIZE},
-        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-        opus::tuple<{da}, {db}, D_C, fp32_t, fp32_t>,
-        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
-        opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>>;
+    using Traits = {k.name}_Traits<D_C>;
 
     int GROUP_M = {k.GROUP_M};
     int GROUP_N = {k.GROUP_N};
@@ -572,29 +701,35 @@ torch::Tensor
     dim3 block({k.BLOCK_SIZE});
 
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    {kernel_func}<Traits><<<grid, block, 0, stream>>>(kargs);
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
     return Y;
 }}}}
+#endif // launcher only on regular host pass
 """
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
-        INSTANCE_TEMPLATE = """// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include "impl/{name}.cuh"
-template torch::Tensor
-{name}<{dtype}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> x_scale,
-    std::optional<torch::Tensor> w_scale);
-"""
+        # See _gen_noscale_instance for how these rows are consumed.
         for CDtype in k.output_dtypes:
-            instance = INSTANCE_TEMPLATE.format(name=k.name, dtype=CDtype)
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_C{CDtype}.cpp")
-            ).write_text(instance)
+            host_decl = (
+                f"template torch::Tensor\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    torch::Tensor &XQ,\n"
+                f"    torch::Tensor &WQ,\n"
+                f"    torch::Tensor &Y,\n"
+                f"    std::optional<torch::Tensor> x_scale,\n"
+                f"    std::optional<torch::Tensor> w_scale);\n"
+            )
+            device_decl = (
+                f"template __global__ void {kernel_func}<\n"
+                f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
+            )
+            self._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            )
+            self._device_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            )
 
     # Shared host-side bias validation + kargs population. Inserted into every
     # A16W16_TUNE_TAGS launcher (split-barrier / flatmm / flatmm_splitk).
@@ -639,7 +774,15 @@ template torch::Tensor
 """
 
     def _gen_noscale_instance(
-        self, k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
     ):
         # a16w16 split-barrier supports HAS_BIAS via the noscale kargs path.
         # a8w8_noscale kids share the same kargs struct but always pass
@@ -748,14 +891,123 @@ template torch::Tensor
         # nullptr / 0 assignments.
         kargs_init_extra = ""
 
+        # ── Compile-time split: host pass vs device pass ──
+        #
+        # The .cuh file contains the heavy host-side launcher (TORCH_CHECK,
+        # `<<<...>>>` launch, kargs marshalling). Wrapping the host includes
+        # plus the launcher body in `#ifndef __HIP_DEVICE_COMPILE__` lets us
+        # skip the entire libtorch + ATen + <hip/hip_runtime.h> header
+        # stack on the device pass for every instance TU. The device pass
+        # only needs the pipeline header (which transitively pulls
+        # opus.hpp + opus_gemm_utils.cuh, both lightweight thanks to their
+        # own __HIP_DEVICE_COMPILE__ guards).
+        #
+        # Functional equivalence with the pre-split layout:
+        #   - host pass: identical preamble + launcher body. The kernel
+        #     `<<<...>>>` launch in the launcher body still triggers the
+        #     usual __device_stub__ generation, so host-side hipLaunchKernel
+        #     resolves at runtime exactly as before.
+        #   - device pass: no launcher body to compile. The companion .cpp
+        #     emits an explicit `template __global__ void
+        #     {kernel_func}<Traits>(kargs)` instantiation under the same
+        #     #else branch, which is what actually drives GPU codegen.
+        #
+        # Pre-declared Traits aliases live at file scope (outside the
+        # #ifndef) so the device-pass branch in the .cpp can reuse them
+        # without repeating the long template argument list.
+        # a16w16 split-barrier emits two Traits (HAS_BIAS true / false);
+        # everything else has a single Traits.
+        if is_a16w16_split_barrier:
+            traits_aliases = f"""
+template <typename D_C>
+using {k.name}_TraitsNoBias = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
+    false,
+    D_C>;
+template <typename D_C>
+using {k.name}_TraitsBias = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra},
+    true,
+    D_C>;
+"""
+        else:
+            traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra}>;
+"""
+
+        # The launcher body now references the pre-declared Traits aliases
+        # instead of `using` them locally, so the device-pass __global__
+        # instantiation in the companion .cpp can name the same type.
+        if is_a16w16_split_barrier:
+            launch_block = f"""
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    if (bias.has_value()) {{{{
+        {kernel_func}<{k.name}_TraitsBias<D_C>><<<grid, block, 0, stream>>>(kargs);
+    }}}} else {{{{
+        {kernel_func}<{k.name}_TraitsNoBias<D_C>><<<grid, block, 0, stream>>>(kargs);
+    }}}}"""
+        else:
+            launch_block = f"""
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
+
+        # Three guard combinations encode the host/device pass split for
+        # this .cuh:
+        #   * __HIP_DEVICE_COMPILE__: device pass, any TU. Skip torch
+        #     includes and the launcher body; the pipeline header and
+        #     Traits aliases ARE visible (kernel templates need them).
+        #   * __HIPCC_RTC__: a TU built with -D__HIPCC_RTC__. This is
+        #     specifically the .device.cu files (one per (kid, dtype))
+        #     emitted by _emit_device_tus. Their host pass also has no
+        #     launcher body, so torch includes would be both wasted and
+        #     harmful (RTC mode skips __clang_hip_runtime_wrapper.h,
+        #     which torch's transitive headers depend on). Treat RTC
+        #     identically to __HIP_DEVICE_COMPILE__ for the purposes of
+        #     hiding the launcher.
+        #   * Otherwise: regular host pass of a non-RTC TU (the fused
+        #     all_instances_host.cu in our codegen). This is the only
+        #     place that actually wants the launcher body + torch.
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include <torch/all.h>
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#endif
+// Pipeline body vs. traits-only split:
+//
+//   * Per-kid TU (default) includes the full pipeline header, which
+//     contains the __global__ kernel template definition + all device
+//     layout helpers. This is what drives device codegen.
+//
+//   * Fused host TU (defines OPUS_FUSED_HOST_TU before #include)
+//     includes only the traits header (kargs + Traits structs, no
+//     free function templates) and forward-declares the kernel
+//     template. The fused TU then writes a launcher body whose
+//     <<<...>>> generates an undefined `__device_stub__` reference
+//     resolved at link time by the per-kid device.cu's explicit
+//     instantiation. Skipping the pipeline header here is what avoids
+//     the ODR clash on `make_layout_ga_noscale` & friends, which are
+//     defined in multiple pipeline headers under the same name.
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+#else
 #include "{pipeline_header}"
-
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
 torch::Tensor
 {k.name}(
@@ -791,6 +1043,7 @@ torch::Tensor
 
     return Y;
 }}}}
+#endif // launcher only on regular host pass
 """
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
@@ -798,25 +1051,65 @@ torch::Tensor
             inst_extra_param = ",\n    std::optional<torch::Tensor>,\n    int"
         else:
             inst_extra_param = ""
-        INSTANCE_TEMPLATE = f"""// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include <optional>
-#include <torch/extension.h>
-#include "impl/{{name}}.cuh"
-template torch::Tensor
-{{name}}<{{dtype}}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y{inst_extra_param});
-"""
+
+        # Record (kid, dtype) instantiation pairs. These are stitched into
+        # one fused host TU + N device TUs at the end of gen_instances().
+        # See _emit_fused_host_tu / _emit_device_tu for how the rows are
+        # consumed.
+        if is_a16w16_split_barrier:
+            # Split-barrier emits two __global__ specializations per
+            # dtype because the launcher dispatches at runtime on
+            # bias.has_value(). Both must be force-instantiated on the
+            # device pass.
+            def _device_decl(dtype):
+                return (
+                    f"template __global__ void {kernel_func}<\n"
+                    f"    {k.name}_TraitsNoBias<{dtype}>>({kargs_name});\n"
+                    f"template __global__ void {kernel_func}<\n"
+                    f"    {k.name}_TraitsBias<{dtype}>>({kargs_name});\n"
+                )
+
+        else:
+
+            def _device_decl(dtype):
+                return (
+                    f"template __global__ void {kernel_func}<\n"
+                    f"    {k.name}_Traits<{dtype}>>({kargs_name});\n"
+                )
+
         for CDtype in k.output_dtypes:
-            instance = INSTANCE_TEMPLATE.format(name=k.name, dtype=CDtype)
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_C{CDtype}.cpp")
-            ).write_text(instance)
+            host_decl = (
+                f"template torch::Tensor\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    torch::Tensor &XQ,\n"
+                f"    torch::Tensor &WQ,\n"
+                f"    torch::Tensor &Y{inst_extra_param});\n"
+            )
+            self._host_instantiations.append(
+                {
+                    "kid_name": k.name,
+                    "dtype": CDtype,
+                    "host_decl": host_decl,
+                }
+            )
+            self._device_instantiations.append(
+                {
+                    "kid_name": k.name,
+                    "dtype": CDtype,
+                    "device_decl": _device_decl(CDtype),
+                }
+            )
 
     def _gen_flatmm_instance(
-        self, k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
     ):
         """Generate a flatmm launcher (a16w16_flatmm).
 
@@ -850,14 +1143,53 @@ template torch::Tensor
         "latent K-tail accumulation bug; pass an even K)");
 """
 
+        # Pre-declared Traits alias at file scope (visible to both passes).
+        # See _gen_noscale_instance for the rationale of the host/device
+        # pass split.
+        traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, D_C, fp32_t, D_C>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
+    {k.WG_PER_CU},
+    {has_bias_str}>;
+"""
+
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include <torch/all.h>
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#endif
+// Pipeline body vs. traits-only split:
+//
+//   * Per-kid TU (default) includes the full pipeline header, which
+//     contains the __global__ kernel template definition + all device
+//     layout helpers. This is what drives device codegen.
+//
+//   * Fused host TU (defines OPUS_FUSED_HOST_TU before #include)
+//     includes only the traits header (kargs + Traits structs, no
+//     free function templates) and forward-declares the kernel
+//     template. The fused TU then writes a launcher body whose
+//     <<<...>>> generates an undefined `__device_stub__` reference
+//     resolved at link time by the per-kid device.cu's explicit
+//     instantiation. Skipping the pipeline header here is what avoids
+//     the ODR clash on `make_layout_ga_noscale` & friends, which are
+//     defined in multiple pipeline headers under the same name.
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+#else
 #include "{pipeline_header}"
-
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
 torch::Tensor
 {k.name}(
@@ -883,13 +1215,7 @@ torch::Tensor
         "bias is not yet supported on a16w16_flatmm kid; use a16w16 "
         "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
 
-    using Traits = {traits_name}<{k.BLOCK_SIZE},
-        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-        opus::tuple<{da}, {db}, D_C, fp32_t, D_C>,
-        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
-        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
-        {k.WG_PER_CU},
-        {has_bias_str}>;
+    using Traits = {k.name}_Traits<D_C>;
 {k_check}
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a = XQ.data_ptr();
@@ -913,34 +1239,46 @@ torch::Tensor
     dim3 block({k.BLOCK_SIZE});
 
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    {kernel_func}<Traits><<<grid, block, 0, stream>>>(kargs);
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
     return Y;
 }}}}
+#endif // launcher only on regular host pass
 """
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
-        INSTANCE_TEMPLATE = """// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include <optional>
-#include <torch/extension.h>
-#include "impl/{name}.cuh"
-template torch::Tensor
-{name}<{dtype}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor>,
-    int);
-"""
+        # See _gen_noscale_instance for how these rows are consumed.
         for CDtype in k.output_dtypes:
-            instance = INSTANCE_TEMPLATE.format(name=k.name, dtype=CDtype)
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_C{CDtype}.cpp")
-            ).write_text(instance)
+            host_decl = (
+                f"template torch::Tensor\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    torch::Tensor &XQ,\n"
+                f"    torch::Tensor &WQ,\n"
+                f"    torch::Tensor &Y,\n"
+                f"    std::optional<torch::Tensor>,\n"
+                f"    int);\n"
+            )
+            device_decl = (
+                f"template __global__ void {kernel_func}<\n"
+                f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
+            )
+            self._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            )
+            self._device_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            )
 
     def _gen_flatmm_splitk_instance(
-        self, k, pipeline_header, kernel_func, da, db, traits_name, kargs_name
+        self,
+        k,
+        pipeline_header,
+        traits_header,
+        kernel_func,
+        da,
+        db,
+        traits_name,
+        kargs_name,
     ):
         """Generate a flatmm split-K launcher (a16w16_flatmm_splitk).
 
@@ -957,14 +1295,53 @@ template torch::Tensor
         D_C template param is fp32_t (workspace is fp32); Y must be bf16.
         opus_gemm.cu's dispatcher forces the <fp32_t> branch for kid >= 200.
         """
+        # Pre-declared Traits alias at file scope (visible to both passes).
+        # See _gen_noscale_instance for the rationale of the host/device
+        # pass split.
+        traits_aliases = f"""
+template <typename D_C>
+using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
+    opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
+    opus::tuple<{da}, {db}, fp32_t, fp32_t, {da}>,
+    opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
+    opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
+    {k.WG_PER_CU},
+    false>;
+"""
+
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include <torch/all.h>
 #include <torch/extension.h>
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#endif
+// Pipeline body vs. traits-only split:
+//
+//   * Per-kid TU (default) includes the full pipeline header, which
+//     contains the __global__ kernel template definition + all device
+//     layout helpers. This is what drives device codegen.
+//
+//   * Fused host TU (defines OPUS_FUSED_HOST_TU before #include)
+//     includes only the traits header (kargs + Traits structs, no
+//     free function templates) and forward-declares the kernel
+//     template. The fused TU then writes a launcher body whose
+//     <<<...>>> generates an undefined `__device_stub__` reference
+//     resolved at link time by the per-kid device.cu's explicit
+//     instantiation. Skipping the pipeline header here is what avoids
+//     the ODR clash on `make_layout_ga_noscale` & friends, which are
+//     defined in multiple pipeline headers under the same name.
+#ifdef OPUS_FUSED_HOST_TU
+#include "{traits_header}"
+template<typename Traits>
+__global__ void {kernel_func}({kargs_name} kargs);
+#else
 #include "{pipeline_header}"
-
+#endif
+{traits_aliases}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
 torch::Tensor
 {k.name}(
@@ -997,14 +1374,7 @@ torch::Tensor
         "K=", K, " must be even (a16w16 family rejects odd K due to a "
         "latent K-tail accumulation bug; pass an even K)");
 {self.BIAS_HOST_VALIDATE}
-    using Traits = {traits_name}<{k.BLOCK_SIZE},
-        opus::seq<{k.B_M}, {k.B_N}, {k.B_K}>,
-        opus::tuple<{da}, {db}, fp32_t, fp32_t, {da}>,   // D_C=fp32 forced; D_BIAS=D_A (matches Y)
-        opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
-        opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
-        {k.WG_PER_CU},
-        false>;                                           // main kernel HAS_BIAS=false
-                                                          // (bias only consumed by reduce kernel)
+    using Traits = {k.name}_Traits<D_C>;
 
     // splitK semantic: literal KBatch. 0 and 1 both mean no split.
     int split_k = (splitK <= 1) ? 1 : splitK;
@@ -1067,7 +1437,7 @@ torch::Tensor
     dim3 block_reduce(REDUCE_BS);
 
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
-    {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
+    {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
     // Reduce kernel: 4 specializations (D_OUT bf16/fp32 x HAS_BIAS true/false).
     // bias dtype is locked to Y.dtype() by BIAS_HOST_VALIDATE.
     if (Y.dtype() == at::ScalarType::BFloat16) {{{{
@@ -1109,27 +1479,49 @@ torch::Tensor
 
     return Y;
 }}}}
+#endif // launcher only on regular host pass
 """
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
-        INSTANCE_TEMPLATE = """// SPDX-License-Identifier: MIT
-// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-#include <optional>
-#include <torch/extension.h>
-#include "impl/{name}.cuh"
-template torch::Tensor
-{name}<{dtype}>(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor>,
-    int);
-"""
+        # See _gen_noscale_instance for how these rows are consumed. The
+        # 4 splitk reduce-kernel instantiations (bf16/fp32 Y x HAS_BIAS
+        # true/false) are appended to the main-kernel device decl so a
+        # single device.cu instance covers main + reduce kernels for one
+        # (kid, dtype). Duplicating them across multiple kid TUs is fine
+        # because the reduce kernel templates are weak `__global__`
+        # symbols (the linker dedupes).
         for CDtype in k.output_dtypes:
-            instance = INSTANCE_TEMPLATE.format(name=k.name, dtype=CDtype)
-            Path(
-                os.path.join(self.instances_path, f"{k.name}_C{CDtype}.cpp")
-            ).write_text(instance)
+            host_decl = (
+                f"template torch::Tensor\n"
+                f"{k.name}<{CDtype}>(\n"
+                f"    torch::Tensor &XQ,\n"
+                f"    torch::Tensor &WQ,\n"
+                f"    torch::Tensor &Y,\n"
+                f"    std::optional<torch::Tensor>,\n"
+                f"    int);\n"
+            )
+            device_decl = (
+                f"template __global__ void {kernel_func}<\n"
+                f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
+                "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16>(\n"
+                "    const float*, __bf16*, int, int, int, int, int, int,\n"
+                "    const __bf16*, int);\n"
+                "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16>(\n"
+                "    const float*, __bf16*, int, int, int, int, int, int,\n"
+                "    const __bf16*, int);\n"
+                "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float>(\n"
+                "    const float*, float*,  int, int, int, int, int, int,\n"
+                "    const float*,  int);\n"
+                "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float>(\n"
+                "    const float*, float*,  int, int, int, int, int, int,\n"
+                "    const float*,  int);\n"
+            )
+            self._host_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+            )
+            self._device_instantiations.append(
+                {"kid_name": k.name, "dtype": CDtype, "device_decl": device_decl}
+            )
 
     # ── Lookup / manifest generation ──
 
@@ -1348,6 +1740,136 @@ torch::Tensor
                 else:
                     f.write(MANIFEST_SCALE.format(kernel_name=k.name))
 
+    # ── Per-pass TU emission ──
+    #
+    # Replaces the old "one .cpp per (kid, dtype)" scheme. The wall-time
+    # math:
+    #   Old: 38 .cpp TUs each pay full <torch/extension.h> + <hip/...>
+    #        parse on host pass (~13s) + a small device pass (~2s, after
+    #        the .cuh #ifndef split). Total parallel wall ≈ host pass.
+    #   New: 1 fused host TU does the heavy host parse exactly once
+    #        (~13s) + N device TUs each ~2s. Parallel wall ≈ max(13s,
+    #        slowest device TU). The 38 host parses collapse into one,
+    #        so the critical path shrinks to roughly the single host
+    #        TU's compile time.
+
+    def _emit_fused_host_tu(self):
+        """Emit one fused HOST translation unit covering every kid's
+        launcher instantiation.
+
+        Defines OPUS_FUSED_HOST_TU before including the .cuh's so each
+        .cuh swaps its `#include "{pipeline_header}"` for the lighter
+        `#include "{traits_header}"` + a forward declaration of the
+        kernel template. That sidesteps the ODR clash we'd otherwise
+        hit when multiple pipeline headers (a16w16, a8w8, ...) define
+        same-named layout helpers like `make_layout_ga_noscale` in the
+        same TU.
+
+        Each launcher's `<<<...>>>` inside the .cuh body emits an
+        undefined `__device_stub__<...>` reference; the link step
+        resolves it against the matching per-kid device.cu (which DOES
+        include the full pipeline header and instantiates the kernel
+        template).
+
+        End result: the heavy <torch/extension.h> + ATen + HIP runtime
+        parse runs ONCE per module rebuild instead of N times, while
+        device codegen still parallelises across N tiny self-contained
+        device.cu's.
+        """
+        impl_includes = sorted({row["kid_name"] for row in self._host_instantiations})
+        host_body = "".join(row["host_decl"] for row in self._host_instantiations)
+        # splitk_reduce_kernel is launched directly from each
+        # a16w16_flatmm_splitk launcher body, so the fused host TU has
+        # to see its declaration to type-check the <<<...>>> call. It
+        # has 4 specialisations (D_OUT bf16/fp32 x HAS_BIAS true/false),
+        # all instantiated in each splitk device.cu.
+        forward_decls = (
+            "// Forward declaration only. The 4 specialisations are\n"
+            "// instantiated by every splitk device.cu so the linker\n"
+            "// always finds at least one definition (weak symbols\n"
+            "// dedupe across TUs).\n"
+            "template<int VEC_, int BLOCK_, typename D_OUT,\n"
+            "         bool HAS_BIAS_, typename D_BIAS_>\n"
+            "__global__ void splitk_reduce_kernel(\n"
+            "    const float* workspace, D_OUT* c_out,\n"
+            "    int split_k, int M, int N, int batch,\n"
+            "    int padded_M, int padded_N,\n"
+            "    const D_BIAS_* bias, int stride_bias_batch);\n"
+        )
+        contents = (
+            "// SPDX-License-Identifier: MIT\n"
+            "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+            "//\n"
+            "// Auto-generated. Do not edit. See gen_instances.py:_emit_fused_host_tu.\n"
+            "//\n"
+            "// Fused HOST translation unit: instantiates every launcher in one\n"
+            "// .o, paying the heavy <torch/extension.h> parse only once per\n"
+            "// module rebuild. Per-kid device codegen lives in <kid>_C<dtype>.device.cu;\n"
+            "// the link step wires our undefined __device_stub__ references to\n"
+            "// the device TUs' kernel definitions (-fno-gpu-rdc safe because\n"
+            "// host stubs are weak symbols and fat-binary segments are merged\n"
+            "// at link time).\n"
+            "//\n"
+            "// The whole TU is host-only -- the per-kid device.cu files are\n"
+            "// where __global__ instantiations actually live -- so we skip the\n"
+            "// device pass entirely. hipcc still launches a device-pass\n"
+            "// invocation, but it sees an empty TU and finishes in <0.5s.\n"
+            "#ifndef __HIP_DEVICE_COMPILE__\n"
+            "#define OPUS_FUSED_HOST_TU 1\n"
+            "#include <optional>\n"
+            "#include <torch/extension.h>\n"
+            "#include <ATen/hip/HIPContext.h>\n"
+            "#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>\n"
+            + forward_decls
+            + "".join(f'#include "impl/{name}.cuh"\n' for name in impl_includes)
+            + host_body
+            + "#endif // host pass only\n"
+        )
+        Path(os.path.join(self.instances_path, "all_instances_host.cu")).write_text(
+            contents
+        )
+
+    def _emit_device_tus(self):
+        """Emit one device-only .device.cu per (kid, dtype).
+
+        Each .cu includes the kid's pipeline header (so the kernel
+        template body is visible) and explicitly instantiates the
+        kernel template. The companion fused host TU's <<<...>>> calls
+        end up referencing host stubs that the linker resolves to the
+        instantiations here.
+
+        This TU does not include torch -- it doesn't need to, because
+        the host pass only sees `template __global__ void k<...>(...)`
+        which doesn't depend on any libtorch type. Skipping the torch
+        parse on host pass drops each device TU's compile to ~1.5s
+        (down from ~13s when torch was forced in).
+        """
+        for row in self._device_instantiations:
+            name = row["kid_name"]
+            dtype = row["dtype"]
+            # Include the kid's .cuh -- it transitively pulls in the
+            # full pipeline header (because OPUS_FUSED_HOST_TU is NOT
+            # defined here) and the per-kid Traits aliases. The .cuh's
+            # `#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)`
+            # guard hides the launcher body and the torch includes
+            # from this device-only TU, so neither the host pass nor
+            # the device pass tries to parse <torch/extension.h>.
+            contents = (
+                "// SPDX-License-Identifier: MIT\n"
+                "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+                "//\n"
+                "// Auto-generated. Do not edit. See gen_instances.py:_emit_device_tus.\n"
+                "//\n"
+                "// Device-only translation unit for one (kid, dtype) pair.\n"
+                "// Compiled with -D__HIPCC_RTC__ (per-source flag in\n"
+                "// optCompilerConfig.json) so the host pass takes the\n"
+                "// minimal branch -- no torch, no full HIP runtime.\n"
+                f'#include "impl/{name}.cuh"\n' + row["device_decl"]
+            )
+            Path(
+                os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
+            ).write_text(contents)
+
     def gen_instances(self, kernels_dict):
         if os.path.exists(self.impl_path):
             shutil.rmtree(self.impl_path)
@@ -1356,8 +1878,18 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
+        # Reset the instantiation accumulators so reruns under the same
+        # codegen object don't double-emit.
+        self._host_instantiations = []
+        self._device_instantiations = []
+
         for mnk, k in kernels_dict.items():
             self.gen_instance(k)
+
+        # Emit one fused HOST TU + N device TUs (one per kid, dtype).
+        # See the docstrings on those methods for the full rationale.
+        self._emit_fused_host_tu()
+        self._emit_device_tus()
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_manifest_head(kernels_dict)

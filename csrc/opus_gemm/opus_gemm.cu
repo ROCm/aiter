@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// opus_gemm.cu is the host-side dispatcher (lookup table + heuristic
+// fallback). It contains no __global__ functions and no `<<<>>>` launches,
+// so the device pass has nothing to codegen but still pays the full
+// libtorch + HIP runtime + opus.hpp parse (~15s/TU). Skipping the entire
+// translation unit on the device pass makes it essentially free, saving
+// a second-bottleneck TU's worth of wall time on every rebuild.
+#ifndef __HIP_DEVICE_COMPILE__
+
 #include "opus_gemm_arch.cuh"                      // OpusGfxArch + opus_get_arch_info / opus_get_gfx_arch
 #include "gfx950/opus_gemm_arch_gfx950.cuh"        // opus_dispatch_a16w16_gfx950<T> / opus_a16w16_tune_dispatch_gfx950<T>
 #include "opus_gemm_common.cuh"
@@ -262,3 +270,5 @@ torch::Tensor opus_gemm_a16w16_tune(
   }
   return Y;
 }
+
+#endif // !__HIP_DEVICE_COMPILE__
