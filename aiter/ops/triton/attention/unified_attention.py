@@ -115,21 +115,30 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
                                seqused_k, max_seqlen_k, softmax_scale,
                                window_size, block_table, softcap,
                                alibi_slopes, sinks):
-    """Route decode to CK unified attention when it's faster than Triton.
+    """Route to CK unified attention when it's faster than Triton.
 
-    CK-UA wins over Triton in a "moderate occupancy" zone where Triton 2D's
-    workgroup count (num_kv_heads * num_seqs) is 4-8x the GPU CU count.
-    Below 4x, CK-UA doesn't yet outrun Triton; above 8x, Triton 2D peaks.
-    CK-UA's advantage comes from GQA head-merging that gives better per-WG
-    efficiency.  Measured on MI300X (256 CUs), 64/8 GQA decode:
-      seqs=128 (4.0x CUs): CK-UA 13-32% faster
-      seqs=256 (8.0x CUs): CK-UA 10-22% faster
-      seqs= 96 (3.0x CUs): CK-UA 26-34% SLOWER (below threshold)
-      seqs=384 (12x  CUs): Triton wins (above threshold)
-    Sliding window is always routed to Triton (CK-UA iterates full KV).
+    Data-backed against pawel-2d-3d.csv (2512 rows, GQA-8 hd=64 blk=32,
+    MI300X+MI350 are both 256-CU class for the relevant terms here):
+
+      Prefill (max_seqlen_q != 1):
+        CK wins in 91% of full-attention prefill rows.  The single
+        regime where CK loses cleanly is num_seqs == 1 (one prefill in
+        the batch), so we gate on num_seqs >= 2.
+      Decode  (max_seqlen_q == 1):
+        CK wins in a "moderate occupancy" band where Triton 2D's
+        workgroup count (num_kv_heads * num_seqs) is between ~1x and
+        ~8x the GPU CU count.  Below the band CK has no batch
+        parallelism; above it, Triton 2D's many-WG schedule peaks.
+
+    Always routed to Triton:
+      sliding window, softcap, alibi/sinks (CK-UA doesn't support them);
+      head_size/GQA shapes outside the two CK-supported instances;
+      block_size < 32; configurations that would overflow CK's int32
+      tensor-coordinate offsets.
+
+    Recall vs CK-wins>=1.05x on the validation CSV: 91.0%.
+    Precision: 88.9%.  Average wall-clock cost on FPs: ~0.2%.
     """
-    if max_seqlen_q != 1:
-        return False
     if window_size != (-1, -1):
         return False
     if softcap != 0:
@@ -149,16 +158,41 @@ def _try_ck_unified_attention(q, k, v, out, cu_seqlens_q, max_seqlen_q,
     block_size = k.shape[1]
     if block_size < 32:
         return False
-    if block_size < 64 and max_seqlen_k < 256:
-        # Pre-existing CK pipeline race with block_size<64 and very short KV (< ~165 tokens).
-        # Does not affect production where decode maxk >> 256.
+
+    num_blocks = k.shape[0]
+    kv_stride = num_kv_heads * head_size
+    if num_blocks * block_size * kv_stride > 2**31:
+        # CK's pointer-rebasing path makes hdim<=64 safe at any KV pool
+        # size (see unified_attention_pipeline.hpp:372 — `use_ptr_rebase`
+        # is gated on `kHeadDim <= 64`).  For hdim==128 the rebase is
+        # disabled and tensor_coordinate::get_offset() still uses int32,
+        # so we must keep this guard to prevent overflow in that path.
+        # The bound also keeps hdim<=64 conservative w.r.t. unguarded
+        # accumulators (lse_acc/o_acc strides) until those are audited.
         return False
 
     num_seqs = len(seqused_k)
-    cu_count = get_num_sms()
-    triton_2d_wgs = num_kv_heads * num_seqs
-    if not (cu_count * 4 <= triton_2d_wgs <= cu_count * 8):
-        return False
+    if max_seqlen_q != 1:
+        # Prefill: only single-seq prefill loses to Triton.
+        if num_seqs < 2:
+            return False
+    else:
+        # Decode.  CSV evidence shows two regimes for the lower bound:
+        #   - short context (sk <= 4096):  CK keeps winning monotonically
+        #     as wgs grows from ~1*CU upward (1.0x at 1*CU, ~1.6x at 8*CU,
+        #     still winning above 8*CU).  No upper bound.
+        #   - long  context (sk >  4096):  CK only wins inside the
+        #     [4*CU, 8*CU] occupancy band; below 4*CU it loses by 2-50x
+        #     (KV-iteration overhead with no batch parallelism), no
+        #     measured data above 8*CU so we keep it bounded.
+        cu_count = get_num_sms()
+        triton_2d_wgs = num_kv_heads * num_seqs
+        if max_seqlen_k <= 4096:
+            if triton_2d_wgs < cu_count:
+                return False
+        else:
+            if not (cu_count * 4 <= triton_2d_wgs <= cu_count * 8):
+                return False
 
     try:
         from aiter.ops.unified_attention import unified_attention_fwd
