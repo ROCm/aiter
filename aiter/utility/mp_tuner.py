@@ -505,6 +505,11 @@ def mp_tuner(
                         dummy_results if shape_grouped else [dummy_results[0]]
                     )
                     completed_this_round.append((k, async_result))
+                    dummy_results = []
+                    add_dummy_result(k, dummy_results)
+                    result_dict[k] = (
+                        dummy_results if shape_grouped else [dummy_results[0]]
+                    )
 
                 # Only log error once per error type
                 if error_type not in logged_error_types:
