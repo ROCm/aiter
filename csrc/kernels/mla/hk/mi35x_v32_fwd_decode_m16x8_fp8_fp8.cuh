@@ -386,7 +386,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     kv_manager.template load_k_to_gpr<16, (tile_idx + 1 + 16) * T::kBlockK>(
                         kv_1, p_lds_kv_curr);
                 }
-                
+
                 if constexpr((idx.value == 0) && (kIsGlobalLast == false) && (kCheckBoundaryNext == false))
                 {
                     if((kv_tile_start + 2 * T::kBlockN) < kv_end)
@@ -407,7 +407,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                         }
                     }
                 }
-                
+
                 if constexpr(kSkipCompute == false)
                 {
                     asm volatile("s_waitcnt lgkmcnt(0)");
@@ -1060,6 +1060,7 @@ void hk_mi35x_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
     case PS:                                                                                    \
     {                                                                                           \
         using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16,                 \
+                                            /*kBlockN_=*/32,                                    \
                                             /*kNumWarps_=*/8,                                   \
                                             /*kOccupancy_=*/1,                                  \
                                             /*kBlockM_=*/128,                                   \

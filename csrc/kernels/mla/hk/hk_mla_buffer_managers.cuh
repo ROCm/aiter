@@ -1031,7 +1031,7 @@ class KvManager8bitsV3
 
     /// TODO: These parameters should reside in Traits.
     // In the view of thread block on loading
-    static constexpr uint32_t kNumRows         = 32;
+    static constexpr uint32_t kNumRows         = T::kBlockN;
     static constexpr uint32_t kNumCols         = 64;
     static constexpr uint32_t kNumSubBlockRows = 4;
     static constexpr uint32_t kNumSubBlockCols = 32;
@@ -1040,16 +1040,16 @@ class KvManager8bitsV3
     static constexpr uint32_t kNumBytesPerSubBlock =
         kNumSubBlockRows * kNumSubBlockCols * sizeof(kv_t); // 4*32*1=128
     static constexpr uint32_t kNumBytesPer2SubBlocksWithPadding =
-        kNumBytesPerSubBlock * 2 + kNumPaddingDw * sizeof(uint32_t); // 128*2+2*4=256+8=264
-    // LDS layout: 32x64 block split into 8 sub-block slots; INDEPENDENT of kNumWarps.
-    static constexpr uint32_t kNum2SubBlocks = 8;
+        kNumBytesPerSubBlock * 2 + kNumPaddingDw * sizeof(uint32_t); // 128*2+2*4=264
+    // LDS layout: kBlockN x 64 block split into kBlockN/4 sub-block slots; INDEPENDENT of kNumWarps.
+    static constexpr uint32_t kNum2SubBlocks = kNumRows / 4; // kBlockN=32 -> 8; kBlockN=64 -> 16
     static_assert(kNum2SubBlocks % T::kNumWarps == 0,
-                  "kNum2SubBlocks (8) must be a multiple of kNumWarps");
-    static constexpr uint32_t kNumPassesPerWarp = kNum2SubBlocks / T::kNumWarps; // 1 (8w) or 2 (4w)
+                  "kNum2SubBlocks must be a multiple of kNumWarps");
+    static constexpr uint32_t kNumPassesPerWarp = kNum2SubBlocks / T::kNumWarps; // 1 or 2
     static constexpr uint32_t kNumBytesPerBlock =
-        kNumBytesPer2SubBlocksWithPadding * kNum2SubBlocks;                 // 264*8=2112
+        kNumBytesPer2SubBlocksWithPadding * kNum2SubBlocks;                 // 264 * kNum2SubBlocks
     static constexpr uint32_t kNumRowsPerWarp = kNumSubBlockRows * 2;       // 8
-    static constexpr uint32_t kNumWarpsPerCol = kNumRows / kNumRowsPerWarp; // 32 / 8 = 4
+    static constexpr uint32_t kNumWarpsPerCol = 32 / kNumRowsPerWarp;       // 4 (rows per pass / 8)
     static constexpr uint32_t kNumBytesPerThrPerRnd =
         4; // use buffer_load_dword which loads 4B each time.
     static constexpr uint32_t kNumThrPerSubBlockRow =
@@ -1077,15 +1077,18 @@ class KvManager8bitsV3
 
     // Constexpr ds_read immediate-offset that selects the (kRowOffset, kColOffset)
     // sub-tile within the warp's V/K block.
-    //   kRowOffset ? {0, 16}                          -- top or bottom 16 rows of the 32-row block.
+    //   kRowOffset ? {0, 16, 32, 48}                  -- top/bot 16-row sub-tile of each pass.
+    //                                                    (For kBlockN=32 only 0/16 valid.)
     //   kColOffset is a multiple of 32, < kQkHeadDim -- picks the 32-col strip.
-    // Note: kColOffset is a multiple of 32 (asserted by callers), so the canonical
-    // (kColOffset/64)*2112 + ((kColOffset%64)/32)*1056 collapses to (kColOffset/32)*1056
-    // because 2 * 1056 == 2112.
+    // Layout B: pass 1 of all warps comes after pass 0 of all warps.
+    //   pass = kRowOffset / 32                          -> +pass * kNumWarps * 264
+    //   sub-block within pass = (kRowOffset % 32) / 16  -> +sub * 128
+    //   col strip: each kColOffset+=32 advances 4 warps -> +4 * 264
     template <uint32_t kRowOffset, uint32_t kColOffset>
     static constexpr uint32_t get_block_fixed_offset()
     {
-        return (kRowOffset / 16) * kNumBytesPerSubBlock +
+        return (kRowOffset / 32) * T::kNumWarps * kNumBytesPer2SubBlocksWithPadding +
+               ((kRowOffset % 32) / 16) * kNumBytesPerSubBlock +
                (kColOffset / 32) * 4 * kNumBytesPer2SubBlocksWithPadding;
     }
 
@@ -1122,6 +1125,10 @@ class KvManager8bitsV3
                (lane_idx % kNumThrPerSubBlockRow) * kNumBytesPerThrPerRnd;
     }
 
+    // Layout B: pass 1 of all warps lives after pass 0 of all warps. Callers requesting pass p
+    // pass `warp_idx + p * kNumWarps` to land in the right slot. m16x4 uses this for col-strip
+    // splitting (pass uses col_base+32); m16x8 kBlockN=64 uses it for row splitting (pass uses
+    // row+32). Stride per warp slot = 264 bytes (one 2-sub-block-with-padding).
     __device__ __forceinline__ static uintptr_t get_p_lds_kv_warp_base(const int32_t warp_idx,
                                                                        const uintptr_t p_lds_kv)
     {
@@ -1239,7 +1246,7 @@ class KvManager8bitsV3
         constexpr uint32_t kMfmaElemPerThr =
             kMfmaRows * kMfmaCols / opus::get_warp_size(); // 16*32/64=8
 
-        static_assert(((kRowOffset % 16) == 0) && (kRowOffset < 32),
+        static_assert(((kRowOffset % 16) == 0) && (kRowOffset < T::kBlockN),
                       "load_k_to_gpr(): Unsupported row offset!");
         static_assert(((kColOffset % 32) == 0) && (kColOffset < 576),
                       "load_k_to_gpr(): Unsupported column offset!");
@@ -1261,29 +1268,44 @@ class KvManager8bitsV3
     }
 
     // Load un-transposed vector from LDS to GPR.
+    // Each warp takes (kNumRows/2) x 128 elements: per-thread 4x8 block-wise column-major layout.
+    // For kBlockN=64 (kNumSubTiles=2), writes 2 consecutive v8ui (sub-tile 0: rows R..R+3,
+    // sub-tile 1: rows R+32..R+35). Caller must allocate p_result[kNumSubTiles].
     __device__ __forceinline__ static void
     load_v_to_gpr(v8ui* p_result, const uint32_t warp_idx, const uintptr_t p_lds_v)
     {
-        const uint32_t lane_idx = opus::lane_id();
+        const uint32_t lane_idx         = opus::lane_id();
+        constexpr uint32_t kNumSubTiles = kNumRows / 32;
+        const uint32_t col              = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
 
-        // Each warp takes 16x128 elements. Each thread takes 4x8 elements block-wise column-major
-        // layout.
-        const uint32_t row           = (warp_idx % 2) * 16 + lane_idx / 16 * 4;
-        const uint32_t row_phy       = (row % 4) + (row / 16) * 4 + (row % 16 / 4) * 8;
-        const uint32_t col           = (lane_idx % 16) * 8 + warp_idx / 2 * 128;
-        const uintptr_t p_lds_v_lane = p_lds_v + (row_phy / 8) * kNumBytesPer2SubBlocksWithPadding +
-                                       (row_phy % 8) * kNumSubBlockCols * sizeof(kv_t) +
-                                       col / kNumCols * kNumBytesPerBlock +
-                                       (col % kNumCols) / 32 * (4 * kNumBytesPer2SubBlocksWithPadding) +
-                                       ((col % kNumCols) % 32) * sizeof(kv_t);
+        #pragma unroll
+        for(uint32_t sub = 0; sub < kNumSubTiles; ++sub)
+        {
+            const uint32_t row = (warp_idx % 2) * 16 + lane_idx / 16 * 4 + sub * 32;
+            // Layout-B row_phy: linear LDS slot ID = pass * kNumWarps + warp_for_row,
+            // then 8 row_phy units per slot (sub_block * 4 + sub_row).
+            //   warp_for_row = (row % 16) / 4
+            //   pass         = row / 32
+            //   sub_block    = (row % 32) / 16
+            //   sub_row      = row % 4
+            const uint32_t row_phy = ((row / 32) * T::kNumWarps + (row % 16) / 4) * 8 +
+                                     ((row % 32) / 16) * 4 +
+                                     (row % 4);
+            const uintptr_t p_lds_v_lane =
+                p_lds_v + (row_phy / 8) * kNumBytesPer2SubBlocksWithPadding +
+                (row_phy % 8) * kNumSubBlockCols * sizeof(kv_t) +
+                col / kNumCols * kNumBytesPerBlock +
+                (col % kNumCols) / 32 * (4 * kNumBytesPer2SubBlocksWithPadding) +
+                ((col % kNumCols) % 32) * sizeof(kv_t);
 
-        const v2ui pass_0 = hkm::ds_read_b64(p_lds_v_lane, 0);
-        const v2ui pass_1 = hkm::ds_read_b64(p_lds_v_lane, 32);
-        const v2ui pass_2 = hkm::ds_read_b64(p_lds_v_lane, 64);
-        const v2ui pass_3 = hkm::ds_read_b64(p_lds_v_lane, 96);
+            const v2ui pass_0 = hkm::ds_read_b64(p_lds_v_lane, 0);
+            const v2ui pass_1 = hkm::ds_read_b64(p_lds_v_lane, 32);
+            const v2ui pass_2 = hkm::ds_read_b64(p_lds_v_lane, 64);
+            const v2ui pass_3 = hkm::ds_read_b64(p_lds_v_lane, 96);
 
-        *p_result = {
-            pass_0.x, pass_0.y, pass_1.x, pass_1.y, pass_2.x, pass_2.y, pass_3.x, pass_3.y};
+            p_result[sub] = {
+                pass_0.x, pass_0.y, pass_1.x, pass_1.y, pass_2.x, pass_2.y, pass_3.x, pass_3.y};
+        }
     }
 
     // Load a 16x32 (rows x cols) tile of V from LDS into 2 consecutive GPRs per lane,
@@ -1312,7 +1334,7 @@ class KvManager8bitsV3
     __device__ __forceinline__ void static load_transposed_v_to_gpr(const uintptr_t p_lds_v)
     {
 #if defined(__gfx950__)
-        static_assert(((kRowOffset % 16) == 0) && (kRowOffset < 32),
+        static_assert(((kRowOffset % 16) == 0) && (kRowOffset < T::kBlockN),
                       "load_transpose_v_to_gpr(): Unsupported row offset!");
         static_assert(((kColOffset % 32) == 0) && (kColOffset < 512),
                       "load_transpose_v_to_gpr(): Unsupported column offset!");

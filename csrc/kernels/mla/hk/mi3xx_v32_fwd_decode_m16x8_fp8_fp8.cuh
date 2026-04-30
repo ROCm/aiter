@@ -909,6 +909,7 @@ void hk_mi3xx_mla_v32_fwd_decode_m16x8_fp8_fp8(torch::Tensor& query,
     case PS:                                                                                    \
     {                                                                                           \
         using Traits = HkMlaDecodeFwdTraits<hk::fp8e4m3, hk::fp8e4m3, hk::bf16,                 \
+                                            /*kBlockN_=*/32,                                    \
                                             /*kNumWarps_=*/8,                                   \
                                             /*kOccupancy_=*/1,                                  \
                                             /*kBlockM_=*/128,                                   \
