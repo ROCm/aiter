@@ -792,70 +792,18 @@ def _compile_stage1_mxscale_kernel_impl(
         def issue_as_load(k_scale_base, target_lds):
             """Vectorised scalar A-scale loader (Option B).
 
-            Fast path (row-major LDS, i.e. ``is_fp4`` or ``wmma_m_rep == 1``):
-              each thread loads one full row of scales (``scale_k_per_tile``
-              bytes) with a single wide ``buffer_load`` and writes them
-              contiguously to LDS via a matching wide ``vector.store`` — e.g.
-              for ``tile_m=16, scale_k_per_tile=16`` this is 16 × b128 VMEM +
-              16 × ``ds_write_b128`` instead of 256 × per-byte ops.
-
-            Slow path (interleaved LDS, ``wmma_m_rep > 1`` and not ``is_fp4``):
-              each thread loads one ``SCALES_PER_WMMA``-sized chunk (4 bytes)
-              and writes it to the interleaved LDS slot.
+            Each thread loads one ``SCALES_PER_WMMA``-sized chunk (4 bytes)
+            and writes it either to the row-major LDS slot (``is_fp4`` or
+            ``wmma_m_rep == 1``) or to the interleaved LDS slot. Avoiding a
+            full-row i8 vector load is important for row widths such as 16
+            bytes, where LLVM cannot legalize ``v16i8`` raw buffer loads.
 
             Rare fallback: ``scale_k_per_tile`` not a multiple of 4 falls back
               to the original per-byte loop for correctness.
             """
             _blk_bytes = int(SCALES_PER_WMMA)
             _row_bytes = int(scale_k_per_tile)
-            if _as_layout_rowmajor and _row_bytes % 4 == 0 and _row_bytes >= 4:
-                _row_align = min(_row_bytes, 16)
-                _row_vec_type = T.vec(_row_bytes, T.i8)
-                total_rows = int(tile_m)
-                rounds = (total_rows + block_threads - 1) // block_threads
-                for it in range(rounds):
-                    elem = tx + fx.Index(it * block_threads)
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.ult,
-                        arith.index_cast(T.i32, elem),
-                        arith.constant(total_rows, type=T.i32),
-                    )
-                    _if_elem = scf.IfOp(in_range)
-                    with ir.InsertionPoint(_if_elem.then_block):
-                        row = elem
-                        fused = _load_fused_from_lds(row)
-                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                        tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
-                        )
-                        lds_idx = row * arith.index(_row_bytes)
-                        _if_ok = scf.IfOp(tok_ok, has_else=True)
-                        with ir.InsertionPoint(_if_ok.then_block):
-                            sx_idx = (
-                                tok * arith.constant(K_scale, type=T.i32)
-                                + arith.index_cast(T.i32, k_scale_base)
-                            )
-                            sx_vec = buffer_ops.buffer_load(
-                                sx_rsrc, sx_idx,
-                                vec_width=_row_bytes, dtype=T.i8,
-                            )
-                            vector.store(
-                                sx_vec, target_lds, [lds_idx],
-                                alignment=_row_align,
-                            )
-                            scf.YieldOp([])
-                        with ir.InsertionPoint(_if_ok.else_block):
-                            fill_vec = vector.broadcast(
-                                _row_vec_type,
-                                arith.constant(127, type=T.i8),
-                            )
-                            vector.store(
-                                fill_vec, target_lds, [lds_idx],
-                                alignment=_row_align,
-                            )
-                            scf.YieldOp([])
-                        scf.YieldOp([])
-            elif _row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes:
+            if const_expr(_row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes):
                 _blk_vec_type = T.vec(_blk_bytes, T.i8)
                 _blks_per_row = _row_bytes // _blk_bytes
                 total = int(tile_m) * _blks_per_row
@@ -876,7 +824,7 @@ def _compile_stage1_mxscale_kernel_impl(
                         tok_ok = arith.cmpi(
                             arith.CmpIPredicate.ult, tok, i32_tokens_in,
                         )
-                        if is_fp4:
+                        if const_expr(_as_layout_rowmajor):
                             lds_idx = (
                                 row * arith.index(_row_bytes)
                                 + ksc_blk * arith.index(_blk_bytes)
@@ -906,9 +854,18 @@ def _compile_stage1_mxscale_kernel_impl(
                                 tok * arith.constant(K_scale, type=T.i32)
                                 + arith.index_cast(T.i32, chunk_off)
                             )
-                            sx_vec = buffer_ops.buffer_load(
-                                sx_rsrc, sx_idx,
-                                vec_width=_blk_bytes, dtype=T.i8,
+                            sx_raw = buffer_ops.buffer_load(
+                                sx_rsrc,
+                                arith.shrui(
+                                    sx_idx,
+                                    arith.constant(2, type=T.i32),
+                                ),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                            sx_vec = vector.bitcast(
+                                _blk_vec_type,
+                                vector.from_elements(T.vec(1, T.i32), [sx_raw]),
                             )
                             vector.store(
                                 sx_vec, target_lds, [lds_idx],
@@ -916,9 +873,12 @@ def _compile_stage1_mxscale_kernel_impl(
                             )
                             scf.YieldOp([])
                         with ir.InsertionPoint(_if_ok.else_block):
-                            fill_vec = vector.broadcast(
+                            fill_vec = vector.bitcast(
                                 _blk_vec_type,
-                                arith.constant(127, type=T.i8),
+                                vector.from_elements(
+                                    T.vec(1, T.i32),
+                                    [arith.constant(0x7F7F7F7F, type=T.i32)],
+                                ),
                             )
                             vector.store(
                                 fill_vec, target_lds, [lds_idx],
@@ -2690,70 +2650,13 @@ def _compile_stage2_mxscale_kernel_impl(
         def issue_as_load(k_scale_base, target_lds):
             """Vectorised scalar A-scale loader (Option B) for stage2.
 
-            See stage1 ``issue_as_load`` for path rationale. Stage2 addresses
-            rows by ``ts = tok * topk + slot`` and the ``load_ok`` guard checks
-            both ``tok_ok`` and ``slot_ok``.
+            See stage1 ``issue_as_load`` for the 4-byte chunking rationale.
+            Stage2 addresses rows by ``ts = tok * topk + slot`` and the
+            ``load_ok`` guard checks both ``tok_ok`` and ``slot_ok``.
             """
             _blk_bytes = int(SCALES_PER_WMMA)
             _row_bytes = int(scale_k_per_tile)
-            if _as_layout_rowmajor and _row_bytes % 4 == 0 and _row_bytes >= 4:
-                _row_align = min(_row_bytes, 16)
-                _row_vec_type = T.vec(_row_bytes, T.i8)
-                total_rows = int(tile_m)
-                rounds = (total_rows + block_threads - 1) // block_threads
-                for it in range(rounds):
-                    elem = tx + fx.Index(it * block_threads)
-                    in_range = arith.cmpi(
-                        arith.CmpIPredicate.ult,
-                        arith.index_cast(T.i32, elem),
-                        arith.constant(total_rows, type=T.i32),
-                    )
-                    _if_elem = scf.IfOp(in_range)
-                    with ir.InsertionPoint(_if_elem.then_block):
-                        row = elem
-                        fused = _load_fused_from_lds(row)
-                        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
-                        slot = fused >> arith.constant(24, type=T.i32)
-                        tok_ok = arith.cmpi(
-                            arith.CmpIPredicate.ult, tok, i32_tokens_in,
-                        )
-                        slot_ok0 = arith.cmpi(
-                            arith.CmpIPredicate.sge, slot,
-                            arith.constant(0, type=T.i32),
-                        )
-                        slot_ok1 = arith.cmpi(
-                            arith.CmpIPredicate.slt, slot, c_topk_i32,
-                        )
-                        ts = tok * c_topk_i32 + slot
-                        ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
-                        lds_idx = row * arith.index(_row_bytes)
-                        _if_ok = scf.IfOp(ts_ok, has_else=True)
-                        with ir.InsertionPoint(_if_ok.then_block):
-                            sx_idx = (
-                                ts * arith.constant(K_scale, type=T.i32)
-                                + arith.index_cast(T.i32, k_scale_base)
-                            )
-                            sx_vec = buffer_ops.buffer_load(
-                                sx_rsrc, sx_idx,
-                                vec_width=_row_bytes, dtype=T.i8,
-                            )
-                            vector.store(
-                                sx_vec, target_lds, [lds_idx],
-                                alignment=_row_align,
-                            )
-                            scf.YieldOp([])
-                        with ir.InsertionPoint(_if_ok.else_block):
-                            fill_vec = vector.broadcast(
-                                _row_vec_type,
-                                arith.constant(127, type=T.i8),
-                            )
-                            vector.store(
-                                fill_vec, target_lds, [lds_idx],
-                                alignment=_row_align,
-                            )
-                            scf.YieldOp([])
-                        scf.YieldOp([])
-            elif _row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes:
+            if const_expr(_row_bytes % _blk_bytes == 0 and _row_bytes >= _blk_bytes):
                 _blk_vec_type = T.vec(_blk_bytes, T.i8)
                 _blks_per_row = _row_bytes // _blk_bytes
                 total = int(tile_m) * _blks_per_row
@@ -2784,7 +2687,7 @@ def _compile_stage2_mxscale_kernel_impl(
                         )
                         ts = tok * c_topk_i32 + slot
                         ts_ok = arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1))
-                        if is_fp4:
+                        if const_expr(_as_layout_rowmajor):
                             lds_idx = (
                                 row * arith.index(_row_bytes)
                                 + ksc_blk * arith.index(_blk_bytes)
@@ -2814,9 +2717,18 @@ def _compile_stage2_mxscale_kernel_impl(
                                 ts * arith.constant(K_scale, type=T.i32)
                                 + arith.index_cast(T.i32, chunk_off)
                             )
-                            sx_vec = buffer_ops.buffer_load(
-                                sx_rsrc, sx_idx,
-                                vec_width=_blk_bytes, dtype=T.i8,
+                            sx_raw = buffer_ops.buffer_load(
+                                sx_rsrc,
+                                arith.shrui(
+                                    sx_idx,
+                                    arith.constant(2, type=T.i32),
+                                ),
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                            sx_vec = vector.bitcast(
+                                _blk_vec_type,
+                                vector.from_elements(T.vec(1, T.i32), [sx_raw]),
                             )
                             vector.store(
                                 sx_vec, target_lds, [lds_idx],
@@ -2824,9 +2736,12 @@ def _compile_stage2_mxscale_kernel_impl(
                             )
                             scf.YieldOp([])
                         with ir.InsertionPoint(_if_ok.else_block):
-                            fill_vec = vector.broadcast(
+                            fill_vec = vector.bitcast(
                                 _blk_vec_type,
-                                arith.constant(127, type=T.i8),
+                                vector.from_elements(
+                                    T.vec(1, T.i32),
+                                    [arith.constant(0x7F7F7F7F, type=T.i32)],
+                                ),
                             )
                             vector.store(
                                 fill_vec, target_lds, [lds_idx],
