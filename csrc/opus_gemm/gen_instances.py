@@ -1393,18 +1393,51 @@ void
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
 
-    // Allocate fp32 workspace stream-ordered. hipMallocAsync /
-    // hipFreeAsync are the torch-free equivalents of the PyTorch
-    // caching allocator pattern: the alloc is queued onto `stream`
-    // before the main kernel, and the matching hipFreeAsync at the
-    // bottom of this launcher is queued AFTER the reduce kernel, so
-    // the GPU side never accesses freed memory even though the
-    // launcher returns synchronously to the host.
+    // Workspace allocation: thread-local cache that grows on demand.
+    // Replaces the original `hipMallocAsync` + `hipFreeAsync` pair
+    // (introduced when the launcher went torch-free), which is not
+    // graph-capturable on ROCm 7.2.2: hipgraph replay re-runs the
+    // alloc/free host-side every replay, costing ~120us / replay (vs
+    // ~30us of actual kernel work). The eager tuner also pays the
+    // alloc cost on every iter, distorting splitk's measured perf so
+    // badly that the tuner picks split-barrier kids for shapes where
+    // splitk would actually win.
+    //
+    // Cache is stream-agnostic: a single ptr is reused across all
+    // streams in the thread. Sync-on-grow uses `hipDeviceSynchronize`
+    // so we don't release memory another stream may still be writing.
+    // Inside graph capture the grow path is forbidden (hipMalloc /
+    // hipFree are stream-capture-illegal); callers that capture splitk
+    // are expected to warm up the cache once eagerly with the largest
+    // workspace they will use first.
     auto stream = aiter::getCurrentHIPStream();
     size_t ws_bytes = (size_t)split_k * (size_t)batch
                     * (size_t)padded_M * (size_t)padded_N * sizeof(float);
-    void* ptr_workspace_ = nullptr;
-    HIP_CALL(hipMallocAsync(&ptr_workspace_, ws_bytes, stream));
+    static thread_local void*  ws_cached_ptr   = nullptr;
+    static thread_local size_t ws_cached_bytes = 0;
+    if (ws_cached_ptr == nullptr || ws_bytes > ws_cached_bytes)
+    {{
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        HIP_CALL(hipStreamIsCapturing(stream, &capture_status));
+        AITER_CHECK(capture_status == hipStreamCaptureStatusNone,
+            "splitk workspace cache miss inside HIP graph capture is not "
+            "supported. Run the launcher once eagerly with the same shape "
+            "before capturing the graph (so the static thread_local "
+            "workspace cache is sized correctly).");
+
+        if (ws_cached_ptr != nullptr)
+        {{
+            HIP_CALL(hipDeviceSynchronize());
+            HIP_CALL(hipFree(ws_cached_ptr));
+        }}
+        // Round up to 4 MiB granularity so small shape variations don't
+        // re-grow the buffer.
+        const size_t kGrowAlign = (size_t)4 * 1024 * 1024;
+        size_t grow_bytes = ((ws_bytes + kGrowAlign - 1) / kGrowAlign) * kGrowAlign;
+        HIP_CALL(hipMalloc(&ws_cached_ptr, grow_bytes));
+        ws_cached_bytes = grow_bytes;
+    }}
+    void* ptr_workspace_ = ws_cached_ptr;
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
@@ -1477,10 +1510,10 @@ void
         }}}}
     }}}}
 
-    // Stream-ordered free: queued AFTER both main + reduce kernels on
-    // the same stream, so the runtime only releases the workspace
-    // once the GPU is done with it.
-    HIP_CALL(hipFreeAsync(ptr_workspace_, stream));
+    // No free here: workspace is held by the static thread_local cache
+    // above and released on first cache resize / process exit. Avoids
+    // the per-call alloc/free overhead and makes the launcher
+    // graph-capturable (the cached pointer is constant across replays).
 }}}}
 #endif // launcher only on regular host pass
 """
