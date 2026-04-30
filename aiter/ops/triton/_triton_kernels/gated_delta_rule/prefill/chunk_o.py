@@ -933,7 +933,7 @@ def chunk_fwd_o_opt_vk(
     Args:
         q: [B, T, Hg, K]
         k: [B, T, Hg, K]
-        v: [B, H, T, V]  (token-major from K5 opt_vk)
+        v: [B, H, T, V]  (token-major from opt_vk)
         h: [B, NT, H, V, K]  (h layout [V, K])
         g: [B*T, H] FP32
         scale: float

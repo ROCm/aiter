@@ -124,7 +124,6 @@ def chunk_gated_delta_rule_fwd_opt(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
-    use_chunk_hip: bool = False,
 ):
     """
     Optimized chunk gated delta rule forward computation (Forward only).
@@ -171,30 +170,18 @@ def chunk_gated_delta_rule_fwd_opt(
         cu_seqlens=cu_seqlens,
     )
 
-    # Step 3: Compute hidden states (K5)
-    if use_chunk_hip:
-        from aiter.ops.chunk_gated_delta_rule_fwd_h import chunk_gated_delta_rule_fwd_h_hip_fn
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_hip_fn(
-            k=k,
-            w=w,
-            u=u,
-            g=g_cumsum,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-        )
-    else:
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt(
-            k=k,
-            w=w,
-            u=u,
-            g=g_cumsum,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-        )
+    # Step 3: Compute hidden states
+    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt(
+        k=k,
+        w=w,
+        u=u,
+        g=g_cumsum,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
 
-    # Step 4: Compute output (directly in [B, T, H, V] layout)
+    # Step 4: Compute output
     o = chunk_fwd_o_opt(
         q=q,
         k=k,
@@ -218,12 +205,16 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
+    use_chunk_hip: bool = False,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
 
-    Uses the same fused K12/K34 kernels as opt, but K5/K6 use transposed
+    Uses the same fused kernels as opt, but with transposed
     h layout [V, K] instead of [K, V].
+
+    When use_chunk_hip=True, hidden state computation uses a HIP kernel
+    instead of Triton.
 
     Args:
         q: [B, T, Hg, K]
@@ -235,6 +226,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         initial_state: [N, H, V, K] — note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
+        use_chunk_hip: bool — use HIP kernel for hidden state computation
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
@@ -258,15 +250,31 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         cu_seqlens=cu_seqlens,
     )
 
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
-        k=k,
-        w=w,
-        u=u,
-        g=g_cumsum,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
+    if use_chunk_hip:
+        from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+            chunk_gated_delta_rule_fwd_h_hip_fn,
+        )
+
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_hip_fn(
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_exp2=False,
+        )
+    else:
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
+            k=k,
+            w=w,
+            u=u,
+            g=g_cumsum,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
 
     o = chunk_fwd_o_opt_vk(
         q=q,

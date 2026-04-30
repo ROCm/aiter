@@ -1,21 +1,91 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""
-Python wrapper for the HIP overlap_2 BV kernel for chunk_gated_delta_rule_fwd_h.
-
-This kernel is specialized for K=128, V=128, bf16 inputs, and supports
-adaptive BV tile sizes (16, 32, 64) for AMD CDNA3 GPUs.
-"""
-
 from typing import Optional
 
 import torch
+import triton
 from torch import Tensor
 
 from ..jit.core import compile_ops
 
 MD_NAME = "module_chunk_gdr_fwd_h"
+
+_BV_FIXED_LDS_BYTES = 32 * 1024
+_BV_LDS_BYTES_PER_BV = 512
+_BV_RESIDENT_WGS_CAP = 2
+_BV_CANDIDATES = (64, 32, 16)
+_BV_CACHE: dict[tuple[int, int, int, int], int] = {}
+
+
+def _device_idx(device: torch.device) -> int:
+    if device.index is not None:
+        return int(device.index)
+    return int(torch.cuda.current_device())
+
+
+def _get_shared_memory_per_cu(props: object) -> int:
+    """Query per-CU shared memory with architecture-based fallback."""
+    shared_per_cu = getattr(props, "shared_memory_per_multiprocessor", None)
+    if shared_per_cu is not None:
+        return int(shared_per_cu)
+    arch = getattr(props, "gcnArchName", "")
+    if arch:
+        arch = arch.split(":")[0]
+    _ARCH_LDS = {"gfx95": 128 * 1024, "gfx94": 64 * 1024}
+    for prefix, size in _ARCH_LDS.items():
+        if arch.startswith(prefix):
+            return size
+    shared_per_block = getattr(props, "shared_memory_per_block", None)
+    if shared_per_block is not None:
+        return int(shared_per_block)
+    raise RuntimeError("Unable to determine shared memory per CU.")
+
+
+def _compute_bv(
+    device: torch.device,
+    total_chunks: int,
+    max_seq_chunks: int,
+    num_heads: int,
+) -> int:
+    props = torch.cuda.get_device_properties(device)
+    num_cus = props.multi_processor_count
+    lds_per_cu = _get_shared_memory_per_cu(props)
+
+    for bv in _BV_CANDIDATES:
+        lds_per_wg = _BV_FIXED_LDS_BYTES + _BV_LDS_BYTES_PER_BV * bv
+        resident = min(max(1, lds_per_cu // lds_per_wg), _BV_RESIDENT_WGS_CAP)
+        total_wgs = (128 // bv) * num_heads * total_chunks
+        threshold = max(1, (num_cus * resident) // 2) * max_seq_chunks
+        if total_wgs >= threshold:
+            return bv
+    return 16
+
+
+def _select_bv(
+    device: torch.device, num_heads: int, total_chunks: int, max_seq_chunks: int
+) -> int:
+    key = (_device_idx(device), num_heads, total_chunks, max_seq_chunks)
+    cached = _BV_CACHE.get(key)
+    if cached is not None:
+        return cached
+    bv = _compute_bv(device, total_chunks, max_seq_chunks, num_heads)
+    _BV_CACHE[key] = bv
+    return bv
+
+
+def _select_bv_for_dense(
+    batch_size: int, seq_len: int, chunk_size: int, num_heads: int, device: torch.device
+) -> int:
+    nt = (seq_len + chunk_size - 1) // chunk_size
+    return _select_bv(device, num_heads, batch_size * nt, nt)
+
+
+def _select_bv_for_varlen(chunk_offsets: torch.Tensor, num_heads: int) -> int:
+    offsets = chunk_offsets.tolist()
+    total_chunks = offsets[-1]
+    max_seq_chunks = max(offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1))
+    return _select_bv(chunk_offsets.device, num_heads, total_chunks, max_seq_chunks)
 
 
 @compile_ops(MD_NAME)
@@ -24,6 +94,7 @@ def chunk_gated_delta_rule_fwd_h_hip(
     w: Tensor,
     u: Tensor,
     g: Tensor,
+    gk: Tensor,
     initial_state: Tensor,
     cu_seqlens: Tensor,
     chunk_offsets: Tensor,
@@ -31,76 +102,81 @@ def chunk_gated_delta_rule_fwd_h_hip(
     has_initial_state: bool,
     output_final_state: bool,
     save_new_value: bool,
-) -> list[Tensor]:
-    ...
+    use_exp2: bool,
+) -> list[Tensor]: ...
 
 
 def chunk_gated_delta_rule_fwd_h_hip_fn(
     k: Tensor,
     w: Tensor,
     u: Tensor,
-    g: Tensor,
+    g: Optional[Tensor] = None,
+    gk: Optional[Tensor] = None,
     initial_state: Optional[Tensor] = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
     save_new_value: bool = True,
     cu_seqlens: Optional[Tensor] = None,
-    selected_bv: int = 64,
-) -> tuple[Tensor, Tensor, Optional[Tensor]]:
+    selected_bv: Optional[int] = None,
+    use_exp2: bool = False,
+) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
-    HIP overlap_2 BV kernel for chunk_gated_delta_rule_fwd_h.
+    HIP hidden state forward with h layout [V, K].
 
-    Drop-in replacement for the Triton chunk_gated_delta_rule_fwd_h_opt
-    when K=128, V=128, bf16 on AMD GPUs.
+    Drop-in replacement for ``chunk_gated_delta_rule_fwd_h_opt_vk``
+    when K=128, V=128, bf16.
 
-    Triton pipeline layout -> HIP kernel layout:
-      k: [B, T, Hg, K] -> [1, Hg, B*T, K]
-      w: [B, H, T, K]  -> [1, H, B*T, K]
-      u: [B, H, T, V]  -> [1, H, B*T, V]
-      g: [B, T, H]     -> [B*T, H]
+    w, u: [B, H, T, K/V] head-major contiguous.
+    initial_state/final_state: [N, H, V, K].
+    h snapshots: [B, NT, H, V, K].
+    v_new output: [B, H, T_flat, V].
     """
-    assert chunk_size == 64, "HIP overlap_2 kernel is specialized for chunk_size=64."
-    assert k.shape[-1] == 128, "HIP overlap_2 kernel is specialized for K=128."
-    assert u.shape[-1] == 128, "HIP overlap_2 kernel is specialized for V=128."
-
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
-        prepare_chunk_offsets,
-    )
+    assert chunk_size == 64
+    assert k.shape[-1] == 128 and u.shape[-1] == 128
 
     B, T, Hg, K = k.shape
     H = w.shape[1]
     V = u.shape[-1]
-    T_flat = B * T
+    T_flat = w.shape[2]
     is_varlen = cu_seqlens is not None
+    NT = triton.cdiv(T, chunk_size)
 
     _has_initial_state = initial_state is not None
 
-    if not is_varlen:
-        cu_seqlens_int32 = torch.arange(
-            0, T_flat + 1, T, dtype=torch.int32, device=k.device
-        )
-    else:
-        cu_seqlens_int32 = cu_seqlens.to(torch.int32)
+    k_hip = k.contiguous()
+    w_hip = w.contiguous()
+    u_hip = u.contiguous()
 
-    N = cu_seqlens_int32.shape[0] - 1
-    _chunk_offsets = prepare_chunk_offsets(cu_seqlens_int32.to(torch.int64), chunk_size)
-    chunk_offsets_int32 = _chunk_offsets.to(torch.int32)
+    total_tokens = T_flat if is_varlen else B * T
+    if g is not None:
+        g_hip = g.reshape(total_tokens, H)
+        if g_hip.dtype != torch.float32:
+            g_hip = g_hip.to(torch.float32)
+        g_hip = g_hip.contiguous()
+    else:
+        g_hip = torch.zeros(total_tokens, H, dtype=torch.float32, device=k.device)
 
     if is_varlen:
+        from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+            prepare_chunk_offsets,
+        )
+
         assert B == 1, "Varlen mode expects B=1 (flattened input)."
-        k_hip = k.permute(2, 0, 1, 3).reshape(1, Hg, T_flat, K).contiguous()
-        w_hip = w.contiguous()
-        u_hip = u.contiguous()
-        g_hip = g.reshape(T_flat, H).contiguous()
+        cu_seqlens_int32 = cu_seqlens.to(torch.int32)
+        chunk_offsets_int32 = prepare_chunk_offsets(
+            cu_seqlens_int32.to(torch.int64), chunk_size
+        ).to(torch.int32)
     else:
-        # k: [B, T, Hg, K] -> [Hg, B, T, K] -> [1, Hg, B*T, K]
-        k_hip = k.permute(2, 0, 1, 3).reshape(1, Hg, T_flat, K).contiguous()
-        # w: [B, H, T, K] -> [H, B, T, K] -> [1, H, B*T, K]
-        w_hip = w.permute(1, 0, 2, 3).reshape(1, H, T_flat, K).contiguous()
-        # u: [B, H, T, V] -> [H, B, T, V] -> [1, H, B*T, V]
-        u_hip = u.permute(1, 0, 2, 3).reshape(1, H, T_flat, V).contiguous()
-        # g: [B, T, H] -> [B*T, H]
-        g_hip = g.reshape(T_flat, H).contiguous()
+        cu_seqlens_int32 = torch.empty(0, device=k.device, dtype=torch.int32)
+        chunk_offsets_int32 = torch.arange(
+            0, (B + 1) * NT, NT, dtype=torch.int32, device=k.device
+        )
+
+    if selected_bv is None:
+        if is_varlen:
+            selected_bv = _select_bv_for_varlen(chunk_offsets_int32, H)
+        else:
+            selected_bv = _select_bv_for_dense(B, T_flat, chunk_size, H, k.device)
 
     _initial_state = (
         initial_state.to(torch.float32)
@@ -108,12 +184,17 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         else torch.empty(0, device=k.device, dtype=torch.float32)
     )
 
-    import triton
-
-    NT = triton.cdiv(T, chunk_size)
+    if gk is not None:
+        gk_arg = gk.to(torch.float32).contiguous()
+    else:
+        gk_arg = torch.empty(0, device=k.device, dtype=torch.float32)
 
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h_hip(
-        k_hip, w_hip, u_hip, g_hip,
+        k_hip,
+        w_hip,
+        u_hip,
+        g_hip,
+        gk_arg,
         _initial_state,
         cu_seqlens_int32,
         chunk_offsets_int32,
@@ -121,19 +202,14 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         _has_initial_state,
         output_final_state,
         save_new_value,
+        use_exp2,
     )
 
     if not is_varlen:
-        # h: [1, total_chunks, H, K, V] -> [B, NT, H, K, V]
-        h = h.view(B, NT, H, K, V)
-        # v_new: [1, H, B*T, V] -> [H, B, T, V] -> [B, H, T, V]
-        if save_new_value:
-            v_new = v_new.view(H, B, T, V).permute(1, 0, 2, 3).contiguous()
-        else:
-            v_new = None
-    else:
-        if not save_new_value:
-            v_new = None
+        h = h.view(B, NT, H, V, K)
+
+    if not save_new_value:
+        v_new = None
 
     if not output_final_state:
         final_state = None
