@@ -2813,10 +2813,18 @@ struct tiled_mma_adaptor : public MMA_ {
     static constexpr index_t tile_c_len = EXPAND_M * EXPAND_N * mma_c_len;
 
     // input a/b/c is array of ext type e.g. "fp16x2_t a[2];", pass "a" to this function
+    //
+    // `#pragma unroll` is required: trip counts are all constexpr, but
+    // clang's default heuristic gives up on large tiles, leaving the
+    // body as a runtime loop with runtime indices into vtype_a/b/c.
+    // GFX9 has no "load VGPR by runtime index" instruction, so each
+    // unrolled-out access compiles to an N-way s_cselect_b64 chain that
+    // blows up SGPR pressure and triggers SGPR-spill-to-VGPR-lane.
     template<typename VA, typename VB, typename VC, index_t cbsz = 0, index_t abid = 0, index_t blgp = 0,
                     std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, number<cbsz> = {}, number<abid> = {}, number<blgp> = {}) {
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
             index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
@@ -2834,13 +2842,21 @@ struct tiled_mma_adaptor : public MMA_ {
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
             index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
             index_t i_a = (i_m * EXPAND_K + i_k) * a_len, i_b = (i_n * EXPAND_K + i_k) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
-            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
-            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
-            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c);
+            #pragma unroll
             for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
         }
         return c_;
@@ -2852,11 +2868,12 @@ struct tiled_mma_adaptor : public MMA_ {
         return operator()(a, b, c, number<cbsz>{}, number<abid>{}, number<blgp>{});
     }
 
-    // Scaled MFMA (f8f6f4): forward scale_a, scale_b to underlying MMA
+    // Scaled MFMA (f8f6f4): forward scale_a, scale_b to underlying MMA.
     template<typename VA, typename VB, typename VC,
              std::enable_if_t< (is_array_v< remove_cvref_t<VA> > && is_array_v< remove_cvref_t<VB> > && is_array_v< remove_cvref_t<VC> >), bool > = true>
     OPUS_D constexpr auto operator()(const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++) {
             index_t i_k = I / (EXPAND_M * EXPAND_N), i_m = (I / EXPAND_N) % EXPAND_M, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + i_k]; auto s_b = b[i_n * EXPAND_K + i_k]; auto s_c = c_[i_m * EXPAND_N + i_n];
@@ -2917,13 +2934,21 @@ struct tiled_mma_adaptor : public MMA_ {
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
             index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
             index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
-            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
-            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
-            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c);
+            #pragma unroll
             for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
         }
         return c_;
@@ -2940,6 +2965,7 @@ struct tiled_mma_adaptor : public MMA_ {
     OPUS_D constexpr auto step_k(number<STEP_K>, const VA& a, const VB& b, const VC& c, int scale_a, int scale_b) {
         static_assert(STEP_K < EXPAND_K);
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
             index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
             auto s_a = a[i_m * EXPAND_K + STEP_K]; auto s_b = b[i_n * EXPAND_K + STEP_K]; auto s_c = c_[i_m * EXPAND_N + i_n];
@@ -2959,13 +2985,21 @@ struct tiled_mma_adaptor : public MMA_ {
         constexpr index_t a_len = mma_a_len, b_len = mma_b_len, c_len = mma_c_len;
 
         VC c_ {c};
+        #pragma unroll
         for (index_t I = 0; I < EXPAND_M * EXPAND_N; I++) {
             index_t i_m = I / EXPAND_N, i_n = I % EXPAND_N;
             index_t i_a = (i_m * EXPAND_K + STEP_K) * a_len, i_b = (i_n * EXPAND_K + STEP_K) * b_len, i_c = (i_m * EXPAND_N + i_n) * c_len;
-            typename MMA::vtype_a s_a; for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
-            typename MMA::vtype_b s_b; for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
-            typename MMA::vtype_c s_c; for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
+            typename MMA::vtype_a s_a;
+            #pragma unroll
+            for (index_t j = 0; j < a_len; j++) s_a[j] = a[i_a + j];
+            typename MMA::vtype_b s_b;
+            #pragma unroll
+            for (index_t j = 0; j < b_len; j++) s_b[j] = b[i_b + j];
+            typename MMA::vtype_c s_c;
+            #pragma unroll
+            for (index_t j = 0; j < c_len; j++) s_c[j] = c_[i_c + j];
             s_c = MMA{}(s_a, s_b, s_c, scale_a, scale_b);
+            #pragma unroll
             for (index_t j = 0; j < c_len; j++) c_[i_c + j] = s_c[j];
         }
         return c_;

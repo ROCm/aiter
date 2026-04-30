@@ -81,6 +81,7 @@ else:
         from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
         from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
         from .ops.deepgemm import *  # noqa: F403,E402
+        from .ops.opus import *  # noqa: F403,E402
         from .ops.aiter_operator import *  # noqa: F403,E402
         from .ops.activation import *  # noqa: F403,E402
         from .ops.attention import *  # noqa: F403,E402
