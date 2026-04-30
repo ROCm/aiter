@@ -176,8 +176,7 @@ def test_flydsl_fmha_correctness_multi_device():
     import subprocess
     import textwrap
 
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import sys
         sys.path.insert(0, "/workspace/FlyDSL/python")
         import flydsl
@@ -216,8 +215,7 @@ def test_flydsl_fmha_correctness_multi_device():
         cm = cos.min().item()
         assert cm > 0.99, f"min_cos={cm:.6f}"
         print("MULTI_DEVICE_OK", flush=True)
-        """
-    )
+        """)
 
     proc = subprocess.run(
         ["python", "-c", script],
