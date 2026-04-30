@@ -8,6 +8,7 @@
 #if ENABLE_CK
 #include "fmha_bwd.hpp"
 #endif
+#include <functional>
 #include <variant>
 
 namespace aiter {
@@ -46,7 +47,6 @@ struct mha_bwd_args
     void* dk_ptr;
     void* dv_ptr;
     void* dbias_ptr;
-    void* dq_acc_ptr;
     const void* sink_ptr   = nullptr; // sink scores [batch, nhead] log-space (LSEDataType=float); nullptr disables sink
     void*       d_sink_ptr = nullptr; // sink gradient accumulator [nhead] (LSEDataType=float); nullptr disables sink grad
     // Usage notes for sequence length pointer parameters:
@@ -108,7 +108,6 @@ struct mha_bwd_args
     int stride_o;
     int stride_randval;
     int stride_do;
-    int stride_dq_acc;
     int stride_dq;
     int stride_dk;
     int stride_dv;
@@ -121,7 +120,6 @@ struct mha_bwd_args
     int nhead_stride_randval;
     int nhead_stride_do;
     int nhead_stride_lsed;
-    int64_t nhead_stride_dq_acc;
     int nhead_stride_dq;
     int nhead_stride_dk;
     int nhead_stride_dv;
@@ -134,18 +132,21 @@ struct mha_bwd_args
     int batch_stride_randval;
     int batch_stride_do;
     int batch_stride_lsed;
-    int64_t batch_stride_dq_acc;
     int batch_stride_dq;
     int batch_stride_dk;
     int batch_stride_dv;
     int batch_stride_dbias;
-    int split_stride_dq_acc;
     int window_size_left;
     int window_size_right;
     float p_drop;
     float p_undrop;
     std::variant<std::pair<uint64_t, uint64_t>, std::pair<const void*, const void*>>
         drop_seed_offset;
+
+    // Per-call device-buffer allocator. Caller keeps the returned pointer alive
+    // until aiter::mha_bwd returns. If zero_init is true the bytes must be zero
+    // by the time the kernel reads them.
+    std::function<void*(size_t bytes, bool zero_init)> workspace_alloc{};
 };
 
 struct __attribute__((packed)) fmha_bwd_dqdkdv_args
