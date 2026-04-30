@@ -761,7 +761,9 @@ class KvManager8bitsV1
         constexpr uint32_t kFixedOffset = kRowOffset * kMfmaElemPerThr * sizeof(kv_t) +
                                           kColOffset / kNumColsPerWarp * kWarpOffset;
 
-        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
+        // RT must hold exactly one 2-vgpr range (one mfma A-tile). Caller passes the
+        // appropriate sub-view per kRowOffset; the function always writes to range 0.
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
         static_assert(range_type::lo + 1 == range_type::hi,
                       "ds_read_b64 requires 2 consecutive registers");
         hkm::ds_read_b64<range_type::lo>(p_lds_kv_lane, kFixedOffset);
@@ -991,7 +993,9 @@ class KvManager8bitsV2
             (kColOffset / kNumCols) * kNumBytesPerBlock +
             (kColOffset % kNumCols) * sizeof(kv_t);
 
-        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
+        // RT must hold exactly one 2-vgpr range (one mfma A-tile). Caller passes the
+        // appropriate sub-view per kRowOffset; the function always writes to range 0.
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
         static_assert(range_type::lo + 1 == range_type::hi,
                       "ds_read_b64 requires 2 consecutive registers");
         hkm::ds_read_b64<range_type::lo>(p_lds_kv_lane, kFixedOffset);
@@ -1261,7 +1265,12 @@ class KvManager8bitsV3
         const uintptr_t p_lds_kv_lane = p_lds_kv + get_block_lane_offset(row, col);
         constexpr uint32_t kFixedOffset = get_block_fixed_offset<kRowOffset, kColOffset>();
 
-        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, kRowOffset / 16>;
+        // RT must hold exactly one 2-vgpr range (one mfma A-tile = 16x32 = 2 vgprs).
+        // Caller passes the appropriate sub-view per kRowOffset; the function always
+        // writes to range 0. This decouples the destination VGPR from the LDS source
+        // address (selected by kFixedOffset via kRowOffset, including pass bits for
+        // the upper N-half on kBlockN=64).
+        using range_type = hkdart::get_nth_range_t<typename RT::register_ranges, 0>;
         static_assert(range_type::lo + 1 == range_type::hi,
                       "ds_read_b64 requires 2 consecutive registers");
         hkm::ds_read_b64<range_type::lo>(p_lds_kv_lane, kFixedOffset);

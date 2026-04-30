@@ -347,14 +347,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
                     // Load K from LDS to GPR
                     constexpr int32_t tile_idx = (reg_start - k_q_nope_begin) / 2;
-                    kv_manager.template load_k_to_gpr<0, (tile_idx + 0) * T::kBlockK>(kv_0,
-                                                                                    p_lds_kv_curr);
-                    kv_manager.template load_k_to_gpr<16, (tile_idx + 0) * T::kBlockK>(kv_0,
-                                                                                    p_lds_kv_curr);
-                    kv_manager.template load_k_to_gpr<0, (tile_idx + 1) * T::kBlockK>(kv_1,
-                                                                                    p_lds_kv_curr);
-                    kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(kv_1,
-                                                                                    p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 0) * T::kBlockK>(
+                        kv_0_top, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 0) * T::kBlockK>(
+                        kv_0_bot, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 1) * T::kBlockK>(
+                        kv_1_top, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(
+                        kv_1_bot, p_lds_kv_curr);
 
                     kv_manager.template async_load_k_tile<(idx.value + 1) * 64,
                                                           kIsGlobalLast,
@@ -397,13 +397,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 {
                     constexpr int32_t tile_idx = (reg_start - k_q_rope_begin) / 2;
                     kv_manager.template load_k_to_gpr<0, (tile_idx + 0 + 16) * T::kBlockK>(
-                        kv_0, p_lds_kv_curr);
+                        kv_0_top, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<16, (tile_idx + 0 + 16) * T::kBlockK>(
-                        kv_0, p_lds_kv_curr);
+                        kv_0_bot, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<0, (tile_idx + 1 + 16) * T::kBlockK>(
-                        kv_1, p_lds_kv_curr);
+                        kv_1_top, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<16, (tile_idx + 1 + 16) * T::kBlockK>(
-                        kv_1, p_lds_kv_curr);
+                        kv_1_bot, p_lds_kv_curr);
                 }
 
                 if constexpr((idx.value == 0) && (kIsGlobalLast == false) && (kCheckBoundaryNext == false))

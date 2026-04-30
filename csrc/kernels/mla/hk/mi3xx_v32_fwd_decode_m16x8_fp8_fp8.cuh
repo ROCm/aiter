@@ -70,6 +70,18 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
     using kv_1_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_kv_1_begin, k_kv_1_end>>,
                              2>; // 4 vgprs
+    // Single-mfma-tile (16x32 = 2 vgpr) sub-views used as load_k_to_gpr
+    // destinations. Each load_k_to_gpr writes one mfma A-tile; RT must
+    // expose exactly one 2-vgpr range (function always writes range 0).
+    // The full kv_0/kv_1 (4 vgprs each) are still consumed by mma_ABt.
+    using kv_0_top_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_0_begin + 0, k_kv_0_begin + 1>>, 2>;
+    using kv_0_bot_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_0_begin + 2, k_kv_0_begin + 3>>, 2>;
+    using kv_1_top_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_1_begin + 0, k_kv_1_begin + 1>>, 2>;
+    using kv_1_bot_ranges = hkdart::split_many_t<
+        hkdart::type_list<hkdart::range<k_kv_1_begin + 2, k_kv_1_begin + 3>>, 2>;
     using p_comp_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin, k_p_comp_end>>,
                              4>; // 8 vgprs
@@ -95,6 +107,11 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_ranges> kv_0;
     hk::art<kv_t, T::kBlockK, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_ranges> kv_1;
+    // Single-mfma-tile sub-views (16x32 each, 2 vgprs) sharing storage with kv_0/kv_1.
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_top_ranges> kv_0_top;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_0_bot_ranges> kv_0_bot;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_top_ranges> kv_1_top;
+    hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, kv_1_bot_ranges> kv_1_bot;
     hk::art<comp_t, T::kBlockN, T::kTileM, hk::col_l, hk::rt_16x16_s, p_comp_ranges> p_comp;
     hk::art<kv_t, T::kTileM, T::kBlockN, hk::row_l, hk::rt_16x32_s, p_mfma_ranges> p_mfma;
     hk::art<comp_t, T::kTileM, T::kVoHeadDim, hk::row_l, hk::rt_16x16_s, o_ranges> oaccu;
@@ -289,14 +306,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
                     // Load K from LDS to GPR
                     constexpr int32_t tile_idx = (reg_start - k_q_nope_begin) / 2;
-                    kv_manager.template load_k_to_gpr<0, (tile_idx + 0) * T::kBlockK>(kv_0,
-                                                                                    p_lds_kv_curr);
-                    kv_manager.template load_k_to_gpr<16, (tile_idx + 0) * T::kBlockK>(kv_0,
-                                                                                    p_lds_kv_curr);
-                    kv_manager.template load_k_to_gpr<0, (tile_idx + 1) * T::kBlockK>(kv_1,
-                                                                                    p_lds_kv_curr);
-                    kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(kv_1,
-                                                                                    p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 0) * T::kBlockK>(
+                        kv_0_top, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 0) * T::kBlockK>(
+                        kv_0_bot, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<0, (tile_idx + 1) * T::kBlockK>(
+                        kv_1_top, p_lds_kv_curr);
+                    kv_manager.template load_k_to_gpr<16, (tile_idx + 1) * T::kBlockK>(
+                        kv_1_bot, p_lds_kv_curr);
 
                     kv_manager.template async_load_k_tile<(idx.value + 1) * 64,
                                                         kIsGlobalLast,
@@ -335,13 +352,13 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     // Load K from LDS to GPR
                     constexpr int32_t tile_idx = (reg_start - k_q_rope_begin) / 2;
                     kv_manager.template load_k_to_gpr<0, (tile_idx + 0 + 16) * T::kBlockK>(
-                        kv_0, p_lds_kv_curr);
+                        kv_0_top, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<16, (tile_idx + 0 + 16) * T::kBlockK>(
-                        kv_0, p_lds_kv_curr);
+                        kv_0_bot, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<0, (tile_idx + 1 + 16) * T::kBlockK>(
-                        kv_1, p_lds_kv_curr);
+                        kv_1_top, p_lds_kv_curr);
                     kv_manager.template load_k_to_gpr<16, (tile_idx + 1 + 16) * T::kBlockK>(
-                        kv_1, p_lds_kv_curr);
+                        kv_1_bot, p_lds_kv_curr);
 
                     asm volatile("s_waitcnt lgkmcnt(2)");
                     hk::mma_ABt(p_comp, kv_0, q_0, p_comp);
