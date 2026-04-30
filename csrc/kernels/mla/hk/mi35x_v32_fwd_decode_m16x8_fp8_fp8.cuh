@@ -91,7 +91,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                              2>; // 4 vgprs (overlays p_comp[12..15])
     using p_comp_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_comp_begin, k_p_comp_end>>,
-                             8>; // 16 vgprs (kBlockN=64 / 16 cols/tile = 4 N-sub-tiles, each 2 vgprs lo/hi)
+                             4>; // 16 vgprs split into 4 ranges of 4 each (4 base tiles, kBlockN=64)
     // Lower / upper N-half sub-views of p_comp (8 vgprs each = 2 mfma 16x16
     // f32 sub-tiles). kBlockN=64 GEMM uses one mma_ABt per half because kv_0
     // only holds 32 K-rows (4 vgprs); the upper half re-loads the same kv_0
@@ -102,7 +102,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         hkdart::type_list<hkdart::range<k_p_comp_begin + 8, k_p_comp_begin + 15>>, 4>;
     using p_mfma_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_p_mfma_begin, k_p_mfma_end>>,
-                             4>; // 4 vgprs (overlays p_comp[0..3])
+                             2>; // 4 vgprs split into 2 ranges of 2 each (2 base tiles, kBlockN=64)
     using o_ranges =
         hkdart::split_many_t<hkdart::type_list<hkdart::range<k_o_begin, k_o_end>>, 4>; // 128 vgprs
 
