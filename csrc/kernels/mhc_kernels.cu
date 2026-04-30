@@ -68,7 +68,9 @@ namespace aiter {
         static constexpr int vec_tile = tile_k / (warp_size / mfma_m);
         static constexpr int repeat_n = tile_n / mfma_n;
         using fp32xtile = opus::vector_t<float, vec_tile>;
+        using fp32x8 = opus::vector_t<float, 8>;
         using halfxtile = opus::vector_t<DTYPE_I, vec_tile>;
+        using halfx8 = opus::vector_t<DTYPE_I, 8>;
 
         DTYPE_I* x_ptr = x + idx * x_stride;
         float* fn_ptr  = fn + n_idx * fn_stride;
@@ -127,37 +129,41 @@ namespace aiter {
         for (int n = 0; n < repeat_n; n++) {
             opus::clear(v_cf[n]);
         }
-        opus::s_waitcnt_vmcnt(opus::number<2 * fn_lds_load_waitcnt + x_load_waitcnt>{});
         const int k_loop = hc_hidden_size / (split_k * tile_k);
 
-#define GEMM_LOOP_BODY(BUF, LDS_SLOT, k)                                                          \
-        do {                                                                                      \
-            fp32xtile v_af;                                                                       \
-            for (int i = 0; i < vec_tile; i++)                                                    \
-                v_af[i] = static_cast<float>(v_a[BUF][i]);                                        \
-            if (n_idx == 0) {                                                                     \
-                for (int i = 0; i < vec_tile; i++)                                                \
-                    sqrsum_part += v_af[i] * v_af[i];                                             \
-            }                                                                                     \
-            v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),                 \
-                                            0, true, interleave_size>(                            \
-                g_a, ga_offset + ((k) + 2) * tile_k);                                             \
-            opus::s_waitcnt_vmcnt(opus::number<2 * x_load_waitcnt + fn_lds_load_waitcnt>{});      \
-            __builtin_amdgcn_s_barrier();                                                         \
-            float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
-            for (int n = 0; n < repeat_n; n++) {                                                  \
-                for (int kk = 0; kk < tile_k / mfma_k; kk++) {                                    \
-                    int fn_row = n * mfma_n + lane_id % mfma_n;                                   \
-                    int K_wanted;                                                                 \
-                    K_wanted = (kk / 8 * mfma_k + lane_id / mfma_n) * 8 + kk % 8;                 \
-                    float v_bf = *(s_fn_rd_ptr + fn_row * tile_k +                                \
-                                   (K_wanted ^ (fn_row & 0xF)));                                  \
-                    v_cf[n] = __builtin_amdgcn_mfma_f32_16x16x4f32(v_bf, v_af[kk], v_cf[n],       \
-                                                                    0, 0, 0);                     \
-                }                                                                                 \
-            }                                                                                     \
-            __syncthreads();                                                                      \
-            lds_load_fn_tile((k) + 2);                                                            \
+#define GEMM_LOOP_BODY(BUF, LDS_SLOT, k)                                                               \
+        do {                                                                                           \
+            opus::s_waitcnt_vmcnt(opus::number<x_load_waitcnt + fn_lds_load_waitcnt>{});               \
+            __builtin_amdgcn_s_barrier();                                                              \
+            float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                                  \
+            for (int ki = 0; ki < vec_tile / 8; ki++) {                                                \
+                fp32x8 v_af;                                                                           \
+                for (int i = 0; i < 8; i++) {                                                          \
+                    v_af[i] = static_cast<float>(v_a[BUF][ki * 8 + i]);                                \
+                }                                                                                      \
+                halfx8* v_a_buf_ki = reinterpret_cast<halfx8*>(&v_a[BUF]) + ki;                        \
+                *v_a_buf_ki = g_a.template load<8>(ga_offset + ((k) + 2) * tile_k,                     \
+                                                   interleave_size * 8 * ki);                          \
+                if (n_idx == 0) {                                                                      \
+                    for (int i = 0; i < 8; i++) {                                                      \
+                        sqrsum_part += v_af[i] * v_af[i];                                              \
+                    }                                                                                  \
+                }                                                                                      \
+                for (int kj = 0; kj < 8; kj++) {                                                       \
+                    for (int n = 0; n < repeat_n; n++) {                                               \
+                        int fn_row = n * mfma_n + lane_id % mfma_n;                                    \
+                        int kk = ki * 8 + kj;                                                          \
+                        int K_wanted;                                                                  \
+                        K_wanted = (kk / 8 * mfma_k + lane_id / mfma_n) * 8 + kk % 8;                  \
+                        float v_bf = *(s_fn_rd_ptr + fn_row * tile_k +                                 \
+                                       (K_wanted ^ (fn_row & 0xF)));                                   \
+                        v_cf[n] = __builtin_amdgcn_mfma_f32_16x16x4f32(v_bf, v_af[kj], v_cf[n],        \
+                                                                        0, 0, 0);                      \
+                    }                                                                                  \
+                }                                                                                      \
+            }                                                                                          \
+            __syncthreads();                                                                           \
+            lds_load_fn_tile((k) + 2);                                                                 \
         } while (0)
 
         for (int k = 0; k < k_loop - 2; k += 2) {
