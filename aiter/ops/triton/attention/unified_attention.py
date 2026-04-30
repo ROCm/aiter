@@ -28,7 +28,6 @@ def select_2d_config(
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
-
     TILE_SIZE = 32 if arch.name == "gfx1201" else 16 if arch.is_rdna else 64
     waves_per_eu = 8 if arch.name == "gfx1151" else 6 if arch.is_rdna else 2
 
@@ -41,6 +40,8 @@ def select_2d_config(
     else:
         # to not have masking when loading KV
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
+        if head_size <= 192:
+            TILE_SIZE = max(32, TILE_SIZE)
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
         else:
@@ -71,6 +72,8 @@ def select_3d_config(
     attn_warps = 2
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
     # MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+    if head_size <= 128 or (head_size <= 192 and element_size < 2):
+        TILE_SIZE = max(32, TILE_SIZE)
     num_segments = math.ceil(target_num_prgms / num_2d_prgms)
     num_segments = triton.next_power_of_2(num_segments)
     num_segments = min(num_segments, 128)
@@ -130,14 +133,30 @@ def unified_attention(
     v_descale,
     alibi_slopes=None,
     output_scale=None,
-    qq_bias=None,
     # Optional tensor for sinks
+    qq_bias=None,
     sinks=None,
+    rope_size=None,
 ):
     assert causal, "Only causal attention is supported"
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+
+    head_size_v = v.shape[-1]
+    head_size_qk = k.shape[-1]
+
+    if rope_size is not None:
+        head_size_qk -= rope_size
+    else:
+        rope_size = 0
+        is_head_size_pow2 = head_size_qk & (head_size_qk - 1) == 0
+        if not is_head_size_pow2:
+            lora = triton.next_power_of_2(head_size_qk) // 2
+            rope_size = head_size_qk - lora
+            head_size_qk = lora
+
+    HAS_ROPE = rope_size > 0
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
@@ -146,9 +165,8 @@ def unified_attention(
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
     num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
+    num_kv_heads = k.shape[-2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -171,7 +189,7 @@ def unified_attention(
     ALL_DECODE = int(max_seqlen_q) == 1
     # if batch contains a prefill
     if use_2d_kernel(
-        head_size,
+        head_size_qk,
         SLIDING_WINDOW,
         ALL_DECODE,
         max_seqlen_q,
@@ -181,7 +199,7 @@ def unified_attention(
     ):
         config = select_2d_config(
             block_size,
-            head_size,
+            head_size_qk,
             SLIDING_WINDOW,
             ALL_DECODE,
             max_seqlen_q,
@@ -222,8 +240,12 @@ def unified_attention(
             output_stride_1=out.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE=head_size_qk,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
+            HEAD_SIZE_V=head_size_v,
+            HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
+            ROPE_SIZE=rope_size,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -240,12 +262,13 @@ def unified_attention(
             query_start_len_ptr=cu_seqlens_q,
             num_seqs=num_seqs,
             ALL_DECODE=ALL_DECODE,
+            HAS_ROPE=HAS_ROPE,
             **config,
         )
 
     else:
         attn_config, reduce_config = select_3d_config(
-            head_size,
+            head_size_qk + rope_size,
             block_size,
             q.element_size(),
             max_seqlen_k,
@@ -257,7 +280,7 @@ def unified_attention(
             q.shape[0],
             num_query_heads,
             NUM_SEGMENTS,
-            triton.next_power_of_2(head_size),
+            triton.next_power_of_2(head_size_v),
             dtype=torch.float32,
             device=q.device,
         )
@@ -300,8 +323,12 @@ def unified_attention(
             query_stride_1=q.stride(1),
             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
             BLOCK_SIZE=block_size,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE=head_size_qk,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_qk),
+            HEAD_SIZE_V=head_size_v,
+            HEAD_SIZE_V_PADDED=triton.next_power_of_2(head_size_v),
+            ROPE_SIZE=rope_size,
+            ROPE_SIZE_PADDED=triton.next_power_of_2(rope_size),
             USE_ALIBI_SLOPES=use_alibi_slopes,
             USE_QQ_BIAS=use_qq_bias,
             USE_SOFTCAP=(softcap > 0),
@@ -320,6 +347,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             ALL_DECODE=ALL_DECODE,
+            HAS_ROPE=HAS_ROPE,
             **attn_config,
         )
         reduce_segments[(q.shape[0], num_query_heads)](
@@ -334,8 +362,8 @@ def unified_attention(
             output_stride_0=out.stride(0),
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE=head_size_v,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size_v),
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             **reduce_config,
