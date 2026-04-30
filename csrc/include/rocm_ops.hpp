@@ -245,15 +245,16 @@ namespace py = pybind11;
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
           &aiter::swap_blocks,                                                      \
-          "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");      \
+          py::arg("src"),                                                           \
+          py::arg("dst"),                                                           \
+          py::arg("block_mapping"));                                                \
     m.def("copy_blocks",                                                            \
           &aiter::copy_blocks,                                                      \
-          "copy_blocks(Tensor(a!)[] key_caches, Tensor[](b!) value_caches, "        \
-          "Tensor block_mapping) -> ()");                                           \
-                                                                                    \
+          py::arg("key_caches"),                                                    \
+          py::arg("value_caches"),                                                  \
+          py::arg("block_mapping"));                                                \
     m.def("reshape_and_cache",                                                      \
           &aiter::reshape_and_cache,                                                \
-          "reshape_and_cache",                                                      \
           py::arg("key"),                                                           \
           py::arg("value"),                                                         \
           py::arg("key_cache"),                                                     \
@@ -264,16 +265,9 @@ namespace py = pybind11;
           py::arg("v_scale")    = std::nullopt,                                     \
           py::arg("asm_layout") = false);                                           \
     m.def("reshape_and_cache_flash",                                                \
-          &aiter::reshape_and_cache_flash,                                          \
-          "reshape_and_cache_flash(Tensor key, Tensor value,"                       \
-          "                        Tensor! key_cache,"                              \
-          "                        Tensor! value_cache,"                            \
-          "                        Tensor slot_mapping,"                            \
-          "                        str kv_cache_dtype,"                             \
-          "                        float k_scale, float v_scale) -> ()");           \
+          &aiter::reshape_and_cache_flash);                                         \
     m.def("reshape_and_cache_with_pertoken_quant",                                  \
           &aiter::reshape_and_cache_with_pertoken_quant,                            \
-          "reshape_and_cache_with_pertoken_quant",                                  \
           py::arg("key"),                                                           \
           py::arg("value"),                                                         \
           py::arg("key_cache"),                                                     \
@@ -283,24 +277,9 @@ namespace py = pybind11;
           py::arg("slot_mapping"),                                                  \
           py::arg("asm_layout"));                                                   \
     m.def("reshape_and_cache_with_block_quant",                                     \
-          &aiter::reshape_and_cache_with_block_quant,                               \
-          "reshape_and_cache_with_block_quant(Tensor key, Tensor value,"            \
-          "                        Tensor! key_cache,"                              \
-          "                        Tensor! value_cache,"                            \
-          "                        Tensor! k_dequant_scales,"                       \
-          "                        Tensor! v_dequant_scales,"                       \
-          "                        Tensor slot_mapping,"                            \
-          "                        const bool asm_layout) -> ()");                  \
+          &aiter::reshape_and_cache_with_block_quant);                              \
     m.def("reshape_and_cache_with_block_quant_for_asm_pa",                          \
           &aiter::reshape_and_cache_with_block_quant_for_asm_pa,                    \
-          "reshape_and_cache_with_block_quant_for_asm_pa(Tensor key, Tensor value," \
-          "                        Tensor! key_cache,"                              \
-          "                        Tensor! value_cache,"                            \
-          "                        Tensor! k_dequant_scales,"                       \
-          "                        Tensor! v_dequant_scales,"                       \
-          "                        Tensor slot_mapping,"                            \
-          "                        const bool asm_layout,"                          \
-          "                        const int ori_block_size) -> ()",                \
           py::arg("key"),                                                           \
           py::arg("value"),                                                         \
           py::arg("key_cache"),                                                     \
@@ -312,11 +291,6 @@ namespace py = pybind11;
           py::arg("ori_block_size") = 128);                                         \
     m.def("concat_and_cache_mla",                                                   \
           &aiter::concat_and_cache_mla,                                             \
-          "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"                          \
-          "                     Tensor! kv_cache,"                                  \
-          "                     Tensor slot_mapping,"                               \
-          "                     str kv_cache_dtype,"                                \
-          "                     Tensor scale) -> ()",                               \
           py::arg("kv_c"),                                                          \
           py::arg("k_pe"),                                                          \
           py::arg("kv_cache"),                                                      \
@@ -325,10 +299,6 @@ namespace py = pybind11;
           py::arg("scale"));                                                        \
     m.def("indexer_k_quant_and_cache",                                              \
           &aiter::indexer_k_quant_and_cache,                                        \
-          "indexer_k_quant_and_cache(Tensor k, Tensor kv_cache,"                    \
-          "                     Tensor slot_mapping,"                               \
-          "                     int64_t quant_block_size,"                          \
-          "                     std::string& scale_fmt) -> ()",                     \
           py::arg("k"),                                                             \
           py::arg("kv_cache"),                                                      \
           py::arg("slot_mapping"),                                                  \
@@ -345,19 +315,6 @@ namespace py = pybind11;
           py::arg("preshuffle") = false);                                           \
     m.def("fused_qk_rope_concat_and_cache_mla",                                     \
           &aiter::fused_qk_rope_concat_and_cache_mla,                               \
-          "fused_qk_rope_concat_and_cache_mla("                                     \
-          "                     Tensor q_nope, Tensor q_pe,"                        \
-          "                     Tensor kv_c, Tensor k_pe,"                          \
-          "                     Tensor! kv_cache,"                                  \
-          "                     Tensor! q_out, "                                    \
-          "                     Tensor slot_mapping,"                               \
-          "                     Tensor k_scale,"                                    \
-          "                     Tensor q_scale,"                                    \
-          "                     Tensor positions,"                                  \
-          "                     Tensor cos_cache,"                                  \
-          "                     Tensor sin_cache,"                                  \
-          "                     bool is_neox    ,"                                  \
-          "                     bool is_nope_first)->()",                           \
           py::arg("q_nope"),                                                        \
           py::arg("q_pe"),                                                          \
           py::arg("kv_c"),                                                          \
