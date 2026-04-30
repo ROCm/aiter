@@ -4,6 +4,7 @@ from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 
 
 def matmul_launch_metadata(grid, kernel, args):
@@ -86,27 +87,6 @@ def unswizzle_mx_scale_gfx1250(
     return scale_buffer_slice
 
 
-@gluon.jit
-def clip(x, limit, clip_lower: tl.constexpr):
-    res = gl.minimum(x, limit)
-    if clip_lower:
-        res = gl.maximum(-limit, res)
-    return res
-
-
-@gluon.jit
-def _swiglu(input, alpha, limit):
-    gelu, linear = gl.split(gl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
-    gelu = gelu.to(gl.float32)
-    if limit is not None:
-        gelu = clip(gelu, limit, clip_lower=False)
-    linear = linear.to(tl.float32)
-    if limit is not None:
-        linear = clip(linear, limit, clip_lower=True)
-    s = gelu / (1 + gl.exp2(-1.44269504089 * alpha * gelu))
-    return gl.fma(s, linear, s)  # (s * (linear + 1))
-
-
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w4(
     Y,
@@ -149,6 +129,7 @@ def _moe_gemm_a8w4(
     alpha,
     limit,
     ACTIVATION_REDUCTION_N: gl.constexpr,
+    ADD_RESIDUAL: gl.constexpr,
     # MoE config
     N_EXPTS_ACT: gl.constexpr,
     # optimization config
@@ -601,7 +582,7 @@ def _moe_gemm_a8w4(
         bias = gl.amd.gfx1250.buffer_load(BPtrs, offs_y_n, mask=mask_n)
         acc = acc + bias[None, :]
     if APPLY_SWIGLU:
-        out = _swiglu(acc, alpha, limit)
+        out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=ADD_RESIDUAL)
         tl.static_assert(
             out.shape[1] == OUT_BLOCK_N,
             f"Activation fn out.shape[1] ({out.shape[1]}) doesn't match computed OUT_BLOCK_N ({OUT_BLOCK_N})",
