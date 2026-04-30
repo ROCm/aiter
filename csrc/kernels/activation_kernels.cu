@@ -629,10 +629,10 @@ static constexpr int nextPow2(unsigned int num)
     {                                                                                         \
         AITER_CHECK(input.dtype() == out.dtype(),                                             \
                     "For bf16/fp16 input, output type must match input type");                \
-        AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "swiglu_act_and_mul_kernel", [&] {    \
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "swiglu_act_and_mul_kernel", [&] { \
             using input_dtype  = typename aiter::hip2opus<scalar_t>::type;                    \
             using output_dtype = input_dtype;                                                 \
-            AITER_DISPATCH_CASE_VEC_SIZE(                                                     \
+            AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(                                             \
                 vec_size,                                                                     \
                 aiter::swiglu_act_and_mul_kernel<input_dtype, output_dtype, VEC_SIZE>        \
                 <<<grid, block, 0, stream>>>(reinterpret_cast<output_dtype*>(out.data_ptr()),\
@@ -677,7 +677,7 @@ void silu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
                     expert_ids.device_id == input.device_id,
                 "silu_and_mul_bias expects all tensors on the same device");
 
-    AITER_DISPATCH_INTEGRAL(expert_ids.dtype(), "silu_and_mul_bias", [&] {
+    VLLM_DISPATCH_INTEGRAL_TYPES_rmTorch(expert_ids.dtype(), "silu_and_mul_bias", [&] {
         using expert_index_t = scalar_t;
         auto* expert_ptr = reinterpret_cast<const expert_index_t*>(expert_ids.data_ptr());
         if(input.dtype() == AITER_DTYPE_fp32)
@@ -715,13 +715,13 @@ void silu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
         {
             AITER_CHECK(input.dtype() == out.dtype(),
                         "For bf16/fp16 input, output type must match input type");
-            AITER_DISPATCH_REDUCED_FLOATING(input.dtype(), "act_and_mul_bias_kernel", [&] {
+            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "act_and_mul_bias_kernel", [&] {
                 using input_dtype  = typename aiter::hip2opus<scalar_t>::type;
                 using output_dtype = input_dtype;
                 auto* out_ptr      = reinterpret_cast<output_dtype*>(out.data_ptr());
                 auto* in_ptr       = reinterpret_cast<const input_dtype*>(input.data_ptr());
                 auto* bias_ptr     = reinterpret_cast<const input_dtype*>(bias.data_ptr());
-                AITER_DISPATCH_CASE_VEC_SIZE(
+                AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(
                     vec_size,
                     aiter::act_and_mul_bias_kernel<input_dtype,
                                                    output_dtype,
@@ -753,7 +753,7 @@ void swiglu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
                     expert_ids.device_id == input.device_id,
                 "swiglu_and_mul_bias expects all tensors on the same device");
 
-    AITER_DISPATCH_INTEGRAL(expert_ids.dtype(), "swiglu_and_mul_bias", [&] {
+    VLLM_DISPATCH_INTEGRAL_TYPES_rmTorch(expert_ids.dtype(), "swiglu_and_mul_bias", [&] {
         using expert_index_t = scalar_t;
         auto* expert_ptr = reinterpret_cast<const expert_index_t*>(expert_ids.data_ptr());
         if(input.dtype() == AITER_DTYPE_fp32)
@@ -791,9 +791,9 @@ void swiglu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
         {
             AITER_CHECK(input.dtype() == out.dtype(),
                         "For bf16/fp16 input, output type must match input type");
-            AITER_DISPATCH_REDUCED_FLOATING(input.dtype(),
-                                            "swiglu_act_and_mul_bias_kernel",
-                                            [&] {
+            AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(),
+                                                    "swiglu_act_and_mul_bias_kernel",
+                                                    [&] {
                                                 using input_dtype =
                                                     typename aiter::hip2opus<scalar_t>::type;
                                                 using output_dtype = input_dtype;
@@ -804,7 +804,7 @@ void swiglu_and_mul_bias(const aiter_tensor_t& out,        // [..., d]
                                                 auto* bias_ptr =
                                                     reinterpret_cast<const input_dtype*>(
                                                         bias.data_ptr());
-                                                AITER_DISPATCH_CASE_VEC_SIZE(
+                                                AITER_DISPATCH_CASE_VEC_SIZE_rmTorch(
                                                     vec_size,
                                                     aiter::swiglu_act_and_mul_bias_kernel<
                                                         input_dtype,
