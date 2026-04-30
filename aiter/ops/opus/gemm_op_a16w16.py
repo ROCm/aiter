@@ -71,6 +71,7 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     "module_deepgemm_opus",
     fc_name="opus_gemm_a16w16_tune",
     gen_fake=_gen_opus_gemm_a16w16_tune_fake_tensors,
+    develop=True,
 )
 def _opus_gemm_a16w16_tune_raw(
     XQ: torch.Tensor,
@@ -192,7 +193,12 @@ def opus_gemm_a16w16_tune(
         splitK = new_splitK
         bias = None
     _check_a16w16_tune_layout(XQ, WQ, Y)
-    return _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, bias, kernelId, splitK)
+    # C++ launcher is in-place on Y (returns void after PR #2932-style
+    # refactor to aiter_tensor_t). Keep the wrapper's `return Y`
+    # contract so callers that did `Y = opus_gemm_a16w16_tune(...)`
+    # still see the populated Y.
+    _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, bias, kernelId, splitK)
+    return Y
 
 
 # Private bf16 no-scale dispatch binding, used only by gemm_a16w16_opus
@@ -221,6 +227,7 @@ def _gen_opus_gemm_bf16_dispatch_fake_tensors(
     "module_deepgemm_opus",
     fc_name="opus_gemm",
     gen_fake=_gen_opus_gemm_bf16_dispatch_fake_tensors,
+    develop=True,
 )
 def _opus_gemm_bf16_dispatch(
     XQ: torch.Tensor,
