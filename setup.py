@@ -83,11 +83,10 @@ def _is_triton_installed():
         "triton-rocm",
     ]:
         try:
-            pkg_version(pkg)
-            return True
+            return pkg, pkg_version(pkg)
         except Exception:
             pass
-    return False
+    return None
 
 
 def _run_install_triton():
@@ -96,15 +95,17 @@ def _run_install_triton():
     subprocess.check_call(["bash", install_triton])
 
 
-if is_develop_mode() and _is_triton_installed():
+_triton_info = _is_triton_installed() if is_develop_mode() else None
+if _triton_info:
     print(
-        "[aiter] triton is already installed, skipping .github/scripts/install_triton.sh"
+        f"[aiter] {_triton_info[0]}=={_triton_info[1]} is already installed,"
+        " recommend using .github/scripts/install_triton.sh to install triton"
     )
 else:
     try:
         _run_install_triton()
     except Exception:
-        print("[aiter] Skipping .github/scripts/install_triton.sh")
+        print("[aiter] Skipping triton install via .github/scripts/install_triton.sh")
 
 
 def write_install_mode():
