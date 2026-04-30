@@ -108,7 +108,7 @@ jobs:
         github.event.inputs.skip_atom != 'true' ||
         github.event.inputs.skip_afo_llm != 'true'
       )
-    runs-on: ubuntu-latest
+    runs-on: build-only-aiter
     outputs:
       sglang_matrix: ${{ steps.load.outputs.sglang_matrix }}
       vllm_matrix: ${{ steps.load.outputs.vllm_matrix }}
@@ -155,13 +155,41 @@ jobs:
           echo "atom_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/atom_models.json)" >> "$GITHUB_OUTPUT"
           echo "afo_llm_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/afo_llm_tests.json)" >> "$GITHUB_OUTPUT"
 
-  # ── SGLang Integration ───────────────────────────────────────────────
-  sglang:
-    name: "SGLang (${{ matrix.test_name }})"
+  # ── SGLang Preflight: find compatible container image ────────────────
+  sglang-preflight:
+    name: "SGLang (preflight)"
     needs: [build, load-configs]
     if: >-
       always() &&
       needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_sglang != 'true'
+    runs-on: aiter-1gpu-runner
+    timeout-minutes: 30
+    outputs:
+      sgl_image: ${{ steps.resolve.outputs.sgl_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Resolve compatible SGLang image
+        id: resolve
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+        run: |
+          bash .github/scripts/run_sglang.sh \
+            "${{ github.sha }}" \
+            "echo preflight-smoke-test-only" \
+            "${{ github.event.inputs.aiter_index_url }}"
+
+  # ── SGLang Integration ───────────────────────────────────────────────
+  sglang:
+    name: "SGLang (${{ matrix.test_name }})"
+    needs: [build, load-configs, sglang-preflight]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      needs.sglang-preflight.result == 'success' &&
       github.event.inputs.skip_sglang != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -178,6 +206,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
           AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          SGL_IMAGE_OVERRIDE: ${{ needs.sglang-preflight.outputs.sgl_image }}
         run: |
           bash .github/scripts/run_sglang.sh \
             "${{ github.sha }}" \
@@ -358,7 +387,7 @@ jobs:
 
   # ── Promote ────────────────────────────────────────────────────────
   promote:
-    needs: [build, sglang, vllm, vllm-tests, atom, afo-llm]
+    needs: [build, sglang-preflight, sglang, vllm, vllm-tests, atom, afo-llm]
     if: >-
       always() &&
       github.repository_owner == 'ROCm' &&

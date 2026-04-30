@@ -81,12 +81,76 @@ case "${GPU_ARCH}" in
 esac
 echo "Detected GPU: ${GPU_ARCH} → image tag: ${GPU_TAG}"
 
-# ── Resolve SGLang base image (with retry) ──
-SGL_IMAGE=$(python3 - "${GPU_TAG}" <<'PY'
+# ── AITER install helpers ──
+install_aiter_from_source() {
+  docker exec ci_sglang bash -lc "
+    set -ex
+    pip uninstall -y amd-aiter aiter || true
+    rm -rf /tmp/aiter-under-test
+    git clone https://github.com/ROCm/aiter.git /tmp/aiter-under-test
+    cd /tmp/aiter-under-test
+    git checkout '${AITER_SHA}'
+    git submodule sync --recursive
+    git submodule update --init --recursive
+    PREBUILD_KERNELS=1 GPU_ARCHS='${GPU_ARCH}' python setup.py build_ext --inplace
+    pip install -e .
+    pip show amd-aiter || pip show aiter
+  "
+}
+
+install_aiter_wheel() {
+  docker exec ci_sglang bash -lc "
+    pip uninstall -y amd-aiter aiter || true
+    ${AITER_INSTALL_CMD}
+    pip show amd-aiter
+  "
+}
+
+start_container() {
+  local image="$1"
+  docker rm -f ci_sglang 2>/dev/null || true
+  export SGLANG_CI_HOSTNAME_OVERRIDE="${SGLANG_CI_HOSTNAME}"
+  GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${HF_TOKEN}" \
+    bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${image}"
+  docker exec -u root ci_sglang bash -c "git config --global --add safe.directory '*'"
+  docker exec -u root ci_sglang bash -c "pip config set global.default-timeout 60"
+  docker exec -u root ci_sglang bash -c "pip config set global.retries 10"
+  bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
+}
+
+# ── Resolve SGLang image ──
+# If SGL_IMAGE_OVERRIDE is set (from preflight job), use it directly.
+# Otherwise, resolve candidates by matching ROCm version from AITER_VERSION,
+# then smoke-test each until one is ABI-compatible.
+if [ -n "${SGL_IMAGE_OVERRIDE:-}" ]; then
+  SGL_IMAGE="${SGL_IMAGE_OVERRIDE}"
+  echo "Using pre-resolved SGLang image: ${SGL_IMAGE}"
+  start_container "${SGL_IMAGE}"
+
+  if [ -n "${AITER_INDEX_URL}" ]; then
+    install_aiter_wheel || install_aiter_from_source
+  else
+    install_aiter_from_source
+  fi
+else
+# Resolve candidates by matching ROCm version from AITER_VERSION
+readarray -t SGL_IMAGES < <(python3 - "${GPU_TAG}" "${AITER_VERSION:-}" <<'PY'
 import json, re, sys, time, urllib.request, urllib.error
 
 gpu_tag = sys.argv[1]
-prefixes = [f"v0.5.10.post1-rocm720-{gpu_tag}-"]
+aiter_version = sys.argv[2] if len(sys.argv) > 2 else ""
+
+rocm_match = re.search(r'rocm(\d+)\.(\d+)', aiter_version)
+if rocm_match:
+    rocm_tag = f"rocm{rocm_match.group(1)}{rocm_match.group(2)}0"
+    print(f"AITER wheel targets ROCm {rocm_match.group(1)}.{rocm_match.group(2)} → preferring {rocm_tag} container", file=sys.stderr)
+    all_rocm = [rocm_tag, "rocm700", "rocm720"]
+    seen = set()
+    rocm_versions = [v for v in all_rocm if v not in seen and not seen.add(v)]
+else:
+    rocm_versions = ["rocm700", "rocm720"]
+
+prefixes = [f"v0.5.10.post1-{rv}-{gpu_tag}-" for rv in rocm_versions]
 patterns = {p: re.compile(rf"^{re.escape(p)}\d{{8}}(?:-preview)?$") for p in prefixes}
 
 max_retries = 3
@@ -104,69 +168,64 @@ for attempt in range(1, max_retries + 1):
                         matches[p].append(name)
             next_url = data.get("next")
 
+        found = False
         for p in prefixes:
             if matches[p]:
                 print(f"rocm/sgl-dev:{sorted(matches[p], reverse=True)[0]}")
-                exit(0)
-        raise SystemExit(f"No public {gpu_tag} SGLang image found")
+                found = True
+        if not found:
+            raise SystemExit(f"No public {gpu_tag} SGLang image found")
+        break
     except (urllib.error.URLError, OSError) as e:
         if attempt < max_retries:
             wait = 15 * attempt
-            print(f"Docker Hub request failed (attempt {attempt}/{max_retries}): {e}", flush=True)
-            print(f"Retrying in {wait}s...", flush=True)
+            print(f"Docker Hub request failed (attempt {attempt}/{max_retries}): {e}", file=sys.stderr)
             time.sleep(wait)
         else:
             raise SystemExit(f"Docker Hub unreachable after {max_retries} attempts: {e}")
 PY
 )
-echo "SGLang image: ${SGL_IMAGE}"
 
-# ── Start container ──
-docker rm -f ci_sglang || true
-export SGLANG_CI_HOSTNAME_OVERRIDE="${SGLANG_CI_HOSTNAME}"
-GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${HF_TOKEN}" \
-  bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${SGL_IMAGE}"
+echo "Candidate SGLang images: ${SGL_IMAGES[*]}"
 
-# ── Fix git dubious ownership for mounted repos ──
-docker exec -u root ci_sglang bash -c "git config --global --add safe.directory '*'"
+# ── Try each candidate image: start container, install wheel, smoke-test import ──
+SGL_IMAGE=""
+for candidate in "${SGL_IMAGES[@]}"; do
+  echo ""
+  echo "=== Trying SGLang image: ${candidate} ==="
+  start_container "${candidate}"
 
-# ── Setup pip ──
-docker exec -u root ci_sglang bash -c "pip config set global.default-timeout 60"
-docker exec -u root ci_sglang bash -c "pip config set global.retries 10"
-
-# ── Install deps ──
-bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
-
-# ── Install AITER under test ──
-install_aiter_from_source() {
-  docker exec ci_sglang bash -lc "
-    set -ex
-    pip uninstall -y amd-aiter aiter || true
-    rm -rf /tmp/aiter-under-test
-    git clone https://github.com/ROCm/aiter.git /tmp/aiter-under-test
-    cd /tmp/aiter-under-test
-    git checkout '${AITER_SHA}'
-    git submodule sync --recursive
-    git submodule update --init --recursive
-    PREBUILD_KERNELS=1 GPU_ARCHS='${GPU_ARCH}' python setup.py build_ext --inplace
-    pip install -e .
-    pip show amd-aiter || pip show aiter
-  "
-}
-
-if [ -n "${AITER_INDEX_URL}" ]; then
-  # Try wheel install first; fall back to source if wheel is incompatible
-  # (e.g. no wheel for this Python version)
-  if ! docker exec ci_sglang bash -lc "
-    pip uninstall -y amd-aiter aiter || true
-    ${AITER_INSTALL_CMD}
-    pip show amd-aiter
-  "; then
-    echo "WARNING: Wheel install failed, falling back to source install from SHA ${AITER_SHA}"
+  if [ -n "${AITER_INDEX_URL}" ]; then
+    if ! install_aiter_wheel; then
+      echo "WARNING: Wheel install failed on ${candidate}, trying next image..."
+      continue
+    fi
+  else
     install_aiter_from_source
   fi
-else
-  install_aiter_from_source
+
+  # Smoke-test: verify AITER can actually be imported (catches ABI mismatches)
+  if docker exec ci_sglang python3 -c "import aiter; print('AITER import OK')" 2>&1; then
+    echo "AITER wheel is compatible with ${candidate}"
+    SGL_IMAGE="${candidate}"
+    break
+  else
+    echo "WARNING: AITER import failed on ${candidate} (ABI mismatch), trying next image..."
+  fi
+done
+
+if [ -z "${SGL_IMAGE}" ]; then
+  echo "ERROR: AITER wheel is not compatible with any available SGLang image"
+  exit 1
+fi
+
+echo ""
+echo "Selected SGLang image: ${SGL_IMAGE}"
+fi
+
+# Export selected image for preflight job to pass to downstream jobs
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  echo "sgl_image=${SGL_IMAGE}" >> "${GITHUB_OUTPUT}"
 fi
 
 # ── Run test ──
