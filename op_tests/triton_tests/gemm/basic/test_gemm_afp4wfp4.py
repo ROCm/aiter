@@ -40,33 +40,30 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     return scales
 
 
-def shuffle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
-    """Shuffle scales for gfx1250 unshuffle pattern in the kernel."""
-    sm, sn = scales.shape
-    scale_kwidth = 4 if sn >= 4 else sn
-    num_chunk_n = sm // preshuffle_factor
-    num_chunk_k = sn // scale_kwidth
+def shuffle_scales_gfx1250(scales: torch.Tensor):
+    """Shuffle scales for gfx1250 unshuffle pattern in the kernel.
+    Derived from hardware constraint:
+      - b128 = 16 bytes
+      - each lane owns 4 bytes (K_GROUPS=4 scales × 1 byte each)
+      - LANES_PER_B128 = 16 // 4 = 4
+    """
+    BLOCK_M, K_GROUPS = scales.shape
+    LANES_PER_B128 = 16 // K_GROUPS  # = 4 (fixed by HW instruction shape)
+    assert BLOCK_M % LANES_PER_B128 == 0
+    return scales.reshape(BLOCK_M // LANES_PER_B128, LANES_PER_B128 * K_GROUPS)
 
-    data = scales.view(num_chunk_n, 4, preshuffle_factor // 4, num_chunk_k, scale_kwidth)
-    data = data.permute(0, 3, 2, 1, 4).contiguous()
-    data = data.view(sm // preshuffle_factor, sn * preshuffle_factor)
-    return data
 
-
-def unshuffle_scales_gfx1250(scales_shuffled: torch.Tensor, preshuffle_factor: int = 32):
-    """Inverse of shuffle_scales_gfx1250."""
-    sm_packed, sn_packed = scales_shuffled.shape
-    sm = sm_packed * preshuffle_factor
-    sn = sn_packed // preshuffle_factor
-    scale_kwidth = 4 if sn >= 4 else sn
-
-    data = scales_shuffled.view(
-        sm // preshuffle_factor, sn // scale_kwidth,
-        preshuffle_factor // 4, 4, scale_kwidth,
-    )
-    data = data.permute(0, 3, 2, 1, 4).contiguous()
-    data = data.view(sm, sn)
-    return data
+def unshuffle_scales_gfx1250(scales_shuffled: torch.Tensor) -> torch.Tensor:
+    """
+    Inverse of shuffle_scales_gfx1250.
+    Input:  (BLOCK_M // 4, 16)   — preshuffled
+    Output: (BLOCK_M, K_GROUPS)  — original row-major
+    """
+    rows, cols = scales_shuffled.shape
+    # cols = LANES_PER_B128 * K_GROUPS = 16 always
+    # rows = BLOCK_M // LANES_PER_B128
+    # BLOCK_M = rows * 4, K_GROUPS = 4 (since LANES_PER_B128=4 and cols=16)
+    return scales_shuffled.reshape(rows * 4, 4)
 
 
 # Note this is specified by the HW and cannot be changed.
@@ -126,10 +123,10 @@ def generate_gemm_afp4wfp4_inputs(
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
             if M >= 32:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales, preshuffle_factor=32)
+                x_scales_shuffled = shuffle_scales_gfx1250(x_scales)
             else:
                 x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales, preshuffle_factor=32)
+            w_scales_shuffled = shuffle_scales_gfx1250(w_scales)
         else:
             if M >= 32:
                 x_scales_shuffled = shuffle_scales(x_scales)

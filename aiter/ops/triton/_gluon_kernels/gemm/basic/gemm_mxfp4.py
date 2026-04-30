@@ -68,48 +68,15 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
     }
 
 
-# ---------------------------------------------------------------------------
-# View transforms for preshuffled data in LDS
-# These are zero-cost (no data movement) — they just reindex the LDS view
-# so load_shared_relaxed reads bytes in the order WMMA expects.
-# ---------------------------------------------------------------------------
-
-
 @gluon.jit
 def preshuffled_scale_offsets(
-    outer,  # 1D: logical outer-dim indices (M for A, N for B)
-    k_g,  # 1D: logical scale-K-group indices [0, K_GROUPS)
-    stride_row,  # physical stride along the outer/PF row
-    stride_col,  # physical stride along the column (typically 1)
-    PF: gl.constexpr,  # outer chunk size (= 32 for shuffle_scales_gfx1250)
-    PF_HI: gl.constexpr,  # high split of PF (= 4)
-    PF_LO: gl.constexpr,  # low  split of PF (= 8); PF_HI * PF_LO == PF
-    KW: gl.constexpr,  # K-group chunk size (= 4)
+    outer, k_g, stride_row, stride_col, K_GROUPS: gl.constexpr
 ):
-    """
-    Address math that inverts shuffle_scales_gfx1250 in registers.
-
-    The preshuffled tensor has physical shape (outer/PF, K_g * PF) with
-    column dim viewed as (K_g/KW, PF_LO, PF_HI, KW). For a logical scale
-    element (outer=idx, k_g=k):
-
-        phys_row = idx // PF
-        phys_col = (((k // KW) * PF_LO + (idx % PF) % PF_LO) * PF_HI
-                    + (idx % PF) // PF_LO) * KW
-                  + (k % KW)
-
-    Returns 2D int32 byte-offsets shaped [len(outer), len(k_g)].
-    """
-    idx_outer = outer // PF
-    idx_mod = outer % PF
-    idx_lo = idx_mod % PF_LO
-    idx_hi = idx_mod // PF_LO
-    k_outer = k_g // KW
-    k_inner = k_g % KW
-    col = (
-        (k_outer[None, :] * PF_LO + idx_lo[:, None]) * PF_HI + idx_hi[:, None]
-    ) * KW + k_inner[None, :]
-    return idx_outer[:, None] * stride_row + col * stride_col
+    phys_row = outer // (16 // K_GROUPS)
+    phys_col = (outer % (16 // K_GROUPS)) * K_GROUPS
+    return (
+        phys_row[:, None] * stride_row + (phys_col[:, None] + k_g[None, :]) * stride_col
+    )
 
 
 @gluon.jit
@@ -177,25 +144,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # Compile-time constants
     FP4_ELEMS_PER_BYTE: gl.constexpr = 2
     SCALE_GROUP_ELEMS: gl.constexpr = 32
-    # Outer-dim chunk size used by shuffle_scales_gfx1250 (M and N share it).
-    # Each PF-chunk further splits into (PF_HI, PF_LO) = (4, 8) inside the
-    # preshuffled tensor's column dim. K is grouped by PF_KW = 4.
-    SCALE_PRESHUFFLE_FACTOR: gl.constexpr = 32
-    SCALE_PRESHUFFLE_HI: gl.constexpr = 4
-    SCALE_PRESHUFFLE_LO: gl.constexpr = (
-        SCALE_PRESHUFFLE_FACTOR // SCALE_PRESHUFFLE_HI
-    )  # 8
-    SCALE_PRESHUFFLE_KW: gl.constexpr = 4
 
     BLOCK_K_BYTES: gl.constexpr = BLOCK_SIZE_K // FP4_ELEMS_PER_BYTE
     K_GROUPS: gl.constexpr = BLOCK_SIZE_K // SCALE_GROUP_ELEMS
 
     gl.static_assert(BLOCK_SIZE_K % SCALE_GROUP_ELEMS == 0)
     gl.static_assert(K_GROUPS * SCALE_GROUP_ELEMS == BLOCK_SIZE_K)
-    # Preshuffle requires M/N divisible by PF and K-groups divisible by KW.
-    gl.static_assert(BLOCK_SIZE_M % SCALE_PRESHUFFLE_FACTOR == 0)
-    gl.static_assert(BLOCK_SIZE_N % SCALE_PRESHUFFLE_FACTOR == 0)
-    gl.static_assert(K_GROUPS % SCALE_PRESHUFFLE_KW == 0)
+    gl.static_assert(BLOCK_SIZE_M % (16 // K_GROUPS) == 0)
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -214,8 +169,9 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # Valid because BLOCK_SIZE_{M,N} % PF == 0, so tile_*  * BLOCK_SIZE_*
     # lands on an exact preshuffled-row boundary.
     # =====================================================================
-    M_TILE_ROWS = tile_m * (BLOCK_SIZE_M // SCALE_PRESHUFFLE_FACTOR)
-    N_TILE_ROWS = tile_n * (BLOCK_SIZE_N // SCALE_PRESHUFFLE_FACTOR)
+    LANES_PER_B128: gl.constexpr = 16 // K_GROUPS   # = 4
+    M_TILE_ROWS = tile_m * (BLOCK_SIZE_M // LANES_PER_B128)
+    N_TILE_ROWS = tile_n * (BLOCK_SIZE_N // LANES_PER_B128)
     as_base_ptr = a_scale_ptr + M_TILE_ROWS * stride_as_m
     bs_base_ptr = b_scale_ptr + N_TILE_ROWS * stride_bs_n
 
@@ -227,10 +183,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         as_k,
         stride_as_m,
         stride_as_k,
-        PF=SCALE_PRESHUFFLE_FACTOR,
-        PF_HI=SCALE_PRESHUFFLE_HI,
-        PF_LO=SCALE_PRESHUFFLE_LO,
-        KW=SCALE_PRESHUFFLE_KW,
+        K_GROUPS,
     )
 
     # --- B scales (N direction is the outer dim) ---
@@ -241,10 +194,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         bs_k,
         stride_bs_n,
         stride_bs_k,
-        PF=SCALE_PRESHUFFLE_FACTOR,
-        PF_HI=SCALE_PRESHUFFLE_HI,
-        PF_LO=SCALE_PRESHUFFLE_LO,
-        KW=SCALE_PRESHUFFLE_KW,
+        K_GROUPS,
     )
 
     # =====================================================================
@@ -294,12 +244,11 @@ def gemm_mxfp4_preshuffle_gfx1250(
     )
 
     # --- 1. Prologue: fill NUM_BUFFERS-1 LDS slots via TDM (A, B only) + buffer_load scales ---
-    SCALE_K_STRIDE_PER_GROUP: gl.constexpr = SCALE_PRESHUFFLE_FACTOR
-    # Per-K-tile byte step for scale buffer_loads. compute_idx advances by 1
-    # per K-tile, so the offset for tile i is (i * as_k_step). Hoisted out of
-    # the loops so we don't recompute K_GROUPS * PF * stride each iteration.
-    as_k_step = (K_GROUPS * SCALE_K_STRIDE_PER_GROUP) * stride_as_k
-    bs_k_step = (K_GROUPS * SCALE_K_STRIDE_PER_GROUP) * stride_bs_k
+    # Per-K-tile byte step for scale buffer_loads. compute_idx advances by 1 per K-tile,
+    # so the offset for tile i is (i * as_k_step). Hoisted out of the loops so we don't
+    # recompute K_GROUPS * stride each iteration.
+    as_k_step = K_GROUPS * stride_as_k
+    bs_k_step = K_GROUPS * stride_bs_k  
     cur_AS = gl.amd.gfx1250.buffer_load(as_base_ptr, as_base)
     cur_BS = gl.amd.gfx1250.buffer_load(bs_base_ptr, bs_base)
 
