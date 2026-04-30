@@ -35,6 +35,22 @@ def _create_llvm_ptr(value, address_space: int = 1):
     return _llvm.IntToPtrOp(ptr_type, value).result
 
 
+def dtype_to_elem_type(dtype_str: str):
+    """Map a dtype string to its MLIR scalar type.
+
+    Supported: 'f32', 'f16', 'bf16'.
+    """
+    if dtype_str == "f32":
+        return T.f32
+    if dtype_str == "f16":
+        return T.f16
+    if dtype_str == "bf16":
+        return T.bf16
+    raise ValueError(
+        f"unsupported dtype: {dtype_str!r} (expected 'f32', 'f16', or 'bf16')"
+    )
+
+
 def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
     stream_llvm_ptr = _create_llvm_ptr(stream_ptr_value)
 
