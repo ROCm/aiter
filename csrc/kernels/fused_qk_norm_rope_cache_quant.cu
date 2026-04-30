@@ -1468,6 +1468,701 @@ void fused_rope_rms_2way(const T* q0,
 #undef DISPATCH_NEOX
 }
 
+template <typename T, int HEAD_SIZE, bool IS_NEOX>
+__global__ void fused_rope_rms_1way_kernel(const T* q_,
+                                           const T* k_,
+                                           const T* w_q,
+                                           const T* w_k,
+                                           const T* cos_sin,
+                                           int num_tokens,
+                                           int num_heads_q,
+                                           int num_heads_k,
+                                           float eps,
+                                           int total_warps,
+                                           T* out_q_,
+                                           T* out_k_)
+{
+    using mrope_utils::WARP_SIZE;
+    constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
+    constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
+    // NEOX neighbor in lane space: lane k swaps with lane (k ^ NEIGHBOR_XOR).
+    // For all supported HEAD_SIZE in {64, 128, 256}, NEIGHBOR_XOR = 16 (= half of WARP_SIZE).
+    constexpr int NEIGHBOR_XOR    = HALF_HEAD_SIZE / VEC_SIZE;
+    const int warp_id             = threadIdx.x / WARP_SIZE;
+    const int num_warps_per_block = blockDim.x / WARP_SIZE;
+    const int global_warp_id      = blockIdx.x * num_warps_per_block + warp_id;
+    if(global_warp_id >= total_warps)
+    {
+        return;
+    }
+    // batch_size, num_tokens, num_heads, head_size
+    int batch_id = blockIdx.y;
+    auto q       = q_ + batch_id * num_tokens * num_heads_q * HEAD_SIZE;
+    auto k       = k_ + batch_id * num_tokens * num_heads_k * HEAD_SIZE;
+    auto out_q   = out_q_ + batch_id * num_tokens * num_heads_q * HEAD_SIZE;
+    auto out_k   = out_k_ + batch_id * num_tokens * num_heads_k * HEAD_SIZE;
+
+    int warp_offset_k = num_tokens * num_heads_q;
+    bool is_q         = global_warp_id < warp_offset_k;
+
+    int access_id_in_head = (threadIdx.x % WARP_SIZE) * VEC_SIZE;
+    bool is_lower_half    = access_id_in_head < HALF_HEAD_SIZE;
+
+    int token_id;
+    int specialized_warp_id;
+    int head_id_in_token;
+    int data_offset;
+
+    vec_t<T, VEC_SIZE> w_vec, x_vec, cos_sin_vec, cos_vec, sin_vec;
+
+    if(is_q)
+    {
+        specialized_warp_id = global_warp_id;
+        token_id            = specialized_warp_id / num_heads_q;
+        head_id_in_token    = specialized_warp_id % num_heads_q;
+        data_offset         = (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_q + access_id_in_head);
+        x_vec.load(q + data_offset + access_id_in_head);
+    }
+    else
+    {
+        specialized_warp_id = global_warp_id - warp_offset_k;
+        token_id            = specialized_warp_id / num_heads_k;
+        head_id_in_token    = specialized_warp_id % num_heads_k;
+        data_offset         = (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE;
+        w_vec.load(w_k + access_id_in_head);
+        x_vec.load(k + data_offset + access_id_in_head);
+    }
+
+    if constexpr(IS_NEOX)
+    {
+        cos_sin_vec.load(&cos_sin[token_id * HEAD_SIZE + access_id_in_head]);
+    }
+    else
+    {
+        // Interleaved mode only consumes VEC_SIZE/2 cos/sin per lane (one per pair).
+        // Use scalar loads of exactly VEC_SIZE/2 elements to avoid the OOB read at
+        // the buffer tail when access_id_in_head/2 + HALF_HEAD_SIZE + VEC_SIZE-1
+        // would read past the last token's row.
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE / 2; ++i)
+        {
+            cos_vec[i] = cos_sin[token_id * HEAD_SIZE + access_id_in_head / 2 + i];
+            sin_vec[i] =
+                cos_sin[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE + i];
+        }
+    }
+
+    // ===========================================================
+    // Inline RMSNorm (vs the shared mrope_utils::warp_rms_norm_)
+    // ===========================================================
+    // Cache the FP32 reads of x_vec[i] in v[] so the writeback loop doesn't
+    // re-read bf16 from x_vec (would be redundant v_lshlrev_b32 conversions),
+    // then pack the result via pack_f32_to_vec_t (10 instr per bf16x2 pair vs
+    // the compiler default ~26 instr — see f32x2_to_bf16x2_rne in
+    // rope_common.h). Bit-exact RNE equivalent to warp_rms_norm_ — only
+    // difference is NaN payload normalisation (canonical 0x7fff bf16 NaN).
+    {
+        float v[VEC_SIZE];
+        float acc = 0.f;
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE; ++i)
+        {
+            v[i] = (float)x_vec[i];
+            acc += v[i] * v[i];
+        }
+        acc         = mrope_utils::block_utils::warp_reduce_sum<float>(acc);
+        float s_val = rsqrtf(acc / (float)HEAD_SIZE + eps);
+
+        float n[VEC_SIZE];
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE; ++i)
+        {
+            n[i] = v[i] * s_val * (float)w_vec[i];
+        }
+        mrope_utils::pack_f32_to_vec_t(x_vec, n);
+    }
+
+    vec_t<T, VEC_SIZE> out_vec;
+
+    if constexpr(IS_NEOX)
+    {
+        // ds_swizzle XOR-by-NEIGHBOR_XOR — replaces the prior runtime `lane + neighbor_offset`
+        // path that lowered to ds_bpermute_b32. Same semantics as `__shfl(v, lane ^ NEIGHBOR_XOR, 32)`.
+        auto nb_cos_sin_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_SIZE>(
+            cos_sin_vec, opus::number<NEIGHBOR_XOR>{});
+        auto nb_x_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_SIZE>(
+            x_vec, opus::number<NEIGHBOR_XOR>{});
+
+        // Replace the divergent `if(is_lower_half){}else{}` (which made the
+        // compiler emit two copies of the RoPE math AND the FP32→bf16 cvt
+        // sequence with s_and_saveexec / s_xor / s_or EXEC mask flips between
+        // them) with a per-lane v_cndmask select. Both expressions are
+        // evaluated in the SAME FP32 op order as the original divergent code
+        // (mul + mul + sub for lower, mul + mul + add for upper) — bit-exact
+        // equivalent. Then a single pack_f32_to_vec_t cvt path is reused for
+        // every lane.
+        float out_f32[VEC_SIZE];
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE; ++i)
+        {
+            const float c   = (float)cos_sin_vec[i];
+            const float nc  = (float)nb_cos_sin_vec[i];
+            const float x0  = (float)x_vec[i];
+            const float nx0 = (float)nb_x_vec[i];
+
+            const float lower = x0 * c - nx0 * nc;  // matches old lower branch
+            const float upper = x0 * nc + nx0 * c;  // matches old upper branch
+            out_f32[i]        = is_lower_half ? lower : upper;
+        }
+        mrope_utils::pack_f32_to_vec_t(out_vec, out_f32);
+    }
+    else
+    {
+        // Stage RoPE results in FP32 then pack via pack_f32_to_vec_t for the
+        // same conversion-instruction-count win as the RMSNorm writeback.
+        float out_f32[VEC_SIZE];
+#pragma unroll
+        for(int i = 0; i < VEC_SIZE / 2; ++i)
+        {
+            out_f32[2 * i + 0] = (float)x_vec[2 * i + 0] * (float)cos_vec[i] -
+                                 (float)x_vec[2 * i + 1] * (float)sin_vec[i];
+            out_f32[2 * i + 1] = (float)x_vec[2 * i + 1] * (float)cos_vec[i] +
+                                 (float)x_vec[2 * i + 0] * (float)sin_vec[i];
+        }
+        mrope_utils::pack_f32_to_vec_t(out_vec, out_f32);
+    }
+
+    if(is_q)
+    {
+        out_vec.store(out_q + (token_id * num_heads_q + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+    else
+    {
+        out_vec.store(out_k + (token_id * num_heads_k + head_id_in_token) * HEAD_SIZE +
+                      access_id_in_head);
+    }
+}
+
+// quad kernel: a single warp processes 4 heads (= 2 same-token head_pairs)
+// for one q-or-k side. Built up from two ideas that compose:
+//
+//   (1) PAIR PACKING (half-warp layout)
+//       The single-head 1way kernel uses VEC_SIZE = HEAD_SIZE / WARP_SIZE
+//       elements per lane. For HEAD_SIZE = 128 and bf16 that is 4 elements
+//       = 8 bytes/lane → the compiler emits global_load_dwordx2 (8B), which
+//       is half the peak per-lane VMEM bandwidth on gfx942.
+//
+//       Inside this kernel we carve the warp into TWO half-warps and assign
+//       each half to one head:
+//
+//           half_warp_idx = (lane >> 4)   ∈ {0, 1}     ← which head
+//           lane_in_half  = lane & 15      ∈ [0, 16)    ← position-in-head
+//           VEC_PAIR      = HEAD_SIZE / 16 = 8 bf16     ← bytes/lane × 2
+//
+//       Each lane now owns 16 bytes of work (a "pair" of heads, with the
+//       upper/lower half-warp providing each one). The compiler emits a
+//       single global_load_dwordx4 per (token, head_pair).
+//
+//       Knock-on wins from the pair grouping:
+//         * cos_sin depends only on the token — both heads share it, so we
+//           load it ONCE per pair instead of twice.
+//         * w_q / w_k depend only on the head index modulo HEAD_SIZE —
+//           identical for the two heads, again a single shared load.
+//         * RMSNorm reduce becomes a 16-lane butterfly (helper
+//           half_warp_reduce_sum() in rope_common.h skips the XOR-by-16
+//           step so the two halves reduce independently).
+//
+//   (2) BUNDLED VMEM ISSUE (multiple outstanding loads, same token)
+//       NOTE on naming: this is NOT classical software-pipelined double
+//       buffering — there is no `prefetch t0; for i: prefetch ti; compute
+//       t(i-1)` loop. There is no loop at all. Each warp processes ONE
+//       (token, head_quad) tile and exits. What we do is just batch
+//       multiple HBM round-trips so they fly in parallel; the win is from
+//       load↔load overlap, not load↔compute overlap.
+//
+//       Step (1) gave us "1 warp = 1 head_pair" with 4 VMEM ops per pair
+//       (q/k load + w + cos_sin + store). At single in-flight load per
+//       warp the kernel is VMEM-latency-bound on MI300X: load → first-use
+//       distance is hundreds of cycles and one outstanding load can't fill
+//       that.
+//
+//       So this kernel doubles the work per warp to TWO head_pairs of the
+//       SAME token and bundles ALL their input loads in the prologue:
+//
+//           prologue (no loop, all issued back-to-back):
+//             global_load_dwordx4 x_pair_0   [pair 0 q/k, heads 4p+0,4p+1]
+//             global_load_dwordx4 x_pair_1   [pair 1 q/k, heads 4p+2,4p+3,
+//                                             +offset 2*HEAD_SIZE]
+//             global_load_dwordx4 w_vec      [shared by both pairs]
+//             global_load_dwordx4 cos_sin    [shared by both pairs, same token]
+//
+//       The compiler sinks each consumer behind a decreasing waitcnt
+//       (vmcnt(3) → vmcnt(2) → ... → vmcnt(0)) so all 4 HBM round-trips
+//       are in flight simultaneously — total wait is max() of the four,
+//       not sum(). One load's latency is hidden behind ANOTHER LOAD's
+//       latency, not behind compute.
+//
+//       (Cross-loop producer-consumer pipelining — the "real" double
+//       buffer that interleaves prefetch ti with compute t(i-1) — needs a
+//       loop. We tried it via TPW=2 (1 warp = 2 tokens) and it didn't
+//       help: the kernel is already at ~50-60% HBM peak BW with ~10
+//       waves/SIMD, and cross-warp occupancy is already hiding the
+//       load latency that a loop-level pipeline would have to fight for.)
+//
+//       Same-token bundling adds two more wins on top of (1):
+//         * w_vec and cos_sin are now loaded ONCE for ALL FOUR heads, not
+//           once per pair (so 2× more reuse than pair packing alone).
+//         * The NEOX cos_sin shuffle (warp_shfl_xor_sync_vec) only needs
+//           to run once per warp; both pair-0 and pair-1 RoPE rotations
+//           reuse the same shuffled cos_sin_vec / nb_cos_sin_vec.
+//
+// Per-warp VMEM cost (4 heads of work):
+//     2× dwordx4 q/k load + 1× dwordx4 w + 1× dwordx4 cos_sin
+//   + 2× dwordx4 store
+//   = 6 VMEM ops per 4 heads → 1.5 ops/head
+//   (vs single-head fallback kernel: 4 ops/head)
+//
+// Numerical envelope:
+//   Each (token, head_pair) is computed with the identical math as the
+//   single-head kernel — only the cross-lane reduce tree changes (16-lane
+//   butterfly instead of 32-lane). With non-associative FP32 the rounded
+//   result drifts by at most 1 mantissa ULP, mapping to 0..1 bf16 ULP on
+//   ≤ 0.0003% of output elements (verified by sweep against the single-head
+//   path). The end-to-end magnitude bound stays inside atol=0.05 vs PyTorch
+//   reference, identical envelope to both the single-head 1way kernel and
+//   the existing 2way kernel — i.e. no model-accuracy impact.
+//
+// Constraint: num_heads_q % 4 == 0 && num_heads_k % 4 == 0. The dispatcher
+// falls back to the single-head fused_rope_rms_1way_kernel for any other
+// shape; that path is untouched and produces bitwise-identical output to
+// the pre-quad-kernel baseline.
+//
+// QUAD_Q_CT / QUAD_K_CT (compile-time):
+//   When > 0 the kernel uses them as constexpr divisors so the compiler
+//   folds `spec / quad_q` / `spec % quad_q` into a magic-number multiply
+//   (5 VALU ops: mul_hi + lshr + mul_lo + sub) instead of the runtime
+//   signed integer-divide expansion (~30 ops including v_rcp_iflag_f32).
+//   Pass 0 to keep the runtime path. Selected by the host dispatcher
+//   based on the actual num_heads_q / num_heads_k.
+//
+//   Empirical impact at T=8192, HEAD_SIZE=128, bf16 on MI308X: 3-5% faster
+//   per-warp than the runtime path (kernel is dominated by VMEM latency,
+//   not int-div). VGPR usage and occupancy are identical.
+template <typename T,
+          int HEAD_SIZE,
+          bool IS_NEOX,
+          int QUAD_Q_CT = 0,
+          int QUAD_K_CT = 0>
+__global__ void fused_rope_rms_1way_quad_kernel(const T* q_,
+                                                   const T* k_,
+                                                   const T* w_q,
+                                                   const T* w_k,
+                                                   const T* cos_sin,
+                                                   int num_tokens,
+                                                   int num_heads_q,
+                                                   int num_heads_k,
+                                                   float eps,
+                                                   int total_warps_quad,
+                                                   T* out_q_,
+                                                   T* out_k_)
+{
+    using mrope_utils::WARP_SIZE;
+    constexpr int LANES_PER_HEAD    = WARP_SIZE / 2; // 16
+    constexpr int VEC_PAIR          = HEAD_SIZE / LANES_PER_HEAD;
+    constexpr int HALF_HEAD_SIZE    = HEAD_SIZE / 2;
+    constexpr int NEIGHBOR_XOR_PAIR = HALF_HEAD_SIZE / VEC_PAIR;
+    static_assert(NEIGHBOR_XOR_PAIR == 8,
+                  "quad kernel requires NEIGHBOR_XOR_PAIR == 8 (XOR within half-warp)");
+
+    const int warp_id             = threadIdx.x / WARP_SIZE;
+    const int num_warps_per_block = blockDim.x / WARP_SIZE;
+    const int global_warp_id      = blockIdx.x * num_warps_per_block + warp_id;
+    if(global_warp_id >= total_warps_quad)
+    {
+        return;
+    }
+
+    const int batch_id = blockIdx.y;
+    auto q             = q_ + batch_id * num_tokens * num_heads_q * HEAD_SIZE;
+    auto k             = k_ + batch_id * num_tokens * num_heads_k * HEAD_SIZE;
+    auto out_q         = out_q_ + batch_id * num_tokens * num_heads_q * HEAD_SIZE;
+    auto out_k         = out_k_ + batch_id * num_tokens * num_heads_k * HEAD_SIZE;
+
+    // "quad" count per token = how many groups-of-4-heads each token contributes.
+    // When QUAD_Q_CT / QUAD_K_CT are non-zero compile-time constants, the
+    // div/mod below becomes a constant-divisor magic-multiply (~3 VALU ops);
+    // otherwise the compiler emits the full runtime int-div sequence
+    // (~30 ops, sat on the critical path before any VMEM can issue).
+    const int quad_q     = (QUAD_Q_CT > 0) ? QUAD_Q_CT : (num_heads_q / 4);
+    const int quad_k     = (QUAD_K_CT > 0) ? QUAD_K_CT : (num_heads_k / 4);
+    const int warp_q_end = num_tokens * quad_q;
+    const bool is_q      = global_warp_id < warp_q_end;
+
+    const int lane_full        = threadIdx.x % WARP_SIZE; // 0..31
+    const int lane_in_half     = lane_full & (LANES_PER_HEAD - 1); // 0..15
+    const int access_id_in_head = lane_in_half * VEC_PAIR;
+    const bool is_lower_half   = access_id_in_head < HALF_HEAD_SIZE;
+
+    int token_id;
+    int quad_idx_in_token;
+    if(is_q)
+    {
+        const int spec = global_warp_id;
+        if constexpr(QUAD_Q_CT > 0)
+        {
+            token_id          = spec / QUAD_Q_CT;
+            quad_idx_in_token = spec % QUAD_Q_CT;
+        }
+        else
+        {
+            token_id          = spec / quad_q;
+            quad_idx_in_token = spec % quad_q;
+        }
+    }
+    else
+    {
+        const int spec = global_warp_id - warp_q_end;
+        if constexpr(QUAD_K_CT > 0)
+        {
+            token_id          = spec / QUAD_K_CT;
+            quad_idx_in_token = spec % QUAD_K_CT;
+        }
+        else
+        {
+            token_id          = spec / quad_k;
+            quad_idx_in_token = spec % quad_k;
+        }
+    }
+
+    // ===========================================================
+    // PROLOGUE: issue all 4 input loads concurrently
+    //   - x_pair_0: q/k for pair 0 (heads 4q+0, 4q+1)
+    //   - x_pair_1: q/k for pair 1 (heads 4q+2, 4q+3) — offset = +2 * HEAD_SIZE
+    //   - w_vec   : RMSNorm gamma (head-independent, shared across pairs)
+    //   - cos_sin : token-only (shared across pairs since same token)
+    // ===========================================================
+    const int head0_in_token = 4 * quad_idx_in_token;
+
+    vec_t<T, VEC_PAIR> x_pair_0, x_pair_1;
+    if(is_q)
+    {
+        const int64_t base_off =
+            (static_cast<int64_t>(token_id) * num_heads_q + head0_in_token) * HEAD_SIZE;
+        x_pair_0.load(q + base_off + lane_full * VEC_PAIR);
+        x_pair_1.load(q + base_off + 2 * HEAD_SIZE + lane_full * VEC_PAIR);
+    }
+    else
+    {
+        const int64_t base_off =
+            (static_cast<int64_t>(token_id) * num_heads_k + head0_in_token) * HEAD_SIZE;
+        x_pair_0.load(k + base_off + lane_full * VEC_PAIR);
+        x_pair_1.load(k + base_off + 2 * HEAD_SIZE + lane_full * VEC_PAIR);
+    }
+
+    vec_t<T, VEC_PAIR> w_vec;
+    if(is_q)
+    {
+        w_vec.load(w_q + access_id_in_head);
+    }
+    else
+    {
+        w_vec.load(w_k + access_id_in_head);
+    }
+
+    vec_t<T, VEC_PAIR> cos_sin_vec;
+    vec_t<T, VEC_PAIR / 2> cos_vec_pair, sin_vec_pair;
+    if constexpr(IS_NEOX)
+    {
+        cos_sin_vec.load(cos_sin + token_id * HEAD_SIZE + access_id_in_head);
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < VEC_PAIR / 2; ++i)
+        {
+            cos_vec_pair[i] =
+                cos_sin[token_id * HEAD_SIZE + access_id_in_head / 2 + i];
+            sin_vec_pair[i] =
+                cos_sin[token_id * HEAD_SIZE + access_id_in_head / 2 + HALF_HEAD_SIZE + i];
+        }
+    }
+
+    // ===========================================================
+    // RMSNorm × 2 (one reduce per pair, both use shared w_vec)
+    // ===========================================================
+    {
+        // Cache FP32 reads so the writeback loop doesn't re-read BF16 from
+        // x_pair_0/1 (would be redundant lshl b32 conversions). Same RNE on
+        // writeback via pack_f32_to_vec_t (10 instr per bf16x2 pair vs the
+        // compiler default 26 instr — see f32x2_to_bf16x2_rne in rope_common.h).
+        float v0[VEC_PAIR], v1[VEC_PAIR];
+        float acc0 = 0.f, acc1 = 0.f;
+#pragma unroll
+        for(int i = 0; i < VEC_PAIR; ++i)
+        {
+            v0[i] = (float)x_pair_0[i];
+            v1[i] = (float)x_pair_1[i];
+            acc0 += v0[i] * v0[i];
+            acc1 += v1[i] * v1[i];
+        }
+        acc0         = mrope_utils::block_utils::half_warp_reduce_sum<float>(acc0);
+        acc1         = mrope_utils::block_utils::half_warp_reduce_sum<float>(acc1);
+        float s_val0 = rsqrtf(acc0 / (float)HEAD_SIZE + eps);
+        float s_val1 = rsqrtf(acc1 / (float)HEAD_SIZE + eps);
+
+        float n0[VEC_PAIR], n1[VEC_PAIR];
+#pragma unroll
+        for(int i = 0; i < VEC_PAIR; ++i)
+        {
+            n0[i] = v0[i] * s_val0 * (float)w_vec[i];
+            n1[i] = v1[i] * s_val1 * (float)w_vec[i];
+        }
+        mrope_utils::pack_f32_to_vec_t(x_pair_0, n0);
+        mrope_utils::pack_f32_to_vec_t(x_pair_1, n1);
+    }
+
+    // ===========================================================
+    // RoPE × 2 (cos_sin shuffle SHARED between pair 0 and pair 1)
+    // ===========================================================
+    vec_t<T, VEC_PAIR> out_pair_0, out_pair_1;
+    if constexpr(IS_NEOX)
+    {
+        // Single shuffle of cos_sin reused by both pairs.
+        auto nb_cos_sin_vec = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_PAIR>(
+            cos_sin_vec, opus::number<NEIGHBOR_XOR_PAIR>{});
+        // Per-pair x shuffles.
+        auto nb_x_pair_0 = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_PAIR>(
+            x_pair_0, opus::number<NEIGHBOR_XOR_PAIR>{});
+        auto nb_x_pair_1 = mrope_utils::warp_shfl_xor_sync_vec<T, VEC_PAIR>(
+            x_pair_1, opus::number<NEIGHBOR_XOR_PAIR>{});
+
+        // Replace divergent `if(is_lower_half){}else{}` (which forced the
+        // compiler to emit two copies of the rope math AND of the FP32→BF16
+        // cvt sequence, with s_and_saveexec / s_xor / s_or EXEC mask
+        // switches between them) with a per-lane cndmask select. Both
+        // expressions are evaluated in the SAME FP32 op order as the
+        // original divergent code (mul + mul + sub for lower, mul + mul +
+        // add for upper), then cndmask picks the right one — bit-exact
+        // equivalent for every lane, single cvt path per output.
+        // FP32 results are staged then packed via pack_f32_to_vec_t which
+        // for bfloat16 lowers to v_cmp_u_f32 + v_bfe_u32 + v_add3_u32 +
+        // v_cndmask + v_and_or_b32 (10 instr per bf16x2 pair vs 26 for the
+        // default scalar __hip_bfloat16(float) ctor expansion).
+        float out0_f32[VEC_PAIR], out1_f32[VEC_PAIR];
+#pragma unroll
+        for(int i = 0; i < VEC_PAIR; ++i)
+        {
+            const float c   = (float)cos_sin_vec[i];
+            const float nc  = (float)nb_cos_sin_vec[i];
+            const float x0  = (float)x_pair_0[i];
+            const float x1  = (float)x_pair_1[i];
+            const float nx0 = (float)nb_x_pair_0[i];
+            const float nx1 = (float)nb_x_pair_1[i];
+
+            const float lower0 = x0 * c - nx0 * nc;   // matches old lower branch
+            const float upper0 = x0 * nc + nx0 * c;   // matches old upper branch
+            const float lower1 = x1 * c - nx1 * nc;
+            const float upper1 = x1 * nc + nx1 * c;
+
+            out0_f32[i] = is_lower_half ? lower0 : upper0;
+            out1_f32[i] = is_lower_half ? lower1 : upper1;
+        }
+        mrope_utils::pack_f32_to_vec_t(out_pair_0, out0_f32);
+        mrope_utils::pack_f32_to_vec_t(out_pair_1, out1_f32);
+    }
+    else
+    {
+        float out0_f32[VEC_PAIR], out1_f32[VEC_PAIR];
+#pragma unroll
+        for(int i = 0; i < VEC_PAIR / 2; ++i)
+        {
+            out0_f32[2 * i + 0] =
+                (float)x_pair_0[2 * i + 0] * (float)cos_vec_pair[i] -
+                (float)x_pair_0[2 * i + 1] * (float)sin_vec_pair[i];
+            out0_f32[2 * i + 1] =
+                (float)x_pair_0[2 * i + 1] * (float)cos_vec_pair[i] +
+                (float)x_pair_0[2 * i + 0] * (float)sin_vec_pair[i];
+            out1_f32[2 * i + 0] =
+                (float)x_pair_1[2 * i + 0] * (float)cos_vec_pair[i] -
+                (float)x_pair_1[2 * i + 1] * (float)sin_vec_pair[i];
+            out1_f32[2 * i + 1] =
+                (float)x_pair_1[2 * i + 1] * (float)cos_vec_pair[i] +
+                (float)x_pair_1[2 * i + 0] * (float)sin_vec_pair[i];
+        }
+        mrope_utils::pack_f32_to_vec_t(out_pair_0, out0_f32);
+        mrope_utils::pack_f32_to_vec_t(out_pair_1, out1_f32);
+    }
+
+    // ===========================================================
+    // Stores: 2 × dwordx4
+    // ===========================================================
+    if(is_q)
+    {
+        const int64_t base_off =
+            (static_cast<int64_t>(token_id) * num_heads_q + head0_in_token) * HEAD_SIZE;
+        out_pair_0.store(out_q + base_off + lane_full * VEC_PAIR);
+        out_pair_1.store(out_q + base_off + 2 * HEAD_SIZE + lane_full * VEC_PAIR);
+    }
+    else
+    {
+        const int64_t base_off =
+            (static_cast<int64_t>(token_id) * num_heads_k + head0_in_token) * HEAD_SIZE;
+        out_pair_0.store(out_k + base_off + lane_full * VEC_PAIR);
+        out_pair_1.store(out_k + base_off + 2 * HEAD_SIZE + lane_full * VEC_PAIR);
+    }
+}
+
+template <typename T>
+void fused_rope_rms_1way(const T* q,
+                         const T* k,
+                         const T* w_q,
+                         const T* w_k,
+                         const T* cos_sin,
+                         int64_t batch_size,
+                         int64_t num_tokens,
+                         int64_t num_heads_q,
+                         int64_t num_heads_k,
+                         int64_t head_size,
+                         bool is_interleaved,
+                         double eps,
+                         T* out_q,
+                         T* out_k,
+                         hipStream_t stream)
+{
+    using mrope_utils::WARP_SIZE;
+    TORCH_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
+    constexpr int block_size = 256;
+    auto num_warps_per_block = block_size / WARP_SIZE;
+    dim3 threadsPerBlock(block_size);
+
+    // Quad fast path: 1 warp processes 4 heads (2 adjacent head_pairs of the
+    // same token, half-warp layout, all input loads bundled into the prologue
+    // so 4 HBM round-trips overlap). See the kernel-side comment on
+    // fused_rope_rms_1way_quad_kernel for the full derivation; requires
+    // num_heads_q % 4 == 0 && num_heads_k % 4 == 0.
+    const bool can_quad = (num_heads_q % 4 == 0) && (num_heads_k % 4 == 0);
+    if(can_quad)
+    {
+        auto total_warps_quad = num_tokens * ((num_heads_q + num_heads_k) / 4);
+        dim3 numBlocks(
+            (total_warps_quad + num_warps_per_block - 1) / num_warps_per_block, batch_size);
+        // Inner macro: pick (IS_NEOX, QUAD_Q_CT, QUAD_K_CT) and launch.
+        // QUAD_Q_CT/QUAD_K_CT = 0 means runtime division; > 0 makes the
+        // div/mod inside the kernel a constant-divisor magic-multiply.
+#define DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, QQ, QK)                            \
+    if(!is_interleaved)                                                     \
+    {                                                                       \
+        fused_rope_rms_1way_quad_kernel<T, HEAD_SIZE, true, QQ, QK>         \
+            <<<numBlocks, threadsPerBlock, 0, stream>>>(q,                  \
+                                                        k,                  \
+                                                        w_q,                \
+                                                        w_k,                \
+                                                        cos_sin,            \
+                                                        num_tokens,         \
+                                                        num_heads_q,        \
+                                                        num_heads_k,        \
+                                                        eps,                \
+                                                        total_warps_quad,   \
+                                                        out_q,              \
+                                                        out_k);             \
+    }                                                                       \
+    else                                                                    \
+    {                                                                       \
+        fused_rope_rms_1way_quad_kernel<T, HEAD_SIZE, false, QQ, QK>        \
+            <<<numBlocks, threadsPerBlock, 0, stream>>>(q,                  \
+                                                        k,                  \
+                                                        w_q,                \
+                                                        w_k,                \
+                                                        cos_sin,            \
+                                                        num_tokens,         \
+                                                        num_heads_q,        \
+                                                        num_heads_k,        \
+                                                        eps,                \
+                                                        total_warps_quad,   \
+                                                        out_q,              \
+                                                        out_k);             \
+    }
+        // Outer macro: route common (num_heads_q, num_heads_k) shapes to the
+        // compile-time-divisor specialization, default to runtime path.
+        // Specialized list intentionally short — each adds ~one .so MB after
+        // template expansion across (T, HEAD_SIZE, IS_NEOX) → ~24 instances.
+#define DISPATCH_NEOX_QUAD(HEAD_SIZE)                              \
+    if(num_heads_q == 24 && num_heads_k == 24)                     \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 6, 6)                     \
+    }                                                              \
+    else if(num_heads_q == 32 && num_heads_k == 32)                \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 8, 8)                     \
+    }                                                              \
+    else if(num_heads_q == 16 && num_heads_k == 16)                \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 4, 4)                     \
+    }                                                              \
+    else                                                           \
+    {                                                              \
+        DISPATCH_NEOX_QUAD_CT(HEAD_SIZE, 0, 0)                     \
+    }
+        switch(head_size)
+        {
+        case 64: DISPATCH_NEOX_QUAD(64) break;
+        case 128: DISPATCH_NEOX_QUAD(128) break;
+        case 256: DISPATCH_NEOX_QUAD(256) break;
+        }
+#undef DISPATCH_NEOX_QUAD
+#undef DISPATCH_NEOX_QUAD_CT
+        return;
+    }
+
+    // Fallback: num_heads_q or num_heads_k is not divisible by 4. Use the
+    // single-head-per-warp kernel — slower but works for any shape.
+    auto total_warps = num_tokens * (num_heads_q + num_heads_k);
+    dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block, batch_size);
+#define DISPATCH_NEOX(HEAD_SIZE)                                    \
+    if(!is_interleaved)                                             \
+    {                                                               \
+        fused_rope_rms_1way_kernel<T, HEAD_SIZE, true>              \
+            <<<numBlocks, threadsPerBlock, 0, stream>>>(q,          \
+                                                        k,          \
+                                                        w_q,        \
+                                                        w_k,        \
+                                                        cos_sin,    \
+                                                        num_tokens, \
+                                                        num_heads_q,\
+                                                        num_heads_k,\
+                                                        eps,        \
+                                                        total_warps,\
+                                                        out_q,      \
+                                                        out_k);     \
+    }                                                               \
+    else                                                            \
+    {                                                               \
+        fused_rope_rms_1way_kernel<T, HEAD_SIZE, false>             \
+            <<<numBlocks, threadsPerBlock, 0, stream>>>(q,          \
+                                                        k,          \
+                                                        w_q,        \
+                                                        w_k,        \
+                                                        cos_sin,    \
+                                                        num_tokens, \
+                                                        num_heads_q,\
+                                                        num_heads_k,\
+                                                        eps,        \
+                                                        total_warps,\
+                                                        out_q,      \
+                                                        out_k);     \
+    }
+    switch(head_size)
+    {
+    case 64: DISPATCH_NEOX(64) break;
+    case 128: DISPATCH_NEOX(128) break;
+    case 256: DISPATCH_NEOX(256) break;
+    }
+
+#undef DISPATCH_NEOX
+}
+
 namespace aiter {
 
 void fused_qk_norm_rope_cache_quant_shuffle(
@@ -1848,6 +2543,49 @@ void fused_qk_norm_rope_2way(at::Tensor& q0,
                                    stream);
         });
 }
+
+void fused_qk_norm_rope_1way(at::Tensor& q,
+                             at::Tensor& k,
+                             at::Tensor& w_q,
+                             at::Tensor& w_k,
+                             at::Tensor& cos_sin,
+                             int64_t batch_size,
+                             int64_t num_tokens,
+                             int64_t num_heads_q,
+                             int64_t num_heads_k,
+                             int64_t head_size,
+                             bool is_interleaved,
+                             double eps,
+                             at::Tensor& out_q,
+                             at::Tensor& out_k)
+{
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous());
+    TORCH_CHECK(w_q.is_contiguous() && w_k.is_contiguous());
+    TORCH_CHECK(cos_sin.is_contiguous());
+    TORCH_CHECK(out_q.is_contiguous() && out_k.is_contiguous());
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::kBFloat16, at::kHalf, q.scalar_type(), "fused_qk_norm_rope_1way", [&] {
+            using T = KernelElementType<scalar_t>::type;
+            fused_rope_rms_1way<T>((T*)q.data_ptr<scalar_t>(),
+                                   (T*)k.data_ptr<scalar_t>(),
+                                   (T*)w_q.data_ptr<scalar_t>(),
+                                   (T*)w_k.data_ptr<scalar_t>(),
+                                   (T*)cos_sin.data_ptr<scalar_t>(),
+                                   batch_size,
+                                   num_tokens,
+                                   num_heads_q,
+                                   num_heads_k,
+                                   head_size,
+                                   is_interleaved,
+                                   eps,
+                                   (T*)out_q.data_ptr<scalar_t>(),
+                                   (T*)out_k.data_ptr<scalar_t>(),
+                                   stream);
+        });
+}
+
 void fused_qk_norm_rope_cache_block_quant_shuffle(
     at::Tensor& qkv,                   // Combined QKV tensor [num_tokens,
                                        // (num_heads_q+num_heads_k+num_heads_v)*head_dim]

@@ -7,6 +7,7 @@
 #include "dispatch_utils.h"
 #include "hip_float8.h"
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <type_traits>
 
 #ifdef __HIP_DEVICE_COMPILE__
 #include "opus/opus.hpp"
@@ -7228,12 +7229,88 @@ __inline__ __device__ T warp_shfl_xor_sync(T val, int offset)
     return __shfl_xor(val, offset, 32);
 }
 
+// XOR-style butterfly sum reduce within a 32-lane subgroup.
+// Lowers to: 3x ds_swizzle_b32 (offset 16, 8, 4 via XOR mask) +
+//            2x v_*_dpp        (offset 2, 1   via opus::mov_dpp quad_perm).
+// Order is intentionally 16 -> 1 (descending) to match the historical
+//   for(offset=16; offset>0; offset>>=1) val += __shfl_xor(val, offset);
+// implementation. ds_swizzle and DPP latencies are symmetric, so reversing the
+// order vs the natural DPP-first form is a free constraint that buys us
+// bitwise-identical output to the prior bpermute-based reduce.
+// All lanes hold the full sum on return — XOR butterfly is symmetric, so no
+// follow-up broadcast is needed.
+//
+// Body is wrapped in #ifdef __HIP_DEVICE_COMPILE__ to match the rest of this
+// file: opus.hpp is only included in the device pass (see line 11), so the
+// opus::* references below would fail host-pass non-dependent-name lookup
+// and break any TU that includes rope_common.h without otherwise pulling in
+// opus.hpp (e.g. csrc/kernels/rope/general_2c_cached_positions_offsets_fwd_kernels.cu).
+// In the host pass the body is empty and the function returns `val`
+// unchanged — fine because these helpers are __device__-only.
 template <typename T>
 __inline__ __device__ T warp_reduce_sum(T val)
 {
-#pragma unroll
-    for(int offset = 16; offset > 0; offset >>= 1)
-        val += warp_shfl_xor_sync(val, offset);
+    static_assert(sizeof(T) == 4, "warp_reduce_sum requires 4-byte type");
+#ifdef __HIP_DEVICE_COMPILE__
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (16 << 10) | 0x1f)); /* XOR by 16 */
+    }
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (8 << 10) | 0x1f)); /* XOR by 8  */
+    }
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (4 << 10) | 0x1f)); /* XOR by 4  */
+    }
+    val += opus::mov_dpp(val,
+                         opus::number<0x4e>{}, /* quad_perm:[2,3,0,1], i.e. XOR by 2 */
+                         opus::number<0xf>{},  /* row_mask  */
+                         opus::number<0xf>{},  /* bank_mask */
+                         opus::bool_constant<false>{} /* bound_ctrl */);
+    val += opus::mov_dpp(val,
+                         opus::number<0xb1>{}, /* quad_perm:[1,0,3,2], i.e. XOR by 1 */
+                         opus::number<0xf>{},
+                         opus::number<0xf>{},
+                         opus::bool_constant<false>{});
+#endif
+    return val;
+}
+
+// 16-lane (half-warp) version of warp_reduce_sum: skips the XOR-by-16 step so
+// lanes 0..15 and lanes 16..31 reduce independently within their group.
+// Used by pair-packed kernels where each half-warp processes a separate head.
+// Body is #ifdef'd for the same reason as warp_reduce_sum above.
+template <typename T>
+__inline__ __device__ T half_warp_reduce_sum(T val)
+{
+    static_assert(sizeof(T) == 4, "half_warp_reduce_sum requires 4-byte type");
+#ifdef __HIP_DEVICE_COMPILE__
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (8 << 10) | 0x1f)); /* XOR by 8 */
+    }
+    {
+        const int v_i32 = __builtin_bit_cast(int, val);
+        val += __builtin_bit_cast(
+            T, __builtin_amdgcn_ds_swizzle(v_i32, (4 << 10) | 0x1f)); /* XOR by 4 */
+    }
+    val += opus::mov_dpp(val,
+                         opus::number<0x4e>{}, /* quad_perm:[2,3,0,1], i.e. XOR by 2 */
+                         opus::number<0xf>{},
+                         opus::number<0xf>{},
+                         opus::bool_constant<false>{});
+    val += opus::mov_dpp(val,
+                         opus::number<0xb1>{}, /* quad_perm:[1,0,3,2], i.e. XOR by 1 */
+                         opus::number<0xf>{},
+                         opus::number<0xf>{},
+                         opus::bool_constant<false>{});
+#endif
     return val;
 }
 
@@ -7341,6 +7418,143 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
     return out;
 }
 
+// Constant-pattern XOR-style cross-lane shuffle for each 32-bit dword inside a vec.
+// Lowers to ds_swizzle_b32 (BitwiseMode XOR, AND=0x1F) within a 32-lane segment.
+// XorOffset must be a compile-time constant in [1, 31]. Compared to the lane-arith
+// path through warp_shfl_sync_vec(threadIdx.x + neighbor_offset), this saves
+// ~5 cycles per dword (ds_swizzle ~5 cyc vs ds_bpermute ~10 cyc) and removes
+// one VALU dependency chain (the runtime neighbor_offset computation).
+//
+// Unlike warp_reduce_sum / half_warp_reduce_sum where opus::* only appears in
+// the body (and so can be hidden with #ifdef __HIP_DEVICE_COMPILE__ to keep
+// the host pass building), here opus::number<XorOffset> is a default
+// argument in the SIGNATURE — the signature is parsed in both passes, so
+// it cannot be #ifdef'd. We use std::integral_constant<int, XorOffset>
+// instead (which doesn't need opus.hpp). Existing callers passing
+// opus::number<X>{} continue to work because opus::number<I> is publicly
+// derived from std::integral_constant<index_t, I> (csrc/include/opus/opus.hpp:57)
+// — pass-by-value slicing of the empty derived type to its empty base is a no-op.
+template <typename T, int vec_size, int XorOffset>
+__inline__ __device__ vec_t<T, vec_size>
+warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
+                       std::integral_constant<int, XorOffset> = {})
+{
+    static_assert(XorOffset > 0 && XorOffset < 32,
+                  "ds_swizzle XOR mask must be in [1, 31] within a 32-lane segment");
+    constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
+    vec_t<T, vec_size> out;
+#pragma unroll
+    for(int i = 0; i < ITERS; ++i)
+    {
+        const int v_i32 = reinterpret_cast<int*>(&val)[i];
+        reinterpret_cast<int*>(&out)[i] =
+            __builtin_amdgcn_ds_swizzle(v_i32, (XorOffset << 10) | 0x1f);
+    }
+    return out;
+}
+
+// Pack two FP32 values into a single bf16x2 dword using round-to-nearest-even.
+//
+// Reference / adapted from:
+//   aiter/csrc/kernels/mla/hk/hk_mla_buffer_managers.cuh,
+//   `float_2_bf16_pair<kRoundMode = 0>` (gfx94 RNE branch).
+// The 10-instruction sequence and the constants 0x7FFF / 0x7FFF0000 /
+// 0xFFFF0000 are taken from there. Differences in this version:
+//   - input constraint changed from "i"(src_0) (which requires the caller to
+//     pin a register number as a compile-time integer constant) to "v"(a_bits)
+//     (a regular VGPR-bound value), so any callsite with compiler-allocated
+//     FP32 scratch can use this helper directly;
+//   - signature takes (float, float) and bit-casts internally, instead of
+//     (uint32_t, uint32_t);
+//   - scratch outputs are early-clobber (`=&s` / `=&v`) since with "v" inputs
+//     we can no longer rely on the immediate constraint to prevent aliasing;
+//   - only RNE is implemented (the RNA/RTZ paths from the original are not
+//     ported because all callers in this file want bit-equivalence with
+//     __hip_bfloat16(float)).
+//
+// Round semantics (bit-identical to __hip_bfloat16(float) ctor for non-NaN inputs):
+//   bf16 = (x + 0x7FFF + ((x >> 16) & 1)) >> 16
+// This is the standard RNE bias trick — adds 0x7FFF for normal rounding, plus the
+// 17-bit ("round") position to break ties to even.
+//
+// NaN handling differs from the ctor: the ctor preserves the NaN payload upper
+// bits (and OR-s 0x10000 if those bits are zero, to keep the NaN signaling); this
+// helper replaces all NaN inputs with the canonical FP32_NAN (0x7FFF0000), which
+// truncates to BF16 0x7FFF (BF16 quiet NaN). For RMSNorm + RoPE outputs, neither
+// path produces NaN under finite inputs (eps>0 prevents div-by-zero in rsqrt,
+// and rotate is a linear combination of finites), so the difference is unreachable.
+//
+// On gfx94 (CDNA3) this lowers to a 10-instruction VALU sequence with NO EXEC
+// mask manipulation (vs 26 instructions for two scalar __hip_bfloat16(float)
+// expansions, each of which serializes the warp via s_and_saveexec / s_xor /
+// s_or around the NaN-check). On gfx95 (CDNA4) it would be a single
+// v_cvt_pk_bf16_f32 — not implemented here yet.
+__device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
+{
+    constexpr uint32_t ROUND_BIAS = 0x7fffu;     // RNE bias
+    constexpr uint32_t FP32_NAN   = 0x7fff0000u; // canonical FP32 NaN → BF16 0x7fff
+    constexpr uint32_t MERGE_MASK = 0xffff0000u; // upper-half mask for and_or merge
+    uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
+    uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
+    uint32_t result;
+    // tmp scratch is read+written; nan_mask is an SGPR pair output of v_cmp_u_f32.
+    // We declare them as early-clobber outputs so the compiler doesn't alias them
+    // with any input register.
+    using uint64x1_t = uint64_t;
+    uint64x1_t nan_mask;
+    uint32_t tmp;
+    asm volatile(
+        // a-side: round + nan-replace, then put bf16 in low 16 bits of result
+        "v_cmp_u_f32 %[mask], %[a], %[a]\n\t"            // mask = isnan(a)
+        "v_bfe_u32 %[tmp], %[a], 16, 1\n\t"              // tmp = (a >> 16) & 1
+        "v_add3_u32 %[tmp], %[a], %[tmp], %[bias]\n\t"   // tmp = a + bias + bit
+        "v_cndmask_b32 %[res], %[tmp], %[nan], %[mask]\n\t" // if nan use canonical
+        "v_lshrrev_b32 %[res], 16, %[res]\n\t"           // result_low = bf16(a)
+        // b-side: round + nan-replace, then merge upper half with result
+        "v_cmp_u_f32 %[mask], %[b], %[b]\n\t"            // mask = isnan(b)
+        "v_bfe_u32 %[tmp], %[b], 16, 1\n\t"              // tmp = (b >> 16) & 1
+        "v_add3_u32 %[tmp], %[b], %[tmp], %[bias]\n\t"   // tmp = b + bias + bit
+        "v_cndmask_b32 %[tmp], %[tmp], %[nan], %[mask]\n\t" // if nan use canonical
+        "v_and_or_b32 %[res], %[tmp], %[mmsk], %[res]"   // result = (tmp & 0xFFFF0000) | result_low
+        : [mask] "=&s"(nan_mask), [tmp] "=&v"(tmp), [res] "=&v"(result)
+        : [a] "v"(a_bits),
+          [b] "v"(b_bits),
+          [bias] "v"(ROUND_BIAS),
+          [nan] "v"(FP32_NAN),
+          [mmsk] "v"(MERGE_MASK));
+    return result;
+}
+
+// Pack an array of N FP32 values into a vec_t<T, N>, using packed bf16x2
+// conversion (round-to-nearest-even) when T is bfloat16, falling back to
+// scalar static_cast for other element types. N must be even.
+//
+// The bf16 path saves ~50% of the conversion cost relative to the default
+// per-element static_cast<bf16>(float) — see the comment on
+// f32x2_to_bf16x2_rne above.
+template <typename T, int N>
+__device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float (&src)[N])
+{
+    static_assert(N % 2 == 0, "pack_f32_to_vec_t requires even N (pairs into bf16x2)");
+    if constexpr(std::is_same_v<T, hip_bfloat16>)
+    {
+        uint32_t* dst_dw = reinterpret_cast<uint32_t*>(&dst);
+#pragma unroll
+        for(int i = 0; i < N / 2; ++i)
+        {
+            dst_dw[i] = f32x2_to_bf16x2_rne(src[2 * i], src[2 * i + 1]);
+        }
+    }
+    else
+    {
+#pragma unroll
+        for(int i = 0; i < N; ++i)
+        {
+            dst[i] = static_cast<T>(src[i]);
+        }
+    }
+}
+
 template <typename T, int VEC_SIZE>
 __device__ __forceinline__ void
 warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_dim, float rms_eps)
@@ -7353,11 +7567,9 @@ warp_rms_norm_(vec_t<T, VEC_SIZE>& input, vec_t<T, VEC_SIZE>& gamma, float rms_d
         float v = (float)input[i];
         acc += v * v;
     }
-    int warp_id   = threadIdx.x / 32;
-    int warp_t_id = threadIdx.x % 32;
-    acc           = block_utils::warp_reduce_sum<float>(acc);
-    acc           = block_utils::warp_shfl_sync<float>(acc, 0);
-    auto s_val    = rsqrtf(acc / rms_dim + rms_eps);
+    // XOR butterfly leaves the same sum in every lane — no extra broadcast needed.
+    acc        = block_utils::warp_reduce_sum<float>(acc);
+    auto s_val = rsqrtf(acc / rms_dim + rms_eps);
 #pragma unroll
     for(int i = 0; i < VEC_SIZE; ++i)
     {

@@ -162,3 +162,22 @@ def fused_qk_norm_rope_2way(
     out_q01: Tensor,
     out_k01: Tensor,
 ) -> None: ...
+
+
+@compile_ops("module_fused_qk_norm_rope_cache_quant_shuffle")
+def fused_qk_norm_rope_1way(
+    q: Tensor,
+    k: Tensor,
+    w_q: Tensor,
+    w_k: Tensor,
+    cos_sin: Tensor,
+    batch_size: int,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    is_interleaved: bool,
+    eps: float,
+    out_q: Tensor,
+    out_k: Tensor,
+) -> None: ...
