@@ -230,6 +230,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    q_dtype_a: Optional[torch.dtype] = None,
     swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -258,7 +259,7 @@ def fused_moe_(
     ], f"Fused_moe unsupported out dtype: {dtype}"
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
-    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    q_dtype_a = q_dtype_a if q_dtype_a is not None else w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
     if (
@@ -269,7 +270,7 @@ def fused_moe_(
         q_dtype_a = dtypes.fp8
     bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
     if quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu:
+        if activation == ActivationType.Swiglu or q_dtype_a == dtypes.fp8:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             elif M >= bf16_fp8_bound:
