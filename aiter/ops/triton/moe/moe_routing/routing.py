@@ -5,6 +5,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 
 @dataclass
@@ -115,6 +116,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        USE_TDM=is_tdm_avail(),
         num_warps=1,
     )
 
@@ -183,6 +185,7 @@ def sort_tokens_fused(
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
+        USE_TDM=is_tdm_avail(),
         num_warps=1,
     )
 
@@ -215,8 +218,11 @@ def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
         max_n_tiles = n_gates
     else:
         max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
+
     # allocate memory
-    pad = lambda x: cdiv(x, BLOCK) * BLOCK
+    def pad(x):
+        return cdiv(x, BLOCK) * BLOCK
+
     dtype = torch.int32
 
     token_offs_combined = torch.empty(

@@ -31,3 +31,7 @@ def is_fp8_avail():
 
 def is_mx_scale_preshuffling_avail():
     return get_arch() in ("gfx950", "gfx1250")
+
+
+def is_tdm_avail():
+    return get_arch() in ("gfx1250",)

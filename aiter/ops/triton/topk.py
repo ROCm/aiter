@@ -18,6 +18,7 @@ from aiter.ops.triton._triton_kernels.topk import (
     topk_stage1_kernel,
     topk_stage2_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -41,7 +42,6 @@ def one_stage_topk(
 
     out_v = torch.empty((B, k), device=x.device, dtype=x.dtype)
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
-
     _topk_kernel[(B,)](
         x.contiguous(),
         out_v,
@@ -53,6 +53,7 @@ def one_stage_topk(
         K=k,
         BLOCK=BLOCK,
         FILL_VALUE=torch.finfo(torch.float32).min,
+        USE_TDM=is_tdm_avail(),
         num_warps=4,
         num_stages=2,
     )
@@ -102,6 +103,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
             if descending
             else torch.finfo(torch.float32).max
         ),
+        USE_TDM=is_tdm_avail(),
     )
     stage2_elem_cnt = chunk_num * k
     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)
@@ -122,6 +124,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
                 else torch.finfo(torch.float32).max
             ),
             torch.iinfo(torch.int32).min,
+            USE_TDM=is_tdm_avail(),
         )
         if descending
         else tl.constexpr(torch.iinfo(torch.int32).max)
