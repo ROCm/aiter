@@ -144,7 +144,8 @@ namespace py = pybind11;
           py::arg("mask")           = 0,            \
           py::arg("high_precision") = 1,            \
           py::arg("kernelName")     = std::nullopt, \
-          py::arg("quant_type")     = QuantType::per_Token);
+          py::arg("quant_type")     = QuantType::per_Token) \
+          py::arg("wave_per_tg")    = 4;
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \

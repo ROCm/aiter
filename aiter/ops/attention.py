@@ -304,6 +304,7 @@ def gen_pa_ps_fwd_asm(
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
     quant_type: Optional[Enum] = QuantType.per_Token.value,
+    wave_per_tg: int = 4,
 ) -> torch.Tensor:
     if out_ is not None:
         return out_
@@ -338,6 +339,7 @@ def _pa_ps_fwd_asm(
     high_precision: Optional[int] = 1,
     kernelName: Optional[str] = None,
     quant_type: Optional[Enum] = QuantType.per_Token.value,
+    wave_per_tg: int = 4,
 ) -> None: ...
 
 
@@ -364,6 +366,7 @@ def pa_ps_fwd_asm(
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: Optional[str] = None,
     quant_type: Optional[Enum] = QuantType.per_Token.value,
+    wave_per_tg: int = 4,
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_ps_fwd_asm(
@@ -387,6 +390,7 @@ def pa_ps_fwd_asm(
         high_precision,
         kernelName,
         quant_type,
+        wave_per_tg,
     )
     return output
 
@@ -434,6 +438,7 @@ def pa_persistent_fwd(
     softmax_scale: Optional[float] = None,
     mask: int = 0,
     quant_type: QuantType = QuantType.per_Token,
+    wave_per_tg: int = 4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -470,6 +475,7 @@ def pa_persistent_fwd(
         splitLse,
         mask,
         quant_type=quant_type,
+        wave_per_tg=wave_per_tg,
     )
     pa_reduce_v1(
         logits,

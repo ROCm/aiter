@@ -106,6 +106,7 @@ std::string get_heuristic_kernel(std::string q_type,
                                  int ps,
                                  int qTile,
                                  int quant_type,
+                                 int wave_per_tg,
                                  CFG* cfgs)
 {
     // # mtp * gqa <= 16
@@ -128,7 +129,7 @@ std::string get_heuristic_kernel(std::string q_type,
                 // hp is just distinct from uhp
                 if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
                    cfg.Mtp == mtp_ && cfg.Msk == msk && (cfg.Hp == hp || hp == 1) &&
-                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type)
+                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type && cfg.wave_per_tg == wave_per_tg)
 
                     return el.first;
             }
@@ -278,7 +279,7 @@ void pa_fwd(aiter_tensor_t* Q,              //   [num_seqs, num_heads, head_size
     std::string kernelName = (kernelName_ != nullptr) ? arch_id + std::string(kernelName_) : "";
     int ps = 0;
     if (kernelName.empty())
-        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, 0, config_map);
+        kernelName = get_heuristic_kernel(q_type, kv_type, gqa_ratio, mtp, msk, hp, block_size, arch_id, ps, qTile, 0, 4, config_map);
     if(kernelName.empty())
     {
         AITER_CHECK(false, __func__, "not supported this kernel now! ");
@@ -331,6 +332,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
                int high_precision,
                const char* kernelName_,   //   nullable
                int quant_type,            //   QuantType enum value
+               int wave_per_tg,           //   Wave per threadgroup
                hipStream_t stream)
 {
     int batch           = qo_indptr->size(0) - 1;
@@ -457,7 +459,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     std::string arch_id = get_gpu_arch();
     std::string kernelName = (kernelName_ != nullptr) ? std::string(kernelName_) :
-        get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, config_map);
+        get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, block_size, arch_id, ps, qTile, quant_type, wave_per_tg, config_map);
     if(kernelName.empty())
     {
         AITER_CHECK(false, __func__, "not supported this kernel now! ");
@@ -494,7 +496,7 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
                              gdx, // gdx
                              gdy, // gdy
                              1,   // gdz
-                             256, // bdx: 4 wv64
+                             wave_per_tg * 64, // bdx: wv64
                              1,   // bdy
                              1,   // bdz
                              stream});
