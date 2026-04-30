@@ -8,6 +8,13 @@ Wraps the FlyDSL `flash_attn_func_gfx1201` kernel with:
   - Automatic seq_len padding to the kernel's tile size (multiple of 128).
   - BSHD ([B, S, H, D]) input/output convention to match upstream
     flash-attention layout.
+  - Non-causal padding-ratio safety guard: padded K/V tokens contribute to
+    the softmax denominator and would scale outputs. Calls with
+    ``n_pad / seq_len_pad > 0.005`` (0.5%) and ``causal=False`` are rejected
+    with a ``ValueError``. The 0.5% threshold is the bf16 mantissa precision
+    floor plus 1 bit of margin; production Wan2.1 (S_real=32760, S_pad=32768,
+    ratio=0.024%) clears it by 20x. See option (d) in
+    ``2969_padded_softmax_rca.md``.
 
 The kernel implements self-attention only (Lq == Lk). Cross-attention
 (Lq != Lk) is rejected; callers should fall back to PyTorch SDPA.
@@ -30,6 +37,15 @@ __all__ = [
 # Tile size baked into the gfx1201 kernel. Seq_len must be a multiple of this.
 # Picked to match BLOCK_M=128 in the kernel; padding is invisible to callers.
 _KERNEL_BLOCK_M = 128
+
+# Maximum tolerated ratio of padded tokens for non-causal attention.
+# Padded K/V keys produce QK^T = 0, but exp(0) = 1 leaks into the softmax
+# denominator and silently scales the output. 0.5% is the bf16 mantissa
+# precision floor (~0.4%) plus 1 bit of margin. Above this the relative
+# error grows quickly (50% pad -> 37% rel_err per RCA in
+# 2969_padded_softmax_rca.md). Causal mode masks future tokens including
+# the padded ones, so it is unaffected.
+_MAX_NONCAUSAL_PAD_RATIO = 0.005
 
 
 def _torch_dtype_to_str(dtype: torch.dtype) -> str:
@@ -81,8 +97,10 @@ def flydsl_flash_attn_func(
         Output tensor with the same shape and dtype as ``q``.
 
     Raises:
-        ValueError: if shapes/dtypes/devices are incompatible or the kernel's
-            ``head_dim`` constraints are not met.
+        ValueError: if shapes/dtypes/devices are incompatible, the kernel's
+            ``head_dim`` constraints are not met, or the non-causal padding
+            ratio ``n_pad / seq_len_pad`` exceeds 0.5% (see module docstring
+            for rationale).
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("flydsl_flash_attn_func requires CUDA/HIP tensors")
@@ -118,15 +136,27 @@ def flydsl_flash_attn_func(
 
     dtype_str = _torch_dtype_to_str(q.dtype)
 
-    # Pad seq_len up to the kernel's tile size. Zero-pad on K/V is safe for
-    # non-causal: padded keys produce QK^T = 0 → uniform softmax mass that
-    # gets normalized away as long as real keys dominate. Padded queries
+    # Pad seq_len up to the kernel's tile size. Tight padding (<= 0.5% of
+    # S_pad) is empirically below the bf16 noise floor on production shapes
+    # (Wan2.1 cos_sim >= 0.999992). Higher ratios are rejected upstream:
+    # padded K/V tokens produce QK^T = 0 but exp(0) = 1 still contributes
+    # to the softmax denominator and would scale the output. Padded queries
     # produce garbage rows that we slice off before returning.
     seq_len_pad = (
         (seq_len_real + _KERNEL_BLOCK_M - 1) // _KERNEL_BLOCK_M
     ) * _KERNEL_BLOCK_M
+    n_pad = seq_len_pad - seq_len_real
+    if not causal and n_pad > 0 and n_pad / seq_len_pad > _MAX_NONCAUSAL_PAD_RATIO:
+        raise ValueError(
+            "flydsl_flash_attn_func: non-causal path with padding ratio "
+            f"{n_pad}/{seq_len_pad}={n_pad / seq_len_pad:.4f} exceeds 0.5% "
+            "safety threshold; padded K/V tokens contribute to softmax "
+            "denominator and would scale outputs. Either set causal=True, "
+            "pad seq_len to a multiple of 128 before calling, or use a "
+            "self-attn kernel with explicit attention masking."
+        )
     if seq_len_pad != seq_len_real:
-        pad = seq_len_pad - seq_len_real
+        pad = n_pad
         # F.pad pads from the last dim; for BSHD (last=head_dim) the seq dim
         # is dim 1, so we pad (D_left, D_right, H_left, H_right, S_left, S_right).
         q_p = F.pad(q.contiguous(), (0, 0, 0, 0, 0, pad))

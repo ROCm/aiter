@@ -239,6 +239,43 @@ def test_flydsl_fmha_correctness_multi_device():
     )
 
 
+def test_flydsl_fmha_rejects_excessive_padding():
+    """Non-causal path must reject padding ratio > 0.5% (option (d) guard).
+
+    S_real=129 -> S_pad=256, pad ratio 127/256 = 49.6%. Padded K/V keys
+    would contribute to the softmax denominator and silently scale outputs
+    (rel_err ~37% per RCA in 2969_padded_softmax_rca.md). Wrapper must
+    raise before launching the kernel.
+    """
+    batch, seq_len, num_heads, head_dim = 1, 129, 8, 128
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    with pytest.raises(ValueError, match="0.5% safety threshold"):
+        flydsl_flash_attn_func(q, k, v, causal=False)
+
+
+def test_flydsl_fmha_allows_tight_padding():
+    """Wan2.1 production case (S_real=32760 -> S_pad=32768, ratio 0.024%)
+    must pass the 0.5% threshold and produce SDPA-equivalent output.
+
+    Regression guard for option (d) — protects the production hot path
+    from a future, stricter threshold accidentally rejecting it.
+    """
+    batch, seq_len, num_heads, head_dim = 1, 32760, 12, 128
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v, causal=False)
+    ref = _ref_sdpa_bshd(q, k, v, causal=False)
+
+    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim),
+        ref.float().reshape(-1, head_dim),
+        dim=1,
+    )
+    # Wan2.1 production cos_min was empirically 0.999992 in the RCA;
+    # 0.9999 is the conservative regression bound (bf16 noise floor).
+    assert cos.min().item() > 0.9999, f"min_cos={cos.min().item():.6f}"
+
+
 def test_flydsl_fmha_rejects_device_mismatch():
     """Same-device check (#6) — q on device 0, k/v on device 1 must raise."""
     if torch.cuda.device_count() < 2:
