@@ -12,6 +12,9 @@ from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_cor
 from csrc.cpp_itfs.pa.pa_ragged import (
     paged_attention_ragged as paged_attention_ragged_core,
 )
+from csrc.cpp_itfs.pa.pa_ragged_nhd import (
+    paged_attention_ragged_nhd as paged_attention_ragged_nhd_core,
+)
 from csrc.cpp_itfs.pa.pa_v1 import paged_attention_v1 as paged_attention_v1_core
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
@@ -642,10 +645,67 @@ def paged_attention_ragged(
     return out
 
 
+def paged_attention_ragged_nhd(
+    out: torch.Tensor,
+    exp_sums: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    scale: float,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    block_size: int,
+    max_num_partitions: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    kv_cache_layout: str,
+    logits_soft_cap: float,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    fp8_out_scale: Optional[torch.Tensor] = None,
+    partition_size: int = 256,
+    mtp: int = 1,
+) -> torch.Tensor:
+    paged_attention_ragged_nhd_core(
+        out,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        query,
+        key_cache,
+        value_cache,
+        scale,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        block_size,
+        max_num_partitions,
+        alibi_slopes,
+        kv_cache_dtype,
+        kv_cache_layout,
+        logits_soft_cap,
+        k_scale,
+        v_scale,
+        fp8_out_scale,
+        partition_size,
+        mtp,
+    )
+    return out
+
+
 direct_register_custom_op(
     "paged_attention_ragged",
     paged_attention_ragged,
     ["out", "workspace_buffer"],
+)
+
+direct_register_custom_op(
+    "paged_attention_ragged_nhd",
+    paged_attention_ragged_nhd,
+    ["out", "exp_sums", "max_logits", "tmp_out"],
 )
 
 
