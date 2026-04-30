@@ -548,15 +548,15 @@ def moe_smooth_per_token_scaled_quant(
         )
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -568,7 +568,7 @@ def dynamic_per_token_scaled_quant(
 ) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def dynamic_per_group_scaled_quant_fp4(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -584,7 +584,7 @@ def dynamic_per_group_scaled_quant_fp4(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def smooth_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -599,7 +599,7 @@ def smooth_per_token_scaled_quant(
 ) -> None: ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def moe_smooth_per_token_scaled_quant_v1(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -616,7 +616,7 @@ def moe_smooth_per_token_scaled_quant_v1(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def moe_smooth_per_token_scaled_quant_v2(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -635,7 +635,7 @@ def moe_smooth_per_token_scaled_quant_v2(
     ...
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def mxfp4_moe_sort_hip(
     out_scale: torch.Tensor,
     scale: torch.Tensor,
@@ -667,7 +667,7 @@ def mxfp4_moe_sort_fwd(
     return out_scale
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def fused_dynamic_mxfp4_quant_moe_sort_hip(
     out: torch.Tensor,
     scales: torch.Tensor,
@@ -731,7 +731,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     return out, scale
 
 
-@compile_ops("module_quant")
+@compile_ops("module_quant", develop=True)
 def partial_transpose(
     out: Tensor,
     input: Tensor,

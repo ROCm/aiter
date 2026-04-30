@@ -25,9 +25,16 @@ def _gemm_a16w16_asm(
 ) -> None: ...
 
 
+# Semaphore workspace shape for ASM SplitK kernels.
+# The kernel indexes into a flat array of size rows*cols; candidates whose
+# grid (gdx*gdy) exceeds this limit must be skipped to avoid out-of-bounds writes.
+_SEMA_SHAPE = (16, 64)
+ASM_SPLITK_MAX_GRID = _SEMA_SHAPE[0] * _SEMA_SHAPE[1]
+
+
 @functools.lru_cache(maxsize=1)
 def get_semaphore_workspace(device: torch.device) -> Tensor:
-    return torch.zeros((16, 64), dtype=torch.uint32, device=device)
+    return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
 
 
 def gemm_a16w16_asm(

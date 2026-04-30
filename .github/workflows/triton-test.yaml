@@ -60,7 +60,7 @@ jobs:
   build-triton:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     name: Build Triton Wheel
-    runs-on: build-only-aiter
+    runs-on: linux-aiter-mi35x-1
     needs: [check-signal]
     env:
       DOCKER_IMAGE: "rocm/pytorch:latest"
@@ -71,7 +71,22 @@ jobs:
           fetch-depth: 1
 
       - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
 
       - name: Build Triton wheel in Docker
         run: |
@@ -148,7 +163,22 @@ jobs:
           ls -l triton_shard_*.list
 
       - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
 
       - name: Export test file list for this shard as env
         id: set_shard_files
@@ -281,7 +311,22 @@ jobs:
           ls -l triton_shard_*.list
 
       - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
 
       - name: Export test file list for this shard as env
         id: set_shard_files
