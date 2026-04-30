@@ -23,4 +23,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("group_size")               = 128,
           py::arg("transpose_scale")          = false,
           py::arg("gemma_norm")              = false);
+    m.def("fused_qk_rmsnorm_per_token_quant",
+          &aiter::fused_qk_rmsnorm_per_token_quant,
+          py::arg("q_out_quantized"),
+          py::arg("q_out_scale"),
+          py::arg("q"),
+          py::arg("q_weight"),
+          py::arg("q_epsilon"),
+          py::arg("q_out_unquantized") = std::nullopt,
+          py::arg("k_out")             = std::nullopt,
+          py::arg("q_res_out")         = std::nullopt,
+          py::arg("k")                 = std::nullopt,
+          py::arg("k_weight")          = std::nullopt,
+          py::arg("k_epsilon")         = std::nullopt,
+          py::arg("q_residual")        = std::nullopt,
+          py::arg("gemma_norm")        = false);
 }
