@@ -81,6 +81,32 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     return interleaved.contiguous().view(src_type)
 
 
+def shuffle_scale_f4(scale: torch.Tensor, intype: int) -> torch.Tensor:
+    """Tile-major shuffle for F4GEMM (gfx1250) scale tensors.
+
+    scale: uint8 tensor of shape (dim, K/32) where dim is M (ScaleA) or N (ScaleB).
+    intype: 7 = MXFP4 (e8m0, tile (8, 32)); 8 = NVFP4 (e4m3, tile (4, 32)).
+    """
+    assert scale.dtype == torch.uint8, f"shuffle_scale_f4 expects uint8, got {scale.dtype}"
+    assert scale.dim() == 2, f"shuffle_scale_f4 expects 2D, got shape {tuple(scale.shape)}"
+    if intype == 7:
+        Tm, Tk = 8, 32
+    elif intype == 8:
+        Tm, Tk = 4, 32
+    else:
+        raise ValueError(f"shuffle_scale_f4: intype must be 7 (MXFP4) or 8 (NVFP4), got {intype}")
+    D, Kblk = scale.shape
+    assert D % Tm == 0, f"dim {D} not divisible by tile_m {Tm}"
+    assert Kblk % Tk == 0, f"K/32 {Kblk} not divisible by tile_k {Tk}"
+    out = (
+        scale.view(D // Tm, Tm, Kblk // Tk, Tk)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(D, Kblk)
+    )
+    return out
+
+
 def shuffle_scale_a16w4(
     src: torch.Tensor, experts_cnt: int, gate_up: bool
 ) -> torch.Tensor:

@@ -205,6 +205,86 @@ def gemm_a4w4_asm(
     return out
 
 
+@compile_ops(
+    "module_f4gemm_mi400_asm",
+    fc_name="mxfp4_gemm_asm",
+    ffi_type="ctypes",
+)
+def _mxfp4_gemm_asm(
+    A: Tensor,        # A:[M, K/2] fp4x2 (preshuffled if a_preshuffle=1)
+    B: Tensor,        # B:[N, K/2] fp4x2 (preshuffled)
+    ScaleA: Tensor,   # ScaleA:[M, K/32] e8m0 (shuffled)
+    ScaleB: Tensor,   # ScaleB:[N, K/32] e8m0 (shuffled)
+    out: Tensor,      # Out:[M, N] bf16
+    kernelName: Optional[str] = None,
+    a_preshuffle: int = 1,
+) -> None: ...
+
+
+@compile_ops(
+    "module_f4gemm_mi400_asm",
+    fc_name="nvfp4_gemm_asm",
+    ffi_type="ctypes",
+)
+def _nvfp4_gemm_asm(
+    A: Tensor,
+    B: Tensor,
+    ScaleA: Tensor,   # e4m3 (shuffled)
+    ScaleB: Tensor,   # e4m3 (shuffled)
+    GlobalScaleA: float,
+    GlobalScaleB: float,
+    out: Tensor,
+    kernelName: Optional[str] = None,
+    a_preshuffle: int = 1,
+) -> None: ...
+
+
+def gemm_mxfp4_asm(
+    A: Tensor,        # A:[M, K/2] fp4x2
+    B: Tensor,        # B:[N, K/2] fp4x2
+    ScaleA: Tensor,   # ScaleA:[M, K/32] e8m0
+    ScaleB: Tensor,   # ScaleB:[N, K/32] e8m0
+    dtype: torch.dtype = dtypes.bf16,
+    a_preshuffle: bool = True,
+    kernelName: str = "",
+) -> Tensor:
+    """gfx1250 MXFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e8m0 scales."""
+    M = A.shape[0]
+    N = B.shape[0]
+    out = torch.empty((M, N), dtype=dtype, device=A.device)
+    _mxfp4_gemm_asm(
+        A, B, ScaleA, ScaleB, out,
+        kernelName if kernelName else None,
+        int(bool(a_preshuffle)),
+    )
+    return out
+
+
+def gemm_nvfp4_asm(
+    A: Tensor,
+    B: Tensor,
+    ScaleA: Tensor,   # e4m3
+    ScaleB: Tensor,   # e4m3
+    GlobalScaleA: float,
+    GlobalScaleB: float,
+    dtype: torch.dtype = dtypes.bf16,
+    a_preshuffle: bool = True,
+    kernelName: str = "",
+) -> Tensor:
+    """gfx1250 NVFP4 GEMM (preload SGPR mode). D[M,N] bf16 = A * B with e4m3 scales + global alphas."""
+    M = A.shape[0]
+    N = B.shape[0]
+    out = torch.empty((M, N), dtype=dtype, device=A.device)
+    _nvfp4_gemm_asm(
+        A, B, ScaleA, ScaleB,
+        float(GlobalScaleA), float(GlobalScaleB),
+        out,
+        kernelName if kernelName else None,
+        int(bool(a_preshuffle)),
+    )
+    return out
+
+
 def gen_gemm_a4w4_blockscale_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
