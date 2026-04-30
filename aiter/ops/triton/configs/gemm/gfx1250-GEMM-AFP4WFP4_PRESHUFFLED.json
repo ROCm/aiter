@@ -13,10 +13,10 @@
     "NUM_BUFFERS": 2
   },
   "any": {
-    "BLOCK_SIZE_M": 256,
+    "BLOCK_SIZE_M": 64,
     "BLOCK_SIZE_N": 256,
     "BLOCK_SIZE_K": 256,
-    "GROUP_SIZE_M": 4,
+    "GROUP_SIZE_M": 1,
     "num_warps": 4,
     "NUM_KSPLIT": 1,
     "num_stages": 2,

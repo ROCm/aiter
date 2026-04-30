@@ -493,11 +493,7 @@ def gemm_afp4wfp4_preshuffle(
         ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
     grid = lambda META: (  # noqa: E731
-        (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
-            * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),
+        (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),
     )
 
     M_POW2 = triton.next_power_of_2(M)
@@ -505,31 +501,51 @@ def gemm_afp4wfp4_preshuffle(
         M_POW2 = 16
 
     if use_gluon:
-        layouts = get_gemm_afp4wfp4_preshuffle_layouts(config["num_warps"], config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
+        layouts = get_gemm_afp4wfp4_preshuffle_layouts(
+            config["num_warps"],
+            config["BLOCK_SIZE_M"],
+            config["BLOCK_SIZE_N"],
+            config["BLOCK_SIZE_K"],
+        )
 
-        config["SPLITK_BLOCK"] = config["SPLITK_BLOCK_SIZE"]
+        _DROP_KEYS = (
+            "NUM_KSPLIT",
+            "SPLITK_BLOCK_SIZE",
+            "SPLITK_BLOCK",
+            "GROUP_SIZE_M",
+            "num_stages",
+            "waves_per_eu",
+            "matrix_instr_nonkdim",
+            "cache_modifier",
+        )
+        kernel_config = {k: v for k, v in config.items() if k not in _DROP_KEYS}
+        # Kernel consumes preshuffled scales directly (address math inverts the shuffle in registers)
+        assert M >= 32, "gluon mxfp4 preshuffle path requires M >= 32"
+        x_scales = x_scales.contiguous()
+        w_scales = w_scales.contiguous()
+
         _gluon_gemm_mxfp4_preshuffle_gfx1250[grid](
-        x_fp4,
-        w_preshuf,
-        y,
-        x_scales,
-        w_scales,
-        M,
-        N,
-        K_elems,
-        x_fp4.stride(0),
-        x_fp4.stride(1),
-        w_preshuf.stride(0),
-        w_preshuf.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
-        y.stride(-2),
-        y.stride(-1),
-        x_scales.stride(0),
-        x_scales.stride(1),
-        w_scales.stride(0),
-        w_scales.stride(1),
-        **config,
-        **layouts,
+            x_fp4,
+            w_preshuf,
+            y,
+            x_scales,
+            w_scales,
+            M,
+            N,
+            K_elems,
+            x_fp4.stride(0),
+            x_fp4.stride(1),
+            w_preshuf.stride(0),
+            w_preshuf.stride(1),
+            0 if config["NUM_KSPLIT"] == 1 else y.stride(0),
+            y.stride(-2),
+            y.stride(-1),
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(1),
+            **kernel_config,
+            **layouts,
         )
         return y
 
