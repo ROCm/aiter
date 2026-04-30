@@ -101,7 +101,7 @@ torch::Tensor
     int KBatch = k_batch.has_value() ? k_batch.value() : 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = KBatch > 1 ? N : N / {3 - k.stage}; //gemm1 gate+up need / 2.
+    int stride_C = {"true" if k.SplitK else "false"} || KBatch > 1 ? N : N / {3 - k.stage}; //gemm1 gate+up need / 2.
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}
@@ -116,6 +116,7 @@ torch::Tensor
         xptr = "nullptr"
         wptr = "nullptr"
         biasptr = "nullptr"
+        bias_type = dtype_dict[self.c_dtype]
         if k.QuantType == "per_tensor":
             scaleGranA = "0"
             scaleGranB = "0"
@@ -133,14 +134,14 @@ torch::Tensor
             biasGran = "1"
             xptr = "x_scale.has_value() ? static_cast<ck_tile::e8m0_t*>(x_scale.value().data_ptr()) : nullptr"
             wptr = "static_cast<ck_tile::e8m0_t*>(w_scale.value().data_ptr())"
-            biasptr = "static_cast<float*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
+            biasptr = f"static_cast<{bias_type}*>(exp_bias.has_value() ? exp_bias.value().data_ptr() : nullptr)"
 
         if not k.HasBias:
             biasGran = "-1"
 
         INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranA}>{{{xptr}}};
     auto per_b_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranB}>{{{wptr}}};
-    auto exp_bias_dev_ptr = ck_tile::FlatmmScalePointer<{biasGran}>{{{biasptr}}};
+    auto exp_bias_dev_ptr = ck_tile::FlatmmScalePointer<{biasGran}, 0, {bias_type}>{{{biasptr}}};
     ck_tile::MoeFlatmmHostArgs<decltype(per_a_scale_dev_ptr),
                                decltype(per_b_scale_dev_ptr),
                                decltype(exp_bias_dev_ptr)> kernel_args{{
