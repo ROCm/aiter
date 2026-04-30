@@ -5,7 +5,6 @@ from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import buffer_ops, const_expr, gpu, math, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -17,6 +16,7 @@ from .mfma_preshuffle_pipeline import (
     load_b_pack_k32,
     swizzle_xor16,
     tile_chunk_coord_i32,
+    xcd_remap_bx_by,
 )
 
 _TILE_PRELOAD_TABLE = {
@@ -386,31 +386,15 @@ def compile_preshuffle_gemm_a8(
         bx = gpu.block_id("x")
         by = gpu.block_id("y")
 
-        if const_expr(xcd_swizzle > 0):
-            _NUM_XCDS = 8
-            _c1 = fx.arith.constant(1, index=True)
-            _c_tm = fx.arith.constant(tile_m, index=True)
-            _gx = fx.arith.constant(N // tile_n, index=True)
-            _gy = (c_m + _c_tm - _c1) / _c_tm
-
-            _linear_id = bx * _gx + by
-            _num_wgs = _gx * _gy
-
-            _c_xcds = fx.arith.constant(_NUM_XCDS, index=True)
-            _wgs_per_xcd = _num_wgs / _c_xcds
-            _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
-
-            _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
-            _num_wgid_in_group = _c_wgm * _gx
-            _group_id = _wgid / _num_wgid_in_group
-            _first_pid_m = _group_id * _c_wgm
-            _remaining_m = _gy - _first_pid_m
-            _cmp_m = fx.arith.cmpi(CmpIPredicate.ult, _remaining_m, _c_wgm)
-            _group_size_m = fx.arith.select(_cmp_m, _remaining_m, _c_wgm)
-
-            _wgid_in_group = _wgid % _num_wgid_in_group
-            bx = _first_pid_m + (_wgid_in_group % _group_size_m)
-            by = _wgid_in_group / _group_size_m
+        bx, by = xcd_remap_bx_by(
+            bx,
+            by,
+            c_m,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            N=N,
+            xcd_swizzle=xcd_swizzle,
+        )
 
         # ---- LDS (separate ping/pong buffers for no-alias guarantee) ----
         base_ptr_pong = allocator_pong.get_base()
