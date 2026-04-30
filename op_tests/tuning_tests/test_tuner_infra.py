@@ -12,9 +12,11 @@ import unittest
 import argparse
 import pandas as pd
 
+TEST_GFX = "gfx942"
+
 
 class _StubTuner:
-    """Lazy-init helper — avoids importing aiter at module level."""
+    """Lazy-init helper -- avoids importing aiter at module level."""
 
     _cls = None
 
@@ -83,6 +85,7 @@ class TestUpdateTunedf(unittest.TestCase):
         tuner = _StubTuner.get()
         old = pd.DataFrame(
             {
+                "gfx": [TEST_GFX],
                 "cu_num": [304],
                 "M": [1],
                 "N": [1024],
@@ -98,6 +101,7 @@ class TestUpdateTunedf(unittest.TestCase):
         )
         new = pd.DataFrame(
             {
+                "gfx": [TEST_GFX],
                 "cu_num": [304],
                 "M": [1],
                 "N": [1024],
@@ -119,6 +123,7 @@ class TestUpdateTunedf(unittest.TestCase):
         tuner = _StubTuner.get()
         old = pd.DataFrame(
             {
+                "gfx": [TEST_GFX],
                 "cu_num": [304],
                 "M": [1],
                 "N": [1024],
@@ -134,6 +139,7 @@ class TestUpdateTunedf(unittest.TestCase):
         )
         new = pd.DataFrame(
             {
+                "gfx": [TEST_GFX],
                 "cu_num": [304],
                 "M": [32],
                 "N": [2048],
@@ -157,6 +163,7 @@ class TestSortResults(unittest.TestCase):
         tuner = _StubTuner.get()
         df = pd.DataFrame(
             {
+                "gfx": [TEST_GFX, TEST_GFX],
                 "cu_num": [304, 304],
                 "M": [1, 1],
                 "N": [1024, 1024],
@@ -185,7 +192,7 @@ class TestCalculate(unittest.TestCase):
 
     def test_tflops_bw_positive(self):
         tuner = _StubTuner.get()
-        keys = (304, 128, 4096, 1024)
+        keys = (TEST_GFX, 304, 128, 4096, 1024)
         result = ((keys,), 100.0, 0.01)
         tflops, bw = tuner.calculate(result)
         self.assertGreater(tflops, 0)
@@ -193,7 +200,7 @@ class TestCalculate(unittest.TestCase):
 
     def test_returns_zero_on_invalid_time(self):
         tuner = _StubTuner.get()
-        keys = (304, 128, 4096, 1024)
+        keys = (TEST_GFX, 304, 128, 4096, 1024)
         result = ((keys,), -1, 1.0)
         tflops, bw = tuner.calculate(result)
         self.assertEqual(tflops, 0)
@@ -201,7 +208,7 @@ class TestCalculate(unittest.TestCase):
 
 
 class TestPostProcess(unittest.TestCase):
-    """Tests for post_process — especially the topk selection logic."""
+    """Tests for post_process -- especially the topk selection logic."""
 
     def _make_args(self, err_ratio=0.05, profile_file=""):
         args = argparse.Namespace()
@@ -219,12 +226,12 @@ class TestPostProcess(unittest.TestCase):
         tuner = _StubTuner.get()
         args = self._make_args()
         rets = [
-            self._make_result((304, 1, 1024, 512), 0, 0, 10.0),
-            self._make_result((304, 1, 1024, 512), 1, 0, 5.0),
-            self._make_result((304, 1, 1024, 512), 2, 0, 8.0),
-            self._make_result((304, 32, 2048, 1024), 0, 0, 20.0),
-            self._make_result((304, 32, 2048, 1024), 1, 0, 12.0),
-            self._make_result((304, 32, 2048, 1024), 2, 0, 15.0),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, 10.0),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, 5.0),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 2, 0, 8.0),
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 0, 0, 20.0),
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 1, 0, 12.0),
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 2, 0, 15.0),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         self.assertEqual(len(resultdf), 2)
@@ -236,9 +243,9 @@ class TestPostProcess(unittest.TestCase):
         tuner = _StubTuner.get()
         args = self._make_args(err_ratio=0.05)
         rets = [
-            self._make_result((304, 1, 1024, 512), 0, 0, 5.0, err=0.1),
-            self._make_result((304, 1, 1024, 512), 1, 0, 10.0, err=0.01),
-            self._make_result((304, 1, 1024, 512), 2, 0, 8.0, err=0.02),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, 5.0, err=0.1),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, 10.0, err=0.01),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 2, 0, 8.0, err=0.02),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         self.assertEqual(len(resultdf), 1)
@@ -249,9 +256,11 @@ class TestPostProcess(unittest.TestCase):
         tuner = _StubTuner.get()
         args = self._make_args()
         rets = [
-            self._make_result((304, 1, 1024, 512), 0, 0, -1, err=0.0),
-            self._make_result((304, 1, 1024, 512), 1, 0, float("inf"), err=0.0),
-            self._make_result((304, 1, 1024, 512), 2, 0, 7.0, err=0.01),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, -1, err=0.0),
+            self._make_result(
+                (TEST_GFX, 304, 1, 1024, 512), 1, 0, float("inf"), err=0.0
+            ),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 2, 0, 7.0, err=0.01),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         self.assertEqual(len(resultdf), 1)
@@ -266,12 +275,12 @@ class TestPostProcess(unittest.TestCase):
         tuner = _StubTuner.get()
         args = self._make_args(err_ratio=0.05)
         rets = [
-            # Shape A: all kernels fail errRatio → 0 valid candidates
-            self._make_result((304, 1, 1024, 512), 0, 0, 5.0, err=0.9),
-            self._make_result((304, 1, 1024, 512), 1, 0, 3.0, err=0.8),
-            # Shape B: has valid candidates → should still get results
-            self._make_result((304, 32, 2048, 1024), 0, 0, 10.0, err=0.01),
-            self._make_result((304, 32, 2048, 1024), 1, 0, 8.0, err=0.02),
+            # Shape A: all kernels fail errRatio -> 0 valid candidates
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, 5.0, err=0.9),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, 3.0, err=0.8),
+            # Shape B: has valid candidates -> should still get results
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 0, 0, 10.0, err=0.01),
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 1, 0, 8.0, err=0.02),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         shape_b_rows = resultdf[resultdf["M"] == 32]
@@ -286,12 +295,12 @@ class TestPostProcess(unittest.TestCase):
         args = self._make_args(err_ratio=0.05)
         rets = [
             # Shape A: only 1 valid candidate (topk=2 requested but only 1 available)
-            self._make_result((304, 1, 1024, 512), 0, 0, 5.0, err=0.01),
-            self._make_result((304, 1, 1024, 512), 1, 0, 3.0, err=0.9),
-            # Shape B: 3 valid candidates → should get topk=2
-            self._make_result((304, 32, 2048, 1024), 0, 0, 10.0, err=0.01),
-            self._make_result((304, 32, 2048, 1024), 1, 0, 8.0, err=0.02),
-            self._make_result((304, 32, 2048, 1024), 2, 0, 12.0, err=0.01),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, 5.0, err=0.01),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 1, 0, 3.0, err=0.9),
+            # Shape B: 3 valid candidates -> should get topk=2
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 0, 0, 10.0, err=0.01),
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 1, 0, 8.0, err=0.02),
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 2, 0, 12.0, err=0.01),
         ]
         resultdf = tuner.post_process(rets, args, topk=2)
         shape_b_rows = resultdf[resultdf["M"] == 32]
@@ -306,22 +315,254 @@ class TestPostProcess(unittest.TestCase):
         tuner = _StubTuner.get()
         args = self._make_args(err_ratio=0.05)
         rets = [
-            self._make_result((304, 1, 1024, 512), 0, 0, 5.0, err=0.9),
-            self._make_result((304, 32, 2048, 1024), 0, 0, 10.0, err=0.8),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, 5.0, err=0.9),
+            self._make_result((TEST_GFX, 304, 32, 2048, 1024), 0, 0, 10.0, err=0.8),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         self.assertEqual(len(resultdf), 2, "Should have fallback entry for each shape")
 
     def test_single_shape_single_kernel(self):
-        """Minimal case: 1 shape, 1 kernel → should work."""
+        """Minimal case: 1 shape, 1 kernel -> should work."""
         tuner = _StubTuner.get()
         args = self._make_args()
         rets = [
-            self._make_result((304, 1, 1024, 512), 0, 0, 5.0, err=0.01),
+            self._make_result((TEST_GFX, 304, 1, 1024, 512), 0, 0, 5.0, err=0.01),
         ]
         resultdf = tuner.post_process(rets, args, topk=1)
         self.assertEqual(len(resultdf), 1)
         self.assertEqual(float(resultdf.iloc[0]["us"]), 5.0)
+
+
+class TestUpdateConfigFiles(unittest.TestCase):
+    """Tests for TunerCommon.update_config_files (config merge/dedup)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_csv(self, name, header, rows):
+        path = os.path.join(self.tmpdir, name)
+        with open(path, "w") as f:
+            f.write(",".join(header) + "\n")
+            for row in rows:
+                f.write(",".join(str(v) for v in row) + "\n")
+        return path
+
+    def test_single_path_returns_as_is(self):
+        tuner = _StubTuner.get()
+        path = "/some/path.csv"
+        self.assertEqual(tuner.update_config_files(path, "test"), path)
+
+    def test_empty_path_returns_as_is(self):
+        tuner = _StubTuner.get()
+        self.assertEqual(tuner.update_config_files("", "test"), "")
+
+    def test_two_files_merge_dedup(self):
+        """Two CSVs with overlapping keys -> merged, fastest us kept."""
+        tuner = _StubTuner.get()
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 1, 0, 50.0, "k1", 2.0, 2.0, 0.005]],
+        )
+        merged_path = tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_merge")
+        try:
+            self.assertNotEqual(merged_path, f"{f1}{os.pathsep}{f2}")
+            df = pd.read_csv(merged_path)
+            self.assertEqual(len(df), 1)
+            self.assertEqual(float(df.iloc[0]["us"]), 50.0)
+        finally:
+            if os.path.exists(merged_path):
+                os.unlink(merged_path)
+
+    def test_column_mismatch_raises(self):
+        """Two CSVs with different columns -> AssertionError."""
+        tuner = _StubTuner.get()
+        h1 = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        h2 = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "extra_col",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            h1,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            h2,
+            [[TEST_GFX, 304, 1, 1024, 512, "x", 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        with self.assertRaises(AssertionError):
+            tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_mismatch")
+
+    def test_missing_second_file(self):
+        """Second path doesn't exist -> only first file data."""
+        tuner = _StubTuner.get()
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        fake = os.path.join(self.tmpdir, "nonexistent.csv")
+        merged_path = tuner.update_config_files(
+            f"{f1}{os.pathsep}{fake}", "test_missing"
+        )
+        try:
+            df = pd.read_csv(merged_path)
+            self.assertEqual(len(df), 1)
+            self.assertEqual(float(df.iloc[0]["us"]), 100.0)
+        finally:
+            if os.path.exists(merged_path):
+                os.unlink(merged_path)
+
+    def test_tag_column_dedup(self):
+        """CSVs with _tag column -> dedup uses keys + _tag."""
+        tuner = _StubTuner.get()
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+            "_tag",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [
+                [
+                    TEST_GFX,
+                    304,
+                    1,
+                    1024,
+                    512,
+                    0,
+                    0,
+                    100.0,
+                    "k0",
+                    1.0,
+                    1.0,
+                    0.01,
+                    "modelA",
+                ]
+            ],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 1, 0, 80.0, "k1", 1.5, 1.5, 0.01, "modelB"]],
+        )
+        merged_path = tuner.update_config_files(f"{f1}{os.pathsep}{f2}", "test_tag")
+        try:
+            df = pd.read_csv(merged_path)
+            self.assertEqual(len(df), 2, "Same keys but different _tag -> both kept")
+        finally:
+            if os.path.exists(merged_path):
+                os.unlink(merged_path)
+
+    def test_two_files_non_overlapping(self):
+        """Two CSVs with different keys -> both rows in output."""
+        tuner = _StubTuner.get()
+        header = [
+            "gfx",
+            "cu_num",
+            "M",
+            "N",
+            "K",
+            "kernelId",
+            "splitK",
+            "us",
+            "kernelName",
+            "tflops",
+            "bw",
+            "errRatio",
+        ]
+        f1 = self._write_csv(
+            "a.csv",
+            header,
+            [[TEST_GFX, 304, 1, 1024, 512, 0, 0, 100.0, "k0", 1.0, 1.0, 0.01]],
+        )
+        f2 = self._write_csv(
+            "b.csv",
+            header,
+            [[TEST_GFX, 304, 32, 2048, 1024, 1, 0, 200.0, "k1", 2.0, 2.0, 0.005]],
+        )
+        merged_path = tuner.update_config_files(
+            f"{f1}{os.pathsep}{f2}", "test_nonoverlap"
+        )
+        try:
+            df = pd.read_csv(merged_path)
+            self.assertEqual(len(df), 2)
+        finally:
+            if os.path.exists(merged_path):
+                os.unlink(merged_path)
 
 
 if __name__ == "__main__":

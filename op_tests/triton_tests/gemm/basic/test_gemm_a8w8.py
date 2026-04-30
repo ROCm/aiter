@@ -97,6 +97,7 @@ def generate_gemm_a8w8_inputs(
     - x: (M, K) -> row-major format
     - w: (N, K) -> column-major format
     """
+    torch.manual_seed(0)
     if layout[0] == "T":
         # T (transposed) in Fortran notation equals row-major
         x = torch.randn((M, K), dtype=torch.float32, device="cuda")
