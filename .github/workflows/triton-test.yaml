@@ -360,7 +360,6 @@ jobs:
         with:
           pattern: triton-test-shard-*
           path: .
-      
       - name: Check Triton Test Results
         run: |
           set -ex

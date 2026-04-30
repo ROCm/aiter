@@ -9,6 +9,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -461,6 +462,49 @@ def test_mla(
         cal_diff(out_ref, out_asm, "out", True)
         return err, us_asm_decode
 
+    def test_absorb_decode_gluon():
+        from aiter.ops.triton.gluon.mla_decode_gluon import mla_decode_gluon
+
+        out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+
+        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
+        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+
+        # KV: flat [N, 576] buffer; the kernel uses KV_PE_OFFSET (default 512)
+        # to reach k_pe columns and picks buffer_load vs global_load internally.
+        kv_c = kv_buffer.view(-1, qk_head_dim)
+
+        # Varlen=False: reshape kv_indices as block_table [batch, ctx_lens]
+        # Varlen=True : pass kv_indices + kv_indptr
+        if not varlen:
+            page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
+            seq_info = seq_lens_kv
+            use_2d_view = True
+        else:
+            page_table = kv_indices
+            seq_info = kv_indptr
+            use_2d_view = False
+
+        (attn_logits, attn_lse), us_gluon_decode = run_perftest(
+            mla_decode_gluon,
+            q_nope,
+            q_pe,
+            kv_c,
+            out_gluon.view(batch_size, nhead, v_head_dim),
+            page_table,
+            seq_info,
+            sm_scale,
+            use_2d_view=use_2d_view,
+            min_kv_seq_len=ctx_lens,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            out_gluon,
+            msg=f"mla_decode-absorb    [golden vs gluon_mla]: {us_gluon_decode:>8.2f} us......",
+        )
+        return err, us_gluon_decode
+
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
@@ -476,6 +520,40 @@ def test_mla(
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
+    # Gluon MLA decode test (bf16 only, nhead in (64,128), decode_qlen=1,
+    # head_dim_ckv=512, head_dim_kpe=64, batch in (64,128,256), page_size=1).
+    # NUM_KV_SPLITS is auto-picked by the wrapper so the launch fills ~256
+    # workgroups; the per-split min seq_len bound depends on it. Mirror the
+    # picker here to gate ctx_lens precisely.
+    us_gluon_decode = 1e12
+    NUM_XCDS_GFX950 = 8
+    BLOCK_H_GLUON = 64
+    if (
+        get_gfx() == "gfx950"
+        and dtype == torch.bfloat16
+        and kvtype == torch.bfloat16
+        and nhead in (64, 128)
+        and decode_qlen == 1
+        and v_head_dim == 512
+        and (qk_head_dim - v_head_dim) == 64
+        and batch_size in (64, 128, 256)
+        and page_size == 1
+    ):
+        base_grid = (
+            NUM_XCDS_GFX950
+            * ((nhead + BLOCK_H_GLUON - 1) // BLOCK_H_GLUON)
+            * (batch_size // NUM_XCDS_GFX950)
+        )
+        splits_needed = max(1, (256 + base_grid - 1) // base_grid)
+        # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
+        num_kv_splits = 1 << (splits_needed - 1).bit_length()
+        # PIPELINE_STAGES=3, BLOCK_N=64 → 192; mirror wrapper's bound.
+        min_ctx_required = num_kv_splits * (192 + num_kv_splits)
+        if ctx_lens > min_ctx_required:
+            err_gluon, us_gluon_decode = test_absorb_decode_gluon()
+            ret["decode:gluon_err"] = err_gluon
+    ret["decode:gluon_576"] = us_gluon_decode
+
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
         total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
@@ -487,6 +565,8 @@ def test_mla(
     ret["decode:bytes"] = bytes
     ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+    ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
+    ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
 
     return ret
 
