@@ -71,13 +71,40 @@ if not IS_WINDOWS and is_develop_mode():
             ]
         )
 
+
+def _is_triton_installed():
+    from importlib.metadata import version as pkg_version
+
+    for pkg in [
+        "triton",
+        "pytorch-triton",
+        "pytorch-triton-rocm",
+        "triton-rocm",
+    ]:
+        try:
+            return pkg, pkg_version(pkg)
+        except Exception:
+            pass
+    return None
+
+
+def _run_install_triton():
+    print("[aiter] Installing amd-triton via .github/scripts/install_triton.sh")
+    install_triton = os.path.join(this_dir, ".github", "scripts", "install_triton.sh")
+    subprocess.check_call(["bash", install_triton])
+
+
+_triton_info = _is_triton_installed() if is_develop_mode() else None
+if _triton_info:
+    print(
+        f"[aiter] {_triton_info[0]}=={_triton_info[1]} is already installed,"
+        " recommend using .github/scripts/install_triton.sh to install triton"
+    )
+else:
     try:
-        install_triton = os.path.join(
-            this_dir, ".github", "scripts", "install_triton.sh"
-        )
-        subprocess.check_call(["bash", install_triton])
+        _run_install_triton()
     except Exception:
-        pass
+        print("[aiter] Skipping triton install via .github/scripts/install_triton.sh")
 
 
 def write_install_mode():
