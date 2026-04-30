@@ -4,7 +4,7 @@
 """High-level FlyDSL Flash Attention APIs (gfx1201 / RDNA4).
 
 Wraps the FlyDSL `flash_attn_func_gfx1201` kernel with:
-  - Build cache keyed by (num_heads, head_dim, causal, dtype).
+  - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
   - Automatic seq_len padding to the kernel's tile size (multiple of 128).
   - BSHD ([B, S, H, D]) input/output convention to match upstream
     flash-attention layout.
@@ -86,6 +86,18 @@ def flydsl_flash_attn_func(
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("flydsl_flash_attn_func requires CUDA/HIP tensors")
+    if not (q.device == k.device == v.device):
+        raise ValueError(
+            "q/k/v must reside on the same device, got "
+            f"q={q.device} k={k.device} v={v.device}"
+        )
+    try:
+        arch = torch.cuda.get_device_properties(q.device.index).gcnArchName
+    except Exception:
+        arch = ""
+    arch_base = arch.lower().split(":")[0] if arch else ""
+    if not arch_base.startswith("gfx1201"):
+        raise ValueError(f"flydsl_flash_attn_func requires gfx1201, got {arch!r}")
     if not (q.shape == k.shape == v.shape):
         raise ValueError(
             "flydsl_flash_attn_func is self-attention; q/k/v must share "
@@ -105,14 +117,6 @@ def flydsl_flash_attn_func(
         )
 
     dtype_str = _torch_dtype_to_str(q.dtype)
-    exe = _get_kernel(
-        num_heads=num_heads,
-        head_dim=head_dim,
-        causal=causal,
-        dtype_str=dtype_str,
-        waves_per_eu=waves_per_eu,
-        daz=daz,
-    )
 
     # Pad seq_len up to the kernel's tile size. Zero-pad on K/V is safe for
     # non-causal: padded keys produce QK^T = 0 → uniform softmax mass that
@@ -135,14 +139,26 @@ def flydsl_flash_attn_func(
 
     o_p = torch.empty_like(q_p)
 
-    exe(
-        q_p.reshape(-1),
-        k_p.reshape(-1),
-        v_p.reshape(-1),
-        o_p.reshape(-1),
-        batch,
-        seq_len_pad,
-    )
+    # Wrap kernel build + launch in q.device context so multi-GPU callers
+    # whose current device differs from q.device get the kernel compiled
+    # and launched on the right device/stream.
+    with torch.cuda.device(q.device.index):
+        exe = _get_kernel(
+            num_heads=num_heads,
+            head_dim=head_dim,
+            causal=causal,
+            dtype_str=dtype_str,
+            waves_per_eu=waves_per_eu,
+            daz=daz,
+        )
+        exe(
+            q_p.reshape(-1),
+            k_p.reshape(-1),
+            v_p.reshape(-1),
+            o_p.reshape(-1),
+            batch,
+            seq_len_pad,
+        )
 
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
