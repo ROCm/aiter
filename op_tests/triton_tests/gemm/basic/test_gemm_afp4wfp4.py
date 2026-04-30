@@ -184,6 +184,7 @@ def get_x_vals():
     x_vals += [(v, 2112, 7168) for v in (128, 192, 4096, 8000)]
     x_vals += [(v, 8192, 512) for v in (128, 192, 4096, 8000)]
     x_vals += [(2048,8192,4096)]
+    x_vals += [(1024,1024,4096)]
     return x_vals
 
 
@@ -360,11 +361,12 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         shuffle_weight_fg=True,
     )
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
-
     triton_out = gemm_afp4wfp4_preshuffle(
         x, w_preshuf, x_scales_shuffled, w_scales_shuffled, dtype,
         y if y is not None else torch.empty_like(torch_out),
     )
+    print("Triton done")
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+
 
     torch.testing.assert_close(torch_out, triton_out)

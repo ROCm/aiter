@@ -9,33 +9,36 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
     K_GROUPS = BLOCK_K // SCALE_GROUP_ELEMS
     BLOCK_K_BYTES = BLOCK_K // 2
 
-    # Warp/register layout bases depend on warp count
+    # Bases are in *new-tile* units: instr_shape[0]=16 for M, instr_shape[1]=32
+    # for N. Compared to the [32, 16] bases used previously, we halve the
+    # large-axis stride and double the small-axis stride so the macro-tile's
+    # *element* coverage is unchanged:
+    #   old [0, 1] (= 16N elements) -> new [1, 0] (= 16M elements)
+    #   old [0, 2] (= 32N elements) -> new [0, 1] (= 32N elements)
+    #   old [1, 0] (= 32M elements) -> new [2, 0] (= 32M elements)
     if num_warps == 2:
-        warp_bases= [[0, 1]]
-        reg_bases= []
+        warp_bases = [[1, 0]]
+        reg_bases = []
     elif num_warps == 4:
-        warp_bases= [[0, 2], [2, 0]]
-        reg_bases= [[1,0],[0,1]]
+        warp_bases = [[0, 1], [2, 0]]
+        reg_bases = [[1, 0]]
     else:
-        warp_bases = [[0, 1], [0, 2], [1, 0]]
+        warp_bases = [[1, 0], [0, 1], [2, 0]]
         reg_bases = []
 
-
-    # e2m1 uses instr_shape [16,16,64] for operands
     wmma_layout = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 64],
+        instr_shape=[16, 32, 64],
     )
-    # scaled WMMA accumulator must be [16,16,128]
     wmma_acc_layout = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 128],
+        instr_shape=[16, 32, 128],
     )
 
     # Shared memory layouts
@@ -247,6 +250,13 @@ def gemm_mxfp4_preshuffle_gfx1250(
         PF_LO=SCALE_PRESHUFFLE_LO, KW=SCALE_PRESHUFFLE_KW)
     bs_mask = (bs_n < N)[:, None]
 
+    # Explicitly mask out OOB scales to 0.
+    SCALE_OOB_ADDR: gl.constexpr = -(1 << 31)
+    as_base = gl.where(as_mask, as_base, SCALE_OOB_ADDR)
+    bs_base = gl.where(bs_mask, bs_base, SCALE_OOB_ADDR)
+    as_base = gl.max_contiguous(gl.multiple_of(as_base, [1, 4]), [1, 4])
+    bs_base = gl.max_contiguous(gl.multiple_of(bs_base, [1, 4]), [1, 4])
+
     # =====================================================================
     # Allocate shared memory (A and B data only, scales skip LDS)
     # =====================================================================
@@ -285,8 +295,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
     # --- 1. Prologue: fill NUM_BUFFERS-1 LDS slots via TDM (A, B only) + buffer_load scales ---
     SCALE_K_STRIDE_PER_GROUP: gl.constexpr = SCALE_PRESHUFFLE_FACTOR 
     g0 = split_k0_groups
-    cur_AS = gl.amd.gfx1250.buffer_load(a_scale_ptr, as_base + (g0 * SCALE_K_STRIDE_PER_GROUP * stride_as_k).to(gl.int32), mask=as_mask)
-    cur_BS = gl.amd.gfx1250.buffer_load(b_scale_ptr, bs_base + (g0 * SCALE_K_STRIDE_PER_GROUP * stride_bs_k).to(gl.int32), mask=bs_mask)
+    cur_AS = gl.amd.gfx1250.buffer_load(a_scale_ptr, as_base + (g0 * SCALE_K_STRIDE_PER_GROUP * stride_as_k).to(gl.int32))
+    cur_BS = gl.amd.gfx1250.buffer_load(b_scale_ptr, bs_base + (g0 * SCALE_K_STRIDE_PER_GROUP * stride_bs_k).to(gl.int32))
 
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if load_idx < k_tiles:
@@ -336,8 +346,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
             depreshuffle_b_raw_to_kn(smem_B.index(next_slot), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES),
             layout=dot_b_layout)
         next_g0 = split_k0_groups + (compute_idx + 1) * K_GROUPS
-        cur_AS = gl.amd.gfx1250.buffer_load(a_scale_ptr, as_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_as_k).to(gl.int32), mask=as_mask)
-        cur_BS = gl.amd.gfx1250.buffer_load(b_scale_ptr, bs_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_bs_k).to(gl.int32), mask=bs_mask)
+        cur_AS = gl.amd.gfx1250.buffer_load(a_scale_ptr, as_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_as_k).to(gl.int32))
+        cur_BS = gl.amd.gfx1250.buffer_load(b_scale_ptr, bs_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_bs_k).to(gl.int32))
         compute_idx += 1
 
     # --- 4. Epilogue: drain remaining tiles (no new TDM loads) ---
@@ -350,8 +360,8 @@ def gemm_mxfp4_preshuffle_gfx1250(
             depreshuffle_b_raw_to_kn(smem_B.index(next_slot), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES),
             layout=dot_b_layout)
         next_g0 = split_k0_groups + (compute_idx + 1) * K_GROUPS
-        next_AS = gl.amd.gfx1250.buffer_load(a_scale_ptr, as_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_as_k).to(gl.int32), mask=as_mask)
-        next_BS = gl.amd.gfx1250.buffer_load(b_scale_ptr, bs_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_bs_k).to(gl.int32), mask=bs_mask)
+        next_AS = gl.amd.gfx1250.buffer_load(a_scale_ptr, as_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_as_k).to(gl.int32))
+        next_BS = gl.amd.gfx1250.buffer_load(b_scale_ptr, bs_base + (next_g0 * SCALE_K_STRIDE_PER_GROUP * stride_bs_k).to(gl.int32))
 
         acc = gl.amd.gfx1250.wmma_scaled(cur_A, cur_AS, "e2m1", cur_B, cur_BS, "e2m1", acc)
         cur_A, cur_B, cur_AS, cur_BS = next_A, next_B, next_AS, next_BS
