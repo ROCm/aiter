@@ -60,15 +60,12 @@ def _gemm_a8w8_blockscale_kernel(
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
-    NUM_KSPLIT: gl.constexpr,
-    SPLITK_BLOCK_SIZE: gl.constexpr,
     EVEN_K: gl.constexpr,
     GRID_MN: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     warp_bases: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    L2_PREFETCH_DISTANCE: gl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -99,7 +96,7 @@ def _gemm_a8w8_blockscale_kernel(
     # acc layout
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(3, True, warp_bases, [], [16, 16, 128])
 
-
+    
     # TDM Shared Layouts
     tdm_shared_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for([[BLOCK_SIZE_K, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_K],
                                                                                 [1, 0])
@@ -188,13 +185,7 @@ def _gemm_a8w8_blockscale_kernel(
         offsets=offs_b_scale,
         cache=cache_modifier,
     )
-    # prefetch lds
-    if L2_PREFETCH_DISTANCE > NUM_BUFFERS:
-        for i in gl.static_range(NUM_BUFFERS - L2_PREFETCH_DISTANCE):
-            prefetch_iteration = num_loads + L2_PREFETCH_DISTANCE + NUM_BUFFERS + i
-            gl.amd.gfx1250.tdm.prefetch(a_desc, [0, prefetch_iteration * BLOCK_SIZE_K], pred=True)
-            gl.amd.gfx1250.tdm.prefetch(b_desc, [prefetch_iteration * BLOCK_SIZE_K, 0], pred=True)
-
+    
     # TDM prologue
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(a_desc, [off_am_tdm, num_loads * BLOCK_SIZE_K], tdm_smem_a.index(num_loads % NUM_BUFFERS))
@@ -237,11 +228,7 @@ def _gemm_a8w8_blockscale_kernel(
         # wait for loads before proceeding
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
-        # prefetches
-        if L2_PREFETCH_DISTANCE - 1 != 0:
-            prefetch_iteration = num_loads + L2_PREFETCH_DISTANCE - 1
-            gl.amd.gfx1250.tdm.prefetch(a_desc, [0, prefetch_iteration * BLOCK_SIZE_K], pred=True)
-            gl.amd.gfx1250.tdm.prefetch(b_desc, [prefetch_iteration * BLOCK_SIZE_K, 0], pred=True)
+        
         # begin loading in advance
         next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
                 tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS), dot_a_layout

@@ -2,33 +2,24 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
-import functools
+# For config parsing
 import json
 import os
+# For testing
 import torch
 import triton
 import math
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.logger import AiterTritonLogger # to debug
 from triton import language as tl
-from aiter.ops.triton._gluon_kernels.gemm_a8w8_blockscale import *
+from aiter.ops.triton._gluon_kernels.gemm_a8w8_blockscale import _gemm_a8w8_blockscale_kernel
 
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 
-@triton.heuristics(
-    {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
-    }
-)
-
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
@@ -51,7 +42,7 @@ def _get_config(
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
         dev = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/gfx1250-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
                 config = json.load(file)
@@ -77,12 +68,6 @@ def _get_config(
         config.copy()
     )  # avoid later inplace modification from interacting with cached config
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
-
-    if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
-        if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
-            config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
     config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
     return config
@@ -116,15 +101,14 @@ def gemm_a8w8_blockscale(
         f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
     )
 
-    _LOGGER.warning("enters here")
-
     M, K = x.shape
     N, K = w.shape
 
     # Check constraints.
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
-    # Transpose w and w_scale
+    # Transpose w and w_scale from UT torch weight shape to match expected dimensions of kernel input.
+    # This is/was a temporary measure to simplify development
     w = w.T
     w_scale = w_scale.T
 
@@ -138,22 +122,13 @@ def gemm_a8w8_blockscale(
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
 
-    if config["NUM_KSPLIT"] == 1:
-        assert (
-            config["GROUP_K"] == config["BLOCK_SIZE_K"]
-        ), f"GROUP_K: {config['GROUP_K']} must equal BLOCK_SIZE_K: {config['BLOCK_SIZE_K']} when not using KSPLIT"
-
-    if config["NUM_KSPLIT"] > 1:
-        y_pp = torch.empty(
-            (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
-        )
-    else:
-        y_pp = None
+    assert (
+        config["GROUP_K"] == config["BLOCK_SIZE_K"]
+    ), f"GROUP_K: {config['GROUP_K']} must equal BLOCK_SIZE_K: {config['BLOCK_SIZE_K']} when not using KSPLIT"
 
     grid = lambda META: (  # noqa: E731
         (
-            META["NUM_KSPLIT"]
-            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            triton.cdiv(M, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
@@ -162,11 +137,10 @@ def gemm_a8w8_blockscale(
     for i in range(int(math.log2(NUM_WARPS // 2))):
         warp_bases.append((1 << i, 0))
     warp_bases = tuple(warp_bases)
-    print("this is being called")
     _gemm_a8w8_blockscale_kernel[grid](
         x,
         w,
-        y if config["NUM_KSPLIT"] == 1 else y_pp,
+        y,
         x_scale,
         w_scale,
         M,
@@ -176,15 +150,16 @@ def gemm_a8w8_blockscale(
         x.stride(1),
         w.stride(0),
         w.stride(1),
-        0 if config["NUM_KSPLIT"] == 1 else y_pp.stride(0),
-        y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
-        y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
+        0,
+        y.stride(0),
+        y.stride(1),
         x_scale.stride(0),
         x_scale.stride(1),
         w_scale.stride(0),
         w_scale.stride(1),
         NUM_WARPS=config["num_warps"],
         warp_bases=warp_bases,
+        NUM_BUFFERS=3,
         **config,
     )
 

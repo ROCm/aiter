@@ -8,12 +8,12 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
 )
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+from aiter.ops.triton.gemm_a8w8_blockscale_gfx1250 import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale_gfx12,
 )
-# from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-#     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
-# )
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+)
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
@@ -232,8 +232,8 @@ def test_gemm(dtype, M, N, K, layout, output, impl="gluon"):
 
     if impl == "gluon" and DEVICE_ARCH in ("gfx1250",):
         impl = gluon_gemm_a8w8_blockscale_gfx12
-    # elif impl == "gluon" and DEVICE_ARCH in ("gfx950",):
-    #     impl = gluon_gemm_a8w8_blockscale
+    elif impl == "gluon" and DEVICE_ARCH in ("gfx950",):
+        impl = gluon_gemm_a8w8_blockscale
     elif impl == "triton":
         impl = triton_gemm_a8w8_blockscale
     elif impl == "triton_shuffle":
@@ -246,17 +246,17 @@ def test_gemm(dtype, M, N, K, layout, output, impl="gluon"):
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
 
 parser = argparse.ArgumentParser(prog='test_gemm_a8w8_blockscale.py')
-parser.add_argument('--gluon')
-parser.add_argument('--triton')
-gluon_check = parser.parse_args(['--gluon', 'gluon'])
-triton_check = parser.parse_args(['--triton', 'triton'])
-if (gluon_check):
+parser.add_argument('-g', '--gluon', action='store_true')
+parser.add_argument('-t', '--triton', action='store_true')
+args = parser.parse_args()
+
+if (args.gluon):
     test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")
     test_gemm("bf16", 2048, 5120, 2880, "TN", True, "gluon")
-if (triton_check):
+if (args.triton):
     test_gemm("bf16", 32, 5120, 2880, "TN", True, "triton")
     test_gemm("bf16", 2048, 5120, 2880, "TN", True, "triton")
-if (!gluon_check && !triton_check): # neither
+if (not args.gluon and not args.triton): # neither
     test_gemm("bf16", 32, 5120, 2880, "TN", True, "gluon")
     test_gemm("bf16", 2048, 5120, 2880, "TN", True, "gluon")
     test_gemm("bf16", 32, 5120, 2880, "TN", True, "triton")

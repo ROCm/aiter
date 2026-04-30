@@ -4,7 +4,7 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
 )
 # Switch gfx9 to gfx12 for gluon kernel
-from aiter.ops.triton.gemm_a8w8_blockscale import (
+from aiter.ops.triton.gemm_a8w8_blockscale_gfx1250 import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
