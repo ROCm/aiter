@@ -192,6 +192,27 @@ a16w16_flatmm_splitk_kernels_list = {
     208: _a16w16_flatmm_splitk( 64,  64, 128, 1),   # cc tile 8: deep K, high compute/load ratio
     209: _a16w16_flatmm_splitk(256,  32,  64, 1),   # cc tile 9: very tall, narrow N
     210: _a16w16_flatmm_splitk( 32, 256,  64, 1),   # cc tile 10: very wide, narrow M
+    # Tile coverage extension (kids 211..223): B_M=96 OR B_N=96 lanes for shapes
+    # whose M or N is a multiple of 96. Validated against the codegen
+    # _validate_a16w16_flatmm_splitk constraints (LDS pfk>=3, cc-spill guard
+    # COM_REP_M*COM_REP_N<=16 for WG=1) plus a refined VGPR estimate (consumer
+    # wave: 2*v_a + 2*v_b + ~64 overhead; cap=512/WG_PER_CU). All 13 fit.
+    # NOT YET PROFILED: COM_REP_M=3 / COM_REP_N=6 odd-loop unrolls are a new
+    # path; precision must be validated via op_tests/test_opus_a16w16_tune.py
+    # before relying on these in production heuristics.
+    211: _a16w16_flatmm_splitk( 32,  96,  64, 1),   # pfk=9, VGPR=176/512, AGPR=24
+    212: _a16w16_flatmm_splitk( 32,  96,  64, 2),   # pfk=4, VGPR=176/256, AGPR=24
+    213: _a16w16_flatmm_splitk( 32,  96, 128, 1),   # pfk=4, VGPR=288/512, AGPR=24
+    214: _a16w16_flatmm_splitk( 64,  96,  64, 1),   # pfk=7, VGPR=192/512, AGPR=48
+    215: _a16w16_flatmm_splitk( 64,  96,  64, 2),   # pfk=3, VGPR=192/256, AGPR=48
+    216: _a16w16_flatmm_splitk( 64,  96, 128, 1),   # pfk=3, VGPR=320/512, AGPR=48
+    217: _a16w16_flatmm_splitk( 96,  32,  64, 1),   # pfk=9, VGPR=144/512, AGPR=24
+    218: _a16w16_flatmm_splitk( 96,  32,  64, 2),   # pfk=4, VGPR=144/256, AGPR=24
+    219: _a16w16_flatmm_splitk( 96,  32, 128, 1),   # pfk=4, VGPR=224/512, AGPR=24
+    220: _a16w16_flatmm_splitk( 96,  64,  64, 1),   # pfk=7, VGPR=176/512, AGPR=48
+    221: _a16w16_flatmm_splitk( 96,  64,  64, 2),   # pfk=3, VGPR=176/256, AGPR=48
+    222: _a16w16_flatmm_splitk( 96,  64, 128, 1),   # pfk=3, VGPR=288/512, AGPR=48
+    223: _a16w16_flatmm_splitk( 96,  96,  64, 2),   # pfk=3, VGPR=208/256, AGPR=72  (81% VGPR -- watch)
 }
 
 # combined list (used by production gen_instances / dispatch)
