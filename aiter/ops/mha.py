@@ -1296,17 +1296,41 @@ def _flash_attn_forward(
         )
         return ret
 
+    def _is_bhsd_layout(t):
+        """Check if tensor has BHSD memory layout (stride_head > stride_seq)."""
+        if t.dim() != 4:
+            return False
+        return t.stride(2) > t.stride(1)
+
+    def is_fmha_v3_mxfp8():
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (q.dtype == dtypes.fp8)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
+        return ret
+
     def can_impl_fmha_v3_fwd():
         # basic
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
-        ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        if is_fmha_v3_mxfp8():
+            ret = ret and (hdim_q in (64, 128))
+            ret = ret and (hdim_v == hdim_q)
+            ret = ret and (seqlen_k % 128 == 0)
+            ret = ret and (not causal)
+            ret = ret and _is_bhsd_layout(q)
+            ret = ret and _is_bhsd_layout(k)
+            ret = ret and _is_bhsd_layout(v)
+        else:
+            ret = ret and (hdim_v == 128)
+            ret = ret and (hdim_q == 128 or hdim_q == 192)
+            ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -3150,3 +3174,92 @@ def flash_attn_varlen_fp8_pertensor_func(
     )
     out = out_padded[..., :head_size_v_og]
     return out
+
+
+def flash_attn_mxfp8_func(
+    q,
+    k,
+    v,
+    q_scale,
+    k_scale,
+    v_scale,
+    causal=False,
+    window_size=(-1, -1),
+    softmax_scale=None,
+):
+    """MHA forward with MXFP8 (microscaling FP8) inputs for gfx1250/MI450.
+
+    The gfx1250 MXFP8 kernel requires BHSD memory layout. Callers must provide
+    tensors with logical shape (B, S, H, D) but underlying BHSD memory order,
+    i.e. stride(2) > stride(1) (head stride > seq stride).
+
+    Limitations:
+        - Input/output must be in BHSD memory layout.
+        - seqlen_k must be a multiple of 128.
+        - Causal masking is not supported.
+
+    Args:
+        q: (batch_size, seqlen_q, nheads, head_dim) in fp8, BHSD memory layout
+        k: (batch_size, seqlen_k, nheads_k, head_dim) in fp8, BHSD memory layout
+        v: (batch_size, seqlen_k, nheads_k, head_dim_v) in fp8, BHSD memory layout
+        q_scale: block scale buffer for q (float8_e8m0fnu)
+        k_scale: block scale buffer for k (float8_e8m0fnu)
+        v_scale: block scale buffer for v (float8_e8m0fnu)
+        causal: must be False
+        window_size: (left, right) window sizes
+        softmax_scale: scaling factor for softmax
+
+    Returns:
+        out: (batch_size, seqlen_q, nheads, head_dim_v) bf16, BHSD memory layout
+             (non-contiguous view; call .float().contiguous().to(bf16) if BSHD
+             contiguous is needed — do NOT call .contiguous() directly on bf16
+             due to ROCm gfx1250 bf16 element-wise codegen hang).
+    """
+    assert not causal, \
+        "MXFP8 kernel does not support causal masking yet"
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+    assert q.stride(2) > q.stride(1), \
+        "MXFP8 kernel requires BHSD memory layout (stride_head > stride_seq) for now"
+    assert k.stride(2) > k.stride(1), \
+        "MXFP8 kernel requires BHSD memory layout (stride_head > stride_seq) for now"
+    assert v.stride(2) > v.stride(1), \
+        "MXFP8 kernel requires BHSD memory layout (stride_head > stride_seq) for now"
+
+    seqlen_k = k.size(1)
+    assert seqlen_k % 128 == 0, \
+        f"MXFP8 kernel requires seqlen_k to be a multiple of 128 for now, got {seqlen_k}"
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    nheads = q.size(2)
+    head_dim_v = v.size(3)
+
+    # Pre-create output in BHSD memory layout, viewed as BSHD shape
+    out_bhsd = torch.empty(batch_size, nheads, seqlen_q, head_dim_v,
+                           device=q.device, dtype=torch.bfloat16)
+    out_view = out_bhsd.transpose(1, 2)
+
+    _flash_attn_forward(
+        q,
+        k,
+        v,
+        0.0,
+        softmax_scale,
+        causal=causal,
+        window_size_left=int(window_size[0]),
+        window_size_right=int(window_size[1]),
+        sink_size=0,
+        bias=None,
+        alibi_slopes=None,
+        q_descale=q_scale,
+        k_descale=k_scale,
+        v_descale=v_scale,
+        return_lse=True,
+        return_softmax=False,
+        out=out_view,
+    )
+
+    return out_view

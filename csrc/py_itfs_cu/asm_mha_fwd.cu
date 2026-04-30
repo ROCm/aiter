@@ -5,6 +5,7 @@
 #include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
+#include "aiter_hip_common.h"
 
 #include "mha_fwd.h"
 
@@ -101,33 +102,40 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
+    bool is_mxfp8_scale = (data_type == "mxfp8bf16");
     if (q_descale_.has_value()) {
         auto q_descale = q_descale_.value();
         CHECK_DEVICE(q_descale);
-        TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (q_descale.dim() == 2) {
-            batch_stride_descale_q = q_descale.stride(0);
-            nhead_stride_descale_q = q_descale.stride(1);
+        if (!is_mxfp8_scale) {
+            TORCH_CHECK(q_descale.sizes() == torch::IntArrayRef({1}) || q_descale.sizes() == torch::IntArrayRef({b, h_k}));
+            if (q_descale.dim() == 2) {
+                batch_stride_descale_q = q_descale.stride(0);
+                nhead_stride_descale_q = q_descale.stride(1);
+            }
         }
         q_descale_ptr = q_descale.data_ptr();
     }
     if (k_descale_.has_value()) {
         auto k_descale = k_descale_.value();
         CHECK_DEVICE(k_descale);
-        TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (k_descale.dim() == 2) {
-            batch_stride_descale_k = k_descale.stride(0);
-            nhead_stride_descale_k = k_descale.stride(1);
+        if (!is_mxfp8_scale) {
+            TORCH_CHECK(k_descale.sizes() == torch::IntArrayRef({1}) || k_descale.sizes() == torch::IntArrayRef({b, h_k}));
+            if (k_descale.dim() == 2) {
+                batch_stride_descale_k = k_descale.stride(0);
+                nhead_stride_descale_k = k_descale.stride(1);
+            }
         }
         k_descale_ptr = k_descale.data_ptr();
     }
     if (v_descale_.has_value()) {
         auto v_descale = v_descale_.value();
         CHECK_DEVICE(v_descale);
-        TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
-        if (v_descale.dim() == 2) {
-            batch_stride_descale_v = v_descale.stride(0);
-            nhead_stride_descale_v = v_descale.stride(1);
+        if (!is_mxfp8_scale) {
+            TORCH_CHECK(v_descale.sizes() == torch::IntArrayRef({1}) || v_descale.sizes() == torch::IntArrayRef({b, h_k}));
+            if (v_descale.dim() == 2) {
+                batch_stride_descale_v = v_descale.stride(0);
+                nhead_stride_descale_v = v_descale.stride(1);
+            }
         }
         v_descale_ptr = v_descale.data_ptr();
     }
@@ -235,14 +243,22 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
 
+    std::string arch_id = get_gpu_arch();
+    bool is_mxfp8 = is_qkv_fp8 && (arch_id == "gfx1250");
+
     std::string dtype_str;
     if (q_dtype == torch::kFloat16) {
         dtype_str = "fp16";
     } else if (q_dtype == torch::kBFloat16) {
         dtype_str = "bf16";
+    } else if (is_mxfp8) {
+        if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
+            dtype_str = "mxfp8bf16";
+        else
+            TORCH_CHECK(false, "For MXFP8 input, output must have dtype BF16 for now");
     } else if (is_qkv_fp8) {
         if (!out_.has_value() || out_.value().dtype() == torch::kBFloat16)
-            dtype_str = "fp8bf16"; // only support bf16 out for fp8
+            dtype_str = "fp8bf16";
         else
             TORCH_CHECK(false, "For FP8 input, output must have dtype BF16 for now");
     }
@@ -252,7 +268,16 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     TORCH_CHECK(q_descale_.has_value() == k_descale_.has_value() &&
                 k_descale_.has_value() == v_descale_.has_value(),
                 "q_descale, k_descale, v_descale must be all provided or all not provided");
-    if(is_qkv_fp8)
+    if(is_mxfp8)
+    {
+        TORCH_CHECK(q_descale_.has_value(),
+                    "q_descale, k_descale, v_descale must be provided for MXFP8");
+        TORCH_CHECK(q_descale_.value().dtype() == at::ScalarType::Float8_e8m0fnu &&
+                        k_descale_.value().dtype() == at::ScalarType::Float8_e8m0fnu &&
+                        v_descale_.value().dtype() == at::ScalarType::Float8_e8m0fnu,
+                    "MXFP8 block scale buffers must be float8_e8m0fnu");
+    }
+    else if(is_qkv_fp8)
     {
         TORCH_CHECK(q_descale_.has_value(),
                     "q_descale, k_descale, v_descale must be provided for asm fp8");
@@ -325,7 +350,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
 
     auto opts = q.options();
-    auto out_type = dtype_str == "fp8bf16" ? torch::kBFloat16 : q.scalar_type();
+    auto out_type = (dtype_str == "fp8bf16" || dtype_str == "mxfp8bf16") ? torch::kBFloat16 : q.scalar_type();
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();

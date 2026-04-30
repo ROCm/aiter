@@ -41,18 +41,25 @@ std::string get_kernel_name_key(const std::string& arch_id,
             continue;
         }
 
-        if(cfg.dtype == data_type && cfg.hdim_q == hdim_q && cfg.hdim_v == hdim_v &&
-           cfg.mask == mask_type && cfg.mode == mode)
+        if(cfg.dtype == data_type && cfg.hdim_q == hdim_q && cfg.hdim_v == hdim_v)
         {
-            if(arch_id == "gfx950")
+            if(arch_id == "gfx1250")
             {
                 kernel_name_key = el.first;
                 break;
             }
-            else if(arch_id == "gfx942" && cfg.bf16_cvt == bf16_cvt)
+            else if(cfg.mask == mask_type && cfg.mode == mode)
             {
-                kernel_name_key = el.first;
-                break;
+                if(arch_id == "gfx950")
+                {
+                    kernel_name_key = el.first;
+                    break;
+                }
+                else if(arch_id == "gfx942" && cfg.bf16_cvt == bf16_cvt)
+                {
+                    kernel_name_key = el.first;
+                    break;
+                }
             }
         }
     }
@@ -84,14 +91,21 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
                            const std::string& arch_id)
 {
     int tune_opt = 5;
-    // if num_head is not 8N, or seqlen is bigger than 16K, downgrade to 2and3
-    if(a.mask_type != 0 && ((a.nhead_q % 8 != 0) || (a.seqlen_q > 16384)))
-    {
-        tune_opt -= 2;
-    }
-    if(a.hdim_q == 192 && a.hdim_v == 128 && arch_id == "gfx942")
+    if(arch_id == "gfx1250")
     {
         tune_opt = 0;
+    }
+    else
+    {
+        // if num_head is not 8N, or seqlen is bigger than 16K, downgrade to 2and3
+        if(a.mask_type != 0 && ((a.nhead_q % 8 != 0) || (a.seqlen_q > 16384)))
+        {
+            tune_opt -= 2;
+        }
+        if(a.hdim_q == 192 && a.hdim_v == 128 && arch_id == "gfx942")
+        {
+            tune_opt = 0;
+        }
     }
     args.ptr_o            = a.o_ptr;
     args.ptr_q            = a.q_ptr;
@@ -126,6 +140,13 @@ void init_fmha_fwd_v3_args(fmha_fwd_v3_args& args,
         args.s_descale_k_Hs = a.nhead_stride_k_descale * 4;
         args.s_descale_v_Bs = a.batch_stride_v_descale * 4;
         args.s_descale_v_Hs = a.nhead_stride_v_descale * 4;
+    }
+    else if(a.data_type == "mxfp8bf16")
+    {
+        in_bpe = 1;
+        args.ptr_q_descale = a.q_descale_ptr;
+        args.ptr_k_descale = a.k_descale_ptr;
+        args.ptr_v_descale = a.v_descale_ptr;
     }
 
     args.scalar           = a.scale_s;
@@ -212,9 +233,15 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     std::string arch_id = get_gpu_arch();
 
-    if((a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
-       (a.data_type != "bf16" && a.data_type != "fp8bf16") || (a.bias_type != 0) || (a.p_drop > 0.f) ||
-       ((arch_id != "gfx942") && (arch_id != "gfx950")))
+    bool is_gfx1250_mxfp8 = (arch_id == "gfx1250") && (a.data_type == "mxfp8bf16") &&
+                            (a.hdim_q == 128 || a.hdim_q == 64) &&
+                            (a.seqlen_k % 128 == 0) && (a.mask_type == 0);
+    bool is_gfx942_950 = ((arch_id == "gfx942") || (arch_id == "gfx950")) &&
+                          (a.hdim_q == 192 || a.hdim_q == 128) && (a.hdim_v == 128) &&
+                          (a.data_type == "bf16" || a.data_type == "fp8bf16");
+
+    if(!is_gfx1250_mxfp8 && !is_gfx942_950 ||
+       (a.bias_type != 0) || (a.p_drop > 0.f))
     {
         AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);
         return -1;
@@ -255,7 +282,25 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     size_t arg_size = sizeof(args);
     init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
 
-    int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
+    if(arch_id == "gfx1250")
+    {
+        auto [gdx_, gdy_, gdz_] = get_grid_dim(a, cfg.ts_qo, arch_id);
+        int bdx_ = 128;
+        printf("[aiter] arg_size=%zu grid=(%d,%d,%d) block=(%d,1,1)\n", arg_size, gdx_, gdy_, gdz_, bdx_);
+        printf("[aiter] scalar=%.6f seq_len=%u kv_seq_len=%u\n", args.scalar, args.s_seq_len, args.s_kv_seq_len);
+        printf("[aiter] s_Seqs=%u s_Ts=%u s_Hs=%u s_Bs=%u gqa=%u\n", args.s_Seqs, args.s_Ts, args.s_Hs, args.s_Bs, args.s_gqa);
+        printf("[aiter] s_k_Seqs=%u s_k_Hs=%u s_k_Bs=%u\n", args.s_k_Seqs, args.s_k_Hs, args.s_k_Bs);
+        printf("[aiter] s_v_Seqs=%u s_v_Hs=%u s_v_Bs=%u\n", args.s_v_Seqs, args.s_v_Hs, args.s_v_Bs);
+        printf("[aiter] s_o_Seqs=%u s_o_Hs=%u s_o_Bs=%u\n", args.s_o_Seqs, args.s_o_Hs, args.s_o_Bs);
+        printf("[aiter] qk_dim=%u v_dim=%u q_head_num=%u opt=%u lse=%u lse_Hs=%u\n",
+               args.s_qk_head_dim, args.s_v_head_dim, args.s_q_head_num, args.s_opt, args.s_lse, args.s_lse_Hs);
+    }
+
+    int bdx;
+    if(arch_id == "gfx1250")
+        bdx = 128;
+    else
+        bdx = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
