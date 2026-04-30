@@ -695,6 +695,32 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             "opus tuner. Retained for argparse compat with upstream GemmCommonTuner.",
         )
 
+        # Force re-tune & in-place overwrite of every shape listed in -i,
+        # regardless of whether the tuned CSV already has a winner for that
+        # shape. Differs from base_tuner's `--all`:
+        #   * `--all` writes results in append mode (concat=True), so the
+        #     pre-existing winners are kept and the CSV grows duplicate
+        #     rows that get sorted by sortResults afterwards.
+        #   * `--retune` keeps the default in-place overwrite mode
+        #     (concat=False -> update_tunedf) but disables the dedup mask
+        #     so already-tuned shapes are NOT skipped. update_tunedf
+        #     replaces the matching key row in-place; new keys still
+        #     append. End result: tuned CSV has exactly one row per shape,
+        #     and that row is the freshly measured winner.
+        # Mutually exclusive with --all (which has its own append-mode
+        # retune semantics inherited from GemmCommonTuner).
+        self.parser.add_argument(
+            "--retune",
+            action="store_true",
+            default=False,
+            dest="retune",
+            help="Re-tune every shape in -i untune_file even when a tuned "
+            "winner already exists, and overwrite the old row in-place "
+            "ONLY when the new measurement is strictly faster (us-wise) "
+            "than the cached one. Ties or regressions keep the old row. "
+            "Mutually exclusive with --all (which uses append+resort).",
+        )
+
         # Direct M/N/K entry -- skip the untuned csv input. Useful for iterating
         # on a single shape during development without editing any file.
         # Usage: python opus_gemm_tune.py -m 128 -n 2048 -k 4096 -o /tmp/t.csv
@@ -780,7 +806,29 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
           without bias generates two distinct rows in the tuned CSV. We
           still need to populate missing columns from the CLI defaults
           (legacy CSVs without dtype/bias columns).
+        * Honor --retune: skip the "already tuned" dedup mask so every
+          shape in untunedf is re-measured, then rely on the existing
+          update_tunedf path (concat=False) to overwrite the old row
+          in-place when result_to_csv writes back. The actual replace-
+          if-better gate lives in our update_tunedf override below.
         """
+        if args.retune and args.all:
+            self.parser.error(
+                "--retune and --all are mutually exclusive. Use --retune "
+                "for in-place overwrite of -i shapes (one row per shape "
+                "stays in tuned CSV); use --all for append+resort retune."
+            )
+        # Stash for update_tunedf to consult: when set, our override only
+        # replaces an existing row when the freshly tuned `us` is strictly
+        # smaller than the cached one. Default behavior (no --retune) is
+        # unchanged because pre_process drops already-tuned shapes from
+        # untunedf before tune() runs, so update_tunedf only ever sees
+        # brand-new keys for non-retune flows.
+        self._retune_only_if_better = bool(args.retune)
+        # update_tunedf only receives (df_old, df_updates); cache verbose
+        # here so the override can decide whether to dump the per-row
+        # rejection table.
+        self._args_verbose_cached = bool(getattr(args, "verbose", False))
         cli_dtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.dtype])
         cli_outdtype_str = _dtype_torch_to_csv_str(_DTYPE_SHORT_TO_TORCH[args.outdtype])
         cli_bias = bool(args.bias)
@@ -871,10 +919,28 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                     .apply(tuple, axis=1)
                     .isin(self.tunedf[key_cols].apply(tuple, axis=1))
                 )
-                if args.verbose:
-                    logger.info("skiped tuned shapes:")
-                    print(self.untunedf[mask])
-                self.untunedf = self.untunedf[~mask]
+                if args.retune:
+                    # --retune: keep all -i shapes (including those already
+                    # tuned). Tuned rows for these shapes will be overwritten
+                    # in-place by update_tunedf during result_to_csv. We log
+                    # which rows are about to be overwritten so the user can
+                    # verify the intended replacement set.
+                    overwrite_count = int(mask.sum())
+                    if overwrite_count > 0:
+                        logger.info(
+                            f"OpusGemmA16W16Tuner: --retune will overwrite "
+                            f"{overwrite_count} existing tuned row(s) in "
+                            f"{args.tune_file} (in-place; one row per "
+                            f"shape stays)."
+                        )
+                        if args.verbose:
+                            logger.info("rows to be overwritten:")
+                            print(self.untunedf[mask])
+                else:
+                    if args.verbose:
+                        logger.info("skiped tuned shapes:")
+                        print(self.untunedf[mask])
+                    self.untunedf = self.untunedf[~mask]
 
     @staticmethod
     def _bpes_from_dtype_strs(dtype_str, outdtype_str):
@@ -980,6 +1046,72 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             df.loc[i, "tflops"] = tflops
             df.loc[i, "bw"] = bw
         df.to_csv(file, index=False, na_rep="Null")
+
+    def result_to_csv(self, resultdf, file, concat=False):
+        """Replace-if-better gate for --retune.
+
+        Default mode (no --retune): pre_process already strips already-tuned
+        shapes from untunedf, so resultdf only contains brand-new keys; the
+        parent's append-then-sortResults flow handles them correctly. This
+        override is identity-equivalent in that flow.
+
+        --retune mode: pre_process keeps already-tuned shapes in untunedf,
+        so resultdf contains rows whose key may match one already on disk.
+        Per the user's requirement we only let the new row reach the
+        parent (which will append it; sortResults later dedups by keep=last)
+        when its `us` is strictly smaller than the cached one. Otherwise
+        the new row is dropped here so the cached row remains the winner.
+
+        Why we hook here rather than in update_tunedf: GemmCommonTuner's
+        result_to_csv calls update_tunedf only when concat=False (i.e.
+        when args.all is True). With --retune we keep args.all=False, so
+        the parent flow uses concat=True (append) + sortResults
+        drop_duplicates(keep="last"). update_tunedf is therefore never
+        invoked on the --retune path; the gate has to live at the
+        result_to_csv layer.
+        """
+        if (
+            getattr(self, "_retune_only_if_better", False)
+            and not resultdf.empty
+            and "us" in resultdf.columns
+        ):
+            old_df = self.get_tuned_gemm_list(file)
+            if not old_df.empty and "us" in old_df.columns:
+                key_columns = list(self.keys)
+                old_keyed = old_df.assign(
+                    _key=old_df[key_columns].apply(tuple, axis=1)
+                )[["_key", "us"]].rename(columns={"us": "_old_us"})
+                new_keyed = resultdf.assign(
+                    _key=resultdf[key_columns].apply(tuple, axis=1)
+                )
+
+                merged = new_keyed.merge(old_keyed, on="_key", how="left")
+                # NaN _old_us = brand-new key -> always keep (first-time
+                # tune). For matched keys keep the new row only when
+                # strictly faster. Ties or regressions are rejected to
+                # avoid churning the CSV on identical-noise reruns.
+                keep_mask = merged["_old_us"].isna() | (
+                    merged["us"] < merged["_old_us"]
+                )
+
+                kept = int(keep_mask.sum())
+                rejected = int((~keep_mask).sum())
+                if rejected > 0:
+                    losers = merged[~keep_mask]
+                    logger.info(
+                        f"OpusGemmA16W16Tuner: --retune kept "
+                        f"{kept}/{kept + rejected} row(s) as improvements; "
+                        f"{rejected} row(s) rejected (new us >= old us)."
+                    )
+                    if getattr(self, "_args_verbose_cached", False):
+                        show = losers[key_columns + ["us", "_old_us"]].rename(
+                            columns={"us": "new_us"}
+                        )
+                        logger.info(f"rejected (no-improvement) rows:\n{show}")
+
+                resultdf = resultdf.loc[keep_mask.values].reset_index(drop=True)
+
+        return super().result_to_csv(resultdf, file, concat)
 
     def tune(self, untunedf, tunedf, args):
         mp_num = args.mp
