@@ -1166,11 +1166,17 @@ class KvManager8bitsV3
     // (00, 032 - 063) [W4L00 - W4L07] BANK 08-15
     // ...
     // (31, 032 - 063) [W7L56 - W7L63] BANK 06-13
+    //
+    // For kBlockN=64 (kNumPassesPerWarp=2): pass p covers KV rows
+    //   [kv_tile_start + p*32, kv_tile_start + (p+1)*32)
+    // and writes to LDS slot warp_idx + p*kNumWarps within the column-block (Layout B).
+    // Caller passes an array of length kNumPassesPerWarp; entries are physical KV rows
+    // already resolved by get_kv_ld_row (-1 means OOB).
     template <uint32_t kColOffset, bool kIsLastIter, bool kCheckBoundary = true>
     __device__ __forceinline__ static void async_load_k_tile(const uintptr_t p_lds_kv_warp_base,
                                                              const uint32_t warp_idx,
                                                              const typename T::gl_kv& kv_buffer,
-                                                             const int32_t row,
+                                                             const int32_t* p_rows,
                                                              const int32_t col_base)
     {
         if constexpr(kIsLastIter == false)
@@ -1182,29 +1188,37 @@ class KvManager8bitsV3
 
             const uint32_t lane_idx = opus::lane_id();
 
-            const uintptr_t p_lds_kv_warp =
-                p_lds_kv_warp_base + kBlockIdx * kNumBytesPerBlock - kColOffset;
+            const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
+            const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
 
-            if(kCheckBoundary && (row == -1))
+            #pragma unroll
+            for(uint32_t pass = 0; pass < kNumPassesPerWarp; ++pass)
             {
-                const uintptr_t p_lds_kv_lane =
-                    p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
-                hkm::ds_write_b32(0u, p_lds_kv_lane, 0);
-            }
-            else
-            {
-                const kv_t* p_kv_buffer = &kv_buffer[{0, 0, 0, 0}];
-                const hk::i32x4 srsrc   = hk::make_srsrc(p_kv_buffer, 0xffffffff);
+                const int32_t row = p_rows[pass];
+                const uintptr_t p_lds_kv_warp =
+                    p_lds_kv_warp_base
+                    + pass * T::kNumWarps * kNumBytesPer2SubBlocksWithPadding
+                    + kBlockIdx * kNumBytesPerBlock
+                    - kColOffset;
 
-                const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
+                if(kCheckBoundary && (row == -1))
+                {
+                    const uintptr_t p_lds_kv_lane =
+                        p_lds_kv_warp + kColOffset + lane_idx * kNumBytesPerThrPerRnd;
+                    hkm::ds_write_b32(0u, p_lds_kv_lane, 0);
+                }
+                else
+                {
+                    const uint32_t voffset = row * T::kQkHeadDim * sizeof(kv_t) + col_base;
 
-                hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
-                                                    (hk::as3_uint32_ptr)(p_lds_kv_warp),
-                                                    kNumBytesPerThrPerRnd,
-                                                    voffset,
-                                                    0,
-                                                    kColOffset,
-                                                    0);
+                    hk::llvm_amdgcn_raw_buffer_load_lds(srsrc,
+                                                        (hk::as3_uint32_ptr)(p_lds_kv_warp),
+                                                        kNumBytesPerThrPerRnd,
+                                                        voffset,
+                                                        0,
+                                                        kColOffset,
+                                                        0);
+                }
             }
         }
     }
@@ -1213,7 +1227,7 @@ class KvManager8bitsV3
     __device__ __forceinline__ static void async_load_k(const uintptr_t p_lds_kv,
                                                         const uint32_t warp_idx,
                                                         const typename T::gl_kv& kv_buffer,
-                                                        const int32_t row_kv_ld,
+                                                        const int32_t* p_rows_kv_ld,
                                                         const int32_t kv_ld_col_base)
     {
         if constexpr(kIsLastIter == false)
@@ -1221,23 +1235,23 @@ class KvManager8bitsV3
             const uintptr_t p_lds_kv_warp = get_p_lds_kv_warp_base(warp_idx, p_lds_kv);
 
             async_load_k_tile<0, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<64, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<128, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<192, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<256, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<320, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<384, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<448, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
             async_load_k_tile<512, false, kCheckBoundary>(
-                p_lds_kv_warp, warp_idx, kv_buffer, row_kv_ld, kv_ld_col_base);
+                p_lds_kv_warp, warp_idx, kv_buffer, p_rows_kv_ld, kv_ld_col_base);
         }
     }
 

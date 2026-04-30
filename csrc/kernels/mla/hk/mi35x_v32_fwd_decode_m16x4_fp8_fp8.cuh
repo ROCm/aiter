@@ -237,15 +237,15 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
         comp_t row_max;
         comp_t row_sum_e;
 
-        int32_t row_kv_ld;
+        int32_t row_kv_ld[1];
         if(kv_len < T::kBlockN)
         {
-            row_kv_ld =
+            row_kv_ld[0] =
                 get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices, kv_ld_row_base_idx, kv_start, kv_end);
         }
         else
         {
-            row_kv_ld = get_kv_ld_row<false, T::kPageSize>(
+            row_kv_ld[0] = get_kv_ld_row<false, T::kPageSize>(
                 params.p_kv_indices, kv_ld_row_base_idx, kv_start, kv_start + T::kBlockN);
         }
 
@@ -273,17 +273,17 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 p_lds_kv_curr, warp_idx + T::kNumWarps, params.kv_buffer, row_kv_ld, kv_ld_col_base + 32);
         }
 
-        int32_t row_kv_ld_next_next = -1;
+        int32_t row_kv_ld_next_next[1] = {-1};
         if(kv_len >= 2 * T::kBlockN)
         {
-            row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
+            row_kv_ld_next_next[0] = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
                                                        kv_ld_row_base_idx,
                                                        kv_start + T::kBlockN,
                                                        kv_start + 2 * T::kBlockN);
         }
         else if(kv_len > T::kBlockN)
         {
-            row_kv_ld_next_next = get_kv_ld_row<true, T::kPageSize>(
+            row_kv_ld_next_next[0] = get_kv_ld_row<true, T::kPageSize>(
                 params.p_kv_indices, kv_ld_row_base_idx, kv_start + T::kBlockN, kv_end);
         }
 
@@ -315,7 +315,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
 
             uintptr_t p_lds_kv_next_warp;
             uintptr_t p_lds_kv_next_warp_p1;
-            int32_t row_kv_ld_next;
+            int32_t row_kv_ld_next[1];
             if constexpr(kIsGlobalLast == false)
             {
                 p_lds_kv_next_warp =
@@ -323,7 +323,7 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                 // Pass-1 slot base: same block, but advanced to the warp_idx+kNumWarps slot.
                 p_lds_kv_next_warp_p1 = kv_manager.get_p_lds_kv_warp_base(
                     warp_idx + T::kNumWarps, p_lds_kv_next);
-                row_kv_ld_next = row_kv_ld_next_next;
+                row_kv_ld_next[0] = row_kv_ld_next_next[0];
             }
 
             kv_manager.template async_load_k_tile<0, kIsGlobalLast, kCheckBoundaryNext>(
@@ -412,14 +412,14 @@ __global__ __launch_bounds__(T::kNumThreads, T::kOccupancy) __attribute__((
                     {
                         if((kv_tile_start + 3 * T::kBlockN) <= kv_end)
                         {
-                            row_kv_ld_next_next = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
+                            row_kv_ld_next_next[0] = get_kv_ld_row<false, T::kPageSize>(params.p_kv_indices,
                                                                     kv_ld_row_base_idx,
                                                                     kv_tile_start + 2 * T::kBlockN,
                                                                     kv_tile_end + 2 * T::kBlockN);
                         }
                         else
                         {
-                            row_kv_ld_next_next = get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices,
+                            row_kv_ld_next_next[0] = get_kv_ld_row<true, T::kPageSize>(params.p_kv_indices,
                                                                     kv_ld_row_base_idx,
                                                                     kv_tile_start + 2 * T::kBlockN,
                                                                     kv_end);
