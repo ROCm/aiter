@@ -1487,12 +1487,15 @@ void
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
         # See _gen_noscale_instance for how these rows are consumed. The
-        # 4 splitk reduce-kernel instantiations (bf16/fp32 Y x HAS_BIAS
-        # true/false) are appended to the main-kernel device decl so a
-        # single device.cu instance covers main + reduce kernels for one
-        # (kid, dtype). Duplicating them across multiple kid TUs is fine
-        # because the reduce kernel templates are weak `__global__`
-        # symbols (the linker dedupes).
+        # splitk_reduce_kernel's 4 specialisations (D_OUT bf16/fp32 x
+        # HAS_BIAS true/false) used to be appended to every splitk kid's
+        # device.cu. That duplicated their codegen across all 23 splitk
+        # TUs (the linker dedupes the resulting weak symbols, but each
+        # TU still pays the full RA + ISA emit cost on its compile).
+        # Now they live in a single dedicated TU emitted by
+        # _emit_splitk_reduce_tu, so each splitk kid's device.cu only
+        # carries its own main-kernel instantiation. See
+        # aiter/ops/opus/README.md §7.6 for the wall-time impact.
         for CDtype in k.output_dtypes:
             host_decl = (
                 f"template void\n"
@@ -1506,18 +1509,6 @@ void
             device_decl = (
                 f"template __global__ void {kernel_func}<\n"
                 f"    {k.name}_Traits<{CDtype}>>({kargs_name});\n"
-                "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16>(\n"
-                "    const float*, __bf16*, int, int, int, int, int, int,\n"
-                "    const __bf16*, int);\n"
-                "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16>(\n"
-                "    const float*, __bf16*, int, int, int, int, int, int,\n"
-                "    const __bf16*, int);\n"
-                "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float>(\n"
-                "    const float*, float*,  int, int, int, int, int, int,\n"
-                "    const float*,  int);\n"
-                "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float>(\n"
-                "    const float*, float*,  int, int, int, int, int, int,\n"
-                "    const float*,  int);\n"
             )
             self._host_instantiations.append(
                 {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
@@ -1912,6 +1903,65 @@ void
                 os.path.join(self.instances_path, f"{name}_C{dtype}.device.cu")
             ).write_text(contents)
 
+    def _emit_splitk_reduce_tu(self):
+        """Emit a single splitk_reduce.device.cu carrying the 4 reduce
+        kernel specialisations (D_OUT bf16/fp32 x HAS_BIAS true/false).
+
+        Why a dedicated TU: each splitk kid's fused-host launcher body
+        does <<<...>>> on all 4 reduce specialisations to handle every
+        Y dtype / bias combination at runtime. That used to inline the
+        4 `template __global__` instantiations into every splitk kid's
+        device.cu (see _gen_flatmm_splitk_instance comment). The linker
+        deduped the resulting weak symbols, but each splitk TU still
+        paid the full RA + ISA-emit cost on its own compile -- ~0.4s
+        wall per TU x 23 splitk TUs = ~9s of duplicated CPU work that
+        also lengthened each TU's individual wall and tightened the
+        ninja schedule on the slowest splitk kid.
+
+        Centralising them here means:
+          * each splitk device.cu only carries its own main-kernel
+            instantiation (~50% smaller .o, ~0.3-0.5s less wall each),
+          * one new tiny TU compiles the 4 reduces in ~1s wall total,
+          * link still works because the reduce symbols are __global__
+            (the host stubs the fused TU emits are linked against this
+            single TU's GPU code, not against per-splitk-TU copies).
+
+        The reduce kernel template lives in splitk_reduce_gfx950.cuh,
+        included transitively here via the splitk pipeline header so we
+        get the same definition the splitk kids saw before. There's no
+        need to gate via OPUS_FUSED_HOST_TU because no launcher body or
+        traits structure is being pulled in.
+        """
+        contents = (
+            "// SPDX-License-Identifier: MIT\n"
+            "// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.\n"
+            "//\n"
+            "// Auto-generated. Do not edit. See gen_instances.py:_emit_splitk_reduce_tu.\n"
+            "//\n"
+            "// Dedicated device TU for the 4 splitk_reduce_kernel\n"
+            "// specialisations (D_OUT bf16/fp32 x HAS_BIAS true/false).\n"
+            "// Carved out of every splitk kid's device.cu so the reduce\n"
+            "// kernels only get RA'd / ISA-emitted once instead of 23\n"
+            "// times. Compiled with -D__HIPCC_RTC__ (per-source flag in\n"
+            "// optCompilerConfig.json) so the host pass is minimal.\n"
+            '#include "gfx950/splitk_reduce_gfx950.cuh"\n'
+            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, true,  __bf16>(\n"
+            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const __bf16*, int);\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, __bf16, false, __bf16>(\n"
+            "    const float*, __bf16*, int, int, int, int, int, int,\n"
+            "    const __bf16*, int);\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, float,  true,  float>(\n"
+            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const float*,  int);\n"
+            "template __global__ void splitk_reduce_kernel<16, 64, float,  false, float>(\n"
+            "    const float*, float*,  int, int, int, int, int, int,\n"
+            "    const float*,  int);\n"
+        )
+        Path(os.path.join(self.instances_path, "splitk_reduce.device.cu")).write_text(
+            contents
+        )
+
     def gen_instances(self, kernels_dict):
         if os.path.exists(self.impl_path):
             shutil.rmtree(self.impl_path)
@@ -1928,10 +1978,20 @@ void
         for mnk, k in kernels_dict.items():
             self.gen_instance(k)
 
-        # Emit one fused HOST TU + N device TUs (one per kid, dtype).
-        # See the docstrings on those methods for the full rationale.
+        # Emit one fused HOST TU + N device TUs (one per kid, dtype) +
+        # one dedicated splitk_reduce.device.cu. See the docstrings on
+        # those methods for the full rationale.
         self._emit_fused_host_tu()
         self._emit_device_tus()
+        # Only emit the standalone reduce TU if the build actually has a
+        # splitk kid (otherwise the fused host TU will never reference
+        # any reduce symbol and the linker would warn about an unused
+        # weak object). Probed by checking any device instantiation
+        # whose kernel function name is the splitk one.
+        if any(
+            "flatmm_splitk" in row["kid_name"] for row in self._device_instantiations
+        ):
+            self._emit_splitk_reduce_tu()
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_manifest_head(kernels_dict)

@@ -450,6 +450,19 @@ for it). Five landed rounds of optimization, in order:
    `{shape, kernel_function_pointer}` plus
    `std::lower_bound`. No template instantiation overhead, no
    heap allocation on first call, faster runtime lookup.
+6. **`splitk_reduce_kernel` carved out of every splitk kid's
+   device.cu into one dedicated `splitk_reduce.device.cu`** --
+   the 4 reduce specialisations (D_OUT bf16/fp32 x HAS_BIAS
+   true/false) used to be appended to every splitk kid's
+   `template __global__` instantiation list, so all 23 splitk
+   TUs each compiled the 4 reduce kernels redundantly. Linker
+   deduped the resulting weak symbols, but each TU still paid
+   the full RA + ISA emit cost on its own compile (~0.3-0.5s
+   per TU x 23 = ~9s of duplicated CPU work). Now they live in
+   a single 0.3s TU. End-to-end wall doesn't move (slowest
+   single TU is still the bottleneck on this hardware) but
+   per-splitk-TU wall drops 8-15% and the build's CPU footprint
+   shrinks accordingly, helping when MAX_JOBS is constrained.
 
 **Headline** (128-core demon_test, ROCm 7.2.2, `MAX_JOBS=102`,
 3-trial average over `AITER_REBUILD=1` with cleared build dir):
@@ -460,8 +473,18 @@ for it). Five landed rounds of optimization, in order:
 | Host/device split (38 .cpp's, kernel decl in `#ifdef`) | **32.5s** (31.8 / 34.2 / 31.6) |
 | Fused host TU + 38 device TUs | **22.3s** (22.5 / 22.0 / 22.4) |
 | + torch removal in launchers | **19.4s** (19.5 / 19.5 / 19.2) |
-| **+ dispatcher torch removal + flat-array lookup (current)** | **14.0s** (14.1 / 14.0 / 14.0) |
-| **Saving vs. baseline** | **−34.4s (−71%)** |
+| + dispatcher torch removal + flat-array lookup | **14.0s** (14.1 / 14.0 / 14.0) |
+| **+ dedicated splitk_reduce TU (current)** | **14.4s** (14.0 / 14.7 / 14.4) |
+| **Saving vs. baseline** | **−34.0s (−70%)** |
+
+Round 6 (dedicated reduce TU) doesn't move end-to-end wall on
+this hardware: the slowest splitk kid (`64x96x64_wgpcu1`) is the
+critical path at ~8s and dropping its 4 reduce kernels saves it
+~0.3s (still bottleneck-bound by its own main-kernel codegen).
+The benefit is in CPU work avoided -- previously 23 splitk TUs x
+~0.4s of redundant reduce codegen each, now 1 TU x 0.3s total.
+On hardware with smaller MAX_JOBS or under load, this shows up
+as a real wall-time win.
 
 Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 `op_tests/test_opus_a16w16_lookup.py` 338/338 still pass.
@@ -497,9 +520,115 @@ total wall                                                ~14s
 
 The 8.5s on that one kid is real AMDGPU backend work
 (register allocation, instruction scheduling, ISA emit) on a
-heavy MFMA-32x32 splitk pipeline -- not parse / template waste --
-so further wall savings need either fewer kid instantiations or
-AMDGPU `-mllvm` flag tuning to shorten that backend pass.
+heavy MFMA-32x32 splitk pipeline -- not parse / template waste.
+See §7.6.1 below for the device-pass forensic breakdown
+(LLVM Greedy RA's `Evict` sub-pass is 99% of RA time = 5.2s,
+driven by ~9000 SGPR spill-to-VGPR-lane decisions on this kid).
+
+#### 7.6.1 Device-pass forensics on the slowest splitk kid
+
+`flatmm_splitk_64x96x64_wgpcu1<fp32_t>` is the build's
+critical-path TU. `hipcc -ftime-report` on it shows:
+
+```
+Pass 1 (DEVICE pass): 8.29s total
+├── Front end:                0.66s ( 8%)   parse pipeline header + traits
+├── Optimizer:                0.61s ( 7%)   middle-end opt passes
+├── LLVM IR generation:       0.09s ( 1%)
+└── Machine code generation:  6.94s (84%)   ← AMDGPU backend
+    ├── Greedy Register Allocator: 5.74s (77% of total)
+    │   └── Evict sub-pass:        5.22s (99% of RA)
+    ├── Machine Instruction Sched: 0.56s ( 7%)
+    └── ~150 other passes:         ~0.45s
+
+Pass 2 (HOST pass): 0.11s   ← RTC short-circuits libtorch + libstdc++
+```
+
+GPU codegen metadata (extracted from the resulting fat binary):
+
+| Metric | Value |
+|---|---:|
+| Main kernel ISA size | **388 KB** (vs ~8 KB for non-splitk kids) |
+| `vgpr_count` (logical) | 423 |
+| `agpr_count` (acc registers) | 167 |
+| `sgpr_count` | 106 |
+| `sgpr_spill_count` | **8931** |
+| `vgpr_spill_count` | 0 |
+| `private_segment_fixed_size` (scratch / wave) | 24 704 bytes |
+| `group_segment_fixed_size` (LDS / WG) | 144 KB |
+| `prefetch_k_iter` | 7 |
+| `WG_PER_CU` | 1 (wgpcu1) |
+
+**Why `Evict` runs for 5.2s** -- ISA size, register pressure
+and SGPR spill all stem from one structural choice. `wgpcu1`
+sets WG_PER_CU=1, which gives the kernel the entire CU's
+registers + LDS. `prefetch_k_iter = LDS_total / per_iter_LDS = 7`
+on this shape, so the K-loop carries **7 prefetch buffers'
+worth of register tile state simultaneously**. With
+`comrep=(2,6)` (2 M x 6 N MFMA tiles per consumer wave) that's
+~336 independent vector-register live ranges open at once
+across 256 physical VGPRs + 167 AGPRs. LLVM's Greedy RA enters
+its `Evict` policy: every conflict triggers an enumeration of
+candidate live ranges to spill, with recursive spill-cost
+calculation. On this kernel the candidate count and recursion
+depth combine into ~5s of pure RA work.
+
+**Why `sgpr_spill_count = 8931`** -- the K-loop indexes the
+prefetch buffers via `slot = issue_k % pfk` (a runtime int).
+GFX9 has no "load VGPR by runtime index" instruction
+(`v_movrels_b32` exists but is restricted), so for each of the
+~192 register tile elements that need slot-indexed access, LLVM
+expands the read into a 7-way `s_cmp_eq + s_cselect_b64 +
+v_cndmask_b32` select tree:
+
+```asm
+s_cmp_eq_u32 s0, 1
+s_cselect_b64 vcc, -1, 0
+v_cndmask_b32_e32 v130, v6, v183, vcc
+s_cmp_eq_u32 s0, 2
+s_cselect_b64 vcc, -1, 0
+v_cndmask_b32_e32 v130, v130, v7, vcc
+... ×7 (one per prefetch slot) ×192 tile elements
+```
+
+Every `s_cselect_b64` produces a `vcc` (a 64-bit SGPR pair)
+live range. With ~12 000 `s_cselect_b64` and ~12 000
+`s_cmpk_eq_i32 / s_cmp_eq_u32` instructions in the kernel, the
+SGPR pressure exceeds the gfx950 physical SGPR cap (~100
+addressable). LLVM's AMDGPU backend handles the overflow by
+**spilling SGPRs to VGPR lanes** (`v_writelane_b32 v252-v255,
+sN, lane_idx`) instead of going to scratch memory. We see
+8931 such spill points statically; the assembly contains 17956
+total `v_writelane` / `v_readlane` instructions because each
+spilled SGPR is reloaded once on average. Four whole VGPRs
+(v252, v253, v254, v255) are reserved as 64-lane SGPR scratch.
+
+Stack frame metadata confirms it:
+
+```
+Function: gemm_a16w16_flatmm_splitk_kernel<...wgpcu1...>
+  private_segment_fixed_size = 24704 bytes
+  ~96 x 256-byte slots (each = one 64-lane wave-level register
+  tile spilled to scratch as a fallback when even the 4 VGPR
+  scratch lanes can't hold a particular live range)
+```
+
+**Bottom line on this TU**: the 8.5s wall is the price of
+choosing `prefetch_k_iter = 7` for runtime perf reasons. The
+Greedy RA Evict cost and the SGPR spill blow-up are downstream
+consequences of that one structural choice. Reducing wall here
+requires either:
+
+1. structurally lowering `pfk` (perf trade-off -- shallower
+   K-pipeline = less L1/LDS reuse), or
+2. teaching the kernel author to write the slot-rotation
+   without runtime indexing (hand-unroll the slot dispatch),
+   which removes the `s_cselect` chains entirely and probably
+   cuts SGPR spill 10x.
+
+Neither is a build-system change. The B-track flag sweep
+(see §7.7) confirms no `-mllvm` knob recovers any meaningful
+wall on this kernel.
 
 **What the codegen actually emits** (post-fusion):
 
@@ -624,9 +753,9 @@ path.
   CPU saturation isn't the bottleneck — the host TU's serial parse
   of `<torch/extension.h>` is.
 
-### 7.7 Future compile-time work (un-implemented; analysis only)
+### 7.7 Future compile-time work
 
-The current 14.0s floor is set by **the slowest single device
+The current 14.4s floor is set by **the slowest single device
 TU's GPU codegen (~8.5s on `flatmm_splitk_64x96x64_wgpcu1` -- 84%
 in machine-code generation, i.e. AMDGPU register allocation +
 instruction scheduling on an MFMA-32x32 splitk pipeline)**, not
@@ -635,55 +764,90 @@ each and runs in parallel; ninja schedules them comfortably
 inside the slowest device TU's wall time. Remaining attack
 surface, in rough order of expected payoff vs. invasiveness:
 
-1. **Drop AMDGPU-side `-mllvm` flags that slow codegen** -- the
-   build currently passes `--lsr-drop-solution=1`,
-   `-amdgpu-early-inline-all=true`, `-amdgpu-function-calls=false`,
-   `-enable-post-misched=0`, `--amdgpu-mfma-vgpr-form` to every
-   device TU. The 8.5s critical-path TU's MCG dominates total
-   build time, so this is the only remaining lever that targets
-   it directly. Some of these flags trade compile time for
-   marginal kernel-perf wins on small shapes; auditing per-flag
-   with `-ftime-report` and the existing tuning harness could
-   reclaim a meaningful slice. Risk: must validate that
-   `op_tests/test_opus_a16w16_*` performance numbers don't
-   regress on the tuned shapes. Saving: speculative; needs
-   measurement, but the upper bound is "the slowest device TU's
-   MCG time" = ~6-7s.
+1. **(MEASURED, NEGATIVE)** AMDGPU-side `-mllvm` flag sweep --
+   the build's device passes inherit five aiter-global -mllvm
+   flags (`--amdgpu-kernarg-preload-count=16`,
+   `--lsr-drop-solution=1`, `-amdgpu-early-inline-all=true`,
+   `-amdgpu-function-calls=false`, `-enable-post-misched=0`)
+   plus opus-private `--amdgpu-mfma-vgpr-form`. Earlier
+   speculation was that `-amdgpu-early-inline-all=true` +
+   `-amdgpu-function-calls=false` (which together force every
+   call to inline into one mega-function for the RA) might be
+   responsible for the long Greedy RA Evict pass. We measured
+   five build configurations:
 
-2. **Trim or split heavy splitk kid instantiations** -- the
-   slowest 4-5 splitk kids (`*_64x96x*` and `*_96x64x*` family
-   with `wgpcu1`) eat the entire ninja schedule's tail. Empirical
-   sweep of tuned CSV winners would reveal which of these are
-   actually selected for production shapes; un-selected kids can
-   be dropped at codegen time, removing them from the build
-   entirely. Saving: depends on CSV coverage; potentially -3 to
-   -5s end-to-end.
+   | Config | Slowest TU wall | Build wall (3-trial avg) | Perf vs baseline (geomean of 24 dsv3+gptoss bf16 shapes) |
+   |---|---:|---:|---:|
+   | baseline (all 6 flags on) | 7.66s | 18.1s | reference |
+   | `-amdgpu-early-inline-all=false` override | 7.68s | 17.9s | +0.24% (slower by 0.24%) |
+   | `-amdgpu-function-calls=true` override | 7.74s | 17.8s | -0.10% (faster by 0.10%) |
+   | `--amdgpu-mfma-vgpr-form=false` override | 7.75s | 18.3s | +0.04% |
+   | all three off | 7.71s | 17.9s | +0.06% |
 
-3. **`ccache` / `sccache` integration** -- reuse `.cuda.o` across
-   rebuilds when `gen_instances.py` produces a byte-identical TU.
-   Pure infra change, complementary to all other items. The first
-   build still pays full freight; subsequent rebuilds (e.g.
-   `AITER_REBUILD=1` after a CSV-only edit) drop to seconds.
-   This was deferred earlier because parsing was the bottleneck
-   and parses don't compose well across rebuilds; with parse
-   gone, MCG dominates and MCG output is much more cacheable.
+   Both build wall and perf differences are within measurement
+   noise (~1%). We also tried `-O1`, `--amdgpu-igrouplp-exact-solver=0`,
+   and `-greedy-regalloc-eviction-max-iterations=2` (last one
+   doesn't exist in ROCm 7.2.2 LLVM and was rejected). None
+   reduced the slowest TU's wall by more than measurement
+   noise. Conclusion: **the Greedy RA Evict cost on this kid
+   is fundamental to the IR's register pressure**, not gated
+   by any user-tunable -mllvm flag in this LLVM revision. See
+   §7.6.1 for the underlying SGPR-spill / pfk=7 analysis. The
+   five flags should stay in the global config because they
+   improve perf on smaller kids elsewhere in aiter.
 
-4. **Header structure cleanup** (low priority) -- `opus.hpp` is
+2. **Trim or split heavy splitk kid instantiations** (untried,
+   high potential) -- the slowest 4-5 splitk kids (`*_64x96x*`
+   and `*_96x64x*` family with `wgpcu1`) eat the entire ninja
+   schedule's tail. Empirical sweep of tuned-CSV winners would
+   reveal which of these are actually selected for production
+   shapes; un-selected kids can be dropped at codegen time,
+   removing them from the build entirely. Saving: depends on
+   CSV coverage; potentially -3 to -5s end-to-end if the
+   slowest 1-2 kids turn out unused.
+
+3. **Restructure splitk pipeline to remove runtime slot
+   indexing** (high potential, structural) -- the SGPR spill
+   blow-up (§7.6.1) all flows from `slot = issue_k % pfk`
+   being a runtime int that drives ~192 register-tile reads
+   per K-loop iteration. Hand-unrolling the slot dispatch into
+   `pfk` separate code paths (one per slot value, statically
+   selected) would eliminate every `s_cselect_b64` chain and
+   collapse the SGPR live-range count. This is a kernel-author
+   change rather than a build-system change but its expected
+   wall benefit is the largest of any remaining option:
+   estimated -3 to -4s on the critical-path TU, which would
+   bring end-to-end build wall to ~10-11s.
+
+4. **`ccache` / `sccache` integration** -- reuse `.cuda.o`
+   across rebuilds when `gen_instances.py` produces a
+   byte-identical TU. Pure infra change, complementary to all
+   other items. The first build still pays full freight;
+   subsequent rebuilds (e.g. `AITER_REBUILD=1` after a CSV-only
+   edit) drop to seconds. This was deferred earlier because
+   parsing was the bottleneck and parses don't compose well
+   across rebuilds; with parse gone, MCG dominates and MCG
+   output is much more cacheable.
+
+5. **Header structure cleanup** (low priority) -- `opus.hpp` is
    3055 lines, parsed by every device TU on its device pass and
-   by the fused host TU on its host pass. The fused TU now parses
-   it in ~1.3s and that's already off the critical path; the
-   per-device TU host pass is even shorter (~0.1s with RTC). Only
-   worth doing for cleanliness, not for time.
+   by the fused host TU on its host pass. The fused TU now
+   parses it in ~1.3s and that's already off the critical path;
+   the per-device TU host pass is even shorter (~0.1s with RTC).
+   Only worth doing for cleanliness, not for time.
 
-The combined ceiling, if item 1 lands without regression, is
-roughly **8-9s** end-to-end on this hardware -- limited by ninja
-schedule overhead + the link step + Python startup + the
-unavoidable minimum AMDGPU codegen wall on the heaviest single
-kernel. Beyond that, further wall savings need either fewer
-heavy kid instantiations (item 2) or fundamentally re-thinking
-the splitk pipeline so it doesn't generate as much GPU code per
-template instantiation, which is a structural change rather than
-a build-time one.
+Practical ceiling on this hardware:
+
+- if item 2 lands and trims the slowest 2 kids: **~10-11s**
+  end-to-end (slowest remaining TU is ~5-6s)
+- if item 3 lands (structural slot-rotation rewrite):
+  **~10-11s** by a different route (the slowest TU itself
+  drops from 8.5s to ~5s)
+- combined items 2 + 3: **~7-8s** floor
+
+Item 1 (-mllvm flag sweep) is closed (measured negative).
+Items 4 + 5 are infrastructure / cleanliness, not on the wall
+critical path.
 
 ---
 
