@@ -1,22 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
-import functools
-import json
-import os
-import torch
 import triton
-import math
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from triton import language as tl
-
-_LOGGER = AiterTritonLogger()
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton.utils.logger import AiterTritonLogger # debug
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(

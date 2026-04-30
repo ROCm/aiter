@@ -12,12 +12,10 @@ import math
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger # to debug
-from triton import language as tl
 from aiter.ops.triton._gluon_kernels.gemm_a8w8_blockscale import _gemm_a8w8_blockscale_kernel
 
+
 _LOGGER = AiterTritonLogger()
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
 
 
 def _get_config(
