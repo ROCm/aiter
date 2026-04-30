@@ -178,6 +178,8 @@ def _emit_stage1_gate_up_epilogue(
     topk: int,
     num_valid_i32=None,
     block_row_start=None,
+    lds_tid=None,
+    memref=None,
     sorted_rsrc,
     tw_rsrc,
     out_rsrc,
@@ -194,6 +196,15 @@ def _emit_stage1_gate_up_epilogue(
     range_constexpr,
     T,
 ):
+    # ``lds_tid``: optional memref<tile_m x i32, shared> holding the pre-decoded
+    # ``sorted_token_ids`` for the current M-tile. Invalid rows (outside the
+    # route slot range or beyond ``num_valid``) are pre-filled with the sentinel
+    # ``0xFFFFFFFF`` so that ``tok_ok``/``slot_ok`` below naturally reject them.
+    # When provided (together with ``memref``), the per-row ``fused`` i32 comes
+    # from a single ``ds_read_b32`` instead of a ``buffer_load(sorted_rsrc,...)``,
+    # eliminating redundant VMEM traffic in the epilogue. When ``lds_tid`` is
+    # ``None`` we fall back to the original per-row buffer_load.
+    _use_lds = lds_tid is not None and memref is not None
     c_topk_i32 = arith.constant(int(topk), type=T.i32)
     default_block_row_start = arith.index_cast(T.i32, by * arith.index(int(route_tile_m)))
     row_base_i32 = block_row_start if block_row_start is not None else default_block_row_start
@@ -217,7 +228,10 @@ def _emit_stage1_gate_up_epilogue(
             sorted_i32,
             row_base_i32,
         )
-        fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
+        if _use_lds:
+            fused = memref.load(lds_tid, [row_local])
+        else:
+            fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
         slot = fused >> arith.constant(24, type=T.i32)
         tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
@@ -262,6 +276,8 @@ def _emit_stage1_gate_up_splitk_epilogue(
     topk: int,
     num_valid_i32,
     block_row_start,
+    lds_tid=None,
+    memref=None,
     sorted_rsrc,
     out_rsrc,
     out_elem_ty,
@@ -287,7 +303,10 @@ def _emit_stage1_gate_up_splitk_epilogue(
       out[row, col]                   += gate_partial[row, col]
       out[row, col + inter_dim]       += up_partial[row, col]
     where ``row = tok * topk + slot`` and ``col < inter_dim``.
+
+    ``lds_tid`` (optional): see ``_emit_stage1_gate_up_epilogue``.
     """
+    _use_lds = lds_tid is not None and memref is not None
     c_topk_i32 = arith.constant(int(topk), type=T.i32)
     c2_i32 = arith.constant(2, type=T.i32)
     zero_i32 = arith.constant(0, type=T.i32)
@@ -311,7 +330,10 @@ def _emit_stage1_gate_up_splitk_epilogue(
         row_in_valid = arith.cmpi(arith.CmpIPredicate.slt, sorted_i32, num_valid_i32)
         row_ok_meta = arith.andi(row_in_route, row_in_valid)
         sorted_safe = arith.select(row_ok_meta, sorted_i32, block_row_start)
-        fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
+        if _use_lds:
+            fused = memref.load(lds_tid, [row_local])
+        else:
+            fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
         slot = fused >> arith.constant(24, type=T.i32)
         tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
@@ -379,6 +401,8 @@ def _emit_stage2_store_epilogue(
     topk: int,
     num_valid_i32,
     block_row_start,
+    lds_tid=None,
+    memref=None,
     sorted_rsrc,
     tw_rsrc,
     out_rsrc,
@@ -396,6 +420,8 @@ def _emit_stage2_store_epilogue(
     rocdl,
     T,
 ):
+    # ``lds_tid`` (optional): see ``_emit_stage1_gate_up_epilogue``.
+    _use_lds = lds_tid is not None and memref is not None
     c_topk_i32 = arith.constant(int(topk), type=T.i32)
     c2_i32 = arith.constant(2, type=T.i32)
     zero_i32 = arith.constant(0, type=T.i32)
@@ -413,7 +439,10 @@ def _emit_stage2_store_epilogue(
         row_in_valid = arith.cmpi(arith.CmpIPredicate.slt, sorted_i32, num_valid_i32)
         row_ok = arith.andi(row_in_route, row_in_valid)
         sorted_safe = arith.select(row_ok, sorted_i32, block_row_start)
-        fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
+        if _use_lds:
+            fused = memref.load(lds_tid, [row_local])
+        else:
+            fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
         tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
         slot = fused >> arith.constant(24, type=T.i32)
         tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
@@ -1006,8 +1035,14 @@ def _compute_pipeline_plan(
     use_tdm_gather: bool,
     wave_specialized_tdm: bool,
     tdm_loader_waves: int,
+    use_tdm_gather_as: bool = False,
 ) -> dict:
-    """Compute pipeline pre-load / tail plan shared by mxscale stages."""
+    """Compute pipeline pre-load / tail plan shared by mxscale stages.
+
+    ``use_tdm_gather_as`` reserves TDM slots for the A-scale gather path so that
+    ``TDM_PER_STEP`` and the derived fence counts account for the extra
+    ``tensor_load_gather`` instructions issued for scales.
+    """
     from kernels.pipeline_utils import make_tail_plan
 
     pre_loaded = int(num_buffers) - 1
@@ -1015,13 +1050,24 @@ def _compute_pipeline_plan(
     tail_start = loop_iters * int(num_buffers)
     extra = num_k_tiles - tail_start - pre_loaded
     A_GATHER_GROUPS = (int(tile_m) + 7) // 8 if bool(use_tdm_gather) else 0
-    if bool(use_tdm_gather) and bool(wave_specialized_tdm):
-        A_GATHER_TDM_PER_STEP = (
-            (A_GATHER_GROUPS + tdm_loader_waves - 1) // tdm_loader_waves
-        )
+    AS_GATHER_GROUPS = (int(tile_m) + 7) // 8 if bool(use_tdm_gather_as) else 0
+    if bool(wave_specialized_tdm):
+        if bool(use_tdm_gather):
+            A_GATHER_TDM_PER_STEP = (
+                (A_GATHER_GROUPS + tdm_loader_waves - 1) // tdm_loader_waves
+            )
+        else:
+            A_GATHER_TDM_PER_STEP = 0
+        if bool(use_tdm_gather_as):
+            AS_GATHER_TDM_PER_STEP = (
+                (AS_GATHER_GROUPS + tdm_loader_waves - 1) // tdm_loader_waves
+            )
+        else:
+            AS_GATHER_TDM_PER_STEP = 0
     else:
         A_GATHER_TDM_PER_STEP = A_GATHER_GROUPS
-    TDM_PER_STEP = B_TDM_PER_STEP + A_GATHER_TDM_PER_STEP
+        AS_GATHER_TDM_PER_STEP = AS_GATHER_GROUPS
+    TDM_PER_STEP = B_TDM_PER_STEP + A_GATHER_TDM_PER_STEP + AS_GATHER_TDM_PER_STEP
     fence_outstanding = TDM_PER_STEP * (int(num_buffers) - 2)
     base_tail_plan = make_tail_plan(int(num_buffers), pre_loaded, extra)
     tail_plan = [
@@ -1039,6 +1085,7 @@ def _compute_pipeline_plan(
         tail_start=tail_start,
         extra=extra,
         A_GATHER_GROUPS=A_GATHER_GROUPS,
+        AS_GATHER_GROUPS=AS_GATHER_GROUPS,
         TDM_PER_STEP=TDM_PER_STEP,
         fence_outstanding=fence_outstanding,
         tail_plan=tail_plan,
