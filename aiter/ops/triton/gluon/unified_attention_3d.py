@@ -343,7 +343,9 @@ class AttentionConfig:
                 )
             )
 
-            # BLOCK_SIZE == 128 and NUM_WARPS == 1 is ensured in the helper function, hence hardcoded the first and the last dimension of V_SCALES_DOT_BROADCAST_LAYOUT
+            # BLOCK_SIZE == 128 and quantization block size == 16 is asserted, hence hardcoded the first and the last dimension of V_SCALES_DOT_BROADCAST_LAYOUT
+            log2_num_head_broadcast_chunk = int(math.log2(HEAD_SIZE // 16))
+            log2_num_warps = int(math.log2(NUM_WARPS))
             self.V_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(
                 gl.DistributedLinearLayout(
                     reg_bases=[
@@ -355,11 +357,11 @@ class AttentionConfig:
                         [64, 0, 0],
                     ]
                     + [
-                        [0, v + 1, 0]
-                        for v in range(int(math.log2(self.HEAD_SIZE // 16)))
+                        [0, 2**v, 0]
+                        for v in range(log2_num_warps, log2_num_head_broadcast_chunk)
                     ],
                     lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32, 0, 0]],
-                    warp_bases=[],
+                    warp_bases=[[0, 2**v, 0] for v in range(log2_num_warps)],
                     block_bases=[],
                     shape=[self.BLOCK_SIZE, self.HEAD_SIZE // 16, 16],
                 )
