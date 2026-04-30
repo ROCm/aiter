@@ -271,9 +271,12 @@ class TorchTensor(TensorBase):
 
 
 class GTensor(TensorBase):
-    def __init__(self, memref, dtype, shape, stride=None, base_offset=0):
+    def __init__(
+        self, memref, dtype, shape, stride=None, base_offset=0, cache_modifier=0
+    ):
         super().__init__(dtype, shape, stride, base_offset)
         self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
+        self.cache_modifier = cache_modifier
 
     def load(self, offset, vec_size=1):
         return buffer_ops.buffer_load(
@@ -281,7 +284,9 @@ class GTensor(TensorBase):
         )
 
     def store(self, offset, value, vec_size=1):
-        buffer_ops.buffer_store(value, self.rsrc, offset)
+        buffer_ops.buffer_store(
+            value, self.rsrc, offset, cache_modifier=self.cache_modifier
+        )
 
 
 class STensor(TensorBase):

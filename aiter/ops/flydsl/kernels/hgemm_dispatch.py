@@ -29,7 +29,7 @@ def compile_flydsl_hgemm_kernel(
     stages: int = 2,
     async_copy: bool = False,
     b_to_lds: bool = False,
-    b_preshuffle: bool = True,
+    b_preshuffle: bool = False,
     c_to_lds: bool = False,
     has_bias: bool = False,
 ):
@@ -38,6 +38,10 @@ def compile_flydsl_hgemm_kernel(
     del pack_n, stages, async_copy, c_to_lds
 
     if kernel_family in (None, KERNEL_FAMILY_HGEMM):
+        if b_preshuffle:
+            raise ValueError(
+                "Generic FlyDSL HGEMM does not support `b_preshuffle=True`"
+            )
         return compile_hgemm_kernel(
             dtype,
             n,
@@ -48,7 +52,6 @@ def compile_flydsl_hgemm_kernel(
             SPLIT_K=split_k,
             BLOCK_M_WARPS=block_m_warps,
             BLOCK_N_WARPS=block_n_warps,
-            B_PRE_SHUFFLE=b_preshuffle,
             B_TO_LDS=b_to_lds,
             HAS_BIAS=has_bias,
         )
