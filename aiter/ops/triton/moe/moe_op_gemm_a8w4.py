@@ -324,10 +324,12 @@ def moe_gemm_a8w4(
             alpha,
             limit,
             reduction_n_matmul,
+            add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
             config["block_k"],
+            config["group_m"],
             XCD_SWIZZLE=config["xcd_swizzle"],
             NUM_BUFFERS=(
                 config["num_buffers"]
@@ -379,6 +381,7 @@ def moe_gemm_a8w4(
             alpha,
             limit,
             reduction_n_matmul,
+            add_residual,
             routing_data.n_expts_act,
             config["block_m"],
             config["block_n"],
