@@ -1084,16 +1084,21 @@ class KvManager8bitsV3
     //   kRowOffset ? {0, 16, 32, 48}                  -- top/bot 16-row sub-tile of each pass.
     //                                                    (For kBlockN=32 only 0/16 valid.)
     //   kColOffset is a multiple of 32, < kQkHeadDim -- picks the 32-col strip.
-    // Layout B: pass 1 of all warps comes after pass 0 of all warps.
-    //   pass = kRowOffset / 32                          -> +pass * kNumWarps * 264
-    //   sub-block within pass = (kRowOffset % 32) / 16  -> +sub * 128
-    //   col strip: each kColOffset+=32 advances 4 warps -> +4 * 264
+    // Layout B (per 64-col block): pass 1 of all warps comes after pass 0 of all warps.
+    //   pass = kRowOffset / 32                            -> +pass * kNumWarps * 264
+    //   sub-block within pass = (kRowOffset % 32) / 16    -> +sub * 128
+    //   64-col block index = kColOffset / 64              -> +block * kNumBytesPerBlock
+    //   32-col strip within block = (kColOffset % 64) / 32 -> +strip * 4 * 264
+    // The block stride must use kNumBytesPerBlock (which depends on kBlockN via
+    // kNum2SubBlocks); collapsing it into (kColOffset/32)*4*264 only works when
+    // kNum2SubBlocks == 8 (i.e., kBlockN == 32).
     template <uint32_t kRowOffset, uint32_t kColOffset>
     static constexpr uint32_t get_block_fixed_offset()
     {
         return (kRowOffset / 32) * T::kNumWarps * kNumBytesPer2SubBlocksWithPadding +
                ((kRowOffset % 32) / 16) * kNumBytesPerSubBlock +
-               (kColOffset / 32) * 4 * kNumBytesPer2SubBlocksWithPadding;
+               (kColOffset / 64) * kNumBytesPerBlock +
+               ((kColOffset % 64) / 32) * 4 * kNumBytesPer2SubBlocksWithPadding;
     }
 
     public:
