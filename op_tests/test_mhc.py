@@ -627,7 +627,7 @@ parser.add_argument(
     "-m",
     type=int,
     nargs="*",
-    default=[512, 1024, 2048, 8192, 65536],
+    default=[1, 32, 64, 128, 256, 512, 1024, 2048, 8192, 65536],
     help="""M.
     e.g.: -m 32""",
 )
@@ -657,8 +657,8 @@ aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 
 df = []
 for dtype in args.dtype:
-    for m in args.m:
-        for hidden_size in args.hidden_size:
+    for hidden_size in args.hidden_size:
+        for m in args.m:
             for hc_mult in [4]:
                 ret = test_mhc_post(m=m, hidden_size=hidden_size, hc_mult=hc_mult)
                 df.append(ret)

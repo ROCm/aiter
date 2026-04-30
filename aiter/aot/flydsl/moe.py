@@ -40,6 +40,7 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    _get_compiled_silu_fused,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -70,12 +71,29 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            token = int(row["token"])
             model_dim = int(row["model_dim"])
             inter_dim = int(row["inter_dim"])
             experts = int(row["expert"])
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
+            block_m = int(row.get("block_m", "0") or "0")
+            act_type = row.get("act_type", "")
+            act = (
+                "swiglu"
+                if act_type.strip().split(".")[-1].lower() == "swiglu"
+                else "silu"
+            )
+            q_type = row.get("q_type", "")
+            dtype = row.get("dtype", "")
+            # TODO: Replace this GPT-OSS-specific bias inference with an
+            # explicit CSV/config field once the model config can express it.
+            enable_bias = (
+                act == "swiglu"
+                and q_type.strip().split(".")[-1] == "per_1x32"
+                and dtype in ("torch.bfloat16", "torch.float16")
+            )
 
             for col in ("kernelName1", "kernelName2"):
                 name = row.get(col, "").strip()
@@ -90,18 +108,25 @@ def parse_csv(csv_path: str):
                     "topk": topk,
                     "doweight_stage1": doweight_stage1,
                     "cu_num": cu_num,
+                    "act": act,
+                    "enable_bias": enable_bias,
                 }
-                key = job_identity(job)
-                if key in seen:
-                    continue
-                seen.add(key)
-
                 params = get_flydsl_kernel_params(name)
                 if params is None:
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
 
-                jobs.append({**job, **params})
+                if params["stage"] == 2:
+                    job["token_num"] = token
+                    job["block_m"] = block_m
+
+                full_job = {**job, **params}
+                key = job_identity(full_job)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                jobs.append(full_job)
 
     return jobs
 
@@ -118,15 +143,21 @@ def _precompile_to_cache(
     a_dtype: str = "fp4",
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
+    act: str = "silu",
     doweight_stage1: bool = False,
     waves_per_eu: int = 3,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
     mode: str = "atomic",
-    persist: bool = False,
+    persist=None,
     sort_block_m: int = 0,
     cu_num: int = 0,
+    token_num: int = 0,
+    block_m: int = 0,
+    a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
+    enable_bias: bool = False,
     **kwargs,
 ):
     """Trigger MLIR compilation with dummy tensors and COMPILE_ONLY=1.
@@ -140,10 +171,114 @@ def _precompile_to_cache(
 
     dev = torch.device("cpu")
     _stream = 0
-    is_fp4 = b_dtype == "fp4"
+    is_fp4_weight = b_dtype == "fp4"
     tokens = tile_m
     E = experts
     _grid_y = 1
+
+    def _storage_numel(element_count: int, dtype: str) -> int:
+        return element_count // 2 if dtype == "fp4" else element_count
+
+    def _storage_dtype(dtype: str):
+        if dtype in ("fp4", "fp8"):
+            return torch.uint8
+        if dtype in ("fp16", "f16"):
+            return torch.float16
+        if dtype == "bf16":
+            return torch.bfloat16
+        return torch.int8
+
+    def _aot_sort_blocks() -> int:
+        token_count = token_num if token_num > 0 else tokens
+        sorting_block_m = block_m if block_m > 0 else tile_m
+        max_tokens_padded = token_count * topk + E * sorting_block_m - topk
+        return (max_tokens_padded + sorting_block_m - 1) // sorting_block_m
+
+    def _aot_stage2_m_blocks() -> int:
+        token_count = token_num if token_num > 0 else tokens
+        _sbm = sort_block_m if sort_block_m > 0 else tile_m
+        sort_blocks = _aot_sort_blocks()
+        if _sbm == tile_m:
+            return min(sort_blocks, token_count * topk)
+        total_sorted = sort_blocks * _sbm
+        return (total_sorted + tile_m - 1) // tile_m
+
+    def _aot_stage2_persist_m(m_blocks: int) -> int:
+        if persist is True:
+            persist_m = -1
+        elif persist is False:
+            persist_m = 4 if m_blocks > 256 else 1
+        else:
+            persist_m = -1 if m_blocks > 256 else 1
+
+        if a_dtype == "fp8":
+            persist_m = 1
+
+        return persist_m
+
+    def _precompile_silu_fused():
+        is_splitk = k_batch > 1
+        need_fp4 = out_dtype == "fp4"
+        need_fp8 = out_dtype == "fp8"
+        fuse_any_quant = need_fp4 or need_fp8
+        gate_up_interleave = gate_mode == "interleave"
+        splitk_fp4 = is_splitk and need_fp4
+        gui_sk = gate_up_interleave and is_splitk
+        gui_sk_fused = gui_sk and fuse_any_quant
+
+        if gui_sk_fused:
+            quant_mode = "fp4" if need_fp4 else "fp8"
+            gui_layout = True
+        elif gui_sk:
+            quant_mode = "none"
+            gui_layout = True
+        elif splitk_fp4:
+            quant_mode = "fp4"
+            gui_layout = False
+        else:
+            return
+
+        silu_fused = _get_compiled_silu_fused(
+            inter_dim,
+            topk,
+            quant_mode,
+            gui_layout,
+        )
+        sorted_len = max(tokens * topk, _aot_sort_blocks() * tile_m)
+        padded_cols = ((inter_dim // 32) + 7) // 8 * 8
+        scale_rows = (sorted_len + 255) // 256 * 256
+        tmp_out = torch.zeros(
+            tokens * topk * inter_dim * 2, device=dev, dtype=torch.bfloat16
+        )
+        out_buf = torch.zeros(
+            (
+                tokens * topk * inter_dim * 2
+                if quant_mode == "none"
+                else _storage_numel(tokens * topk * inter_dim, quant_mode)
+            ),
+            device=dev,
+            dtype=torch.uint8,
+        )
+        out_scale_sorted = torch.zeros(
+            scale_rows * padded_cols,
+            device=dev,
+            dtype=torch.uint8,
+        )
+        sorted_token_ids = torch.zeros(sorted_len, device=dev, dtype=torch.int32)
+        num_valid = torch.zeros(1, device=dev, dtype=torch.int32)
+        _run_compiled(
+            silu_fused,
+            (
+                tmp_out.view(-1, inter_dim * 2),
+                out_buf.view(-1),
+                out_scale_sorted,
+                sorted_token_ids,
+                num_valid,
+                tokens,
+                sorted_len,
+                _stream,
+            ),
+        )
 
     # Dummy routing tensors (shape matters, data doesn't)
     sorted_ids = torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
@@ -161,20 +296,39 @@ def _precompile_to_cache(
         if stage == 1:
 
             _is_splitk = k_batch > 1
-            n_in = inter_dim * 2 if is_fp4 else inter_dim
+            n_in = inter_dim * 2 if is_fp4_weight else inter_dim
             k_in = model_dim
 
-            if is_fp4:
+            if is_fp4_weight:
+                gemm_out_dtype = (
+                    "bf16" if _is_splitk and out_dtype in ("fp4", "fp8") else out_dtype
+                )
+                gemm_out_elems = tokens * topk * inter_dim
+                if _is_splitk:
+                    gemm_out_elems *= 2
                 out = torch.zeros(
-                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(gemm_out_elems, gemm_out_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(gemm_out_dtype),
                 )
-                a = torch.zeros(tokens * model_dim // 2, device=dev, dtype=torch.uint8)
+                a = torch.zeros(
+                    _storage_numel(tokens * model_dim, a_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(a_dtype),
+                )
                 w = torch.zeros(
-                    E * 2 * inter_dim * model_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(E * 2 * inter_dim * model_dim, b_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(b_dtype),
                 )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                a_scale = (
+                    torch.zeros(1, device=dev, dtype=torch.uint8)
+                    if a_dtype in ("fp4", "fp8")
+                    else torch.empty(0, device=dev, dtype=torch.float32)
+                )
                 w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
                 out_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                bias = torch.zeros(1, device=dev, dtype=torch.float32)
                 args = _s1_args_fp4(
                     out,
                     a,
@@ -191,6 +345,7 @@ def _precompile_to_cache(
                     k_in,
                     _grid_y,
                     dev,
+                    bias=bias if enable_bias else None,
                     stream=_stream,
                 )
             else:
@@ -231,31 +386,48 @@ def _precompile_to_cache(
                 doweight_stage1=doweight_stage1,
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
-                out_dtype=out_dtype,
+                out_dtype=gemm_out_dtype if is_fp4_weight else out_dtype,
+                act=act,
+                use_async_copy=True,
                 waves_per_eu=waves_per_eu,
                 k_batch=k_batch,
                 b_nt=b_nt,
                 gate_mode=gate_mode,
+                a_scale_one=a_scale_one,
+                xcd_swizzle=xcd_swizzle,
+                enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
+            if is_fp4_weight:
+                _precompile_silu_fused()
 
         elif stage == 2:
 
             accumulate = mode != "reduce"
-            _persist_m = -1 if persist else 4
+            _m_blocks = _aot_stage2_m_blocks()
+            _persist_m = _aot_stage2_persist_m(_m_blocks)
             n_in = model_dim
             k_in = inter_dim
 
-            if is_fp4:
+            if is_fp4_weight:
                 out = torch.zeros(tokens * model_dim, device=dev, dtype=torch.bfloat16)
                 a = torch.zeros(
-                    tokens * topk * inter_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(tokens * topk * inter_dim, a_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(a_dtype),
                 )
                 w = torch.zeros(
-                    E * model_dim * inter_dim // 2, device=dev, dtype=torch.uint8
+                    _storage_numel(E * model_dim * inter_dim, b_dtype),
+                    device=dev,
+                    dtype=_storage_dtype(b_dtype),
                 )
-                a_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                a_scale = (
+                    torch.zeros(1, device=dev, dtype=torch.uint8)
+                    if a_dtype in ("fp4", "fp8")
+                    else torch.empty(0, device=dev, dtype=torch.float32)
+                )
                 w_scale = torch.zeros(1, device=dev, dtype=torch.uint8)
+                bias = torch.zeros(1, device=dev, dtype=torch.float32)
                 args = _s2_args_fp4(
                     out,
                     a,
@@ -269,8 +441,9 @@ def _precompile_to_cache(
                     tokens,
                     n_in,
                     k_in,
-                    _grid_y,
+                    _m_blocks,
                     dev,
+                    bias=bias if enable_bias else None,
                     stream=_stream,
                 )
             else:
@@ -304,13 +477,16 @@ def _precompile_to_cache(
                 tile_m=tile_m,
                 tile_n=tile_n,
                 tile_k=tile_k,
-                doweight_stage2=False,
+                doweight_stage2=not doweight_stage1,
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
                 out_dtype=out_dtype,
                 accumulate=accumulate,
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
+                b_nt=b_nt,
+                xcd_swizzle=xcd_swizzle,
+                enable_bias=enable_bias,
             )
             _run_compiled(exe, args)
 

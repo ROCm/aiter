@@ -13,7 +13,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
 
-FLYDSL_VERSION = "flydsl==0.1.4.2"
+FLYDSL_VERSION = "flydsl==0.1.5.dev515"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
@@ -70,6 +70,41 @@ if not IS_WINDOWS and is_develop_mode():
                 FLYDSL_VERSION,
             ]
         )
+
+
+def _is_triton_installed():
+    from importlib.metadata import version as pkg_version
+
+    for pkg in [
+        "triton",
+        "pytorch-triton",
+        "pytorch-triton-rocm",
+        "triton-rocm",
+    ]:
+        try:
+            return pkg, pkg_version(pkg)
+        except Exception:
+            pass
+    return None
+
+
+def _run_install_triton():
+    print("[aiter] Installing amd-triton via .github/scripts/install_triton.sh")
+    install_triton = os.path.join(this_dir, ".github", "scripts", "install_triton.sh")
+    subprocess.check_call(["bash", install_triton])
+
+
+_triton_info = _is_triton_installed() if is_develop_mode() else None
+if _triton_info:
+    print(
+        f"[aiter] {_triton_info[0]}=={_triton_info[1]} is already installed,"
+        " recommend using .github/scripts/install_triton.sh to install triton"
+    )
+else:
+    try:
+        _run_install_triton()
+    except Exception:
+        print("[aiter] Skipping triton install via .github/scripts/install_triton.sh")
 
 
 def write_install_mode():
@@ -315,15 +350,15 @@ if PREBUILD_KERNELS != 0:
             prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
-        # --- FlyDSL AOT pre-compilation (MOE + GEMM in parallel, before CK) ---
+        # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
         _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
         os.environ["AITER_AOT_IMPORT"] = "1"
         try:
             from aiter.aot.flydsl.common import start_aot, wait_aot
 
             flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            _flydsl_pool, _flydsl_futures = start_aot(flydsl_cache_dir)
-            wait_aot(_flydsl_pool, _flydsl_futures)
+            pool, futures = start_aot(flydsl_cache_dir)
+            wait_aot(pool, futures)
         finally:
             if _prev_aot_import is None:
                 os.environ.pop("AITER_AOT_IMPORT", None)

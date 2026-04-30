@@ -35,6 +35,7 @@ def test_fused_qk_rope_cat_and_cache_mla(
     cache_dtype: bool,
     dtype: torch.dtype,
 ):
+    torch.manual_seed(0)
     pos = True
     _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
@@ -207,6 +208,7 @@ def test_fused_qk_rope_reshape_and_cache(
     offs: bool,
     dtype: torch.dtype,
 ):
+    torch.manual_seed(0)
     pos = True
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
@@ -231,6 +233,7 @@ def test_fused_qk_rope_reshape_and_cache(
         else:
             cache_dtype_actual = torch.float8_e4m3fnuz
             pytest.skip("Skipping FP8 dtype cases non-gfx950")
+    torch.manual_seed(0)
 
     if cache_flash:
         key_cache = torch.zeros(
@@ -441,6 +444,7 @@ def test_fused_qk_rope_reshape_and_cache_value_shuffle_layout(
     """Test fused_qk_rope_reshape_and_cache with value_cache in shuffle layout
     [num_blocks, num_kv_heads, block_size // x, head_size, x].
     """
+    torch.manual_seed(0)
     assert D % x_size == 0
     pos = True
     offs = False
@@ -584,6 +588,7 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
     pos = True
     offs = False
 
+    torch.manual_seed(0)
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
         T,
@@ -731,6 +736,7 @@ def test_fused_qk_rope_cosine_cache_llama(
     offs: bool,
     dtype: torch.dtype,
 ):
+    torch.manual_seed(0)
     pos = True
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
@@ -764,6 +770,7 @@ def test_fused_qk_rope_cosine_cache_llama(
         )
     else:
         pytest.skip()
+    torch.manual_seed(0)
 
     if cache_dtype == torch.uint8:
         k_scale = torch.randn(
