@@ -615,8 +615,6 @@ def test_mha_backward(
     dtype=torch.float16,
 ):
     HAS_DROPOUT = DROPOUT > 0.0
-    torch.cuda.empty_cache()
-    torch.manual_seed(20)
 
     if FP8 and not _supports_fp8:
         pytest.skip(f"FP8 not supported on {arch}")
@@ -629,7 +627,10 @@ def test_mha_backward(
     if FP8 and CAUSAL:
         pytest.skip("FP8+CAUSAL results in random precision errors")
 
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
     mha_set_use_fused_bwd_kernel(FUSED)
+
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     v = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
@@ -778,8 +779,6 @@ def test_mha_backward_varlen(
     HEAD_SZ = 128
     NUM_K_HEADS = 8
     HAS_DROPOUT = DROPOUT > 0.0
-    torch.cuda.empty_cache()
-    torch.manual_seed(20)
 
     if FP8 and not _supports_fp8:
         pytest.skip(f"FP8 not supported on {arch}")
@@ -790,7 +789,10 @@ def test_mha_backward_varlen(
     if CAUSAL and HAS_DROPOUT:
         pytest.skip("CAUSAL+DROPOUT backward results in NaNs")
 
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
     mha_set_use_fused_bwd_kernel(FUSED)
+
     q = torch.randn(BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     k = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
     v = torch.randn(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)

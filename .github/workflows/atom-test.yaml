@@ -89,6 +89,9 @@ jobs:
           repository: ${{ env.ATOM_REPOSITORY_URL }}
           branch: ${{ env.ATOM_BRANCH }}
 
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+
       - name: Download the ATOM base image
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'
         run: |
@@ -109,7 +112,9 @@ jobs:
               cd /app/aiter-test && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
-              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e .
+              MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 pip install -e . && \\
+              ./.github/scripts/install_triton.sh
+          RUN echo "=== amd-triton version ===" && pip show amd-triton || true
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
           EOF
 
