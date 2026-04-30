@@ -587,8 +587,11 @@ class Gemm:
         task = []
         flydsl_catalog = get_flydsl_bf16_catalog(self.m, self.n, self.k)
         weight_idx = 6 if self.is_shuffle else 1
+        min_tile_m = min((c["tile_m"] for _, _, c in flydsl_catalog), default=16)
         for solidx, kernel_name, config in flydsl_catalog:
             if config["b_preshuffle"] != self.is_shuffle:
+                continue
+            if config["tile_m"] > max(self.m, min_tile_m):
                 continue
             if self.n < config["tile_n"] or self.n % config["tile_n"] != 0:
                 continue
