@@ -185,8 +185,13 @@ void mla_decode_stage1_asm_fwd(
     }
     else
     {
-        args.out_16_nosplit = 0;
-        args.ptr_RP = nullptr;
+        // Legacy QH16 ASM kernels (nhead=32/64, qseqlen=1) write directly to
+        // output via ptr_RP when kv_split==1.  Passing nullptr causes GPU
+        // memory faults on gfx950.  Newer kernels (e.g. gqa_ratio=64) do not
+        // use ptr_RP and expect it to be null.
+        bool legacy_kernel = (gqa_ratio * max_seqlen_q <= 64);
+        args.out_16_nosplit = legacy_kernel ? kv_split : 0;
+        args.ptr_RP = legacy_kernel ? output->data_ptr() : nullptr;
         args.ptr_STP = num_kv_splits_indptr->data_ptr();
     }
 
