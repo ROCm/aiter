@@ -96,7 +96,9 @@ jobs:
               cd /aiter && \\
               git checkout ${{ env.GITHUB_COMMIT_SHA }} && \\
               git submodule sync && git submodule update --init --recursive && \\
-              pip install -e .
+              pip install -e . && \\
+              ./.github/scripts/install_triton.sh
+          RUN echo "=== amd-triton version ===" && pip show amd-triton || true
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
 
