@@ -868,6 +868,26 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    # Safety override: the CK 2-stage kernel has a tile-index buffer-overflow on gfx942
+    # for large expert/hidden-dim configurations.  Bypass any tuned config that would
+    # route to CK 2-stage and fall through to the heuristics below, which will select
+    # the 1-stage ASM path (fmoe_fp8_blockscale_g1u1) instead.
+    # Crash boundary (confirmed on MI325X / gfx942): E>=128, model_dim>=7168, token>=64.
+    _ck2stage_unsafe_gfx942 = (
+        q_type == QuantType.per_1x128
+        and get_gfx() == "gfx942"
+        and expert >= 128
+        and model_dim >= 7168
+        and token >= 64
+    )
+    if _ck2stage_unsafe_gfx942 and cfg is not None and not cfg.get("run_1stage", False):
+        logger.warning(
+            f"[fused_moe] Bypassing tuned CK 2-stage config for {keys}: "
+            "gfx942 CK stage2 OOB for E>=128, model_dim>=7168, token>=64; "
+            "using 1-stage ASM instead."
+        )
+        cfg = None
+
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -885,8 +905,12 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
-                # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 128 == 0)
+                # for fp8 blockscale, ck has better performance so prefer it;
+                # but force 1-stage on gfx942 for large E/model_dim configs to
+                # avoid a CK 2-stage tile-index buffer-overflow (OOB crash).
+                run_1stage = _ck2stage_unsafe_gfx942 or (
+                    token > 32 and (inter_dim % 128 == 0)
+                )
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
