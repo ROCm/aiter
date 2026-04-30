@@ -2920,7 +2920,7 @@ def _bwd_dkdv_inner(
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
         if ENABLE_DROPOUT:
-            pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
+            pT_dropout = pT * dropout_mask.to(pT.dtype) * dropout_scale
             dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             dv += tl.dot(pT.to(do.type.element_ty), do)
