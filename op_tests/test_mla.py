@@ -520,23 +520,38 @@ def test_mla(
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
 
-    # Gluon MLA decode test (bf16 only, nhead multiple of 64, decode_qlen=1,
-    # head_dim_ckv=512, head_dim_kpe=64, seq_len > 192, batch in (128,256), page_size=1)
+    # Gluon MLA decode test (bf16 only, nhead in (64,128), decode_qlen=1,
+    # head_dim_ckv=512, head_dim_kpe=64, batch in (64,128,256), page_size=1).
+    # NUM_KV_SPLITS is auto-picked by the wrapper so the launch fills ~256
+    # workgroups; the per-split min seq_len bound depends on it. Mirror the
+    # picker here to gate ctx_lens precisely.
     us_gluon_decode = 1e12
+    NUM_XCDS_GFX950 = 8
+    BLOCK_H_GLUON = 64
     if (
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
-        and nhead % 64 == 0
+        and nhead in (64, 128)
         and decode_qlen == 1
-        and ctx_lens > 192
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
-        and batch_size in (128, 256)
+        and batch_size in (64, 128, 256)
         and page_size == 1
     ):
-        err_gluon, us_gluon_decode = test_absorb_decode_gluon()
-        ret["decode:gluon_err"] = err_gluon
+        base_grid = (
+            NUM_XCDS_GFX950
+            * ((nhead + BLOCK_H_GLUON - 1) // BLOCK_H_GLUON)
+            * (batch_size // NUM_XCDS_GFX950)
+        )
+        splits_needed = max(1, (256 + base_grid - 1) // base_grid)
+        # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
+        num_kv_splits = 1 << (splits_needed - 1).bit_length()
+        # PIPELINE_STAGES=3, BLOCK_N=64 → 192; mirror wrapper's bound.
+        min_ctx_required = num_kv_splits * (192 + num_kv_splits)
+        if ctx_lens > min_ctx_required:
+            err_gluon, us_gluon_decode = test_absorb_decode_gluon()
+            ret["decode:gluon_err"] = err_gluon
     ret["decode:gluon_576"] = us_gluon_decode
 
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2

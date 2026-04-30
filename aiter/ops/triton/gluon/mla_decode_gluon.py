@@ -2,8 +2,18 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # Gluon MLA decode kernel originated from FlashMLA triton kernel(https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
-# Single-stage (NUM_KV_SPLITS=1) MLA attention using explicit Gluon layouts,
-# Constraints: CDNA4, PAGE_SIZE=1, bf16, BLOCK_H=64, BLOCK_N=64.
+# Stage-1 split-KV MLA attention using explicit Gluon layouts. When
+# NUM_KV_SPLITS=1 the kernel writes the final attention output to O directly
+# and no reduce is launched; when NUM_KV_SPLITS>1 each program writes per-split
+# (acc, lse) to a temp buffer and stage-2 (_mla_softmax_reducev_kernel) combines
+# them. NUM_KV_SPLITS is auto-picked in the wrapper so the launch grid fills
+# ~256 workgroups (one wave on MI350).
+# Constraints: CDNA4 (gfx950), bf16, PAGE_SIZE=1, BLOCK_H=64, BLOCK_N=64,
+#   head_dim_ckv=512, head_dim_kpe=64,
+#   nhead in {64, 128}, batch_size in {64, 128, 256},
+#   min_kv_seq_len > NUM_KV_SPLITS * (PIPELINE_STAGES*BLOCK_N + NUM_KV_SPLITS)
+#   where PIPELINE_STAGES=3 (sufficient to keep per-split num_iter > 3;
+#   see wrapper assert).
 #
 # 3-stage software pipeline (double-buffered, BLOCK_N=64 with 2x32 KV slices):
 #   AC = async_copy (global->LDS), LL = load (LDS->reg), P = page, K = K-cache, V = V-cache
@@ -20,6 +30,7 @@
 
 import torch
 import triton
+import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -58,9 +69,9 @@ def _mla_decode_gluon(
     WITHIN_2GB: gl.constexpr,
     NUM_XCDS: gl.constexpr,
 ):
-    cur_batch = gl.program_id(0) + gl.program_id(2) * NUM_XCDS
+    cur_batch = gl.program_id(0) + (gl.program_id(2) // NUM_KV_SPLITS) * NUM_XCDS
     cur_head_id = gl.program_id(1)
-    split_kv_id = 0
+    split_kv_id = gl.program_id(2) % NUM_KV_SPLITS
 
     # USE_2D_VIEW=True: fixed len or max padded VarLen
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
@@ -171,10 +182,12 @@ def _mla_decode_gluon(
     e_sum = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout))
     acc = gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout)
 
-    # num_kv_splits == 1
-    split_kv_end = cur_batch_seq_len
-    num_iter = gl.cdiv(split_kv_end, BLOCK_N)
-    start_n = 0
+    # split-KV: each program covers [split_kv_start, split_kv_end).
+    kv_len_per_split = gl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+    split_kv_start = kv_len_per_split * split_kv_id
+    split_kv_end = gl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
+    start_n = split_kv_start
 
     ### bufs of page_number
     blocked_page: gl.constexpr = gl.DistributedLinearLayout(
@@ -337,7 +350,7 @@ def _mla_decode_gluon(
 
         #### dot, softmax, dot (part1)
         qk *= sm_scale
-        offs_n_qk = i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+        offs_n_qk = split_kv_start + i * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
         qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
         n_e_max = gl.maximum(gl.max(qk, 1), e_max)
         LOG2E: gl.constexpr = 1.4426950408889634
@@ -394,7 +407,7 @@ def _mla_decode_gluon(
     k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
     qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
     qk *= sm_scale
-    offs_n_qk = (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+    offs_n_qk = split_kv_start + (num_iter - 2) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
     qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
     n_e_max = gl.maximum(gl.max(qk, 1), e_max)
     LOG2E: gl.constexpr = 1.4426950408889634
@@ -422,7 +435,7 @@ def _mla_decode_gluon(
     k_pe = bufs_kpe.index(buf_idx).load(layout=mfma_layout_b)
     qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
     qk *= sm_scale
-    offs_n_qk = (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
+    offs_n_qk = split_kv_start + (num_iter - 1) * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))
     qk = gl.where(offs_n_qk[None, :] < split_kv_end, qk, float("-inf"))
     n_e_max = gl.maximum(gl.max(qk, 1), e_max)
     re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
@@ -443,6 +456,73 @@ def _mla_decode_gluon(
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
     gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
+    if NUM_KV_SPLITS > 1:
+        # Per-split lse for stage-2 reduce (stored at the trailing slot).
+        offs_o_lse = cur_batch * stride_o_b + cur_head_o * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
+        lse = e_max + gl.log(e_sum)
+        gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o_lse)
+# fmt: on
+
+
+# fmt: off
+@triton.jit
+def _mla_softmax_reducev_kernel(
+    Logits,
+    B_seq_len,
+    O,  # noqa: E741
+    stride_l_b,
+    stride_l_h,
+    stride_l_s,
+    stride_o_b,
+    stride_o_h,
+    NUM_KV_SPLITS: tl.constexpr,
+    HEAD_DIM_CKV: tl.constexpr,
+    USE_2D_VIEW: tl.constexpr,
+    ALL_SPLITS_NONEMPTY: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+
+    offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
+    offs_l = cur_batch * stride_l_b + cur_head * stride_l_h + offs_d_ckv
+    offs_l_1 = cur_batch * stride_l_b + cur_head * stride_l_h + HEAD_DIM_CKV
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+
+    if not ALL_SPLITS_NONEMPTY:
+        if USE_2D_VIEW:
+            cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+        else:
+            cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - tl.load(
+                B_seq_len + cur_batch
+            )
+
+    for split_kv_id in range(0, NUM_KV_SPLITS):
+        if not ALL_SPLITS_NONEMPTY:
+            kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+            split_kv_start = kv_len_per_split * split_kv_id
+            split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+            if split_kv_end <= split_kv_start:
+                continue
+
+        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
+        logits_1 = tl.load(Logits + offs_l_1 + split_kv_id * stride_l_s)
+
+        n_e_max = tl.maximum(logits_1, e_max)
+        old_scale = tl.exp(e_max - n_e_max)
+        acc *= old_scale
+        exp_logic = tl.exp(logits_1 - n_e_max)
+        acc += exp_logic * logits
+
+        e_sum = e_sum * old_scale + exp_logic
+        e_max = n_e_max
+
+    tl.store(
+        O + cur_batch * stride_o_b + cur_head * stride_o_h + offs_d_ckv,
+        acc / e_sum,
+    )
 # fmt: on
 
 
@@ -467,25 +547,46 @@ def mla_decode_gluon(
     batch_size, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
 
+    PAGE_SIZE = 1
+    BLOCK_H = 64
+    BLOCK_N = 64
+    NUM_XCDS = get_num_xcds()
+
+    # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
+    # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
+    TARGET_GRID = 256
+    base_grid = NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * (batch_size // NUM_XCDS)
+    NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(TARGET_GRID, base_grid)))
+
     assert (
         arch_info.get_arch() == "gfx950"
     ), f"mla_decode_gluon requires gfx950 (CDNA4), got {arch_info.get_arch()}"
     assert batch_size in (
+        64,
         128,
         256,
-    ), f"mla_decode_gluon requires batch_size in (128, 256), got {batch_size}"
+    ), f"mla_decode_gluon requires batch_size in (64, 128, 256), got {batch_size}"
+    assert nhead in (
+        64,
+        128,
+    ), f"mla_decode_gluon requires nhead in (64, 128), got {nhead}"
     assert (
         head_dim_ckv == 512
     ), f"mla_decode_gluon requires head_dim_ckv=512, got {head_dim_ckv}"
     assert (
         head_dim_kpe == 64
     ), f"mla_decode_gluon requires head_dim_kpe=64, got {head_dim_kpe}"
+    # gl.assume(num_iter > PIPELINE_STAGES) inside the kernel requires every
+    # split to have > PIPELINE_STAGES * BLOCK_N tokens. The smallest split
+    # (last) for a batch of length s is s - (k-1)*ceil(s/k); a sufficient
+    # bound that keeps this > min_per_split_tokens for all s >= min_kv_seq_len
+    # is min_kv_seq_len > k * (min_per_split_tokens + k).
+    PIPELINE_STAGES = 3  # matches gl.assume(num_iter > 3) inside the kernel
+    min_per_split_tokens = PIPELINE_STAGES * BLOCK_N  # 192
+    min_kv_seq_len_required = NUM_KV_SPLITS * (min_per_split_tokens + NUM_KV_SPLITS)
     assert (
-        nhead % 64 == 0
-    ), f"mla_decode_gluon requires nhead divisible by 64, got {nhead}"
-    assert (
-        min_kv_seq_len > 192
-    ), f"mla_decode_gluon requires min_kv_seq_len > 192, got {min_kv_seq_len}"
+        min_kv_seq_len > min_kv_seq_len_required
+    ), f"mla_decode_gluon requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
     assert q_nope.dtype == torch.bfloat16, f"q_nope must be bf16, got {q_nope.dtype}"
     assert q_pe.dtype == torch.bfloat16, f"q_pe must be bf16, got {q_pe.dtype}"
     assert kv_c.dtype == torch.bfloat16, f"kv_c must be bf16, got {kv_c.dtype}"
@@ -496,14 +597,24 @@ def mla_decode_gluon(
     max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
 
-    NUM_KV_SPLITS = 1
-    PAGE_SIZE = 1
-    BLOCK_H = 64
-    BLOCK_N = 64
-    NUM_XCDS = get_num_xcds()
+    if NUM_KV_SPLITS == 1:
+        # Fast path: stage-1 writes the final attention output directly to o,
+        # no temp buffer, no reduce.
+        attn_logits = o.view(batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv)
+    else:
+        # Stage-1 writes per-split (acc, lse) to a temp buffer; the trailing
+        # slot at index head_dim_ckv holds the per-split lse.
+        attn_logits = torch.empty(
+            (batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv + 1),
+            dtype=o.dtype,
+            device=o.device,
+        )
 
-    attn_logits = o.view(batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv)
-    grid = (NUM_XCDS, triton.cdiv(nhead, BLOCK_H), batch_size // NUM_XCDS)
+    grid = (
+        NUM_XCDS,
+        triton.cdiv(nhead, BLOCK_H),
+        (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
+    )
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_decode_gluon[grid](
@@ -536,4 +647,27 @@ def mla_decode_gluon(
         WITHIN_2GB=within_2gb,
         NUM_XCDS=NUM_XCDS,
     )
+
+    if NUM_KV_SPLITS > 1:
+        # Stage-2: combine per-split (acc, lse) into the final attention in o.
+        # ALL_SPLITS_NONEMPTY lets the reduce skip the per-iter range check;
+        # for NUM_KV_SPLITS in {2,4} the threshold is trivially satisfied.
+        all_splits_nonempty = min_kv_seq_len > (NUM_KV_SPLITS - 1) ** 2
+        grid_reduce = (batch_size, nhead)
+        _mla_softmax_reducev_kernel[grid_reduce](
+            attn_logits,
+            seq_info,
+            o,
+            attn_logits.stride(0),
+            attn_logits.stride(1),
+            attn_logits.stride(2),
+            o.stride(0),
+            o.stride(1),
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            HEAD_DIM_CKV=head_dim_ckv,
+            USE_2D_VIEW=use_2d_view,
+            ALL_SPLITS_NONEMPTY=all_splits_nonempty,
+            num_warps=8,
+        )
+
     return attn_logits, None
