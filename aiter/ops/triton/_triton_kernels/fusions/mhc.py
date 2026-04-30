@@ -135,7 +135,7 @@ def _mhc_fused_kernel(
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     acc_sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
+
     # Compute phi column offset in unified tensor layout: [pre: 0..n-1, post: n..2n-1, res: 2n..2n+n_res-1]
     # phi/bias indexing keeps the original [pre | post | res] layout
     phi_col_start = tl.where(is_pre_program, 0, tl.where(is_post_program, n, 2 * n))
@@ -188,8 +188,11 @@ def _mhc_fused_kernel(
             pre_mix_n = tl.where(rn_local[None, :] < n, pre_mix, 0.0)
             i_n = tl.arange(0, N_POW2)
             pre_mix_2d = tl.sum(
-                tl.where(rn_local[None, None, :] == i_n[None, :, None],
-                         pre_mix_n[:, None, :], 0.0),
+                tl.where(
+                    rn_local[None, None, :] == i_n[None, :, None],
+                    pre_mix_n[:, None, :],
+                    0.0,
+                ),
                 axis=2,
             )  # (BLOCK_M, N_POW2)
             for c0 in range(0, C, BLOCK_C):
@@ -229,18 +232,14 @@ def _mhc_fused_kernel(
                 for _ in range(NUM_SINKHORN_ITERS):
                     scaled_row = log_A + log_v[:, None, :]
                     row_max = tl.max(scaled_row, axis=2)
-                    exp_shifted = tl.exp2(
-                        (scaled_row - row_max[:, :, None]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
                     row_sum_exp = tl.sum(exp_shifted, axis=2)
                     log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
                     log_u = -log_row_sums
 
                     scaled_col = log_A + log_u[:, :, None]
                     col_max = tl.max(scaled_col, axis=1)
-                    exp_shifted = tl.exp2(
-                        (scaled_col - col_max[:, None, :]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
                     col_sum_exp = tl.sum(exp_shifted, axis=1)
                     log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
                     log_v = -log_col_sums
@@ -253,7 +252,9 @@ def _mhc_fused_kernel(
             out_col_start = n
         out_col_offset = out_col_start + rn_local
         tl.store(
-            out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
+            out_ptr
+            + rm[:, None] * stride_out_m
+            + out_col_offset[None, :] * stride_out_n,
             out_activated,
             mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
         )
@@ -531,8 +532,11 @@ def _mhc_fused_reduce_kernel(
             pre_mix_n = tl.where(rn_local[None, :] < n, pre_mix, 0.0)
             i_n = tl.arange(0, N_POW2)
             pre_mix_2d = tl.sum(
-                tl.where(rn_local[None, None, :] == i_n[None, :, None],
-                         pre_mix_n[:, None, :], 0.0),
+                tl.where(
+                    rn_local[None, None, :] == i_n[None, :, None],
+                    pre_mix_n[:, None, :],
+                    0.0,
+                ),
                 axis=2,
             )  # (BLOCK_M, N_POW2)
             for c0 in range(0, C, BLOCK_C):
@@ -572,18 +576,14 @@ def _mhc_fused_reduce_kernel(
                 for _ in range(NUM_SINKHORN_ITERS):
                     scaled_row = log_A + log_v[:, None, :]
                     row_max = tl.max(scaled_row, axis=2)
-                    exp_shifted = tl.exp2(
-                        (scaled_row - row_max[:, :, None]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_row - row_max[:, :, None]) * LOG2_E)
                     row_sum_exp = tl.sum(exp_shifted, axis=2)
                     log_row_sums = row_max + tl.log2(row_sum_exp) * LN_2
                     log_u = -log_row_sums
 
                     scaled_col = log_A + log_u[:, :, None]
                     col_max = tl.max(scaled_col, axis=1)
-                    exp_shifted = tl.exp2(
-                        (scaled_col - col_max[:, None, :]) * LOG2_E
-                    )
+                    exp_shifted = tl.exp2((scaled_col - col_max[:, None, :]) * LOG2_E)
                     col_sum_exp = tl.sum(exp_shifted, axis=1)
                     log_col_sums = col_max + tl.log2(col_sum_exp) * LN_2
                     log_v = -log_col_sums
@@ -596,7 +596,9 @@ def _mhc_fused_reduce_kernel(
             out_col_start = n
         out_col_offset = out_col_start + rn_local
         tl.store(
-            out_ptr + rm[:, None] * stride_out_m + out_col_offset[None, :] * stride_out_n,
+            out_ptr
+            + rm[:, None] * stride_out_m
+            + out_col_offset[None, :] * stride_out_n,
             out_activated,
             mask=(rm[:, None] < M) & (rn_local[None, :] < n_out),
         )
@@ -604,9 +606,9 @@ def _mhc_fused_reduce_kernel(
 
 @triton.jit
 def _mhc_reduce_splitc_kernel(
-    x_ptr,           # (M, n*C)
-    pre_mix_ptr,     # (M, n) fp32
-    out_ptr,         # (M, C) layer_input in x.dtype
+    x_ptr,  # (M, n*C)
+    pre_mix_ptr,  # (M, n) fp32
+    out_ptr,  # (M, C) layer_input in x.dtype
     M,
     C: tl.constexpr,
     n: tl.constexpr,

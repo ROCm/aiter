@@ -142,9 +142,7 @@ def mhc_torch(
     # Eq 19: Apply Sinkhorn-Knopp to H^res for doubly stochastic constraint.
     H_res_3d = H_res.view(M, n, n)
     if return_with_sinkhorn:
-        hres = sinkhorn_knopp_log_domain_torch(
-            H_res_3d, num_iters=sinkhorn_iters
-        )
+        hres = sinkhorn_knopp_log_domain_torch(H_res_3d, num_iters=sinkhorn_iters)
     else:
         hres = H_res_3d  # already fp32
 
@@ -325,5 +323,3 @@ def get_test_shapes():
     ]
 
     return shapes
-
-

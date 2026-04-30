@@ -269,9 +269,9 @@ def run_benchmark(args):
                     msg=msg,
                     printLog=True,
                 )
-                assert pct <= 0.05, (
-                    f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
-                )
+                assert (
+                    pct <= 0.05
+                ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
             _checked_configs.add((M, n, C))
 
         backend = "hip" if provider.startswith("hip_") else "triton"

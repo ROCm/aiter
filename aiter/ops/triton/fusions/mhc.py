@@ -32,44 +32,44 @@ def mhc(
     config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-Single entry point ``mhc()`` runs equations 14-19 plus the layer_input apply
-step in a single Triton launch (or split-K + reduce launch pair). The
-log-domain Sinkhorn-Knopp projection of H^res (Eq 19) is fused into the
-res-stream branch of the kernel.
+    Single entry point ``mhc()`` runs equations 14-19 plus the layer_input apply
+    step in a single Triton launch (or split-K + reduce launch pair). The
+    log-domain Sinkhorn-Knopp projection of H^res (Eq 19) is fused into the
+    res-stream branch of the kernel.
 
-    This function implements:
-    - Eq 14: H̃ = x̃φ (matrix multiplication)
-    - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
-    - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
-    - Eq 17: H^pre = σ(H^pre) + hc_pre_eps  (folded into layer_input below)
-    - Eq 18: H^post = hc_post_mult_value · σ(H^post)
-    - Eq 19: H^res = SinkhornKnopp(H^res)  (log-domain, in-kernel; skipped when
-      sinkhorn_iters == 0, in which case raw H^res logits are returned)
-    - layer_input[m, c] = Σᵢ (σ(H^pre[m, i]) + hc_pre_eps) · x[m, i, c]
+        This function implements:
+        - Eq 14: H̃ = x̃φ (matrix multiplication)
+        - Eq 15: r = ||x̃||₂ / √(nC) (RMS normalization)
+        - Eq 16: [H^pre, H^post, H^res] = 1/r [α^pre·H̃^pre, α^post·H̃^post, α^res·H̃^res] + b
+        - Eq 17: H^pre = σ(H^pre) + hc_pre_eps  (folded into layer_input below)
+        - Eq 18: H^post = hc_post_mult_value · σ(H^post)
+        - Eq 19: H^res = SinkhornKnopp(H^res)  (log-domain, in-kernel; skipped when
+          sinkhorn_iters == 0, in which case raw H^res logits are returned)
+        - layer_input[m, c] = Σᵢ (σ(H^pre[m, i]) + hc_pre_eps) · x[m, i, c]
 
-    Args:
-        x: (M, K) input tensor where K = n*C
-        phi: (K, N) unified projection matrix where N = n + n + n²
-             Layout: [pre | post | res] where res is n²
-        alpha_pre: Scaling factor for pre-stream
-        alpha_post: Scaling factor for post-stream
-        alpha_res: Scaling factor for residual stream
-        bias: (N,) bias vector (fp32)
-        n: Stream parameter (manifold dimension)
-        eps: Epsilon for RMS-norm numerical stability
-        hc_pre_eps: Additive epsilon on σ(H^pre) before the apply step
-            (default 0.0 for Eq-17 parity).
-        hc_post_mult_value: Multiplier on σ(H^post) (default 2.0 for Eq-18 parity).
-        sinkhorn_iters: Number of in-kernel log-domain Sinkhorn-Knopp iterations
-            on H^res. ``0`` returns raw H^res logits (skips Eq 19).
-        config: Optional kernel configuration dict
+        Args:
+            x: (M, K) input tensor where K = n*C
+            phi: (K, N) unified projection matrix where N = n + n + n²
+                 Layout: [pre | post | res] where res is n²
+            alpha_pre: Scaling factor for pre-stream
+            alpha_post: Scaling factor for post-stream
+            alpha_res: Scaling factor for residual stream
+            bias: (N,) bias vector (fp32)
+            n: Stream parameter (manifold dimension)
+            eps: Epsilon for RMS-norm numerical stability
+            hc_pre_eps: Additive epsilon on σ(H^pre) before the apply step
+                (default 0.0 for Eq-17 parity).
+            hc_post_mult_value: Multiplier on σ(H^post) (default 2.0 for Eq-18 parity).
+            sinkhorn_iters: Number of in-kernel log-domain Sinkhorn-Knopp iterations
+                on H^res. ``0`` returns raw H^res logits (skips Eq 19).
+            config: Optional kernel configuration dict
 
-    Returns:
-        Tuple `(h_post, h_res, layer_input)`:
-        - h_post:      (M, n, 1)  in x.dtype  - hc_post_mult_value · σ(H^post)
-        - h_res:       (M, n, n)  in x.dtype  - doubly-stochastic Sinkhorn output
-                                                 (or raw logits when sinkhorn_iters==0)
-        - layer_input: (M, C)     in x.dtype  - Σᵢ pre_mix_i · x_i
+        Returns:
+            Tuple `(h_post, h_res, layer_input)`:
+            - h_post:      (M, n, 1)  in x.dtype  - hc_post_mult_value · σ(H^post)
+            - h_res:       (M, n, n)  in x.dtype  - doubly-stochastic Sinkhorn output
+                                                     (or raw logits when sinkhorn_iters==0)
+            - layer_input: (M, C)     in x.dtype  - Σᵢ pre_mix_i · x_i
     """
     M, K = x.shape
     C = K // n  # Derive C from K and n

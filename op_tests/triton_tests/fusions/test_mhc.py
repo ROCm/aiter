@@ -197,9 +197,7 @@ def test_mhc_large_values():
 
     # Layer_input scales linearly with x, so loosen its absolute tolerance for
     # x ~ N(0, 100²).
-    _assert_mhc_close(
-        triton_tuple, out_torch, layer_atol=2.0, layer_rtol=1e-2
-    )
+    _assert_mhc_close(triton_tuple, out_torch, layer_atol=2.0, layer_rtol=1e-2)
 
 
 @pytest.mark.parametrize("M, n, C", [(32, 4, 1024), (64, 4, 2048), (128, 8, 1024)])
@@ -460,10 +458,10 @@ def test_split_k_large_k():
     )
 
 
-
 # =============================================================================
 # Triton-vs-HIP parity anchor
 # =============================================================================
+
 
 def _triton_to_hip_pre_inputs(x, phi, alpha_pre, alpha_post, alpha_res, bias, n):
     """Convert Triton-convention mhc inputs to HIP `aiter.mhc_pre` conventions.
@@ -575,6 +573,6 @@ def test_triton_mhc_matches_hip(M, n, C):
             tol_err_ratio=0.05,
             msg=msg,
         )
-        assert pct <= 0.05, (
-            f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
-        )
+        assert (
+            pct <= 0.05
+        ), f"{msg} (atol={atol:g}, rtol={rtol:g}, bad_element_ratio={pct:.2%})"
