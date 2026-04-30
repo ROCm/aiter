@@ -9,6 +9,10 @@
 AITER_PYTHON_TAG="${AITER_PYTHON_TAG:-cp312}"
 
 if [ -n "${AITER_INDEX_URL:-}" ]; then
+  # Export so the heredoc Python script can read them via os.environ
+  export AITER_INDEX_URL AITER_PYTHON_TAG
+  export AITER_VERSION="${AITER_VERSION:-}"
+
   # Find the direct wheel URL from the index.
   # Some S3 buckets serve wheels under an /amd-aiter/ subdirectory (PEP 503 style),
   # others serve them at the root of the index URL.  Try both locations.
