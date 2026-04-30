@@ -38,47 +38,56 @@ class TileKernelInstance:
 
     BlockPerCu: int  # 1..BLOCK_PER_CU_MAX
 
+    # When True, 8-warp kernels read x_scale in row-major layout natively,
+    # skipping the host-side transpose.
+    AQRowMajor: bool = False
+
+    @property
+    def is_eight_warp(self) -> bool:
+        return self.M_Warp * self.N_Warp * self.K_Warp == 8 and self.K_Warp_Tile == 128
+
     @property
     def name(self) -> str:
         """
         Generate a unique name for the kernel instance based on its parameters.
         """
 
-        return ("_").join(
-            [
-                "a8w8_blockscale_cktile",
-                ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [self.M_Tile, self.N_Tile, self.K_Tile],
-                    )
-                ),
-                ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [self.M_Warp, self.N_Warp, self.K_Warp],
-                    )
-                ),
-                ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [self.M_Warp_Tile, self.N_Warp_Tile, self.K_Warp_Tile],
-                    )
-                ),
-                self.Scheduler.lower(),
-                ("x").join(
-                    map(
-                        lambda x: str(int(x)),
-                        [
-                            self.TiledMMAPermuteN,
-                            self.TransposeC,
-                            self.UsePersistentKernel,
-                        ],
-                    )
-                ),
-                str(self.BlockPerCu),
-            ]
-        )
+        parts = [
+            "a8w8_blockscale_cktile",
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Tile, self.N_Tile, self.K_Tile],
+                )
+            ),
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Warp, self.N_Warp, self.K_Warp],
+                )
+            ),
+            ("x").join(
+                map(
+                    lambda x: str(x),
+                    [self.M_Warp_Tile, self.N_Warp_Tile, self.K_Warp_Tile],
+                )
+            ),
+            self.Scheduler.lower(),
+            ("x").join(
+                map(
+                    lambda x: str(int(x)),
+                    [
+                        self.TiledMMAPermuteN,
+                        self.TransposeC,
+                        self.UsePersistentKernel,
+                    ],
+                )
+            ),
+            str(self.BlockPerCu),
+        ]
+        if self.AQRowMajor:
+            parts.append("aqrm")
+        return "_".join(parts)
 
 
 BLOCK_PER_CU_MAX = 4
@@ -131,6 +140,8 @@ kernels_list_95x = {
      9:   TileKernelInstance(   128,     128,      128,     1,        4,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
     10:   TileKernelInstance(   128,     128,      128,     2,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             2      ),
     11:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1      ),
+    # 8-warp kernel (4x2x1=8) with AQRowMajor=True: skip host-side x_scale transpose
+    12:   TileKernelInstance(   192,     256,      128,     4,        2,       1,        16,            16,          128,      "Intrawave",        False,             True,           False,             1,     AQRowMajor=True),
 }
 
 default_kernels_cktile_dict = {
