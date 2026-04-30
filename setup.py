@@ -76,7 +76,6 @@ def _is_triton_installed():
     from importlib.metadata import version as pkg_version
 
     for pkg in [
-        "amd-triton",
         "triton",
         "pytorch-triton",
         "pytorch-triton-rocm",
