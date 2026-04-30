@@ -352,6 +352,13 @@ def compile_hgemm_kernel(
                             has_side_effects=True,
                         )
                         scf.YieldOp([])
+                llvm.InlineAsmOp(
+                    None,
+                    [],
+                    "s_waitcnt vmcnt(0)",
+                    "",
+                    has_side_effects=True,
+                )
                 gpu.barrier()
                 # trigger signal when zeroc is done by the first arrived block
                 is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)

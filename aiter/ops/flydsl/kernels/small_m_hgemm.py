@@ -693,6 +693,13 @@ def compile_small_m_hgemm_kernel(
             first_arrival_if = scf.IfOp(first_arrival, results_=[], has_else=False)
             with ir.InsertionPoint(first_arrival_if.then_block):
                 zero_c_tile(c_g, bias_g, tile_n_offset)
+                llvm.InlineAsmOp(
+                    None,
+                    [],
+                    "s_waitcnt vmcnt(0)",
+                    "",
+                    has_side_effects=True,
+                )
                 gpu.barrier()
                 is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
                 with ir.InsertionPoint(is_t0_cond_if.then_block):

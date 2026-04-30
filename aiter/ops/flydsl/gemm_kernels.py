@@ -658,20 +658,21 @@ def _get_split_k_tensors(
     key = _stream_cache_key(stream)
     semaphore = SPLIT_K_GLOBAL_SEMAPHORE.get(key)
     signal = SPLIT_K_GLOBAL_SIGNAL.get(key)
-    if semaphore is None:
-        semaphore = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,),
-            dtype=torch.int32,
-            device=stream.device,
-        )
-        SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
-    if signal is None:
-        signal = torch.zeros(
-            (SPLIT_K_SEMAPHORE_MAX_LEN,),
-            dtype=torch.int32,
-            device=stream.device,
-        )
-        SPLIT_K_GLOBAL_SIGNAL[key] = signal
+    with torch.cuda.device(stream.device), torch.cuda.stream(stream):
+        if semaphore is None:
+            semaphore = torch.zeros(
+                (SPLIT_K_SEMAPHORE_MAX_LEN,),
+                dtype=torch.int32,
+                device=stream.device,
+            )
+            SPLIT_K_GLOBAL_SEMAPHORE[key] = semaphore
+        if signal is None:
+            signal = torch.zeros(
+                (SPLIT_K_SEMAPHORE_MAX_LEN,),
+                dtype=torch.int32,
+                device=stream.device,
+            )
+            SPLIT_K_GLOBAL_SIGNAL[key] = signal
     return semaphore, signal
 
 
@@ -863,11 +864,11 @@ def flydsl_hgemm(
     if auto_shuffle_b:
         raise ValueError(
             "`auto_shuffle_b=True` is unsupported because `b_preshuffle=True` "
-            "is no longer supported for generic FlyDSL HGEMM"
+            "is not supported for generic FlyDSL HGEMM now"
         )
     if b_preshuffle:
         raise ValueError(
-            "`b_preshuffle=True` is no longer supported for generic FlyDSL HGEMM"
+            "`b_preshuffle=True` is not supported for generic FlyDSL HGEMM now"
         )
 
     if out is None:

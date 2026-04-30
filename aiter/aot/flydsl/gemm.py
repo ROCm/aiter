@@ -46,7 +46,10 @@ from aiter.aot.flydsl.common import (
     override_env,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.flydsl.gemm_kernels import get_flydsl_splitk_hgemm_kernel_params
+from aiter.ops.flydsl.gemm_kernels import (
+    SPLIT_K_SEMAPHORE_MAX_LEN,
+    get_flydsl_splitk_hgemm_kernel_params,
+)
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
 
@@ -230,6 +233,16 @@ def _compile_hgemm_to_cache(
     a = torch.empty((m, k), device=dev, dtype=torch_dtype)
     b = torch.empty((n, k), device=dev, dtype=torch_dtype)
     bias = torch.empty((n,), device=dev, dtype=torch_dtype)
+    semaphore = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,),
+        device=dev,
+        dtype=torch.int32,
+    )
+    signal = torch.zeros(
+        (SPLIT_K_SEMAPHORE_MAX_LEN,),
+        device=dev,
+        dtype=torch.int32,
+    )
     stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
 
     exe = compile_flydsl_hgemm_kernel(
@@ -253,9 +266,9 @@ def _compile_hgemm_to_cache(
         c_to_lds=c_to_lds,
         has_bias=has_bias,
     )
-    # FlyDSL JIT does not accept None for tensor slots; pass a real buffer when
-    # bias fusion is disabled (matches runtime launcher dummy tensor behavior).
-    _compile_executable_to_cache(exe, out, a, b, bias, m, stream)
+    # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
+    # optional bias and split-K sync tensors.
+    _compile_executable_to_cache(exe, out, a, b, bias, m, semaphore, signal, stream)
 
 
 def _compile_preshuffle_to_cache(

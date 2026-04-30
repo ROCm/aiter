@@ -40,7 +40,7 @@ def compile_flydsl_hgemm_kernel(
     if kernel_family in (None, KERNEL_FAMILY_HGEMM):
         if b_preshuffle:
             raise ValueError(
-                "Generic FlyDSL HGEMM no longer supports `b_preshuffle=True`"
+                "Generic FlyDSL HGEMM does not support `b_preshuffle=True`"
             )
         return compile_hgemm_kernel(
             dtype,
