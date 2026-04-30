@@ -386,11 +386,11 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
             + bs_offs_2 * 2 * 2
             + bs_offs_5 * 2 * 2 * 16
             + bs_offs_3 * 2 * 2 * 16 * 4
-            + bs_offs_0 * 2 * 16 * scaleN
+            + bs_offs_0 * 2 * 16 * scaleN_pad
         )
         bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
         bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
-        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 0)
         tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
     else:
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
