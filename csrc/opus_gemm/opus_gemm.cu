@@ -7,6 +7,14 @@
 // libtorch + HIP runtime + opus.hpp parse (~15s/TU). Skipping the entire
 // translation unit on the device pass makes it essentially free, saving
 // a second-bottleneck TU's worth of wall time on every rebuild.
+//
+// Host pass is also torch-free now: the entry points take aiter_tensor_t
+// (POD, defined in csrc/include/aiter_tensor.h) instead of torch::Tensor,
+// mirroring the refactor in PR #2932 (csrc/kernels/quant_kernels.cu).
+// Eliminating <torch/all.h> + <ATen/...> from this TU drops its host-pass
+// preprocessed lines from ~440K to ~110K, which feeds straight into a
+// shorter critical path in the fused codegen layout (see
+// aiter/ops/opus/README.md §7.6).
 #ifndef __HIP_DEVICE_COMPILE__
 
 #include "opus_gemm_arch.cuh"                      // OpusGfxArch + opus_get_arch_info / opus_get_gfx_arch
@@ -14,7 +22,7 @@
 #include "opus_gemm_common.cuh"
 #include "gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh"  // OpusA16W16NoscaleKernel
 #include "opus_gemm_manifest.h"                    // a8w8 launcher symbols
-#include "py_itfs_common.h"
+#include "opus_gemm_utils.cuh"                     // bf16_t / fp32_t
 
 #include <functional>
 #include <optional>
@@ -24,16 +32,16 @@
 //
 // a8w8 paths bypass the arch-routed dispatcher because there's currently a
 // single hardcoded launcher per dtype (no tuned lookup table). The fp8 entry
-// in opus_gemm() guards them with an explicit gfx950 TORCH_CHECK so callers
+// in opus_gemm() guards them with an explicit gfx950 AITER_CHECK so callers
 // on other archs see the same "pipeline TBD" error as the bf16 path.
 using OpusScaleKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &,
-                  std::optional<torch::Tensor>, std::optional<torch::Tensor>)>;
+    void(aiter_tensor_t &, aiter_tensor_t &,
+         aiter_tensor_t &,
+         std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>)>;
 
 using OpusNoscaleKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &)>;
+    void(aiter_tensor_t &, aiter_tensor_t &,
+         aiter_tensor_t &)>;
 
 template <typename CDataType>
 OpusScaleKernel opus_dispatch_scale(int M, int N, int K)
@@ -65,7 +73,7 @@ OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch)
     default:
     {
       const auto &info = opus_get_arch_info();
-      TORCH_CHECK(false,
+      AITER_CHECK(false,
                   "opus_gemm: a16w16 dispatch is only implemented for gfx950 today; "
                   "current device ", info.dev,
                   " has gcnArchName='", info.name,
@@ -87,7 +95,7 @@ opus_a16w16_tune_dispatch(int id)
     default:
     {
       const auto &info = opus_get_arch_info();
-      TORCH_CHECK(false,
+      AITER_CHECK(false,
                   "opus_gemm_a16w16_tune: dispatch is only implemented for gfx950 today; "
                   "current device ", info.dev,
                   " has gcnArchName='", info.name,
@@ -98,18 +106,18 @@ opus_a16w16_tune_dispatch(int id)
 
 // ── opus_gemm() — top-level a16w16 / a8w8 entry ─────────────────────────────
 
-torch::Tensor opus_gemm(
-  torch::Tensor &XQ,
-  torch::Tensor &WQ,
-  torch::Tensor &Y,
-  std::optional<torch::Tensor> group_layout,
-  std::optional<torch::Tensor> x_scale,
-  std::optional<torch::Tensor> w_scale,
-  std::optional<torch::Tensor> bias)
+void opus_gemm(
+  aiter_tensor_t &XQ,
+  aiter_tensor_t &WQ,
+  aiter_tensor_t &Y,
+  std::optional<aiter_tensor_t> group_layout,
+  std::optional<aiter_tensor_t> x_scale,
+  std::optional<aiter_tensor_t> w_scale,
+  std::optional<aiter_tensor_t> bias)
 {
-  TORCH_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
-  TORCH_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
-  TORCH_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
+  AITER_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
+  AITER_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
+  AITER_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
 
   int M = XQ.size(1);
   int N = WQ.size(1);
@@ -117,36 +125,36 @@ torch::Tensor opus_gemm(
 
   bool has_scale = x_scale.has_value() && w_scale.has_value();
 
-  if (XQ.dtype() == torch_fp8)
+  if (XQ.dtype() == AITER_DTYPE_fp8)
   {
     // a8w8 / a8w8_scale launchers are gfx950-only today and don't yet flow
     // through the arch-routed dispatcher (they pick a single hardcoded
     // launcher). Guard the entry explicitly so non-gfx950 callers see the
     // same "pipeline TBD for this arch" message as the bf16 path.
     const auto &arch_info = opus_get_arch_info();
-    TORCH_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
+    AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
                 "opus_gemm: a8w8 path is only implemented for gfx950 today; "
                 "current device ", arch_info.dev,
                 " has gcnArchName='", arch_info.name,
                 "'. Other archs will be added as more pipelines land.");
     // a8w8 / a8w8_scale launchers do not consume bias yet; reject up front
     // rather than silently dropping it.
-    TORCH_CHECK(!bias.has_value(),
+    AITER_CHECK(!bias.has_value(),
                 "opus_gemm: bias is not supported on a8w8 / a8w8_scale paths");
     if (has_scale)
     {
-      TORCH_CHECK(Y.dtype() == at::ScalarType::Float,
+      AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
                   "opus_gemm a8w8_scale only supports fp32 output");
       opus_dispatch_scale<fp32_t>(M, N, K)(XQ, WQ, Y, x_scale, w_scale);
     }
     else
     {
-      TORCH_CHECK(Y.dtype() == at::ScalarType::Float,
+      AITER_CHECK(Y.dtype() == AITER_DTYPE_fp32,
                   "opus_gemm a8w8 no-scale only supports fp32 output");
       opus_dispatch_a8w8<fp32_t>(M, N, K)(XQ, WQ, Y);
     }
   }
-  else if (XQ.dtype() == at::ScalarType::BFloat16)
+  else if (XQ.dtype() == AITER_DTYPE_bf16)
   {
     // Two-level dispatch: tuned CSV lookup (baked in at JIT time) first,
     // heuristic if-else tree on miss. splitK is passed 0; splitk kids
@@ -162,24 +170,23 @@ torch::Tensor opus_gemm(
     // only split-barrier 4..9 and a16w16_flatmm_splitk 200..299 ever
     // appear), so a non-empty bias is always safe at this entry.
     int batch = XQ.size(0);
-    if (Y.dtype() == at::ScalarType::BFloat16)
+    if (Y.dtype() == AITER_DTYPE_bf16)
     {
       opus_dispatch_a16w16<bf16_t>(M, N, K, batch)(XQ, WQ, Y, bias, 0);
     }
-    else if (Y.dtype() == at::ScalarType::Float)
+    else if (Y.dtype() == AITER_DTYPE_fp32)
     {
       opus_dispatch_a16w16<fp32_t>(M, N, K, batch)(XQ, WQ, Y, bias, 0);
     }
     else
     {
-      TORCH_CHECK(false, "opus_gemm a16w16: unsupported output dtype, expected bf16 or fp32");
+      AITER_CHECK(false, "opus_gemm a16w16: unsupported output dtype, expected bf16 or fp32");
     }
   }
   else
   {
-    TORCH_CHECK(false, "opus_gemm: unsupported input dtype, expected fp8 or bf16");
+    AITER_CHECK(false, "opus_gemm: unsupported input dtype, expected fp8 or bf16");
   }
-  return Y;
 }
 
 // ── opus_gemm_a16w16_tune() — id-based tune entry ───────────────────────────
@@ -211,64 +218,63 @@ static inline bool opus_kid_supports_bias(int kid)
          (kid >= OPUS_SPLITK_KID_MIN && kid < OPUS_SPLITK_KID_MAX);
 }
 
-torch::Tensor opus_gemm_a16w16_tune(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
+void opus_gemm_a16w16_tune(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
     int kernelId,
     int splitK)
 {
-  TORCH_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
-  TORCH_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
-  TORCH_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
-  TORCH_CHECK(XQ.dtype() == WQ.dtype(),
+  AITER_CHECK(XQ.dim() == 3, "XQ must be 3D [batch, M, K]");
+  AITER_CHECK(WQ.dim() == 3, "WQ must be 3D [batch, N, K]");
+  AITER_CHECK(Y.dim() == 3, "Y must be 3D [batch, M, N]");
+  AITER_CHECK(XQ.dtype() == WQ.dtype(),
               "XQ and WQ should have the same dtype!");
   // Gate non-bias-capable kids early. The launcher itself will also do the
   // detailed shape/dtype check on a non-empty bias; this guard just gives a
   // clear "wrong kid" error before we even enter the launcher.
-  TORCH_CHECK(!bias.has_value() || opus_kid_supports_bias(kernelId),
+  AITER_CHECK(!bias.has_value() || opus_kid_supports_bias(kernelId),
               "opus_gemm_a16w16_tune: bias is currently only supported on "
               "a16w16 split-barrier kids [", OPUS_A16W16_SB_KID_MIN, ", ",
               OPUS_A16W16_SB_KID_MAX, ") or a16w16_flatmm_splitk kids [",
               OPUS_SPLITK_KID_MIN, ", ", OPUS_SPLITK_KID_MAX,
               "); got kid=", kernelId);
 
-  if (XQ.dtype() == at::ScalarType::BFloat16)
+  if (XQ.dtype() == AITER_DTYPE_bf16)
   {
     // splitk kids force <fp32_t> because traits static_assert D_C=float.
     // Y can be bf16 or fp32 -- the launcher dispatches the reduce kernel
     // on Y.dtype() at runtime.
     if (kernelId >= OPUS_SPLITK_KID_MIN && kernelId < OPUS_SPLITK_KID_MAX)
     {
-      TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16
-                  || Y.dtype() == at::ScalarType::Float,
+      AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+                  || Y.dtype() == AITER_DTYPE_fp32,
                   "opus_gemm_a16w16_tune splitk kid requires bf16 or fp32 Y "
                   "(reduce kernel writes the correct dtype)");
       opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
     }
-    else if (Y.dtype() == at::ScalarType::BFloat16)
+    else if (Y.dtype() == AITER_DTYPE_bf16)
     {
       opus_a16w16_tune_dispatch<bf16_t>(kernelId)(XQ, WQ, Y, bias, splitK);
     }
-    else if (Y.dtype() == at::ScalarType::Float)
+    else if (Y.dtype() == AITER_DTYPE_fp32)
     {
       opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
     }
     else
     {
-      TORCH_CHECK(false,
+      AITER_CHECK(false,
                   "opus_gemm_a16w16_tune: unsupported output dtype, expected bf16 or fp32");
     }
   }
   else
   {
-    TORCH_CHECK(false,
-                "opus_gemm_a16w16_tune: unsupported input dtype " +
-                    std::string(c10::toString(XQ.dtype())) +
-                    ", expected bf16");
+    AITER_CHECK(false,
+                "opus_gemm_a16w16_tune: unsupported input dtype ",
+                AiterDtype_to_str(XQ.dtype()),
+                ", expected bf16");
   }
-  return Y;
 }
 
 #endif // !__HIP_DEVICE_COMPILE__

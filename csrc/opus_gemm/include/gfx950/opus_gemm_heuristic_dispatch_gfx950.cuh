@@ -50,8 +50,8 @@
 
 #include <functional>
 #include <optional>
-#include <torch/extension.h>
 
+#include "aiter_tensor.h"  // aiter_tensor_t (torch-free)
 #include "../opus_gemm_common.cuh"
 #include "opus_gemm_manifest.h"
 
@@ -61,9 +61,14 @@
 // the splitk launcher treats it as literal KBatch. bias is consumed by the
 // split-barrier and splitk launchers; the flatmm launcher rejects any
 // non-empty bias up front (HAS_BIAS=false on its warp-spec epilogue).
+//
+// Returns void (in-place on Y); the launchers used to return Y but
+// nothing read the return value at any call site, and dropping the
+// torch::Tensor return type lets the whole dispatch graph go
+// torch-free.
 using OpusA16W16NoscaleKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, std::optional<torch::Tensor>, int)>;
+    void(aiter_tensor_t &, aiter_tensor_t &,
+         aiter_tensor_t &, std::optional<aiter_tensor_t>, int)>;
 
 // Single template body shared by both bf16 and fp32 specializations.
 // All splitk kids are forced to <fp32_t> (their main kernel only has the

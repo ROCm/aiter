@@ -107,7 +107,7 @@ class opus_gemm_codegen:
         #
         # Build layout:
         #   * One fused HOST TU (instances/all_instances_host.cu)
-        #     instantiates every launcher's `template torch::Tensor
+        #     instantiates every launcher's `template void
         #     xxx<dtype>(...)`. It includes `<torch/extension.h>` ONCE
         #     and forward-declares the kernel templates (so the
         #     launcher body's `<<<...>>>` typechecks and emits an
@@ -621,10 +621,9 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include <torch/all.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
 #endif
 // Pipeline body vs. traits-only split:
 //
@@ -651,13 +650,13 @@ __global__ void {kernel_func}({kargs_name} kargs);
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
-torch::Tensor
+void
 {k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> x_scale,
-    std::optional<torch::Tensor> w_scale)
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale)
 {{{{
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -700,10 +699,9 @@ torch::Tensor
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
     dim3 block({k.BLOCK_SIZE});
 
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
-    return Y;
 }}}}
 #endif // launcher only on regular host pass
 """
@@ -712,13 +710,13 @@ torch::Tensor
         # See _gen_noscale_instance for how these rows are consumed.
         for CDtype in k.output_dtypes:
             host_decl = (
-                f"template torch::Tensor\n"
+                f"template void\n"
                 f"{k.name}<{CDtype}>(\n"
-                f"    torch::Tensor &XQ,\n"
-                f"    torch::Tensor &WQ,\n"
-                f"    torch::Tensor &Y,\n"
-                f"    std::optional<torch::Tensor> x_scale,\n"
-                f"    std::optional<torch::Tensor> w_scale);\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y,\n"
+                f"    std::optional<aiter_tensor_t> x_scale,\n"
+                f"    std::optional<aiter_tensor_t> w_scale);\n"
             )
             device_decl = (
                 f"template __global__ void {kernel_func}<\n"
@@ -734,7 +732,7 @@ torch::Tensor
     # Shared host-side bias validation + kargs population. Inserted into every
     # A16W16_TUNE_TAGS launcher (split-barrier / flatmm / flatmm_splitk).
     #
-    #   * bias is std::optional<torch::Tensor>; kargs.ptr_bias / stride_bias_batch
+    #   * bias is std::optional<aiter_tensor_t>; kargs.ptr_bias / stride_bias_batch
     #     are populated from it (or set to nullptr / 0 when absent).
     #   * Shape protocol (matches plan + reduce / split-barrier kernel side):
     #       [M]            ->  stride_bias_batch=0  AND batch must == 1
@@ -748,25 +746,26 @@ torch::Tensor
     int stride_bias_batch_ = 0;
     if (bias.has_value()) {{
         const auto& bt = bias.value();
-        TORCH_CHECK(bt.is_contiguous(),
+        AITER_CHECK(bt.is_contiguous(),
             "bias must be contiguous (got non-contiguous tensor)");
-        TORCH_CHECK(bt.dtype() == Y.dtype(),
-            "bias dtype must match Y dtype (got bias=", bt.dtype(),
-            " Y=", Y.dtype(), ")");
+        AITER_CHECK(bt.dtype() == Y.dtype(),
+            "bias dtype must match Y dtype (got bias=",
+            AiterDtype_to_str(bt.dtype()),
+            " Y=", AiterDtype_to_str(Y.dtype()), ")");
         if (bt.dim() == 1) {{
-            TORCH_CHECK(bt.size(0) == M,
+            AITER_CHECK(bt.size(0) == M,
                 "bias 1D length must equal M (got bias.size(0)=", bt.size(0),
                 " M=", M, ")");
-            TORCH_CHECK(batch == 1,
+            AITER_CHECK(batch == 1,
                 "bias 1D [M] requires batch == 1; pass [batch, M] for batch>1");
             stride_bias_batch_ = 0;
         }} else if (bt.dim() == 2) {{
-            TORCH_CHECK(bt.size(0) == batch && bt.size(1) == M,
+            AITER_CHECK(bt.size(0) == batch && bt.size(1) == M,
                 "bias 2D shape must equal [batch, M] (got [", bt.size(0), ", ",
                 bt.size(1), "] vs batch=", batch, " M=", M, ")");
             stride_bias_batch_ = M;
         }} else {{
-            TORCH_CHECK(false, "bias must be 1D [M] or 2D [batch, M]; got dim=",
+            AITER_CHECK(false, "bias must be 1D [M] or 2D [batch, M]; got dim=",
                 bt.dim());
         }}
         ptr_bias_ = bt.data_ptr();
@@ -800,19 +799,19 @@ torch::Tensor
         # K >= 2 * B_K and the loop count to be even.
         k_check = f"""
     int loops_ = (K + {k.B_K} - 1) / {k.B_K};
-    TORCH_CHECK(loops_ >= 2,
+    AITER_CHECK(loops_ >= 2,
         "K=", K, " too small for B_K={k.B_K}, need K >= {min_k}");
-    TORCH_CHECK(loops_ % 2 == 0,
+    AITER_CHECK(loops_ % 2 == 0,
         "ceil_div(K, {k.B_K})=", loops_, " must be even (prefetch constraint)");
     // Odd-K is unsafe across the a16w16 family: the splitk pipeline shows
     // up to ~7% maxdelta on bf16-acc paths when K is odd (predates this
     // PR). Reject odd K uniformly so callers get a clear error instead
     // of silent ~3% accuracy regressions; relax once the underlying K-tail
     // handling is fixed.
-    TORCH_CHECK(K % 2 == 0,
+    AITER_CHECK(K % 2 == 0,
         "K=", K, " must be even (a16w16 family rejects odd K due to a "
         "latent K-tail accumulation bug; pass an even K)");
-    TORCH_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
+    AITER_CHECK(M >= 1 && N >= 1, "M and N must be >= 1");
 """
 
         # a16w16 kids live in opus_gemm_a16w16_tune_lookup.h alongside the
@@ -823,7 +822,7 @@ torch::Tensor
         # 3-arg signature.
         if k.kernel_tag in A16W16_TUNE_TAGS:
             extra_param = (
-                ",\n    std::optional<torch::Tensor> bias," "\n    int /*splitK*/"
+                ",\n    std::optional<aiter_tensor_t> bias," "\n    int /*splitK*/"
             )
         else:
             extra_param = ""
@@ -849,7 +848,7 @@ torch::Tensor
         true,                                  // HAS_BIAS
         D_C>;                                  // D_BIAS = D_C
 
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    auto stream = aiter::getCurrentHIPStream();
     if (bias.has_value()) {{{{
         {kernel_func}<TraitsBias><<<grid, block, 0, stream>>>(kargs);
     }}}} else {{{{
@@ -862,7 +861,7 @@ torch::Tensor
         opus::tuple<{da}, {db}, D_C, fp32_t>,
         opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>{traits_extra}>;
 
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<Traits><<<grid, block, 0, stream>>>(kargs);"""
 
         # bias-aware kargs population: only emit for a16w16 split-barrier
@@ -879,7 +878,7 @@ torch::Tensor
             # Other A16W16_TUNE_TAGS handled by their own _gen_*_instance.
             # Defensive guard in case of future routing changes.
             bias_kargs_block = (
-                "    TORCH_CHECK(!bias.has_value(),\n"
+                "    AITER_CHECK(!bias.has_value(),\n"
                 '        "bias not supported on this a16w16 kid");\n'
             )
         else:
@@ -893,7 +892,7 @@ torch::Tensor
 
         # ── Compile-time split: host pass vs device pass ──
         #
-        # The .cuh file contains the heavy host-side launcher (TORCH_CHECK,
+        # The .cuh file contains the heavy host-side launcher (AITER_CHECK,
         # `<<<...>>>` launch, kargs marshalling). Wrapping the host includes
         # plus the launcher body in `#ifndef __HIP_DEVICE_COMPILE__` lets us
         # skip the entire libtorch + ATen + <hip/hip_runtime.h> header
@@ -948,7 +947,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
         # instantiation in the companion .cpp can name the same type.
         if is_a16w16_split_barrier:
             launch_block = f"""
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    auto stream = aiter::getCurrentHIPStream();
     if (bias.has_value()) {{{{
         {kernel_func}<{k.name}_TraitsBias<D_C>><<<grid, block, 0, stream>>>(kargs);
     }}}} else {{{{
@@ -956,7 +955,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     }}}}"""
         else:
             launch_block = f"""
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);"""
 
         # Three guard combinations encode the host/device pass split for
@@ -979,10 +978,9 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include <torch/all.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
 #endif
 // Pipeline body vs. traits-only split:
 //
@@ -1009,11 +1007,11 @@ __global__ void {kernel_func}({kargs_name} kargs);
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
-torch::Tensor
+void
 {k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y{extra_param})
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y{extra_param})
 {{{{
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -1041,14 +1039,13 @@ torch::Tensor
     dim3 block({k.BLOCK_SIZE});
 {launch_block}
 
-    return Y;
 }}}}
 #endif // launcher only on regular host pass
 """
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
         if k.kernel_tag in A16W16_TUNE_TAGS:
-            inst_extra_param = ",\n    std::optional<torch::Tensor>,\n    int"
+            inst_extra_param = ",\n    std::optional<aiter_tensor_t>,\n    int"
         else:
             inst_extra_param = ""
 
@@ -1079,11 +1076,11 @@ torch::Tensor
 
         for CDtype in k.output_dtypes:
             host_decl = (
-                f"template torch::Tensor\n"
+                f"template void\n"
                 f"{k.name}<{CDtype}>(\n"
-                f"    torch::Tensor &XQ,\n"
-                f"    torch::Tensor &WQ,\n"
-                f"    torch::Tensor &Y{inst_extra_param});\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y{inst_extra_param});\n"
             )
             self._host_instantiations.append(
                 {
@@ -1130,15 +1127,15 @@ torch::Tensor
         # pfk is a compile-time member so the effective bound is inlined.
         k_check = f"""
     int loops_ = (K + {k.B_K} - 1) / {k.B_K};
-    TORCH_CHECK(loops_ >= Traits::prefetch_k_iter,
+    AITER_CHECK(loops_ >= Traits::prefetch_k_iter,
         "K=", K, " too small for flatmm B_K={k.B_K}, need K >= pfk*B_K = ",
         Traits::prefetch_k_iter * {k.B_K}, " (pfk=", Traits::prefetch_k_iter, ")");
-    TORCH_CHECK(M >= 1 && N >= 1 && K >= 1, "M, N, K must be >= 1");
-    TORCH_CHECK(batch >= 1, "batch must be >= 1");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1, "M, N, K must be >= 1");
+    AITER_CHECK(batch >= 1, "batch must be >= 1");
     // Odd-K is unsafe across the a16w16 family (see _gen_noscale_instance
     // for the rationale); reject uniformly until the K-tail handling is
     // fixed.
-    TORCH_CHECK(K % 2 == 0,
+    AITER_CHECK(K % 2 == 0,
         "K=", K, " must be even (a16w16 family rejects odd K due to a "
         "latent K-tail accumulation bug; pass an even K)");
 """
@@ -1161,10 +1158,9 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include <torch/all.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
 #endif
 // Pipeline body vs. traits-only split:
 //
@@ -1191,12 +1187,12 @@ __global__ void {kernel_func}({kargs_name} kargs);
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
-torch::Tensor
+void
 {k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
     int /*splitK*/)   // flatmm (non-splitk) ignores splitK; shares tune-lookup slot signature
 {{{{
     int batch = XQ.size(0);
@@ -1211,7 +1207,7 @@ torch::Tensor
     // GENERATE_A16W16_TUNE_LOOKUP std::function slot, but reject any
     // non-empty bias up front so the user gets a clear error instead of
     // silently dropping the bias.
-    TORCH_CHECK(!bias.has_value(),
+    AITER_CHECK(!bias.has_value(),
         "bias is not yet supported on a16w16_flatmm kid; use a16w16 "
         "split-barrier (kid 4..9) or a16w16_flatmm_splitk (kid 200..299)");
 
@@ -1238,10 +1234,9 @@ torch::Tensor
     dim3 grid(num_tiles_m * num_tiles_n, 1, batch);
     dim3 block({k.BLOCK_SIZE});
 
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
+    auto stream = aiter::getCurrentHIPStream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid, block, 0, stream>>>(kargs);
 
-    return Y;
 }}}}
 #endif // launcher only on regular host pass
 """
@@ -1250,12 +1245,12 @@ torch::Tensor
         # See _gen_noscale_instance for how these rows are consumed.
         for CDtype in k.output_dtypes:
             host_decl = (
-                f"template torch::Tensor\n"
+                f"template void\n"
                 f"{k.name}<{CDtype}>(\n"
-                f"    torch::Tensor &XQ,\n"
-                f"    torch::Tensor &WQ,\n"
-                f"    torch::Tensor &Y,\n"
-                f"    std::optional<torch::Tensor>,\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y,\n"
+                f"    std::optional<aiter_tensor_t>,\n"
                 f"    int);\n"
             )
             device_decl = (
@@ -1313,10 +1308,9 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
-#include <torch/all.h>
-#include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
 #endif
 // Pipeline body vs. traits-only split:
 //
@@ -1343,12 +1337,12 @@ __global__ void {kernel_func}({kargs_name} kargs);
 {traits_aliases}
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 template <typename D_C>
-torch::Tensor
+void
 {k.name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
     static_assert(std::is_same<D_C, fp32_t>::value,
@@ -1360,17 +1354,17 @@ torch::Tensor
     int N = WQ.size(1);
     int K = XQ.size(2);
 
-    TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16
-                || Y.dtype() == at::ScalarType::Float,
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
+                || Y.dtype() == AITER_DTYPE_fp32,
         "flatmm_splitk requires Y dtype bf16 or fp32 "
         "(reduce kernel casts fp32 workspace to D_OUT)");
-    TORCH_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
         "M, N, K, batch must be >= 1");
     // Odd-K is unsafe: splitk pipeline shows ~3-7% maxdelta on odd K (e.g.
     // K=257 / 513) while even K stays near bf16 noise floor. The bug lives
     // in the K-tail handling (mask_va_tail / reduce-tail interplay) and
     // predates this PR. Reject uniformly until fixed.
-    TORCH_CHECK(K % 2 == 0,
+    AITER_CHECK(K % 2 == 0,
         "K=", K, " must be even (a16w16 family rejects odd K due to a "
         "latent K-tail accumulation bug; pass an even K)");
 {self.BIAS_HOST_VALIDATE}
@@ -1389,7 +1383,7 @@ torch::Tensor
         if (iters_full >= pfk && last_loops >= pfk) break;
         split_k--;
     }}}}
-    TORCH_CHECK(total_iters >= pfk,
+    AITER_CHECK(total_iters >= pfk,
         "K=", K, " too small for flatmm_splitk B_K={k.B_K}: "
         "need total_iters >= pfk*B_K = ", pfk * {k.B_K},
         " (pfk=", pfk, ")");
@@ -1399,16 +1393,23 @@ torch::Tensor
     int padded_M    = num_tiles_m * {k.B_M};
     int padded_N    = num_tiles_n * {k.B_N};
 
-    // Allocate fp32 workspace via torch caching allocator (same idiom as
-    // aiter/ops/triton/gemm/basic/gemm_a16w16.py y_pp). No persistent cache.
-    auto workspace = torch::empty(
-        {{{{(int64_t)split_k, (int64_t)batch, (int64_t)padded_M, (int64_t)padded_N}}}},
-        torch::TensorOptions().dtype(torch::kFloat32).device(Y.device()));
+    // Allocate fp32 workspace stream-ordered. hipMallocAsync /
+    // hipFreeAsync are the torch-free equivalents of the PyTorch
+    // caching allocator pattern: the alloc is queued onto `stream`
+    // before the main kernel, and the matching hipFreeAsync at the
+    // bottom of this launcher is queued AFTER the reduce kernel, so
+    // the GPU side never accesses freed memory even though the
+    // launcher returns synchronously to the host.
+    auto stream = aiter::getCurrentHIPStream();
+    size_t ws_bytes = (size_t)split_k * (size_t)batch
+                    * (size_t)padded_M * (size_t)padded_N * sizeof(float);
+    void* ptr_workspace_ = nullptr;
+    HIP_CALL(hipMallocAsync(&ptr_workspace_, ws_bytes, stream));
 
     {kargs_name} kargs{{{{}}}};
     kargs.ptr_a         = XQ.data_ptr();
     kargs.ptr_b         = WQ.data_ptr();
-    kargs.ptr_workspace = workspace.data_ptr();
+    kargs.ptr_workspace = ptr_workspace_;
     kargs.ptr_c         = Y.data_ptr();
     kargs.ptr_bias      = ptr_bias_;          // populated by BIAS_HOST_VALIDATE
     kargs.m = M; kargs.n = N; kargs.k = K; kargs.batch = batch;
@@ -1436,15 +1437,14 @@ torch::Tensor
                       batch * M, 1);
     dim3 block_reduce(REDUCE_BS);
 
-    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     {kernel_func}<{k.name}_Traits<D_C>><<<grid_main, block_main, 0, stream>>>(kargs);
     // Reduce kernel: 4 specializations (D_OUT bf16/fp32 x HAS_BIAS true/false).
     // bias dtype is locked to Y.dtype() by BIAS_HOST_VALIDATE.
-    if (Y.dtype() == at::ScalarType::BFloat16) {{{{
+    if (Y.dtype() == AITER_DTYPE_bf16) {{{{
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const __bf16*>(ptr_bias_),
@@ -1452,17 +1452,17 @@ torch::Tensor
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<__bf16*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
         }}}}
     }}}} else {{{{
-        // Y.dtype() == Float per the TORCH_CHECK above.
+        // Y.dtype() == Float per the AITER_CHECK above.
         if (bias.has_value()) {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, true, float>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     reinterpret_cast<const float*>(ptr_bias_),
@@ -1470,14 +1470,17 @@ torch::Tensor
         }}}} else {{{{
             splitk_reduce_kernel<REDUCE_VEC, REDUCE_BS, float, false, float>
                 <<<grid_reduce, block_reduce, 0, stream>>>(
-                    reinterpret_cast<const float*>(workspace.data_ptr()),
+                    reinterpret_cast<const float*>(ptr_workspace_),
                     reinterpret_cast<float*>(Y.data_ptr()),
                     split_k, M, N, batch, padded_M, padded_N,
                     nullptr, 0);
         }}}}
     }}}}
 
-    return Y;
+    // Stream-ordered free: queued AFTER both main + reduce kernels on
+    // the same stream, so the runtime only releases the workspace
+    // once the GPU is done with it.
+    HIP_CALL(hipFreeAsync(ptr_workspace_, stream));
 }}}}
 #endif // launcher only on regular host pass
 """
@@ -1492,12 +1495,12 @@ torch::Tensor
         # symbols (the linker dedupes).
         for CDtype in k.output_dtypes:
             host_decl = (
-                f"template torch::Tensor\n"
+                f"template void\n"
                 f"{k.name}<{CDtype}>(\n"
-                f"    torch::Tensor &XQ,\n"
-                f"    torch::Tensor &WQ,\n"
-                f"    torch::Tensor &Y,\n"
-                f"    std::optional<torch::Tensor>,\n"
+                f"    aiter_tensor_t &XQ,\n"
+                f"    aiter_tensor_t &WQ,\n"
+                f"    aiter_tensor_t &Y,\n"
+                f"    std::optional<aiter_tensor_t>,\n"
                 f"    int);\n"
             )
             device_decl = (
@@ -1687,32 +1690,38 @@ torch::Tensor
             _emit_map(f, "GENERATE_A16W16_TUNE_LOOKUP_FP32", "fp32_t")
 
     def gen_manifest_head(self, kernels_dict):
+        # Forward declarations for every launcher symbol the dispatcher
+        # references. Declarations only -- the definitions live in the
+        # fused host TU (or in per-kid TUs in the legacy layout). All
+        # use aiter_tensor_t (POD, declared in csrc/include/aiter_tensor.h)
+        # so this header costs ~200 lines instead of the ~50K that
+        # <torch/all.h> + <torch/extension.h> would drag in.
         MANIFEST_HEAD = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "aiter_tensor.h"
 #include <cstdlib>
 #include <optional>
-#include <torch/extension.h>
 """
         MANIFEST_SCALE = """
 template <typename D_C>
-torch::Tensor
+void
 {kernel_name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> x_scale,
-    std::optional<torch::Tensor> w_scale);
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale);
 """
         # a8w8 noscale (3 args, no splitK): stays compatible with
         # opus_gemm_lookup.h where a8w8 kids live.
         MANIFEST_NOSCALE_3ARG = """
 template <typename D_C>
-torch::Tensor
+void
 {kernel_name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y);
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y);
 """
         # a16w16 family (5 args with optional bias + splitK): shared
         # signature for tune lookup. All three a16w16-family launchers
@@ -1722,12 +1731,12 @@ torch::Tensor
         # runtime; the other two consume it.
         MANIFEST_NOSCALE_4ARG = """
 template <typename D_C>
-torch::Tensor
+void
 {kernel_name}(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
     int splitK);
 """
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
@@ -1816,10 +1825,9 @@ torch::Tensor
             "// invocation, but it sees an empty TU and finishes in <0.5s.\n"
             "#ifndef __HIP_DEVICE_COMPILE__\n"
             "#define OPUS_FUSED_HOST_TU 1\n"
+            '#include "aiter_tensor.h"\n'
+            '#include "aiter_stream.h"\n'
             "#include <optional>\n"
-            "#include <torch/extension.h>\n"
-            "#include <ATen/hip/HIPContext.h>\n"
-            "#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>\n"
             + forward_decls
             + "".join(f'#include "impl/{name}.cuh"\n' for name in impl_includes)
             + host_body

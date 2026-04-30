@@ -124,8 +124,8 @@ opus_a16w16_tune_dispatch_gfx950<bf16_t>(int id)
         return OpusA16W16TuneMap{GENERATE_A16W16_TUNE_LOOKUP_BF16(bf16_t)};
     }();
     auto it = lookup.find(id);
-    TORCH_CHECK(it != lookup.end(),
-                "Kernel id " + std::to_string(id) +
+    AITER_CHECK(it != lookup.end(),
+                "Kernel id ", id,
                 " not found in a16w16 bf16 tune lookup table");
     return it->second;
 }
@@ -140,8 +140,8 @@ opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
         return OpusA16W16TuneMap{GENERATE_A16W16_TUNE_LOOKUP_FP32(fp32_t)};
     }();
     auto it = lookup.find(id);
-    TORCH_CHECK(it != lookup.end(),
-                "Kernel id " + std::to_string(id) +
+    AITER_CHECK(it != lookup.end(),
+                "Kernel id ", id,
                 " not found in a16w16 fp32 tune lookup table");
     return it->second;
 }
