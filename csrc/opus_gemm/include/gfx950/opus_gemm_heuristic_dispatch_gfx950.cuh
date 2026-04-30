@@ -48,7 +48,6 @@
 //     casting.
 #pragma once
 
-#include <functional>
 #include <optional>
 
 #include "aiter_tensor.h"  // aiter_tensor_t (torch-free)
@@ -57,18 +56,28 @@
 
 // a16w16-family launcher signature (split-barrier, flatmm, flatmm_splitk):
 // 3 tensors + std::optional<bias> + int splitK so all three populate the
-// same GENERATE_A16W16_TUNE_LOOKUP map. Non-splitk launchers ignore splitK;
-// the splitk launcher treats it as literal KBatch. bias is consumed by the
-// split-barrier and splitk launchers; the flatmm launcher rejects any
-// non-empty bias up front (HAS_BIAS=false on its warp-spec epilogue).
+// same GENERATE_A16W16_TUNE_LOOKUP table. Non-splitk launchers ignore
+// splitK; the splitk launcher treats it as literal KBatch. bias is
+// consumed by the split-barrier and splitk launchers; the flatmm launcher
+// rejects any non-empty bias up front (HAS_BIAS=false on its warp-spec
+// epilogue).
 //
 // Returns void (in-place on Y); the launchers used to return Y but
 // nothing read the return value at any call site, and dropping the
 // torch::Tensor return type lets the whole dispatch graph go
 // torch-free.
-using OpusA16W16NoscaleKernel = std::function<
-    void(aiter_tensor_t &, aiter_tensor_t &,
-         aiter_tensor_t &, std::optional<aiter_tensor_t>, int)>;
+//
+// Plain function pointer (was: `std::function<void(...)>`). Every
+// callable we ever store in this slot is one of the explicitly
+// instantiated `xxx<bf16_t>` / `xxx<fp32_t>` launcher templates --
+// no captures, no type erasure needed. Switching to a function
+// pointer drops a heavyweight `std::function` template instantiation
+// from the dispatcher TU's host pass and also avoids the per-call
+// virtual-dispatch overhead that std::function pays for the type
+// erasure we don't actually use.
+using OpusA16W16NoscaleKernel = void (*)(
+    aiter_tensor_t &, aiter_tensor_t &,
+    aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
 
 // Single template body shared by both bf16 and fp32 specializations.
 // All splitk kids are forced to <fp32_t> (their main kernel only has the
