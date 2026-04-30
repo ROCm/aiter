@@ -1,0 +1,68 @@
+[
+  {
+    "test_name": "LLAMA-3.3-70B-FP8-gsm8k",
+    "model_key": "LLAMA_3.3_70B",
+    "quantizer": "FP8",
+    "tp": 1,
+    "threshold": "0",
+    "timeout": 90,
+    "extra_args": "",
+    "env_vars": "",
+    "runner": "linux-aiter-mi300x-1"
+  },
+  {
+    "test_name": "LLAMA-3.3-70B-FP4-gsm8k",
+    "model_key": "LLAMA_3.3_70B",
+    "quantizer": "FP4",
+    "tp": 1,
+    "threshold": "0",
+    "timeout": 90,
+    "extra_args": "",
+    "env_vars": "",
+    "runner": "linux-aiter-mi300x-1"
+  },
+  {
+    "test_name": "QWEN3-30B-A3B-gsm8k",
+    "model_key": "QWEN3_30B_A3B",
+    "quantizer": "DEFAULT",
+    "tp": 1,
+    "threshold": "0",
+    "timeout": 90,
+    "extra_args": "",
+    "env_vars": "",
+    "runner": "linux-aiter-mi300x-1"
+  },
+  {
+    "test_name": "DEEPSEEK-R1-0528-gsm8k",
+    "model_key": "DEEPSEEK_R1_0528",
+    "quantizer": "DEFAULT",
+    "tp": 8,
+    "threshold": "0",
+    "timeout": 120,
+    "extra_args": "",
+    "env_vars": "",
+    "runner": "linux-aiter-mi300x-8"
+  },
+  {
+    "test_name": "DEEPSEEK-V3.2-gsm8k",
+    "model_key": "DEEPSEEK_V3.2",
+    "quantizer": "DEFAULT",
+    "tp": 8,
+    "threshold": "0",
+    "timeout": 120,
+    "extra_args": "",
+    "env_vars": "",
+    "runner": "linux-aiter-mi300x-8"
+  },
+  {
+    "test_name": "LLAMA-3.1-405B-FP8-gsm8k",
+    "model_key": "LLAMA_3.1_405B",
+    "quantizer": "FP8",
+    "tp": 8,
+    "threshold": "0",
+    "timeout": 120,
+    "extra_args": "",
+    "env_vars": "",
+    "runner": "linux-aiter-mi300x-8"
+  }
+]

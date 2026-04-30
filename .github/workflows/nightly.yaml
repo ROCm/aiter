@@ -2,7 +2,6 @@ name: Nightly Build
 
 on:
   schedule:
-    # Run daily at 3 AM UTC
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
@@ -18,24 +17,75 @@ on:
         description: 'GPU architectures (default: gfx942;gfx950)'
         type: string
         required: false
-      skip_tests:
-        description: 'Skip test job for faster iteration'
+      skip_build:
+        description: 'Skip build (use aiter_version + aiter_index_url instead)'
         type: boolean
         default: false
       skip_promote:
-        description: 'Skip promote job (build + test only)'
+        description: 'Skip promote job'
         type: boolean
         default: false
+      aiter_index_url:
+        description: 'AITER pip index URL'
+        type: string
+        required: false
+        default: 'https://rocm.frameworks-devreleases.amd.com/whl-staging/gfx942-gfx950/'
+      aiter_version:
+        description: 'AITER version to install (e.g. 0.1.12.post1+rocm7.2.1). Leave blank for latest.'
+        type: string
+        required: false
+        default: ''
+      skip_sglang:
+        description: 'Skip SGLang integration tests'
+        type: boolean
+        default: false
+      skip_vllm:
+        description: 'Skip vLLM integration tests'
+        type: boolean
+        default: false
+      skip_atom:
+        description: 'Skip ATOM integration tests'
+        type: boolean
+        default: false
+      skip_afo_llm:
+        description: 'Skip AFO-LLM accuracy tests'
+        type: boolean
+        default: true
+      sglang_job_filter:
+        description: 'SGLang scout filter'
+        type: choice
+        options:
+          - all
+          - nightly-amd
+          - nightly-amd-rocm720
+          - pr-test-amd
+          - pr-test-amd-rocm720
+        default: 'all'
+      gpu_arch_filter:
+        description: 'Target runner architecture (gfx942, gfx950, or both)'
+        type: choice
+        options:
+          - both
+          - gfx942
+          - gfx950
+        default: 'both'
+      runner_filter:
+        description: 'Comma-separated runner labels to include (e.g. linux-aiter-mi300x-1,linux-aiter-mi300x-2)'
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  # ── Build ────────────────────────────────────────────────────────────
   build:
+    if: ${{ github.event.inputs.skip_build != 'true' }}
     uses: ./.github/workflows/aiter-release.yaml
     with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'nightlies' || 'devreleases' }}
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
       docker_image_py310: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1' }}
       docker_image_py312: ${{ github.event.inputs.docker_image || 'rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.9.1' }}
       build_py310: ${{ github.event.inputs.python_version == '' || github.event.inputs.python_version == '3.10' }}
@@ -48,25 +98,310 @@ jobs:
       contents: read
       actions: read
 
-  test:
-    needs: build
-    if: ${{ !(github.event.inputs.skip_tests || false) }}
-    uses: ./.github/workflows/test-whl.yaml
-    with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'nightlies' || 'devreleases' }}
-      wheel_names: ${{ needs.build.outputs.wheel_names }}
-    permissions:
-      contents: read
-      actions: read
-
-  promote:
-    needs: [build, test]
+  # ── Load model configs ──────────────────────────────────────────────
+  load-configs:
     if: >-
-      ${{ github.repository_owner == 'ROCm'
-          && !(github.event.inputs.skip_promote || false) }}
+      always() &&
+      (
+        github.event.inputs.skip_sglang != 'true' ||
+        github.event.inputs.skip_vllm != 'true' ||
+        github.event.inputs.skip_atom != 'true' ||
+        github.event.inputs.skip_afo_llm != 'true'
+      )
+    runs-on: build-only-aiter
+    outputs:
+      sglang_matrix: ${{ steps.load.outputs.sglang_matrix }}
+      vllm_matrix: ${{ steps.load.outputs.vllm_matrix }}
+      vllm_tests_matrix: ${{ steps.load.outputs.vllm_tests_matrix }}
+      atom_matrix: ${{ steps.load.outputs.atom_matrix }}
+      afo_llm_matrix: ${{ steps.load.outputs.afo_llm_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load model configs from JSON
+        id: load
+        env:
+          GPU_ARCH_FILTER: ${{ github.event.inputs.gpu_arch_filter || 'both' }}
+          RUNNER_FILTER_INPUT: ${{ github.event.inputs.runner_filter || '' }}
+        run: |
+          set -eo pipefail
+          filter="${RUNNER_FILTER_INPUT}"
+          if [ -z "$filter" ]; then
+            case "${GPU_ARCH_FILTER}" in
+              gfx942)
+                filter="linux-aiter-mi300x-1,linux-aiter-mi300x-2,linux-aiter-mi300x-4,linux-aiter-mi300x-8,aiter-1gpu-runner,aiter-8gpu-runner"
+                ;;
+              gfx950)
+                filter="linux-aiter-mi35x-1,linux-aiter-mi35x-8,linux-aiter-mi355-1,linux-aiter-mi355-8"
+                ;;
+              *)
+                filter=""
+                ;;
+            esac
+          fi
+          filter="$(echo "$filter" | tr -d '[:space:]')"
+          jq_filter="$(cat <<'JQ'
+            def allowed($filter):
+              if $filter == "" then true
+              else
+                ($filter | split(",") | map(gsub("^\\s+|\\s+$";""))) as $allowed
+                | .runner as $r | any($allowed[]; . == $r)
+              end;
+            [ .[] | select(allowed($filter)) ]
+          JQ
+          )"
+          echo "sglang_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/sglang_tests.json)" >> "$GITHUB_OUTPUT"
+          echo "vllm_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/vllm_models.json)" >> "$GITHUB_OUTPUT"
+          echo "vllm_tests_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/vllm_tests.json)" >> "$GITHUB_OUTPUT"
+          echo "atom_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/atom_models.json)" >> "$GITHUB_OUTPUT"
+          echo "afo_llm_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/afo_llm_tests.json)" >> "$GITHUB_OUTPUT"
+
+  # ── SGLang Preflight: find compatible container image ────────────────
+  sglang-preflight:
+    name: "SGLang (preflight)"
+    needs: [build, load-configs]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_sglang != 'true'
+    runs-on: aiter-1gpu-runner
+    timeout-minutes: 30
+    outputs:
+      sgl_image: ${{ steps.resolve.outputs.sgl_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Resolve compatible SGLang image
+        id: resolve
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+        run: |
+          bash .github/scripts/run_sglang.sh \
+            "${{ github.sha }}" \
+            "echo preflight-smoke-test-only" \
+            "${{ github.event.inputs.aiter_index_url }}"
+
+  # ── SGLang Integration ───────────────────────────────────────────────
+  sglang:
+    name: "SGLang (${{ matrix.test_name }})"
+    needs: [build, load-configs, sglang-preflight]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      needs.sglang-preflight.result == 'success' &&
+      github.event.inputs.skip_sglang != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.load-configs.outputs.sglang_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run SGLang test
+        timeout-minutes: ${{ matrix.timeout }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          SGL_IMAGE_OVERRIDE: ${{ needs.sglang-preflight.outputs.sgl_image }}
+        run: |
+          bash .github/scripts/run_sglang.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.test_cmd }}" \
+            "${{ github.event.inputs.aiter_index_url }}"
+
+  # ── vLLM Benchmarks ────────────────────────────────────────────────
+  vllm:
+    name: "vLLM (${{ matrix.label }}, ${{ matrix.model_name }}, ${{ matrix.kv }})"
+    needs: [build, load-configs]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_vllm != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.load-configs.outputs.vllm_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load vLLM pins
+        run: |
+          {
+            printf 'VLLM_BASE_IMAGE=%s\n' "$(jq -r '.base_image' .github/configs/vllm_pins.json)"
+            printf 'VLLM_COMMIT=%s\n' "$(jq -r '.vllm_commit' .github/configs/vllm_pins.json)"
+          } >> "$GITHUB_ENV"
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run vLLM benchmark
+        timeout-minutes: 45
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          VLLM_BASE_IMAGE: ${{ env.VLLM_BASE_IMAGE }}
+          VLLM_COMMIT: ${{ env.VLLM_COMMIT }}
+          VLLM_INSTALL_MODE: ${{ matrix.install_mode || 'source' }}
+          VLLM_EXTRA_ARGS: ${{ matrix.extra_args || '' }}
+        run: |
+          bash .github/scripts/run_vllm.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.model }}" \
+            "${{ matrix.tp }}" \
+            "${{ matrix.kv }}" \
+            "${{ github.event.inputs.aiter_index_url }}"
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-${{ matrix.label }}-${{ matrix.model_name }}-${{ matrix.kv }}
+          path: vllm_nightly_*.log
+
+  # ── vLLM AITER Kernel Tests ─────────────────────────────────────────
+  vllm-tests:
+    name: "vLLM Test (${{ matrix.test_name }})"
+    needs: [build, load-configs]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_vllm != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.load-configs.outputs.vllm_tests_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load vLLM pins
+        run: |
+          {
+            printf 'VLLM_BASE_IMAGE=%s\n' "$(jq -r '.base_image' .github/configs/vllm_pins.json)"
+            printf 'VLLM_COMMIT=%s\n' "$(jq -r '.vllm_commit' .github/configs/vllm_pins.json)"
+          } >> "$GITHUB_ENV"
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run vLLM AITER test
+        timeout-minutes: ${{ matrix.timeout }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          VLLM_BASE_IMAGE: ${{ env.VLLM_BASE_IMAGE }}
+          VLLM_COMMIT: ${{ env.VLLM_COMMIT }}
+          VLLM_INSTALL_MODE: ${{ matrix.install_mode || 'source' }}
+          VLLM_EXTRA_ARGS: ${{ matrix.extra_args || '' }}
+        run: |
+          bash .github/scripts/run_vllm_test.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.test_cmd }}" \
+            "${{ github.event.inputs.aiter_index_url }}"
+
+  # ── ATOM Accuracy ──────────────────────────────────────────────────
+  atom:
+    name: "ATOM (${{ matrix.model_name }})"
+    needs: [build, load-configs]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_atom != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.load-configs.outputs.atom_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run ATOM accuracy test
+        timeout-minutes: 90
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          ATOM_ENV_VARS: ${{ matrix.env_vars }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          bash .github/scripts/run_atom.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.model_path }}" \
+            "${{ matrix.threshold }}" \
+            "${{ matrix.extra_args }}" \
+            "${{ github.event.inputs.aiter_index_url }}"
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: atom-${{ matrix.model_name }}
+          path: atom_nightly_*.txt
+
+  # ── AFO-LLM Accuracy ────────────────────────────────────────────────
+  afo-llm:
+    name: "AFO-LLM (${{ matrix.test_name }})"
+    needs: [build, load-configs]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_afo_llm != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.load-configs.outputs.afo_llm_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load vLLM pins
+        run: |
+          {
+            printf 'VLLM_BASE_IMAGE=%s\n' "$(jq -r '.base_image' .github/configs/vllm_pins.json)"
+            printf 'VLLM_COMMIT=%s\n' "$(jq -r '.vllm_commit' .github/configs/vllm_pins.json)"
+          } >> "$GITHUB_ENV"
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run AFO-LLM accuracy test
+        timeout-minutes: ${{ matrix.timeout }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          VLLM_BASE_IMAGE: ${{ env.VLLM_BASE_IMAGE }}
+          VLLM_COMMIT: ${{ env.VLLM_COMMIT }}
+          AFO_LLM_ENV_VARS: ${{ matrix.env_vars }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          bash .github/scripts/run_afo_llm.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.model_key }}" \
+            "${{ matrix.quantizer }}" \
+            "${{ matrix.tp }}" \
+            "${{ matrix.threshold }}" \
+            "${{ matrix.extra_args }}" \
+            "${{ github.event.inputs.aiter_index_url }}"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afo-llm-${{ matrix.test_name }}
+          path: afo_llm_nightly_*.log
+
+  # ── Promote ────────────────────────────────────────────────────────
+  promote:
+    needs: [build, sglang-preflight, sglang, vllm, vllm-tests, atom, afo-llm]
+    if: >-
+      always() &&
+      github.repository_owner == 'ROCm' &&
+      github.event.inputs.skip_promote != 'true' &&
+      github.event.inputs.skip_build != 'true' &&
+      needs.build.result == 'success' &&
+      (needs.sglang.result == 'success' || needs.sglang.result == 'skipped') &&
+      (needs.vllm.result == 'success' || needs.vllm.result == 'skipped') &&
+      (needs.vllm-tests.result == 'success' || needs.vllm-tests.result == 'skipped') &&
+      (needs.atom.result == 'success' || needs.atom.result == 'skipped') &&
+      (needs.afo-llm.result == 'success' || needs.afo-llm.result == 'skipped')
     uses: ./.github/workflows/promote.yaml
     with:
-      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || github.event_name == 'pull_request' && 'nightlies' || 'devreleases' }}
+      release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}
       wheel_names: ${{ needs.build.outputs.wheel_names }}
     permissions:
       id-token: write
