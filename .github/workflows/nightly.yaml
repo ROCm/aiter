@@ -47,6 +47,10 @@ on:
         description: 'Skip ATOM integration tests'
         type: boolean
         default: false
+      skip_afo_llm:
+        description: 'Skip AFO-LLM accuracy tests'
+        type: boolean
+        default: false
       sglang_job_filter:
         description: 'SGLang scout filter'
         type: choice
@@ -101,7 +105,8 @@ jobs:
       (
         github.event.inputs.skip_sglang != 'true' ||
         github.event.inputs.skip_vllm != 'true' ||
-        github.event.inputs.skip_atom != 'true'
+        github.event.inputs.skip_atom != 'true' ||
+        github.event.inputs.skip_afo_llm != 'true'
       )
     runs-on: ubuntu-latest
     outputs:
@@ -109,6 +114,7 @@ jobs:
       vllm_matrix: ${{ steps.load.outputs.vllm_matrix }}
       vllm_tests_matrix: ${{ steps.load.outputs.vllm_tests_matrix }}
       atom_matrix: ${{ steps.load.outputs.atom_matrix }}
+      afo_llm_matrix: ${{ steps.load.outputs.afo_llm_matrix }}
     steps:
       - uses: actions/checkout@v4
       - name: Load model configs from JSON
@@ -147,6 +153,7 @@ jobs:
           echo "vllm_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/vllm_models.json)" >> "$GITHUB_OUTPUT"
           echo "vllm_tests_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/vllm_tests.json)" >> "$GITHUB_OUTPUT"
           echo "atom_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/atom_models.json)" >> "$GITHUB_OUTPUT"
+          echo "afo_llm_matrix=$(jq -c --arg filter "$filter" "$jq_filter" .github/configs/afo_llm_tests.json)" >> "$GITHUB_OUTPUT"
 
   # ── SGLang Integration ───────────────────────────────────────────────
   sglang:
@@ -300,9 +307,58 @@ jobs:
           name: atom-${{ matrix.model_name }}
           path: atom_nightly_*.txt
 
+  # ── AFO-LLM Accuracy ────────────────────────────────────────────────
+  afo-llm:
+    name: "AFO-LLM (${{ matrix.test_name }})"
+    needs: [build, load-configs]
+    if: >-
+      always() &&
+      needs.load-configs.result == 'success' &&
+      github.event.inputs.skip_afo_llm != 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.load-configs.outputs.afo_llm_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load vLLM pins
+        run: |
+          {
+            printf 'VLLM_BASE_IMAGE=%s\n' "$(jq -r '.base_image' .github/configs/vllm_pins.json)"
+            printf 'VLLM_COMMIT=%s\n' "$(jq -r '.vllm_commit' .github/configs/vllm_pins.json)"
+          } >> "$GITHUB_ENV"
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+      - name: Run AFO-LLM accuracy test
+        timeout-minutes: ${{ matrix.timeout }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+          AITER_VERSION: ${{ github.event.inputs.aiter_version }}
+          VLLM_BASE_IMAGE: ${{ env.VLLM_BASE_IMAGE }}
+          VLLM_COMMIT: ${{ env.VLLM_COMMIT }}
+          AFO_LLM_ENV_VARS: ${{ matrix.env_vars }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          bash .github/scripts/run_afo_llm.sh \
+            "${{ github.sha }}" \
+            "${{ matrix.model_key }}" \
+            "${{ matrix.quantizer }}" \
+            "${{ matrix.tp }}" \
+            "${{ matrix.threshold }}" \
+            "${{ matrix.extra_args }}" \
+            "${{ github.event.inputs.aiter_index_url }}"
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: afo-llm-${{ matrix.test_name }}
+          path: afo_llm_nightly_*.log
+
   # ── Promote ────────────────────────────────────────────────────────
   promote:
-    needs: [build, sglang, vllm, vllm-tests, atom]
+    needs: [build, sglang, vllm, vllm-tests, atom, afo-llm]
     if: >-
       always() &&
       github.repository_owner == 'ROCm' &&
@@ -312,7 +368,8 @@ jobs:
       (needs.sglang.result == 'success' || needs.sglang.result == 'skipped') &&
       (needs.vllm.result == 'success' || needs.vllm.result == 'skipped') &&
       (needs.vllm-tests.result == 'success' || needs.vllm-tests.result == 'skipped') &&
-      (needs.atom.result == 'success' || needs.atom.result == 'skipped')
+      (needs.atom.result == 'success' || needs.atom.result == 'skipped') &&
+      (needs.afo-llm.result == 'success' || needs.afo-llm.result == 'skipped')
     uses: ./.github/workflows/promote.yaml
     with:
       release_type: ${{ github.event_name == 'schedule' && 'nightlies' || 'devreleases' }}

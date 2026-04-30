@@ -127,6 +127,9 @@ export SGLANG_CI_HOSTNAME_OVERRIDE="${SGLANG_CI_HOSTNAME}"
 GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${HF_TOKEN}" \
   bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${SGL_IMAGE}"
 
+# ── Fix git dubious ownership for mounted repos ──
+docker exec -u root ci_sglang bash -c "git config --global --add safe.directory '*'"
+
 # ── Setup pip ──
 docker exec -u root ci_sglang bash -c "pip config set global.default-timeout 60"
 docker exec -u root ci_sglang bash -c "pip config set global.retries 10"

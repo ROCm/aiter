@@ -52,7 +52,8 @@ else:
 " 2>/dev/null)
 
   if [ -n "${WHEEL_URL}" ]; then
-    AITER_INSTALL_CMD="pip install --force-reinstall '${WHEEL_URL}'"
+    # Try direct URL first; if 403, fall back to pip index install
+    AITER_INSTALL_CMD="pip install --force-reinstall '${WHEEL_URL}' || pip install --force-reinstall --extra-index-url '${AITER_INDEX_URL}' 'amd-aiter==${AITER_VERSION:-}'"
     echo "AITER wheel: ${WHEEL_URL}"
   else
     echo "WARNING: Could not resolve ${AITER_PYTHON_TAG} wheel URL, falling back to pip install amd-aiter"
