@@ -1719,6 +1719,9 @@ def reference_attention_kv_blockscale(
 # stress-testing the paged KV cache addressing when pages span large physical distances.
 @pytest.mark.parametrize("scatter_pages", [False, True])
 @pytest.mark.parametrize("kv_layout", ["linear", "vectorized"])
+# quant_mode: "pertensor" uses single Q/K/V scale (existing behavior);
+# "kv_blockscale" uses per-page K/V scales.
+@pytest.mark.parametrize("quant_mode", ["pertensor", "kv_blockscale"])
 def test_batch_prefill_large_kvcache(
     batch_size,
     kv_cache_size_gb,
@@ -1730,6 +1733,7 @@ def test_batch_prefill_large_kvcache(
     input_dtype,
     scatter_pages,
     kv_layout,
+    quant_mode,
 ):
     """
     Test that batch prefill produces correct results with large KV caches
@@ -1749,6 +1753,13 @@ def test_batch_prefill_large_kvcache(
     # page_size=1 only supports linear layout (3D tensor)
     if page_size == 1 and kv_layout == "vectorized":
         pytest.skip("page_size=1 does not support vectorized layout")
+
+    # Skip otherwise so the parametrize matrix doesn't generate dead cells.
+    if quant_mode == "kv_blockscale":
+        if input_dtype != "fp8":
+            pytest.skip("KV_BLOCKSCALE requires fp8 input")
+        if page_size != 1024:
+            pytest.skip("KV_BLOCKSCALE requires page_size=1024")
 
     torch.manual_seed(42)
     torch.cuda.empty_cache()
@@ -1927,19 +1938,36 @@ def test_batch_prefill_large_kvcache(
 
     # --- Step 2: Prepare kernel inputs (quantize for FP8, free bf16 after) ---
     if is_fp8:
-        k_cache_kernel, k_descale = per_tensor_quant(
-            k_cache_bf16, quant_dtype=dtypes.fp8
-        )
-        v_cache_kernel, v_descale = per_tensor_quant(
-            v_cache_bf16, quant_dtype=dtypes.fp8
-        )
+        # Q is always per-tensor quantized (both quant modes).
         q_kernel, q_descale = per_tensor_quant(q_bf16, quant_dtype=dtypes.fp8)
+        if quant_mode == "kv_blockscale":
+            # KV_BLOCKSCALE: per-page K/V scales. Requires 4D paged shape
+            # [num_blocks, page_size, num_kv_heads, head_dim] -- guaranteed by
+            # the page_size=1024 skip above.
+            k_cache_kernel, k_descales = per_page_quant(
+                k_cache_bf16, page_size, dtypes.fp8
+            )
+            v_cache_kernel, v_descales = per_page_quant(
+                v_cache_bf16, page_size, dtypes.fp8
+            )
+            # kv_block_descale: [num_blocks, num_kv_heads, 2] (K in [..,0], V in [..,1])
+            kv_block_descale = torch.stack([k_descales, v_descales], dim=-1)
+            k_descale = v_descale = None
+        else:
+            k_cache_kernel, k_descale = per_tensor_quant(
+                k_cache_bf16, quant_dtype=dtypes.fp8
+            )
+            v_cache_kernel, v_descale = per_tensor_quant(
+                v_cache_bf16, quant_dtype=dtypes.fp8
+            )
+            kv_block_descale = None
         del k_cache_bf16, v_cache_bf16, q_bf16
         torch.cuda.empty_cache()
     else:
         k_cache_kernel = k_cache_bf16
         v_cache_kernel = v_cache_bf16
         q_kernel = q_bf16
+        kv_block_descale = None
 
     # Apply vectorized layout transformation if needed
     if kv_layout == "vectorized" and page_size > 1:
@@ -1980,9 +2008,12 @@ def test_batch_prefill_large_kvcache(
     # --- Step 3: Run CK kernel ---
     extra_kwargs = {}
     if is_fp8:
-        extra_kwargs = dict(
-            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
-        )
+        if quant_mode == "kv_blockscale":
+            extra_kwargs = dict(q_descale=q_descale, kv_block_descale=kv_block_descale)
+        else:
+            extra_kwargs = dict(
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
+            )
 
     result = aiter.mha_batch_prefill_func(
         q_kernel,
@@ -2022,6 +2053,224 @@ def test_batch_prefill_large_kvcache(
                 f"(overflow at page {overflow_page}): {msg}"
             ),
         )
+
+
+# Targeted boundary detector. Companion to test_batch_prefill_large_kvcache:
+# the latter exercises *correctness under stress* with 4M-token sequences,
+# but those long sequences dilute single-page-corruption bugs below the
+# threshold (one bad page contributes ~2e-4 to attention output).
+# This test picks exactly 2 contiguous pages at byte-offset boundaries
+# (factor*overflow_page) so kv_len=2048 and ALL attention math runs through
+# the suspect pages -- wrong reads produce max_diff well above threshold.
+@pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
+@pytest.mark.parametrize("quant_mode", ["pertensor", "kv_blockscale"])
+@pytest.mark.parametrize("page_offset_factor", [1, 2])
+@pytest.mark.parametrize("causal", [False, True])
+def test_batch_prefill_4gb_boundary_targeted(
+    input_dtype, quant_mode, page_offset_factor, causal
+):
+    """Targeted 2-page boundary probe for >4GB KV cache offset bugs.
+
+    Args:
+        input_dtype:
+            "bf16", "fp8"
+        quant_mode (only meaningful for fp8; bf16 ignores and skips kv_blockscale):
+            "pertensor"
+            "kv_blockscale"
+        page_offset_factor:
+            1 - first page at overflow_page boundary (byte offset = 2^31)
+            2 - first page at 2x overflow boundary (byte offset = 2^32 exactly,
+                int32-wrap-to-zero edge)
+        causal: standard causal attention toggle.
+    """
+
+    # bf16 has no descale -> quant_mode is meaningless. Run only the pertensor
+    # combo to avoid duplicated bf16 runs across the matrix.
+    if input_dtype == "bf16" and quant_mode == "kv_blockscale":
+        pytest.skip("bf16 has no quant_mode (no descale); pertensor combo covers bf16")
+
+    # Skip the known ROCm 7.2 + gfx950 compiler bug: causal=True + logits_soft_cap=0.0
+    # produces wrong output for bf16 + multi-Q (qo>=2) due to SGPR spill in the
+    # generated kernel. Cross-validated on gfx942 (MI308X, same ROCm 7.2.26015):
+    # gfx942 PASSES with max_diff=0.001 vs gfx950 FAILS with max_diff=0.05-1.78.
+    # Same skip rule used by 5 other batch_prefill tests in this file.
+    # Logits soft cap is 0.0 by default in this targeted boundary test.
+    if should_skip_rocm72_issue(causal, logits_soft_cap=0.0):
+        pytest.skip(
+            "ROCm 7.2 + gfx950 compiler bug (SGPR spill) with causal=True + "
+            "logits_soft_cap=0.0; cross-validated PASS on gfx942 with same source"
+        )
+
+    torch.manual_seed(42)
+    torch.cuda.empty_cache()
+
+    is_fp8 = input_dtype == "fp8"
+    elem_size = 1 if is_fp8 else 2  # fp8=1B, bf16=2B
+
+    # bf16/PERTENSOR share the shape for parity / direct dispatch comparison.
+    num_blocks = 5000
+    page_size = 1024
+    num_kv_heads = 8
+    num_qo_heads = 8
+    head_dim = 128
+    qo_len = 128
+
+    # bytes_per_page = page_size x num_kv_heads x head_dim x elem_size.
+    # overflow_page = first page index where byte_offset >= 2^31.
+    # fp8: 1MB/page -> overflow_page=2048. bf16: 2MB/page -> overflow_page=1024.
+    bytes_per_page = page_size * num_kv_heads * head_dim * elem_size
+    overflow_page = (2**31) // bytes_per_page
+
+    vh_start = overflow_page * page_offset_factor
+    if vh_start + 2 > num_blocks:
+        pytest.skip(
+            f"page_offset_factor={page_offset_factor} -> vh_start={vh_start} "
+            f"out of range for num_blocks={num_blocks}"
+        )
+
+    # Memory budget check.
+    # bf16: 2x bf16 KV (10GB each = 20GB total, kept for kernel + reference).
+    # fp8:  bf16 source (2x10GB) + fp8 quantized (2x5GB) at peak = 30GB peak.
+    free_mem = torch.cuda.mem_get_info()[0]
+    bf16_kv_bytes = num_blocks * page_size * num_kv_heads * head_dim * 2  # per K or V
+    if is_fp8:
+        # peak: bf16 source (2x) + fp8 quantized (2x) before del bf16
+        required_mem = 2 * bf16_kv_bytes + 2 * (bf16_kv_bytes // 2)  # bf16+fp8
+    else:
+        required_mem = 2 * bf16_kv_bytes  # K+V bf16
+    if free_mem < required_mem * 1.2:
+        pytest.skip(
+            f"Not enough GPU memory: need {required_mem / 1e9:.1f}GB, "
+            f"have {free_mem / 1e9:.1f}GB"
+        )
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    quant_dtype = dtypes.fp8
+
+    # Allocate bf16 source (always -- kept alive for fp8 dequant reference too)
+    k_bf16 = torch.randn(
+        num_blocks, page_size, num_kv_heads, head_dim, device=device, dtype=dtype
+    )
+    v_bf16 = torch.randn(
+        num_blocks, page_size, num_kv_heads, head_dim, device=device, dtype=dtype
+    )
+    q_bf16 = torch.randn(qo_len, num_qo_heads, head_dim, device=device, dtype=dtype)
+
+    # Build kernel inputs. bf16: pass tensors as-is. fp8: quantize per quant_mode.
+    if is_fp8:
+        if quant_mode == "kv_blockscale":
+            k_kernel, k_descales = per_page_quant(k_bf16, page_size, quant_dtype)
+            v_kernel, v_descales = per_page_quant(v_bf16, page_size, quant_dtype)
+            kv_block_descale = torch.stack([k_descales, v_descales], dim=-1)
+            k_descale = v_descale = None
+        else:  # pertensor
+            k_kernel, k_descale = per_tensor_quant(k_bf16, quant_dtype=quant_dtype)
+            v_kernel, v_descale = per_tensor_quant(v_bf16, quant_dtype=quant_dtype)
+            kv_block_descale = None
+        q_kernel, q_descale = per_tensor_quant(q_bf16, quant_dtype=quant_dtype)
+        del k_bf16, v_bf16, q_bf16
+        torch.cuda.empty_cache()
+    else:
+        k_kernel = k_bf16
+        v_kernel = v_bf16
+        q_kernel = q_bf16
+
+    # Page table: single batch, 2 pages [vh_start, vh_start+1]
+    page_indices = [vh_start, vh_start + 1]
+    kv_len = page_size * 2  # 2048 tokens -- short enough to avoid dilution
+
+    cu_seqlens_q = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
+    kv_indptr = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    # Kernel ABI: pad page_indices buffer to avoid OOB speculative reads.
+    kv_page_indices = torch.nn.functional.pad(
+        torch.tensor(page_indices, dtype=torch.int32), (0, 256), value=0
+    ).to(device)
+    kv_last_page_lens = torch.tensor([page_size], dtype=torch.int32, device=device)
+
+    # Reference: gather the 2 selected pages and compute SDPA in float32.
+    # For fp8: dequantize first (mirrors what the kernel does internally).
+    # For bf16: use raw page data directly.
+    if is_fp8:
+        q_for_ref = q_kernel.float() * q_descale.item()
+    else:
+        q_for_ref = q_kernel.float()
+    k_ref_pages, v_ref_pages = [], []
+    for pidx in page_indices:
+        if is_fp8:
+            if quant_mode == "kv_blockscale":
+                k_page = k_kernel[pidx].float() * k_descales[pidx].unsqueeze(
+                    0
+                ).unsqueeze(-1)
+                v_page = v_kernel[pidx].float() * v_descales[pidx].unsqueeze(
+                    0
+                ).unsqueeze(-1)
+            else:
+                k_page = k_kernel[pidx].float() * k_descale.item()
+                v_page = v_kernel[pidx].float() * v_descale.item()
+        else:
+            k_page = k_kernel[pidx].float()
+            v_page = v_kernel[pidx].float()
+        k_ref_pages.append(k_page)
+        v_ref_pages.append(v_page)
+
+    k_ref = torch.cat(k_ref_pages, dim=0)  # [2048, 8, 128]
+    v_ref = torch.cat(v_ref_pages, dim=0)
+
+    # Use PyTorch SDPA with explicit attn_mask -- same approach as
+    # test_batch_prefill_large_kvcache. Manual softmax + torch.triu produces
+    # subtle numerical differences from SDPA on small kv_len (off-by-one in the
+    # boundary region), which would falsely fail the causal cases here even
+    # though the kernel and the SDPA reference agree.
+    # SDPA expects [B, H, S, D]; reshape from [S, H, D] -> [1, H, S, D].
+    q_sdpa = q_for_ref.unsqueeze(0).transpose(1, 2)
+    k_sdpa = k_ref.unsqueeze(0).transpose(1, 2)
+    v_sdpa = v_ref.unsqueeze(0).transpose(1, 2)
+    sdpa_kwargs = {}
+    if causal:
+        # CK batch prefill causal: Q is at the END of the KV context.
+        # Q[i] sees K[j] when j <= (kv_len - qo_len) + i.
+        sq = q_for_ref.shape[0]
+        sk = k_ref.shape[0]
+        offset = sk - sq
+        row_idx = torch.arange(sq, device=device).unsqueeze(1)
+        col_idx = torch.arange(sk, device=device).unsqueeze(0)
+        sdpa_kwargs["attn_mask"] = col_idx <= (offset + row_idx)
+    o_b = torch.nn.functional.scaled_dot_product_attention(
+        q_sdpa, k_sdpa, v_sdpa, **sdpa_kwargs
+    )
+    o_ref = o_b.transpose(1, 2).squeeze(0).to(torch.bfloat16)  # [S, H, D]
+
+    # Build descale kwargs for kernel call (bf16 has none).
+    extra_kwargs = {}
+    if is_fp8:
+        if quant_mode == "kv_blockscale":
+            extra_kwargs = dict(q_descale=q_descale, kv_block_descale=kv_block_descale)
+        else:
+            extra_kwargs = dict(
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
+            )
+
+    out = aiter.mha_batch_prefill_func(
+        q_kernel,
+        k_kernel,
+        v_kernel,
+        cu_seqlens_q,
+        kv_indptr,
+        kv_page_indices,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=kv_len,
+        causal=causal,
+        kv_last_page_lens=kv_last_page_lens,
+        **extra_kwargs,
+    )
+    torch.cuda.synchronize()  # surface async faults before the next test masks them
+
+    if is_fp8:
+        verify_fp8_output(out.float(), o_ref.float(), threshold=0.055)
+    else:
+        rtol, atol = get_tolerances(dtype)
+        torch.testing.assert_close(out, o_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -3355,8 +3604,7 @@ def test_batch_prefill_aick1171_hard_fault_via_guard_page(total_blocks):
 
     aiter_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    child_code = _textwrap.dedent(
-        f"""
+    child_code = _textwrap.dedent(f"""
         import sys
         sys.path.insert(0, {aiter_root!r})
         import torch
@@ -3438,8 +3686,7 @@ def test_batch_prefill_aick1171_hard_fault_via_guard_page(total_blocks):
         rtol, atol = get_tolerances(dtype)
         assert_output_matches_reference(out, q_indptr_cpu, o_ref, rtol, atol)
         print('AICK1171_GUARD_PAGE_OK', flush=True)
-    """
-    )
+    """)
 
     result = _aick1171_run_in_subprocess(child_code)
 
