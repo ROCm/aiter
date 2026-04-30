@@ -56,67 +56,12 @@ jobs:
           path: triton_shard_*.list
           retention-days: 7
 
-  # Build Triton wheel once, shared by all shard jobs via artifact
-  build-triton:
-    if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
-    name: Build Triton Wheel
-    runs-on: build-only-aiter
-    needs: [check-signal]
-    env:
-      DOCKER_IMAGE: "rocm/pytorch:latest"
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
-
-      - name: Build Triton wheel in Docker
-        run: |
-          set -ex
-          mkdir -p triton-wheels
-
-          if [ -f "/etc/podinfo/gha-render-devices" ]; then
-            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
-          else
-            DEVICE_FLAG="--device /dev/dri"
-          fi
-
-          docker run --rm \
-            --device=/dev/kfd $DEVICE_FLAG \
-            --shm-size=16G \
-            --group-add $(getent group render | cut -d: -f3) \
-            --group-add $(getent group video | cut -d: -f3) \
-            -v "${{ github.workspace }}:/workspace" \
-            -w /workspace \
-            ${{ env.DOCKER_IMAGE }} \
-            bash -c '
-              set -ex
-              pip config set global.default-timeout 60
-              pip config set global.retries 10
-              TRITON_COMMIT=${TRITON_COMMIT:-756afc06}
-              git clone https://github.com/triton-lang/triton
-              cd triton
-              git checkout "$TRITON_COMMIT"
-              pip install -r python/requirements.txt
-              MAX_JOBS=64 pip wheel --no-deps -w /workspace/triton-wheels .
-            '
-
-      - name: Upload Triton wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: triton-wheel
-          path: triton-wheels/*.whl
-          retention-days: 7
-
   # Step 2: MI35X matrix jobs
   triton:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') }}
     name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi35x-1
-    needs: [split_triton_tests, build-triton, check-signal]
+    needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -137,18 +82,27 @@ jobs:
         with:
           name: triton_shards
 
-      - name: Download Triton wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: triton-wheel
-          path: triton-wheels
-
       - name: List test shard files
         run: |
           ls -l triton_shard_*.list
 
       - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
 
       - name: Export test file list for this shard as env
         id: set_shard_files
@@ -188,7 +142,7 @@ jobs:
           set -ex
           echo "Setting up Aiter and Triton..."
           docker exec \
-          -e TRITON_WHEEL_DIR=/workspace/triton-wheels \
+          -e BUILD_TRITON=0 \
           -w /workspace \
           triton_test \
           ./.github/scripts/build_aiter_triton.sh
@@ -249,7 +203,7 @@ jobs:
     if: ${{ (!github.event.pull_request || github.event.pull_request.draft == false) && (github.event_name != 'pull_request' || github.event.action != 'labeled' || github.event.label.name == 'ci:triton-300x') && (github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:triton-300x'))) }}
     name: Triton Tests (MI300X) / Shard ${{ matrix.shard }}
     runs-on: linux-aiter-mi300x-1
-    needs: [split_triton_tests, build-triton, check-signal]
+    needs: [split_triton_tests, check-signal]
     strategy:
       fail-fast: false
       matrix:
@@ -270,18 +224,27 @@ jobs:
         with:
           name: triton_shards
 
-      - name: Download Triton wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: triton-wheel
-          path: triton-wheels
-
       - name: List test shard files
         run: |
           ls -l triton_shard_*.list
 
       - name: Docker login
-        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }} || true
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
 
       - name: Export test file list for this shard as env
         id: set_shard_files
@@ -321,7 +284,7 @@ jobs:
           set -ex
           echo "Setting up Aiter and Triton..."
           docker exec \
-          -e TRITON_WHEEL_DIR=/workspace/triton-wheels \
+          -e BUILD_TRITON=0 \
           -w /workspace \
           triton_test \
           ./.github/scripts/build_aiter_triton.sh
