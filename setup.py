@@ -71,6 +71,14 @@ if not IS_WINDOWS and is_develop_mode():
             ]
         )
 
+    try:
+        install_triton = os.path.join(
+            this_dir, ".github", "scripts", "install_triton.sh"
+        )
+        subprocess.check_call(["bash", install_triton])
+    except Exception:
+        pass
+
 
 def write_install_mode():
     """Write install_mode so core.py uses aiter_meta/ (install) vs repo root (develop).
