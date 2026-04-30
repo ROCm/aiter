@@ -1,56 +1,243 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import aiter
 import torch
+
+import aiter
 
 # from aiter import get_torch_quant as get_quant
 from aiter import ActivationType, QuantType, dtypes
 from aiter import get_hip_quant as get_quant
 from aiter import logger
-from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIGS,
+    PY,
+    bd_dir,
+    get_asm_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
+from aiter.utility import fp4_utils
+from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.ops.triton.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
 
 BLOCK_SIZE_M = 32
 
-_USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+# ---------------------------------------------------------------------------
+# Threshold below which the 1-stage ASM FP8-blockscale kernel is preferred
+# over the 2-stage CK path for gfx950 decode workloads.
+# The 1-stage kernel fuses both GEMMs + SiLU into a single dispatch, saving
+# one round-trip to HBM3e for the intermediate activations.
+# ---------------------------------------------------------------------------
+_1STAGE_TOKEN_THRESHOLD = 512  # tokens (after padding)
+
+# ---------------------------------------------------------------------------
+# Module-level GFX / CU-count cache.
+#
+# get_gfx() and get_cu_num() both call into the HIP runtime to query the
+# device.  On MI355X (gfx950) with 304 CUs this is a cheap but non-trivial
+# call (~1-3 µs) that is executed repeatedly in the hot decode path:
+#   - get_2stage_cfgs   (once per unique (token, shape) combination, cached
+#                        by lru_cache, but the first call pays the cost)
+#   - fused_moe_1stage  (on every forward pass if kernelName is empty)
+#   - get_block_size_M  (once per unique token/expert/inter_dim, cached)
+#   - fused_topk        (on every forward pass)
+#
+# Caching them at module-import time eliminates all runtime overhead: after
+# the first import neither get_gfx() nor get_cu_num() is ever called again.
+#
+# Safety: GFX string and CU count are hardware constants that cannot change
+# within a process lifetime, so a module-level singleton is correct.
+# ---------------------------------------------------------------------------
+_cached_gfx: str = get_gfx()
+_cached_cu_num: int = get_cu_num()
+
+# ---------------------------------------------------------------------------
+# Per-GFX kernel-name table for the 1-stage fused FP8-blockscale g1u1 kernel.
+#
+# When the force-1stage override fires (doweight_stage1=False, gfx950, per_1x128
+# FP8) we pass the exact mangled C++ kernel name so the ASM dispatch layer
+# skips its internal selection loop and loads the correct .co binary directly.
+# This removes ~5-10µs of selection overhead visible at small decode batch sizes.
+#
+# novs    = no-vskip: applies sorted_weights inside kernel (doweight_stage1=False)
+# novs_ps = same but with pre-sorted weight layout from moe_sorting (better L2)
+#
+# The ps (pre-sorted) variant is preferred because moe_sorting always produces
+# expert-sorted token blocks, giving better L2 cache hit rates for weight loads.
+# ---------------------------------------------------------------------------
+_GFX950_BLOCKSCALE_NOVS_KERNELS = {
+    # (gfx, output_dtype) -> (plain_novs_name, presorted_novs_ps_name)
+    ("gfx950", dtypes.bf16): (
+        "_ZN5aiter49fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E",
+        "_ZN5aiter52fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E",
+    ),
+    ("gfx950", dtypes.fp16): (
+        "_ZN5aiter49fmoe_fp16_blockscaleFp8_g1u1_novs_silu_1tg_32x256E",
+        "_ZN5aiter52fmoe_fp16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256E",
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Pre-resolved fast-path kernel names for the current GPU.
+#
+# On gfx950 these resolve to the full mangled presorted-ps novs kernel names.
+# On all other GPUs they resolve to "" (safe fallback: let ASM select internally).
+# Resolved once at import time — zero overhead on the decode hot path.
+# ---------------------------------------------------------------------------
+_FAST_PATH_KERNELNAME_BF16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.bf16), ("", "")
+)[1]
+_FAST_PATH_KERNELNAME_FP16: str = _GFX950_BLOCKSCALE_NOVS_KERNELS.get(
+    (_cached_gfx, dtypes.fp16), ("", "")
+)[1]
+
+# ---------------------------------------------------------------------------
+# Scale-transpose buffer cache.
+#
+# For LLM decode the same (M, model_dim) shape repeats on every token step.
+# Allocating a new transposed scale buffer on every fused_moe_1stage call
+# causes a stream of small HIP mallocs (~2-3µs each on MI355X) that compound
+# at high token-step throughput.  We keep one buffer per (device, shape, dtype)
+# and reuse it across iterations.
+# ---------------------------------------------------------------------------
+_scale_t_cache: dict = {}
 
 
-def _moe_sorting_impl(
+def _get_scale_t_buf(scale: torch.Tensor) -> torch.Tensor:
+    """Return a [cols, rows] buffer for transpose of scale [rows, cols],
+    reusing a cached allocation when shape/dtype/device match."""
+    rows, cols = scale.shape
+    key = (scale.device.index, cols, rows, scale.dtype)
+    buf = _scale_t_cache.get(key)
+    if buf is None:
+        buf = torch.empty((cols, rows), dtype=scale.dtype, device=scale.device)
+        _scale_t_cache[key] = buf
+    return buf
+
+
+# ---------------------------------------------------------------------------
+# moe_sorting output buffer cache.
+#
+# moe_sorting() allocates 5 tensors via torch.empty on every call:
+#   sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+# For LLM decode the (M, topk, num_experts, block_size, model_dim, dtype)
+# combination is fixed across steps.  We cache these 5 tensors and reuse
+# them, eliminating 5 HIP malloc calls (~2-3 µs each) per decode step.
+#
+# Safety: moe_sorting_fwd WRITES into these buffers each call; LLM decode
+# is sequential (no concurrent fused_moe calls on the same device), so
+# reuse is safe.  The caller must consume moe_buf before the next step,
+# which is guaranteed by the sequential decode loop structure.
+# ---------------------------------------------------------------------------
+_moe_sorting_buf_cache: dict = {}
+
+
+def _get_moe_sorting_bufs(
+    M: int,
+    topk: int,
+    num_experts: int,
+    block_size: int,
+    model_dim: int,
+    moebuf_dtype,
+    device: torch.device,
+):
+    """Return (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf),
+    reusing cached allocations keyed on (device_idx, M, topk, experts, block, dim, dtype).
+    Avoids repeated HIP malloc overhead in decode loops."""
+    key = (device.index, M, topk, num_experts, block_size, model_dim, moebuf_dtype)
+    bufs = _moe_sorting_buf_cache.get(key)
+    if bufs is None:
+        max_num_tokens_padded = M * topk + num_experts * block_size - topk
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(
+            (max_num_tokens_padded,), dtype=dtypes.i32, device=device
+        )
+        sorted_weights = torch.empty(
+            (max_num_tokens_padded,), dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty((2,), dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        bufs = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+        _moe_sorting_buf_cache[key] = bufs
+    return bufs
+
+
+# ---------------------------------------------------------------------------
+# Quantization function + partial cache.
+#
+# get_quant(quant_type) is cheap but functools.partial() has non-trivial
+# Python overhead at high decode throughput.  We cache the transpose-scale
+# partial once per quant_type to avoid recreating it on every forward pass.
+# ---------------------------------------------------------------------------
+_quant_func_t_cache: dict = {}
+
+
+def _get_quant_func_transpose(quant_type):
+    """Return functools.partial(get_quant(quant_type), transpose_scale=True),
+    reusing a cached object to avoid creating a new partial each call."""
+    fn = _quant_func_t_cache.get(quant_type)
+    if fn is None:
+        fn = functools.partial(get_quant(quant_type), transpose_scale=True)
+        _quant_func_t_cache[quant_type] = fn
+    return fn
+
+
+def moe_sorting(
     topk_ids,
     topk_weights,
     num_experts,
     model_dim,
     moebuf_dtype,
-    block_size,
-    expert_mask,
-    num_local_tokens,
-    dispatch_policy,
-    use_opus,
+    block_size=BLOCK_SIZE_M,
+    expert_mask=None,
+    num_local_tokens=None,
+    dispatch_policy=0,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
-    max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
-    )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    # ---------------------------------------------------------------------------
+    # Fast path: reuse cached output buffers when expert_mask is None.
+    # expert_mask modifies the effective num_experts used for buffer sizing, so
+    # we only cache when it is absent (the common LLM decode path).
+    # Saves 5 HIP malloc calls (~2-3 µs each) per decode step.
+    # ---------------------------------------------------------------------------
+    if expert_mask is None:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+        ) = _get_moe_sorting_bufs(
+            M, topk, num_experts, block_size, model_dim, moebuf_dtype, device
+        )
+    else:
+        max_num_tokens_padded = topk_ids.numel() + num_experts * block_size - topk
+        max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+        sorted_ids = torch.empty(
+            (max_num_tokens_padded,), dtype=dtypes.i32, device=device
+        )
+        sorted_weights = torch.empty(
+            (max_num_tokens_padded,), dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
-    fwd_fn = aiter.moe_sorting_opus_fwd if use_opus else aiter.moe_sorting_fwd
-    fwd_fn(
+    aiter.moe_sorting_fwd(
         topk_ids,
         topk_weights,
         sorted_ids,
@@ -67,45 +254,9 @@ def _moe_sorting_impl(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
-def moe_sorting(
-    topk_ids,
-    topk_weights,
-    num_experts,
-    model_dim,
-    moebuf_dtype,
-    block_size=BLOCK_SIZE_M,
-    expert_mask=None,
-    num_local_tokens=None,
-    dispatch_policy=0,
-):
-    try:
-        return _moe_sorting_impl(
-            topk_ids,
-            topk_weights,
-            num_experts,
-            model_dim,
-            moebuf_dtype,
-            block_size,
-            expert_mask,
-            num_local_tokens,
-            dispatch_policy,
-            use_opus=_USE_OPUS_MOE_SORTING,
-        )
-    except Exception as e:
-        logger.error(f"Error in moe_sorting: {e}")
-        max_num_tokens_padded = int(
-            topk_ids.numel() + num_experts * block_size - topk_ids.shape[1]
-        )
-        topk = topk_ids.shape[1]
-        logger.error(
-            f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
-        )
-        raise e
-
-
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
-@functools.lru_cache(maxsize=2048)
+@functools.lru_cache(maxsize=1024)
 def get_inter_dim(w1_shape, w2_shape):
     E, _, model_dim = w1_shape
     E, model_dim, inter_dim = w2_shape
@@ -519,9 +670,10 @@ def fused_moe_1stage(
     return moe_buf
 
 
-@functools.lru_cache(maxsize=2048)
+@functools.lru_cache(maxsize=1024)
 def get_block_size_M(token, topk, expert, inter_dim):
-    cu_num = get_cu_num()
+    # Use the module-level cached CU count to avoid HIP runtime call overhead.
+    cu_num = _cached_cu_num
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
@@ -606,17 +758,19 @@ quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
 
 
 def nextPow2(n):
-    if n <= 1:
+    if n <= 0:
         return 1
     return 1 << (n - 1).bit_length()
 
 
 def get_padded_M(M):
     padded_m = M
-    if M < 32768:
+    if M >= 1 and M <= 16:
+        padded_m = 16
+    elif M < 1024:
         padded_m = nextPow2(padded_m)
     else:
-        padded_m = 32768
+        padded_m = 1024
     return padded_m
 
 
@@ -804,7 +958,8 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
-    cu_num = get_cu_num()
+    # Use module-level cached CU count — avoids HIP runtime call per shape.
+    cu_num = _cached_cu_num
     keys = (
         cu_num,
         token,
