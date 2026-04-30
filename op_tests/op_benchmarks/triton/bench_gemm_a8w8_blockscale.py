@@ -4,6 +4,10 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
 )
+# Switch gfx9 to gfx12 for gluon kernel
+from aiter.ops.triton.gemm_a8w8_blockscale_gfx1250 import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale_gfx12,
+)
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
@@ -22,6 +26,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_ff_args,
 )
 import math
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 block_shape = (128, 128)
 
@@ -142,7 +147,10 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     if args.gluon:
-        impl = gluon_gemm_a8w8_blockscale
+        if arch_info.get_arch() in ("gfx1250",):
+            impl = gluon_gemm_a8w8_blockscale_gfx12
+        else:
+            impl = gluon_gemm_a8w8_blockscale
     elif args.preshuffle:
         impl = triton_gemm_a8w8_blockscale_preshuffle
     else:
