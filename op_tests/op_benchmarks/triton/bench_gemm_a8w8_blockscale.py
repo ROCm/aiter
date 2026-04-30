@@ -2,9 +2,13 @@ import torch
 import triton
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+    gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
 )
 # Switch gfx9 to gfx12 for gluon kernel
 from aiter.ops.triton.gemm_a8w8_blockscale_gfx1250 import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale_gfx12,
+)
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
@@ -26,13 +30,36 @@ import math
 block_shape = (128, 128)
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callable):
+def bench_gemm_fn(
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    impl: callable,
+    shuffle: bool = False,
+):
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
-    x, weight, _, x_scale, _, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M, N, K, block_shape_n, block_shape_k, layout=layout, output=True
+    x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y = (
+        generate_gemm_a8w8_blockscale_inputs(
+            M,
+            N,
+            K,
+            block_shape_n,
+            block_shape_k,
+            layout=layout,
+            output=True,
+            shuffle=shuffle,
+        )
     )
+    if shuffle:
+        bench_weight = weight_shuffled
+        bench_x_scale = x_scale_shuffled
+    else:
+        bench_weight = weight
+        bench_x_scale = x_scale
     # flops
     flops = 2.0 * M * N * K
     # memory transfer
@@ -41,7 +68,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callab
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, c_dtype, y),  # noqa: E731
+        lambda: impl(x, bench_weight, bench_x_scale, w_scale, c_dtype, y),  # noqa: E731
         warmup=25,
         rep=100,
     )
@@ -93,7 +120,9 @@ def run_model_benchmark(args, impl):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
@@ -105,7 +134,9 @@ def run_shape_benchmark(args, impl):
     def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, impl)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle
+        )
 
     bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
@@ -115,7 +146,12 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     if args.gluon:
-        impl = gluon_gemm_a8w8_blockscale
+        if arch_info.get_arch() in ("gfx1250",):
+            impl = gluon_gemm_a8w8_blockscale_gfx12
+        else:
+            impl = gluon_gemm_a8w8_blockscale
+    elif args.preshuffle:
+        impl = triton_gemm_a8w8_blockscale_preshuffle
     else:
         impl = triton_gemm_a8w8_blockscale
     if args.model:
@@ -147,6 +183,11 @@ def parse_args(args: list[str] | None = None):
         "-gluon",
         action="store_true",
         help="Use Gluon implementation (experimental, requires latest Triton from main)",
+    )
+    parser.add_argument(
+        "-preshuffle",
+        action="store_true",
+        help="Use preshuffle implementation",
     )
     return get_ff_args(parser, args=args)
 
