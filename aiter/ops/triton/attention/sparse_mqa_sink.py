@@ -19,6 +19,8 @@ def sparse_mqa_sink(
     *,
     tile_k: int = 64,
     block_h: int = 8,
+    block_d: int = 64,
+    score_d: int = 64,
 ) -> torch.Tensor:
     """Sparse MQA with DSv4 attention-sink semantics.
 
@@ -60,10 +62,12 @@ def sparse_mqa_sink(
     num_seqs = seqused_k.shape[0]
 
     block_h = min(block_h, triton.next_power_of_2(num_heads))
-    block_d = triton.next_power_of_2(head_dim)
+    block_d = min(block_d, triton.next_power_of_2(head_dim))
+    score_d = min(score_d, triton.next_power_of_2(head_dim))
     tile_k = min(tile_k, triton.next_power_of_2(max(topk_count, 1)))
     head_blocks = triton.cdiv(num_heads, block_h)
-    grid = (num_tokens * head_blocks,)
+    dim_blocks = triton.cdiv(head_dim, block_d)
+    grid = (num_tokens, head_blocks, dim_blocks)
 
     _sparse_mqa_sink_kernel[grid](
         out,
@@ -95,6 +99,7 @@ def sparse_mqa_sink(
         num_seqs,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
+        SCORE_D=score_d,
         TILE_K=tile_k,
         num_warps=4,
         num_stages=1,

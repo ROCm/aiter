@@ -47,17 +47,19 @@ def _sparse_mqa_sink_kernel(
     num_seqs: tl.int32,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SCORE_D: tl.constexpr,
     TILE_K: tl.constexpr,
 ):
     """Sparse MQA with DSv4's attention-sink denominator.
 
-    One program handles one query token and BLOCK_H query heads. KV is MQA:
-    all query heads share the same [topk, head_dim] key/value rows.
+    One program handles one query token, BLOCK_H query heads, and one output
+    dimension tile. KV is MQA: all query heads share the same [topk, head_dim]
+    key/value rows.
     """
     head_blocks: tl.constexpr = (num_heads + BLOCK_H - 1) // BLOCK_H
-    program_id = tl.program_id(0)
-    token_id = program_id // head_blocks
-    head_block = program_id % head_blocks
+    token_id = tl.program_id(0)
+    head_block = tl.program_id(1)
+    dim_block = tl.program_id(2)
 
     seq_idx = _find_seq_idx(cu_seqlens_q_ptr, token_id, num_seqs)
     seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
@@ -68,19 +70,10 @@ def _sparse_mqa_sink_kernel(
     kv_len = tl.load(seqused_k_ptr + seq_idx)
 
     offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
-    offs_d = tl.arange(0, BLOCK_D)
+    offs_d = dim_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_score_d = tl.arange(0, SCORE_D)
     h_mask = offs_h < num_heads
     d_mask = offs_d < head_dim
-
-    q = tl.load(
-        q_ptr
-        + token_id * q_stride_t
-        + offs_h[:, None] * q_stride_h
-        + offs_d[None, :] * q_stride_d,
-        mask=h_mask[:, None] & d_mask[None, :],
-        other=0.0,
-        cache_modifier=".cg",
-    )
 
     sink = tl.load(attn_sink_ptr + offs_h, mask=h_mask, other=float("-inf")).to(
         tl.float32
@@ -109,16 +102,30 @@ def _sparse_mqa_sink_kernel(
             other=0,
         )
 
-        k = tl.load(
-            kv_ptr
-            + physical_block[None, :] * kv_stride_b
-            + slot[None, :] * kv_stride_s
-            + offs_d[:, None] * kv_stride_d,
-            mask=d_mask[:, None] & valid_k[None, :],
-            other=0.0,
-            cache_modifier=".cg",
-        )
-        scores = tl.dot(q, k) * scale
+        scores = tl.zeros((BLOCK_H, TILE_K), dtype=tl.float32)
+        for d_start in range(0, head_dim, SCORE_D):
+            score_d = d_start + offs_score_d
+            score_d_mask = score_d < head_dim
+            q = tl.load(
+                q_ptr
+                + token_id * q_stride_t
+                + offs_h[:, None] * q_stride_h
+                + score_d[None, :] * q_stride_d,
+                mask=h_mask[:, None] & score_d_mask[None, :],
+                other=0.0,
+                cache_modifier=".cg",
+            )
+            k = tl.load(
+                kv_ptr
+                + physical_block[None, :] * kv_stride_b
+                + slot[None, :] * kv_stride_s
+                + score_d[:, None] * kv_stride_d,
+                mask=score_d_mask[:, None] & valid_k[None, :],
+                other=0.0,
+                cache_modifier=".cg",
+            )
+            scores += tl.dot(q, k)
+        scores *= scale
         scores = tl.where(h_mask[:, None] & valid_k[None, :], scores, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
