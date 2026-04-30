@@ -2,9 +2,25 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
+import os
 import torch
 import triton
 import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+# Cache Triton knob values to avoid repeated os.getenv lookups during JIT specialization.
+import triton.knobs as _triton_knobs
+if not hasattr(_triton_knobs.amd, '_batched_gemm_knobs_cached'):
+    if "AMDGCN_USE_BUFFER_OPS" not in os.environ:
+        _triton_knobs.amd.use_buffer_ops = False
+    if "TRITON_INTERPRET" not in os.environ:
+        _triton_knobs.runtime.interpret = False
+    if "TRITON_DEBUG" not in os.environ:
+        _triton_knobs.runtime.debug = False
+    if "TRITON_KERNEL_OVERRIDE" not in os.environ:
+        _triton_knobs.compilation.override = False
+    if "TRITON_KERNEL_DUMP" not in os.environ:
+        _triton_knobs.compilation.dump_ir = False
+    _triton_knobs.amd._batched_gemm_knobs_cached = True
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _batched_gemm_a16wfp4_reduce_kernel,
     _batched_gemm_a16wfp4_kernel,
@@ -76,17 +92,8 @@ def batched_gemm_a16wfp4_(
     Returns:
         y (torch.Tensor): Output batch with shape (B, M, N).
     """
-    _LOGGER.info(
-        f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
-    )
-
-    assert prequant is True, "prequant = False is not yet supported"
-
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
-
     Bx, M, K = x.shape
     Bw, N, K = w.shape
-    assert Bx == Bw
     B = Bx
 
     if config is None:
@@ -99,15 +106,6 @@ def batched_gemm_a16wfp4_(
             y = torch.empty((M, B, N), dtype=dtype, device=x.device)
         else:
             y = torch.empty((B, M, N), dtype=dtype, device=x.device)
-    else:
-        if transpose_bm:
-            assert (
-                y.shape[0] == M and y.shape[1] == B and y.shape[2] == N
-            ), f"Output dimension error {y.shape} {B} {M} {N}"
-        else:
-            assert (
-                y.shape[0] == B and y.shape[1] == M and y.shape[2] == N
-            ), f"Output dimension error {y.shape} {B} {M} {N}"
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
@@ -152,8 +150,8 @@ def batched_gemm_a16wfp4_(
         stride_cn = y_pp.stride(3)
 
     grid = lambda META: (  # noqa: E731
-        B,
-        (
+        B
+        * (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"])

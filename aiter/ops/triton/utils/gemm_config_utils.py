@@ -174,7 +174,7 @@ def get_gemm_config(
     config, is_tuned = _get_gemm_config_cached(
         config_name, M, N, K, bounds, specialized_filename
     )
-    return copy.deepcopy(config), is_tuned
+    return dict(config), is_tuned
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
