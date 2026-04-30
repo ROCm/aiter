@@ -178,6 +178,13 @@ jobs:
           echo "Starting benchmark for model: ${{ matrix.model }} with kv_cache_dtype: ${{ matrix.kv_cache_dtype }}"
 
           logFile="result_$(echo '${{ matrix.model }}' | sed 's/\//_/g')_kv_${{ matrix.kv_cache_dtype }}.log"
+          MODEL_MOUNT=""
+          if [ -d "/models" ]; then
+            MODEL_MOUNT="-v /models:/models"
+            echo "Using host model cache mount: /models"
+          else
+            echo "Warning: /models directory not found on runner; using remote model path."
+          fi
 
           extraArgs="${{ matrix.extra_args }}"
           if [[ -n "${{ matrix.kv_cache_dtype }}" ]]; then
@@ -189,6 +196,7 @@ jobs:
           docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
+              $MODEL_MOUNT \
               -v "${{ github.workspace }}:/workspace" -w /workspace \
               -e HF_TOKEN=${{ secrets.HF_TOKEN_TEST }} -e VLLM_ROCM_USE_AITER=1 \
               ${{ matrix.extra_env_args }} \
@@ -204,8 +212,15 @@ jobs:
                 pip uninstall -y aiter amd-aiter || true
                 pip install --no-deps \"\${wheels[0]}\"
                 pip show amd-aiter || pip show aiter
+                if [ -d \"/models/${{ matrix.model }}\" ]; then
+                  model_path=\"/models/${{ matrix.model }}\"
+                  echo \"Using cached model path: \${model_path}\"
+                else
+                  model_path=\"${{ matrix.model }}\"
+                  echo \"Using remote model path: \${model_path}\"
+                fi
                 python -m vllm.entrypoints.cli.main bench latency \
-                  --model \"${{ matrix.model }}\" \
+                  --model \"\${model_path}\" \
                   --batch-size 123 --input-len 456 --output-len 78 \
                   --num-iters-warmup 3 --num-iters 10 \
                   -tp ${{ matrix.tp }} --load-format dummy ${extraArgs}
