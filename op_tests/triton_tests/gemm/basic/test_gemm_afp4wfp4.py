@@ -41,10 +41,11 @@ def un_shuffle_scales(scales_shuffled: torch.Tensor):
     return scales
 
 
-def shuffle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
+def shuffle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32, scale_kwidth: int = None):
     """Shuffle scales for gfx1250 unshuffle pattern in the kernel."""
     sm, sn = scales.shape
-    scale_kwidth = 4 if sn >= 4 else sn
+    if scale_kwidth is None:
+        scale_kwidth = 4 if sn >= 4 else sn
     num_chunk_n = sm // preshuffle_factor
     num_chunk_k = sn // scale_kwidth
 
@@ -54,12 +55,13 @@ def shuffle_scales_gfx1250(scales: torch.Tensor, preshuffle_factor: int = 32):
     return data
 
 
-def unshuffle_scales_gfx1250(scales_shuffled: torch.Tensor, preshuffle_factor: int = 32):
+def unshuffle_scales_gfx1250(scales_shuffled: torch.Tensor, preshuffle_factor: int = 32, scale_kwidth: int = None):
     """Inverse of shuffle_scales_gfx1250."""
     sm_packed, sn_packed = scales_shuffled.shape
     sm = sm_packed * preshuffle_factor
     sn = sn_packed // preshuffle_factor
-    scale_kwidth = 4 if sn >= 4 else sn
+    if scale_kwidth is None:
+        scale_kwidth = 4 if sn >= 4 else sn
 
     data = scales_shuffled.view(
         sm // preshuffle_factor, sn // scale_kwidth,
@@ -83,6 +85,8 @@ def generate_gemm_afp4wfp4_inputs(
     output=True,
     shuffle_weight_fg=False,
     shuffle_scales_fg=False,
+    scale_preshuffle_factor=128,
+    scale_kwidth=None,
 ):
     if shuffle_weight_fg:
         assert (
@@ -126,11 +130,11 @@ def generate_gemm_afp4wfp4_inputs(
     w_scales = w_scales.T
     if shuffle_scales_fg:
         if DEVICE_ARCH == "gfx1250":
-            if M >= 128:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales, preshuffle_factor=128)
+            if M >= scale_preshuffle_factor:
+                x_scales_shuffled = shuffle_scales_gfx1250(x_scales, preshuffle_factor=scale_preshuffle_factor, scale_kwidth=scale_kwidth)
             else:
                 x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales, preshuffle_factor=128)
+            w_scales_shuffled = shuffle_scales_gfx1250(w_scales, preshuffle_factor=scale_preshuffle_factor, scale_kwidth=scale_kwidth)
         else:
             if M >= 32:
                 x_scales_shuffled = shuffle_scales(x_scales)
@@ -411,6 +415,8 @@ def test_gemm_mxfp4_nopad_gfx1250(
         output=output,
         shuffle_scales_fg=True,
         shuffle_weight_fg=False,
+        scale_preshuffle_factor=128,
+        scale_kwidth=8,
     )
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)

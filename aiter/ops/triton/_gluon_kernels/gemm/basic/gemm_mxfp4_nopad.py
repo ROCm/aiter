@@ -19,34 +19,39 @@ def get_gemm_mxfp4_nopad_layouts(
     K_GROUPS = BLOCK_K // SCALE_GROUP_ELEMS
     BLOCK_K_BYTES = BLOCK_K // FP4_ELEMS_PER_BYTE
 
-    # Non-preshuffled scales: tiles_per_warp=1 pattern from the gfx1250
-    # reference (triton-dev .../examples/gluon/mxfp_gemm_gfx1250.py). The
-    # preshuffle variant uses tiles_per_warp=2 (warp_bases doubled, reg_bases
-    # non-empty) to match scales packed in 32-row groups; using that pattern
-    # with raw scales gives the wrong thread→scale mapping.
+    # WMMA layout with tiles_per_warp=2 expressed via reg_bases=[[0,1],[1,0]],
+    # following the gfx1250 reference's SCALE_PRESHUFFLE=True path
+    # (triton-dev .../examples/gluon/mxfp_gemm_gfx1250.py). We keep
+    # instr_shape=[32, 16, 64]/[32, 16, 128] and transposed=False (constraint
+    # for this kernel). warp_bases are scaled ×2 to step over the 2×2
+    # reg-tile each warp owns.
+    #
+    # This reshapes A/B dot-operand distribution so operand ds_reads from LDS
+    # vectorize wider (target: b128). The derived a_scale_layout changes too:
+    # lane 0 now holds m ∈ {0, 32, 128, 160} × k ∈ {0..7}, and the SCALE_*
+    # constants below are paired with this layout so the offset formula yields
+    # 2 × 16-byte contiguous runs per lane → buffer_load_b128 on scales.
+    reg_bases = [[0, 1], [1, 0]]
     if num_warps == 2:
-        warp_bases = [[0, 1]]
-        reg_bases = []
+        warp_bases = [[0, 2]]
     elif num_warps == 4:
-        warp_bases = [[0, 1], [1, 0]]
-        reg_bases = []
+        warp_bases = [[0, 2], [2, 0]]
     else:
-        warp_bases = [[0, 1], [0, 2], [1, 0]]
-        reg_bases = []
+        warp_bases = [[0, 2], [0, 4], [2, 0]]
 
     wmma_layout = gl.amd.AMDWMMALayout(
         version=3,
-        transposed=True,
+        transposed=False,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 64],
+        instr_shape=[32, 16, 64],
     )
     wmma_acc_layout = gl.amd.AMDWMMALayout(
         version=3,
-        transposed=True,
+        transposed=False,
         warp_bases=warp_bases,
         reg_bases=reg_bases,
-        instr_shape=[16, 16, 128],
+        instr_shape=[32, 16, 128],
     )
 
     PAD_A = 256 if BLOCK_K_BYTES <= 256 else BLOCK_K_BYTES
@@ -172,11 +177,15 @@ def gemm_mxfp4_nopad_gfx1250(
     # subsequent async_loads use [0, 0] and advance only along K.
     a_base = a_fp4_ptr + pid_m * BLOCK_SIZE_M * stride_a_m
     b_base = b_ptr + pid_n * BLOCK_SIZE_N * stride_b_n
-    # Scales are preshuffled (factor 128, matching pack_scale): one preshuffled
-    # row packs 128 logical rows, so the per-block M (or N) bias is scaled by
-    # BLOCK / PF.
+    # Scales are preshuffled (PF=128, KW=8) to match a_scale_layout under the
+    # tiles_per_warp=2 WMMA layout above: lane 0 holds m ∈ {0, 32, 128, 160}
+    # × k ∈ {0..7}. With PF=128 (matching pack_scale's hardcoded 4-way M
+    # split) and KW=8 (so the lane's full K-run lives in one k-chunk), the
+    # offset formula produces 2 × 16-byte contiguous runs per lane:
+    #   slots  0..15 (m=0,32):    offsets   0..15      → buffer_load_b128
+    #   slots 16..31 (m=128,160): offsets 1024..1039   → buffer_load_b128
     SCALE_PRESHUFFLE_FACTOR: gl.constexpr = 128
-    SCALE_KWIDTH: gl.constexpr = 4
+    SCALE_KWIDTH: gl.constexpr = 8
     as_base = a_scale_ptr + (
         pid_m * BLOCK_SIZE_M // SCALE_PRESHUFFLE_FACTOR
     ) * stride_as_m
@@ -210,7 +219,7 @@ def gemm_mxfp4_nopad_gfx1250(
             block_shape=(BLOCK_SIZE_N, BLOCK_K_BYTES),
             layout=shared_B,
         )
-    # Scales: preshuffled (factor 32), loaded directly from global into the
+    # Scales: preshuffled (PF=128, KW=8), loaded directly from global into the
     # register layout wmma_scaled consumes — no LDS round-trip. The offset
     # tensor uses SliceLayout(axis, {a,b}_scale_layout) so the load result is
     # already in the right register layout.
@@ -218,10 +227,10 @@ def gemm_mxfp4_nopad_gfx1250(
     # Preshuffled memory layout: scale at logical (m, k) lives at
     #   (m // PF) * stride_{as,bs}_m                 -- preshuffled row
     # + (k // KW) * (PF * KW)                        -- k-chunk within row
-    # + (m %  PF//4) * (4 * KW)                      -- 8-way micro-row
+    # + (m % (PF // 4)) * (4 * KW)                   -- micro-row in 4×KW tile
     # + ((m % PF) // (PF // 4)) * KW                 -- 4-way lane
     # + (k %  KW)
-    # where PF = SCALE_PRESHUFFLE_FACTOR (32), KW = SCALE_KWIDTH (4).
+    # where PF = SCALE_PRESHUFFLE_FACTOR (128), KW = SCALE_KWIDTH (8).
     PF: gl.constexpr = SCALE_PRESHUFFLE_FACTOR
     KW: gl.constexpr = SCALE_KWIDTH
     offs_as_m = gl.arange(
