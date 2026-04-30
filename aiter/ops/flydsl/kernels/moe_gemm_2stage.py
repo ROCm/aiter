@@ -503,7 +503,7 @@ def compile_moe_gemm1(
                 # OUT: normal=[tokens, topk, inter] f16/bf16,
                 #      split-K=[tokens*topk, 2*inter] f32 (or bf16 for bf16 split-K)
                 out_elem_bytes = 4 if (_is_splitk and not _splitk_use_bf16) else 2
-                if _is_splitk:
+                if const_expr(_is_splitk):
                     out_nbytes_idx = (
                         tokens_in * c_topk * inter_in * fx.Index(2 * out_elem_bytes)
                     )
