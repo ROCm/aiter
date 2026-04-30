@@ -103,6 +103,8 @@ _BACKWARD_COMPAT_MAP = {
     "pa_prefill": "attention.pa_prefill",
     "pod_attention": "attention.pod_attention",
     "prefill_attention": "attention.prefill_attention",
+    "dsv4_indexer": "attention.dsv4_indexer",
+    "sparse_mqa_sink": "attention.sparse_mqa_sink",
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
     # Fusions modules (fusions/)
