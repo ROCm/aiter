@@ -195,7 +195,9 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, max_blk_len = kv_indices.size()
 
-    TileQCount = batch_size * next_n * (heads // ChunkQ)
+    # Make sure TileQCount is not zero
+    TileQCount = batch_size * next_n * (heads // ChunkQ) if heads // ChunkQ != 0 \
+        else batch_size * next_n
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
 
     kv_cache_fp8, kv_cache_scale = (
