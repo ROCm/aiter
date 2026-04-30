@@ -164,6 +164,26 @@ def shuffle_scale_n32k4(src: torch.Tensor, experts_cnt: int = None) -> torch.Ten
     g = s.view(E, N // 32, 32, k_scale // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
     return g.reshape(E, N // 32, k_scale * 32)
 
+def shuffle_scale_f4(
+    src: torch.Tensor,
+    intype: int = 7,
+) -> torch.Tensor:
+    """gfx1250 F4GEMM scale shuffle matching moe_shuffle_one in poc_kl.
+
+    NVFP4 (intype=8): tileSizeMajor=8, tileSizeMinor=32, majorInN=True
+    MXFP4 (intype=7): tileSizeMajor=4, tileSizeMinor=32, majorInN=True
+    """
+    tile_major = 8 if intype == 8 else 4
+    tile_minor = 32
+    M, N = src.shape
+
+    tiles_m = M // tile_minor
+    tiles_n = N // tile_major
+
+    out = src.view(tiles_m, tile_minor, tiles_n, tile_major)
+    out = out.permute(0, 2, 3, 1).contiguous()
+    return out.view(M, N)
+
 
 def shuffle_scale(
     src: torch.Tensor,
