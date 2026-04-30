@@ -24,7 +24,7 @@ Y = gemm_a16w16_opus(A, B, dtype=torch.float32)   # fp32 output
 Y = gemm_a16w16_opus(A, B, out=preallocated_Y)    # reuse buffer
 ```
 
-First call triggers a JIT build of `module_deepgemm_opus` (~19s on
+First call triggers a JIT build of `module_deepgemm_opus` (~14s on
 the dev container; see [§7.6](#76-compile-time-techniques)).
 Subsequent Python processes reuse the compiled `.so`.
 
@@ -417,7 +417,7 @@ entries entirely (launcher `TORCH_CHECK`s `Y.dtype() == BFloat16`).
 
 JIT build of `module_deepgemm_opus` is on the user-visible critical
 path (first call into any opus entry point on a fresh checkout pays
-for it). Three landed rounds of optimization, in order:
+for it). Five landed rounds of optimization, in order:
 
 1. **Host/device pass split** -- the codegen-emitted `.cuh` files
    guard their `<torch/all.h>` + launcher body behind
@@ -426,14 +426,30 @@ for it). Three landed rounds of optimization, in order:
 2. **Fusion** -- 38 per-kid host TUs collapse into one
    `all_instances_host.cu`. The heavy `<torch/extension.h>` parse
    only happens once per module rebuild instead of 38 times.
-3. **Torch removal** (this round, mirrors PR #2932 for quant) --
+3. **Torch removal in launchers** (mirrors PR #2932 for quant) --
    the dispatcher entry points and the codegen-emitted launcher
    bodies use `aiter_tensor_t` (POD, defined in
    `csrc/include/aiter_tensor.h`) instead of `torch::Tensor`.
    `<torch/all.h>` is replaced with a ~200-line header. The
    splitk launcher's fp32 workspace is allocated stream-ordered
-   via `hipMallocAsync` / `hipFreeAsync` instead of
-   `torch::empty`.
+   via `hipMallocAsync` / `hipFreeAsync` instead of `torch::empty`.
+4. **Dispatcher TU torch removal** -- one stale
+   `#include "py_itfs_common.h"` in `opus_gemm_arch_gfx950.cuh`
+   was still pulling `<torch/all.h>` + the full `<ATen/...>` stack
+   into the dispatcher TU even after step 3. Replaced with the
+   torch-free `opus_gemm_utils.cuh` (same `bf16_t` / `fp32_t`
+   aliases). Drops dispatcher TU preprocessed input from 401K
+   lines to 154K.
+5. **Lookup map: `unordered_map` + `std::function` -> sorted flat
+   array + function pointer + `std::lower_bound`** -- the runtime
+   `(M,N,K) -> kernel` and `kid -> kernel` tables used to be
+   `std::unordered_map<..., std::function<...>>`, which alone
+   added ~1s of frontend / template instantiation per dispatcher
+   TU because of the `std::function` + hashtable templates. The
+   replacement is a `static constexpr` array of POD entries
+   `{shape, kernel_function_pointer}` plus
+   `std::lower_bound`. No template instantiation overhead, no
+   heap allocation on first call, faster runtime lookup.
 
 **Headline** (128-core demon_test, ROCm 7.2.2, `MAX_JOBS=102`,
 3-trial average over `AITER_REBUILD=1` with cleared build dir):
@@ -443,8 +459,9 @@ for it). Three landed rounds of optimization, in order:
 | Pre-split baseline (38 .cpp's, each parses torch + has both passes) | **48.4s** (49.2 / 47.2 / 48.9) |
 | Host/device split (38 .cpp's, kernel decl in `#ifdef`) | **32.5s** (31.8 / 34.2 / 31.6) |
 | Fused host TU + 38 device TUs | **22.3s** (22.5 / 22.0 / 22.4) |
-| **+ torch removal (current)** | **19.4s** (19.5 / 19.5 / 19.2) |
-| **Saving vs. baseline** | **−29.0s (−60%)** |
+| + torch removal in launchers | **19.4s** (19.5 / 19.5 / 19.2) |
+| **+ dispatcher torch removal + flat-array lookup (current)** | **14.0s** (14.1 / 14.0 / 14.0) |
+| **Saving vs. baseline** | **−34.4s (−71%)** |
 
 Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 `op_tests/test_opus_a16w16_lookup.py` 338/338 still pass.
@@ -456,20 +473,33 @@ Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 | Pre-split `instance.cpp` | 13.6s | 13.3s | ~26s |
 | Host/device-split `instance.cpp` | 11.7s | 1.2s (instantiations only) | ~15s |
 | Fused `all_instances_host.cu` (with torch) | ~11.7s (one-time, all 38 launchers) | ~0.4s (device pass empty) | ~12s |
-| Fused `all_instances_host.cu` (torch-free) | **~7s (−40%)** | ~0.4s | **~8s** |
-| Per-kid `*.device.cu` | ~0.5s (RTC short-circuits torch + libstdc++) | ~1.5s (single Traits codegen) | ~2s |
+| Fused `all_instances_host.cu` (current, torch-free) | **2.05s** (FE 1.33s 65% / OPT 0.32s 16% / MCG 0.34s 17%) | 0.42s (empty) | **~2.5s** |
+| Per-kid `*.device.cu` (typical a16w16) | ~0.10s (RTC) | ~1.5s (single Traits codegen) | ~1.8s |
+| Per-kid `*.device.cu` (worst splitk: 64x96x64-wgpcu1) | ~0.11s | **8.29s (MCG 6.93s 84%)** | **~8.5s** |
 | Pre-split dispatcher (`opus_gemm.cu`, with torch) | 12.5s | 15.0s | ~27s |
 | Split dispatcher (with torch) | 12.5s | 0.4s | ~13s |
-| Split dispatcher (torch-free) | **~3s (−76%)** | 0.4s | **~3s** |
-| Pre-split pybind (`opus_gemm_pybind.cu`) | ~13s | ~13s | ~26s |
-| Split pybind | ~13s | **~0.4s (−97%)** | ~13s |
+| Dispatcher after torch + lookup overhaul (current) | **1.43s** (FE 1.21s 85%) | 0.42s | **~2.0s** |
+| Pre-split pybind | ~13s | ~13s | ~26s |
+| Split pybind (current) | ~5s | 0.42s | ~5.5s |
 
-The critical path is now the single fused host TU's ~8s after
-torch removal -- libtorch parse is gone, what remains is opus's
-own headers (`opus.hpp` ~3K lines via the traits header chain) +
-38 launcher template instantiations. The 38 device TUs all run in
-parallel under MAX_JOBS=102 and finish well before the host TU
-does.
+The end-to-end wall is now bounded by **the slowest single
+device-pass GPU codegen (~8.5s on the worst splitk kid)**, plus
+ninja schedule + link + Python startup overhead (~5s). Everything
+else (host-only TUs, dispatcher, pybind, fused TU's host pass)
+finishes long before the slowest device.cu does. Critical path
+breakdown:
+
+```
+slowest device.cu (splitk-64x96x64-wgpcu1) device pass    ~8.5s   ← GPU codegen, MCG dominated
+ninja schedule + link + python startup                    ~5.5s
+total wall                                                ~14s
+```
+
+The 8.5s on that one kid is real AMDGPU backend work
+(register allocation, instruction scheduling, ISA emit) on a
+heavy MFMA-32x32 splitk pipeline -- not parse / template waste --
+so further wall savings need either fewer kid instantiations or
+AMDGPU `-mllvm` flag tuning to shorten that backend pass.
 
 **What the codegen actually emits** (post-fusion):
 
@@ -596,55 +626,64 @@ path.
 
 ### 7.7 Future compile-time work (un-implemented; analysis only)
 
-The current 22.3s floor is set by **the fused host TU's
-opus.hpp parsing + 38 launcher template instantiations on host
-pass (~7s)**, serial inside a single TU. Per-kid device codegen
-runs in ~2s × 38 wide-parallel and is no longer on the critical
-path. Remaining attack surface, in rough order of expected payoff
-vs. invasiveness:
+The current 14.0s floor is set by **the slowest single device
+TU's GPU codegen (~8.5s on `flatmm_splitk_64x96x64_wgpcu1` -- 84%
+in machine-code generation, i.e. AMDGPU register allocation +
+instruction scheduling on an MFMA-32x32 splitk pipeline)**, not
+by host parse anymore. Every host-side TU now finishes in 2-5s
+each and runs in parallel; ninja schedules them comfortably
+inside the slowest device TU's wall time. Remaining attack
+surface, in rough order of expected payoff vs. invasiveness:
 
-1. **Split `opus.hpp` into device-only / host-only / shared
-   subheaders** — every device TU still parses the full 3055
-   lines of opus.hpp on its device pass. The fused host TU pulls
-   a subset of opus.hpp via `aiter_tensor.h` →
-   `aiter_hip_common.h` chain plus the per-kid traits header. A
-   header restructure would let each TU include only the slice it
-   needs. Risk: opus is shared by many kernels (opus_attn,
-   opus_fmm, etc.); the split has to be ABI-stable. Saving:
-   ~1s/device TU (off the critical path on this hardware) +
-   ~2-3s off the fused TU's host parse.
-
-2. **PCH (precompiled header) for the fused host TU** — now that
-   torch is gone, PCH would amortise the opus.hpp / pipeline
-   header / traits header parse instead of libtorch. Smaller
-   absolute saving than the pre-torch-removal world (the pure
-   opus headers parse in ~7s, not ~12s) but the warm-rebuild
-   benefit is still real because PCH scope is now much smaller
-   and so is the PCH build cost itself. Estimated end-to-end
-   saving: ~3-5s on warm rebuilds, neutral on cold.
-
-3. **Drop AMDGPU-side `-mllvm` flags that gate fewer optimizations
-   in JIT mode** — the current build sets `--lsr-drop-solution=1`,
+1. **Drop AMDGPU-side `-mllvm` flags that slow codegen** -- the
+   build currently passes `--lsr-drop-solution=1`,
    `-amdgpu-early-inline-all=true`, `-amdgpu-function-calls=false`,
-   etc. Some of these slow codegen for marginal kernel-perf wins
-   on small instances. Auditing per-flag with `-ftime-report`
-   could reclaim part of the device-pass time. Risk: must
-   validate kernel performance doesn't regress on the tuned
-   shapes. Saving: speculative; needs measurement.
+   `-enable-post-misched=0`, `--amdgpu-mfma-vgpr-form` to every
+   device TU. The 8.5s critical-path TU's MCG dominates total
+   build time, so this is the only remaining lever that targets
+   it directly. Some of these flags trade compile time for
+   marginal kernel-perf wins on small shapes; auditing per-flag
+   with `-ftime-report` and the existing tuning harness could
+   reclaim a meaningful slice. Risk: must validate that
+   `op_tests/test_opus_a16w16_*` performance numbers don't
+   regress on the tuned shapes. Saving: speculative; needs
+   measurement, but the upper bound is "the slowest device TU's
+   MCG time" = ~6-7s.
 
-4. **`ccache` / `sccache` integration** — reuse `.cuda.o` across
+2. **Trim or split heavy splitk kid instantiations** -- the
+   slowest 4-5 splitk kids (`*_64x96x*` and `*_96x64x*` family
+   with `wgpcu1`) eat the entire ninja schedule's tail. Empirical
+   sweep of tuned CSV winners would reveal which of these are
+   actually selected for production shapes; un-selected kids can
+   be dropped at codegen time, removing them from the build
+   entirely. Saving: depends on CSV coverage; potentially -3 to
+   -5s end-to-end.
+
+3. **`ccache` / `sccache` integration** -- reuse `.cuda.o` across
    rebuilds when `gen_instances.py` produces a byte-identical TU.
    Pure infra change, complementary to all other items. The first
    build still pays full freight; subsequent rebuilds (e.g.
    `AITER_REBUILD=1` after a CSV-only edit) drop to seconds.
+   This was deferred earlier because parsing was the bottleneck
+   and parses don't compose well across rebuilds; with parse
+   gone, MCG dominates and MCG output is much more cacheable.
 
-The combined ceiling, if items 1 + 2 land without regression, is
-roughly **10–12s** end-to-end on this hardware — limited by
-opus.hpp's intrinsic parsing cost on the fused host TU plus the
-host stub generation + link step. Beyond that, further gains
-require fundamentally fewer launcher instantiations (e.g. unifying
-multiple kid signatures through a thin runtime dispatch), which
-is a structural change rather than a build-time one.
+4. **Header structure cleanup** (low priority) -- `opus.hpp` is
+   3055 lines, parsed by every device TU on its device pass and
+   by the fused host TU on its host pass. The fused TU now parses
+   it in ~1.3s and that's already off the critical path; the
+   per-device TU host pass is even shorter (~0.1s with RTC). Only
+   worth doing for cleanliness, not for time.
+
+The combined ceiling, if item 1 lands without regression, is
+roughly **8-9s** end-to-end on this hardware -- limited by ninja
+schedule overhead + the link step + Python startup + the
+unavoidable minimum AMDGPU codegen wall on the heaviest single
+kernel. Beyond that, further wall savings need either fewer
+heavy kid instantiations (item 2) or fundamentally re-thinking
+the splitk pipeline so it doesn't generate as much GPU code per
+template instantiation, which is a structural change rather than
+a build-time one.
 
 ---
 
@@ -663,10 +702,11 @@ CSV changes on JIT rebuild:
 AITER_REBUILD=1 python3 -c "from aiter.ops.opus import gemm_a16w16_opus"
 ```
 
-The whole rebuild takes ~19s on dev hardware (128-core,
+The whole rebuild takes ~14s on dev hardware (128-core,
 ROCm 7.2.2; see [§7.6 Compile-time techniques](#76-compile-time-techniques)
-for the host/device split + fused TU + torch removal that drop it
-from ~48s).
+for the five-stage optimization stack (host/device split + fused TU +
+torch removal + dispatcher torch removal + flat-array lookup) that
+drops it from ~48s).
 
 ### `RuntimeError: K=... must be even`
 

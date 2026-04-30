@@ -28,39 +28,69 @@
 #include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_BF16 / FP32
 #include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_BF16 / FP32
 #include "opus_gemm_manifest.h"                     // launcher symbols referenced by the lookup macros
-#include "py_itfs_common.h"                         // bf16_t / fp32_t
+#include "../opus_gemm_utils.cuh"                   // bf16_t / fp32_t (torch-free; py_itfs_common.h pulls full <torch/all.h>)
 
+#include <algorithm>  // std::lower_bound
 #include <cstddef>
-#include <functional>
-#include <string>
-#include <tuple>
-#include <unordered_map>
 
 namespace opus_gfx950_detail
 {
-struct IntTupleHash
+// Sorted flat-array entries for the runtime (M, N, K) -> kernel lookup
+// (was: std::unordered_map<std::tuple<int,int,int>,
+// OpusA16W16NoscaleKernel, IntTupleHash>). The unordered_map version
+// added ~1s of frontend / template instantiation per dispatcher TU
+// because of the heavyweight std::function-valued hashtable templates;
+// a flat array of POD entries plus std::lower_bound costs essentially
+// nothing at parse time and matches the lookup at runtime in O(log N)
+// over 339 entries.
+// Nested {shape, func} aggregate matches the `{ {M, N, K}, &kernel }`
+// initializer the codegen emits. Splitting shape into its own struct
+// keeps the comparators small and gives gen_instances.py a stable
+// brace pattern to target.
+struct OpusA16W16Shape
 {
-    size_t operator()(const std::tuple<int, int, int> &t) const
-    {
-        auto h1 = std::hash<int>{}(std::get<0>(t));
-        auto h2 = std::hash<int>{}(std::get<1>(t));
-        auto h3 = std::hash<int>{}(std::get<2>(t));
-        return h1 ^ h2 ^ h3;
-    }
+    int M;
+    int N;
+    int K;
 };
 
-// (M, N, K) -> kernel<CDataType>. Populated from opus-private tuned CSV at
-// JIT time by gen_instances.py --tune_file. Mirrors the IntTupleHash +
-// unordered_map layout used by csrc/ck_gemm_a8w8/gemm_a8w8.cu.
-using OpusA16W16RuntimeMap = std::unordered_map<
-    std::tuple<int, int, int>,
-    OpusA16W16NoscaleKernel,
-    IntTupleHash>;
+struct OpusA16W16RuntimeEntry
+{
+    OpusA16W16Shape key;
+    OpusA16W16NoscaleKernel func;
+};
 
-// id -> kernel<CDataType>. Same launcher signature as the runtime map; both
-// the bf16 and fp32 specializations use the same alias.
+// Lex order on (M, N, K). Used both during sorting (gen_instances.py
+// emits entries in lex order) and by std::lower_bound at lookup time.
+constexpr bool entry_less(const OpusA16W16RuntimeEntry& a,
+                          const OpusA16W16RuntimeEntry& b) noexcept
+{
+    if (a.key.M != b.key.M) return a.key.M < b.key.M;
+    if (a.key.N != b.key.N) return a.key.N < b.key.N;
+    return a.key.K < b.key.K;
+}
+
+constexpr bool entry_eq(const OpusA16W16RuntimeEntry& a,
+                        const OpusA16W16RuntimeEntry& b) noexcept
+{
+    return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
+}
+
+// id -> kernel<CDataType>, same flat-array layout. Sorted by id (the
+// codegen always emits in ascending id order).
+struct OpusA16W16TuneEntry
+{
+    int kid;
+    OpusA16W16NoscaleKernel func;
+};
+
+constexpr bool tune_entry_less(const OpusA16W16TuneEntry& a,
+                               const OpusA16W16TuneEntry& b) noexcept
+{
+    return a.kid < b.kid;
+}
+
 using OpusA16W16TuneKernel = OpusA16W16NoscaleKernel;
-using OpusA16W16TuneMap    = std::unordered_map<int, OpusA16W16TuneKernel>;
 }  // namespace opus_gfx950_detail
 
 // ── a16w16 runtime dispatch (tuned lookup → heuristic fallback) ─────────────
@@ -74,14 +104,15 @@ inline OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch)
 {
     using namespace opus_gfx950_detail;
-    static const auto lookup = []
+    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)
+    };
+    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
+    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
+    if (it != kLookup + kSize && entry_eq(*it, needle))
     {
-        return OpusA16W16RuntimeMap{GENERATE_OPUS_LOOKUP_TABLE_BF16(bf16_t)};
-    }();
-    auto it = lookup.find({M, N, K});
-    if (it != lookup.end())
-    {
-        return it->second;
+        return it->func;
     }
     return opus_a16w16_heuristic_dispatch_gfx950<bf16_t>(M, N, K, batch);
 }
@@ -91,24 +122,26 @@ inline OpusA16W16NoscaleKernel
 opus_dispatch_a16w16_gfx950<fp32_t>(int M, int N, int K, int batch)
 {
     using namespace opus_gfx950_detail;
-    static const auto lookup = []
+    static constexpr OpusA16W16RuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)
+    };
+    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
+    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
+    if (it != kLookup + kSize && entry_eq(*it, needle))
     {
-        return OpusA16W16RuntimeMap{GENERATE_OPUS_LOOKUP_TABLE_FP32(fp32_t)};
-    }();
-    auto it = lookup.find({M, N, K});
-    if (it != lookup.end())
-    {
-        return it->second;
+        return it->func;
     }
     return opus_a16w16_heuristic_dispatch_gfx950<fp32_t>(M, N, K, batch);
 }
 
 // ── a16w16 tune dispatch (id-based, two specializations) ────────────────────
 //
-// The bf16 map omits splitk kids (their <bf16_t> instantiation doesn't exist;
-// splitk main kernel hardcodes D_C=float). The fp32 map includes all
-// a16w16-family kids; splitk kids appear there with <fp32_t> hardcoded as
-// well, since the reduce kernel handles fp32 Y output by skipping the cast.
+// The bf16 table omits splitk kids (their <bf16_t> instantiation doesn't
+// exist; splitk main kernel hardcodes D_C=float). The fp32 table includes
+// all a16w16-family kids; splitk kids appear there with <fp32_t>
+// hardcoded as well, since the reduce kernel handles fp32 Y output by
+// skipping the cast.
 
 template <typename CDataType>
 inline opus_gfx950_detail::OpusA16W16TuneKernel
@@ -119,15 +152,16 @@ inline opus_gfx950_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx950<bf16_t>(int id)
 {
     using namespace opus_gfx950_detail;
-    static const auto lookup = []
-    {
-        return OpusA16W16TuneMap{GENERATE_A16W16_TUNE_LOOKUP_BF16(bf16_t)};
-    }();
-    auto it = lookup.find(id);
-    AITER_CHECK(it != lookup.end(),
+    static constexpr OpusA16W16TuneEntry kTune[] = {
+        GENERATE_A16W16_TUNE_LOOKUP_BF16(bf16_t)
+    };
+    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
+    OpusA16W16TuneEntry needle{id, nullptr};
+    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ", id,
                 " not found in a16w16 bf16 tune lookup table");
-    return it->second;
+    return it->func;
 }
 
 template <>
@@ -135,13 +169,14 @@ inline opus_gfx950_detail::OpusA16W16TuneKernel
 opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
 {
     using namespace opus_gfx950_detail;
-    static const auto lookup = []
-    {
-        return OpusA16W16TuneMap{GENERATE_A16W16_TUNE_LOOKUP_FP32(fp32_t)};
-    }();
-    auto it = lookup.find(id);
-    AITER_CHECK(it != lookup.end(),
+    static constexpr OpusA16W16TuneEntry kTune[] = {
+        GENERATE_A16W16_TUNE_LOOKUP_FP32(fp32_t)
+    };
+    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
+    OpusA16W16TuneEntry needle{id, nullptr};
+    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ", id,
                 " not found in a16w16 fp32 tune lookup table");
-    return it->second;
+    return it->func;
 }

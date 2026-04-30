@@ -24,9 +24,7 @@
 #include "opus_gemm_manifest.h"                    // a8w8 launcher symbols
 #include "opus_gemm_utils.cuh"                     // bf16_t / fp32_t
 
-#include <functional>
 #include <optional>
-#include <string>
 
 // ── a8w8 / a8w8_scale launcher signatures ───────────────────────────────────
 //
@@ -34,14 +32,19 @@
 // single hardcoded launcher per dtype (no tuned lookup table). The fp8 entry
 // in opus_gemm() guards them with an explicit gfx950 AITER_CHECK so callers
 // on other archs see the same "pipeline TBD" error as the bf16 path.
-using OpusScaleKernel = std::function<
-    void(aiter_tensor_t &, aiter_tensor_t &,
-         aiter_tensor_t &,
-         std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>)>;
+//
+// Plain function pointers (was: `std::function<...>`). Same rationale as
+// OpusA16W16NoscaleKernel: every callable stored here is one of the
+// explicit launcher template instantiations, no captures, so std::function's
+// type-erasure overhead and template instantiation cost are pure waste.
+using OpusScaleKernel = void (*)(
+    aiter_tensor_t &, aiter_tensor_t &,
+    aiter_tensor_t &,
+    std::optional<aiter_tensor_t>, std::optional<aiter_tensor_t>);
 
-using OpusNoscaleKernel = std::function<
-    void(aiter_tensor_t &, aiter_tensor_t &,
-         aiter_tensor_t &)>;
+using OpusNoscaleKernel = void (*)(
+    aiter_tensor_t &, aiter_tensor_t &,
+    aiter_tensor_t &);
 
 template <typename CDataType>
 OpusScaleKernel opus_dispatch_scale(int M, int N, int K)
