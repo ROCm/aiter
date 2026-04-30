@@ -78,7 +78,9 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
             src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
         )
     # print("interleaved shape:", interleaved.shape)
-    return interleaved.contiguous().view(src_type)
+    result = interleaved.contiguous().view(src_type)
+    result.is_shuffled = True
+    return result
 
 
 def shuffle_scale_a16w4(
