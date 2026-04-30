@@ -5326,7 +5326,8 @@ def pa_decode_gluon(
     temporary_output : torch.Tensor
         Buffer for partial attention outputs from each context partition.
         - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
-        - Dtype: torch.float32 for multi-partition decode; output dtype for one-shot decode
+        - Dtype: caller-provided dtype; internally defaults to bfloat16 for FP8 queries
+          and otherwise matches query dtype. Ignored for one-shot decode.
 
     alibi_slopes : torch.Tensor, optional
         ALiBi (Attention with Linear Biases) slopes for positional encoding.
@@ -5441,7 +5442,7 @@ def pa_decode_gluon(
             equivalent_query_group_size,
             head_size,
             device=query.device,
-            dtype=query.dtype,
+            dtype=aiter.dtypes.bf16 if query.dtype == aiter.dtypes.fp8 else query.dtype,
         )
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
