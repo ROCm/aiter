@@ -107,7 +107,6 @@ else:
         print("[aiter] Skipping .github/scripts/install_triton.sh")
 
 
-
 def write_install_mode():
     """Write install_mode so core.py uses aiter_meta/ (install) vs repo root (develop).
 
