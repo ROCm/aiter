@@ -3,6 +3,8 @@ name: Sglang Downstream Test
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 17 * * *'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]  # Triggers on PRs targeting `main`
@@ -35,28 +37,42 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
 
-  sglang:
+  select-sglang-tests:
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
       contains(github.event.pull_request.labels.*.name, 'ci:all')))
-    name: Sglang Integration Test (1 GPU)
     needs: [check-signal]
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_tests: ${{ steps.select.outputs.has_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select SGLang tests
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: python3 ./.github/scripts/sglang_downstream.py select-tests
+
+  sglang:
+    if: needs.select-sglang-tests.outputs.has_tests == 'true'
+    name: Sglang ${{ matrix.model }} ${{ matrix.test_type }} (8 GPU)
+    needs: [check-signal, select-sglang-tests]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: linux-aiter-mi300x-1
-            label: MI300X
+      matrix: ${{ fromJSON(needs.select-sglang-tests.outputs.matrix) }}
 
     env:
-      SGL_BRANCH: v0.5.10
-      GPU_ARCH: gfx942
-      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi325-gpu-1
+      SGL_BRANCH: main
+      GPU_ARCH: gfx950
+      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi35x-gpu-8
       GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
-      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
 
     steps:
       - name: Checkout aiter repo
@@ -91,87 +107,15 @@ jobs:
           exit 0
 
       - name: Patch sglang CI scripts for aiter runners
-        run: |
-          cd "${SGLANG_WORKSPACE}"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path_str: str, old: str, new: str) -> None:
-              path = Path(path_str)
-              text = path.read_text()
-              if old not in text:
-                  raise SystemExit(f"Expected snippet not found in {path}: {old!r}")
-              path.write_text(text.replace(old, new, 1))
-
-          hostname_override = 'HOSTNAME_VALUE="${SGLANG_CI_HOSTNAME_OVERRIDE:-$(hostname)}"'
-          for rel in (
-              "scripts/ci/amd/amd_ci_start_container.sh",
-              "scripts/ci/amd/amd_ci_install_dependency.sh",
-              "scripts/ci/amd/amd_ci_exec.sh",
-          ):
-              replace_once(rel, "HOSTNAME_VALUE=$(hostname)", hostname_override)
-
-          replace_once(
-              "scripts/ci/amd/amd_ci_install_dependency.sh",
-              "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .",
-              "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .",
-          )
-          PY
-
-      - name: Resolve SGLang base image
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          import urllib.request
-
-          prefixes = [
-              "v0.5.10-rocm700-mi30x-",
-              "v0.5.10rc0-rocm700-mi30x-",
-          ]
-          matches = {prefix: [] for prefix in prefixes}
-          patterns = {
-              prefix: re.compile(rf"^{re.escape(prefix)}\d{{8}}(?:-preview)?$")
-              for prefix in prefixes
-          }
-          next_url = "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100"
-
-          while next_url:
-              with urllib.request.urlopen(next_url, timeout=30) as resp:
-                  data = json.load(resp)
-              for item in data.get("results", []):
-                  name = item["name"]
-                  for prefix in prefixes:
-                      if patterns[prefix].match(name):
-                          matches[prefix].append(name)
-              next_url = data.get("next")
-
-          chosen_tag = None
-          for prefix in prefixes:
-              if matches[prefix]:
-                  chosen_tag = sorted(matches[prefix], reverse=True)[0]
-                  break
-
-          if not chosen_tag:
-              raise SystemExit("No public MI30X SGLang image found for v0.5.10.")
-
-          image = f"rocm/sgl-dev:{chosen_tag}"
-          print(f"Resolved SGLang base image: {image}")
-          if chosen_tag.startswith("v0.5.10rc0-"):
-              print("Using v0.5.10rc0 image because no public v0.5.10 MI30X tag was found.")
-
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
-              fh.write(f"SGL_IMAGE={image}\n")
-          PY
+        run: python3 ./.github/scripts/sglang_downstream.py patch-sglang "${SGLANG_WORKSPACE}"
 
       - name: Start CI container
         run: |
           set -ex
           docker rm -f ci_sglang || true
           cd "${SGLANG_WORKSPACE}"
-          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --custom-image "${SGL_IMAGE}"
-          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python'
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh
+          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/sgl-kernel; test -d /sglang-checkout/python; test -d /models'
 
       - name: Setup pip config
         run: |
@@ -182,8 +126,11 @@ jobs:
         run: |
           cd "${SGLANG_WORKSPACE}"
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
 
       - name: Install aiter under test
+        id: install_aiter_under_test
         run: |
           set -ex
           docker exec ci_sglang bash -lc "
@@ -201,15 +148,24 @@ jobs:
             pip show amd-aiter || pip show aiter
           "
 
-      - name: Evaluate Accuracy
-        timeout-minutes: 120
+      - name: ${{ matrix.test_type }} Test MI35x (8-GPU ${{ matrix.model }})
+        timeout-minutes: ${{ matrix.timeout_minutes }}
+        env:
+          TEST_SPEC: ${{ toJson(matrix) }}
+          EXTRA_EXEC_ARGS: ${{ matrix.extra_exec_args }}
+          TEST_COMMAND: ${{ matrix.test_command }}
         run: |
           set -ex
           cd "${SGLANG_WORKSPACE}"
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" python3 -c 'import os; print({k: os.environ.get(k) for k in ("GPU_ARCHS", "SGLANG_USE_AITER")})'
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" -e SGLANG_USE_AITER=0 python3 registered/eval/test_eval_accuracy_large.py
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/quant/test_eval_fp8_accuracy.py
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/models/test_qwen_models.py
+          > github_summary.md
+          mapfile -t MODEL_ENV_ARGS < <(python3 ./.github/scripts/sglang_downstream.py model-env-args)
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            "${MODEL_ENV_ARGS[@]}" \
+            ${EXTRA_EXEC_ARGS} \
+            ${TEST_COMMAND} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
 
       - name: Clean Up
         if: always()
