@@ -26,6 +26,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_ff_args,
 )
 import math
+import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 block_shape = (128, 128)
 
