@@ -12,43 +12,39 @@ if [ -n "${AITER_INDEX_URL:-}" ]; then
   # Find the direct wheel URL from the index.
   # Some S3 buckets serve wheels under an /amd-aiter/ subdirectory (PEP 503 style),
   # others serve them at the root of the index URL.  Try both locations.
-  WHEEL_URL=$(python3 -c "
+  WHEEL_URL=$(python3 << 'PYEOF'
 import os, re, sys, urllib.parse, urllib.request
 
-index = '${AITER_INDEX_URL}'.rstrip('/')
-version_filter = '${AITER_VERSION:-}'
-pytag = '${AITER_PYTHON_TAG}'
+index = os.environ.get("AITER_INDEX_URL", "").rstrip("/")
+version_filter = os.environ.get("AITER_VERSION", "")
+pytag = os.environ.get("AITER_PYTHON_TAG", "cp312")
 
 def list_wheels(page_url):
-    \"\"\"Return wheel filenames found at page_url.\"\"\"
     try:
         with urllib.request.urlopen(page_url, timeout=30) as resp:
             html = urllib.parse.unquote(resp.read().decode())
     except Exception:
         return []
-    pat = r'href=\"([^\"]*amd_aiter-[^\"]*' + pytag + r'-' + pytag + r'-[^\"]+\.whl)\"'
+    pat = r'href="([^"]*amd_aiter-[^"]*' + pytag + r'-' + pytag + r'-[^"]+\.whl)"'
     found = re.findall(pat, html)
     if not found:
-        pat2 = r'(amd_aiter-[^\s\"<>]*' + pytag + r'-' + pytag + r'-[^\s\"<>]+\.whl)'
+        pat2 = r'(amd_aiter-[^\s"<>]*' + pytag + r'-' + pytag + r'-[^\s"<>]+\.whl)'
         found = re.findall(pat2, html)
     return [os.path.basename(urllib.parse.unquote(w)) for w in found]
 
 def is_downloadable(url):
-    \"\"\"HEAD-check whether the URL returns 200.\"\"\"
-    req = urllib.request.Request(url, method='HEAD')
+    req = urllib.request.Request(url, method="HEAD")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status == 200
     except Exception:
         return False
 
-# Build list of base URLs to try (for both listing and downloading)
-if index.rstrip('/').endswith('amd-aiter'):
-    bases = [index + '/']
+if index.endswith("amd-aiter"):
+    bases = [index + "/"]
 else:
-    bases = [index + '/amd-aiter/', index + '/']
+    bases = [index + "/amd-aiter/", index + "/"]
 
-# Collect wheel filenames from whichever listing succeeds
 filenames = []
 for base in bases:
     filenames = list_wheels(base)
@@ -56,31 +52,27 @@ for base in bases:
         break
 
 if not filenames:
-    raise SystemExit(f'No {pytag} wheels found at any of: {bases}')
+    sys.exit(0)
 
-# Filter by version
 if version_filter:
-    encoded = version_filter.replace('+', '%2B')
+    encoded = version_filter.replace("+", "%2B")
     filenames = [f for f in filenames if version_filter in f or encoded in f]
 
 if not filenames:
-    raise SystemExit('No matching wheel found for version filter')
+    sys.exit(0)
 
-# Pick latest
 best_name = sorted(filenames)[-1]
-best_encoded = best_name.replace('+', '%2B')
+best_encoded = best_name.replace("+", "%2B")
 
-# Try each base URL for actual download (listing may succeed at one path
-# while downloads only work at another)
 for base in bases:
-    candidate = base.rstrip('/') + '/' + best_encoded
+    candidate = base.rstrip("/") + "/" + best_encoded
     if is_downloadable(candidate):
         print(candidate)
         sys.exit(0)
 
-# None passed HEAD check — return the first candidate and let pip error clearly
-print(bases[0].rstrip('/') + '/' + best_encoded)
-" 2>/dev/null)
+print(bases[0].rstrip("/") + "/" + best_encoded)
+PYEOF
+  ) || true
 
   if [ -n "${WHEEL_URL}" ]; then
     AITER_INSTALL_CMD="pip install --force-reinstall '${WHEEL_URL}'"
