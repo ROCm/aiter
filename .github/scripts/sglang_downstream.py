@@ -229,7 +229,9 @@ def model_env_args() -> None:
         print("-e")
         print(f"{env_name}={model_dir}")
     else:
-        print(f"Local model path not readable, using default: {model_id}", file=sys.stderr)
+        print(
+            f"Local model path not readable, using default: {model_id}", file=sys.stderr
+        )
 
 
 def main() -> None:
