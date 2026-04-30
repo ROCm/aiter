@@ -1061,7 +1061,9 @@ def compile_moe_gemm1(
                                     else:
                                         packed_g, sc_g = b_gate_raw[ni], None
                                         packed_u, sc_u = b_up_raw[ni], None
-                                    if const_expr(is_int4_bf16_groupwise and use_gfx950_cvt):
+                                    if const_expr(
+                                        is_int4_bf16_groupwise and use_gfx950_cvt
+                                    ):
                                         # Defer group scale to post-MFMA FMA with pipeline:
                                         # Issue current MFMA, then apply FMA for previous iteration's result.
                                         bg0, bg1 = unpack_b_w4a16(
@@ -1568,7 +1570,9 @@ def compile_moe_gemm1(
                         t_idx = arith.index_cast(T.index, t2)
                         s_idx = arith.index_cast(T.index, s2)
                         ts_idx = t_idx * arith.index(topk) + s_idx
-                        if const_expr(_splitk_use_bf16 and not _needs_global_atomic_bf16_s1):
+                        if const_expr(
+                            _splitk_use_bf16 and not _needs_global_atomic_bf16_s1
+                        ):
                             # For buffer atomics: compute relative byte offset from buffer base
                             row_byte_off = ts_idx * arith.index(_split_k_out_row_stride)
                             return (row_byte_off, t_ok)
@@ -2919,7 +2923,9 @@ def compile_moe_gemm2(
                                             sc = extract_bf16_scale(arith, sc, ku)
                                     else:
                                         packed, sc = b_raw[ni], None
-                                    if const_expr(is_int4_bf16_groupwise and use_gfx950_cvt):
+                                    if const_expr(
+                                        is_int4_bf16_groupwise and use_gfx950_cvt
+                                    ):
                                         b0, b1 = unpack_b_w4a16(
                                             packed,
                                             arith,
