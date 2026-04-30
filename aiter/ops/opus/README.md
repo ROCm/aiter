@@ -24,7 +24,7 @@ Y = gemm_a16w16_opus(A, B, dtype=torch.float32)   # fp32 output
 Y = gemm_a16w16_opus(A, B, out=preallocated_Y)    # reuse buffer
 ```
 
-First call triggers a JIT build of `module_deepgemm_opus` (~22s on
+First call triggers a JIT build of `module_deepgemm_opus` (~19s on
 the dev container; see [§7.6](#76-compile-time-techniques)).
 Subsequent Python processes reuse the compiled `.so`.
 
@@ -417,9 +417,23 @@ entries entirely (launcher `TORCH_CHECK`s `Y.dtype() == BFloat16`).
 
 JIT build of `module_deepgemm_opus` is on the user-visible critical
 path (first call into any opus entry point on a fresh checkout pays
-for it). The codegen splits the work along host/device pass
-boundaries and shares the heavy libtorch parse across all kids via a
-single fused host TU.
+for it). Three landed rounds of optimization, in order:
+
+1. **Host/device pass split** -- the codegen-emitted `.cuh` files
+   guard their `<torch/all.h>` + launcher body behind
+   `#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)`,
+   so the device pass parses ~10K lines instead of ~70K.
+2. **Fusion** -- 38 per-kid host TUs collapse into one
+   `all_instances_host.cu`. The heavy `<torch/extension.h>` parse
+   only happens once per module rebuild instead of 38 times.
+3. **Torch removal** (this round, mirrors PR #2932 for quant) --
+   the dispatcher entry points and the codegen-emitted launcher
+   bodies use `aiter_tensor_t` (POD, defined in
+   `csrc/include/aiter_tensor.h`) instead of `torch::Tensor`.
+   `<torch/all.h>` is replaced with a ~200-line header. The
+   splitk launcher's fp32 workspace is allocated stream-ordered
+   via `hipMallocAsync` / `hipFreeAsync` instead of
+   `torch::empty`.
 
 **Headline** (128-core demon_test, ROCm 7.2.2, `MAX_JOBS=102`,
 3-trial average over `AITER_REBUILD=1` with cleared build dir):
@@ -428,8 +442,9 @@ single fused host TU.
 |---|---:|
 | Pre-split baseline (38 .cpp's, each parses torch + has both passes) | **48.4s** (49.2 / 47.2 / 48.9) |
 | Host/device split (38 .cpp's, kernel decl in `#ifdef`) | **32.5s** (31.8 / 34.2 / 31.6) |
-| **Fused host TU + 38 device TUs (current)** | **22.3s** (22.5 / 22.0 / 22.4) |
-| **Saving vs. baseline** | **−26.1s (−54%)** |
+| Fused host TU + 38 device TUs | **22.3s** (22.5 / 22.0 / 22.4) |
+| **+ torch removal (current)** | **19.4s** (19.5 / 19.5 / 19.2) |
+| **Saving vs. baseline** | **−29.0s (−60%)** |
 
 Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 `op_tests/test_opus_a16w16_lookup.py` 338/338 still pass.
@@ -440,20 +455,21 @@ Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 |---|---:|---:|---:|
 | Pre-split `instance.cpp` | 13.6s | 13.3s | ~26s |
 | Host/device-split `instance.cpp` | 11.7s | 1.2s (instantiations only) | ~15s |
-| Fused `all_instances_host.cu` (host pass only) | ~13s (one-time, all 38 launchers) | ~0.4s (device pass empty) | ~14s |
+| Fused `all_instances_host.cu` (with torch) | ~11.7s (one-time, all 38 launchers) | ~0.4s (device pass empty) | ~12s |
+| Fused `all_instances_host.cu` (torch-free) | **~7s (−40%)** | ~0.4s | **~8s** |
 | Per-kid `*.device.cu` | ~0.5s (RTC short-circuits torch + libstdc++) | ~1.5s (single Traits codegen) | ~2s |
-| Pre-split dispatcher (`opus_gemm.cu`) | 12.5s | 15.0s | ~27s |
-| Split dispatcher | 12.5s | **0.4s (−97%)** | ~13s |
+| Pre-split dispatcher (`opus_gemm.cu`, with torch) | 12.5s | 15.0s | ~27s |
+| Split dispatcher (with torch) | 12.5s | 0.4s | ~13s |
+| Split dispatcher (torch-free) | **~3s (−76%)** | 0.4s | **~3s** |
 | Pre-split pybind (`opus_gemm_pybind.cu`) | ~13s | ~13s | ~26s |
 | Split pybind | ~13s | **~0.4s (−97%)** | ~13s |
 
-The critical path is now the single fused host TU's ~14s — the 38
-device TUs all run in parallel under MAX_JOBS=102 and finish well
-before the host TU does. Compare to the pre-split layout's ~26s
-critical path (worst-case `instance.cpp`, pinned by torch parse +
-device codegen running back-to-back inside hipcc) and the ~15s of
-the host/device-split layout (worst-case `instance.cpp` with kernel
-codegen still inside the same TU as the launcher).
+The critical path is now the single fused host TU's ~8s after
+torch removal -- libtorch parse is gone, what remains is opus's
+own headers (`opus.hpp` ~3K lines via the traits header chain) +
+38 launcher template instantiations. The 38 device TUs all run in
+parallel under MAX_JOBS=102 and finish well before the host TU
+does.
 
 **What the codegen actually emits** (post-fusion):
 
@@ -481,17 +497,17 @@ codegen still inside the same TU as the launcher).
 3. **`csrc/opus_gemm/gen_instances.py`** — restructured around three
    file shapes:
    * `impl/{name}.cuh` (one per kid): Traits aliases + launcher body.
-     Three guard combinations: skip torch when the host pass is
-     irrelevant (`__HIP_DEVICE_COMPILE__` or `__HIPCC_RTC__` set);
+     Three guard combinations: skip torch headers when the host pass
+     is irrelevant (`__HIP_DEVICE_COMPILE__` or `__HIPCC_RTC__` set);
      pick `traits header + forward kernel decl` over `pipeline body`
      when `OPUS_FUSED_HOST_TU` is set (avoids the ODR clash on
      same-named layout helpers between pipeline headers).
    * `instances/all_instances_host.cu` (one for the WHOLE module):
-     defines `OPUS_FUSED_HOST_TU`, includes `<torch/extension.h>`
-     once, includes every kid's `.cuh`, and emits all
-     `template torch::Tensor xxx<dtype>(...)` instantiations. The
-     launcher's `<<<...>>>` calls produce undefined
-     `__device_stub__` references. Wrapped in
+     defines `OPUS_FUSED_HOST_TU`, includes `aiter_tensor.h` +
+     `aiter_stream.h` + `<optional>` once, includes every kid's
+     `.cuh`, and emits all `template void xxx<dtype>(...)`
+     instantiations. The launcher's `<<<...>>>` calls produce
+     undefined `__device_stub__` references. Wrapped in
      `#ifndef __HIP_DEVICE_COMPILE__` so the device pass sees an
      empty TU.
    * `instances/{name}_C{dtype}.device.cu` (one per kid, dtype):
@@ -503,12 +519,54 @@ codegen still inside the same TU as the launcher).
      producing the host stub + device GPU IR that the linker pairs
      with the fused host TU's undefined references.
 
-4. **`csrc/opus_gemm/opus_gemm.cu` and `csrc/pybind/opus_gemm_pybind.cu`**
+4. **Torch removal across the dispatcher graph** -- mirrors PR #2932
+   (`csrc/kernels/quant_kernels.cu`):
+   * **`csrc/opus_gemm/include/opus_gemm.h`** -- entry-point
+     signatures take `aiter_tensor_t&` (POD,
+     `csrc/include/aiter_tensor.h`) instead of `torch::Tensor&`,
+     return `void`. The header costs ~200 preprocessed lines instead
+     of ~50K.
+   * **`csrc/opus_gemm/include/opus_gemm_arch.cuh`** and
+     **`opus_gemm_arch_gfx950.cuh`** -- `TORCH_CHECK` →
+     `AITER_CHECK`, `<c10/util/Exception.h>` → `aiter_hip_common.h`.
+   * **`csrc/opus_gemm/include/gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh`**
+     -- `OpusA16W16NoscaleKernel` is now
+     `std::function<void(aiter_tensor_t&, ...)>` so every dispatch
+     map entry is torch-free.
+   * **`csrc/opus_gemm/opus_gemm.cu`** -- both entry points
+     (`opus_gemm`, `opus_gemm_a16w16_tune`) take `aiter_tensor_t`,
+     use `AiterDtype` enum (`AITER_DTYPE_bf16` / `_fp32` / `_fp8`)
+     instead of `at::ScalarType::*` / `torch_fp8`, return `void`.
+   * **`csrc/opus_gemm/gen_instances.py`** -- the codegen-emitted
+     launcher signatures use `aiter_tensor_t&`, the bias validator
+     calls `AITER_CHECK` + `bt.is_contiguous() / dtype() / dim() /
+     size()` (POD accessors that `aiter_tensor_t` provides
+     PyTorch-compatible by design). The splitk launcher allocates
+     its fp32 workspace with `hipMallocAsync(stream)` + matching
+     `hipFreeAsync(stream)` after the reduce kernel, replacing
+     `torch::empty(... TensorOptions().dtype(kFloat32).device(...))`
+     while preserving the same stream-ordered lifetime invariant
+     PyTorch's caching allocator gave us.
+   * **`aiter/ops/opus/gemm_op_a16w16.py`** --
+     `@compile_ops("module_deepgemm_opus", develop=True)` on both
+     `_opus_gemm_a16w16_tune_raw` and `_opus_gemm_bf16_dispatch`.
+     `develop=True` makes the JIT wrapper (a) inject the current
+     torch CUDA stream into the C++ `aiter::getCurrentHIPStream`
+     thread-local via `module._set_current_hip_stream` before the
+     call and (b) auto-convert any `torch.Tensor` arg to
+     `aiter_tensor_t` via `torch_to_aiter_pybind`. Because the C++
+     side now returns `void`, `opus_gemm_a16w16_tune` keeps its
+     `return Y` contract by returning the in-place tensor directly.
+
+5. **`csrc/opus_gemm/opus_gemm.cu` and `csrc/pybind/opus_gemm_pybind.cu`**
    — entire-file `#ifndef __HIP_DEVICE_COMPILE__` skip. Pure host
    code with no `__global__` / `<<<>>>`; their device pass is dead
    weight (12.5–15s → 0.4s).
+   `opus_gemm_pybind.cu` additionally registers
+   `AITER_SET_STREAM_PYBIND` so Python can call
+   `module._set_current_hip_stream(...)`.
 
-5. **Per-file flag plumbing in `aiter/jit/`** — `core.py` reads the
+6. **Per-file flag plumbing in `aiter/jit/`** — `core.py` reads the
    new `flags_extra_hip_per_source` dict from
    `optCompilerConfig.json` and forwards it through `_jit_compile`
    into `_write_ninja_file`, which emits a per-build
@@ -523,10 +581,11 @@ host/device-split layout, the critical path was ~15s (each
 `instance.cpp` had to parse `<torch/extension.h>` AND run device
 codegen, in series inside one hipcc invocation). The fused host TU
 detaches those: launcher instantiations all live in one .cu that
-parses torch ONCE (~13s) but skips device codegen entirely; per-kid
+parses headers ONCE but skips device codegen entirely; per-kid
 device codegen lives in 38 tiny self-contained .cu's that finish in
-~2s each in parallel. End-to-end wall now mirrors the host TU's
-~14s, not the sum of 38 device codegens.
+~2s each in parallel. After torch removal the fused TU's parse
+drops from ~12s to ~7s, and that's now the end-to-end critical
+path.
 
 **What did NOT help** on this hardware:
 
@@ -538,52 +597,33 @@ device codegen lives in 38 tiny self-contained .cu's that finish in
 ### 7.7 Future compile-time work (un-implemented; analysis only)
 
 The current 22.3s floor is set by **the fused host TU's
-`<torch/extension.h>` + `<ATen/...>` parse on host pass (~13s)**,
-which is serial inside a single TU. Per-kid device codegen runs in
-~2s × 38 wide-parallel and is no longer on the critical path.
-Remaining attack surface, in rough order of expected payoff vs.
-invasiveness:
+opus.hpp parsing + 38 launcher template instantiations on host
+pass (~7s)**, serial inside a single TU. Per-kid device codegen
+runs in ~2s × 38 wide-parallel and is no longer on the critical
+path. Remaining attack surface, in rough order of expected payoff
+vs. invasiveness:
 
-1. **PCH (precompiled header) for the fused host TU's torch /
-   ATen include set** — preprocess `<torch/extension.h>` +
-   `<ATen/hip/HIPContext.h>` once, persist as `.gch`, and have the
-   fused TU consume it via `-include-pch`. The 11.7s frontend cost
-   is exactly what PCH is designed to amortise. Risk: PCH builds
-   themselves take ~9s for this header set, so the gain depends on
-   whether the PCH is reused across rebuilds (yes for all
-   incremental edits, no for the first ever build). Estimated
-   end-to-end saving: ~10s on warm rebuilds, neutral on cold.
-
-2. **Lift `<ATen/hip/HIPContext.h>` out of the launcher body** —
-   the launchers only use it for
-   `at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream()`. A
-   thin custom shim that reads the current HIP stream via the
-   exposed C API would bypass all of ATen's transitive includes
-   (~5K lines). Risk: thin shim has to track ATen's internal API
-   layout; small, but not zero. Estimated saving: 1–3s of host
-   parse.
-
-3. **Strip `<torch/extension.h>` to `<torch/types.h>` +
-   `<torch/csrc/utils/pybind.h>`** — the launcher body only uses
-   `torch::Tensor`, `std::optional<torch::Tensor>`, `TORCH_CHECK`,
-   and `torch::empty`. The full extension umbrella header pulls in
-   pybind11 + dispatch + autograd + JIT, none of which the launcher
-   touches. Risk: the explicit instantiation
-   `template torch::Tensor xxx<dtype>(...)` may need additional
-   pieces; needs trial-and-error pruning. Saving: ~5–10K
-   preprocessed lines of fused TU input, ~2–4s wall.
-
-4. **Split `opus.hpp` into device-only / host-only / shared
+1. **Split `opus.hpp` into device-only / host-only / shared
    subheaders** — every device TU still parses the full 3055
-   lines of opus.hpp on its device pass. The fused TU also pulls a
-   subset of opus.hpp via the traits header. A header restructure
-   would let each TU include only the slice it needs. Risk: opus
-   is shared by many kernels (opus_attn, opus_fmm, etc.); the
-   split has to be ABI-stable. Saving: ~1s/device TU (off the
-   critical path on this hardware) + a small slice off the fused
-   TU's host parse.
+   lines of opus.hpp on its device pass. The fused host TU pulls
+   a subset of opus.hpp via `aiter_tensor.h` →
+   `aiter_hip_common.h` chain plus the per-kid traits header. A
+   header restructure would let each TU include only the slice it
+   needs. Risk: opus is shared by many kernels (opus_attn,
+   opus_fmm, etc.); the split has to be ABI-stable. Saving:
+   ~1s/device TU (off the critical path on this hardware) +
+   ~2-3s off the fused TU's host parse.
 
-5. **Drop AMDGPU-side `-mllvm` flags that gate fewer optimizations
+2. **PCH (precompiled header) for the fused host TU** — now that
+   torch is gone, PCH would amortise the opus.hpp / pipeline
+   header / traits header parse instead of libtorch. Smaller
+   absolute saving than the pre-torch-removal world (the pure
+   opus headers parse in ~7s, not ~12s) but the warm-rebuild
+   benefit is still real because PCH scope is now much smaller
+   and so is the PCH build cost itself. Estimated end-to-end
+   saving: ~3-5s on warm rebuilds, neutral on cold.
+
+3. **Drop AMDGPU-side `-mllvm` flags that gate fewer optimizations
    in JIT mode** — the current build sets `--lsr-drop-solution=1`,
    `-amdgpu-early-inline-all=true`, `-amdgpu-function-calls=false`,
    etc. Some of these slow codegen for marginal kernel-perf wins
@@ -592,19 +632,19 @@ invasiveness:
    validate kernel performance doesn't regress on the tuned
    shapes. Saving: speculative; needs measurement.
 
-6. **`ccache` / `sccache` integration** — reuse `.cuda.o` across
+4. **`ccache` / `sccache` integration** — reuse `.cuda.o` across
    rebuilds when `gen_instances.py` produces a byte-identical TU.
    Pure infra change, complementary to all other items. The first
    build still pays full freight; subsequent rebuilds (e.g.
    `AITER_REBUILD=1` after a CSV-only edit) drop to seconds.
 
-The combined ceiling, if PCH (item 1) lands without regression, is
-roughly **10–12s** end-to-end on this hardware — limited by the
-host stub generation + link step, which currently take ~1s
-combined. Beyond that, further gains require fundamentally fewer
-launcher instantiations (e.g. unifying multiple kid signatures
-through a thin runtime dispatch), which is a structural change
-rather than a build-time one.
+The combined ceiling, if items 1 + 2 land without regression, is
+roughly **10–12s** end-to-end on this hardware — limited by
+opus.hpp's intrinsic parsing cost on the fused host TU plus the
+host stub generation + link step. Beyond that, further gains
+require fundamentally fewer launcher instantiations (e.g. unifying
+multiple kid signatures through a thin runtime dispatch), which
+is a structural change rather than a build-time one.
 
 ---
 
@@ -623,9 +663,10 @@ CSV changes on JIT rebuild:
 AITER_REBUILD=1 python3 -c "from aiter.ops.opus import gemm_a16w16_opus"
 ```
 
-The whole rebuild takes ~22s on dev hardware (128-core,
+The whole rebuild takes ~19s on dev hardware (128-core,
 ROCm 7.2.2; see [§7.6 Compile-time techniques](#76-compile-time-techniques)
-for the fused-host / per-kid-device split that drops it from ~48s).
+for the host/device split + fused TU + torch removal that drop it
+from ~48s).
 
 ### `RuntimeError: K=... must be even`
 
