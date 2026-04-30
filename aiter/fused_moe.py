@@ -880,13 +880,12 @@ def get_2stage_cfgs(
         and model_dim >= 7168
         and token >= 64
     )
-    if _ck2stage_unsafe_gfx942:
-        if cfg is not None:
-            logger.warning(
-                f"[fused_moe] Bypassing tuned CK 2-stage config for {keys}: "
-                "gfx942 CK stage2 OOB for E>=128, model_dim>=7168, token>=64; "
-                "using 1-stage ASM instead."
-            )
+    if _ck2stage_unsafe_gfx942 and cfg is not None and not cfg.get("run_1stage", False):
+        logger.warning(
+            f"[fused_moe] Bypassing tuned CK 2-stage config for {keys}: "
+            "gfx942 CK stage2 OOB for E>=128, model_dim>=7168, token>=64; "
+            "using 1-stage ASM instead."
+        )
         cfg = None
 
     use_non_temporal_load = False
