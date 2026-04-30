@@ -880,7 +880,10 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict[get_gfx()]:
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 256 == 0)
+                # NEW-RC-3 patch (2026-04-28): force CK blockscale path on gfx942 to avoid
+                # routing per_1x128 prefill to ASM fmoe_g1u1 which lacks block shape param
+                # original: run_1stage = token > 32 and (inter_dim % 256 == 0)
+                run_1stage = False
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
