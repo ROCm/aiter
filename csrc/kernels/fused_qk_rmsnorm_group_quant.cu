@@ -841,11 +841,31 @@ void fused_qk_rmsnorm_group_quant(
                 n1,
                 ", n2=",
                 n2);
-    // Small token counts: GPU under-saturated, separate x2 blocks add useful parallelism.
-    // Large token counts: GPU saturated, fusing x2 into same block halves block count.
-    const int grid_y = (has_second_input && m <= 1024) ? 2 : 1;
+    // --- grid_y strategy ---
+    // When n2 > n1 across different size tiers ("K dominates"), the fused path
+    // wastes threads on Q.  For small/medium m, separate Q/K blocks (grid_y=2)
+    // add parallelism on under-saturated CUs.  For large m the fused path wins
+    // through better cache locality within one block.
+    //
+    // size_tier() is a rough heuristic to detect gross n1-vs-n2 mismatch; it
+    // intentionally does NOT mirror the exact BlockSize dispatch below (which
+    // depends on grid_y itself, creating a circular dependency).
+    auto size_tier = [](int n) -> int {
+        if(n <= 1024) return 0;
+        if(n <= 2048) return 1;
+        if(n <= 4096) return 2;
+        return 3;
+    };
+    const bool k_dominates =
+        has_second_input && n2 > n1 && (size_tier(n1) != size_tier(n2));
+    const int grid_y =
+        (has_second_input && (m <= 1024 || (k_dominates && m <= 4096))) ? 2 : 1;
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp1));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    // --- BlockSize / thread_data_size selection ---
     const int max_n = n1 > n2 ? n1 : n2;
-    // fp4x2 path reuses fp8 kernels but requires thread_data_size >= 8 for store packing.
     const int thread_data_size =
         quant_is_fp4 ? ((max_n <= 1024) ? 8 : 16) : ((max_n <= 128) ? 4 : ((max_n <= 1024) ? 8 : 16));
     TORCH_CHECK(group_size % thread_data_size == 0,
@@ -860,20 +880,19 @@ void fused_qk_rmsnorm_group_quant(
     TORCH_CHECK((reduce_thread_size & (reduce_thread_size - 1)) == 0,
                 __func__,
                 " reduce_thread_size is not power of 2");
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp1));
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    (void)get_num_cu_func();
+
+    // gfx950-specific: use more threads with smaller TDS to improve occupancy
+    // and reduce barrier stall in the fused Q+K path (matching Triton's strategy
+    // of using a larger BlockSize for better thread utilization).
+    const bool gfx950_wide_block =
+        get_gpu_arch() == "gfx950" && has_residual && group_size <= WARP_SIZE * 8;
 
     if(max_n <= 128)
     {
         if(quant_is_fp4)
-        {
             DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 64, 8);
-        }
         else
-        {
             DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_ONLY_GROUP_QUANT_DISPATCH, 64, 4);
-        }
     }
     else if(max_n <= 512)
     {
@@ -885,18 +904,17 @@ void fused_qk_rmsnorm_group_quant(
     }
     else if(max_n <= 2048)
     {
-        if(get_gpu_arch() == "gfx950" && has_residual && group_size <= WARP_SIZE * 8)
-        {
+        if(gfx950_wide_block)
             DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 8);
-        }
         else
-        {
             DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 128, 16);
-        }
     }
     else if(max_n <= 4096)
     {
-        DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 16);
+        if(gfx950_wide_block && grid_y == 1)
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 512, 8);
+        else
+            DISPATCH_REDUCE_THREAD_SIZE_(FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH, 256, 16);
     }
     else
     {
