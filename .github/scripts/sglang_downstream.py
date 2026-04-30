@@ -34,6 +34,7 @@ TESTS = [
         "extra_exec_args": "",
         "test_command": "python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py",
         "run_on_pr": False,
+        "comment": "Standalone performance job is too long for PR validation.",
         "run_on_schedule": True,
     },
     {
@@ -46,8 +47,9 @@ TESTS = [
         "timeout_minutes": 70,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-8-gpu-mi35x-qwen3-235b-mxfp4 --nightly --timeout-per-file 3600",
-        "run_on_pr": True,
-        "run_on_schedule": True,
+        "run_on_pr": False,
+        "run_on_schedule": False,
+        "comment": "issue https://github.com/ROCm/aiter/issues/2857 not resolved yet",
     },
     {
         "runner": "linux-aiter-mi35x-8",
@@ -85,8 +87,9 @@ TESTS = [
         "timeout_minutes": 70,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
-        "run_on_pr": True,
-        "run_on_schedule": True,
+        "run_on_pr": False,
+        "run_on_schedule": False,
+        "comment": "fix PR https://github.com/ROCm/aiter/pull/2877 not merged yet",
     },
     {
         "runner": "linux-aiter-mi35x-8",
@@ -99,7 +102,8 @@ TESTS = [
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-basic --nightly --timeout-per-file 5400",
         "run_on_pr": False,
-        "run_on_schedule": True,
+        "run_on_schedule": False,
+        "comment": "fix PR https://github.com/ROCm/aiter/pull/2877 not merged yet",
     },
 ]
 
@@ -153,6 +157,16 @@ def write_output(name: str, value: str) -> None:
         output.write(f"{name}={value}\n")
 
 
+def run_cell(test: dict, key: str) -> str:
+    if test.get(key, False):
+        return "yes"
+
+    comment = test.get("comment")
+    if comment:
+        return f"no ({comment})"
+    return "no"
+
+
 def write_summary(
     selected: list[dict], skipped: list[dict], disabled: list[dict], event_name: str
 ) -> None:
@@ -171,8 +185,8 @@ def write_summary(
         for test in TESTS:
             summary.write(
                 f"| {test['model']} | {test['test_type']} | "
-                f"{'yes' if test.get('run_on_pr', False) else 'no'} | "
-                f"{'yes' if test.get('run_on_schedule', False) else 'no'} |\n"
+                f"{run_cell(test, 'run_on_pr')} | "
+                f"{run_cell(test, 'run_on_schedule')} |\n"
             )
 
 
