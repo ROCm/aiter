@@ -23,6 +23,8 @@ struct aiter_tensor_t
     int dim() const { return ndim; }
     AiterDtype dtype() const { return dtype_; }
     size_t element_size() const { return AiterDtype_element_size(dtype_); }
+    bool is_gpu() const { return device_id >= 0; }
+    bool is_cpu() const { return device_id == -1; }
 
     bool is_contiguous() const
     {

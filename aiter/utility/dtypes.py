@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from ..jit.utils.chip_info import get_gfx
-from ..jit.core import compile_ops
 from ..ops.enum import QuantType, ActivationType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
@@ -48,7 +47,6 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
     this function constructs a *pybind11* aiter_tensor_t via
     module_aiter_core.  The two types are not interchangeable.
     """
-    assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
     assert (
         tensor.ndim <= 8
     ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
@@ -64,14 +62,13 @@ def torch_to_aiter_pybind(tensor: torch.Tensor):
         list(tensor.shape),
         list(tensor.stride()),
         _torch_to_aiter_dtype[tensor.dtype],
-        tensor.device.index or 0,
+        tensor.device.index if tensor.is_cuda else -1,
     )
 
 
 def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
     """This is for ctypes binding.
     torch.Tensor -> aiter_tensor_t, zero-copy, points to the same GPU memory."""
-    assert tensor.is_cuda, "aiter_tensor_t only supports CUDA tensors"
     assert (
         tensor.ndim <= 8
     ), f"aiter_tensor_t supports at most 8 dims, got {tensor.ndim}"
@@ -85,7 +82,7 @@ def torch_to_aiter(tensor: torch.Tensor) -> aiter_tensor_t:
         at.shape[i] = tensor.shape[i]
         at.strides[i] = tensor.stride(i)
     at.dtype_ = _torch_to_aiter_dtype[tensor.dtype]
-    at.device_id = tensor.device.index or 0
+    at.device_id = tensor.device.index if tensor.is_cuda else -1
     return at
 
 

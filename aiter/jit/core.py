@@ -195,22 +195,26 @@ class AITER_CONFIG(object):
                 continue
 
             df = pd.read_csv(path)
-            if source_pairs:
-                base_path, base_df = source_pairs[0]
-                base_cols = [c for c in base_df.columns if c != "_tag"]
-                new_cols = [c for c in df.columns if c != "_tag"]
-                if base_cols != new_cols:
-                    raise ValueError(
-                        f"Column mismatch between {base_path} and {path}, "
-                        f"{base_cols}, {new_cols}"
-                    )
-
             source_pairs.append((path, df))
 
         if not source_pairs:
             raise FileNotFoundError(
-                f"No existing config files found in '{file_path}' when merging '{merge_name}'."
+                f"No existing config files found in '{file_path}' "
+                f"when merging '{merge_name}'."
             )
+
+        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+        all_cols = list(source_pairs[0][1].columns)
+        for _, df in source_pairs[1:]:
+            for c in df.columns:
+                if c not in all_cols:
+                    insert_before = "tflops" if "tflops" in all_cols else all_cols[-1]
+                    all_cols.insert(all_cols.index(insert_before), c)
+        for i, (path, df) in enumerate(source_pairs):
+            for c in all_cols:
+                if c not in df.columns:
+                    df[c] = _FILL_DEFAULTS.get(c, 0)
+            source_pairs[i] = (path, df[all_cols])
 
         merge_df = pd.concat([df for _, df in source_pairs], ignore_index=True)
         has_tag = "_tag" in merge_df.columns
@@ -305,8 +309,8 @@ class AITER_CONFIG(object):
             model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
             op_tuned_file_list = [
                 p
-                for p in model_config_dir.glob(f"*{tuned_file_name}*")
-                if (p.is_file() and "untuned" not in str(p))
+                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+                if (p.is_file() and "untuned" not in p.name)
             ]
 
             if not op_tuned_file_list:

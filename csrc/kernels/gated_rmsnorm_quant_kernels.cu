@@ -219,8 +219,6 @@ void gated_rmsnorm_fp8_group_quant_launcher_impl(
             num_heads,
             head_dim
         );
-
-    C10_HIP_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename DTYPE_I, typename DTYPE_O>
