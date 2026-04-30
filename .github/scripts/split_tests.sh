@@ -139,7 +139,7 @@ elif [[ "$TEST_TYPE" == "triton" ]]; then
     FILE_TIMES[op_tests/triton_tests/attention/test_flash_attn_kvcache.py]=357
     FILE_TIMES[op_tests/triton_tests/attention/test_chunked_pa_prefill.py]=336
     FILE_TIMES[op_tests/triton_tests/attention/test_pa_prefill.py]=313
-    FILE_TIMES[op_tests/triton_tests/test_gated_delta_rule.py]=303
+    FILE_TIMES[op_tests/test_gated_delta_rule.py]=303
     FILE_TIMES[op_tests/triton_tests/attention/test_unified_attention.py]=276
     FILE_TIMES[op_tests/triton_tests/moe/test_moe_gemm_a8w8_blockscale.py]=263
     FILE_TIMES[op_tests/triton_tests/moe/test_moe.py]=133

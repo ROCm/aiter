@@ -586,16 +586,11 @@ def test_chunk_opt(
     mask_p: float,
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
-    use_chunk_hip: bool = False,
 ):
     torch.manual_seed(42)
     if IS_INTEL_ALCHEMIST and D > 128:
         pytest.skip(
             reason="chunk_gated_delta_rule_opt is not supported on alchemist for D>128"
-        )
-    if use_chunk_hip and (D != 128 or dtype != torch.bfloat16):
-        pytest.skip(
-            reason="HIP overlap_2 kernel requires D=128 and bfloat16"
         )
 
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -628,7 +623,6 @@ def test_chunk_opt(
         initial_state=h0.clone(),
         output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        use_chunk_hip=use_chunk_hip,
     )
 
     ref, ref_ht = recurrent_gated_delta_rule_ref(
@@ -685,14 +679,56 @@ def test_chunk_opt_hip(
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
 ):
-    test_chunk_opt(
-        B=B, T=T, H=H, D=D, scale=scale,
-        gate_logit_normalizer=gate_logit_normalizer,
-        mask_p=mask_p,
+    torch.manual_seed(42)
+    if D != 128 or dtype != torch.bfloat16:
+        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+
+    q = torch.rand(B, T, H, D, dtype=dtype)
+    k = torch.rand(B, T, H, D, dtype=dtype)
+    v = torch.rand(B, T, H, D, dtype=dtype)
+    beta = torch.rand(B, T, H, dtype=dtype).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+    g = g / gate_logit_normalizer
+    g = g * (torch.rand_like(g) > mask_p)
+    h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    )
+
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=(
+            F.normalize(q.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else q.clone()
+        ),
+        k=(
+            F.normalize(k.clone(), p=2, dim=-1)
+            if not use_qk_l2norm_in_kernel
+            else k.clone()
+        ),
+        v=v.clone(),
+        g=g.clone(),
+        beta=beta.clone(),
+        scale=scale,
+        initial_state=h0.clone().transpose(-1, -2).contiguous(),
+        output_final_state=True,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        dtype=dtype,
         use_chunk_hip=True,
     )
+
+    ref, ref_ht = recurrent_gated_delta_rule_ref(
+        q=F.normalize(q.clone(), p=2, dim=-1),
+        k=F.normalize(k.clone(), p=2, dim=-1),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        scale=scale,
+        output_final_state=True,
+        initial_state=h0.clone(),
+    )
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
 
 
 @pytest.mark.parametrize(
@@ -721,15 +757,10 @@ def test_chunk_opt_varlen(
     mask_p: float,
     cu_seqlens: list[int],
     dtype: torch.dtype,
-    use_chunk_hip: bool = False,
 ):
     if IS_INTEL_ALCHEMIST and D > 128:
         pytest.skip(
             reason="chunk_gated_delta_rule_opt is not supported on alchemist for D>128"
-        )
-    if use_chunk_hip and (D != 128 or dtype != torch.bfloat16):
-        pytest.skip(
-            reason="HIP overlap_2 kernel requires D=128 and bfloat16"
         )
     torch.manual_seed(42)
     os.environ["TRITON_F32_DEFAULT"] = "ieee"
@@ -758,7 +789,6 @@ def test_chunk_opt_varlen(
         initial_state=h0.clone(),
         output_final_state=True,
         cu_seqlens=cu_seqlens,
-        use_chunk_hip=use_chunk_hip,
     )
 
     ref = []
@@ -804,11 +834,57 @@ def test_chunk_opt_varlen_hip(
     cu_seqlens: list[int],
     dtype: torch.dtype,
 ):
-    test_chunk_opt_varlen(
-        H=H, D=D, mask_p=mask_p,
-        cu_seqlens=cu_seqlens, dtype=dtype,
+    if D != 128 or dtype != torch.bfloat16:
+        pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    q = torch.randn((1, T, H, D), dtype=dtype)
+    k = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
+    v = torch.randn((1, T, H, D), dtype=dtype)
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = g * (torch.rand_like(g) > mask_p)
+    beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
+    h0 = torch.randn((N, H, D, D), dtype=dtype)
+
+    q, k, v, beta, g, h0 = map(
+        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    )
+
+    tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+        q=q.clone(),
+        k=k.clone(),
+        v=v.clone(),
+        beta=beta.clone(),
+        g=g.clone(),
+        initial_state=h0.clone().transpose(-1, -2).contiguous(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
         use_chunk_hip=True,
     )
+
+    ref = []
+    ref_ht = []
+    for i in range(N):
+        ref_i, ref_ht_i = recurrent_gated_delta_rule_ref(
+            q=q[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            k=k[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            v=v[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            beta=beta[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            g=g[:, cu_seqlens[i] : cu_seqlens[i + 1]],
+            initial_state=h0[i],
+            output_final_state=True,
+        )
+        ref.append(ref_i)
+        ref_ht.append(ref_ht_i)
+    ref = torch.cat(ref, 1)
+    ref_ht = torch.cat(ref_ht, 0)
+
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
 
 
 @pytest.mark.parametrize(

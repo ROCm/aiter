@@ -11,12 +11,14 @@ std::vector<torch::Tensor> chunk_gated_delta_rule_fwd_h_hip(
     torch::Tensor w,
     torch::Tensor u,
     torch::Tensor g,
+    torch::Tensor gk,
     torch::Tensor initial_state,
     torch::Tensor cu_seqlens,
     torch::Tensor chunk_offsets,
     int64_t selected_bv,
     bool has_initial_state,
     bool output_final_state,
-    bool save_new_value);
+    bool save_new_value,
+    bool use_exp2);
 
 } // namespace aiter
