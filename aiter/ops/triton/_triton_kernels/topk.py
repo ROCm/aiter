@@ -63,7 +63,10 @@ def _topk_kernel(
 
     if USE_TDM:
         row_desc = tl.make_tensor_descriptor(
-            base=X + pid * stride_xm, shape=(1, M), strides=(M, 1), block_shape=(1, BLOCK)
+            base=X + pid * stride_xm,
+            shape=(1, M),
+            strides=(M, 1),
+            block_shape=(1, BLOCK),
         )
         vals = tl.reshape(row_desc.load([0, 0]), (BLOCK,)).to(tl.float32)
     else:
@@ -112,7 +115,10 @@ def topk_stage1_kernel(
 
     if USE_TDM:
         x_desc = tl.make_tensor_descriptor(
-            base=x_ptr + cur_batch * N, shape=(1, N), strides=(N, 1), block_shape=(1, CHUNK_SIZE)
+            base=x_ptr + cur_batch * N,
+            shape=(1, N),
+            strides=(N, 1),
+            block_shape=(1, CHUNK_SIZE),
         )
         x_val = tl.reshape(x_desc.load([0, chunk_offset]), (CHUNK_SIZE,)).to(tl.float32)
     else:
@@ -273,10 +279,16 @@ def topk_stage2_kernel(
 
     if USE_TDM:
         cx_desc = tl.make_tensor_descriptor(
-            base=chunk_x + cur_batch * N, shape=(1, N), strides=(N, 1), block_shape=(1, BLOCK_SIZE)
+            base=chunk_x + cur_batch * N,
+            shape=(1, N),
+            strides=(N, 1),
+            block_shape=(1, BLOCK_SIZE),
         )
         ci_desc = tl.make_tensor_descriptor(
-            base=chunk_index + cur_batch * N, shape=(1, N), strides=(N, 1), block_shape=(1, BLOCK_SIZE)
+            base=chunk_index + cur_batch * N,
+            shape=(1, N),
+            strides=(N, 1),
+            block_shape=(1, BLOCK_SIZE),
         )
         chunk_x_val = tl.reshape(cx_desc.load([0, 0]), (BLOCK_SIZE,)).to(tl.float32)
         chunk_index_val = tl.reshape(ci_desc.load([0, 0]), (BLOCK_SIZE,)).to(tl.int32)
@@ -284,10 +296,12 @@ def topk_stage2_kernel(
         chunk_x += cur_batch * N
         chunk_index += cur_batch * N
         mask = cols < N
-        chunk_x_val = tl.load(chunk_x + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
-        chunk_index_val = tl.load(chunk_index + cols, mask=mask, other=MASK_INDEX_VAL).to(
-            tl.int32
+        chunk_x_val = tl.load(chunk_x + cols, mask=mask, other=FILL_VALUE).to(
+            tl.float32
         )
+        chunk_index_val = tl.load(
+            chunk_index + cols, mask=mask, other=MASK_INDEX_VAL
+        ).to(tl.int32)
 
     sorted_chunk_x, sorted_chunk_index = argsort(
         chunk_x_val, chunk_index_val, 0, descending=DESCENDING
