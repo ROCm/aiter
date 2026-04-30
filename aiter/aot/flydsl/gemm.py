@@ -268,7 +268,10 @@ def _compile_hgemm_to_cache(
     )
     # FlyDSL JIT does not accept None for tensor slots; pass real buffers for
     # optional bias and split-K sync tensors.
-    _compile_executable_to_cache(exe, out, a, b, bias, m, semaphore, signal, stream)
+    launch_bias = bias if has_bias else b
+    _compile_executable_to_cache(
+        exe, out, a, b, launch_bias, m, semaphore, signal, stream
+    )
 
 
 def _compile_preshuffle_to_cache(

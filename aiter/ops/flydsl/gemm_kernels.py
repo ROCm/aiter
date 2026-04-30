@@ -12,6 +12,7 @@ from typing import Dict, Optional
 import torch
 from torch import Tensor
 
+import flydsl.expr as fx
 from aiter import logger
 from flydsl.runtime.device import get_rocm_arch
 
@@ -817,7 +818,7 @@ def _compile_flydsl_hgemm(
             runtime_m,
             semaphore,
             signal,
-            launch_stream,
+            fx.Stream(launch_stream),
         )
 
     return launcher
@@ -864,11 +865,11 @@ def flydsl_hgemm(
     if auto_shuffle_b:
         raise ValueError(
             "`auto_shuffle_b=True` is unsupported because `b_preshuffle=True` "
-            "is not supported for generic FlyDSL HGEMM now"
+            "is not supported for generic FlyDSL HGEMM"
         )
     if b_preshuffle:
         raise ValueError(
-            "`b_preshuffle=True` is not supported for generic FlyDSL HGEMM now"
+            "`b_preshuffle=True` is not supported for generic FlyDSL HGEMM"
         )
 
     if out is None:
@@ -1015,7 +1016,7 @@ def flydsl_preshuffle_gemm_a8(
         w_scale.contiguous().view(-1),
         m,
         n,
-        torch.cuda.current_stream(),
+        fx.Stream(torch.cuda.current_stream()),
     )
     if out_contig is not Out:
         Out.copy_(out_contig)
