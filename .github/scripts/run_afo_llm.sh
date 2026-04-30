@@ -51,7 +51,11 @@ echo ""
 # ── Clone AFO-LLM ──
 AFO_DIR="${WORKDIR}/afo-llm-checkout"
 rm -rf "${AFO_DIR}"
-git clone --depth 1 -b "${AFO_LLM_BRANCH}" "https://github.com/${AFO_LLM_REPO}.git" "${AFO_DIR}"
+CLONE_URL="https://github.com/${AFO_LLM_REPO}.git"
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  CLONE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${AFO_LLM_REPO}.git"
+fi
+git clone --depth 1 -b "${AFO_LLM_BRANCH}" "${CLONE_URL}" "${AFO_DIR}"
 
 # ── Build Docker image ──
 cat > /tmp/Dockerfile.afo-llm <<EOF

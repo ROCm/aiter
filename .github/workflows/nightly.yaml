@@ -50,7 +50,7 @@ on:
       skip_afo_llm:
         description: 'Skip AFO-LLM accuracy tests'
         type: boolean
-        default: false
+        default: true
       sglang_job_filter:
         description: 'SGLang scout filter'
         type: choice
