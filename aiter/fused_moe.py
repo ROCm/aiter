@@ -25,6 +25,9 @@ _USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
 _USE_GENERIC_SWIGLU_MXFP4_LAYOUT = (
     os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "1") == "1"
 )
+_SWIGLU_MXFP4_BF16_BOUND = int(
+    os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256")
+)
 
 
 def _moe_sorting_impl(
@@ -268,7 +271,9 @@ def fused_moe_(
         q_dtype_a = dtypes.fp8
     if quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu and _USE_GENERIC_SWIGLU_MXFP4_LAYOUT:
-            q_dtype_a = dtypes.bf16 if M < 256 else dtypes.fp4x2
+            q_dtype_a = (
+                dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+            )
         elif activation == ActivationType.Swiglu:
             bf16_fp8_bound = 256
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
@@ -1093,9 +1098,8 @@ def get_2stage_cfgs(
     ):
         # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
         # keeping the generic preshuffled fp4 weights. CK2stages has no
-        # heuristic kernel for that A16W4 combination, so use CK-Tile and force
-        # a real split-k.
-        _split_k = max(ksplit, 2) if activation == ActivationType.Swiglu else ksplit
+        # heuristic kernel for that A16W4 combination, so use CK-Tile.
+        _split_k = max(int(ksplit), 1)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
             functools.partial(
@@ -1903,21 +1907,37 @@ def cktile_moe_stage1(
     if w1.dtype is torch.uint32:
         D = D * 8
 
-    out = torch.empty((token_num, topk, D), dtype=dtype, device=hidden_states.device)
-    # Split-k stage1 reduces into a padded token-topk workspace.
-    # Keep the full padded buffer to match the kernel's M dimension and
-    # slice back to the valid token-topk rows before the post-activation.
-    sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
-    tmp_out = (
-        torch.zeros(
-            (sorted_size, w1.shape[1]), dtype=dtype, device=out.device
+    expected_out_shape = (token_num, topk, D)
+    if (
+        out is None
+        or tuple(out.shape) != expected_out_shape
+        or out.dtype != dtype
+        or out.device != hidden_states.device
+    ):
+        out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
+    needs_post_activation = split_k > 1 or (
+        split_k == 1 and activation == ActivationType.Swiglu
+    )
+    # Split-k reduces into a token-topk workspace. For SwiGLU split_k=1 we
+    # still materialize full gate/up output and run the post activation kernel;
+    # that is currently faster than CK-Tile's generic gate/up fused epilogue.
+    workspace_rows = token_num * topk
+    if split_k > 1:
+        tmp_out = torch.zeros(
+            (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
         )
-        if split_k > 1
-        else out
-    )
+    elif needs_post_activation:
+        tmp_out = torch.empty(
+            (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
+        )
+    else:
+        tmp_out = out
     bias1 = _normalize_bias_for_kernel(
-        bias1, tmp_out.dtype if split_k > 1 else out.dtype
+        bias1, tmp_out.dtype if needs_post_activation else out.dtype
     )
+    # A split_k value of 0 is used internally to select CK-Tile's full gate/up
+    # GEMM1 epilogue without actually splitting K.
+    kernel_split_k = 0 if needs_post_activation and split_k == 1 else split_k
 
     # print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
@@ -1933,14 +1953,14 @@ def cktile_moe_stage1(
         sorted_weights,
         a1_scale,
         w1_scale,
-        None if split_k > 1 else bias1,
+        None if needs_post_activation else bias1,
         activation,
         block_m,
-        split_k,
+        kernel_split_k,
         kernel_name,
     )
 
-    if split_k > 1:
+    if needs_post_activation:
         valid_out = tmp_out[: token_num * topk, :]
         if bias1 is not None and topk_ids is None:
             raise ValueError("topk_ids are required for CK-Tile split-k bias handling")
