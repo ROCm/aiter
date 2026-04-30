@@ -76,7 +76,7 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,            // [num_tokens, hea
                                aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
                                aiter_tensor_t& slot_mapping,  // [num_tokens]
                                int64_t quant_block_size,
-                               const std::string& scale_fmt，
+                               const std::string& scale_fmt,
                                bool preshuffle = false);
 
 void cp_gather_indexer_k_quant_cache(
