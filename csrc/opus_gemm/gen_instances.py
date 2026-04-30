@@ -1561,27 +1561,52 @@ void
             splitk reduce kernel handles the cast / passthrough at
             launch time based on the actual Y dtype.
         """
+        # Sorted flat-array layout (was: {(M,N,K), kernel<CTYPE>} initializer
+        # list for std::unordered_map). Two reasons for the switch:
+        #
+        # 1. Compile time: the macro expanded into an unordered_map's
+        #    initializer-list, and `std::function`-valued unordered_map
+        #    instantiation alone added ~1s of frontend / template
+        #    instantiation per dispatcher TU. A flat
+        #    `static constexpr OpusA16W16RuntimeEntry kBf16Lookup[] = { ... };`
+        #    plus `std::lower_bound` does the same lookup with much less
+        #    template work.
+        #
+        # 2. Runtime: 339 entries, each cache-warm on first call after
+        #    process start; binary search over a sorted POD array beats
+        #    `std::function<...>` heap allocations + hash table walks
+        #    handily, and the array constexpr-initialises so first-call
+        #    latency drops too.
+        #
+        # The header now emits sorted `OpusA16W16RuntimeEntry` arrays
+        # directly. ENTRY_MATCH_CTYPE / ENTRY_FORCE_FP32 use a CTYPE macro
+        # param so the same emit logic feeds both BF16 (CTYPE=bf16_t) and
+        # FP32 (CTYPE=fp32_t) tables, with splitk kids forced to <fp32_t>
+        # regardless of the table they live in.
         HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-// Per-CTYPE (M,N,K)->kernel tables. Same (M,N,K) can resolve to
-// different kernels in the BF16 vs FP32 maps because get_tune_dict
-// keys winners on (M, N, K, outdtype_str) and gen_lookup_dict buckets
-// the rows into per-CTYPE macros below. splitk kids appear in either
-// map with their main-kernel template forced to <fp32_t> (the reduce
-// kernel handles the final Y cast at launch time).
+//
+// Auto-generated. Do not edit. See gen_instances.py:gen_lookup_dict.
+//
+// Per-CTYPE sorted flat arrays for (M,N,K)->kernel runtime dispatch.
+// Same (M,N,K) can resolve to different kernels in the BF16 vs FP32
+// tables because get_tune_dict keys winners on (M, N, K, outdtype_str)
+// and gen_lookup_dict buckets the rows into per-CTYPE macros below.
+// splitk kids appear in either table with their main-kernel template
+// forced to <fp32_t> (the reduce kernel handles the final Y cast at
+// launch time).
+//
+// Lookup is std::lower_bound on the lex-ordered (M, N, K) key. See
+// opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
 """
 
-        # ENTRY_MATCH_CTYPE uses the CTYPE macro parameter so it expands
-        # to `kernel<bf16_t>` inside the BF16 macro and `kernel<fp32_t>`
-        # inside the FP32 macro. ENTRY_FORCE_FP32 hardcodes the template
-        # parameter for splitk kids that only have the fp32 instance.
-        ENTRY_MATCH_CTYPE = """
-       {{{MNK},                                                        \\
-        {kernel_name}<CTYPE>}},                                        \\"""
-        ENTRY_FORCE_FP32 = """
-       {{{MNK},                                                        \\
-        {kernel_name}<fp32_t>}},                                       \\"""
+        ENTRY_MATCH_CTYPE = """\
+    {{ {{{M}, {N}, {K}}}, &{kernel_name}<CTYPE> }},  \\
+"""
+        ENTRY_FORCE_FP32 = """\
+    {{ {{{M}, {N}, {K}}}, &{kernel_name}<fp32_t> }}, \\
+"""
 
         # Map ctype short name -> CSV outdtype string emitted by the
         # tuner's result_to_df.
@@ -1591,45 +1616,42 @@ void
         }
 
         def _emit_map(f, macro_name: str, ctype: str):
-            f.write(f"#define {macro_name}(CTYPE)                         \\\n")
-            f.write(
-                "   {                                                                   \\"
-            )
+            # No body line break between `\` and the first entry; macro
+            # continuation requires every line that participates in the
+            # definition to end with `\`. Empty lines after `\` would
+            # silently truncate the macro.
+            f.write(f"#define {macro_name}(CTYPE) \\\n")
             target_outdtype = ctype_to_outdtype.get(ctype)
+            # Collect all (M, N, K, kernel_name, is_splitk) rows for this
+            # CTYPE first, so we can sort lex on (M, N, K) before emitting.
+            rows = []
             for mnk, k in kernels_dict.items():
                 if self.istune and isinstance(mnk, int):
-                    # tune mode: id-based map, no shape / outdtype filter.
-                    mnk_lit = str(mnk)
-                elif (not self.istune) and isinstance(mnk, tuple) and mnk[0] > 0:
-                    # Tuple key shape: (M, N, K, outdtype_str). Skip rows
-                    # whose outdtype doesn't match the macro we're emitting
-                    # (e.g. an fp32 row from the CSV must not pollute the
-                    # bf16 map -- C++ would resolve the same (M,N,K) to
-                    # the wrong kid for bf16 callers).
-                    if len(mnk) >= 4:
-                        row_outdtype = str(mnk[3])
-                        if (
-                            target_outdtype is not None
-                            and row_outdtype != target_outdtype
-                        ):
-                            continue
-                    # The C++ map key is still 3-wide: (M, N, K).
-                    mnk_lit = "{" + ", ".join(map(str, mnk[:3])) + "}"
-                else:
+                    # tune mode shouldn't reach here (gen_lookup_dict is
+                    # for the runtime (M,N,K) map). Skip defensively.
                     continue
-
-                is_splitk = k.kernel_tag == "a16w16_flatmm_splitk"
-                if is_splitk:
-                    # splitk only emits <fp32_t>; the per-row outdtype
-                    # filter above already ensures we end up in the right
-                    # CTYPE bucket.
-                    entry = ENTRY_FORCE_FP32
-                else:
-                    if ctype not in k.output_dtypes:
+                if not (isinstance(mnk, tuple) and mnk[0] > 0):
+                    continue
+                if len(mnk) >= 4:
+                    row_outdtype = str(mnk[3])
+                    if target_outdtype is not None and row_outdtype != target_outdtype:
                         continue
-                    entry = ENTRY_MATCH_CTYPE
-                f.write(entry.format(MNK=mnk_lit, kernel_name=k.name))
-            f.write("\n   }\n\n")
+                is_splitk = k.kernel_tag == "a16w16_flatmm_splitk"
+                if not is_splitk and ctype not in k.output_dtypes:
+                    continue
+                rows.append((int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name, is_splitk))
+
+            rows.sort(key=lambda r: (r[0], r[1], r[2]))
+            n = len(rows)
+            for i, (M, N, K, name, is_splitk) in enumerate(rows):
+                entry = ENTRY_FORCE_FP32 if is_splitk else ENTRY_MATCH_CTYPE
+                line = entry.format(M=M, N=N, K=K, kernel_name=name)
+                if i == n - 1:
+                    # Last entry: drop the trailing `\` so the macro
+                    # ends cleanly. Strip the line's continuation.
+                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
+                f.write(line)
+            f.write("\n")
 
         with open(os.path.join(self.working_path, "opus_gemm_lookup.h"), "w") as f:
             f.write(HEADER)
@@ -1655,29 +1677,41 @@ void
 
         Emit two macros side by side, gated on each kid's output_dtypes set.
         """
+        # Same flat-array design as gen_lookup_dict, keyed on int kid
+        # instead of (M,N,K). Sorted by kid so the dispatcher can binary
+        # search.
         HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-// A macro selector picks the right map based on CTYPE. Kids whose
-// output_dtypes doesn't include CTYPE are omitted from that CTYPE's map
-// (splitk kids only live in the fp32 map).
+//
+// Auto-generated. Do not edit. See gen_instances.py:gen_a16w16_tune_lookup.
+//
+// Per-CTYPE sorted flat arrays for kid->kernel tune dispatch. Kids whose
+// output_dtypes doesn't include CTYPE are omitted from that CTYPE's table
+// (splitk kids only live in the fp32 table). See
+// opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
 """
-        ENTRY = """
-       {{{kid},                                                        \\
-        {kernel_name}<CTYPE>}},                                        \\"""
+        ENTRY = """\
+    {{ {kid}, &{kernel_name}<CTYPE> }},  \\
+"""
 
         def _emit_map(f, macro_name, ctype):
-            f.write(f"#define {macro_name}(CTYPE)                         \\\n")
-            f.write(
-                "   {                                                                   \\"
-            )
+            f.write(f"#define {macro_name}(CTYPE) \\\n")
+            rows = []
             for kid, k in kernels_dict.items():
                 if not (isinstance(kid, int) and k.kernel_tag in A16W16_TUNE_TAGS):
                     continue
                 if ctype not in k.output_dtypes:
                     continue
-                f.write(ENTRY.format(kid=kid, kernel_name=k.name))
-            f.write("\n   }\n\n")
+                rows.append((kid, k.name))
+            rows.sort(key=lambda r: r[0])
+            n = len(rows)
+            for i, (kid, name) in enumerate(rows):
+                line = ENTRY.format(kid=kid, kernel_name=name)
+                if i == n - 1:
+                    line = line.rstrip().rstrip("\\").rstrip() + "\n"
+                f.write(line)
+            f.write("\n")
 
         with open(
             os.path.join(self.working_path, "opus_gemm_a16w16_tune_lookup.h"), "w"
