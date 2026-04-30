@@ -21,7 +21,8 @@ from aiter import fused_dynamic_mxfp4_quant_moe_sort, mxfp4_moe_sort_fwd
 
 BLOCK_SIZE_M = 32
 
-_USE_OPUS_MOE_SORTING = os.environ.get("AITER_USE_OPUS_MOE_SORTING", "0") == "1"
+# Default to Opus unless CK sorting is explicitly requested.
+_USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 
 
 def _moe_sorting_impl(
@@ -89,7 +90,7 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             dispatch_policy,
-            use_opus=_USE_OPUS_MOE_SORTING,
+            use_opus=not _USE_CK_MOE_SORTING,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")

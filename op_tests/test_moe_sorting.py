@@ -209,6 +209,22 @@ parser.add_argument(
     e.g.: -e 32""",
 )
 parser.add_argument(
+    "-md",
+    "--model_dim",
+    type=int,
+    default=4096,
+    help="""Model dimension.
+    e.g.: -md 4096""",
+)
+parser.add_argument(
+    "-id",
+    "--inter_dim",
+    type=int,
+    default=4096,
+    help="""Intermediate dimension.
+    e.g.: -id 4096""",
+)
+parser.add_argument(
     "-t",
     "--topk",
     type=int,
@@ -261,8 +277,8 @@ for padding_token in args.padding:
                         ret = test_moe_sorting(
                             dtype,
                             m,
-                            4096,
-                            4096,
+                            args.model_dim,
+                            args.inter_dim,
                             E,
                             top,
                             has_expert_mask=expert_mask,
