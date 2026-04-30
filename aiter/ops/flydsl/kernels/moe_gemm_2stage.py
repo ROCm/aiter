@@ -428,7 +428,7 @@ def compile_moe_gemm1(
             by = gpu.block_id("x")  # tile along inter_dim
             bx = gpu.block_id("y")  # tile along sorted M
 
-            if _is_splitk:
+            if const_expr(_is_splitk):
                 bz = gpu.block_id("z")  # K-batch id
                 k_base_idx = bz * arith.index(_k_per_batch)
             else:
@@ -924,7 +924,7 @@ def compile_moe_gemm1(
                     gate_list = list(acc_gate_in)
                     up_list = list(acc_up_in)
                     mfma_res_ty = T.i32x4 if is_int8 else T.f32x4
-                    if _use_mfma_k32:
+                    if const_expr(_use_mfma_k32):
                         mfma_fn = (
                             rocdl.mfma_f32_16x16x32_f16
                             if is_f16
@@ -1025,7 +1025,7 @@ def compile_moe_gemm1(
                             _math_fma(scale_vec, _uw(f32_partial_vec), _uw(f32_acc_vec))
                         )
 
-                    if is_int4_bf16 or is_int4_bf16_groupwise:
+                    if const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
                         # W4A16: deferred dequant — unpack int4->bf16 right before MFMA
                         # to minimize VGPR lifetime of dequantized bf16 values.
                         _pending_gate_up = None
@@ -1039,7 +1039,7 @@ def compile_moe_gemm1(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
@@ -1052,16 +1052,16 @@ def compile_moe_gemm1(
 
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
-                                    if is_int4_bf16_groupwise:
+                                    if const_expr(is_int4_bf16_groupwise):
                                         packed_g, sc_g = b_gate_raw[ni]
                                         packed_u, sc_u = b_up_raw[ni]
-                                        if _scale_is_bf16:
+                                        if const_expr(_scale_is_bf16):
                                             sc_g = extract_bf16_scale(arith, sc_g, ku)
                                             sc_u = extract_bf16_scale(arith, sc_u, ku)
                                     else:
                                         packed_g, sc_g = b_gate_raw[ni], None
                                         packed_u, sc_u = b_up_raw[ni], None
-                                    if is_int4_bf16_groupwise and use_gfx950_cvt:
+                                    if const_expr(is_int4_bf16_groupwise and use_gfx950_cvt):
                                         # Defer group scale to post-MFMA FMA with pipeline:
                                         # Issue current MFMA, then apply FMA for previous iteration's result.
                                         bg0, bg1 = unpack_b_w4a16(
@@ -1448,7 +1448,7 @@ def compile_moe_gemm1(
 
                 # When defer_scale16 was used, the x16 correction for v_cvt_off_f32_i4
                 # was omitted from the hot loop.  Fold it into the epilogue scale.
-                if use_gfx950_cvt:
+                if const_expr(use_gfx950_cvt):
                     _c16 = fx.Float32(16.0)
                     sw_gate_vals = [v * _c16 for v in sw_gate_vals]
                     sw_up_vals = [v * _c16 for v in sw_up_vals]
@@ -1515,7 +1515,7 @@ def compile_moe_gemm1(
                         )
                         t2 = fused2 & mask24_i32
                         t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
-                        if x_is_token_slot:
+                        if const_expr(x_is_token_slot):
                             s2 = fused2 >> 24
                             ts2 = s2 * tokens_i32_v + t2
                             sx = (
@@ -1568,7 +1568,7 @@ def compile_moe_gemm1(
                         t_idx = arith.index_cast(T.index, t2)
                         s_idx = arith.index_cast(T.index, s2)
                         ts_idx = t_idx * arith.index(topk) + s_idx
-                        if _splitk_use_bf16 and not _needs_global_atomic_bf16_s1:
+                        if const_expr(_splitk_use_bf16 and not _needs_global_atomic_bf16_s1):
                             # For buffer atomics: compute relative byte offset from buffer base
                             row_byte_off = ts_idx * arith.index(_split_k_out_row_stride)
                             return (row_byte_off, t_ok)
@@ -1579,7 +1579,7 @@ def compile_moe_gemm1(
                             )
                             return (row_byte_base, t_ok)
 
-                    _splitk_zero_i32 = [None]
+                    _splitk_zero_i32 = [fx.Int32(0) if _splitk_use_bf16 else None]
 
                     def store_pair_splitk(
                         *, row_local, row, row_ctx, col_pair0, col_g0, frag
@@ -1587,11 +1587,9 @@ def compile_moe_gemm1(
                         row_byte_ctx = row_ctx
                         col_idx = col_g0 + arith.index(_split_k_n_offset[0])
                         byte_off_col = col_idx * arith.index(out_elem_bytes)
-                        if _splitk_use_bf16:
-                            if _splitk_zero_i32[0] is None:
-                                _splitk_zero_i32[0] = fx.Int32(0)
+                        if const_expr(_splitk_use_bf16):
                             _z = _splitk_zero_i32[0]
-                            if _needs_global_atomic_bf16_s1:
+                            if const_expr(_needs_global_atomic_bf16_s1):
                                 # gfx942: global atomicrmw fadd for bf16
                                 ptr_addr_idx = row_byte_ctx + byte_off_col
                                 out_ptr = buffer_ops.create_llvm_ptr(
@@ -2777,7 +2775,7 @@ def compile_moe_gemm2(
                 ):
                     acc_list = list(acc_in)
                     mfma_res_ty = T.i32x4 if is_int8 else T.f32x4
-                    if _use_mfma_k32:
+                    if const_expr(_use_mfma_k32):
                         mfma_fn = (
                             rocdl.mfma_f32_16x16x32_f16
                             if is_f16
@@ -2889,7 +2887,7 @@ def compile_moe_gemm2(
                             _math_fma(scale_vec, _uw(f32_partial_vec), _uw(f32_acc_vec))
                         )
 
-                    if is_int4_bf16 or is_int4_bf16_groupwise:
+                    if const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
                         # W4A16: deferred dequant -- unpack int4->bf16 right before MFMA
                         # to minimize VGPR lifetime of dequantized bf16 values.
                         _pending_acc = None
@@ -2902,7 +2900,7 @@ def compile_moe_gemm2(
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
 
-                                if (
+                                if const_expr(
                                     (a0_prefetch is not None)
                                     and (ku == 0)
                                     and (mi == 0)
@@ -2915,13 +2913,13 @@ def compile_moe_gemm2(
 
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
-                                    if is_int4_bf16_groupwise:
+                                    if const_expr(is_int4_bf16_groupwise):
                                         packed, sc = b_raw[ni]
-                                        if _scale_is_bf16:
+                                        if const_expr(_scale_is_bf16):
                                             sc = extract_bf16_scale(arith, sc, ku)
                                     else:
                                         packed, sc = b_raw[ni], None
-                                    if is_int4_bf16_groupwise and use_gfx950_cvt:
+                                    if const_expr(is_int4_bf16_groupwise and use_gfx950_cvt):
                                         b0, b1 = unpack_b_w4a16(
                                             packed,
                                             arith,
