@@ -24,7 +24,7 @@ Y = gemm_a16w16_opus(A, B, dtype=torch.float32)   # fp32 output
 Y = gemm_a16w16_opus(A, B, out=preallocated_Y)    # reuse buffer
 ```
 
-First call triggers a JIT build of `module_deepgemm_opus` (~14s on
+First call triggers a JIT build of `module_deepgemm_opus` (~11s on
 the dev container; see [§7.6](#76-compile-time-techniques)).
 Subsequent Python processes reuse the compiled `.so`.
 
@@ -459,10 +459,50 @@ for it). Five landed rounds of optimization, in order:
    deduped the resulting weak symbols, but each TU still paid
    the full RA + ISA emit cost on its own compile (~0.3-0.5s
    per TU x 23 = ~9s of duplicated CPU work). Now they live in
-   a single 0.3s TU. End-to-end wall doesn't move (slowest
-   single TU is still the bottleneck on this hardware) but
-   per-splitk-TU wall drops 8-15% and the build's CPU footprint
-   shrinks accordingly, helping when MAX_JOBS is constrained.
+   a single 0.3s TU.
+7. **`#pragma unroll` on `tiled_mma_adaptor` MMA-tile loops in
+   `opus.hpp`** -- the runtime
+   `for (I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++)`
+   outer loop and the inner `for (j = 0; j < a_len; j++)`
+   extract / insert loops in the `vector_t` overload of
+   `operator()` and `step_k` were relying on clang's default
+   unroll heuristic to fold trip counts that are all
+   constexpr. For small tiles (e.g. non-splitk's
+   2x2x2 = 8 outer iters) clang did unroll them; but for the
+   large splitk tiles
+   (`flatmm_splitk_64x96x64_wgpcu1`'s 4x6x2 = 48 outer iters
+   x mma_a_len=4 inner, 192 reads in total) the loop was
+   left as a runtime loop over the `vtype_a` / `vtype_b` /
+   `vtype_c` register arrays. GFX9 has no "load VGPR by
+   runtime index" instruction, so LLVM expanded each
+   `s_a[j] = a[i_a + j]` into an N-way
+   `s_cmp_eq + s_cselect_b64 + v_cndmask_b32` select tree.
+   Result on the worst kid: 8931 SGPR spills, 12100
+   `s_cselect_b64`, 17956 `v_writelane_b32`, 388 KB ISA, and
+   5.2s of LLVM Greedy RA Evict time = 7.7s slowest TU wall
+   (the build's critical path). Forcing the unroll lets every
+   index resolve at compile time, eliminates the select trees,
+   and collapses register pressure. Numbers after the fix on
+   the same kid:
+
+   | Metric | Before | After | Change |
+   |---|---:|---:|---:|
+   | Slowest TU wall | 7.7s | **1.3s** | **-83%** |
+   | ISA size | 388 KB | 27 KB | -93% |
+   | `s_cselect_b64` | 12 098 | 2 | -99.98% |
+   | `v_writelane_b32` | 17 956 | 0 | -100% |
+   | `sgpr_spill_count` | 8 931 | 0 | -100% |
+   | `sgpr_count` | 106 | 46 | -57% |
+   | `vgpr_count` | 423 | 310 | -27% |
+   | `agpr_count` | 167 | 54 | -68% |
+   | `private_segment` | 24 704 B | 0 | -100% |
+   | ASM total lines | 69 426 | 1 958 | -97% |
+
+   This change touches `opus.hpp` (a shared header used by
+   opus_attn / opus_fmm / opus_gemm). Smaller tile configs
+   that already unrolled spontaneously are unaffected: they
+   unroll the same way they did before, just under the
+   explicit pragma instead of the heuristic.
 
 **Headline** (128-core demon_test, ROCm 7.2.2, `MAX_JOBS=102`,
 3-trial average over `AITER_REBUILD=1` with cleared build dir):
@@ -474,17 +514,23 @@ for it). Five landed rounds of optimization, in order:
 | Fused host TU + 38 device TUs | **22.3s** (22.5 / 22.0 / 22.4) |
 | + torch removal in launchers | **19.4s** (19.5 / 19.5 / 19.2) |
 | + dispatcher torch removal + flat-array lookup | **14.0s** (14.1 / 14.0 / 14.0) |
-| **+ dedicated splitk_reduce TU (current)** | **14.4s** (14.0 / 14.7 / 14.4) |
-| **Saving vs. baseline** | **−34.0s (−70%)** |
+| + dedicated splitk_reduce TU | **14.4s** (14.0 / 14.7 / 14.4) |
+| **+ MMA-tile unroll on opus.hpp (current)** | **11.1s** (11.1 / 11.3 / 11.0) |
+| **Saving vs. baseline** | **−37.3s (−77%)** |
 
-Round 6 (dedicated reduce TU) doesn't move end-to-end wall on
-this hardware: the slowest splitk kid (`64x96x64_wgpcu1`) is the
-critical path at ~8s and dropping its 4 reduce kernels saves it
-~0.3s (still bottleneck-bound by its own main-kernel codegen).
-The benefit is in CPU work avoided -- previously 23 splitk TUs x
-~0.4s of redundant reduce codegen each, now 1 TU x 0.3s total.
-On hardware with smaller MAX_JOBS or under load, this shows up
-as a real wall-time win.
+Rounds 6 + 7 together flipped the build's critical path. Round
+6 (dedicated reduce TU) doesn't move end-to-end wall on its own
+because round 7's eventual fix is in the slowest kid's main
+kernel, but it cuts ~9s of duplicated reduce codegen across all
+splitk TUs (a real win on hardware with smaller MAX_JOBS).
+Round 7 cracks the slowest-TU bottleneck the previous five
+rounds had left untouched: every splitk TU drops to
+~1.2-1.5s wall (vs the worst's 7.7s before), and the new
+critical path is the pybind TU (4.7s, mostly pybind11 + libtorch
+parse) and the fused host TU (2.4s). Perf on the 24-shape
+dsv3+gptoss bf16 benchmark is unchanged across rounds 6+7
+(geomean +0.37% per shape, well within measurement noise; total
++0.27% sum of best-kernel us).
 
 Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 `op_tests/test_opus_a16w16_lookup.py` 338/338 still pass.
@@ -498,7 +544,8 @@ Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 | Fused `all_instances_host.cu` (with torch) | ~11.7s (one-time, all 38 launchers) | ~0.4s (device pass empty) | ~12s |
 | Fused `all_instances_host.cu` (current, torch-free) | **2.05s** (FE 1.33s 65% / OPT 0.32s 16% / MCG 0.34s 17%) | 0.42s (empty) | **~2.5s** |
 | Per-kid `*.device.cu` (typical a16w16) | ~0.10s (RTC) | ~1.5s (single Traits codegen) | ~1.8s |
-| Per-kid `*.device.cu` (worst splitk: 64x96x64-wgpcu1) | ~0.11s | **8.29s (MCG 6.93s 84%)** | **~8.5s** |
+| Per-kid `*.device.cu` (worst splitk: 64x96x64-wgpcu1, pre-round-7) | ~0.11s | **8.29s (MCG 6.93s 84%, RA 5.74s 77%)** | **~8.5s** |
+| Per-kid `*.device.cu` (worst splitk: 96x64x128-wgpcu1, post-round-7) | ~0.10s | ~1.4s (clean codegen, 0 spill) | **~1.5s** |
 | Pre-split dispatcher (`opus_gemm.cu`, with torch) | 12.5s | 15.0s | ~27s |
 | Split dispatcher (with torch) | 12.5s | 0.4s | ~13s |
 | Dispatcher after torch + lookup overhaul (current) | **1.43s** (FE 1.21s 85%) | 0.42s | **~2.0s** |
@@ -506,28 +553,34 @@ Functional regression: `op_tests/test_opus_a16w16_tune.py` 30/30 and
 | Split pybind (current) | ~5s | 0.42s | ~5.5s |
 
 The end-to-end wall is now bounded by **the slowest single
-device-pass GPU codegen (~8.5s on the worst splitk kid)**, plus
-ninja schedule + link + Python startup overhead (~5s). Everything
-else (host-only TUs, dispatcher, pybind, fused TU's host pass)
-finishes long before the slowest device.cu does. Critical path
-breakdown:
+pybind TU (~4.7s, mostly pybind11 + libtorch parse on host
+pass)** plus ninja schedule + link + Python startup overhead
+(~6s). Critical path breakdown post-round-7:
 
 ```
-slowest device.cu (splitk-64x96x64-wgpcu1) device pass    ~8.5s   ← GPU codegen, MCG dominated
-ninja schedule + link + python startup                    ~5.5s
-total wall                                                ~14s
+opus_gemm_pybind.cu host pass    ~4.7s   ← pybind11 + libtorch parse
+ninja + link + python startup    ~6.4s
+total wall                       ~11s
 ```
 
-The 8.5s on that one kid is real AMDGPU backend work
-(register allocation, instruction scheduling, ISA emit) on a
-heavy MFMA-32x32 splitk pipeline -- not parse / template waste.
-See §7.6.1 below for the device-pass forensic breakdown
-(LLVM Greedy RA's `Evict` sub-pass is 99% of RA time = 5.2s,
-driven by ~9000 SGPR spill-to-VGPR-lane decisions on this kid).
+The slowest device TU now finishes in 1.5s (vs 7.7s before
+round 7); every device.cu's GPU codegen is bounded comfortably
+under the pybind TU. Round 7's `#pragma unroll` on
+`tiled_mma_adaptor` was the breakthrough -- see §7.6.1 below
+for the original forensic breakdown of the spill blow-up that
+the unroll fixed.
 
-#### 7.6.1 Device-pass forensics on the slowest splitk kid
+#### 7.6.1 Device-pass forensics on the slowest splitk kid (historical)
 
-`flatmm_splitk_64x96x64_wgpcu1<fp32_t>` is the build's
+> Status: **fixed in round 7**. This section documents the
+> diagnostic path for posterity. The numbers below are
+> pre-fix and no longer reproducible -- they referred to the
+> kernel before the `#pragma unroll` was added to the MMA-tile
+> loops in `opus.hpp::tiled_mma_adaptor::operator()` /
+> `step_k`. After the fix, this same kid compiles in 1.3s
+> with 0 SGPR spills.
+
+`flatmm_splitk_64x96x64_wgpcu1<fp32_t>` *was* the build's
 critical-path TU. `hipcc -ftime-report` on it shows:
 
 ```
@@ -755,13 +808,14 @@ path.
 
 ### 7.7 Future compile-time work
 
-The current 14.4s floor is set by **the slowest single device
-TU's GPU codegen (~8.5s on `flatmm_splitk_64x96x64_wgpcu1` -- 84%
-in machine-code generation, i.e. AMDGPU register allocation +
-instruction scheduling on an MFMA-32x32 splitk pipeline)**, not
-by host parse anymore. Every host-side TU now finishes in 2-5s
-each and runs in parallel; ninja schedules them comfortably
-inside the slowest device TU's wall time. Remaining attack
+The current 11.1s floor is now set by **the pybind TU at ~4.7s**
+(mostly pybind11 + libtorch parse, neither of which the
+dispatcher / launcher refactors can touch since the pybind
+layer is the boundary with Python). The previous champion --
+the slowest device TU's GPU codegen on
+`flatmm_splitk_64x96x64_wgpcu1` -- went from 7.7s down to 1.3s
+in round 7 once we found the SGPR spill root cause and added
+`#pragma unroll` (see §7.6 round 7 + §7.6.1). Remaining attack
 surface, in rough order of expected payoff vs. invasiveness:
 
 1. **(MEASURED, NEGATIVE)** AMDGPU-side `-mllvm` flag sweep --
@@ -806,18 +860,19 @@ surface, in rough order of expected payoff vs. invasiveness:
    CSV coverage; potentially -3 to -5s end-to-end if the
    slowest 1-2 kids turn out unused.
 
-3. **Restructure splitk pipeline to remove runtime slot
-   indexing** (high potential, structural) -- the SGPR spill
-   blow-up (§7.6.1) all flows from `slot = issue_k % pfk`
-   being a runtime int that drives ~192 register-tile reads
-   per K-loop iteration. Hand-unrolling the slot dispatch into
-   `pfk` separate code paths (one per slot value, statically
-   selected) would eliminate every `s_cselect_b64` chain and
-   collapse the SGPR live-range count. This is a kernel-author
-   change rather than a build-system change but its expected
-   wall benefit is the largest of any remaining option:
-   estimated -3 to -4s on the critical-path TU, which would
-   bring end-to-end build wall to ~10-11s.
+3. **(LANDED, round 7)** Force unroll on tiled_mma_adaptor's
+   MMA-tile loops -- root cause of the §7.6.1 SGPR spill
+   blow-up turned out to be `opus.hpp`'s
+   `for (I = 0; I < EXPAND_K * EXPAND_M * EXPAND_N; I++)`
+   relying on clang's heuristic to unroll. For the worst
+   splitk tile (4x6x2 = 48 outer iters x mma_a_len=4 inner)
+   the heuristic gave up, the loop ran at runtime, and the
+   `a[i_a + j]` reads compiled to N-way s_cselect select
+   trees. Adding `#pragma unroll` to the five overloads in
+   `tiled_mma_adaptor` (plus the inner extract / insert loops
+   in the vector_t path) eliminated the spill problem
+   entirely: slowest TU 7.7s -> 1.3s, 8931 spills -> 0,
+   ASM 69k lines -> 2k. End-to-end wall 14.4s -> 11.1s.
 
 4. **`ccache` / `sccache` integration** -- reuse `.cuda.o`
    across rebuilds when `gen_instances.py` produces a
@@ -836,17 +891,27 @@ surface, in rough order of expected payoff vs. invasiveness:
    the per-device TU host pass is even shorter (~0.1s with RTC).
    Only worth doing for cleanliness, not for time.
 
-Practical ceiling on this hardware:
+Practical ceiling on this hardware (post-round-7):
 
-- if item 2 lands and trims the slowest 2 kids: **~10-11s**
-  end-to-end (slowest remaining TU is ~5-6s)
-- if item 3 lands (structural slot-rotation rewrite):
-  **~10-11s** by a different route (the slowest TU itself
-  drops from 8.5s to ~5s)
-- combined items 2 + 3: **~7-8s** floor
+- The new bottleneck is the **pybind TU at 4.7s** (mostly
+  pybind11 + libtorch parse, neither easy to remove without
+  abandoning the python binding).
+- Fused host TU is 2.4s, dispatcher TU 1.8s, slowest device
+  TU 1.5s -- the gap between pybind and the next slowest TU
+  is ~2.3s, leaving room for ninja schedule / link / Python
+  startup (~6s observed).
+- If item 2 (CSV-driven kid trimming) lands and removes
+  ~5 unused splitk variants: probably **~10s** end-to-end
+  (slow TUs are already fast, savings are linear in TU count
+  and amortized across MAX_JOBS=102 parallelism).
+- Removing the pybind TU entirely (e.g. via a C-API shim
+  similar to the dispatcher's torch-free refactor) would
+  bring this to ~7-8s but requires wider-scope changes to
+  the Python wrapper layer.
 
-Item 1 (-mllvm flag sweep) is closed (measured negative).
-Items 4 + 5 are infrastructure / cleanliness, not on the wall
+Items 1 (-mllvm flag sweep) and 3 (MMA-tile unroll) are
+closed -- 1 measured negative, 3 landed in round 7. Items
+4 + 5 are infrastructure / cleanliness, not on the wall
 critical path.
 
 ---
@@ -866,11 +931,9 @@ CSV changes on JIT rebuild:
 AITER_REBUILD=1 python3 -c "from aiter.ops.opus import gemm_a16w16_opus"
 ```
 
-The whole rebuild takes ~14s on dev hardware (128-core,
+The whole rebuild takes ~11s on dev hardware (128-core,
 ROCm 7.2.2; see [§7.6 Compile-time techniques](#76-compile-time-techniques)
-for the five-stage optimization stack (host/device split + fused TU +
-torch removal + dispatcher torch removal + flat-array lookup) that
-drops it from ~48s).
+for the seven-stage optimization stack that drops it from ~48s).
 
 ### `RuntimeError: K=... must be even`
 
