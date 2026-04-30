@@ -142,6 +142,7 @@ def fused_moe(
     bias1=None,
     bias2=None,
     splitk=0,
+    q_dtype_a=None,
     swiglu_limit=0.0,
 ):
     if not block_size_M:
@@ -168,6 +169,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        q_dtype_a=q_dtype_a,
         swiglu_limit=swiglu_limit,
     )
 
@@ -196,6 +198,8 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: Optional[torch.Tensor] = None,
     bias2: Optional[torch.Tensor] = None,
+    q_dtype_a: Optional[torch.dtype] = None,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, topk = topk_ids.shape
