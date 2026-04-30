@@ -84,38 +84,16 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
-          for attempt in 1 2 3; do
-            if docker run --rm \
-              --device=/dev/kfd $DEVICE_FLAG \
-              --shm-size=16G \
-              --group-add $(getent group render | cut -d: -f3) \
-              --group-add $(getent group video | cut -d: -f3) \
-              -v "${{ github.workspace }}:/workspace" \
-              -w /workspace \
-              ${{ env.DOCKER_IMAGE }} \
-              bash -c '
-                set -ex
-                pip config set global.default-timeout 120
-                pip config set global.retries 20
-                TRITON_COMMIT=${TRITON_COMMIT:-756afc06}
-                git clone https://github.com/triton-lang/triton
-                cd triton
-                git checkout "$TRITON_COMMIT"
-                pip install -r python/requirements.txt
-                MAX_JOBS=64 pip wheel --no-deps -w /workspace/triton-wheels .
-              '; then
-              echo "Triton wheel build succeeded on attempt ${attempt}"
-              exit 0
-            fi
-
-            echo "Triton wheel build failed on attempt ${attempt}"
-            if [ "${attempt}" != 3 ]; then
-              sleep $((attempt * 30))
-            fi
-          done
-
-          echo "Triton wheel build failed after 3 attempts"
-          exit 1
+          docker run --rm \
+            --device=/dev/kfd $DEVICE_FLAG \
+            --shm-size=16G \
+            --group-add $(getent group render | cut -d: -f3) \
+            --group-add $(getent group video | cut -d: -f3) \
+            -e TRITON_BUILD_WHEEL_DIR=/workspace/triton-wheels \
+            -w /workspace \
+            -v "${{ github.workspace }}:/workspace" \
+            ${{ env.DOCKER_IMAGE }} \
+            bash ./.github/scripts/install_triton.sh
 
       - name: Upload Triton wheel
         uses: actions/upload-artifact@v4
