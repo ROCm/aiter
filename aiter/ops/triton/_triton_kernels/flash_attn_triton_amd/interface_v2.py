@@ -392,6 +392,10 @@ def varlen_fwd(
         raise NotImplementedError(
             "seqused_k is not supported in AMD Triton FA2 varlen_fwd."
         )
+    if num_splits not in (0, 1):
+        raise NotImplementedError(
+            "num_splits > 1 not supported in AMD Triton FA2 varlen_fwd."
+        )
 
     if DEBUG:
         print()
