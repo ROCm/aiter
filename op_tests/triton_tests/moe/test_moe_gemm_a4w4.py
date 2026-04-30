@@ -10,10 +10,12 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+    is_gluon_supported,
     mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
-    swizzle_scales,
+    swizzle_scales_gfx950,
+    swizzle_scales_gfx1250,
 )
 
 # numerics utilities
@@ -68,7 +70,8 @@ def init_compute_data(
     has_y_gammas,
     device="cuda",
 ):
-    torch.manual_seed(0)
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
     x = alloc_rand(shape_x, device=device, dtype=act_dtype)
@@ -212,7 +215,7 @@ class Case:
 )
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
-@pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_op(
     m,
     n,
@@ -221,23 +224,29 @@ def test_op(
     do_scatter,
     has_y_gammas,
     apply_swiglu,
-    fused_quant,
     n_expts_tot,
     n_expts_act,
     hbm_swizzling,
+    backend,
     device="cuda",
 ):
-    if get_arch() != "gfx950":
-        pytest.skip("FP4 kernels are not supported on MI300.")
     if hbm_swizzling:
-        if n % 32 != 0 or k % (32 * 8) != 0:
+        if get_arch() == "gfx950" and (m % 32 != 0 or k % (32 * 8) != 0):
+            pytest.skip(
+                f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
+            )
+        elif get_arch() == "gfx1250" and k % (32 * 4) != 0:
             pytest.skip(
                 f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
             )
 
-    torch.manual_seed(0)
+    # skip gluon backend if not supported
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip(f"Gluon backend is not supported on {get_arch()}")
 
-    act_mxfp4 = "mxfloat4_e2m1"
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    # torch.manual_seed(0)
+
     weight_mxfp4 = "mxfloat4_e2m1"
     weight_dtype_str = weight_mxfp4[2:]
 
@@ -264,8 +273,14 @@ def test_op(
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
     if hbm_swizzling:
-        swizzle_mx_scale = "CDNA4_SCALE"
-        w_scale_tri = swizzle_scales(w_scale_tri)
+        if get_arch() == "gfx1250":
+            swizzle_mx_scale = "GFX1250_SCALE"
+            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
+        elif get_arch() == "gfx950":
+            swizzle_mx_scale = "CDNA4_SCALE"
+            w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
+        else:
+            assert False, "Unsupported architecture"
     else:
         swizzle_mx_scale = None
 
@@ -279,17 +294,15 @@ def test_op(
     ref_y = moe_gemm_torch(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
-    if not act_mxfp4 and fused_quant:
-        quant_static_scale = ref_y.abs().max().float() / 448.0
-    else:
-        quant_static_scale = None
+
+    # run kernel
     tri_y = moe_gemm_a4w4(
         x_tri,
         w_tri,
         x_mx_scales_tri,
         w_scale_tri,
         x_static_scale,
-        quant_static_scale,
+        None,
         bias_tri,
         rdata,
         gindx,
@@ -298,7 +311,6 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        backend=backend,
     )
-    if not act_mxfp4 and fused_quant:
-        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
     assert_close(ref_y, tri_y, maxtol=maxtol, rmstol=rmstol)
