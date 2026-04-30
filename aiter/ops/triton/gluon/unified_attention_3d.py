@@ -58,7 +58,7 @@ class AttentionConfig:
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     QK_WMMA_UNPACKED_LAYOUT: gl.constexpr
-    PV_WMMA_UNPACKED_LAYOUT: gl.constexpr
+    PV_WMMA_LAYOUT: gl.constexpr
 
     # Dot operand layouts
     Q_DOT_LAYOUT: gl.constexpr
@@ -67,7 +67,8 @@ class AttentionConfig:
     P_DOT_LAYOUT: gl.constexpr
     Q_SCALES_DOT_LAYOUT: gl.constexpr
     K_SCALES_DOT_LAYOUT: gl.constexpr
-    V_SCALES_DOT_LAYOUT: gl.constexpr
+    V_DOT_PACKED_LAYOUT: gl.constexpr
+    V_SCALES_DOT_BROADCAST_LAYOUT: gl.constexpr
 
     # Layout for loading Q
     Q_LOAD_LAYOUT: gl.constexpr
@@ -184,10 +185,10 @@ class AttentionConfig:
                 PV -> FP8 WMMA (downcast P)
             A8W4:
                 QK -> FP8-FP4 scaled WMMA (Q scales with all 1.0 in e8m0)
-                PV -> BF16 WMMA (downcast P, upcast V and mul by broadcasted V_scales)
+                PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
             A4W4:
                 QK -> FP4-FP4 scaled WMMA 
-                PV -> BF16 WMMA (downcast P, upcast V and mul by broadcasted V_scales)
+                PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
         """
 
         assert (
@@ -197,15 +198,18 @@ class AttentionConfig:
         )
 
         if self.QUERY_DTYPE == "bf16":
+            # A16W16 / A16W8
             assert self.KV_CACHE_DTYPE == "bf16" or self.KV_CACHE_DTYPE == "fp8"
             instr_width_qk = 32
             instr_width_pv = 32
         elif self.QUERY_DTYPE == "fp8":
             assert self.KV_CACHE_DTYPE == "fp8" or self.KV_CACHE_DTYPE == "nvfp4"
             if self.KV_CACHE_DTYPE == "fp8":
+                # A8W8
                 instr_width_qk = 64
                 instr_width_pv = 64
             else:
+                # A8W4
                 instr_width_qk = 128 // 2  # packed
                 instr_width_pv = 32
         else:
@@ -214,8 +218,13 @@ class AttentionConfig:
             instr_width_qk = 128 // 2  # packed
             instr_width_pv = 32
 
-        if self.KV_CACHE_DTYPE == "nvfp4":
+        if self.KV_CACHE_DTYPE == "bf16":
+            assert K_WIDTH == 8
+        elif self.KV_CACHE_DTYPE == "fp8":
+            assert K_WIDTH == 16
+        else:
             assert SHUFFLED_KV_CACHE
+            assert K_WIDTH == 16
 
         self.QK_WMMA_LAYOUT = gl.constexpr(
             gl.amd.AMDWMMALayout(
@@ -259,20 +268,8 @@ class AttentionConfig:
                     instr_shape=[16, 16, 128],
                 )
             )
-            # warp_bases_pv_unpacked = warp_bases_pv
-            # self.PV_WMMA_UNPACKED_LAYOUT = gl.constexpr(
-            #     gl.amd.AMDWMMALayout(
-            #         version=3,
-            #         transposed=True,
-            #         warp_bases=warp_bases_pv_unpacked,
-            #         reg_bases=reg_bases,
-            #         instr_shape=[16, 16, 128],
-            #     )
-            # )
-            self.PV_WMMA_UNPACKED_LAYOUT = self.PV_WMMA_LAYOUT
         else:
             self.QK_WMMA_UNPACKED_LAYOUT = self.QK_WMMA_LAYOUT
-            self.PV_WMMA_UNPACKED_LAYOUT = self.PV_WMMA_LAYOUT
 
         self.Q_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
@@ -293,15 +290,23 @@ class AttentionConfig:
         self.P_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
                 operand_index=0,
-                parent=self.PV_WMMA_UNPACKED_LAYOUT,
-                k_width=self.K_WIDTH,
+                parent=self.PV_WMMA_LAYOUT,
+                k_width=(
+                    self.K_WIDTH
+                    if self.KV_CACHE_DTYPE != "nvfp4"
+                    else (self.K_WIDTH * 2)
+                ),
             )
         )
         self.V_DOT_LAYOUT = gl.constexpr(
             gl.DotOperandLayout(
                 operand_index=1,
-                parent=self.PV_WMMA_UNPACKED_LAYOUT,
-                k_width=self.K_WIDTH,
+                parent=self.PV_WMMA_LAYOUT,
+                k_width=(
+                    self.K_WIDTH
+                    if self.KV_CACHE_DTYPE != "nvfp4"
+                    else (self.K_WIDTH * 2)
+                ),
             )
         )
 
@@ -322,17 +327,48 @@ class AttentionConfig:
                 )
             )
 
-            self.V_SCALES_DOT_LAYOUT = gl.constexpr(
-                gl.amd.gfx1250.get_wmma_scale_layout(
-                    self.V_DOT_LAYOUT,
-                    [self.BLOCK_SIZE, self.HEAD_SIZE // self.BLOCK_SCALES_SIZE],
-                    scale_factor=16,
+            self.V_DOT_PACKED_LAYOUT = gl.constexpr(
+                gl.DotOperandLayout(
+                    operand_index=1,
+                    parent=(
+                        gl.amd.AMDWMMALayout(
+                            version=3,
+                            transposed=True,
+                            warp_bases=[],
+                            reg_bases=[],
+                            instr_shape=[16, 16, 64],
+                        )
+                    ),
+                    k_width=16,
+                )
+            )
+
+            # BLOCK_SIZE == 128 and NUM_WARPS == 1 is ensured in the helper function, hence hardcoded the first and the last dimension of V_SCALES_DOT_BROADCAST_LAYOUT
+            self.V_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(
+                gl.DistributedLinearLayout(
+                    reg_bases=[
+                        [1, 0, 0],
+                        [2, 0, 0],
+                        [4, 0, 0],
+                        [8, 0, 0],
+                        [16, 0, 0],
+                        [64, 0, 0],
+                    ]
+                    + [
+                        [0, v + 1, 0]
+                        for v in range(int(math.log2(self.HEAD_SIZE // 16)))
+                    ],
+                    lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [32, 0, 0]],
+                    warp_bases=[],
+                    block_bases=[],
+                    shape=[self.BLOCK_SIZE, self.HEAD_SIZE // 16, 16],
                 )
             )
         else:
             self.Q_SCALES_DOT_LAYOUT = gl.constexpr(None)
             self.K_SCALES_DOT_LAYOUT = gl.constexpr(None)
-            self.V_SCALES_DOT_LAYOUT = gl.constexpr(None)
+            self.V_DOT_PACKED_LAYOUT = gl.constexpr(None)
+            self.V_SCALES_DOT_BROADCAST_LAYOUT = gl.constexpr(None)
 
         assert (
             NUM_BLOCKS_GATHER_PER_TILE == 1
@@ -975,7 +1011,7 @@ class AttentionProgram:
         acc = gl.zeros(
             [self.cfg.BLOCK_M, self.cfg.HEAD_SIZE],
             dtype=tl.float32,
-            layout=self.cfg.PV_WMMA_UNPACKED_LAYOUT,
+            layout=self.cfg.PV_WMMA_LAYOUT,
         )
 
         return L, M, acc
@@ -1122,7 +1158,11 @@ class AttentionProgram:
             )
             .permute((0, 1, 4, 3, 2, 5))
             .reshape(
-                (self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // self.cfg.BLOCK_SCALES_SIZE)
+                (
+                    self.cfg.BLOCK_SIZE,
+                    self.cfg.HEAD_SIZE // self.cfg.BLOCK_SCALES_SIZE,
+                    1,
+                )
             )
         )
 
@@ -1207,7 +1247,7 @@ class AttentionProgram:
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
             return self.lds_unshuffle_v_scales(buffer_id).load(
-                layout=self.cfg.V_SCALES_DOT_LAYOUT
+                layout=self.cfg.V_SCALES_DOT_BROADCAST_LAYOUT
             )
 
     @gluon.jit
@@ -1234,7 +1274,14 @@ class AttentionProgram:
     def tdm_shared_load_v(self, wait_count, buffer_id):
         gl.amd.gfx1250.tdm.async_wait(wait_count)
         if self.cfg.SHUFFLED_KV_CACHE:
-            return self.lds_unshuffle_v(buffer_id).load(layout=self.cfg.V_DOT_LAYOUT)
+            if self.cfg.KV_CACHE_DTYPE == "nvfp4":
+                return gl.amd.gfx1250.local_load_packed_transposed(
+                    self.lds_unshuffle_v(buffer_id), layout=self.cfg.V_DOT_PACKED_LAYOUT
+                )
+            else:
+                return self.lds_unshuffle_v(buffer_id).load(
+                    layout=self.cfg.V_DOT_LAYOUT
+                )
         else:
             if self.cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
                 return self.v_shared.index(buffer_id).load(layout=self.cfg.V_DOT_LAYOUT)
@@ -1402,9 +1449,7 @@ class AttentionProgram:
     @gluon.jit
     def softmax_part1(self, p, L, acc, alpha):
         l_ij = gl.sum(p, 1)
-        acc = acc * gl.convert_layout(
-            alpha[:, None], layout=self.cfg.PV_WMMA_UNPACKED_LAYOUT
-        )
+        acc = acc * gl.convert_layout(alpha[:, None], layout=self.cfg.PV_WMMA_LAYOUT)
         L = L * alpha + l_ij
         return p, L, acc
 
@@ -1412,26 +1457,18 @@ class AttentionProgram:
     def compute_pv(self, p, v, v_scales, acc):
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
             # A8W4 / A4W4
-            v = gl.fp4_to_fp(v, gl.bfloat16, axis=1)
-            v_scales = tl.broadcast_to(
-                v_scales.reshape(
-                    (
-                        self.cfg.TILE_SIZE,
-                        self.cfg.HEAD_SIZE // self.cfg.BLOCK_SCALES_SIZE,
-                        1,
-                    )
-                ),
-                (
-                    self.cfg.TILE_SIZE,
-                    self.cfg.HEAD_SIZE // self.cfg.BLOCK_SCALES_SIZE,
-                    self.cfg.BLOCK_SCALES_SIZE,
-                ),
-            )
-            v_scales = v_scales.reshape((self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE))
-            v = gl.convert_layout(v, layout=self.cfg.V_DOT_LAYOUT)
-            v_scales = gl.convert_layout(v_scales, layout=self.cfg.V_DOT_LAYOUT)
-            v *= v_scales
+            v_scales_dummy = gl.full(
+                (self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE),
+                127,
+                dtype=tl.uint8,
+                layout=self.cfg.V_DOT_LAYOUT,
+            )  # 1.0 in e8m0
+            v = gl.amd.gfx1250.scaled_upcast(v, v_scales_dummy, gl.bfloat16, axis=0)
+            v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE // 16, 16))
+            v = v * v_scales
+            v = v.reshape((self.cfg.BLOCK_SIZE, self.cfg.HEAD_SIZE))
             v = v.to(gl.bfloat16)
+            v = gl.convert_layout(v, self.cfg.V_DOT_LAYOUT, assert_trivial=True)
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         elif self.cfg.QUERY_DTYPE == "fp8":
             # A8W8
@@ -1453,7 +1490,7 @@ class AttentionProgram:
         offs_q_d = gl.arange(
             0,
             self.cfg.HEAD_SIZE,
-            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_UNPACKED_LAYOUT),
+            layout=gl.SliceLayout(0, self.cfg.PV_WMMA_LAYOUT),
         )
         dim_mask = gl.full((1,), 1, dtype=tl.int1)
 
@@ -1972,16 +2009,16 @@ def _unified_attention_gluon_kernel_3d(
     # query_mask_qk = query_mask_0_qk[:, None] & query_mask_1_qk[:, None]
 
     query_offset_0_pv = gl.convert_layout(
-        query_offset_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_offset_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
     query_offset_1_pv = gl.convert_layout(
-        query_offset_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_offset_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
     query_mask_0_pv = gl.convert_layout(
-        query_mask_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_mask_0_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
     query_mask_1_pv = gl.convert_layout(
-        query_mask_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_UNPACKED_LAYOUT)
+        query_mask_1_qk, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT)
     )
 
     # compute the length of the longest sequence prefix spanned by any
@@ -2075,7 +2112,7 @@ def _unified_attention_gluon_kernel_3d(
     pgm.tdm_load_global_to_shared_k(physical_block_idx, buffer_id=buffer_id)
     pgm.tdm_load_global_to_shared_v(physical_block_idx, buffer_id=buffer_id)
 
-    for j in range(pgm.tile_start, pgm.tile_end - 1):
+    for j in range(pgm.tile_start, pgm.tile_end - (cfg.NUM_STAGES - 1)):
         # physical_block_idx = physical_block_idx + 1 # no-paging expt
         physical_block_idx = next_physical_block_idx
         j_hbm, next_physical_block_idx = pgm.load_physical_block_idx_safe(

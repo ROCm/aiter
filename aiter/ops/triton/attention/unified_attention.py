@@ -107,6 +107,7 @@ def select_3d_config(
     attn_warps = 2
     waves_per_eu = 2
     num_segments = 0
+    attn_stages = 2
     if shuffled_kv_cache:
         if kv_cache_dtype == torch.bfloat16:
             if num_2d_prgms >= 256:
@@ -118,7 +119,7 @@ def select_3d_config(
                 attn_warps = 1
                 waves_per_eu = 2
                 num_segments = 8
-        else:
+        elif kv_cache_dtype == e4m3_dtype:
             if num_2d_prgms >= 256:
                 attn_warps = 1
                 waves_per_eu = 2
@@ -128,10 +129,19 @@ def select_3d_config(
                 attn_warps = 1
                 waves_per_eu = 2
                 num_segments = 8
-
-        # assert (
-        #     block_size >= 64
-        # ), "Only block_size >= 64 is supported for shuffled KV cache"
+        else:
+            assert (
+                block_size == 128
+            ), "Only block_size == 128 is supported for FP4 KV cache"
+            if num_2d_prgms >= 256:
+                attn_warps = 1
+                waves_per_eu = 2
+                if IS_DEVICE_ARCH_GFX12:
+                    num_segments = 1
+            else:
+                attn_warps = 1
+                waves_per_eu = 2
+                num_segments = 8
 
     TILE_SIZE = min(64, triton.next_power_of_2(block_size))
 
@@ -147,7 +157,6 @@ def select_3d_config(
     if num_segments == MIN_SEGMENTS:
         reduce_num_warps = 1
 
-    attn_stages = 2
     occ = waves_per_eu * 4 // attn_warps
 
     # # this section increases the num_warps if the occ is too high
