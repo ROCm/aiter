@@ -135,6 +135,11 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
     seen: Set[Tuple] = set()
     results: List[Dict] = []
     for row in _get_tuned_fmoe_rows():
+        kn1 = (row.get("kernelName1") or "").strip()
+        kn2 = (row.get("kernelName2") or "").strip()
+        if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
+            continue
+
         c_dtype = _normalize_dtype(row["dtype"])
         a_dtype = _normalize_dtype(row.get("q_dtype_a") or row["dtype"])
         b_dtype = _normalize_dtype(row.get("q_dtype_w") or row["dtype"])
@@ -144,6 +149,11 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> List[Dict]:
         need_splitk = _should_include_splitk(row, quant_type)
 
         if activation == "swiglu":
+            continue
+
+        # A16W4 per_1x32 (bf16 activation, int4 weight) is owned by FlyDSL,
+        # not CK 2stages. CK has no matching instance — skip prebuild.
+        if quant_type == "per_1x32" and a_dtype == "b16" and b_dtype == "torch.int4":
             continue
 
         for preshuffle in _infer_preshuffle_modes(b_dtype, quant_type):
