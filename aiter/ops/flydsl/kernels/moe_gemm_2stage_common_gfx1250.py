@@ -140,7 +140,7 @@ def _extract_sub8(acc, vec_base: int, *, vector, range_constexpr, ACC_VEC_SIZE: 
 
 
 def _finalize_alloc_and_launch_2d(*, ctx, alloc, launcher, gx, gy, block_threads: int, stream, waves_per_eu, ir,
-                                  cluster=None):
+                                  cluster=None, gz=1):
     with ir.InsertionPoint(ctx.gpu_module_body):
         alloc.finalized = False
         alloc.finalize()
@@ -154,7 +154,7 @@ def _finalize_alloc_and_launch_2d(*, ctx, alloc, launcher, gx, gy, block_threads
                 op.attributes["rocdl.cluster_dims"] = ir.StringAttr.get(
                     f"{cluster[0]},{cluster[1]},{cluster[2]}")
     launcher.launch(
-        grid=(gx, gy, 1),
+        grid=(gx, gy, gz),
         block=(block_threads, 1, 1),
         stream=stream,
         cluster=cluster,
@@ -242,6 +242,123 @@ def _emit_stage1_gate_up_epilogue(
                 out_idx = ((tok * c_topk_i32 + slot) * i32_inter_in
                            + arith.index_cast(T.i32, col))
                 buffer_ops.buffer_store(out_v, out_rsrc, out_idx)
+                scf.YieldOp([])
+
+
+def _emit_stage1_gate_up_splitk_epilogue(
+    *,
+    sub_tiles,
+    by,
+    tile_m: int,
+    route_tile_m: int,
+    warp_m_base,
+    warp_n_base,
+    blk_n,
+    lane16,
+    lane_kgrp,
+    WMMA_N: int,
+    i32_tokens_in,
+    i32_inter_in,
+    topk: int,
+    num_valid_i32,
+    block_row_start,
+    sorted_rsrc,
+    out_rsrc,
+    out_elem_ty,
+    load_gate_up_sub8,
+    ir,
+    fx,
+    arith,
+    buffer_ops,
+    scf,
+    vector,
+    range_constexpr,
+    rocdl,
+    T,
+):
+    """Stage1 split-K epilogue.
+
+    Writes per-K-slice gate/up partial sums to a ``[tokens*topk, 2*inter_dim]``
+    output tensor with atomic fadd. The silu/mul fusion is skipped and must
+    be applied by a separate reduction kernel (which also folds in the
+    per-slot routing weight).
+
+    Layout:
+      out[row, col]                   += gate_partial[row, col]
+      out[row, col + inter_dim]       += up_partial[row, col]
+    where ``row = tok * topk + slot`` and ``col < inter_dim``.
+    """
+    c_topk_i32 = arith.constant(int(topk), type=T.i32)
+    c2_i32 = arith.constant(2, type=T.i32)
+    zero_i32 = arith.constant(0, type=T.i32)
+    mask_even_i32 = arith.constant(0xFFFFFFFE, type=T.i32)
+
+    def atomic_add_x2(val_x2, byte_off_i32):
+        rocdl.raw_ptr_buffer_atomic_fadd(val_x2, out_rsrc, byte_off_i32, zero_i32, zero_i32)
+
+    inter_stride_i32 = i32_inter_in * c2_i32  # row stride for [tokens*topk, 2*inter_dim]
+
+    for acc_idx, vec_base, m_off, wn in sub_tiles:
+        row_local = warp_m_base + fx.Index(m_off) + lane16
+        sorted_row = by * arith.index(int(tile_m)) + row_local
+        row_i32 = arith.index_cast(T.i32, row_local)
+        sorted_i32 = arith.index_cast(T.i32, sorted_row)
+        row_in_route = arith.cmpi(
+            arith.CmpIPredicate.ult,
+            row_i32,
+            arith.constant(int(route_tile_m), type=T.i32),
+        )
+        row_in_valid = arith.cmpi(arith.CmpIPredicate.slt, sorted_i32, num_valid_i32)
+        row_ok_meta = arith.andi(row_in_route, row_in_valid)
+        sorted_safe = arith.select(row_ok_meta, sorted_i32, block_row_start)
+        fused = buffer_ops.buffer_load(sorted_rsrc, sorted_safe, vec_width=1, dtype=T.i32)
+        tok = fused & arith.constant((1 << 24) - 1, type=T.i32)
+        slot = fused >> arith.constant(24, type=T.i32)
+        tok_ok = arith.cmpi(arith.CmpIPredicate.ult, tok, i32_tokens_in)
+        slot_ok0 = arith.cmpi(arith.CmpIPredicate.sge, slot, arith.constant(0, type=T.i32))
+        slot_ok1 = arith.cmpi(arith.CmpIPredicate.slt, slot, c_topk_i32)
+        row_ok = arith.andi(row_ok_meta, arith.andi(tok_ok, arith.andi(slot_ok0, slot_ok1)))
+
+        sub8g, sub8u = load_gate_up_sub8(acc_idx, vec_base)
+        col_base = blk_n + warp_n_base + fx.Index(wn * WMMA_N) + lane_kgrp * fx.Index(8)
+        row_elem_base = (tok * c_topk_i32 + slot) * inter_stride_i32
+
+        for vpair in range_constexpr(4):
+            vi0 = vpair * 2
+            vi1 = vi0 + 1
+            col0 = col_base + fx.Index(vi0)
+            col1 = col_base + fx.Index(vi1)
+            col0_i32 = arith.index_cast(T.i32, col0)
+            col1_i32 = arith.index_cast(T.i32, col1)
+            col0_ok = arith.cmpi(arith.CmpIPredicate.ult, col0_i32, i32_inter_in)
+            col1_ok = arith.cmpi(arith.CmpIPredicate.ult, col1_i32, i32_inter_in)
+            out_ok = arith.andi(row_ok, col0_ok)
+            _if_out = scf.IfOp(out_ok)
+            with ir.InsertionPoint(_if_out.then_block):
+                # ---- gate partial ----
+                vg0 = vector.extract(sub8g, static_position=[vi0], dynamic_position=[])
+                vg1 = vector.extract(sub8g, static_position=[vi1], dynamic_position=[])
+                vg1 = arith.select(col1_ok, vg1, arith.constant(0.0, type=T.f32))
+                g0 = arith.trunc_f(out_elem_ty, vg0)
+                g1 = arith.trunc_f(out_elem_ty, vg1)
+                frag_g = vector.from_elements(T.vec(2, out_elem_ty), [g0, g1])
+                idx_g0 = row_elem_base + col0_i32
+                idx_g_even = idx_g0 & mask_even_i32
+                byte_off_g = idx_g_even * c2_i32
+                atomic_add_x2(frag_g, byte_off_g)
+
+                # ---- up partial (offset by inter_dim) ----
+                vu0 = vector.extract(sub8u, static_position=[vi0], dynamic_position=[])
+                vu1 = vector.extract(sub8u, static_position=[vi1], dynamic_position=[])
+                vu1 = arith.select(col1_ok, vu1, arith.constant(0.0, type=T.f32))
+                u0 = arith.trunc_f(out_elem_ty, vu0)
+                u1 = arith.trunc_f(out_elem_ty, vu1)
+                frag_u = vector.from_elements(T.vec(2, out_elem_ty), [u0, u1])
+                idx_u0 = row_elem_base + i32_inter_in + col0_i32
+                idx_u_even = idx_u0 & mask_even_i32
+                byte_off_u = idx_u_even * c2_i32
+                atomic_add_x2(frag_u, byte_off_u)
+
                 scf.YieldOp([])
 
 
@@ -376,25 +493,13 @@ def _pack_stage1_gate_up_tiles(tensor, *, experts: int, inter_dim: int, tile_n: 
             f"Stage1 gate/up packed layout requires inter_dim divisible by tile_n, got {inter_dim} and {tile_n}"
         )
 
-    # torch.cat does not implement some 1-byte float dtypes (e.g.
-    # Float8_e8m0fnu); operate through uint8 view if needed.
-    orig_dtype = tensor.dtype
-    _need_view_cast = tensor.element_size() == 1 and tensor.dtype not in (
-        torch.uint8, torch.int8
-    )
-    if _need_view_cast:
-        tensor = tensor.contiguous().view(torch.uint8)
-
     tensor_3d = tensor.contiguous().view(int(experts), int(2 * inter_dim), int(cols))
     gate = tensor_3d[:, :int(inter_dim), :]
     up = tensor_3d[:, int(inter_dim):, :]
     gate_tiles = gate.view(int(experts), int(inter_dim // tile_n), int(tile_n), int(cols))
     up_tiles = up.view(int(experts), int(inter_dim // tile_n), int(tile_n), int(cols))
     packed = torch.cat((gate_tiles, up_tiles), dim=2)
-    packed = packed.view(expected_rows, int(cols))
-    if _need_view_cast:
-        packed = packed.view(orig_dtype)
-    return packed
+    return packed.view(expected_rows, int(cols))
 
 
 class _Stage1GateUpPackedWrapper:
@@ -422,26 +527,8 @@ class _Stage1GateUpPackedWrapper:
             if hasattr(stage1_exe, attr):
                 setattr(self, attr, getattr(stage1_exe, attr))
 
-    @staticmethod
-    def _tensor_key(t):
-        """Stable cache key surviving .view() / dtype reinterpret_cast.
-
-        Using id(t) breaks when the caller (e.g. aiter.fused_moe) calls
-        `.view(torch.uint8)` on an fp8_e8m0 scale every invocation: every
-        fresh Python view has a new id, so the cache misses and we redo
-        the ~1GB `torch.cat` repack every call. Keying on the underlying
-        storage pointer + numel + element_size survives those benign view
-        creations while still distinguishing different tensors.
-        """
-        import torch
-        if t is None:
-            return None
-        if isinstance(t, torch.Tensor):
-            return (int(t.data_ptr()), int(t.numel()), int(t.element_size()))
-        return id(t)
-
     def _get_packed_operands(self, arg_w, arg_scale_w):
-        key = (self._tensor_key(arg_w), self._tensor_key(arg_scale_w))
+        key = (id(arg_w), id(arg_scale_w))
         cached = self._cache.get(key)
         if cached is not None:
             return cached[0]
@@ -464,9 +551,8 @@ class _Stage1GateUpPackedWrapper:
         else:
             packed_scale_w = arg_scale_w
 
-        # Keep strong refs to the originals so the storage (and thus the
-        # data_ptr-based key) cannot be reclaimed + reused while the entry
-        # is alive.
+        # Store (result, original_refs) — the strong refs to originals
+        # prevent id() reuse while the entry is alive.
         self._cache[key] = ((packed_w, packed_scale_w), (arg_w, arg_scale_w))
         return packed_w, packed_scale_w
 
