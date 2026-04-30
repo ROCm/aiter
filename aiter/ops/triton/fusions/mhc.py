@@ -6,6 +6,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions import (
+    _mhc_reduce_splitc_kernel,
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
     _mhc_fused_reduce_kernel,
@@ -75,6 +76,7 @@ res-stream branch of the kernel.
     K_phi, total_phi_cols = phi.shape
 
     n_squared = n * n
+    N_POW2 = triton.next_power_of_2(n)
 
     if config is None:
         config, _ = get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
@@ -92,16 +94,35 @@ res-stream branch of the kernel.
     # Ensure BLOCK_K doesn't exceed K dimension
     BLOCK_K = min(BLOCK_K, triton.next_power_of_2(K))
 
-    # TODO: have BLOCK_C in json config file and load it here later
-    BLOCK_C = config.pop("BLOCK_C", BLOCK_K)
-    BLOCK_C = min(BLOCK_C, triton.next_power_of_2(C))
+    # Hybrid dispatch for fusing layer_input in the pre-stream:
+    # - Large C: launch dedicated `_mhc_reduce_splitc_kernel` after the GEMM.
+    # - Small C: run apply inline inside the fused/reduce kernel (avoids ~10-20us launch overhead).
+    DEFAULT_REDUCE_SPLITC_THRESHOLD = 4096
+    use_reduce_splitc = bool(
+        config.pop("USE_REDUCE_SPLITC", C >= DEFAULT_REDUCE_SPLITC_THRESHOLD)
+    )
+
+    # Reduce-splitC kernel block sizes (only used when use_reduce_splitc)
+    BLOCK_M_SPLITC = config.pop(
+        "BLOCK_M_SPLITC", 32 if M >= 32 else triton.next_power_of_2(M)
+    )
+    BLOCK_C_SPLITC = config.pop("BLOCK_C_SPLITC", min(128, triton.next_power_of_2(C)))
+
+    # Inline-path apply-tile budget (only used when not use_reduce_splitc). The 3D tile
+    # (BLOCK_M, N_POW2, BLOCK_C) f32 must stay within ~64 KB to avoid VGPR spills.
+    BLOCK_C = min(BLOCK_K, triton.next_power_of_2(C))
+    apply_tile_budget = 64 * 1024
+    max_block_c = max(1, apply_tile_budget // (BLOCK_M * N_POW2))
+    BLOCK_C = min(BLOCK_C, 1 << (max_block_c.bit_length() - 1))
 
     _LOGGER.info(
         f"MHC: x={tuple(x.shape)} phi={tuple(phi.shape)} "
         f"alpha_pre={alpha_pre} alpha_post={alpha_post} alpha_res={alpha_res} "
         f"hc_pre_eps={hc_pre_eps} hc_post_mult_value={hc_post_mult_value} "
         f"sinkhorn_iters={sinkhorn_iters} num_ksplit={num_ksplit} "
-        f"BLOCK_N={BLOCK_N} BLOCK_C={BLOCK_C}"
+        f"BLOCK_N={BLOCK_N} BLOCK_C={BLOCK_C} "
+        f"use_reduce_splitc={use_reduce_splitc} "
+        f"BLOCK_M_SPLITC={BLOCK_M_SPLITC} BLOCK_C_SPLITC={BLOCK_C_SPLITC}"
     )
 
     assert K == K_phi, f"Dimension mismatch: x has K={K}, but phi has K={K_phi}"
@@ -134,11 +155,14 @@ res-stream branch of the kernel.
 
     N = N_total
 
-    # Output `out` shrinks to (M, n + n_squared) with layout [post | res] —
-    # H^pre is consumed inside the kernel, so its slice is no longer materialized.
     N_out_post_res = n + n_squared
     out = torch.empty(M, N_out_post_res, dtype=x.dtype, device=x.device)
     layer_input = torch.empty(M, C, dtype=x.dtype, device=x.device)
+    if use_reduce_splitc:
+        pre_mix_buf = torch.empty(M, n, dtype=torch.float32, device=x.device)
+    else:
+        # Dummy ptr; the kernel never reads/writes it when USE_REDUCE_SPLITC=False.
+        pre_mix_buf = layer_input
 
     # Stream-aware grid: Each program processes exactly one stream
     n_blocks_pre = triton.cdiv(n, BLOCK_N)
@@ -193,6 +217,7 @@ res-stream branch of the kernel.
             alpha_res,
             bias,
             out,
+            pre_mix_buf,
             x,
             layer_input,
             M=M,
@@ -211,6 +236,8 @@ res-stream branch of the kernel.
             stride_acc_sq_m=acc_sq_partial.stride(1),
             stride_out_m=out.stride(0),
             stride_out_n=out.stride(1),
+            stride_pm=pre_mix_buf.stride(0),
+            stride_pn=pre_mix_buf.stride(1),
             stride_xm=x.stride(0),
             stride_xk=x.stride(1),
             stride_li_m=layer_input.stride(0),
@@ -218,8 +245,10 @@ res-stream branch of the kernel.
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_C=BLOCK_C,
+            N_POW2=N_POW2,
             ACTUAL_KSPLIT=actual_ksplit,
             NUM_SINKHORN_ITERS=sinkhorn_iters,
+            USE_REDUCE_SPLITC=use_reduce_splitc,
             **config,
         )
     else:
@@ -232,6 +261,7 @@ res-stream branch of the kernel.
             alpha_res,
             bias,
             out,
+            pre_mix_buf,
             layer_input,
             M=M,
             K=K,
@@ -248,17 +278,44 @@ res-stream branch of the kernel.
             stride_phi_n=phi.stride(1),
             stride_out_m=out.stride(0),
             stride_out_n=out.stride(1),
+            stride_pm=pre_mix_buf.stride(0),
+            stride_pn=pre_mix_buf.stride(1),
             stride_li_m=layer_input.stride(0),
             stride_li_c=layer_input.stride(1),
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
             BLOCK_C=BLOCK_C,
+            N_POW2=N_POW2,
             NUM_SINKHORN_ITERS=sinkhorn_iters,
+            USE_REDUCE_SPLITC=use_reduce_splitc,
             **config,
         )
 
-    # `out` layout is [post | res]: out[:, :n] is H^post, out[:, n:] is H^res
+    if use_reduce_splitc:
+        # Apply step (Eq 17): layer_input[m, c] = sum_i pre_mix[m, i] * x[m, i*C + c].
+        # Dedicated kernel with an (M_blocks, C_blocks) grid that exposes C-axis
+        # parallelism the fused kernel cannot.
+        grid_apply = (triton.cdiv(M, BLOCK_M_SPLITC), triton.cdiv(C, BLOCK_C_SPLITC))
+        _mhc_reduce_splitc_kernel[grid_apply](
+            x,
+            pre_mix_buf,
+            layer_input,
+            M=M,
+            C=C,
+            n=n,
+            stride_xm=x.stride(0),
+            stride_xk=x.stride(1),
+            stride_pm=pre_mix_buf.stride(0),
+            stride_pn=pre_mix_buf.stride(1),
+            stride_om=layer_input.stride(0),
+            stride_oc=layer_input.stride(1),
+            BLOCK_M=BLOCK_M_SPLITC,
+            BLOCK_C=BLOCK_C_SPLITC,
+            N_POW2=N_POW2,
+        )
+
+    # `out` layout is [post + res]: out[:, :n] is H^post, out[:, n:] is H^res
     h_post = out[:, :n].unsqueeze(-1)  # (M, n, 1)
     h_res = out[:, n:].view(M, n, n)  # (M, n, n)
     return h_post, h_res, layer_input
