@@ -77,10 +77,10 @@ def _is_triton_installed():
 
     for pkg in [
         "triton",
-        "amd-triton",
         "pytorch-triton",
         "pytorch-triton-rocm",
         "triton-rocm",
+        "amd-triton",
     ]:
         try:
             return pkg, pkg_version(pkg)

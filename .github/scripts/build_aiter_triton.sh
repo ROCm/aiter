@@ -33,34 +33,17 @@ echo "==== Install dependencies and aiter ===="
 git config --global --add safe.directory /workspace
 pip config set global.retries 15
 pip config set global.timeout 120
-pip install --upgrade pandas pyzmq einops numpy==1.26.2 || {
-    echo "WARNING: batch pip install failed, retrying packages individually..."
-    pip install --upgrade pandas || true
-    pip install --upgrade pyzmq || echo "WARNING: pyzmq unavailable (only needed by aiter.dist.shm_broadcast)"
-    pip install --upgrade einops
-    pip install --upgrade "numpy==1.26.2"
-}
+pip install -r .github/requirements/triton-test.txt
 pip uninstall -y aiter || true
-retry_cmd 3 pip install --upgrade \
-    "pybind11>=3.0.1" \
-    "setuptools>=45" \
-    "setuptools_scm[toml]>=6.2" \
-    wheel \
-    packaging \
-    psutil \
-    "ninja>=1.11.1" \
-    pandas \
-    "flydsl==0.1.8"
-pip install tabulate
 retry_cmd 3 pip install --no-build-isolation -e .
-./.github/scripts/install_triton.sh
 
-# Read BUILD_TRITON env var, default to 1. If 1, install Triton; if 0, skip installation.
-BUILD_TRITON=${BUILD_TRITON:-1}
+# BUILD_TRITON=1: override the pinned triton wheel with a source build.
+# Default is 0 (use the pinned wheel from triton-test.txt).
+BUILD_TRITON=${BUILD_TRITON:-0}
 
 if [[ "$BUILD_TRITON" == "1" ]]; then
     echo
-    echo "==== Install triton ===="
+    echo "==== Install triton (source build) ===="
     pip uninstall -y triton || true
 
     TRITON_WHEEL_DIR=${TRITON_WHEEL_DIR:-}
@@ -69,8 +52,6 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
         pip install "$TRITON_WHEEL_DIR"/*.whl
     else
         echo "Building triton from source..."
-        # Pin triton to a known-good commit to avoid CI breakage from
-        # upstream changes (e.g. AMD codegen regressions in triton-lang/triton).
         TRITON_COMMIT=${TRITON_COMMIT:-756afc06}
         git clone https://github.com/triton-lang/triton || true
         cd triton
@@ -79,13 +60,6 @@ if [[ "$BUILD_TRITON" == "1" ]]; then
         MAX_JOBS=64 pip --retries=10 --default-timeout=60 install .
         cd ..
     fi
-    pip install filecheck
-    # NetworkX is a dependency of Triton test selection script
-    # `.github/scripts/select_triton_tests.py`.
-    pip install networkx
-else
-    echo
-    echo "[SKIP] Triton installation skipped because BUILD_TRITON=$BUILD_TRITON"
 fi
 
 echo
