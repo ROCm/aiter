@@ -606,9 +606,6 @@ struct layout_linear : public remove_cvref_t<Layout>{
     OPUS_H_D constexpr void inc(index_t offset) { linear_offset += offset; }
     OPUS_H_D constexpr layout_linear& operator+=(index_t offset) { inc(offset); return *this; }
     OPUS_H_D constexpr layout_linear operator+(index_t offset) const { layout_linear result(*this); result += offset; return result; }
-    // Compile-time-static offset: returns a wrapper preserving N for tr_load imm-folding.
-    template<index_t N>
-    OPUS_H_D constexpr auto operator+(number<N>) const;
 
     index_t linear_offset;
 };
@@ -639,53 +636,35 @@ struct layout_cached : public remove_cvref_t<Layout> {
     OPUS_H_D constexpr void inc(index_t offset) { static_for<num_issues>([&](auto i){ offsets[i] += offset; }); }
     OPUS_H_D constexpr layout_cached& operator+=(index_t offset) { inc(offset); return *this; }
     OPUS_H_D constexpr layout_cached operator+(index_t offset) const { layout_cached result(*this); result += offset; return result; }
-    template<index_t N>
-    OPUS_H_D constexpr auto operator+(number<N>) const;
 
     array<index_t, num_issues> offsets;
+};
+
+template<typename Layout, index_t N>
+struct layout_shifted : public remove_cvref_t<Layout> {
+    using base = remove_cvref_t<Layout>;
+    OPUS_H_D constexpr layout_shifted(const base& layout) : base(layout) {}
+    template<typename Shape, typename Stride, typename Coord = false_type>
+    OPUS_H_D constexpr layout_shifted(const Shape& shape, const Stride& stride, const Coord& coord = {}) : base(shape, stride, coord) {}
+    template <typename... Cs>
+    OPUS_H_D constexpr auto operator()(Cs&&... cs) const { return base::operator()(std::forward<Cs>(cs)...) + N; }
 };
 
 template<typename T> struct is_layout : false_type {};
 template<typename X, typename Y, typename Z> struct is_layout<layout<X, Y, Z>> : true_type {};
 template<index_t cached_vec, typename Layout> struct is_layout<layout_cached<cached_vec, Layout>> : true_type {};
 template<typename Layout> struct is_layout<layout_linear<Layout>> : true_type {};
+template<typename Layout, index_t N> struct is_layout<layout_shifted<Layout, N>> : true_type {};
 template<typename T> constexpr bool is_layout_v = is_layout<remove_cvref_t<T>>::value;
 
-// ─── layout_static_shifted: layout wrapper carrying a compile-time linear offset ───
-// Produced by `layout + opus::number<N>{}`. tr_load peels the wrapper so the static delta
-// folds into the ds_read `offset:` immediate while the dynamic VGPR base is shared.
-template<typename Layout, int N>
-struct layout_static_shifted : public Layout {
-    using base_layout = Layout;
-    static constexpr int static_offset = N;
-
-    OPUS_H_D constexpr layout_static_shifted(const Layout& l) : Layout(l) {}
-
-    template <typename... Cs, std::enable_if_t<(!is_tuple_v<Cs> && ...), bool> = true>
-    OPUS_H_D constexpr auto operator()(Cs&&... cs) const { return Layout::operator()(std::forward<Cs>(cs)...) + N; }
-    template <typename C, std::enable_if_t<is_tuple_v<C>, bool> = true>
-    OPUS_H_D constexpr auto operator()(C&& c) const { return Layout::operator()(std::forward<C>(c)) + N; }
-};
-template<typename Layout, int N> struct is_layout<layout_static_shifted<Layout, N>> : true_type {};
-
-// Member-detection peel: (base=L, value=0) for plain layouts; (base=L::base_layout, value=L::static_offset) for shifted.
-template<typename L, typename = void> struct layout_static_offset { using base = L; static constexpr int value = 0; };
-template<typename L> struct layout_static_offset<L, std::void_t<decltype(L::static_offset)>> { using base = typename L::base_layout; static constexpr int value = L::static_offset; };
-
-// Out-of-class definitions for member operator+(number<N>)
-template<typename Layout>
-template<index_t N>
-OPUS_H_D constexpr auto layout_linear<Layout>::operator+(number<N>) const {
-    if constexpr (N == 0) return *this;
-    else return layout_static_shifted<layout_linear<Layout>, static_cast<int>(N)>(*this);
+template<typename Layout> struct layout_shift_traits { using base = Layout; static constexpr index_t value = 0; };
+template<typename Layout, index_t N> struct layout_shift_traits<layout_shifted<Layout, N>> { using base = remove_cvref_t<Layout>; static constexpr index_t value = N; };
+template<typename Layout, index_t N, std::enable_if_t<is_layout_v<remove_cvref_t<Layout>>, bool> = true>
+OPUS_H_D constexpr auto operator+(const Layout& layout, number<N>) {
+    using shift = layout_shift_traits<remove_cvref_t<Layout>>;
+    if constexpr (N == 0) return layout;
+    else                  return layout_shifted<typename shift::base, shift::value + N>(static_cast<const typename shift::base&>(layout));
 }
-template<index_t cached_vec_, typename Layout>
-template<index_t N>
-OPUS_H_D constexpr auto layout_cached<cached_vec_, Layout>::operator+(number<N>) const {
-    if constexpr (N == 0) return *this;
-    else return layout_static_shifted<layout_cached<cached_vec_, Layout>, static_cast<int>(N)>(*this);
-}
-
 
 template <typename Layout>
 OPUS_H_D constexpr auto layout_to_issue_space() {
@@ -718,9 +697,6 @@ template<typename Layout, index_t vec = 1> struct layout_load_traits {
     static constexpr auto issue_space = layout_to_issue_space<Layout>();
     static constexpr auto issue_space_vec = vectorize_issue_space(issue_space, number<vec>{}); static constexpr auto r_elem = get<0>(reduce_tuple_mul(issue_space_vec));
 };
-// Compile-time per-issue offsets for layouts with fully-static Shape/Stride/Coord — used by tr_load imm path.
-template<typename L, index_t vec>
-inline constexpr auto layout_static_offsets_v = layout_to_offsets<vec>(L{typename L::Shape{}, typename L::Stride{}, typename L::Coord{}});
 // Runtime flat index → multi-index tuple (all index_t) — avoids per-iteration template instantiation
 template<index_t... Is, index_t... Ns> OPUS_H_D constexpr auto flat_to_coords(index_t flat, seq<Is...>, tuple<number<Ns>...>) {
     constexpr index_t strides[] = {impl::ford_stride<Is>(make_index_seq<sizeof...(Ns)>{}, seq<Ns...>{})...}, dims[] = {Ns...};
@@ -732,6 +708,9 @@ template<index_t vec, typename Layout> OPUS_H_D constexpr auto layout_to_offsets
     array<index_t, num_issues> offsets;
     for (index_t i = 0; i < num_issues; i++) offsets[i] = u(flat_to_coords(i, make_index_seq<ndim>{}, issue_space_vec));
     return offsets; }
+// Compile-time per-issue offsets for layouts with static Shape/Stride
+template<typename Layout, index_t vec>
+inline constexpr auto layout_imm_offsets_v = layout_to_offsets<vec>(Layout{typename Layout::Shape{}, typename Layout::Stride{}, typename Layout::Coord{}});
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // vector, a wrapper for __attribute__((ext_vector_type(*)))
 template <typename V_, index_t N_> // V_ must be literal type, otherwise clang ext_vector_type will not recognize
@@ -1952,37 +1931,33 @@ struct smem {
     template<index_t vec = 1, typename Layout, std::enable_if_t<is_layout_v<Layout>, bool> = true>
     OPUS_D auto tr_load(const Layout& u)
     {
-        // Peel any layout_static_shifted: the dynamic VGPR base is shared across calls that
-        // differ only by a compile-time delta, which is folded into ds_read `offset:` imm.
-        using L      = remove_cvref_t<Layout>;
-        using info   = layout_static_offset<L>;
-        using L_base = typename info::base;
-        using LT     = layout_load_traits<L_base, vec>;
-        constexpr int  static_extra = info::value;
-        constexpr auto r_elem       = LT::r_elem;
-        constexpr bool use_imm      = is_static_tuple_v<typename L_base::Shape> && is_static_tuple_v<typename L_base::Stride>;
+        using LT = layout_load_traits<Layout, vec>;
+        constexpr auto r_elem = LT::r_elem;
+        constexpr bool is_static_layout = is_static_tuple_v<typename Layout::Shape> && is_static_tuple_v<typename Layout::Stride>;
+        [[maybe_unused]] auto offsets = layout_to_offsets<vec>(u);
 
-        auto do_load = [&](auto i) {
-            if constexpr (use_imm) {
-                constexpr int off = (layout_static_offsets_v<L_base, vec>[i.value] + static_extra) * sizeof(T);
+        auto issue = [&](auto i) {
+            if constexpr (is_static_layout) {
+                using shift = layout_shift_traits<remove_cvref_t<Layout>>;
+                constexpr int off = layout_imm_offsets_v<Layout, vec>[i.value] * sizeof(T);
                 if constexpr (off >= 0 && off <= 0xffff) {
-                    const auto& ub = static_cast<const L_base&>(u);
+                    const auto& ub = static_cast<const typename shift::base&>(u);
                     const int base = ub(make_repeated_tuple(number<0>{}, number<size<decltype(LT::issue_space_vec)>()>{})) * sizeof(T);
                     return _tr_load<vec, off>(base);
                 }
             }
-            return tr_load<vec>(layout_to_offsets<vec>(u)[i.value]);
+            return tr_load<vec>(offsets[i.value]);
         };
 
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         static_for<r_elem.value>([&](auto i){
-            set_slice(r, do_load(i), number<i.value * vec>{}, number<(i.value + 1) * vec>{});
+            set_slice(r, issue(i), number<i.value * vec>{}, number<(i.value + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        static_for<r_elem.value>([&](auto i){ r[i.value] = do_load(i); });
+        static_for<r_elem.value>([&](auto i){ r[i.value] = issue(i); });
         return r;
 #endif
     }
@@ -2038,20 +2013,34 @@ struct smem {
         using LT = layout_load_traits<Layout, vec>;
         constexpr auto issue_space_vec = LT::issue_space_vec;
         constexpr auto r_elem = LT::r_elem;
-        auto offsets = layout_to_offsets<vec>(u);
+        constexpr bool is_static_layout = is_static_tuple_v<typename Layout::Shape> && is_static_tuple_v<typename Layout::Stride>;
+        [[maybe_unused]] auto offsets = layout_to_offsets<vec>(u);
         constexpr auto u_r = make_layout<-1>(issue_space_vec);
+
+        auto issue = [&](auto i) {
+            if constexpr (is_static_layout) {
+                using shift = layout_shift_traits<remove_cvref_t<Layout>>;
+                constexpr int off = layout_imm_offsets_v<Layout, vec>[i.value] * sizeof(T);
+                if constexpr (off >= 0 && off <= 0xffff) {
+                    const auto& ub = static_cast<const typename shift::base&>(u);
+                    const int base = ub(make_repeated_tuple(number<0>{}, number<size<decltype(LT::issue_space_vec)>()>{})) * sizeof(T);
+                    return _tr_load<vec, off>(base);
+                }
+            }
+            return tr_load<vec>(offsets[i.value]);
+        };
 
 #if OPUS_TILE_CONTAINER == 0
         vector_t<scalar_type, vec * vector_size * r_elem.value> r;
         static_ford(issue_space_vec, [&](auto ... ids){
             constexpr index_t idx = u_r(ids...);
-            auto tmp = pred(ids...) ? tr_load<vec>(offsets[idx]) : vector_type<vec>{0};
+            auto tmp = pred(ids...) ? issue(number<idx>{}) : vector_type<vec>{0};
             set_slice(r, tmp, number<idx * vec>{}, number<(idx + 1) * vec>{});
         });
         return r;
 #elif OPUS_TILE_CONTAINER == 1
         array<vector_type<vec>, r_elem.value> r;
-        static_ford(issue_space_vec, [&](auto ... ids){ r[u_r(ids...)] = pred(ids...) ? tr_load<vec>(offsets[u_r(ids...)]) : vector_type<vec>{0}; });
+        static_ford(issue_space_vec, [&](auto ... ids){ constexpr index_t idx = u_r(ids...); r[idx] = pred(ids...) ? issue(number<idx>{}) : vector_type<vec>{0}; });
         return r;
 #endif
     }
