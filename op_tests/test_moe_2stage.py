@@ -527,7 +527,10 @@ def _run_flydsl_branch(
     # Useful on small shapes where the per-1x32 quant noise legitimately
     # dominates ``checkAllclose`` even when the kernel is correct.
     if int(os.environ.get("AITER_FLYDSL_SKIP_REF", "0")):
-        finite = bool(torch.isfinite(out_ck).all())
+        # NOTE: avoid bool .all() (broken on gfx1250 + rocm 7.2 + torch 2.10 ->
+        # GPU reduction kernel hangs).  Use sum-vs-numel equivalent.
+        _isf = torch.isfinite(out_ck)
+        finite = int(_isf.sum().item()) == int(_isf.numel())
         if not finite:
             aiter.logger.error(
                 "flydsl_gfx1250 %s: output contains inf/nan", fmt_label,
@@ -578,7 +581,9 @@ def _run_flydsl_branch(
         os.environ.get("AITER_FLYDSL_DIFF_TOL", _FLYDSL_DIFF_TOL[fmt_label])
     )
     strict_elem = int(os.environ.get("AITER_FLYDSL_STRICT_ELEM", "0"))
-    finite = bool(torch.isfinite(out_ck).all())
+    # See note above: avoid Tensor.all() on bool reductions (gfx1250 hang).
+    _isf = torch.isfinite(out_ck)
+    finite = int(_isf.sum().item()) == int(_isf.numel())
     fallback_pass = (
         not strict_elem
         and err != 0
