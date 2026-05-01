@@ -190,6 +190,23 @@ def mla_decode_fwd(
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
+    # AITER ships ps=0 (page-1-only) decode-stage1 kernels for the bf16
+    # absorbed MLA path used by DeepSeek-V3 / Kimi-K2 / Kimi-K2.5. The launcher
+    # template still passes s_log2_plen=log2(page_size), but the underlying
+    # kernel binary ignores it, silently producing wrong outputs. Refuse loudly
+    # rather than corrupting generation. See hsa/gfx950/mla/mla_asm.csv column
+    # "ps" (0/1) — bf16 a16w16 dec_stage1 has no _ps variant shipped.
+    _bf16_path = (kv_buffer.dtype == torch.bfloat16
+                  or (kv_buffer.dtype == torch.uint8 and q.dtype == torch.bfloat16))
+    if page_size != 1 and _bf16_path:
+        raise NotImplementedError(
+            f"aiter.mla.mla_decode_fwd: page_size={page_size} is not safe with "
+            "the bf16 decode-stage1 kernel. Only page_size=1 is correct in "
+            "this AITER build (kernel asm has no paged variant). "
+            "Pass page_size=1 or wait for an AITER release shipping "
+            "mla_dec_stage1_bf16_a16w16_*_ps.co."
+        )
+
     ori_total_s, ori_nhead, ori_v_head_dim = o.shape
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
