@@ -18,8 +18,8 @@ def sparse_mqa_sink(
     attn_sink: torch.Tensor,
     *,
     tile_k: int = 64,
-    block_h: int = 8,
-    block_d: int = 64,
+    block_h: int = 4,
+    block_d: int = 128,
     score_d: int = 64,
 ) -> torch.Tensor:
     """Sparse MQA with DSv4 attention-sink semantics.
@@ -61,6 +61,9 @@ def sparse_mqa_sink(
     topk_count = topk_indices.shape[1]
     num_seqs = seqused_k.shape[0]
 
+    # Keep the accumulator footprint comparable to the original 8x64 tile
+    # while halving output-D tiles. That cuts repeated QK score work for
+    # DSv4's 512-wide value vector from 8x to 4x.
     block_h = min(block_h, triton.next_power_of_2(num_heads))
     block_d = min(block_d, triton.next_power_of_2(head_dim))
     score_d = min(score_d, triton.next_power_of_2(head_dim))
