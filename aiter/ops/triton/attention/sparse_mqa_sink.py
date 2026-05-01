@@ -5,6 +5,8 @@ from aiter.ops.triton._triton_kernels.attention.sparse_mqa_sink import (
     _sparse_mqa_sink_kernel,
 )
 
+_DEQUANT_DTYPES = (torch.float16, torch.bfloat16)
+
 
 def sparse_mqa_sink(
     q: torch.Tensor,
@@ -25,8 +27,8 @@ def sparse_mqa_sink(
     """Sparse MQA with DSv4 attention-sink semantics.
 
     Args:
-        q: [num_tokens, num_heads, head_dim], BF16/FP16.
-        kv: [num_blocks, block_size, head_dim], BF16/FP16.
+        q: [num_tokens, num_heads, head_dim], dequantized BF16/FP16.
+        kv: [num_blocks, block_size, head_dim], dequantized BF16/FP16.
         out: [num_tokens, num_heads, head_dim], same dtype as q.
         cu_seqlens_q: [num_seqs + 1], int32 token offsets.
         seqused_k: [num_seqs], int32 logical KV lengths before padding.
@@ -34,6 +36,9 @@ def sparse_mqa_sink(
         topk_indices: [num_tokens, topk], int32 logical KV positions. -1 is invalid.
         block_table: [num_seqs, max_blocks_per_seq], int32 logical->physical block IDs.
         attn_sink: [num_heads], FP32 sink logits included in the denominator only.
+
+    This op does not unpack native DSv4 FP4/FP8 cache layouts or apply their
+    scale tensors. Callers must pass dequantized BF16/FP16 Q/KV tensors.
     """
     assert q.dim() == 3, f"q must be [T, H, D], got {q.shape}"
     assert kv.dim() == 3, f"kv must be [num_blocks, block_size, D], got {kv.shape}"
@@ -44,6 +49,26 @@ def sparse_mqa_sink(
     assert block_table.dim() == 2
     assert attn_sink.shape == (q.shape[1],)
     assert kv.shape[2] == q.shape[2]
+    assert q.is_cuda and kv.is_cuda, "q and kv must be CUDA tensors"
+    assert (
+        out.device == q.device
+        and cu_seqlens_q.device == q.device
+        and seqused_k.device == q.device
+        and topk_indices.device == q.device
+        and block_table.device == q.device
+        and attn_sink.device == q.device
+        and kv.device == q.device
+    ), "all inputs must be on the same device"
+    assert q.dtype in _DEQUANT_DTYPES, f"q must be dequantized BF16/FP16, got {q.dtype}"
+    assert (
+        kv.dtype in _DEQUANT_DTYPES
+    ), f"kv must be dequantized BF16/FP16, got {kv.dtype}"
+    assert out.dtype == q.dtype, f"out dtype {out.dtype} must match q dtype {q.dtype}"
+    assert cu_seqlens_q.dtype == torch.int32
+    assert seqused_k.dtype == torch.int32
+    assert topk_indices.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+    assert attn_sink.dtype == torch.float32
 
     num_tokens, num_heads, head_dim = q.shape
     block_size = kv.shape[1]

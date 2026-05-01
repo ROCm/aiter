@@ -27,6 +27,34 @@ def _dsv4_indexer_dense_kernel(
 
 
 @triton.jit
+def _dsv4_indexer_dense_batched_kernel(
+    out_ptr,  # [num_tokens, topk]
+    positions_ptr,  # [num_tokens]
+    seq_ids_ptr,  # [num_tokens]
+    kv_lens_ptr,  # [num_seqs]
+    out_stride_t: tl.int64,
+    out_stride_k: tl.int64,
+    n_committed: tl.constexpr,
+    offset: tl.int32,
+    ratio: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    offs_k = tl.arange(0, BLOCK_K)
+    seq_id = tl.load(seq_ids_ptr + token_id).to(tl.int32)
+    kv_len = tl.load(kv_lens_ptr + seq_id).to(tl.int32)
+    pos = tl.load(positions_ptr + token_id).to(tl.int32)
+    causal_limit = (pos + 1) // ratio
+    valid = (offs_k < n_committed) & (offs_k < kv_len) & (offs_k < causal_limit)
+    out = tl.where(valid, offs_k + offset, -1)
+    tl.store(
+        out_ptr + token_id * out_stride_t + offs_k * out_stride_k,
+        out,
+        mask=offs_k < n_committed,
+    )
+
+
+@triton.jit
 def _dsv4_indexer_score_kernel(
     score_ptr,  # [num_tokens, kv_len], fp32
     q_ptr,  # [num_tokens, num_heads, head_dim]
@@ -95,6 +123,86 @@ def _dsv4_indexer_score_kernel(
         score_ptr + token_id * score_stride_t + offs_t * score_stride_k,
         acc,
         mask=offs_t < kv_len,
+    )
+
+
+@triton.jit
+def _dsv4_indexer_score_batched_kernel(
+    score_ptr,  # [num_tokens, kv_len], fp32
+    q_ptr,  # [num_tokens, num_heads, head_dim]
+    kv_ptr,  # [num_seqs, kv_len, head_dim]
+    weights_ptr,  # [num_tokens, num_heads]
+    positions_ptr,  # [num_tokens]
+    seq_ids_ptr,  # [num_tokens]
+    kv_lens_ptr,  # [num_seqs]
+    q_stride_t: tl.int64,
+    q_stride_h: tl.int64,
+    q_stride_d: tl.int64,
+    kv_stride_b: tl.int64,
+    kv_stride_t: tl.int64,
+    kv_stride_d: tl.int64,
+    weights_stride_t: tl.int64,
+    weights_stride_h: tl.int64,
+    score_stride_t: tl.int64,
+    score_stride_k: tl.int64,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    kv_len_max: tl.constexpr,
+    ratio: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+
+    seq_id = tl.load(seq_ids_ptr + token_id).to(tl.int32)
+    kv_len = tl.load(kv_lens_ptr + seq_id).to(tl.int32)
+    offs_t = tile_id * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < head_dim
+    acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+
+    for h_start in range(0, num_heads, BLOCK_H):
+        offs_h = h_start + tl.arange(0, BLOCK_H)
+        h_mask = offs_h < num_heads
+
+        q = tl.load(
+            q_ptr
+            + token_id * q_stride_t
+            + offs_h[:, None] * q_stride_h
+            + offs_d[None, :] * q_stride_d,
+            mask=h_mask[:, None] & d_mask[None, :],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        kv = tl.load(
+            kv_ptr
+            + seq_id * kv_stride_b
+            + offs_t[None, :] * kv_stride_t
+            + offs_d[:, None] * kv_stride_d,
+            mask=(offs_t[None, :] < kv_len) & d_mask[:, None],
+            other=0.0,
+            cache_modifier=".cg",
+        )
+        dots = tl.dot(q, kv)
+        dots = tl.maximum(dots, 0.0)
+        weights = tl.load(
+            weights_ptr + token_id * weights_stride_t + offs_h * weights_stride_h,
+            mask=h_mask,
+            other=0.0,
+            cache_modifier=".cg",
+        ).to(tl.float32)
+        acc += tl.sum(dots * weights[:, None], axis=0)
+
+    pos = tl.load(positions_ptr + token_id).to(tl.int32)
+    causal_limit = (pos + 1) // ratio
+    valid = (offs_t < kv_len_max) & (offs_t < kv_len) & (offs_t < causal_limit)
+    acc = tl.where(valid, acc, float("-inf"))
+    tl.store(
+        score_ptr + token_id * score_stride_t + offs_t * score_stride_k,
+        acc,
+        mask=offs_t < kv_len_max,
     )
 
 
