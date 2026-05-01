@@ -327,6 +327,7 @@ if __name__ == "__main__":
 
     def to_list(x):
         return x if isinstance(x, (list, tuple)) else [x]
+
     num_experts_list = to_list(args.num_experts)
     num_tokens_list = to_list(args.num_tokens)
     topk_list = to_list(args.topk)
