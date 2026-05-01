@@ -380,6 +380,11 @@ jobs:
             pip show amd-aiter
           "
 
+      - name: Install amd-triton
+        run: |
+          docker exec -w /workspace aiter_test \
+            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
+
       - name: Show Aiter version
         run: |
           set -ex
@@ -563,6 +568,11 @@ jobs:
             pip install '${AITER_WHEEL_PATH}'
             pip show amd-aiter
           "
+
+      - name: Install amd-triton
+        run: |
+          docker exec -w /workspace aiter_test \
+            bash -c "./.github/scripts/install_triton.sh && pip show amd-triton"
 
       - name: Show Aiter version
         run: |
