@@ -63,10 +63,15 @@ def sparse_mqa_sink(
         return out
 
     assert num_seqs > 0, "non-empty q requires at least one sequence"
-    assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
-    assert (
-        cu_seqlens_q[-1] == num_tokens
-    ), f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} must equal num_tokens {num_tokens}"
+    # Keep value checks on-device to avoid synchronizing this hot path.
+    if hasattr(torch, "_assert_async"):
+        torch._assert_async(cu_seqlens_q[0] == 0)
+        torch._assert_async(cu_seqlens_q[-1] == num_tokens)
+    else:
+        assert cu_seqlens_q[0] == 0, "cu_seqlens_q must start with 0"
+        assert (
+            cu_seqlens_q[-1] == num_tokens
+        ), f"cu_seqlens_q[-1] {cu_seqlens_q[-1]} must equal num_tokens {num_tokens}"
 
     q = q.contiguous()
     kv = kv.contiguous()
